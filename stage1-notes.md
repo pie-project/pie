@@ -66,6 +66,19 @@ Live mixed workload, 3× naive-baseline + 1× trackb-snapkv, 24–48 tok:
 - quest-attention needs `envelope_dot` (KV envelopes), capability-gated off
   in this config — snapkv/h2o are the hook-path exercisers.
 
+## Stage 5 — why the "dual derivation" of fast_rows stays
+
+`fire_plan.rs` computes a member-count prefix; the driver's
+`launch_hook_free_prefix_rows` independently derives the wire-row prefix
+from the program row CSR. Handing the plan's number across the ABI was
+considered and rejected: the planner's job is the ORDER (which creates the
+prefix), and measuring the prefix off the wire layout it ordered is the
+driver applying device-side knowledge to a device-shaped fact — exactly
+the "emit alternatives, runtime picks" split of plan §4.4. The CSR
+derivation also survives composition (device-geometry placeholders) that a
+scheduler-side row count would have to re-model. Revisit only if a site
+appears whose lowering the driver cannot derive locally.
+
 ## Stage 4 — cache_domain × adapters (why there is no digest fold yet)
 
 The concern: `cache_domain` (runtime/engine/src/store/kv/hash.rs:30) is
@@ -126,3 +139,147 @@ domain byte-for-byte. That needs the seed bytes plumbed from instance
 registration to `fire::kv`, and only pays once lora fires can pass a
 (relaxed, lora-aware) canonical gate — deferred until increment 2a gives
 it a consumer.
+
+## Stage 2 — verdict
+
+Recon result: 4 of the 5 plan claims are obsolete or were never true.
+
+- "Multi-row fires are forced solo": false. `preserves_inner_rows` only
+  solos in conjunction with an empty qo tail
+  (`PendingRequest::requires_solo_submission`, worker.rs — the clause is
+  `preserves_inner_rows() && qo_indptr.last() == Some(0)`); ordinary
+  multi-row fires co-batch.
+- "Quest can't co-batch": false today —
+  `tests/inferlets/test_quest_pages.py::test_quest_two_requests` enforces
+  two quest requests batching together.
+- "Needs per-lane page tables": landed pre-plan in ea3c868b ("Track A/B
+  L4: consume the page mask, so Quest actually evicts") — the mask is
+  honoured by gathering the page table per request.
+- "Fused-QKV tap blocks hooks": fixed in stage 1 (`77446890` —
+  `fused_decode_qkv_post` gates on `hook_free_prefix_rows`; hook lanes run
+  the unfused tail, hook-free lanes keep the fused kernel).
+
+RS-buffer solo relax: rejected. `FoldBuffered` is unbatchable by WIT
+contract (the driver rejects a batch mixing folded and forward rows), and
+`Buffer` has zero callers — there is nothing to relax for.
+
+Remaining real item A — structured device-mask co-batch. Honest cost:
+packing a structured mask sets `has_custom_mask`, and the driver's fused
+paths gate on `!has_custom_mask` (llama_like.cpp ~:636-663), so the WHOLE
+fire loses the fused path. Measure before making it a default. Quest
+enablement note: `PIE_CUDA_KV_ENVELOPES=1` at boot is the only switch.
+
+**Measured** (2026-07-31, branch head `32507463`, L40S, Qwen3-0.6B,
+config as-is except `PIE_FRAME_SIZE=1` — required, see finding 1 below).
+
+Method. Plan (a) — force `fwd_cfg.force_prefill_path` for a clean env A/B —
+is unavailable: the flag is derived solely from
+`flashinfer_decode_supports_gqa` (context.cpp:1414) and XQA (default on)
+clears it; no env reaches it. Plan (b) instead, with a purpose-built
+instrument: `tests/inferlets/naive-masked` (UNCOMMITTED measurement
+inferlet, left in the tree with a workspace-member line in
+tests/inferlets/Cargo.toml — delete both when this note is settled). It is
+chat-completion's decode shape (all descriptor ports channel-bound,
+re-put per fire) with naive-baseline's gumbel sampler and three mask
+modes that differ ONLY in the mask: `none` (control), `dense` (causal
+mask from iota/le — packs a dense custom mask, the custom-mask prefill
+path), `structured` (the `causal_mask` opcode — the driver's
+structured-mask recognizer lowers it to the window-override decode path,
+`runtime_window_for_tail_aligned`, llama_like `supports_runtime_window`).
+All three produce token-identical output (checked at ctx 512 and 3072).
+Metric: per-token decode ms by endpoint differencing (`bench_quest.py`
+discipline: wall time at max_tokens 8 vs 104, interleaved conditions,
+min/median over 4-5 reps; driver script preserved at the session
+scratchpad, `bench_maskpath.py`). Mixed conditions run 3 naive-baseline
+lanes + 1 masked lane on separate client connections; the metric is the
+PLAIN lanes' time.
+
+Numbers (per-token ms, min/median). Debug build, ctx~512: every condition
+— naive 25.0/25.2, control 24.9/24.8, dense 25.1/25.1, structured
+25.3/25.3, 4×naive 24.8/24.8, mixed 24.4/24.5 — sits in one ±2% band: the
+~25 ms/step debug host floor swallows the entire effect, as this file's
+first measurements predicted. The decision numbers below are from
+`target/release/pie` (binary in-tree, built this same day from this
+branch):
+
+    ctx~512   naive 2.79/2.58   control 2.41/2.43   dense 2.34/2.42
+              struct 2.64/2.58  4xnaive 3.10/3.08   mixed(dense) 6.09/5.56
+    ctx~512   (fresh server)    4xnaive 3.00/2.77   mixed(dense) 5.68/5.51
+                                mixed(struct) 6.14/6.27
+    ctx~3072  naive 5.49/5.53   control 5.55/5.53   dense 3.28/3.39
+              struct 5.76/5.76  4xnaive 5.87/6.01
+    ctx~512, PIE_CUDA_DECODE_FUSED_POST=0:
+              naive 2.69/2.42   control 2.55/2.57   dense 2.56/2.64
+              4xnaive 3.32/3.48 (vs 3.10/3.08 default: +7-13%, weak signal)
+
+Reading. The fused-path loss the verdict worried about is NOT visible at
+these scales: dense (custom-mask prefill path, unfused QKV) is within
+noise of the unmasked control at ctx 512 and is ~40% FASTER per step at
+ctx 3072 (3.3 vs 5.5 — per-fire host/planning work differs by scheduling
+class and dominates; the kernels the mask path forfeits are worth tens of
+µs on a 0.6B/L40S step whose release-build floor is ~2.4 ms). Killing
+`fused_decode_qkv_post` outright costs at most ~0.2-0.4 ms/step at R=4
+(inside a noisy band). What IS expensive and reproducible is the status
+quo the relax would replace: a masked lane firing solo beside 3 plain
+lanes costs the plain lanes 1.8-2.3x per token — every step becomes two
+serialized waves — and the structured (window-override) mask is no
+cheaper than the dense one there (6.1-6.3 vs 5.5-5.7), because the cost
+is the extra wave, not the kernel.
+
+Verdict on the verdict: on this evidence, NO — co-batch admission should
+not gate on the window-override path; the window override buys nothing
+measurable end-to-end here (struct ≈ naive ≈ dense at R≤4), and the
+co-batch side of the ledger (one fire instead of two) is worth ~2x to the
+plain lanes. Caveats before acting: R≤4 and 0.6B keep every step
+host-bound — on a kernel-bound config (larger model, much wider R, longer
+kv) the mask-prefill + unfused-QKV loss and the O(R x pool) dense pack
+could reappear; re-measure there before defaulting co-batch on. And two
+liveness seams found while measuring block the relax anyway:
+
+1. FIXED (engine, `fire::submit_frame`). At the default `PIE_FRAME_SIZE=2`,
+   EVERY dense-device-mask decode inferlet (chat-completion included) died
+   at frame slot 1: the pooled device-geometry pass resolves descriptor
+   ports on the host at frame prepare (`descriptor_resolve.hpp` "not
+   ready"), and FramePrepare for every step of a v14 frame runs before ANY
+   step reaches the stream (driver `context.cpp` `launch`) — so a
+   device-geometry fire behind another fire of the same frame read cells
+   whose producing fire (its own previous fire, slot 0) was not even
+   enqueued. Structured mode died the same way on its OTHER ports (tokens/
+   kv-len — the device-composed template covers only mask-free
+   DecodeEnvelope shapes; DeviceGeometry class always host-reads at
+   prepare). The fix: `submit_frame` detects a DeviceGeometry-class pass in
+   any slot after the first and submits the frame's fires as single-slot
+   frames (one frame per lane seals per boundary, so the producer's frame
+   is on-stream before the consumer's prepare readback syncs it — the
+   `PIE_FRAME_SIZE=1` shape, paid only by that lane). Verified: dense
+   12/12, structured 5/5, stock chat-completion clean at default frame
+   size; all modes byte-identical to `PIE_FRAME_SIZE=1`; mixed
+   masked+plain (repro_maskmix) 12/12 clean at BOTH frame sizes; FS=1
+   outputs byte-identical pre/post fix. Note while verifying: dense-mode
+   text diverges from none/structured at ctx≈512 (repro_maskmix --parity)
+   — pre-existing kernel-path numerics, present identically in this
+   session's pre-fix captures and in the item A session's own
+   modes_prefix/postfix_512_104.json captures, NOT a frame-size effect
+   (all three modes byte-identical at the short-prompt config across both
+   frame sizes).
+2. Twice under mixed masked+plain load, the scheduler handed a
+   dense-masked fire into a multi-program batch; the driver's v1 mask
+   scope throws `RetryableLaunchError` ("dense device mask in a
+   multi-program batch requires solo retry", frame.cpp:938-947) but the
+   wave POISONED all lanes instead of retrying solo, and the dead
+   instances leaked pages until later frames hit "exceeds the driver's
+   physical budget ceiling". The same lesson as item B: the invariant
+   lives in a driver throw, and the throw is reachable. Whatever admission
+   policy item A lands on, this seam needs the item-B treatment first
+   (scheduling decision, not launch-time refusal), plus a working solo
+   retry.
+
+Item B — the `is_pure_decode` hazard — is fixed at admission (this
+branch): a fire carrying an `attn_page_mask`-writing program throws
+mid-body if the fire is not pure decode (llama_like.cpp ~:1040), and no
+scheduler predicate separated prefill from quest-class decode.
+`ProgramFacts::page_mask_sink` is derived at registration,
+`PendingRequest::page_mask_program` is stamped at admission, and
+`LaunchGrouping::accepts` refuses (defers, order-independently) any
+page-mask + multi-token mix. Hook programs without the sink (snapkv
+prefill capture) stay freely mixable.

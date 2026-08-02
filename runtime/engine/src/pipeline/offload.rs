@@ -1741,6 +1741,7 @@ mod tests {
             has_attn_page_mask: false,
             has_lora: false,
             has_kv_envelopes: false,
+            model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             device_geometry_port_mask: 0,
             max_forward_tokens: 128,
             max_forward_requests: 8,
@@ -1834,6 +1835,7 @@ mod tests {
                     max_page_refs: 128,
                 },
                 device_geometry_port_mask: 0,
+                model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             },
             crate::driver::DriverBackend::Remote(remote),
         );
@@ -1967,6 +1969,7 @@ mod tests {
                     max_page_refs: 128,
                 },
                 device_geometry_port_mask: 0,
+                model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             },
             crate::driver::DriverBackend::Remote(remote),
         );

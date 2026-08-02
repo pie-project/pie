@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/imodel.hpp"
+#include "model/qwen3_5/declared_facts.hpp"
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
 
@@ -36,6 +37,12 @@ public:
     ModelCapabilities capabilities() const override { return caps_; }
     std::uint32_t graph_layout() override;
 
+    // The validated declared plan (empty → nullptr), for the load-time
+    // capability site summary (imodel.hpp).
+    const pie_forward::ForwardPlan* declared_plan() const override {
+        return declared_ ? &declared_.plan : nullptr;
+    }
+
     // Qwen3.5's linear-attention layers need extra per-fire scratch
     // (mixed_qkv/conv/gating buffers) on top of the universal `Workspace`
     // formula, sized by the model's own runtime tp_size.
@@ -64,6 +71,12 @@ private:
     KvCache& kv_cache_;
     Qwen3_5ForwardCfg fwd_cfg_;
     ModelCapabilities caps_;
+    // The declared executor's plan (declared_facts.hpp): traced +
+    // structurally validated at construction when PIE_DECLARED_FORWARD
+    // opted in. Arc 2 consumes it in body() on eligible PURE-DECODE fires
+    // (declared_forward.hpp's slice); every other fire falls back to the
+    // hand-written path with the reason trace-logged.
+    Qwen35DeclaredPlan declared_;
 };
 
 }  // namespace pie_cuda_driver::model

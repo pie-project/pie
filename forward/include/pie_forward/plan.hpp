@@ -64,7 +64,7 @@ class ForwardPlan {
         pie_forward_release(&plan_);
     }
 
-    /// Trace the llama_like family. The only way in, mirroring
+    /// Trace the llama_like family. Mirroring
     /// `pie_loader::LoadPlan::compile`: the facts are the whole request, and
     /// none of them is a model's name.
     static ForwardPlan trace_llama_like(const PieForwardLlamaLikeFacts& facts) {
@@ -73,6 +73,108 @@ class ForwardPlan {
         if (status != PieForwardStatus::Ok) {
             throw std::runtime_error(
                 "forward plan: trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
+    /// Trace the LOWERED llama_like — the same text, with the CUDA backend
+    /// facts and a fire class in hand, so the class arms run and the
+    /// traced form STATES its kernels as `Launch` ops (north-star-dsl.md).
+    /// Call once per class the deployment fires; the semantic trace above
+    /// remains the parity reference.
+    static ForwardPlan trace_llama_like_cuda(
+        const PieForwardLlamaLikeFacts& facts,
+        const PieForwardLlamaLikeCudaFacts& cuda,
+        PieForwardFireClass fire_class) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_llama_like_cuda(
+            &facts, &cuda, static_cast<std::uint32_t>(fire_class), &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: lowered trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
+    /// Trace the qwen3_5_moe MoE MLP-block FRAGMENT — the first traced form
+    /// carrying `dyn` ops (`TopK`, selector-carrying `Matmul`s,
+    /// `WeightedSum`, `SigmoidGateAdd`).
+    ///
+    /// This wrapper exposes the plan; the declared EXECUTORS do not consume
+    /// it. Feeding a dyn trace to either emitter throws rather than
+    /// half-emitting: their op-kind switches end in a loud default arm
+    /// ("op kind N has no emission rule" — the CUDA executor's
+    /// `declared_forward.cpp`, the Metal DAG builder's `declared_dag.hpp`,
+    /// which also refuses the MoE weight names before ever reaching a dyn
+    /// kind; `driver/metal/tests/llama_like_declared_dag_test.cpp` pins the
+    /// refusal). Emitting the grouped-GEMM lowering is a later, much larger
+    /// lift.
+    static ForwardPlan trace_qwen3_5_moe_mlp(const PieForwardQwen35MoeMlpFacts& facts) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_moe_mlp(&facts, &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: moe mlp trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
+    /// Trace the qwen3_5 GDN linear-attention block FRAGMENT — the traced
+    /// form carrying the GDN kinds (`SplitGdn`, `CausalConv1d`, `GdnPrep`,
+    /// `GatedDelta`, `RmsnormGated`) and the first ops addressing
+    /// PER-REQUEST state (the conv/recurrent slabs, implicit behind the
+    /// state ops' layer param exactly as the KV cache is behind
+    /// `KvAppend`'s).
+    ///
+    /// Like the MoE fragment above, this wrapper exposes the plan; the
+    /// declared EXECUTORS do not consume it — both emitters' op-kind
+    /// switches end in the loud default arm, and the Metal DAG builder
+    /// refuses the GDN weight names before ever reaching a GDN kind
+    /// (`driver/metal/tests/llama_like_declared_dag_test.cpp` pins both
+    /// refusals). Emitting the GDN core is the driver-side rung, not this
+    /// one.
+    static ForwardPlan trace_qwen3_5_gdn(const PieForwardQwen35GdnFacts& facts) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_gdn(&facts, &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: gdn trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
+    /// Trace the qwen3_5 FULL-attention block FRAGMENT — the traced form
+    /// carrying the gated-attention kinds (`SplitQGate`, `SigmoidGateMul`)
+    /// plus the partial `Rope` (param1 = rotary width) and the Gemma-fold
+    /// `RmsnormPerHead` (param1 = variant), with `KvAppend`/`Attention`
+    /// marking the layer's KV cache exactly as llama_like's do.
+    ///
+    /// Like the fragments above, this wrapper exposes the plan; the
+    /// declared EXECUTORS do not consume it — both emitters' op-kind
+    /// switches end in the loud default arm on the appended kinds
+    /// (`driver/metal/tests/llama_like_declared_dag_test.cpp` pins the
+    /// refusal). Emitting the gated attention is a driver-side rung.
+    static ForwardPlan trace_qwen3_5_full_attn(const PieForwardQwen35FullAttnFacts& facts) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_full_attn(&facts, &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: full attn trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
+    /// Trace the full qwen3_5 HYBRID model — embed → per-layer {GDN or
+    /// full attention on the checkpoint's schedule; dense or MoE MLP} →
+    /// final norm → lm_head. Composes every fragment vocabulary, so the
+    /// declared executors refuse it loudly; the wrapper serves the
+    /// toolchain side (planning, tests, cross-language pinning).
+    static ForwardPlan trace_qwen3_5_hybrid(const PieForwardQwen35HybridFacts& facts) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_hybrid(&facts, &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: hybrid trace failed (" + status_name(status) + ")");
         }
         return ForwardPlan(raw);
     }
@@ -102,6 +204,9 @@ class ForwardPlan {
 
     IdSpan inputs(const PieForwardOp& op) const { return ids(op.inputs); }
     IdSpan outputs(const PieForwardOp& op) const { return ids(op.outputs); }
+    /// `Launch` only: the weight names the stated kernel consumes, as NAME
+    /// indices (resolve each with [`name`]), in signature order.
+    IdSpan aux_names(const PieForwardOp& op) const { return ids(op.aux_names); }
 
     /// A name-table entry as a view into the plan's blob; valid for the
     /// plan's lifetime (the strings are not NUL-terminated — see

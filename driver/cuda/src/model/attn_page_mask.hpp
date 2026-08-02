@@ -55,12 +55,42 @@ struct AttentionMaskSink {
 };
 
 struct StageHooks;
+class HookSidebandArena;
+struct AttentionObservation;
+
+/// Stage 6 increment 4 — the hook-graph prepare pass's fire-level view of the
+/// page-mask sideband. A captured hook body bakes the mask buffers' addresses
+/// (the PTIR sink kernel's destination rows, the seeding memset, the
+/// compaction kernel's outputs the attention then reads), so the prepare pass
+/// must know — before the body constructs its `FirePageMask` — exactly where
+/// the arena's mask slot will carve them, and must pre-grow the slot so no
+/// growth (a stream-synced free+realloc) can happen inside a captured region.
+/// Mirrors `FirePageMask`'s constructor byte-for-byte via a shared layout
+/// function; enqueues no stream work and holds no slot.
+struct PageMaskCapturePlan {
+    bool ok = false;
+    std::uint8_t* keep = nullptr;
+    std::uint32_t num_requests = 0;
+    std::uint32_t stride = 0;
+    const std::uint32_t* out_indices = nullptr;
+    const std::uint32_t* out_indptr = nullptr;
+    const std::uint32_t* out_last_lens = nullptr;
+};
+
+PageMaskCapturePlan prepare_page_mask_capture(
+    HookSidebandArena* arena,
+    const AttentionObservation& observation,
+    cudaStream_t stream);
 
 /// Fire-scoped owner of the page mask and of the compacted CSR it produces.
 ///
 /// One instance brackets the whole layer loop: the keep buffer and the
-/// compaction outputs are allocated once and reused by every layer, because the
-/// page geometry is a property of the fire, not of the layer.
+/// compaction outputs are acquired once and reused by every layer, because the
+/// page geometry is a property of the fire, not of the layer. The bytes come
+/// from the fire's `HookSidebandArena` mask slot (via `hooks`), so across
+/// fires there is no allocation at all once the arena has grown to the
+/// workload's max — and the addresses stay stable while it suffices, the
+/// increment-4 graph-capture precondition (hook_sideband_arena.hpp).
 ///
 /// Usage per layer:
 ///
@@ -114,10 +144,12 @@ class FirePageMask {
     std::uint32_t* out_indices_ = nullptr;
     std::uint32_t* out_indptr_ = nullptr;
     std::uint32_t* out_last_lens_ = nullptr;
-    // Scratch for the compaction's per-request survivor counts. Allocated once
+    // Scratch for the compaction's per-request survivor counts. Acquired once
     // per fire and reused by all 28-odd layers, rather than once per layer.
     std::uint32_t* counts_ = nullptr;
-    cudaStream_t stream_ = nullptr;
+    // The arena the mask slot was acquired from; null when the fire wants no
+    // mask. Released (not freed) in the destructor.
+    HookSidebandArena* arena_ = nullptr;
     bool active_ = false;
 };
 

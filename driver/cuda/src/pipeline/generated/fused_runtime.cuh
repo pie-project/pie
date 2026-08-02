@@ -413,6 +413,195 @@ inline void PersistentDeviceLease::reset() noexcept {
     }
 }
 
+// Stable per-stage staging for the prepared execution path
+// (`prepare_generated_stage` / `launch_generated_stage`): ONE pinned host
+// block and ONE device metadata+scratch pair per (stage runtime id, stream),
+// grow-only and generation-counted. This is the same shape as
+// `model::HookSidebandArena` (driver/cuda/src/model/hook_sideband_arena.hpp),
+// the sibling precedent for graph-capture-ready storage: while capacity
+// suffices, the addresses handed out are STABLE across fires; a growth moves
+// a block and bumps `generation()`, and anything that baked the addresses (a
+// future captured graph — stage6-plan.md increment 1) must treat a
+// generation change as invalidation. Like the arena, this is confined to the
+// single submitting thread of its stream; nothing here is thread-safe.
+//
+// Why ONE buffer, with no ring and no ring wait, is enough on the
+// attention-phase path (ON_ATTN_PROJ / ON_ATTN): a given stage id fires once
+// per model layer, and layers run SEQUENTIALLY on one stream. On the device
+// side that is the whole argument — occurrence N+1's H2D metadata copy and
+// every kernel reading the block are enqueued on the same stream after
+// occurrence N's launches, so stream order alone keeps the overwrite
+// unobservable. On the host side, the pinned block is repacked no earlier
+// than occurrence N+1's prepare, by which point occurrence N's copy —
+// enqueued a full model layer of stream work earlier — has normally
+// retired. "Normally" is not "always": across a FIRE boundary the submitter
+// can be a whole fire ahead of the GPU (measured live: a handful of stalls
+// per run, at the first hook occurrence after a prefill), so `pinned()`
+// keeps a `copy_done_` event that it QUERIES — no wait on the steady
+// per-layer path — and only when the previous copy is genuinely still in
+// flight does it synchronize, with a warning, instead of letting the
+// in-flight DMA read a half-repacked block. That residual wait lives in
+// PREPARE, which stays outside any captured region, so it is capture-legal;
+// what this path removes is the rotating rings' unconditional
+// `cudaEventSynchronize` on slot reuse (`PinnedUploadStaging::acquire`,
+// `PersistentDeviceWorkspace::try_acquire`) that sat where the body — the
+// captured half — runs.
+class StableStageBuffers {
+  public:
+    StableStageBuffers() = default;
+    StableStageBuffers(const StableStageBuffers&) = delete;
+    StableStageBuffers& operator=(const StableStageBuffers&) = delete;
+
+    ~StableStageBuffers() {
+        if (copy_pending_ && copy_done_ != nullptr) {
+            cudaEventSynchronize(copy_done_);
+        }
+        if (copy_done_ != nullptr) cudaEventDestroy(copy_done_);
+        if (pinned_ != nullptr) cudaFreeHost(pinned_);
+        // Blocks superseded by growth, parked until destruction. Their
+        // uploads were enqueued before the event synchronized above on the
+        // same stream, so they have retired by now.
+        for (std::uint8_t* block : retired_pinned_) {
+            if (block != nullptr) cudaFreeHost(block);
+        }
+        if (metadata_ != nullptr) cudaFree(metadata_);
+        if (scratch_ != nullptr) cudaFree(scratch_);
+        if (side_ != nullptr) cudaFree(side_);
+    }
+
+    // The pinned staging block, safe for the host to repack.
+    std::uint8_t* pinned(std::size_t bytes) {
+        if (bytes > pinned_capacity_) {
+            // Same discipline as PinnedUploadStaging::acquire: growth never
+            // calls cudaFreeHost on the hot path (it synchronizes the whole
+            // device); the superseded block is parked until destruction —
+            // an in-flight upload keeps reading valid memory — and capacity
+            // grows geometrically so a stage ratchets O(log) times.
+            if (pinned_ != nullptr) {
+                retired_pinned_.push_back(pinned_);
+                pinned_ = nullptr;
+            }
+            const std::size_t grown = std::max(
+                {bytes, pinned_capacity_ * 2, std::size_t{4096}});
+            CUDA_CHECK(cudaMallocHost(
+                reinterpret_cast<void**>(&pinned_), grown));
+            pinned_capacity_ = grown;
+            copy_pending_ = false;
+        } else if (copy_pending_) {
+            copy_pending_ = false;
+            const cudaError_t status = cudaEventQuery(copy_done_);
+            if (status == cudaErrorNotReady) {
+                // Fire-boundary run-ahead (see the class comment): rare,
+                // loud, and correct — never silent DMA corruption.
+                if (pinned_stall_warnings_++ == 0) {
+                    std::fprintf(
+                        stderr,
+                        "[pie-driver-cuda] stable stage staging: previous "
+                        "metadata upload still in flight at repack; "
+                        "synchronizing (submitter ran ahead of a full "
+                        "layer)\n");
+                }
+                CUDA_CHECK(cudaEventSynchronize(copy_done_));
+            } else if (status != cudaSuccess) {
+                CUDA_CHECK(status);
+            }
+        }
+        return pinned_;
+    }
+
+    void record_upload(cudaStream_t stream) {
+        if (copy_done_ == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(
+                &copy_done_, cudaEventDisableTiming));
+        }
+        const cudaError_t status = cudaEventRecord(copy_done_, stream);
+        if (status != cudaSuccess) {
+            cudaStreamSynchronize(stream);
+            CUDA_CHECK(status);
+        }
+        copy_pending_ = true;
+    }
+
+    // The stable device metadata and scratch blocks, grown to fit.
+    std::pair<std::uint8_t*, std::uint8_t*> device_blocks(
+        std::size_t metadata_bytes,
+        std::size_t scratch_bytes,
+        cudaStream_t stream) {
+        grow_device(&metadata_, &metadata_capacity_, metadata_bytes,
+                    stream, "metadata");
+        grow_device(&scratch_, &scratch_capacity_, scratch_bytes,
+                    stream, "scratch");
+        return {metadata_, scratch_};
+    }
+
+    // A stable per-region side-table block (increment 4): per-lane device
+    // tables the region launches take as KERNEL ARGUMENTS (the page-mask
+    // dest table) live here instead of a per-fire cudaMallocAsync, so a
+    // captured launch's baked table address is the address every later
+    // prepare re-uploads into. Same growth discipline (and the same
+    // generation counter) as the metadata/scratch blocks.
+    std::uint8_t* side_block(std::size_t bytes, cudaStream_t stream) {
+        grow_device(&side_, &side_capacity_, bytes, stream, "side");
+        return side_;
+    }
+
+    // Bumped on every device-block growth. See the capture precondition in
+    // the class comment (the HookSidebandArena::generation() contract).
+    std::uint64_t generation() const noexcept { return generation_; }
+
+    std::size_t retained_device_bytes() const noexcept {
+        return metadata_capacity_ + scratch_capacity_;
+    }
+
+  private:
+    void grow_device(
+        std::uint8_t** block,
+        std::size_t* capacity,
+        std::size_t bytes,
+        cudaStream_t stream,
+        const char* what) {
+        if (bytes <= *capacity) return;
+        // Growth path, mirroring HookSidebandArena::acquire: retire
+        // everything in flight that may still read the old block, then
+        // free+realloc. Synchronous and logged because it is meant to be
+        // rare — the steady state is the capacity check above (a stage's
+        // first fire, then never again until its lattice widens).
+        std::size_t grown = std::max<std::size_t>(
+            {bytes, *capacity * 2, std::size_t{4096}});
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (*block != nullptr) {
+            cudaFree(*block);
+            *block = nullptr;
+            *capacity = 0;
+        }
+        void* fresh = nullptr;
+        CUDA_CHECK(cudaMalloc(&fresh, grown));
+        *block = static_cast<std::uint8_t*>(fresh);
+        *capacity = grown;
+        ++generation_;
+        std::fprintf(
+            stderr,
+            "[pie-driver-cuda] generated stable stage %s grew to %zu KiB "
+            "(need %zu B, generation %llu)\n",
+            what, grown >> 10, bytes,
+            static_cast<unsigned long long>(generation_));
+    }
+
+    std::uint8_t* pinned_ = nullptr;
+    std::size_t pinned_capacity_ = 0;
+    std::vector<std::uint8_t*> retired_pinned_;
+    cudaEvent_t copy_done_ = nullptr;
+    bool copy_pending_ = false;
+    std::uint64_t pinned_stall_warnings_ = 0;
+    std::uint8_t* metadata_ = nullptr;
+    std::size_t metadata_capacity_ = 0;
+    std::uint8_t* scratch_ = nullptr;
+    std::size_t scratch_capacity_ = 0;
+    std::uint8_t* side_ = nullptr;
+    std::size_t side_capacity_ = 0;
+    std::uint64_t generation_ = 0;
+};
+
 inline std::size_t align_generated(std::size_t value) {
     return (value + 255) / 256 * 256;
 }
@@ -489,6 +678,22 @@ class GeneratedRuntimeContext {
         return *entry(runtime_id, stream).staging;
     }
 
+    // The prepared path's stable buffers (see detail::StableStageBuffers):
+    // one per (stage runtime id, stream, slot), sized on first use. `slot`
+    // is 0 on the eager per-layer path (one buffer per stage, repacked
+    // between that stage's occurrences). The hook-graph prepare pass
+    // (stage 6 increment 4) instead hands every prepared (phase, layer,
+    // occurrence, group) its own nonzero slot: all of a fire's prepares run
+    // BEFORE the body launches, so occurrence N+1's repack can no longer
+    // hide behind stream order — distinct occurrences need distinct stable
+    // blocks, and a captured graph bakes each block's address per slot.
+    detail::StableStageBuffers& stable_stage_buffers(
+        std::uint64_t runtime_id,
+        cudaStream_t stream,
+        std::uint32_t slot = 0) {
+        return entry(runtime_id, stream, slot).stable;
+    }
+
     std::optional<detail::PersistentDeviceLease> acquire_device_workspace(
         std::uint64_t runtime_id,
         cudaStream_t stream,
@@ -519,13 +724,17 @@ class GeneratedRuntimeContext {
     }
 
   private:
-    static constexpr std::size_t kMaximumEntries = 1024;
+    // Raised 1024 -> 4096 for increment 4: the hook-graph prepare pass keys
+    // stable buffers per (stage, stream, occurrence slot), so one hook-fire
+    // structure contributes O(model layers) entries per attention stage.
+    static constexpr std::size_t kMaximumEntries = 4096;
     static constexpr std::size_t kMaximumRetainedDeviceBytes =
         512ull * 1024ull * 1024ull;
 
     struct Key {
         std::uint64_t runtime_id = 0;
         cudaStream_t stream = nullptr;
+        std::uint32_t slot = 0;
         bool operator==(const Key&) const = default;
     };
 
@@ -536,24 +745,27 @@ class GeneratedRuntimeContext {
             const std::size_t stream =
                 std::hash<const void*>{}(key.stream);
             return runtime ^ (stream + 0x9e3779b9u +
-                              (runtime << 6) + (runtime >> 2));
+                              (runtime << 6) + (runtime >> 2)) ^
+                   (static_cast<std::size_t>(key.slot) * 0x85ebca6bu);
         }
     };
 
     struct Entry {
         std::unique_ptr<detail::PinnedUploadStaging> staging;
         detail::PersistentDeviceWorkspace workspace;
+        detail::StableStageBuffers stable;
         std::uint64_t last_use = 0;
     };
 
     Entry& entry(
         std::uint64_t runtime_id,
-        cudaStream_t stream) {
+        cudaStream_t stream,
+        std::uint32_t slot = 0) {
         if (runtime_id == 0) {
             throw std::runtime_error(
                 "generated executable has no runtime identity");
         }
-        const Key key{runtime_id, stream};
+        const Key key{runtime_id, stream, slot};
         const auto found = entries_.find(key);
         if (found != entries_.end()) {
             found->second.last_use = ++clock_;
@@ -941,12 +1153,234 @@ generated_compact_argmax_value(
     return argmax_value;
 }
 
-inline GroupedLaunchResult run_generated_stage(
+// ---------------------------------------------------------------------------
+// The prepare/body split (stage6-plan.md increment 1).
+//
+// `run_generated_stage` (today the Prologue/Epilogue-only
+// `run_generated_stage_ring`) used to be one eager monolith: per fire it rebuilt
+// the host metadata block, leased rotating pinned/device ring slots (with
+// event waits on slot reuse), uploaded, and launched — the same defect the
+// attention planner had before it was hoisted (batch/forward_graph.hpp:14-24:
+// no host-side work and no event waits may live where a CUDA graph will be
+// captured). The split puts every piece of host work — metadata build,
+// elision analysis, channel-cursor reads, staging pack, async upload,
+// per-region launch-shape resolution and side-table uploads — into
+// `prepare_generated_stage`, and leaves `launch_generated_stage` a body that
+// only issues kernel launches against prepared state. Attention phases now
+// go through this seam exclusively — hoisted to fire level for prepared
+// pure-decode hook fires (eager and graph alike, since the eager-path
+// unification) or called back-to-back at hook time for prepare-vetoed
+// fires; only Prologue/Epilogue still take the ring-backed combined wrapper
+// (`run_generated_stage_ring`).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Lane-grid lattice (stage6-plan.md increment 3 — the capture prerequisite).
+//
+// A captured CUDA graph freezes every kernel's grid dimensions, so any grid
+// derived from the EXACT per-fire lane count would force one graph per lane
+// count. Instead, every lane-derived grid dimension in the body
+// (`launch_generated_stage`) is baked at the lattice ceiling of the fire's
+// lane count, and the LIVE count travels to the device as data: it is
+// `PtirLaneTableHeader::lane_count` in the metadata block that every prepare
+// already re-packs and re-uploads per fire. Idle blocks exit on the guard
+// every kernel on this path already carries as its FIRST action — the
+// grouped kernels (`k_grouped_stage_readiness`, `k_grouped_topk`, the
+// nucleus family in grouped_runtime.cuh), the driver-side region kernels in
+// this file, and the NVRTC-emitted region kernel
+// (compiler/codegen/runtime/cuda/fused_block1.cuh:18-19,
+// `dispatch_lane >= header->lane_count`) all guard before touching any
+// lane-indexed table — so no emitter change and no golden re-bless is
+// needed, and an idle block costs one global read of the header.
+//
+// The ladder is powers of two rather than `forward_graph_request_bucket`'s
+// R lattice (batch/forward_graph.hpp:66: 1,2,4, x8 to 256, then x16). That
+// lattice earns its shape from decode batches in the hundreds, and its
+// "max_requests is a legal bucket" rule needs a planner bound this layer
+// does not have. Lane counts here are the number of programs grouped into
+// one stage fire — tens, not hundreds — so pow2 pads by at most 2x in idle
+// blocks whose whole cost is the guard read, and gives a future capture
+// cache at most ~log2(max lanes) distinct grids per stage.
+constexpr std::uint32_t generated_lane_grid_bucket(
+    std::uint32_t lane_count) noexcept {
+    // 2^31 is the largest u32 power of two; nothing real approaches it
+    // (prepare rejects empty fires and lanes are per-fire programs), but
+    // stay total rather than overflow the shift.
+    if (lane_count > (std::uint32_t{1} << 31)) return lane_count;
+    std::uint32_t bucket = 1;
+    while (bucket < lane_count) bucket <<= 1;
+    return bucket;
+}
+static_assert(generated_lane_grid_bucket(0) == 1);
+static_assert(generated_lane_grid_bucket(1) == 1);
+static_assert(generated_lane_grid_bucket(2) == 2);
+static_assert(generated_lane_grid_bucket(3) == 4);
+static_assert(generated_lane_grid_bucket(4) == 4);
+static_assert(generated_lane_grid_bucket(5) == 8);
+static_assert(generated_lane_grid_bucket(16) == 16);
+static_assert(generated_lane_grid_bucket(17) == 32);
+static_assert(generated_lane_grid_bucket(1000) == 1024);
+
+enum class PreparedBufferMode : std::uint8_t {
+    // Rotating pinned/device rings with event-guarded slot reuse — the
+    // pre-split storage. Still used by the phases that have not migrated to
+    // the prepared path (Prologue / Epilogue this slice).
+    kRotatingRing,
+    // ONE stable pinned block + ONE stable device block per
+    // (stage runtime id, stream) — no rings, no ring waits
+    // (detail::StableStageBuffers). The attention phases run here, and it is
+    // the storage discipline a captured body will replay against.
+    kStablePerStage,
+};
+
+// One region of a prepared stage, resolved to the point where launching it
+// requires no host work: kind, grid geometry, device-side argument tables
+// (already uploaded by prepare), and value indices.
+struct PreparedRegionLaunch {
+    enum class Kind : std::uint8_t {
+        kGenerated,
+        kNucleus,
+        kNucleusScalable,
+        kPageMask,
+        kEnvelopeDot,
+        kScan,
+        kMatmul,
+        kTopK,
+    };
+    Kind kind = Kind::kGenerated;
+    // kGenerated — the NVRTC-compiled region function; every generated
+    // region of a stage shares the prepared argument block.
+    const FusedRegionExecutable* region = nullptr;
+    // kNucleus / kNucleusScalable
+    GroupedNucleusLaunch nucleus{};
+    std::uint32_t nucleus_segments = 0;      // padded lanes * rows (grid)
+    float* partial_maxima = nullptr;         // kNucleusScalable, device
+    float* thread_masses = nullptr;          // kNucleusScalable, device
+    float* probabilities = nullptr;          // kNucleusScalable, device
+    // kPageMask
+    GroupedLanePageMaskDevice* device_dests = nullptr;
+    std::uint8_t mask_dtype = 0;
+    // kEnvelopeDot
+    GroupedLaneEnvelopeDevice* device_envelopes = nullptr;
+    std::uint32_t max_pages = 0;
+    // kScan
+    bool scan_f32 = false;
+    bool scan_product = false;
+    std::uint32_t scan_blocks = 0;           // padded lanes * max_rows (grid)
+    GroupedRowShape shape_a{};               // scan input / matmul left / topk rows
+    GroupedRowShape shape_b{};               // matmul right
+    GroupedDynamicShape dynamic_shape{};     // topk input
+    std::uint32_t value_a = 0;               // input value id
+    std::uint32_t value_b = 0;               // matmul right value id
+    std::uint32_t out_a = 0;                 // result value id
+    std::uint32_t out_b = 0;                 // topk indices value id
+    // kMatmul
+    std::uint32_t matmul_grid = 0;
+    // kTopK
+    std::uint32_t topk_rows = 0;
+    std::uint32_t topk_length = 0;
+    std::uint32_t topk_k = 0;
+    bool topk_is_sort = false;
+    std::uint32_t topk_vocab = 0;
+};
+
+// Everything the body half needs and nothing it must compute: the uploaded
+// metadata block's typed device pointers, the resolved region launches, and
+// the ownership that keeps the fire's transient device tables alive until
+// the caller is past the launches. Heap-owned so the kernel-argument block
+// below has a stable address for cuLaunchKernel (and, later, capture).
+struct GeneratedStagePrepared {
+    explicit GeneratedStagePrepared(cudaStream_t launch_stream)
+        : stream(launch_stream), allocations(launch_stream) {}
+    GeneratedStagePrepared(const GeneratedStagePrepared&) = delete;
+    GeneratedStagePrepared& operator=(const GeneratedStagePrepared&) = delete;
+
+    cudaStream_t stream = nullptr;
+    // Per-fire transient device tables (bf16 row tables, page-mask dests,
+    // envelope tables, nucleus partials). Freed stream-ordered when the
+    // prepared state is destroyed — after the body's launches, exactly where
+    // the combined path freed them. Stable-address versions of these are
+    // stage6-plan.md increment 2 territory.
+    detail::AsyncAllocations allocations;
+    // Ring path only; empty under PreparedBufferMode::kStablePerStage.
+    std::optional<detail::PersistentDeviceLease> device_workspace;
+
+    std::uint32_t lane_count = 0;
+    // The lane-grid lattice ceiling of `lane_count`
+    // (`generated_lane_grid_bucket`). Every lane-derived grid dimension the
+    // body launches is sized by THIS, never by the live count — the live
+    // count reaches the kernels as `device_header->lane_count` and blocks
+    // beyond it guard-exit. This is what lets a captured body replay across
+    // fires whose lane counts share a bucket.
+    std::uint32_t padded_lane_count = 0;
+    std::uint32_t value_count = 0;
+
+    // Typed views into the uploaded device metadata block.
+    PtirLaneTableHeader* device_header = nullptr;
+    PtirLaneRecord* device_lanes = nullptr;
+    PtirLaneChannelSlot* device_channels = nullptr;
+    GroupedReadinessLane* device_readiness = nullptr;
+    std::uint32_t* device_readiness_slots = nullptr;
+    std::uint64_t* device_value_pointers = nullptr;
+    std::uint8_t* device_scratch = nullptr;
+
+    // Channel-ring device state for the readiness kernel.
+    const std::uint8_t* ring_full = nullptr;
+    const std::uint32_t* ring_head = nullptr;
+    const std::uint32_t* ring_tail = nullptr;
+    const std::uint32_t* ring_cap1 = nullptr;
+    std::uint32_t readiness_diagnose = 0;
+
+    // Kernel-argument block for the generated regions. The values live here
+    // so `generated_arguments` points at storage with the prepared state's
+    // lifetime: the body reads only this block, and a captured body can hand
+    // it to cuLaunchKernel unchanged.
+    CUdeviceptr arg_header = 0;
+    CUdeviceptr arg_lanes = 0;
+    CUdeviceptr arg_channels = 0;
+    CUdeviceptr arg_descriptors = 0;
+    CUdeviceptr arg_params = 0;
+    CUdeviceptr arg_offsets = 0;
+    CUdeviceptr arg_scratch = 0;
+    std::uint32_t arg_value_count = 0;
+    std::uint32_t arg_scratch_stride = 0;
+    std::uint32_t arg_temporary_offset = 0;
+    CUdeviceptr arg_pending = 0;
+    CUdeviceptr arg_intrinsic_bases = 0;
+    CUdeviceptr arg_intrinsic_modes = 0;
+    CUdeviceptr arg_intrinsic_widths = 0;
+    CUdeviceptr arg_intrinsic_strides = 0;
+    CUdeviceptr arg_intrinsic_offsets = 0;
+    std::array<void*, 16> generated_arguments{};
+
+    std::vector<PreparedRegionLaunch> regions;
+
+    // Section timing (GroupedExecutionOptions::time_sections).
+    bool timing = false;
+    std::int64_t t_build_us = -1;
+    std::int64_t t_workspace_us = -1;
+    std::int64_t t_upload_us = -1;
+    fire_timing::Clock::time_point section_mark{};
+};
+
+// The prepare half: ALL host work for one stage fire. Builds the lane /
+// channel / readiness / descriptor / intrinsic tables, runs the elision
+// analysis, packs the metadata block into pinned staging and enqueues its
+// upload, uploads every per-region side table, and resolves every region
+// into a `PreparedRegionLaunch`. After this returns, launching the stage
+// touches no host state beyond the returned object.
+inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
     const std::vector<GroupedLaneBinding>& lanes,
     const FusedStageExecutable& executable,
     GeneratedRuntimeContext& runtime,
     cudaStream_t stream,
-    GroupedExecutionOptions options = {}) {
+    GroupedExecutionOptions options = {},
+    PreparedBufferMode buffer_mode = PreparedBufferMode::kRotatingRing,
+    // kStablePerStage only: which stable-buffer slot backs this prepare
+    // (`GeneratedRuntimeContext::stable_stage_buffers`). 0 = the eager
+    // per-layer slot; the hook-graph prepare pass numbers each hoisted
+    // (phase, layer, occurrence, group) distinctly.
+    std::uint32_t stable_slot = 0) {
     if (lanes.empty()) {
         throw std::runtime_error("generated fused launch has no lanes");
     }
@@ -970,7 +1404,12 @@ inline GroupedLaunchResult run_generated_stage(
         static_cast<std::uint32_t>(stage.channel_bindings.size());
     const std::uint32_t value_count =
         static_cast<std::uint32_t>(stage.value_types.size());
-    detail::AsyncAllocations allocations(stream);
+    auto prepared = std::make_unique<GeneratedStagePrepared>(stream);
+    prepared->timing = timing;
+    prepared->lane_count = lane_count;
+    prepared->padded_lane_count = generated_lane_grid_bucket(lane_count);
+    prepared->value_count = value_count;
+    detail::AsyncAllocations& allocations = prepared->allocations;
 
     std::vector<PtirLaneRecord> host_lanes(lane_count);
     std::vector<PtirLaneChannelSlot> host_channels(
@@ -1007,6 +1446,17 @@ inline GroupedLaunchResult run_generated_stage(
             binding.row_valid);
         record.row_valid_offset = binding.row_valid_offset;
         record.reserved0 = 0;
+        // Channel-cursor bake (stage6-plan.md, spike hazard (a)): the
+        // protocol cursors (`expected_head`/`expected_tail`, and the
+        // committed/pending CELL ADDRESSES derived from the live registry
+        // head/tail below) are read HERE, per prepare, and baked into the
+        // prepared metadata. That is already "per replay = per prepare"
+        // semantics: a future captured body replays against the metadata
+        // block this prepare uploads, so it sees the channel view of the
+        // fire being prepared — but ONLY IF prepare runs before every
+        // replay. A replay without a fresh prepare would re-execute a
+        // previous fire's channel view (issue #24's failure class, living
+        // in runtime data where no static_assert can see it).
         for (std::uint32_t local = 0; local < channel_count; ++local) {
             const std::uint32_t dense =
                 binding.plan->channel_bindings[local];
@@ -1620,27 +2070,40 @@ inline GroupedLaunchResult run_generated_stage(
     }
     const std::size_t total_scratch_bytes =
         nucleus_workspace_offset + nucleus_workspace_bytes;
-    std::int64_t t_build_us = -1;
     if (timing) {
         const auto now = fire_timing::Clock::now();
-        t_build_us = fire_timing::duration_us(section_mark, now);
+        prepared->t_build_us =
+            fire_timing::duration_us(section_mark, now);
         section_mark = now;
     }
-    auto device_workspace = runtime.acquire_device_workspace(
-        executable.runtime_id,
-        stream,
-        metadata_bytes,
-        total_scratch_bytes);
     std::uint8_t* device_metadata = nullptr;
-    if (device_workspace.has_value()) {
-        device_metadata = device_workspace->metadata();
-        device_scratch = device_workspace->scratch();
+    detail::StableStageBuffers* stable = nullptr;
+    if (buffer_mode == PreparedBufferMode::kStablePerStage) {
+        // The prepared path: one stable device block per (stage id, stream),
+        // sized on first use, grown (rarely) in place of a ring acquire. No
+        // slot search, no cudaEventQuery, no lease.
+        stable = &runtime.stable_stage_buffers(
+            executable.runtime_id, stream, stable_slot);
+        const auto blocks = stable->device_blocks(
+            metadata_bytes, total_scratch_bytes, stream);
+        device_metadata = blocks.first;
+        device_scratch = blocks.second;
     } else {
-        device_metadata =
-            allocations.allocate<std::uint8_t>(metadata_bytes);
-        device_scratch =
-            allocations.allocate<std::uint8_t>(
-                total_scratch_bytes);
+        prepared->device_workspace = runtime.acquire_device_workspace(
+            executable.runtime_id,
+            stream,
+            metadata_bytes,
+            total_scratch_bytes);
+        if (prepared->device_workspace.has_value()) {
+            device_metadata = prepared->device_workspace->metadata();
+            device_scratch = prepared->device_workspace->scratch();
+        } else {
+            device_metadata =
+                allocations.allocate<std::uint8_t>(metadata_bytes);
+            device_scratch =
+                allocations.allocate<std::uint8_t>(
+                    total_scratch_bytes);
+        }
     }
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
         for (std::uint32_t value = 0; value < value_count; ++value) {
@@ -1652,17 +2115,23 @@ inline GroupedLaunchResult run_generated_stage(
                     host_offsets[value]);
         }
     }
-    std::int64_t t_workspace_us = -1;
     if (timing) {
         const auto now = fire_timing::Clock::now();
-        t_workspace_us = fire_timing::duration_us(section_mark, now);
+        prepared->t_workspace_us =
+            fire_timing::duration_us(section_mark, now);
         section_mark = now;
     }
-    auto& metadata_staging =
-        runtime.metadata_staging(executable.runtime_id, stream);
-    const detail::PinnedUploadLease metadata_lease =
-        metadata_staging.acquire(metadata_bytes);
-    std::uint8_t* host_metadata = metadata_lease.data;
+    std::uint8_t* host_metadata = nullptr;
+    detail::PinnedUploadLease metadata_lease{};
+    detail::PinnedUploadStaging* metadata_staging = nullptr;
+    if (stable != nullptr) {
+        host_metadata = stable->pinned(metadata_bytes);
+    } else {
+        metadata_staging =
+            &runtime.metadata_staging(executable.runtime_id, stream);
+        metadata_lease = metadata_staging->acquire(metadata_bytes);
+        host_metadata = metadata_lease.data;
+    }
     std::memset(host_metadata, 0, metadata_bytes);
     auto pack = [&](const Segment& segment,
                     const void* source) {
@@ -1682,6 +2151,18 @@ inline GroupedLaunchResult run_generated_stage(
     pack(params_segment, host_params.data());
     pack(offsets_segment, host_offsets.data());
     pack(value_pointers_segment, host_value_pointers.data());
+    // pending_flags re-initialization (stage6-plan.md, spike hazard (b)):
+    // the region kernels MUTATE the pending-flag bytes inside the device
+    // metadata block as puts commit, so a "stable metadata buffer" is not
+    // stable across fires for this segment. The fix is structural: every
+    // prepare rebuilds `host_pending` from the fire's own prior-put overlay
+    // (above) and repacks + re-uploads the WHOLE block, pending flags
+    // included. Rebuild-and-repack was chosen over patching from a pristine
+    // template because the block is small (a few KiB), the rebuild shares
+    // this one code path with the ring path (no second template to drift),
+    // and a partial-segment upload would save nothing while splitting one
+    // H2D copy into two. A future captured body therefore relies on prepare
+    // running before EVERY replay — same contract as the channel cursors.
     pack(pending_segment, host_pending.data());
     pack(intrinsic_bases_segment, host_intrinsic_bases.data());
     pack(intrinsic_modes_segment, host_intrinsic_modes.data());
@@ -1694,13 +2175,22 @@ inline GroupedLaunchResult run_generated_stage(
         metadata_bytes,
         cudaMemcpyHostToDevice,
         stream));
-    metadata_staging.record(metadata_lease.slot, stream);
-    std::int64_t t_upload_us = -1;
+    if (stable != nullptr) {
+        stable->record_upload(stream);
+    } else {
+        metadata_staging->record(metadata_lease.slot, stream);
+    }
     if (timing) {
         const auto now = fire_timing::Clock::now();
-        t_upload_us = fire_timing::duration_us(section_mark, now);
+        prepared->t_upload_us =
+            fire_timing::duration_us(section_mark, now);
         section_mark = now;
     }
+    // From here the body half's clock runs: everything below (region
+    // resolution included) was part of the combined function's launch
+    // section, and `launch_generated_stage` measures t_launch_us from this
+    // mark so the section accounting is unchanged by the split.
+    prepared->section_mark = section_mark;
     auto pointer = [&](const Segment& segment) -> std::uint8_t* {
         return segment.bytes == 0
             ? nullptr
@@ -1715,60 +2205,77 @@ inline GroupedLaunchResult run_generated_stage(
     auto* device_channels =
         reinterpret_cast<PtirLaneChannelSlot*>(
             pointer(channels_segment));
-    auto* device_readiness =
-        reinterpret_cast<GroupedReadinessLane*>(
-            pointer(readiness_segment));
-    auto* device_readiness_slots =
-        reinterpret_cast<std::uint32_t*>(
-            pointer(readiness_slots_segment));
-    auto* device_descriptors =
-        reinterpret_cast<GeneratedValueDesc*>(
-            pointer(descriptors_segment));
-    auto* device_params =
-        reinterpret_cast<GeneratedOpParams*>(
-            pointer(params_segment));
-    auto* device_offsets =
-        reinterpret_cast<std::uint32_t*>(
-            pointer(offsets_segment));
     auto* device_value_pointers =
         reinterpret_cast<std::uint64_t*>(
             pointer(value_pointers_segment));
-    auto* device_pending =
-        pointer(pending_segment);
-    auto* device_intrinsic_bases =
-        reinterpret_cast<std::uint64_t*>(
-            pointer(intrinsic_bases_segment));
-    auto* device_intrinsic_modes =
+    prepared->device_header = device_header;
+    prepared->device_lanes = device_lanes;
+    prepared->device_channels = device_channels;
+    prepared->device_readiness =
+        reinterpret_cast<GroupedReadinessLane*>(
+            pointer(readiness_segment));
+    prepared->device_readiness_slots =
         reinterpret_cast<std::uint32_t*>(
-            pointer(intrinsic_modes_segment));
-    auto* device_intrinsic_widths =
-        reinterpret_cast<std::uint32_t*>(
-            pointer(intrinsic_widths_segment));
-    auto* device_intrinsic_strides =
-        reinterpret_cast<std::uint32_t*>(
-            pointer(intrinsic_strides_segment));
-    auto* device_intrinsic_offsets =
-        reinterpret_cast<std::uint32_t*>(
-            pointer(intrinsic_offsets_segment));
+            pointer(readiness_slots_segment));
+    prepared->device_value_pointers = device_value_pointers;
+    prepared->device_scratch = device_scratch;
     ChannelView& group_view = lanes.front().instance->view();
-    k_grouped_stage_readiness<<<
-        (lane_count + 127) / 128, 128, 0, stream>>>(
-        device_header,
-        device_lanes,
-        device_readiness,
-        device_readiness_slots,
-        group_view.d_full(),
-        group_view.d_head(),
-        group_view.d_tail(),
-        group_view.d_cap1(),
-        std::getenv("PIE_DEBUG_PULL_VALIDATE") != nullptr ? 1u : 0u);
-    CUDA_CHECK(cudaGetLastError());
+    prepared->ring_full = group_view.d_full();
+    prepared->ring_head = group_view.d_head();
+    prepared->ring_tail = group_view.d_tail();
+    prepared->ring_cap1 = group_view.d_cap1();
+    prepared->readiness_diagnose =
+        std::getenv("PIE_DEBUG_PULL_VALIDATE") != nullptr ? 1u : 0u;
 
-    GroupedLaunchResult result;
-    std::uint32_t mutable_value_count = value_count;
-    std::uint32_t mutable_scratch_stride =
+    prepared->arg_header =
+        reinterpret_cast<CUdeviceptr>(device_header);
+    prepared->arg_lanes =
+        reinterpret_cast<CUdeviceptr>(device_lanes);
+    prepared->arg_channels =
+        reinterpret_cast<CUdeviceptr>(device_channels);
+    prepared->arg_descriptors =
+        reinterpret_cast<CUdeviceptr>(pointer(descriptors_segment));
+    prepared->arg_params =
+        reinterpret_cast<CUdeviceptr>(pointer(params_segment));
+    prepared->arg_offsets =
+        reinterpret_cast<CUdeviceptr>(pointer(offsets_segment));
+    prepared->arg_scratch =
+        reinterpret_cast<CUdeviceptr>(device_scratch);
+    prepared->arg_value_count = value_count;
+    prepared->arg_scratch_stride =
         static_cast<std::uint32_t>(scratch_stride);
-    std::uint32_t mutable_temporary_offset = temporary_offset;
+    prepared->arg_temporary_offset = temporary_offset;
+    prepared->arg_pending =
+        reinterpret_cast<CUdeviceptr>(pointer(pending_segment));
+    prepared->arg_intrinsic_bases =
+        reinterpret_cast<CUdeviceptr>(pointer(intrinsic_bases_segment));
+    prepared->arg_intrinsic_modes =
+        reinterpret_cast<CUdeviceptr>(pointer(intrinsic_modes_segment));
+    prepared->arg_intrinsic_widths =
+        reinterpret_cast<CUdeviceptr>(pointer(intrinsic_widths_segment));
+    prepared->arg_intrinsic_strides =
+        reinterpret_cast<CUdeviceptr>(pointer(intrinsic_strides_segment));
+    prepared->arg_intrinsic_offsets =
+        reinterpret_cast<CUdeviceptr>(pointer(intrinsic_offsets_segment));
+    prepared->generated_arguments = {
+        &prepared->arg_header,
+        &prepared->arg_lanes,
+        &prepared->arg_channels,
+        &prepared->arg_descriptors,
+        &prepared->arg_params,
+        &prepared->arg_offsets,
+        &prepared->arg_scratch,
+        &prepared->arg_value_count,
+        &prepared->arg_scratch_stride,
+        &prepared->arg_temporary_offset,
+        &prepared->arg_pending,
+        &prepared->arg_intrinsic_bases,
+        &prepared->arg_intrinsic_modes,
+        &prepared->arg_intrinsic_widths,
+        &prepared->arg_intrinsic_strides,
+        &prepared->arg_intrinsic_offsets,
+    };
+
     const auto direct_logits_kind = [&](std::uint32_t value) {
         for (std::size_t depth = 0; depth < 2; ++depth) {
             bool found = false;
@@ -1807,6 +2314,11 @@ inline GroupedLaunchResult run_generated_stage(
         }
         return std::uint8_t{0};
     };
+    // Resolve every region into a host-work-free launch record. This is the
+    // host half of what used to be the launch loop: shape maximization,
+    // library support decisions, side-table builds and their uploads all
+    // happen HERE; the body half only issues the recorded launches.
+    prepared->regions.reserve(executable.regions.size());
     for (std::size_t region_index = 0;
          region_index < executable.regions.size();
          ++region_index) {
@@ -1877,24 +2389,28 @@ inline GroupedLaunchResult run_generated_stage(
                             stage.value_types[launch.logit_scale],
                             launch_shape));
                 }
+                PreparedRegionLaunch record;
+                record.nucleus = launch;
+                // Grid: lane factor at the lattice ceiling (idle lanes
+                // guard-exit on `header->lane_count`); `rows` is the
+                // program's row shape, already maximized over the fire's
+                // lanes above — a data-sized dimension kept exact this
+                // slice (stage6-plan.md increment 3 scopes the lattice to
+                // the lane factor).
+                record.nucleus_segments =
+                    prepared->padded_lane_count * rows;
                 if (grouped_nucleus_library_supported(
                         stage, planned_region)) {
-                    k_grouped_nucleus_sample<<<
-                        lane_count * rows,
-                        kCanonicalReduceWidth,
-                        0,
-                        stream>>>(
-                        device_header,
-                        device_lanes,
-                        device_channels,
-                        nullptr,
-                        nullptr,
-                        device_value_pointers,
-                        value_count,
-                        launch);
-                    CUDA_CHECK(cudaGetLastError());
-                    ++result.body_op_launches;
+                    record.kind = PreparedRegionLaunch::Kind::kNucleus;
                 } else {
+                    record.kind =
+                        PreparedRegionLaunch::Kind::kNucleusScalable;
+                    // Workspace stays sized by the LIVE lane count: the
+                    // padded grid's idle blocks return before touching
+                    // `partial_maxima`/`thread_masses`/`probabilities`, so
+                    // padding the allocations would buy nothing. (These are
+                    // per-fire allocations anyway — stable-address
+                    // workspace is increment 2 territory.)
                     const std::uint32_t segments =
                         lane_count * rows;
                     const std::size_t items =
@@ -1904,67 +2420,21 @@ inline GroupedLaunchResult run_generated_stage(
                         throw std::runtime_error(
                             "generated nucleus workspace is undersized");
                     }
-                    float* probabilities =
+                    record.probabilities =
                         reinterpret_cast<float*>(
                             device_scratch +
                             nucleus_workspace_offset);
                     const std::size_t chunk_count =
                         static_cast<std::size_t>(segments) *
                         kFastNucleusChunks;
-                    float* partial_maxima =
+                    record.partial_maxima =
                         allocations.allocate<float>(
                             chunk_count *
                             (1 + kFastNucleusThreads));
-                    float* thread_masses =
-                        partial_maxima + chunk_count;
-                    k_grouped_nucleus_max_chunks<<<
-                        segments * kFastNucleusChunks,
-                        kFastNucleusThreads,
-                        0,
-                        stream>>>(
-                        device_header,
-                        device_lanes,
-                        nullptr,
-                        nullptr,
-                        device_value_pointers,
-                        value_count,
-                        partial_maxima,
-                        launch);
-                    CUDA_CHECK(cudaGetLastError());
-                    k_grouped_nucleus_weight_chunks<<<
-                        segments * kFastNucleusChunks,
-                        kFastNucleusThreads,
-                        0,
-                        stream>>>(
-                        device_header,
-                        device_lanes,
-                        nullptr,
-                        nullptr,
-                        device_value_pointers,
-                        value_count,
-                        partial_maxima,
-                        probabilities,
-                        thread_masses,
-                        launch);
-                    CUDA_CHECK(cudaGetLastError());
-                    k_grouped_nucleus_inverse_sample<<<
-                        segments,
-                        kFastNucleusThreads,
-                        0,
-                        stream>>>(
-                        device_header,
-                        device_lanes,
-                        device_channels,
-                        device_value_pointers,
-                        value_count,
-                        probabilities,
-                        thread_masses,
-                        launch);
-                    CUDA_CHECK(cudaGetLastError());
-                    result.body_op_launches += 3;
-                    result.large_nucleus_scalable = true;
+                    record.thread_masses =
+                        record.partial_maxima + chunk_count;
                 }
-                result.used_nucleus_library = true;
+                prepared->regions.push_back(record);
                 continue;
             }
             const std::uint32_t node = planned_region.nodes.front();
@@ -2027,46 +2497,42 @@ inline GroupedLaunchResult run_generated_stage(
                     GroupedLanePageMaskDevice* device_dests = nullptr;
                     const std::size_t dest_bytes =
                         host_dests.size() * sizeof(GroupedLanePageMaskDevice);
-                    CUDA_CHECK(cudaMallocAsync(
-                        reinterpret_cast<void**>(&device_dests), dest_bytes,
-                        stream));
-                    allocations.values.push_back(device_dests);
+                    if (stable != nullptr) {
+                        // Stable side table (increment 4): the captured
+                        // launch bakes this address, so it must be the one
+                        // every later prepare re-uploads into. Upload from
+                        // the (stack) host vector is safe: at prepare time
+                        // no capture is active on this stream, and a
+                        // pageable H2D async copy stages synchronously with
+                        // respect to the host source.
+                        device_dests =
+                            reinterpret_cast<GroupedLanePageMaskDevice*>(
+                                stable->side_block(dest_bytes, stream));
+                    } else {
+                        CUDA_CHECK(cudaMallocAsync(
+                            reinterpret_cast<void**>(&device_dests),
+                            dest_bytes, stream));
+                        allocations.values.push_back(device_dests);
+                    }
                     CUDA_CHECK(cudaMemcpyAsync(
                         device_dests, host_dests.data(), dest_bytes,
                         cudaMemcpyHostToDevice, stream));
 
                     const std::uint8_t mask_dtype =
                         stage.value_types[op.args[0]].dtype;
-                    if (mask_dtype == PTIR_DT_F32) {
-                        k_generated_attn_page_mask<float><<<
-                            lane_count, kTier0Block, 0, stream>>>(
-                            device_header, device_lanes, device_dests,
-                            device_value_pointers, value_count, op.args[0]);
-                    } else if (mask_dtype == PTIR_DT_I32) {
-                        k_generated_attn_page_mask<std::int32_t><<<
-                            lane_count, kTier0Block, 0, stream>>>(
-                            device_header, device_lanes, device_dests,
-                            device_value_pointers, value_count, op.args[0]);
-                    } else if (mask_dtype == PTIR_DT_U32) {
-                        k_generated_attn_page_mask<std::uint32_t><<<
-                            lane_count, kTier0Block, 0, stream>>>(
-                            device_header, device_lanes, device_dests,
-                            device_value_pointers, value_count, op.args[0]);
-                    } else if (mask_dtype == PTIR_DT_BOOL) {
-                        // A predicate is what a policy naturally produces
-                        // (`ge(scores, threshold)`), and bool values are stored
-                        // one byte per element here -- so this is the narrow
-                        // instantiation, not a reinterpretation of the u32 one.
-                        k_generated_attn_page_mask<std::uint8_t><<<
-                            lane_count, kTier0Block, 0, stream>>>(
-                            device_header, device_lanes, device_dests,
-                            device_value_pointers, value_count, op.args[0]);
-                    } else {
+                    if (mask_dtype != PTIR_DT_F32 &&
+                        mask_dtype != PTIR_DT_I32 &&
+                        mask_dtype != PTIR_DT_U32 &&
+                        mask_dtype != PTIR_DT_BOOL) {
                         throw std::runtime_error(
                             "attn_page_mask has an unsupported mask dtype");
                     }
-                    CUDA_CHECK(cudaGetLastError());
-                    ++result.body_op_launches;
+                    PreparedRegionLaunch record;
+                    record.kind = PreparedRegionLaunch::Kind::kPageMask;
+                    record.device_dests = device_dests;
+                    record.mask_dtype = mask_dtype;
+                    record.value_a = op.args[0];
+                    prepared->regions.push_back(record);
                     continue;
                 }
                 // `generated_stage_supported` already proved this is
@@ -2119,60 +2585,39 @@ inline GroupedLaunchResult run_generated_stage(
                 CUDA_CHECK(cudaMemcpyAsync(
                     device_envelopes, host_envelopes.data(), envelope_bytes,
                     cudaMemcpyHostToDevice, stream));
-                k_generated_envelope_dot<kTier0Block><<<
-                    lane_count * max_pages,
-                    kTier0Block,
-                    0,
-                    stream>>>(
-                    device_header,
-                    device_lanes,
-                    device_envelopes,
-                    device_value_pointers,
-                    value_count,
-                    bases[node],
-                    max_pages);
-                CUDA_CHECK(cudaGetLastError());
-                ++result.body_op_launches;
+                PreparedRegionLaunch record;
+                record.kind = PreparedRegionLaunch::Kind::kEnvelopeDot;
+                record.device_envelopes = device_envelopes;
+                record.max_pages = max_pages;
+                record.out_a = bases[node];
+                prepared->regions.push_back(record);
                 continue;
             }
             if (planned_region.library_op == PTIR_LIBRARY_SCAN) {
                 const auto shape = grouped_row_shape(
                     stage.value_types[op.args[0]], lanes);
-                const std::uint32_t blocks =
-                    lane_count * shape.max_rows;
-                const bool product = op.tag == PTIR_OP_CUMPROD;
                 const std::uint8_t dtype =
                     stage.value_types[op.args[0]].dtype;
-                if (dtype == PTIR_DT_F32) {
-                    k_generated_scan_f32<<<
-                        blocks, 1, 0, stream>>>(
-                        device_header,
-                        device_lanes,
-                        device_value_pointers,
-                        value_count,
-                        op.args[0],
-                        bases[node],
-                        shape,
-                        product);
-                } else if (
-                    dtype == PTIR_DT_I32 ||
-                    dtype == PTIR_DT_U32) {
-                    k_generated_scan_u32<<<
-                        blocks, 1, 0, stream>>>(
-                        device_header,
-                        device_lanes,
-                        device_value_pointers,
-                        value_count,
-                        op.args[0],
-                        bases[node],
-                        shape,
-                        product);
-                } else {
+                if (dtype != PTIR_DT_F32 &&
+                    dtype != PTIR_DT_I32 &&
+                    dtype != PTIR_DT_U32) {
                     throw std::runtime_error(
                         "generated scan library has an invalid dtype");
                 }
-                CUDA_CHECK(cudaGetLastError());
-                ++result.body_op_launches;
+                PreparedRegionLaunch record;
+                record.kind = PreparedRegionLaunch::Kind::kScan;
+                record.scan_f32 = dtype == PTIR_DT_F32;
+                record.scan_product = op.tag == PTIR_OP_CUMPROD;
+                // Lane factor at the lattice ceiling; `max_rows` is the
+                // value's data-sized row bound (max over lanes), kept exact
+                // this slice. Idle blocks guard-exit on
+                // `header->lane_count`.
+                record.scan_blocks =
+                    prepared->padded_lane_count * shape.max_rows;
+                record.shape_a = shape;
+                record.value_a = op.args[0];
+                record.out_a = bases[node];
+                prepared->regions.push_back(record);
                 continue;
             }
             if (planned_region.library_op == PTIR_LIBRARY_MATMUL) {
@@ -2191,25 +2636,26 @@ inline GroupedLaunchResult run_generated_stage(
                     grouped_row_shape(left_type, lanes);
                 const auto right_shape =
                     grouped_row_shape(right_type, lanes);
+                // The matmul kernel is grid-stride: its true bound is
+                // `header->lane_count * per_lane`, computed on the device,
+                // so the grid is only a parallelism cap. Padding the lane
+                // factor keeps the cap a function of the lattice bucket
+                // (surplus blocks find `flat >= total` and fall through);
+                // the row/column factors are data-sized and stay exact
+                // this slice.
                 const std::uint64_t total =
-                    static_cast<std::uint64_t>(lane_count) *
+                    static_cast<std::uint64_t>(
+                        prepared->padded_lane_count) *
                     left_shape.max_rows * right_shape.max_columns;
-                k_generated_matmul_f32<<<
-                    grouped_grid(total),
-                    kTier0Block,
-                    0,
-                    stream>>>(
-                    device_header,
-                    device_lanes,
-                    device_value_pointers,
-                    value_count,
-                    op.args[0],
-                    op.args[1],
-                    bases[node],
-                    left_shape,
-                    right_shape);
-                CUDA_CHECK(cudaGetLastError());
-                ++result.body_op_launches;
+                PreparedRegionLaunch record;
+                record.kind = PreparedRegionLaunch::Kind::kMatmul;
+                record.matmul_grid = grouped_grid(total);
+                record.shape_a = left_shape;
+                record.shape_b = right_shape;
+                record.value_a = op.args[0];
+                record.value_b = op.args[1];
+                record.out_a = bases[node];
+                prepared->regions.push_back(record);
                 continue;
             }
             if (planned_region.library_op == PTIR_LIBRARY_TOP_K ||
@@ -2235,112 +2681,359 @@ inline GroupedLaunchResult run_generated_stage(
                     : op.imm;
                 const auto input_shape =
                     grouped_dynamic_shape(input_type, lanes);
-                k_grouped_topk<<<
-                    lane_count * rows,
-                    kTier0Block,
-                    0,
-                    stream>>>(
-                    device_header,
-                    device_lanes,
-                    nullptr,
-                    nullptr,
-                    device_value_pointers,
-                    value_count,
-                    op.args[0],
-                    bases[node],
-                    bases[node] + 1,
-                    rows,
-                    length,
-                    k,
-                    planned_region.library_op == PTIR_LIBRARY_SORT,
-                    input_shape,
-                    input_row_shape,
-                    launch_shape.vocab,
-                    0);
-                CUDA_CHECK(cudaGetLastError());
-                result.used_selection_library = true;
-                ++result.body_op_launches;
+                PreparedRegionLaunch record;
+                record.kind = PreparedRegionLaunch::Kind::kTopK;
+                record.topk_rows = rows;
+                record.topk_length = length;
+                record.topk_k = k;
+                record.topk_is_sort =
+                    planned_region.library_op == PTIR_LIBRARY_SORT;
+                record.dynamic_shape = input_shape;
+                record.shape_a = input_row_shape;
+                record.topk_vocab = launch_shape.vocab;
+                record.value_a = op.args[0];
+                record.out_a = bases[node];
+                record.out_b = bases[node] + 1;
+                prepared->regions.push_back(record);
                 continue;
             }
             throw std::runtime_error(
                 "registered generated library has no CUDA launcher");
         }
-        const auto& region = executable.regions[region_index];
-        CUdeviceptr header_pointer =
-            reinterpret_cast<CUdeviceptr>(device_header);
-        CUdeviceptr lanes_pointer =
-            reinterpret_cast<CUdeviceptr>(device_lanes);
-        CUdeviceptr channels_pointer =
-            reinterpret_cast<CUdeviceptr>(device_channels);
-        CUdeviceptr descriptors_pointer =
-            reinterpret_cast<CUdeviceptr>(device_descriptors);
-        CUdeviceptr params_pointer =
-            reinterpret_cast<CUdeviceptr>(device_params);
-        CUdeviceptr offsets_pointer =
-            reinterpret_cast<CUdeviceptr>(device_offsets);
-        CUdeviceptr scratch_pointer =
-            reinterpret_cast<CUdeviceptr>(device_scratch);
-        CUdeviceptr pending_pointer =
-            reinterpret_cast<CUdeviceptr>(device_pending);
-        CUdeviceptr bases_pointer =
-            reinterpret_cast<CUdeviceptr>(device_intrinsic_bases);
-        CUdeviceptr modes_pointer =
-            reinterpret_cast<CUdeviceptr>(device_intrinsic_modes);
-        CUdeviceptr widths_pointer =
-            reinterpret_cast<CUdeviceptr>(device_intrinsic_widths);
-        CUdeviceptr strides_pointer =
-            reinterpret_cast<CUdeviceptr>(device_intrinsic_strides);
-        CUdeviceptr intrinsic_offsets_pointer =
-            reinterpret_cast<CUdeviceptr>(device_intrinsic_offsets);
-        void* arguments[] = {
-            &header_pointer,
-            &lanes_pointer,
-            &channels_pointer,
-            &descriptors_pointer,
-            &params_pointer,
-            &offsets_pointer,
-            &scratch_pointer,
-            &mutable_value_count,
-            &mutable_scratch_stride,
-            &mutable_temporary_offset,
-            &pending_pointer,
-            &bases_pointer,
-            &modes_pointer,
-            &widths_pointer,
-            &strides_pointer,
-            &intrinsic_offsets_pointer,
-        };
-        CUresult launch_status = cuLaunchKernel(
-            region->function,
-            lane_count, 1, 1,
-            static_cast<unsigned>(region->block_threads), 1, 1,
-            0,
-            stream,
-            arguments,
-            nullptr);
-        if (launch_status != CUDA_SUCCESS) {
-            const char* message = nullptr;
-            cuGetErrorString(launch_status, &message);
-            throw std::runtime_error(
-                "generated fused launch failed: " +
-                std::string(
-                    message == nullptr
-                        ? "unknown CUDA driver error"
-                        : message));
+        PreparedRegionLaunch record;
+        record.kind = PreparedRegionLaunch::Kind::kGenerated;
+        record.region = executable.regions[region_index].get();
+        prepared->regions.push_back(record);
+    }
+    return prepared;
+}
+
+// The body half: kernel launches only, reading nothing but prepared state.
+// No host metadata, no allocation, no event wait, no channel-registry read
+// lives here — this is the code a later slice captures into a CUDA graph
+// (batch/forward_graph.hpp:14-24 is the doctrine being applied).
+inline GroupedLaunchResult launch_generated_stage(
+    GeneratedStagePrepared& prepared,
+    // Optional launch-stream override (hook-graph mode, stage 6 increment
+    // 4): the prepare pass runs on the fire's submission stream, but the
+    // body's launches must land on the stream the model body hands the hook
+    // — under capture that is the capture stream. The prepared state itself
+    // is stream-agnostic device data; only the launches move.
+    cudaStream_t stream_override = nullptr) {
+    cudaStream_t stream =
+        stream_override != nullptr ? stream_override : prepared.stream;
+    // Every lane-derived grid below is sized by the lattice bucket, never
+    // the live count (see `generated_lane_grid_bucket`); the live count is
+    // device data (`prepared.device_header->lane_count`) and idle blocks
+    // guard-exit first thing.
+    const std::uint32_t grid_lanes = prepared.padded_lane_count;
+    const std::uint32_t value_count = prepared.value_count;
+    // Readiness under padding (stage6-plan.md increment 3, scope 3): the
+    // grid is a function of the bucket alone, so a captured graph's
+    // readiness node is dimension-stable across fires in the bucket. Its
+    // per-thread guard (`lane >= header->lane_count`,
+    // grouped_runtime.cuh:339) already made the surplus threads inert —
+    // this kernel always over-launched to the 128 ceiling. What padding
+    // does NOT fix is the spike caveat that the kernel evaluates live ring
+    // head/tail state: that stays correct while prepare re-runs before
+    // every launch (this slice is eager), and device-resolving it for
+    // replay is deliberately deferred to the capture slice.
+    k_grouped_stage_readiness<<<
+        (grid_lanes + 127) / 128, 128, 0, stream>>>(
+        prepared.device_header,
+        prepared.device_lanes,
+        prepared.device_readiness,
+        prepared.device_readiness_slots,
+        prepared.ring_full,
+        prepared.ring_head,
+        prepared.ring_tail,
+        prepared.ring_cap1,
+        prepared.readiness_diagnose);
+    CUDA_CHECK(cudaGetLastError());
+
+    GroupedLaunchResult result;
+    for (const PreparedRegionLaunch& region : prepared.regions) {
+        switch (region.kind) {
+            case PreparedRegionLaunch::Kind::kNucleus: {
+                k_grouped_nucleus_sample<<<
+                    region.nucleus_segments,
+                    kCanonicalReduceWidth,
+                    0,
+                    stream>>>(
+                    prepared.device_header,
+                    prepared.device_lanes,
+                    prepared.device_channels,
+                    nullptr,
+                    nullptr,
+                    prepared.device_value_pointers,
+                    value_count,
+                    region.nucleus);
+                CUDA_CHECK(cudaGetLastError());
+                ++result.body_op_launches;
+                result.used_nucleus_library = true;
+                break;
+            }
+            case PreparedRegionLaunch::Kind::kNucleusScalable: {
+                const std::uint32_t segments = region.nucleus_segments;
+                k_grouped_nucleus_max_chunks<<<
+                    segments * kFastNucleusChunks,
+                    kFastNucleusThreads,
+                    0,
+                    stream>>>(
+                    prepared.device_header,
+                    prepared.device_lanes,
+                    nullptr,
+                    nullptr,
+                    prepared.device_value_pointers,
+                    value_count,
+                    region.partial_maxima,
+                    region.nucleus);
+                CUDA_CHECK(cudaGetLastError());
+                k_grouped_nucleus_weight_chunks<<<
+                    segments * kFastNucleusChunks,
+                    kFastNucleusThreads,
+                    0,
+                    stream>>>(
+                    prepared.device_header,
+                    prepared.device_lanes,
+                    nullptr,
+                    nullptr,
+                    prepared.device_value_pointers,
+                    value_count,
+                    region.partial_maxima,
+                    region.probabilities,
+                    region.thread_masses,
+                    region.nucleus);
+                CUDA_CHECK(cudaGetLastError());
+                k_grouped_nucleus_inverse_sample<<<
+                    segments,
+                    kFastNucleusThreads,
+                    0,
+                    stream>>>(
+                    prepared.device_header,
+                    prepared.device_lanes,
+                    prepared.device_channels,
+                    prepared.device_value_pointers,
+                    value_count,
+                    region.probabilities,
+                    region.thread_masses,
+                    region.nucleus);
+                CUDA_CHECK(cudaGetLastError());
+                result.body_op_launches += 3;
+                result.large_nucleus_scalable = true;
+                result.used_nucleus_library = true;
+                break;
+            }
+            case PreparedRegionLaunch::Kind::kPageMask: {
+                // One block per PADDED lane; the per-lane dest table is
+                // live-sized, but the kernel guards `lane >=
+                // header->lane_count` before reading `dests[lane]`.
+                if (region.mask_dtype == PTIR_DT_F32) {
+                    k_generated_attn_page_mask<float><<<
+                        grid_lanes, kTier0Block, 0, stream>>>(
+                        prepared.device_header, prepared.device_lanes,
+                        region.device_dests,
+                        prepared.device_value_pointers, value_count,
+                        region.value_a);
+                } else if (region.mask_dtype == PTIR_DT_I32) {
+                    k_generated_attn_page_mask<std::int32_t><<<
+                        grid_lanes, kTier0Block, 0, stream>>>(
+                        prepared.device_header, prepared.device_lanes,
+                        region.device_dests,
+                        prepared.device_value_pointers, value_count,
+                        region.value_a);
+                } else if (region.mask_dtype == PTIR_DT_U32) {
+                    k_generated_attn_page_mask<std::uint32_t><<<
+                        grid_lanes, kTier0Block, 0, stream>>>(
+                        prepared.device_header, prepared.device_lanes,
+                        region.device_dests,
+                        prepared.device_value_pointers, value_count,
+                        region.value_a);
+                } else {
+                    // A predicate is what a policy naturally produces
+                    // (`ge(scores, threshold)`), and bool values are stored
+                    // one byte per element here -- so this is the narrow
+                    // instantiation, not a reinterpretation of the u32 one.
+                    // (Prepare already refused every other dtype.)
+                    k_generated_attn_page_mask<std::uint8_t><<<
+                        grid_lanes, kTier0Block, 0, stream>>>(
+                        prepared.device_header, prepared.device_lanes,
+                        region.device_dests,
+                        prepared.device_value_pointers, value_count,
+                        region.value_a);
+                }
+                CUDA_CHECK(cudaGetLastError());
+                ++result.body_op_launches;
+                break;
+            }
+            case PreparedRegionLaunch::Kind::kEnvelopeDot: {
+                // Lane factor padded; `max_pages` is the program-declared
+                // page-slot bound (data-sized), kept exact this slice —
+                // padding it would multiply idle blocks by the page count
+                // for a dimension the future capture key can carry
+                // exactly. Idle lanes guard-exit before reading
+                // `envelopes[lane]` (live-sized table).
+                k_generated_envelope_dot<kTier0Block><<<
+                    grid_lanes * region.max_pages,
+                    kTier0Block,
+                    0,
+                    stream>>>(
+                    prepared.device_header,
+                    prepared.device_lanes,
+                    region.device_envelopes,
+                    prepared.device_value_pointers,
+                    value_count,
+                    region.out_a,
+                    region.max_pages);
+                CUDA_CHECK(cudaGetLastError());
+                ++result.body_op_launches;
+                break;
+            }
+            case PreparedRegionLaunch::Kind::kScan: {
+                if (region.scan_f32) {
+                    k_generated_scan_f32<<<
+                        region.scan_blocks, 1, 0, stream>>>(
+                        prepared.device_header,
+                        prepared.device_lanes,
+                        prepared.device_value_pointers,
+                        value_count,
+                        region.value_a,
+                        region.out_a,
+                        region.shape_a,
+                        region.scan_product);
+                } else {
+                    k_generated_scan_u32<<<
+                        region.scan_blocks, 1, 0, stream>>>(
+                        prepared.device_header,
+                        prepared.device_lanes,
+                        prepared.device_value_pointers,
+                        value_count,
+                        region.value_a,
+                        region.out_a,
+                        region.shape_a,
+                        region.scan_product);
+                }
+                CUDA_CHECK(cudaGetLastError());
+                ++result.body_op_launches;
+                break;
+            }
+            case PreparedRegionLaunch::Kind::kMatmul: {
+                k_generated_matmul_f32<<<
+                    region.matmul_grid,
+                    kTier0Block,
+                    0,
+                    stream>>>(
+                    prepared.device_header,
+                    prepared.device_lanes,
+                    prepared.device_value_pointers,
+                    value_count,
+                    region.value_a,
+                    region.value_b,
+                    region.out_a,
+                    region.shape_a,
+                    region.shape_b);
+                CUDA_CHECK(cudaGetLastError());
+                ++result.body_op_launches;
+                break;
+            }
+            case PreparedRegionLaunch::Kind::kTopK: {
+                // Lane factor padded; `topk_rows` is the program's row
+                // bound (data-sized), kept exact this slice. Idle lanes
+                // guard-exit (`k_grouped_topk` reads `header->lane_count`
+                // before any lane table).
+                k_grouped_topk<<<
+                    grid_lanes * region.topk_rows,
+                    kTier0Block,
+                    0,
+                    stream>>>(
+                    prepared.device_header,
+                    prepared.device_lanes,
+                    nullptr,
+                    nullptr,
+                    prepared.device_value_pointers,
+                    value_count,
+                    region.value_a,
+                    region.out_a,
+                    region.out_b,
+                    region.topk_rows,
+                    region.topk_length,
+                    region.topk_k,
+                    region.topk_is_sort,
+                    region.dynamic_shape,
+                    region.shape_a,
+                    region.topk_vocab,
+                    0);
+                CUDA_CHECK(cudaGetLastError());
+                result.used_selection_library = true;
+                ++result.body_op_launches;
+                break;
+            }
+            case PreparedRegionLaunch::Kind::kGenerated: {
+                // One block per PADDED lane. The NVRTC-emitted region
+                // kernel's first act is the guard
+                // (`dispatch_lane >= header->lane_count`,
+                // compiler/codegen/runtime/cuda/fused_block1.cuh:18-19),
+                // so idle blocks exit before touching any lane table.
+                const CUresult launch_status = cuLaunchKernel(
+                    region.region->function,
+                    grid_lanes, 1, 1,
+                    static_cast<unsigned>(
+                        region.region->block_threads), 1, 1,
+                    0,
+                    stream,
+                    prepared.generated_arguments.data(),
+                    nullptr);
+                if (launch_status != CUDA_SUCCESS) {
+                    const char* message = nullptr;
+                    cuGetErrorString(launch_status, &message);
+                    throw std::runtime_error(
+                        "generated fused launch failed: " +
+                        std::string(
+                            message == nullptr
+                                ? "unknown CUDA driver error"
+                                : message));
+                }
+                ++result.body_op_launches;
+                break;
+            }
         }
-        ++result.body_op_launches;
     }
-    if (device_workspace.has_value()) {
-        device_workspace->record();
+    if (prepared.device_workspace.has_value()) {
+        prepared.device_workspace->record();
     }
-    if (timing) {
-        result.t_build_us = t_build_us;
-        result.t_workspace_us = t_workspace_us;
-        result.t_upload_us = t_upload_us;
+    if (prepared.timing) {
+        result.t_build_us = prepared.t_build_us;
+        result.t_workspace_us = prepared.t_workspace_us;
+        result.t_upload_us = prepared.t_upload_us;
         result.t_launch_us = fire_timing::duration_us(
-            section_mark, fire_timing::Clock::now());
+            prepared.section_mark, fire_timing::Clock::now());
     }
     return result;
+}
+
+// The ring-backed combined path: prepare + launch back-to-back on the
+// rotating rings — byte-for-byte the pre-split behavior. Prologue/Epilogue
+// ONLY: since the eager-path unification, every attention-phase execution
+// (eager or graph, fire-level or veto-fallback) goes through
+// `prepare_generated_stage`(kStablePerStage) + `launch_generated_stage`
+// instead; nothing else may take this wrapper.
+// TODO(stage6-plan.md increment 1): migrate the remaining phases onto the
+// prepared kStablePerStage path and retire the rotating rings entirely.
+inline GroupedLaunchResult run_generated_stage_ring(
+    const std::vector<GroupedLaneBinding>& lanes,
+    const FusedStageExecutable& executable,
+    GeneratedRuntimeContext& runtime,
+    cudaStream_t stream,
+    GroupedExecutionOptions options = {}) {
+    const std::unique_ptr<GeneratedStagePrepared> prepared =
+        prepare_generated_stage(
+            lanes,
+            executable,
+            runtime,
+            stream,
+            options,
+            PreparedBufferMode::kRotatingRing);
+    return launch_generated_stage(*prepared);
 }
 
 }  // namespace pie_cuda_driver::pipeline::generated

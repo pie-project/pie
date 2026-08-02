@@ -8,11 +8,18 @@
 
 use super::arena::{self, view};
 use super::entry::{
-    PieForwardLlamaLikeFacts, PieForwardStatus, pie_forward_release, pie_forward_trace_llama_like,
+    PieForwardLlamaLikeCudaFacts, PieForwardLlamaLikeFacts, PieForwardQwen35FullAttnFacts,
+    PieForwardQwen35GdnFacts, PieForwardQwen35HybridFacts, PieForwardQwen35MoeMlpFacts,
+    PieForwardStatus, pie_forward_release, pie_forward_trace_llama_like,
+    pie_forward_trace_llama_like_cuda, pie_forward_trace_qwen3_5_full_attn,
+    pie_forward_trace_qwen3_5_gdn, pie_forward_trace_qwen3_5_hybrid,
+    pie_forward_trace_qwen3_5_moe_mlp,
 };
 use super::types::*;
-use crate::facts::LlamaLikeFacts;
-use crate::family::llama_like;
+use crate::facts::{
+    LlamaLikeFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
+};
+use crate::family::{llama_like, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_moe_mlp_block};
 use crate::trace::OpKind;
 
 /// The qwen3 parity facts, as a C caller would state them.
@@ -28,7 +35,8 @@ fn c_facts_qwen3() -> PieForwardLlamaLikeFacts {
         vocab: facts.vocab,
         rope: PieForwardRopeKind::from(facts.rope) as u32,
         norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
-        qk_norm: u8::from(facts.qk_norm),
+        norm_placement: PieForwardNormPlacement::from(facts.norm_placement) as u32,
+        qk_norm: PieForwardQkNorm::from(facts.qk_norm) as u32,
         fused_qkv: u8::from(facts.fused_qkv),
         tied_embeddings: u8::from(facts.tied_embeddings),
     }
@@ -49,17 +57,37 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::Attention { .. } => PieForwardOpKind::Attention,
         OpKind::Swiglu { .. } => PieForwardOpKind::Swiglu,
         OpKind::LmHead { .. } => PieForwardOpKind::LmHead,
+        OpKind::ResidualAdd => PieForwardOpKind::ResidualAdd,
+        OpKind::TopK { .. } => PieForwardOpKind::TopK,
+        OpKind::WeightedSum { .. } => PieForwardOpKind::WeightedSum,
+        OpKind::SigmoidGateAdd => PieForwardOpKind::SigmoidGateAdd,
+        OpKind::SplitGdn { .. } => PieForwardOpKind::SplitGdn,
+        OpKind::CausalConv1d { .. } => PieForwardOpKind::CausalConv1d,
+        OpKind::GdnPrep { .. } => PieForwardOpKind::GdnPrep,
+        OpKind::GatedDelta { .. } => PieForwardOpKind::GatedDelta,
+        OpKind::RmsnormGated { .. } => PieForwardOpKind::RmsnormGated,
+        OpKind::SplitQGate { .. } => PieForwardOpKind::SplitQGate,
+        OpKind::SigmoidGateMul => PieForwardOpKind::SigmoidGateMul,
+        OpKind::Launch { .. } => PieForwardOpKind::Launch,
+        OpKind::Guard { .. } => PieForwardOpKind::Guard,
     }
 }
 
-/// The weight name each Rust op carries, if any.
+/// The (primary) weight name each Rust op carries, if any. GdnPrep's
+/// second name (dt_bias) crosses as a param0 name index and is asserted
+/// where the GDN fragment is round-tripped.
 fn expect_weight(kind: &OpKind) -> Option<&str> {
     match kind {
         OpKind::Embed { weight }
         | OpKind::Matmul { weight, .. }
         | OpKind::Rmsnorm { weight, .. }
         | OpKind::RmsnormPerHead { weight, .. }
+        | OpKind::CausalConv1d { weight, .. }
+        | OpKind::RmsnormGated { weight }
         | OpKind::LmHead { weight } => Some(weight),
+        OpKind::GdnPrep { a_log, .. } => Some(a_log),
+        // The Launch "weight" slot carries the KERNEL name.
+        OpKind::Launch { kernel, .. } => Some(kernel),
         _ => None,
     }
 }
@@ -195,7 +223,592 @@ fn entry_rejects_out_of_range_enums() {
         unsafe { pie_forward_trace_llama_like(&facts, &mut out) },
         PieForwardStatus::InvalidArgument
     );
+
+    let mut facts = c_facts_qwen3();
+    facts.norm_placement = 2;
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like(&facts, &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
+
+    let mut facts = c_facts_qwen3();
+    facts.qk_norm = 3;
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like(&facts, &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
     assert!(out.owner.is_null());
+}
+
+/// The olmo2 facts cross the boundary: post-norm placement and the global
+/// qk-norm reach the tracer as enum wire values, and the traced form that
+/// comes back is the post-norm walk — ResidualAdd ops present, no beta=1
+/// accumulates, no RmsnormPerHead (the global convention is a plain
+/// Rmsnorm), 16 ops per layer.
+#[test]
+fn entry_honours_post_norm_and_global_qk_norm() {
+    let facts = LlamaLikeFacts::olmo2_1b();
+    let c_facts = PieForwardLlamaLikeFacts {
+        hidden: facts.hidden,
+        layers: facts.layers,
+        q_heads: facts.q_heads,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        intermediate: facts.intermediate,
+        vocab: facts.vocab,
+        rope: PieForwardRopeKind::from(facts.rope) as u32,
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+        norm_placement: PieForwardNormPlacement::from(facts.norm_placement) as u32,
+        qk_norm: PieForwardQkNorm::from(facts.qk_norm) as u32,
+        fused_qkv: u8::from(facts.fused_qkv),
+        tied_embeddings: u8::from(facts.tied_embeddings),
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like(&c_facts, &mut out) },
+        PieForwardStatus::Ok
+    );
+    let ops = view::ops(&out);
+    assert_eq!(ops.len(), 16 * facts.layers as usize + 3);
+    let layer0_adds = ops
+        .iter()
+        .filter(|op| op.layer == 0 && op.kind == PieForwardOpKind::ResidualAdd)
+        .count();
+    assert_eq!(layer0_adds, 2);
+    assert!(
+        !ops.iter()
+            .any(|op| op.kind == PieForwardOpKind::Matmul && op.param0 != 0)
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| op.kind == PieForwardOpKind::RmsnormPerHead)
+    );
+    // ResidualAdd references no weight; its two inputs (normed output,
+    // residual stream) crossed intact.
+    let add = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::ResidualAdd)
+        .unwrap();
+    assert_eq!(add.weight_name, PIE_FORWARD_NO_NAME);
+    assert_eq!(add.inputs.len, 2);
+    unsafe { pie_forward_release(&mut out) };
+}
+
+/// The MoE fragment round-trips: dyn op kinds, the selector field (set on
+/// exactly the two expert matmuls, resting at [`PIE_FORWARD_NO_VALUE`]
+/// everywhere else), the weight TEMPLATE crossing verbatim, the rank-3
+/// route-expanded shapes, and the TopK params.
+#[test]
+fn moe_fragment_round_trips_through_the_arena() {
+    let facts = Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+    let plan = qwen3_5_moe_mlp_block(&facts);
+    let mut pod = arena::build(&plan);
+
+    assert_eq!(view::name(&pod, pod.family), "qwen3_5_moe_mlp_block");
+    let ops = view::ops(&pod);
+    assert_eq!(ops.len(), plan.ops.len());
+    for (rust, c) in plan.ops.iter().zip(ops) {
+        assert_eq!(c.kind, expect_kind(&rust.kind), "kind of {rust:?}");
+        assert_eq!(view::ids(&pod, c.inputs), &rust.inputs[..]);
+        assert_eq!(view::ids(&pod, c.outputs), &rust.outputs[..]);
+        match &rust.kind {
+            OpKind::Matmul {
+                selector: Some(selector),
+                ..
+            } => assert_eq!(c.selector, *selector),
+            _ => assert_eq!(c.selector, PIE_FORWARD_NO_VALUE, "selector of {rust:?}"),
+        }
+    }
+
+    let topk = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::TopK)
+        .unwrap();
+    assert_eq!(topk.param0, facts.top_k);
+    assert_eq!(topk.weight_name, PIE_FORWARD_NO_NAME);
+    let idx_id = view::ids(&pod, topk.outputs)[0];
+    let idx = view::values(&pod)[idx_id as usize];
+    assert_eq!(idx.dtype, PieForwardDType::I32);
+    assert_eq!(idx.rank, 2);
+    assert_eq!(idx.dims[0].kind, PieForwardDimKind::Tokens);
+    assert_eq!(idx.dims[1].value, facts.top_k);
+
+    let grouped: Vec<_> = ops
+        .iter()
+        .filter(|op| op.selector != PIE_FORWARD_NO_VALUE)
+        .collect();
+    assert_eq!(grouped.len(), 2);
+    for op in &grouped {
+        assert_eq!(op.kind, PieForwardOpKind::Matmul);
+        assert_eq!(op.selector, idx_id);
+        // The selector is also the last input — the field states which
+        // input selects, it does not add an operand.
+        assert_eq!(*view::ids(&pod, op.inputs).last().unwrap(), idx_id);
+    }
+    assert_eq!(
+        view::name(&pod, grouped[0].weight_name),
+        "layer.0.expert.{e}.gate_up"
+    );
+    // Rank-3 route-expanded output: [Tokens, k, 2 * Im].
+    let gu_out = view::values(&pod)[view::ids(&pod, grouped[0].outputs)[0] as usize];
+    assert_eq!(gu_out.rank, 3);
+    assert_eq!(gu_out.dims[0].kind, PieForwardDimKind::Tokens);
+    assert_eq!(gu_out.dims[1].value, facts.top_k);
+    assert_eq!(gu_out.dims[2].value, 2 * facts.moe_intermediate);
+
+    let combine = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::WeightedSum)
+        .unwrap();
+    assert_eq!(combine.param0, facts.top_k);
+
+    unsafe { arena::release(&mut pod) };
+}
+
+/// The MoE entry point end to end: C facts in, POD plan out; malformed
+/// requests (bad enum, zero experts/k) answer InvalidArgument.
+#[test]
+fn moe_entry_traces_and_validates() {
+    let facts = Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+    let c_facts = PieForwardQwen35MoeMlpFacts {
+        hidden: facts.hidden,
+        num_experts: facts.num_experts,
+        top_k: facts.top_k,
+        moe_intermediate: facts.moe_intermediate,
+        shared_expert_intermediate: facts.shared_expert_intermediate,
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_moe_mlp(&c_facts, &mut out) },
+        PieForwardStatus::Ok
+    );
+    // The 13-op block `family::tests::moe_block_op_sequence` pins.
+    assert_eq!(out.ops.len, 13);
+    unsafe { pie_forward_release(&mut out) };
+
+    for bad in [
+        PieForwardQwen35MoeMlpFacts {
+            norm_variant: 9,
+            ..c_facts
+        },
+        PieForwardQwen35MoeMlpFacts {
+            num_experts: 0,
+            ..c_facts
+        },
+        PieForwardQwen35MoeMlpFacts { top_k: 0, ..c_facts },
+    ] {
+        assert_eq!(
+            unsafe { pie_forward_trace_qwen3_5_moe_mlp(&bad, &mut out) },
+            PieForwardStatus::InvalidArgument
+        );
+        assert!(out.owner.is_null());
+    }
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_moe_mlp(std::ptr::null(), &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
+}
+
+/// The GDN fragment round-trips: the five appended op kinds, the state
+/// layer + kernel params, GdnPrep's TWO names (a_log in the weight slot,
+/// dt_bias as the param0 name index), the rank-3 f32 prep/core values, and
+/// the five-output prep operand run.
+#[test]
+fn gdn_fragment_round_trips_through_the_arena() {
+    let facts = Qwen35GdnFacts::qwen3_5_0_8b();
+    let plan = qwen3_5_gdn_block(&facts);
+    let mut pod = arena::build(&plan);
+
+    assert_eq!(view::name(&pod, pod.family), "qwen3_5_gdn_block");
+    let ops = view::ops(&pod);
+    assert_eq!(ops.len(), plan.ops.len());
+    for (rust, c) in plan.ops.iter().zip(ops) {
+        assert_eq!(c.kind, expect_kind(&rust.kind), "kind of {rust:?}");
+        assert_eq!(view::ids(&pod, c.inputs), &rust.inputs[..]);
+        assert_eq!(view::ids(&pod, c.outputs), &rust.outputs[..]);
+        assert_eq!(c.selector, PIE_FORWARD_NO_VALUE, "selector of {rust:?}");
+        match expect_weight(&rust.kind) {
+            Some(weight) => assert_eq!(view::name(&pod, c.weight_name), weight),
+            None => assert_eq!(c.weight_name, PIE_FORWARD_NO_NAME),
+        }
+    }
+
+    let conv = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::CausalConv1d)
+        .unwrap();
+    assert_eq!(view::name(&pod, conv.weight_name), "layer.0.conv");
+    assert_eq!(conv.param0, 0); // state layer
+    assert_eq!(conv.param1, facts.conv_kernel);
+
+    // GdnPrep: a_log in the weight slot, dt_bias as a param0 NAME index.
+    let prep = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::GdnPrep)
+        .unwrap();
+    assert_eq!(view::name(&pod, prep.weight_name), "layer.0.a_log");
+    assert_eq!(view::name(&pod, prep.param0), "layer.0.dt_bias");
+    let prep_outs = view::ids(&pod, prep.outputs);
+    assert_eq!(prep_outs.len(), 5);
+    let q = view::values(&pod)[prep_outs[0] as usize];
+    assert_eq!(q.dtype, PieForwardDType::F32);
+    assert_eq!(q.rank, 3);
+    assert_eq!(q.dims[0].kind, PieForwardDimKind::Tokens);
+    assert_eq!(q.dims[1].value, facts.key_heads);
+    assert_eq!(q.dims[2].value, facts.key_head_dim);
+
+    let delta = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::GatedDelta)
+        .unwrap();
+    assert_eq!(delta.param0, 0); // state layer
+    assert_eq!(delta.weight_name, PIE_FORWARD_NO_NAME);
+    assert_eq!(view::ids(&pod, delta.inputs), prep_outs);
+    let core = view::values(&pod)[view::ids(&pod, delta.outputs)[0] as usize];
+    assert_eq!(core.dtype, PieForwardDType::F32);
+    assert_eq!(core.rank, 3);
+    assert_eq!(core.dims[1].value, facts.value_heads);
+    assert_eq!(core.dims[2].value, facts.value_head_dim);
+
+    let gated = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::RmsnormGated)
+        .unwrap();
+    assert_eq!(view::name(&pod, gated.weight_name), "layer.0.gate_norm");
+    let out = view::values(&pod)[view::ids(&pod, gated.outputs)[0] as usize];
+    assert_eq!(out.dtype, PieForwardDType::BF16);
+    assert_eq!(out.rank, 2);
+    assert_eq!(out.dims[1].value, facts.value_width());
+
+    unsafe { arena::release(&mut pod) };
+}
+
+/// The fused in-proj binding crosses too: two SplitGdn ops carrying their
+/// widths, three matmuls, same 10-op count.
+#[test]
+fn gdn_fragment_fused_binding_round_trips() {
+    let facts = Qwen35GdnFacts {
+        fused_in_proj: true,
+        ..Qwen35GdnFacts::qwen3_5_0_8b()
+    };
+    let plan = qwen3_5_gdn_block(&facts);
+    let mut pod = arena::build(&plan);
+    let ops = view::ops(&pod);
+    assert_eq!(ops.len(), 10);
+    let splits: Vec<_> = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::SplitGdn)
+        .collect();
+    assert_eq!(splits.len(), 2);
+    assert_eq!(splits[0].param0, facts.conv_dim());
+    assert_eq!(splits[0].param1, facts.value_width());
+    assert_eq!(splits[1].param0, facts.value_heads);
+    assert_eq!(splits[1].param1, facts.value_heads);
+    assert_eq!(splits[0].weight_name, PIE_FORWARD_NO_NAME);
+    unsafe { arena::release(&mut pod) };
+}
+
+/// The GDN entry point end to end: C facts in, POD plan out; malformed
+/// requests (bad enum, zero heads/dims/kernel, a GQA share that does not
+/// divide) answer InvalidArgument.
+#[test]
+fn gdn_entry_traces_and_validates() {
+    let facts = Qwen35GdnFacts::qwen3_5_0_8b();
+    let c_facts = PieForwardQwen35GdnFacts {
+        hidden: facts.hidden,
+        key_heads: facts.key_heads,
+        value_heads: facts.value_heads,
+        key_head_dim: facts.key_head_dim,
+        value_head_dim: facts.value_head_dim,
+        conv_kernel: facts.conv_kernel,
+        fused_in_proj: u8::from(facts.fused_in_proj),
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_gdn(&c_facts, &mut out) },
+        PieForwardStatus::Ok
+    );
+    // The 10-op block `family::tests::gdn_block_op_sequence` pins.
+    assert_eq!(out.ops.len, 10);
+    unsafe { pie_forward_release(&mut out) };
+
+    for bad in [
+        PieForwardQwen35GdnFacts {
+            norm_variant: 9,
+            ..c_facts
+        },
+        PieForwardQwen35GdnFacts {
+            key_heads: 0,
+            ..c_facts
+        },
+        PieForwardQwen35GdnFacts {
+            value_head_dim: 0,
+            ..c_facts
+        },
+        PieForwardQwen35GdnFacts {
+            conv_kernel: 0,
+            ..c_facts
+        },
+        // 16 value heads cannot GQA-share 3 key heads.
+        PieForwardQwen35GdnFacts {
+            key_heads: 3,
+            ..c_facts
+        },
+    ] {
+        assert_eq!(
+            unsafe { pie_forward_trace_qwen3_5_gdn(&bad, &mut out) },
+            PieForwardStatus::InvalidArgument
+        );
+        assert!(out.owner.is_null());
+    }
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_gdn(std::ptr::null(), &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
+}
+
+/// The 0.8B full-attention facts, as a C caller would state them.
+fn c_facts_full_attn() -> PieForwardQwen35FullAttnFacts {
+    let facts = Qwen35FullAttnFacts::qwen3_5_0_8b();
+    PieForwardQwen35FullAttnFacts {
+        hidden: facts.hidden,
+        q_heads: facts.q_heads,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        rotary_dim: facts.rotary_dim,
+        fused_qkv: u8::from(facts.fused_qkv),
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+    }
+}
+
+/// The full-attention fragment round-trips: the two appended op kinds
+/// (SplitQGate's head geometry in its params, SigmoidGateMul's paired
+/// operands), the partial rope crossing as Rope's param1, and the per-head
+/// norm's Gemma variant crossing as RmsnormPerHead's param1 — the two
+/// appended-param-additive fields.
+#[test]
+fn full_attn_fragment_round_trips_through_the_arena() {
+    let facts = Qwen35FullAttnFacts::qwen3_5_0_8b();
+    let plan = qwen3_5_full_attn_block(&facts);
+    let mut pod = arena::build(&plan);
+
+    assert_eq!(view::name(&pod, pod.family), "qwen3_5_full_attn_block");
+    let ops = view::ops(&pod);
+    assert_eq!(ops.len(), plan.ops.len());
+    for (rust, c) in plan.ops.iter().zip(ops) {
+        assert_eq!(c.kind, expect_kind(&rust.kind), "kind of {rust:?}");
+        assert_eq!(view::ids(&pod, c.inputs), &rust.inputs[..]);
+        assert_eq!(view::ids(&pod, c.outputs), &rust.outputs[..]);
+        assert_eq!(c.selector, PIE_FORWARD_NO_VALUE, "selector of {rust:?}");
+        match expect_weight(&rust.kind) {
+            Some(weight) => assert_eq!(view::name(&pod, c.weight_name), weight),
+            None => assert_eq!(c.weight_name, PIE_FORWARD_NO_NAME),
+        }
+    }
+
+    let split = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::SplitQGate)
+        .unwrap();
+    assert_eq!(split.param0, facts.q_heads);
+    assert_eq!(split.param1, facts.head_dim);
+    assert_eq!(split.weight_name, PIE_FORWARD_NO_NAME);
+    let split_outs = view::ids(&pod, split.outputs);
+    assert_eq!(split_outs.len(), 2);
+    for &id in split_outs {
+        let v = view::values(&pod)[id as usize];
+        assert_eq!(v.rank, 2);
+        assert_eq!(v.dims[1].value, facts.q_width());
+    }
+
+    // Per-head norm: head_dim in param0, the GEMMA variant in param1 —
+    // non-zero for the first time, which is what pins the appended param.
+    let per_head = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::RmsnormPerHead)
+        .unwrap();
+    assert_eq!(per_head.param0, facts.head_dim);
+    assert_eq!(
+        per_head.param1,
+        PieForwardNormVariant::Gemma as u32
+    );
+
+    // Partial rope: kind in param0, the rotary width in param1.
+    let rope = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::Rope)
+        .unwrap();
+    assert_eq!(rope.param0, PieForwardRopeKind::Standard as u32);
+    assert_eq!(rope.param1, facts.rotary_dim);
+
+    // The output gate consumes attention's output and the gate leg.
+    let attn = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::Attention)
+        .unwrap();
+    let gate_mul = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::SigmoidGateMul)
+        .unwrap();
+    assert_eq!(gate_mul.weight_name, PIE_FORWARD_NO_NAME);
+    let gm_in = view::ids(&pod, gate_mul.inputs);
+    assert_eq!(gm_in[0], view::ids(&pod, attn.outputs)[0]);
+    assert_eq!(gm_in[1], split_outs[1]);
+
+    unsafe { arena::release(&mut pod) };
+}
+
+/// The full-attention entry point end to end: C facts in, POD plan out;
+/// malformed requests (bad enum, zero heads, a rotary width of zero or
+/// wider than the head, a GQA share that does not divide) answer
+/// InvalidArgument.
+#[test]
+fn full_attn_entry_traces_and_validates() {
+    let c_facts = c_facts_full_attn();
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_full_attn(&c_facts, &mut out) },
+        PieForwardStatus::Ok
+    );
+    // The 12-op block `family::tests::full_attn_block_op_sequence` pins.
+    assert_eq!(out.ops.len, 12);
+    unsafe { pie_forward_release(&mut out) };
+
+    for bad in [
+        PieForwardQwen35FullAttnFacts {
+            norm_variant: 9,
+            ..c_facts
+        },
+        PieForwardQwen35FullAttnFacts {
+            q_heads: 0,
+            ..c_facts
+        },
+        PieForwardQwen35FullAttnFacts {
+            rotary_dim: 0,
+            ..c_facts
+        },
+        // Wider than the head: rotating channels that do not exist.
+        PieForwardQwen35FullAttnFacts {
+            rotary_dim: 512,
+            ..c_facts
+        },
+        // 3 query heads cannot GQA-share 2 kv heads.
+        PieForwardQwen35FullAttnFacts {
+            q_heads: 3,
+            ..c_facts
+        },
+    ] {
+        assert_eq!(
+            unsafe { pie_forward_trace_qwen3_5_full_attn(&bad, &mut out) },
+            PieForwardStatus::InvalidArgument
+        );
+        assert!(out.owner.is_null());
+    }
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_full_attn(std::ptr::null(), &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
+}
+
+/// The hybrid entry point end to end: the flattened C facts (nested
+/// sub-facts, the mlp_is_moe tag) trace the 351-op 0.8B model; malformed
+/// requests — zero layers/interval, a dense MLP with no width, sub-facts
+/// disagreeing on hidden — answer InvalidArgument.
+#[test]
+fn hybrid_entry_traces_and_validates() {
+    let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+    let gdn = &facts.gdn;
+    let c_gdn = PieForwardQwen35GdnFacts {
+        hidden: gdn.hidden,
+        key_heads: gdn.key_heads,
+        value_heads: gdn.value_heads,
+        key_head_dim: gdn.key_head_dim,
+        value_head_dim: gdn.value_head_dim,
+        conv_kernel: gdn.conv_kernel,
+        fused_in_proj: u8::from(gdn.fused_in_proj),
+        norm_variant: PieForwardNormVariant::from(gdn.norm_variant) as u32,
+    };
+    let c_moe_unused = PieForwardQwen35MoeMlpFacts {
+        hidden: 0,
+        num_experts: 0,
+        top_k: 0,
+        moe_intermediate: 0,
+        shared_expert_intermediate: 0,
+        norm_variant: 0,
+    };
+    let c_facts = PieForwardQwen35HybridFacts {
+        layers: facts.layers,
+        full_attn_interval: facts.full_attn_interval,
+        vocab: facts.vocab,
+        tied_embeddings: u8::from(facts.tied_embeddings),
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+        attn: c_facts_full_attn(),
+        gdn: c_gdn,
+        mlp_is_moe: 0,
+        dense_intermediate: 3584,
+        // Ignored under mlp_is_moe == 0 — and deliberately garbage, so the
+        // test also pins that a dense request never reads the moe leg.
+        moe: c_moe_unused,
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_hybrid(&c_facts, &mut out) },
+        PieForwardStatus::Ok
+    );
+    // The count `family::tests::hybrid_full_plan_shape` pins.
+    assert_eq!(out.ops.len, 18 * 14 + 6 * 16 + 3);
+    let ops = view::ops(&out);
+    assert_eq!(view::name(&out, out.family), "qwen3_5_hybrid");
+    // Layer 3 is the first full-attention layer; its rope is partial.
+    let rope3 = ops
+        .iter()
+        .find(|op| op.layer == 3 && op.kind == PieForwardOpKind::Rope)
+        .unwrap();
+    assert_eq!(rope3.param1, 64);
+    // Layer 0 is GDN: its conv addresses the layer-0 recurrent slab.
+    let conv0 = ops
+        .iter()
+        .find(|op| op.layer == 0 && op.kind == PieForwardOpKind::CausalConv1d)
+        .unwrap();
+    assert_eq!(view::name(&out, conv0.weight_name), "layer.0.conv");
+    unsafe { pie_forward_release(&mut out) };
+
+    for bad in [
+        PieForwardQwen35HybridFacts { layers: 0, ..c_facts },
+        PieForwardQwen35HybridFacts {
+            full_attn_interval: 0,
+            ..c_facts
+        },
+        PieForwardQwen35HybridFacts {
+            dense_intermediate: 0,
+            ..c_facts
+        },
+        // The gdn sub-facts disagree with attn on hidden.
+        PieForwardQwen35HybridFacts {
+            gdn: PieForwardQwen35GdnFacts {
+                hidden: 2048,
+                ..c_gdn
+            },
+            ..c_facts
+        },
+        // Under mlp_is_moe the (garbage) moe leg IS read, and refused.
+        PieForwardQwen35HybridFacts {
+            mlp_is_moe: 1,
+            ..c_facts
+        },
+    ] {
+        assert_eq!(
+            unsafe { pie_forward_trace_qwen3_5_hybrid(&bad, &mut out) },
+            PieForwardStatus::InvalidArgument
+        );
+        assert!(out.owner.is_null());
+    }
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_hybrid(std::ptr::null(), &mut out) },
+        PieForwardStatus::InvalidArgument
+    );
 }
 
 /// The unfused binding crosses the boundary too: three per-layer projection
@@ -218,4 +831,80 @@ fn entry_honours_the_unfused_binding() {
         .count();
     assert_eq!(layer0_matmuls, 6);
     unsafe { pie_forward_release(&mut out) };
+}
+
+/// The lowered trace crosses the boundary intact: the `Launch` wire form
+/// — kernel symbol in the weight slot, consumed weight names in
+/// `aux_names` (signature order), the state mark in the params — plus
+/// the fused decode shape itself: 28 fused posts, ONE table build
+/// consumed by all of them as an operand, and the general arm's
+/// SplitQkv/Rope/KvAppend absent.
+#[test]
+fn lowered_trace_round_trips_through_the_arena() {
+    let facts = c_facts_qwen3();
+    let cuda = PieForwardLlamaLikeCudaFacts {
+        xqa_decode: 1,
+        decode_fused_post: 1,
+        rope_table: 1,
+        force_prefill_path: 0,
+    };
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like_cuda(&facts, &cuda, /*Decode=*/ 0, &mut out) },
+        PieForwardStatus::Ok
+    );
+    let ops = view::ops(&out);
+
+    let launches: Vec<_> = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::Launch)
+        .collect();
+    // 1 table build + 28 fused posts + 28 attentions.
+    assert_eq!(launches.len(), 57);
+
+    let table = launches[0];
+    assert_eq!(view::name(&out, table.weight_name), "launch_rope_standard_table");
+    assert_eq!(table.param0, 0); // no implicit state
+    assert_eq!(table.aux_names.len, 0);
+    let table_out = view::ids(&out, table.outputs)[0];
+
+    let posts: Vec<_> = launches
+        .iter()
+        .filter(|op| {
+            view::name(&out, op.weight_name) == "launch_qkv_decode_qk_norm_rope_write_kv_bf16"
+        })
+        .collect();
+    assert_eq!(posts.len(), 28);
+    let post = posts[0];
+    let aux = view::ids(&out, post.aux_names);
+    assert_eq!(view::name(&out, aux[0]), "layer.0.q_norm");
+    assert_eq!(view::name(&out, aux[1]), "layer.0.k_norm");
+    assert_eq!(post.param0, 1); // kv-cache state...
+    assert_eq!(post.param1, 0); // ...of layer 0
+    // Every fused post consumes THE table value as its second operand.
+    for post in &posts {
+        assert_eq!(view::ids(&out, post.inputs)[1], table_out);
+    }
+
+    let attn = launches
+        .iter()
+        .find(|op| {
+            view::name(&out, op.weight_name) == "launch_attention_xqa_decode_bf16_prepared"
+        })
+        .expect("decode class states XQA");
+    assert_eq!(attn.param0, 1);
+
+    // No general-arm leftovers in the fused decode class.
+    assert!(!ops.iter().any(|op| matches!(
+        op.kind,
+        PieForwardOpKind::SplitQkv | PieForwardOpKind::Rope | PieForwardOpKind::KvAppend
+    )));
+    unsafe { pie_forward_release(&mut out) };
+
+    // An out-of-range class is a malformed request, not a default.
+    let mut out2 = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_llama_like_cuda(&facts, &cuda, 2, &mut out2) },
+        PieForwardStatus::InvalidArgument
+    );
 }

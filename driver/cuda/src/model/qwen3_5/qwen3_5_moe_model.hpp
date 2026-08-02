@@ -2,6 +2,7 @@
 
 #include "distributed.hpp"
 #include "model/imodel.hpp"
+#include "model/qwen3_5/declared_facts.hpp"
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
 #include "model/qwen3_5/qwen3_5_moe.hpp"
@@ -48,6 +49,13 @@ public:
     RecurrentStateCache* state_cache() override { return &state_cache_; }
     std::uint32_t graph_layout() override;
 
+    // The validated declared plan (empty → nullptr), for the load-time
+    // capability site summary (imodel.hpp) — the one family whose plan can
+    // carry expert sites when the facts are MoE.
+    const pie_forward::ForwardPlan* declared_plan() const override {
+        return declared_ ? &declared_.plan : nullptr;
+    }
+
     // Same linear-attention scratch as `Qwen35Model::workspace_bytes`, plus
     // the routed/shared-MoE MLP scratch.
     std::size_t workspace_bytes(const HfConfig& cfg, int max_tokens,
@@ -73,6 +81,11 @@ private:
     KvCache& kv_cache_;
     Qwen3_5ForwardCfg fwd_cfg_;
     ModelCapabilities caps_;
+    // Arc 1 of the declared executor (declared_facts.hpp): the traced +
+    // structurally validated plan, built at construction when
+    // PIE_DECLARED_FORWARD opted in. Stored for arc 2; body() does NOT
+    // consume it — cold-start validation only.
+    Qwen35DeclaredPlan declared_;
 };
 
 }  // namespace pie_cuda_driver::model

@@ -47,31 +47,83 @@ struct AttentionScores {
 std::uint32_t default_attn_score_window() noexcept;
 
 struct StageHooks;
+class HookSidebandArena;
+struct AttentionObservation;
+
+// Stage 6 increment 4 — the hook-graph prepare pass's fire-level view of the
+// DECODE score capture. A captured hook body replays `LayerScoreCapture`'s
+// stream ops (the CSR upload and the folded memset) with capture-time
+// parameters, so before EVERY replay the prepare pass must (a) refresh the
+// host CSR the captured upload reads — same thread-local storage, same
+// contents the constructor would compute — and (b) pre-grow the arena score
+// slot so the capture-time constructor (and nothing at replay) ever hits the
+// arena's stream-synced growth path. This helper does both and hands back
+// the arena-stable addresses the pass folds into its fingerprint. It
+// enqueues NO stream work and takes NO slot: the arena acquire is released
+// before returning (growth is its only lasting effect).
+struct DecodeScoreCapturePlan {
+    bool ok = false;
+    // Arena-stable device addresses (stable until the score region grows).
+    const float* folded = nullptr;
+    const std::int32_t* indptr_d = nullptr;
+    // The host raw-offset CSR the captured `cudaMemcpyAsync` reads at replay
+    // time. Thread-local storage: the ADDRESS must be fingerprinted, because
+    // a different fire shape may reallocate the vector under the captured
+    // node's recorded source pointer.
+    const void* indptr_h_data = nullptr;
+    // Folded (per-position) offsets, host, `num_requests + 1` entries.
+    const std::uint32_t* folded_offsets_h = nullptr;
+    std::uint32_t num_requests = 0;
+};
+
+DecodeScoreCapturePlan prepare_decode_score_capture(
+    HookSidebandArena* arena,
+    const AttentionObservation& observation,
+    std::uint32_t num_q_heads,
+    cudaStream_t stream);
 
 namespace detail {
 
 // The three device buffers every score capture needs: the raw per-head rows the
 // kernel writes, the head-folded row a PTIR program reads, and the ragged CSR
 // both are addressed by. Shared by the decode and prefill captures so the two
-// cannot drift in how they allocate, zero, or release -- the failure mode of a
+// cannot drift in how they acquire, zero, or release -- the failure mode of a
 // drift here is a program reading a row that was never zeroed, which looks like
 // a plausible attention distribution rather than like a bug.
+//
+// The bytes live in the fire's `HookSidebandArena` score slot rather than in a
+// fresh `cudaMallocAsync` per layer: every layer of a fire has identical
+// geometry and at most one capture is live at a time, so one slot sized on the
+// first layer serves the whole fire, and the addresses stay stable across
+// layers AND across same-geometry fires (the increment-4 graph-capture
+// precondition — see hook_sideband_arena.hpp).
 struct ScoreBuffers {
     float* raw = nullptr;
     float* folded = nullptr;
     std::int32_t* indptr_d = nullptr;
 
-    // `folded` is zeroed but `raw` is not: every element of `folded` that the
-    // fold kernel skips must still read as "this position received no
-    // attention", whereas `raw` is only ever read back by the fold kernel over
-    // exactly the region the capture kernel wrote.
-    bool allocate(
+    // Carve raw/folded/indptr out of the arena's score slot and stage the
+    // host CSR into `indptr_d`.
+    //
+    // `folded` is zeroed but `raw` is not — and because the slot is REUSED,
+    // that asymmetry is now load-bearing across layers too: every element of
+    // `folded` that the fold kernel skips must still read as "this position
+    // received no attention" (so it is re-zeroed on every acquire), whereas
+    // `raw` is only ever read back by the fold kernel over exactly the region
+    // the capture kernel wrote this layer, so the previous layer's leftovers
+    // in it are dead bytes by construction.
+    bool acquire(
+        HookSidebandArena* arena,
         std::uint64_t raw_elems,
         std::uint64_t folded_elems,
         const std::int32_t* indptr_h,
         std::uint32_t num_requests,
         cudaStream_t stream) noexcept;
-    void release(cudaStream_t stream) noexcept;
+    void release() noexcept;
+
+  private:
+    // The arena the slot was acquired from; null while nothing is held.
+    HookSidebandArena* arena_ = nullptr;
 };
 
 }  // namespace detail

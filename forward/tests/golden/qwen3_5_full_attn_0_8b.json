@@ -1,0 +1,312 @@
+{
+  "family": "qwen3_5_full_attn_block",
+  "values": [
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 4096
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    }
+  ],
+  "ops": [
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.0.attn_norm",
+          "variant": "Gemma"
+        }
+      },
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        1
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.q_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        2
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.k_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        3
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.v_proj",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        4
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "SplitQGate": {
+          "heads": 8,
+          "head_dim": 256
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        5,
+        6
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.0.q_norm",
+          "head_dim": 256,
+          "variant": "Gemma"
+        }
+      },
+      "inputs": [
+        5
+      ],
+      "outputs": [
+        7
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "RmsnormPerHead": {
+          "weight": "layer.0.k_norm",
+          "head_dim": 256,
+          "variant": "Gemma"
+        }
+      },
+      "inputs": [
+        3
+      ],
+      "outputs": [
+        8
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Rope": {
+          "kind": "Standard",
+          "partial": 64
+        }
+      },
+      "inputs": [
+        7,
+        8
+      ],
+      "outputs": [
+        9,
+        10
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "KvAppend": {
+          "layer": 0
+        }
+      },
+      "inputs": [
+        10,
+        4
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Attention": {
+          "layer": 0
+        }
+      },
+      "inputs": [
+        9
+      ],
+      "outputs": [
+        11
+      ],
+      "layer": 0
+    },
+    {
+      "kind": "SigmoidGateMul",
+      "inputs": [
+        11,
+        6
+      ],
+      "outputs": [
+        12
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.o_proj",
+          "beta_one": true
+        }
+      },
+      "inputs": [
+        12,
+        0
+      ],
+      "outputs": [
+        13
+      ],
+      "layer": 0
+    }
+  ]
+}

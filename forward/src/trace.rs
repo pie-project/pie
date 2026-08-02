@@ -13,6 +13,48 @@
 //! per fire — the hook-free prefix taking the fused kernel while the tail
 //! runs unfused (stage1-notes.md) is exactly that choice, and it is not
 //! expressible if the trace bakes the fusion in.
+//!
+//! # `dyn`: the first per-token axis
+//!
+//! Everything above is resolved at trace time. The MoE expert axis is the
+//! first thing that is not: `TopK` produces a per-token expert assignment
+//! whose CONTENT exists only at fire time, and the expert-indexed `Matmul`s
+//! downstream of it name a weight *template* (`layer.0.expert.{e}.gate_up`)
+//! whose `{e}` the selector resolves per token. This is the first trace
+//! whose lowering is not fixed at trace time — the expert dimension is
+//! data — and, per the tart prototype's `ir.py`, per-token weight selection
+//! IS `Div::Weight` at token granularity: gather → grouped GEMM → scatter is
+//! its lowering, and `matmul(x, W[i])` with `i` per-token being MoE grouped
+//! GEMM (with `i` per-request, SGMV) is the syntactic identity that
+//! motivated this work (plan.md Part 1). The trace states the selection;
+//! which grouped-GEMM strategy fires (cuBLAS batched, aligned blocks,
+//! CUTLASS fused) stays the emitter's per-fire choice, exactly as fusion
+//! does. The [`DynAxis`] marker on values and the `selector` field on
+//! [`OpKind::Matmul`] are that syntax — present exactly where cost is
+//! incurred, absent everywhere else.
+//!
+//! # The per-request state axis
+//!
+//! The GDN ops (`CausalConv1d`, `GatedDelta`) are the first whose semantics
+//! include a store that is per-layer AND per-request: each request owns a
+//! conv-window slab and a recurrent-state slab that the op reads and
+//! advances in place, across fires (pie-application-plan.md §5.4's
+//! "state[l] is per-request" — the axis the sketch left unmarked, and the
+//! reason RS-touching fires are forced solo today, `touches_rs_buffer()`).
+//! The trace marks it the way the KV cache is already marked: the ops carry
+//! `layer` and the store stays implicit, NOT a traced value. That is a
+//! deliberate design call, justified by the hand-written pass: state never
+//! appears as an activation there — every state-touching kernel takes the
+//! cache base plus a per-request slot indirection (`slot_ids_d`) and
+//! mutates the slab in place — and a traced SSA value is per-fire and
+//! single-assignment, so a first-class state value would misstate both the
+//! lifetime (state outlives the fire) and the dataflow (state is not
+//! produced by any op of this pass). What the planner needs is the FACT
+//! that an op addresses such a store; [`OpKind::state_ref`] derives exactly
+//! that from the vocabulary, so "does this trace touch per-request
+//! recurrent state" is a query, not a name-match. (`DynAxis::PerRequest`
+//! stays un-introduced: `dyn` marks values whose CONTENT selects structure,
+//! and no state value exists to mark.)
 
 use serde::{Deserialize, Serialize};
 
@@ -40,12 +82,41 @@ pub enum DType {
 /// Index into [`ForwardPlan::values`].
 pub type ValueId = u32;
 
+/// The `dyn` marker: which fire extent a value's *selection* varies over.
+///
+/// Marks values whose content chooses lowering-relevant structure per
+/// element of an extent — today only the per-token expert assignment a
+/// [`OpKind::TopK`] produces. Ordinary activations are per-token *data* and
+/// carry no marker; the marker means "the planner must look at this value's
+/// content to know which weights a downstream op reads" (plan.md Part 1's
+/// `dyn PerToken<Expert>`). `PerRequest` (adapters, depth) is the same
+/// grammar at request granularity and lands with its own axes later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DynAxis {
+    /// Varies per token row of the fire (`Dim::Tokens` granularity).
+    PerToken,
+}
+
 /// RMSNorm weight conventions that change the arithmetic, not the kernel
 /// choice. `Gemma` folds `(1 + w)`; `Plain` multiplies `w` directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is `Plain` so the field can ride serde-additively on ops that
+/// predate it ([`OpKind::RmsnormPerHead`]): a golden that never stated a
+/// variant reads back as the plain fold it always meant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NormVariant {
+    #[default]
     Plain,
     Gemma,
+}
+
+impl NormVariant {
+    /// Serde helper: `Plain` is the resting value and is skipped on
+    /// serialization, the discipline that keeps pre-variant goldens
+    /// byte-identical (the same rule as `selector`/`dyn_axis`).
+    pub fn is_plain(&self) -> bool {
+        *self == NormVariant::Plain
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +124,47 @@ pub enum RopeKind {
     Standard,
     /// Llama3/YaRN-style frequency scaling; parameters live in the facts.
     Yarn,
+}
+
+/// The fire-shape class a LOWERED trace is specialized to (north-star-dsl.md).
+///
+/// The one input that varies after model load: whether the fire is pure
+/// decode (every request contributes one token row) or prefill-shaped
+/// (anything else — the hand-written bodies treat mixed fires as one
+/// qo_indptr-windowed prefill, a decode row being an `Nr == 1` window).
+/// The toolchain traces a lowered declaration once per class, so inside
+/// the declaration a class arm is an ordinary trace-time `match` — the
+/// same mechanism that erases static facts, applied to the axis that
+/// used to be the driver's `is_pure_decode` boolean.
+///
+/// Semantic traces ([`crate::family::llama_like`]) have no class: they
+/// serve every fire shape, and kernel choice stays with their consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FireClass {
+    Decode,
+    Prefill,
+}
+
+// (The short-lived `AttnKernel` enum — rung 1's `Attention.param1` tag —
+// is gone: a lowered trace states its attention kernel the way it states
+// every kernel, as an [`OpKind::Launch`] with the launcher's name. Raw
+// signatures, not enum tags; north-star-dsl.md.)
+
+/// A [`OpKind::Guard`]'s predicate: the ONE kind of branch a lowered
+/// trace may carry — over a per-fire RUNTIME INPUT, closed-vocabulary so
+/// every predicate is emittable as a fixed C++ condition (rung 3's
+/// generated form spells it; the interpreter evaluates it). Trace-time
+/// facts never appear here — they resolved during tracing — and anything
+/// not in this vocabulary is not expressible, which is the point: a
+/// declaration cannot smuggle an open-ended runtime choice past the
+/// toolchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum GuardPred {
+    /// The fire carries explicit KV-write descriptors (`w_page`/`w_off`),
+    /// the graph-replay steering path — `has_write_desc` in every driver
+    /// signature.
+    HasWriteDesc = 0,
 }
 
 /// One operation of the traced form.
@@ -66,27 +178,258 @@ pub enum OpKind {
     Embed { weight: String },
     /// `out = act @ weight^T (+ beta * out)`. `beta_one` is the residual
     /// accumulate the hand-written passes fold into cuBLAS.
-    Matmul { weight: String, beta_one: bool },
+    ///
+    /// With `selector` set, `weight` is a TEMPLATE (`layer.0.expert.{e}.gate_up`)
+    /// whose `{e}` the selector value — a per-token expert assignment,
+    /// `[Tokens, k]` of expert indices — resolves per token: row `t` of the
+    /// activation is multiplied against the weights its `k` selected experts
+    /// name, producing a `[Tokens, k, out]` result. This is `Div::Weight` at
+    /// token granularity; grouped GEMM is its lowering (the drivers' MoE
+    /// gate_up/down kernels), chosen by the emitter per fire. The selector
+    /// is also the op's LAST input (the [`TraceBuilder::matmul_add`]
+    /// convention for auxiliary operands), so dataflow walks need no special
+    /// case; the field states which input selects rather than flows.
+    Matmul {
+        weight: String,
+        beta_one: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<ValueId>,
+    },
     /// Row RMSNorm over the trailing dim.
     Rmsnorm {
         weight: String,
         variant: NormVariant,
     },
     /// Per-head RMSNorm of packed `[rows, heads * head_dim]` Q or K.
-    RmsnormPerHead { weight: String, head_dim: u32 },
+    /// `variant` selects the weight fold exactly as on [`OpKind::Rmsnorm`]:
+    /// qwen3/olmo-style checkpoints multiply `w` directly (`Plain`), while
+    /// qwen3.5's full-attention q/k norms fold `(1 + w)` (`Gemma` —
+    /// `full_attn_layer_body` launches `launch_rmsnorm_gemma_bf16` over
+    /// `N * heads` rows of `head_dim`). Serde-defaulted to `Plain` and
+    /// skipped there, so every pre-variant golden stays byte-identical.
+    RmsnormPerHead {
+        weight: String,
+        head_dim: u32,
+        #[serde(default, skip_serializing_if = "NormVariant::is_plain")]
+        variant: NormVariant,
+    },
     /// Split packed QKV `[rows, q + 2kv]` into Q, K, V (three results).
     SplitQkv { q_width: u32, kv_width: u32 },
     /// Rotary embedding applied in place to Q and K (two operands).
-    Rope { kind: RopeKind },
+    ///
+    /// `partial` is the partial-rotary width: `Some(rotary_dim)` rotates
+    /// only the first `rotary_dim` channels of each head and passes the
+    /// rest through (qwen3.5 full attention, `launch_rope_partial_bf16`);
+    /// `None` is the full rotation every earlier family traces. The trace
+    /// states the resolved CHANNEL COUNT, not HF's `partial_rotary_factor`,
+    /// for the same reason `SplitQkv` states widths rather than head
+    /// counts: every trace-time constant is already multiplied out, and the
+    /// driver's `max(2, 2 * int(0.5 * factor * head_dim))` derivation is
+    /// config-parsing knowledge that belongs with the facts (the fixture
+    /// pins 0.25 × 256 → 64 with its provenance). Serde-skipped when
+    /// absent, so pre-partial goldens stay byte-identical.
+    Rope {
+        kind: RopeKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partial: Option<u32>,
+    },
     /// Append this fire's K/V rows to the layer's paged cache.
     KvAppend { layer: u32 },
-    /// Paged attention over the layer's cache. Opaque: the backend owns
-    /// plan choice (decode/prefill/FA2/XQA) entirely.
+    /// Paged attention over the layer's cache. Opaque in the SEMANTIC
+    /// trace: the executor derives the path. A lowered trace states its
+    /// attention kernel as an [`OpKind::Launch`] instead of this kind.
     Attention { layer: u32 },
     /// SwiGLU over packed `[rows, 2 * inter]` gate‖up.
     Swiglu { inter: u32 },
     /// Gather the sampled rows and project to logits.
     LmHead { weight: String },
+    /// `residual += x`, elementwise. The post-norm residual landing
+    /// (`NormPlacement::Post`): the sub-layer's normed output is added to
+    /// the residual stream by its own launch, because the norm between the
+    /// projection GEMM and the add is what makes the pre-norm `beta=1`
+    /// fold impossible. A separate op because it is a separate launch in
+    /// the hand-written pass (`launch_residual_add_bf16`).
+    ResidualAdd,
+    /// Router top-k over per-token logits: for each token row, the `k`
+    /// highest-scoring experts, with softmaxed-and-renormalized routing
+    /// weights. Two results: the expert indices (`[Tokens, k]` i32, marked
+    /// [`DynAxis::PerToken`] — the `dyn` value everything expert-indexed
+    /// consumes) and the routing weights (`[Tokens, k]` f32). One op
+    /// because it is one launch in the hand-written MoE pass
+    /// (`launch_topk_softmax_bf16`: top-k + softmax + renormalize).
+    TopK { k: u32 },
+    /// Per-token combine of the k routed expert outputs:
+    /// `out[t] = sum_j w[t, j] * x[t, j, :]`, collapsing `[Tokens, k, d]`
+    /// to `[Tokens, d]`. The hand-written MoE pass's
+    /// `launch_token_batched_weighted_sum_bf16` (the prefill path's
+    /// per-expert `scatter_add_weighted` loop is a lowering of the same
+    /// combine, chosen with the grouped GEMM it follows).
+    WeightedSum { k: u32 },
+    /// Shared-expert landing: `out = base + sigmoid(gate) * x`, the scalar
+    /// per-token gate broadcast over the hidden dim. Operands `[x, gate,
+    /// base]` — fresh value first, the stream it lands on last, the
+    /// [`TraceBuilder::residual_add`] convention. One op because it is one
+    /// launch (`launch_sigmoid_scalar_gate_add_bf16`); the `[Tokens, 1]`
+    /// gate logit comes from an ordinary `Matmul` the trace states
+    /// separately, exactly as the hand-written pass launches it.
+    SigmoidGateAdd,
+    /// Split a packed `[rows, w0 + w1]` value at `w0` into two (two
+    /// results). The GDN in-projection splits when the deployment binds the
+    /// fused banks: `in_proj_qkvz` → (mixed qkv, z gate) and `in_proj_ba` →
+    /// (b, a) — `launch_split_bf16_rows` and `launch_split_qwen_gdn_ba_bf16`
+    /// respectively, one op each because each is one launch. Distinct from
+    /// [`OpKind::SplitQkv`], which is the three-way attention split.
+    SplitGdn { width0: u32, width1: u32 },
+    /// Depthwise causal conv1d over the packed `[rows, conv_dim]` qkv, with
+    /// the fused SiLU the hand-written kernels apply
+    /// (`launch_causal_conv1d_{update,prefill}*`). `weight` names the conv
+    /// binding (the driver binds the checkpoint's conv weight AND bias
+    /// under it); `kernel` is the window width (`linear_conv_kernel_dim`).
+    /// `layer` marks the implicit PER-REQUEST conv-state slab the op reads
+    /// and advances — see the module doc's "the per-request state axis" and
+    /// [`OpKind::state_ref`]. Decode-update vs prefill-walk vs batched
+    /// slot-indirected variants are lowerings of this one op, the emitter's
+    /// per-fire choice.
+    CausalConv1d {
+        weight: String,
+        layer: u32,
+        kernel: u32,
+    },
+    /// The post-conv GDN prep (`launch_qwen_gdn_post_conv_prep_bf16`): one
+    /// launch that unpacks the conv output's `[q_raw | k_raw | v_raw]`,
+    /// L2-normalizes q/k into compact per-head fp32, converts v to fp32,
+    /// and folds `a`/`b` with the `a_log`/`dt_bias` parameters into the
+    /// per-head gating log-decay `g` and mixing `beta`. Inputs `[qkv, a,
+    /// b]` (the kernel's operand order); five results: q `[Tokens, Kh,
+    /// Kd]`, k `[Tokens, Kh, Kd]`, v `[Tokens, Vh, Vd]`, g `[Tokens, Vh]`,
+    /// beta `[Tokens, Vh]`, all f32. Two weight names because the launch
+    /// reads two parameter tensors. (The GQA `repeat_interleave` of q/k
+    /// from Kh to Vh heads is NOT an op: most recurrence kernels index the
+    /// compact layout directly, so materializing it is a lowering choice.)
+    GdnPrep { a_log: String, dt_bias: String },
+    /// The gated-delta recurrence: fold this fire's tokens into the layer's
+    /// PER-REQUEST recurrent state and produce the core attention output
+    /// `[Tokens, Vh, Vd]` f32. Inputs `[q, k, v, g, beta]`. Opaque, like
+    /// `Attention`: the decode-step, chunked-prefill, warp-tiled and cached
+    /// kernel families (`launch_{recurrent,chunk}_gated_delta_*`) are all
+    /// lowerings the backend picks per fire. `layer` marks the implicit
+    /// per-request state slab ([`OpKind::state_ref`]).
+    GatedDelta { layer: u32 },
+    /// Gated RMSNorm (`launch_rmsnorm_gated_fp32_in_bf16`): per (row,
+    /// head), `out = w * rmsnorm(x) * silu(gate)`, normalizing the trailing
+    /// head dim of the rank-3 f32 core output and flattening to the gate's
+    /// `[Tokens, Vh * Vd]` bf16 shape (the fp32→bf16 conversion is fused
+    /// into the same launch). Inputs `[x, gate]`. NOT a [`NormVariant`]:
+    /// variants select the weight arithmetic at fixed arity, while gating
+    /// adds an operand and changes the launch — and the kernel's weight
+    /// fold is plain (`rmsnorm.hpp`: "Plain weight (no `1+w` convention)"),
+    /// so there is no variant to state.
+    RmsnormGated { weight: String },
+    /// The interleaved per-head `[query | gate]` split of qwen3.5 full
+    /// attention's 2×-wide gated q projection
+    /// (`launch_split_q_gate_bf16`): the packed `[rows, heads * 2 *
+    /// head_dim]` input carries, PER HEAD, `head_dim` query channels then
+    /// `head_dim` gate channels — `q[n, h*d + i] = packed[n, h*2d + i]`,
+    /// `gate[n, h*d + i] = packed[n, h*2d + d + i]` — so this is NOT a row
+    /// split: [`OpKind::SplitGdn`] cuts a packed row at one offset, while
+    /// this op de-interleaves at head granularity. Two results, q then
+    /// gate, each `[rows, heads * head_dim]`.
+    SplitQGate { heads: u32, head_dim: u32 },
+    /// `out = x * sigmoid(gate)`, elementwise — qwen3.5 full attention's
+    /// output gate (`launch_sigmoid_gate_inplace_bf16`: `attn_out *=
+    /// sigmoid(gate)` before o_proj). Operands `[x, gate]`, same shape.
+    /// A multiply with NO residual and no landing: distinct from
+    /// [`OpKind::SigmoidGateAdd`], whose scalar per-token gate broadcasts
+    /// over the hidden dim and lands on a base stream — here the gate is
+    /// full-width and nothing is added.
+    SigmoidGateMul,
+    /// A STATED kernel launch — the op a LOWERED trace uses wherever the
+    /// declaration's class arm called a raw kernel signature
+    /// (`dsl::cuda`, north-star-dsl.md). `kernel` is the driver's
+    /// launcher symbol; a dumb consumer resolves it in a name→launcher
+    /// registry and launches, and the ABI stops growing per kernel — this
+    /// ONE kind carries every stated kernel, present and future.
+    ///
+    /// `weights` are the weight names the launcher consumes, in signature
+    /// order. `state` marks the implicit per-layer store the kernel
+    /// addresses (the fused decode-QKV kernel writes the KV cache), the
+    /// same declaration [`OpKind::state_ref`] derives from vocabulary for
+    /// semantic kinds. Operand values ride `inputs`/`outputs` like every
+    /// other op; mechanical launcher parameters (stream, dims, workspace)
+    /// are the driver's binding, not the trace's business.
+    ///
+    /// A SEMANTIC trace never contains one — the general arm it lowers
+    /// remains the semantics the parity harness holds it to.
+    Launch {
+        kernel: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        weights: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<StateRef>,
+    },
+    /// The one branch a lowered trace may carry: over a per-fire RUNTIME
+    /// INPUT ([`GuardPred`], closed vocabulary). The `then_ops` ops
+    /// immediately after this one run when the predicate holds, the
+    /// `else_ops` after those when it does not — flat regions, no
+    /// nesting (the builder enforces it), and no region may produce a
+    /// value consumed outside it (side-effect launches only; a
+    /// value-producing guard is a later design when a consumer exists).
+    /// The interpreter evaluates the predicate and skips the dead
+    /// region; rung 3's emitter spells `if (...) { … } else { … }` —
+    /// the ONLY `if` a generated file carries that the declaration wrote.
+    Guard {
+        pred: GuardPred,
+        then_ops: u32,
+        else_ops: u32,
+    },
+}
+
+/// Which implicit store an op addresses. Both stores are per-layer and
+/// PER-REQUEST — the axis pie-application-plan.md §5.4 calls out — but they
+/// are different resources with different lowerings: the paged KV cache
+/// grows and is page-table-indirected, the recurrent store is fixed-size
+/// slabs advanced in place (and is why RS fires are forced solo today).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateStore {
+    /// The paged KV cache (`KvAppend` writes, `Attention` reads).
+    KvCache,
+    /// The GDN conv-window + recurrent-state slabs (`CausalConv1d` and
+    /// `GatedDelta` each read AND advance their half).
+    RecurrentState,
+}
+
+/// The state an op addresses: which store, at which layer. Derived from the
+/// vocabulary by [`OpKind::state_ref`] — the honest marking of the
+/// per-request state axis (module doc), with the store implicit exactly as
+/// the KV cache always was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateRef {
+    pub store: StateStore,
+    pub layer: u32,
+}
+
+impl OpKind {
+    /// The implicit per-layer, per-request store this op addresses, if any.
+    ///
+    /// This is how the planner learns a trace touches per-request state
+    /// without name-matching: `plan.ops.iter().any(|op|
+    /// op.kind.state_ref().is_some_and(|s| s.store ==
+    /// StateStore::RecurrentState))` is the traced-form statement of
+    /// today's hand-maintained `touches_rs_buffer()`.
+    pub fn state_ref(&self) -> Option<StateRef> {
+        match *self {
+            OpKind::KvAppend { layer } | OpKind::Attention { layer, .. } => Some(StateRef {
+                store: StateStore::KvCache,
+                layer,
+            }),
+            OpKind::Launch { state, .. } => state,
+            OpKind::CausalConv1d { layer, .. } | OpKind::GatedDelta { layer } => Some(StateRef {
+                store: StateStore::RecurrentState,
+                layer,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +447,12 @@ pub struct Op {
 pub struct ValueInfo {
     pub shape: Shape,
     pub dtype: DType,
+    /// The `dyn` marker: set on values whose content selects per-element
+    /// structure (a [`OpKind::TopK`] expert assignment), `None` for
+    /// ordinary data. Serde-skipped when absent so every pre-dyn traced
+    /// form serializes byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dyn_axis: Option<DynAxis>,
 }
 
 /// The traced form of one family's forward pass, for one set of load-time
@@ -133,6 +482,8 @@ pub struct TraceBuilder {
     values: Vec<ValueInfo>,
     ops: Vec<Op>,
     layer: Option<u32>,
+    /// A guard is open ([`Self::open_guard`]); nesting is refused.
+    in_guard: bool,
 }
 
 impl TraceBuilder {
@@ -142,6 +493,7 @@ impl TraceBuilder {
             values: Vec::new(),
             ops: Vec::new(),
             layer: None,
+            in_guard: false,
         }
     }
 
@@ -153,9 +505,107 @@ impl TraceBuilder {
         out
     }
 
+    /// The dsl surface's per-op layer tag ([`crate::dsl`] derives it from
+    /// the handle an op touches rather than from this bracket).
+    pub(crate) fn set_layer(&mut self, layer: Option<u32>) {
+        self.layer = layer;
+    }
+
+    /// A value's shape, for dsl ops whose outputs mirror their inputs.
+    pub(crate) fn value_shape(&self, id: ValueId) -> Shape {
+        self.values[id as usize].shape.clone()
+    }
+
+    /// Open a [`OpKind::Guard`]: records the op with zeroed region counts
+    /// and returns its index for [`Self::close_guard`] to patch once the
+    /// dsl has run both region closures. Nesting is refused here — flat
+    /// regions are the contract every consumer (interpreter skip logic,
+    /// emitter) relies on.
+    pub(crate) fn open_guard(&mut self, pred: GuardPred) -> usize {
+        assert!(
+            !self.in_guard,
+            "nested guards are not part of the vocabulary (flat regions)"
+        );
+        self.in_guard = true;
+        self.push(
+            OpKind::Guard {
+                pred,
+                then_ops: 0,
+                else_ops: 0,
+            },
+            vec![],
+            vec![],
+        );
+        self.ops.len() - 1
+    }
+
+    pub(crate) fn op_count_now(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub(crate) fn close_guard(&mut self, guard_idx: usize, then_ops: u32, else_ops: u32) {
+        let OpKind::Guard {
+            then_ops: t,
+            else_ops: e,
+            ..
+        } = &mut self.ops[guard_idx].kind
+        else {
+            panic!("close_guard: not a guard at {guard_idx}");
+        };
+        *t = then_ops;
+        *e = else_ops;
+        self.in_guard = false;
+    }
+
+    /// The `+=` fold ([`crate::dsl`]): if `rhs` is the output of the op
+    /// just recorded and that op is a plain unfused matmul, rewrite it to
+    /// the `beta_one` accumulate against `residual` — id-neutral, the
+    /// same op [`Self::matmul_add`] records directly. Returns false when
+    /// the shape doesn't hold (rhs older than the last op, or the last op
+    /// is not a plain matmul), in which case the caller lands the
+    /// residual explicitly.
+    pub(crate) fn try_fold_residual(&mut self, rhs: ValueId, residual: ValueId) -> bool {
+        let Some(op) = self.ops.last_mut() else {
+            return false;
+        };
+        let foldable = matches!(
+            &op.kind,
+            OpKind::Matmul {
+                beta_one: false,
+                selector: None,
+                ..
+            }
+        ) && op.outputs == [rhs];
+        if !foldable {
+            return false;
+        }
+        let OpKind::Matmul { beta_one, .. } = &mut op.kind else {
+            unreachable!("matched above");
+        };
+        *beta_one = true;
+        op.inputs.push(residual);
+        true
+    }
+
     fn value(&mut self, shape: Shape, dtype: DType) -> ValueId {
-        self.values.push(ValueInfo { shape, dtype });
+        self.values.push(ValueInfo {
+            shape,
+            dtype,
+            dyn_axis: None,
+        });
         (self.values.len() - 1) as ValueId
+    }
+
+    /// Declare a fragment parameter: a value no op of this trace produces.
+    ///
+    /// Full-model traces never need this — `embed` starts them — but a
+    /// traced *fragment* (`family::qwen3_5_moe_mlp_block`) takes the
+    /// residual stream it lands on as a parameter, and stating that as a
+    /// producer-less value keeps the dataflow honest: the composing
+    /// declaration substitutes its own value where the fragment reads the
+    /// parameter.
+    pub fn input(&mut self, shape: Shape, dtype: DType) -> ValueId {
+        self.value(shape, dtype)
     }
 
     fn push(
@@ -226,9 +676,53 @@ impl TraceBuilder {
             OpKind::Matmul {
                 weight: weight.to_string(),
                 beta_one,
+                selector: None,
             },
             vec![x],
             vec![(Shape(vec![rows, Dim::Const(out_width)]), DType::BF16)],
+        )[0]
+    }
+
+    /// The expert-indexed matmul: `weight_template` names a weight bank
+    /// (`layer.0.expert.{e}.gate_up`) and `selector` — a [`Self::topk`]
+    /// index value, `[Tokens, k]` — resolves `{e}` per token. Each token
+    /// row is multiplied against its k selected experts' weights, so the
+    /// result is `[Tokens, k, out_width]` (the driver's route-expanded
+    /// `[N*K, out]` scratch, kept factored because k is a load-time
+    /// constant and Tokens is not). One op = one launch: the grouped
+    /// gate_up/down GEMM of the hand-written MoE pass, whatever strategy
+    /// (cuBLAS batched, aligned blocks, CUTLASS fused) the emitter picks.
+    pub fn matmul_per_token(
+        &mut self,
+        x: ValueId,
+        weight_template: &str,
+        selector: ValueId,
+        out_width: u32,
+    ) -> ValueId {
+        assert!(
+            weight_template.contains("{e}"),
+            "per-token matmul weight must be a template with an {{e}} slot, got {weight_template:?}"
+        );
+        assert_eq!(
+            self.values[selector as usize].dyn_axis,
+            Some(DynAxis::PerToken),
+            "per-token matmul selector must be a dyn PerToken value"
+        );
+        let rows = self.values[x as usize].shape.0[0];
+        let k = self.values[selector as usize].shape.0[1];
+        self.push(
+            OpKind::Matmul {
+                weight: weight_template.to_string(),
+                beta_one: false,
+                selector: Some(selector),
+            },
+            // The selector is an input too — its content is consumed — and
+            // by convention the last one, like matmul_add's residual.
+            vec![x, selector],
+            vec![(
+                Shape(vec![rows, k, Dim::Const(out_width)]),
+                DType::BF16,
+            )],
         )[0]
     }
 
@@ -244,12 +738,19 @@ impl TraceBuilder {
         )[0]
     }
 
-    pub fn rmsnorm_per_head(&mut self, x: ValueId, weight: &str, head_dim: u32) -> ValueId {
+    pub fn rmsnorm_per_head(
+        &mut self,
+        x: ValueId,
+        weight: &str,
+        head_dim: u32,
+        variant: NormVariant,
+    ) -> ValueId {
         let shape = self.values[x as usize].shape.clone();
         self.push(
             OpKind::RmsnormPerHead {
                 weight: weight.to_string(),
                 head_dim,
+                variant,
             },
             vec![x],
             vec![(shape, DType::BF16)],
@@ -277,10 +778,34 @@ impl TraceBuilder {
 
     /// Rope mutates Q and K in place; SSA-wise it produces two new values.
     pub fn rope(&mut self, q: ValueId, k: ValueId, kind: RopeKind) -> (ValueId, ValueId) {
+        self.rope_inner(q, k, kind, None)
+    }
+
+    /// The partial-rotary form: only the first `rotary_dim` channels of
+    /// each head rotate (`launch_rope_partial_bf16`; qwen3.5's
+    /// `partial_rotary_factor` resolved to a channel count — see
+    /// [`OpKind::Rope`]).
+    pub fn rope_partial(
+        &mut self,
+        q: ValueId,
+        k: ValueId,
+        kind: RopeKind,
+        rotary_dim: u32,
+    ) -> (ValueId, ValueId) {
+        self.rope_inner(q, k, kind, Some(rotary_dim))
+    }
+
+    fn rope_inner(
+        &mut self,
+        q: ValueId,
+        k: ValueId,
+        kind: RopeKind,
+        partial: Option<u32>,
+    ) -> (ValueId, ValueId) {
         let q_shape = self.values[q as usize].shape.clone();
         let k_shape = self.values[k as usize].shape.clone();
         let out = self.push(
-            OpKind::Rope { kind },
+            OpKind::Rope { kind, partial },
             vec![q, k],
             vec![(q_shape, DType::BF16), (k_shape, DType::BF16)],
         );
@@ -302,12 +827,262 @@ impl TraceBuilder {
         )[0]
     }
 
-    pub fn swiglu(&mut self, packed: ValueId, inter: u32) -> ValueId {
-        let rows = self.values[packed as usize].shape.0[0];
+    /// A STATED kernel launch ([`OpKind::Launch`]) — the recording half of
+    /// the raw kernel signatures in [`crate::dsl::cuda`]; declarations
+    /// call those, never this.
+    pub fn launch(
+        &mut self,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        inputs: Vec<ValueId>,
+        out_shapes: Vec<(Shape, DType)>,
+    ) -> Vec<ValueId> {
         self.push(
-            OpKind::Swiglu { inter },
+            OpKind::Launch {
+                kernel: kernel.to_string(),
+                weights,
+                state,
+            },
+            inputs,
+            out_shapes,
+        )
+    }
+
+    /// SwiGLU halves the trailing gate‖up dim and keeps every leading dim,
+    /// so it covers both the dense `[Tokens, 2*inter]` activation and the
+    /// route-expanded `[Tokens, k, 2*inter]` one (the driver's
+    /// `chunked_swiglu` over `N*K` rows).
+    pub fn swiglu(&mut self, packed: ValueId, inter: u32) -> ValueId {
+        let mut shape = self.values[packed as usize].shape.clone();
+        *shape.0.last_mut().expect("swiglu input has a trailing dim") = Dim::Const(inter);
+        self.push(OpKind::Swiglu { inter }, vec![packed], vec![(shape, DType::BF16)])[0]
+    }
+
+    /// Router top-k: `(indices, weights)`, both `[Tokens, k]`. The indices
+    /// are the trace's first `dyn` value ([`DynAxis::PerToken`]); the
+    /// weights are already softmaxed and renormalized, because the launch
+    /// this op mirrors (`launch_topk_softmax_bf16`) does all three.
+    pub fn topk(&mut self, logits: ValueId, k: u32) -> (ValueId, ValueId) {
+        let rows = self.values[logits as usize].shape.0[0];
+        let out = self.push(
+            OpKind::TopK { k },
+            vec![logits],
+            vec![
+                (Shape(vec![rows, Dim::Const(k)]), DType::I32),
+                (Shape(vec![rows, Dim::Const(k)]), DType::F32),
+            ],
+        );
+        self.values[out[0] as usize].dyn_axis = Some(DynAxis::PerToken);
+        (out[0], out[1])
+    }
+
+    /// The top-k combine: collapse `x` (`[Tokens, k, d]`) to `[Tokens, d]`
+    /// under per-token `weights` (`[Tokens, k]`). Operand order: weights,
+    /// then the value they weight.
+    pub fn weighted_sum(&mut self, weights: ValueId, x: ValueId) -> ValueId {
+        let x_shape = &self.values[x as usize].shape.0;
+        let (rows, d) = (x_shape[0], x_shape[2]);
+        let k = match self.values[weights as usize].shape.0[1] {
+            Dim::Const(k) => k,
+            other => panic!("weighted_sum weights must have a Const k dim, got {other:?}"),
+        };
+        self.push(
+            OpKind::WeightedSum { k },
+            vec![weights, x],
+            vec![(Shape(vec![rows, d]), DType::BF16)],
+        )[0]
+    }
+
+    /// The shared-expert landing: `base + sigmoid(gate) * x`. Operand
+    /// order mirrors [`Self::residual_add`] — the fresh value first, the
+    /// stream it lands on last — and the result is the (new SSA id of the)
+    /// combined value.
+    pub fn sigmoid_gate_add(&mut self, x: ValueId, gate: ValueId, base: ValueId) -> ValueId {
+        let shape = self.values[base as usize].shape.clone();
+        self.push(
+            OpKind::SigmoidGateAdd,
+            vec![x, gate, base],
+            vec![(shape, DType::BF16)],
+        )[0]
+    }
+
+    /// The two-way GDN split: packed `[rows, w0 + w1]` into `[rows, w0]`
+    /// and `[rows, w1]` at `w0`.
+    pub fn split_gdn(
+        &mut self,
+        packed: ValueId,
+        width0: u32,
+        width1: u32,
+    ) -> (ValueId, ValueId) {
+        let rows = self.values[packed as usize].shape.0[0];
+        let out = self.push(
+            OpKind::SplitGdn { width0, width1 },
             vec![packed],
-            vec![(Shape(vec![rows, Dim::Const(inter)]), DType::BF16)],
+            vec![
+                (Shape(vec![rows, Dim::Const(width0)]), DType::BF16),
+                (Shape(vec![rows, Dim::Const(width1)]), DType::BF16),
+            ],
+        );
+        (out[0], out[1])
+    }
+
+    /// The interleaved per-head `[query | gate]` split of a 2×-wide gated
+    /// q projection: packed `[rows, heads * 2 * head_dim]` into (q, gate),
+    /// each `[rows, heads * head_dim]`. See [`OpKind::SplitQGate`] for why
+    /// this is not a [`Self::split_gdn`] row split.
+    pub fn split_q_gate(
+        &mut self,
+        packed: ValueId,
+        heads: u32,
+        head_dim: u32,
+    ) -> (ValueId, ValueId) {
+        let rows = self.values[packed as usize].shape.0[0];
+        match self.values[packed as usize].shape.0[1] {
+            Dim::Const(w) if w == 2 * heads * head_dim => {}
+            other => panic!(
+                "split_q_gate input width {other:?} must be 2 * {heads} * {head_dim}"
+            ),
+        }
+        let half = Shape(vec![rows, Dim::Const(heads * head_dim)]);
+        let out = self.push(
+            OpKind::SplitQGate { heads, head_dim },
+            vec![packed],
+            vec![(half.clone(), DType::BF16), (half, DType::BF16)],
+        );
+        (out[0], out[1])
+    }
+
+    /// The multiply-only output gate: `out = x * sigmoid(gate)`, both
+    /// operands the same shape ([`OpKind::SigmoidGateMul`] — no residual,
+    /// unlike [`Self::sigmoid_gate_add`]).
+    pub fn sigmoid_gate_mul(&mut self, x: ValueId, gate: ValueId) -> ValueId {
+        let shape = self.values[x as usize].shape.clone();
+        assert_eq!(
+            shape, self.values[gate as usize].shape,
+            "sigmoid_gate_mul operands must share a shape"
+        );
+        self.push(
+            OpKind::SigmoidGateMul,
+            vec![x, gate],
+            vec![(shape, DType::BF16)],
+        )[0]
+    }
+
+    /// Depthwise causal conv1d (+ fused SiLU) over the packed qkv, against
+    /// layer `layer`'s per-request conv state. Shape-preserving.
+    pub fn causal_conv1d(
+        &mut self,
+        layer: u32,
+        qkv: ValueId,
+        weight: &str,
+        kernel: u32,
+    ) -> ValueId {
+        let shape = self.values[qkv as usize].shape.clone();
+        self.push(
+            OpKind::CausalConv1d {
+                weight: weight.to_string(),
+                layer,
+                kernel,
+            },
+            vec![qkv],
+            vec![(shape, DType::BF16)],
+        )[0]
+    }
+
+    /// The post-conv GDN prep: `(q, k, v, g, beta)`, all f32, with q/k in
+    /// the compact `[Tokens, key_heads, key_dim]` per-head layout and v in
+    /// `[Tokens, value_heads, value_dim]`. Operand order `[qkv, a, b]` is
+    /// the kernel's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_prep(
+        &mut self,
+        qkv: ValueId,
+        a: ValueId,
+        b: ValueId,
+        a_log: &str,
+        dt_bias: &str,
+        key_heads: u32,
+        key_dim: u32,
+        value_heads: u32,
+        value_dim: u32,
+    ) -> (ValueId, ValueId, ValueId, ValueId, ValueId) {
+        let rows = self.values[qkv as usize].shape.0[0];
+        let qk = Shape(vec![rows, Dim::Const(key_heads), Dim::Const(key_dim)]);
+        let out = self.push(
+            OpKind::GdnPrep {
+                a_log: a_log.to_string(),
+                dt_bias: dt_bias.to_string(),
+            },
+            vec![qkv, a, b],
+            vec![
+                (qk.clone(), DType::F32),
+                (qk, DType::F32),
+                (
+                    Shape(vec![rows, Dim::Const(value_heads), Dim::Const(value_dim)]),
+                    DType::F32,
+                ),
+                (Shape(vec![rows, Dim::Const(value_heads)]), DType::F32),
+                (Shape(vec![rows, Dim::Const(value_heads)]), DType::F32),
+            ],
+        );
+        (out[0], out[1], out[2], out[3], out[4])
+    }
+
+    /// The gated-delta recurrence against layer `layer`'s per-request
+    /// recurrent state. The core output keeps v's `[Tokens, Vh, Vd]` shape.
+    pub fn gated_delta(
+        &mut self,
+        layer: u32,
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        g: ValueId,
+        beta: ValueId,
+    ) -> ValueId {
+        let shape = self.values[v as usize].shape.clone();
+        self.push(
+            OpKind::GatedDelta { layer },
+            vec![q, k, v, g, beta],
+            vec![(shape, DType::F32)],
+        )[0]
+    }
+
+    /// The gated RMSNorm landing: per-head norm of the rank-3 f32 core
+    /// output, silu-gated by `gate`, flattened to `gate`'s `[Tokens,
+    /// Vh * Vd]` bf16 shape (the fused fp32→bf16 conversion).
+    pub fn rmsnorm_gated(&mut self, x: ValueId, gate: ValueId, weight: &str) -> ValueId {
+        let x_elems: u32 = self.values[x as usize].shape.0[1..]
+            .iter()
+            .map(|d| match d {
+                Dim::Const(c) => *c,
+                other => panic!("rmsnorm_gated x must have Const head dims, got {other:?}"),
+            })
+            .product();
+        let gate_shape = self.values[gate as usize].shape.clone();
+        match gate_shape.0[1] {
+            Dim::Const(w) if w == x_elems => {}
+            other => panic!("rmsnorm_gated gate width {other:?} must equal x's flattened {x_elems}"),
+        }
+        self.push(
+            OpKind::RmsnormGated {
+                weight: weight.to_string(),
+            },
+            vec![x, gate],
+            vec![(gate_shape, DType::BF16)],
+        )[0]
+    }
+
+    /// The post-norm residual landing: `residual += x`. Operand order
+    /// mirrors [`Self::matmul_add`] — the freshly computed value first,
+    /// the residual stream it lands on appended — and the result is the
+    /// (new SSA id of the) accumulated stream.
+    pub fn residual_add(&mut self, x: ValueId, residual: ValueId) -> ValueId {
+        let shape = self.values[residual as usize].shape.clone();
+        self.push(
+            OpKind::ResidualAdd,
+            vec![x, residual],
+            vec![(shape, DType::BF16)],
         )[0]
     }
 

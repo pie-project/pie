@@ -225,6 +225,49 @@ class Dispatch {
         const pie_native::LaunchView& resolved_view,
         std::span<const std::uint32_t> program_token_starts);
 
+    // ── Hook prepared mode (stage 6 increment 4 + eager unification) ────
+    // Fire-level prepare pass for a hook fire. Since the eager-path
+    // unification the batch engine runs it for EVERY pure-decode hook fire
+    // — eager and graph alike — so both modes drive the attention phases
+    // through one prepare-then-launch seam; graph mode adds capture/replay
+    // on top. Hoists EVERY attention-phase prepare — binding
+    // assembly, grouping, `prepare_generated_stage` (stable per-occurrence
+    // buffers), channel-effect application, score-sideband sizing — out of
+    // the body, in the exact (layer-major, OnAttnProj-then-OnAttn) order the
+    // body will consume them. After a nonzero return the launch is in
+    // prepared mode: `execute_attention_phase` becomes a pure launch replay
+    // against the stored cursor (loud throw on any order mismatch), which is
+    // what a captured graph records and what a replayed graph re-executes.
+    //
+    // Returns a fingerprint over every address and grid the captured body
+    // bakes (stable-buffer blocks, channel-ring arrays, sideband-arena
+    // addresses, region launch geometry). The batch engine stores it per
+    // graph key and recaptures when it changes — that is the generation /
+    // growth / instance-churn invalidation in one value. Returns 0 — with NO
+    // side effects on the launch — when this fire cannot run prepared (a
+    // stage reads Query, needs per-fire device allocations, a non-decode
+    // fire, …) and must take the legacy interleaved eager body.
+    struct HookReplayPrepare {
+        const model::AttentionObservation* observation = nullptr;
+        model::HookSidebandArena* arena = nullptr;
+        std::uint32_t num_q_heads = 0;
+        std::uint32_t hook_free_prefix_rows = 0;
+        bool wants_attn_score = false;
+        bool wants_page_mask = false;
+        cudaStream_t stream = nullptr;
+    };
+    std::uint64_t prepare_attention_phases(
+        StagedLaunch& launch,
+        const HookReplayPrepare& in);
+
+    // Structural check: every prepared attention invocation was consumed by
+    // the body that just ran. Run by the batch engine right after a
+    // hook-graph capture AND after every prepared-eager body — the moments
+    // the model's per-layer hook coverage is observable — and never after a
+    // replay (a replayed body does not touch the cursors). Throws on
+    // partial consumption.
+    void verify_hook_capture_consumed(StagedLaunch& launch) const;
+
     // `sideband` carries what the model body published for exactly this hook
     // invocation — the fire's KV geometry, the layer's captured scores, the
     // page-mask destination. An empty sideband is "the body published
@@ -391,6 +434,22 @@ class Dispatch {
                              bool allow_structured_masks = false,
                              StagedLaunch* launch = nullptr,
                              bool allow_device_composed = false);
+
+    // STATIC v1 mask-scope admission check, run at frame admission — before
+    // the arena commit and before any prepare-time state mutation. A
+    // device-geometry program carrying a dense device `AttnMask` channel
+    // composes only SOLO (batch_compose.hpp "out of scope" v1); the runtime
+    // scheduler batches such fires alone, and `prepare_step`'s resolve-time
+    // throw used to be the only defence — reachable AFTER `begin_host` had
+    // applied the wave's channel tickets, so a violating step poisoned every
+    // lane in the frame and leaked the dead lanes' pages. Returns the
+    // offending program's index in `view.ptir_program_hashes` when the step
+    // is MULTI-program and one of its device-geometry programs binds a
+    // dense device mask, -1 otherwise. `allow_structured_masks` mirrors the
+    // resolve path (`resolve_attention_mask`): a mask the structured-mask
+    // recognizer lowers to a runtime window override is not a dense mask.
+    int dense_mask_scope_violation(const pie_native::LaunchView& view,
+                                   bool allow_structured_masks) const;
 
     // Device-composition lowering, split along the frame pipeline: the
     // `stage_*` half (FramePrepare) validates and builds the lane tables —

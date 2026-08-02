@@ -21,6 +21,10 @@
 #include "ops/attention_workspace.hpp"
 #include "store/kv_cache.hpp"
 
+namespace pie_forward {
+class ForwardPlan;
+}
+
 namespace pie_cuda_driver {
 
 class LoadedModel;
@@ -61,6 +65,15 @@ struct ModelCapabilities {
     bool supports_small_prefill_graph = false;
     bool supports_runtime_window       = false;
     bool supports_media_encode         = false;
+    // Stage 6 increment 4: this model's BODY with live stage hooks is
+    // capture-legal for pure-decode fires — every hook-adjacent branch it
+    // takes under capture (score capture, page-mask seeding) is stream work
+    // against stable addresses, and its per-layer hook invocation order is
+    // deterministic. Only llama_like asserts this; the batch engine
+    // additionally requires wants_page_mask == false (host-side control flow
+    // on the mask's written_layer cannot be captured), no lora, and a single
+    // rank before a hook fire may replay a graph.
+    bool supports_hook_graph_capture   = false;
 };
 
 // Polymorphic per-model interface. Implementations hold refs to per-arch
@@ -102,6 +115,19 @@ public:
 
     // Static-at-construction capability flags.
     virtual ModelCapabilities capabilities() const = 0;
+
+    // Optional: the traced + structurally validated declared-forward plan
+    // this model built at construction (PIE_DECLARED_FORWARD opted in AND
+    // the configuration was representable AND the validation passed).
+    // nullptr otherwise — including for every family without a declared
+    // trace. Read once at load, when the capability payload derives the
+    // plan's model-structural site summary (`model_site_summary` in
+    // context.cpp): the driver is the party holding a VALIDATED plan, so
+    // the summary the engine's fire planner consumes is stated here rather
+    // than re-derived runtime-side from binding facts the engine lacks.
+    virtual const pie_forward::ForwardPlan* declared_plan() const {
+        return nullptr;
+    }
 
     // Optional: per-model recurrent state cache (Mamba2 / linear-attn / MTP
     // hidden snapshot). nullptr = model has no recurrent state.

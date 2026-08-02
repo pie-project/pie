@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::trace::{ForwardPlan, Op, OpKind, ValueInfo};
+use crate::trace::{ForwardPlan, Op, OpKind, StateRef, StateStore, ValueInfo};
 
 use super::types::*;
 
@@ -64,8 +64,9 @@ impl Interner {
 /// Flatten one [`ValueInfo`] into the inline-dims POD form.
 ///
 /// Panics if a shape outgrows [`PIE_FORWARD_MAX_DIMS`]. That is a tracer
-/// bug, not caller input — the tracer emits rank-2 shapes today — and the
-/// entry rules turn the panic into an abort rather than a status
+/// bug, not caller input — the tracer emits rank-2 shapes plus the MoE
+/// trace's rank-3 route-expanded values — and the entry rules turn the
+/// panic into an abort rather than a status
 /// (`loader/src/ffi/entry.rs:1-19`).
 fn flatten_value(info: &ValueInfo) -> PieForwardValue {
     assert!(
@@ -84,57 +85,265 @@ fn flatten_value(info: &ValueInfo) -> PieForwardValue {
     }
 }
 
-/// Flatten one [`OpKind`] into (kind tag, weight name, param0, param1).
+/// One op's flattened slots, [`flatten_kind`]'s result.
+///
+/// `aux_names` is a range of NAME indices in the flat id array — empty for
+/// every kind except `Launch`, whose consumed weight names it carries.
+struct OpParts {
+    kind: PieForwardOpKind,
+    weight_name: u32,
+    param0: u32,
+    param1: u32,
+    selector: u32,
+    aux_names: PieForwardIdRange,
+}
+
+impl OpParts {
+    fn plain(parts: (PieForwardOpKind, u32, u32, u32, u32)) -> Self {
+        let (kind, weight_name, param0, param1, selector) = parts;
+        Self {
+            kind,
+            weight_name,
+            param0,
+            param1,
+            selector,
+            aux_names: PieForwardIdRange { offset: 0, len: 0 },
+        }
+    }
+}
+
+/// Flatten one [`OpKind`] into its POD slots.
 ///
 /// The mapping is the table documented on [`PieForwardOp`]; keeping the two
-/// adjacent to one match arm each is what keeps the table honest.
-fn flatten_kind(
-    arena: &mut PlanArena,
-    interner: &mut Interner,
-    kind: &OpKind,
-) -> (PieForwardOpKind, u32, u32, u32) {
+/// adjacent to one match arm each is what keeps the table honest. Only the
+/// expert-indexed `Matmul` carries a selector; everything else rests at
+/// [`PIE_FORWARD_NO_VALUE`].
+fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -> OpParts {
     let mut name = |arena: &mut PlanArena, weight: &str| interner.intern(arena, weight);
-    match kind {
-        OpKind::Embed { weight } => (PieForwardOpKind::Embed, name(arena, weight), 0, 0),
-        OpKind::Matmul { weight, beta_one } => (
+    OpParts::plain(match kind {
+        OpKind::Embed { weight } => (
+            PieForwardOpKind::Embed,
+            name(arena, weight),
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::Matmul {
+            weight,
+            beta_one,
+            selector,
+        } => (
             PieForwardOpKind::Matmul,
             name(arena, weight),
             u32::from(*beta_one),
             0,
+            selector.unwrap_or(PIE_FORWARD_NO_VALUE),
         ),
         OpKind::Rmsnorm { weight, variant } => (
             PieForwardOpKind::Rmsnorm,
             name(arena, weight),
             PieForwardNormVariant::from(*variant) as u32,
             0,
+            PIE_FORWARD_NO_VALUE,
         ),
-        OpKind::RmsnormPerHead { weight, head_dim } => (
+        OpKind::RmsnormPerHead {
+            weight,
+            head_dim,
+            variant,
+        } => (
             PieForwardOpKind::RmsnormPerHead,
             name(arena, weight),
             *head_dim,
-            0,
+            PieForwardNormVariant::from(*variant) as u32,
+            PIE_FORWARD_NO_VALUE,
         ),
         OpKind::SplitQkv { q_width, kv_width } => (
             PieForwardOpKind::SplitQkv,
             PIE_FORWARD_NO_NAME,
             *q_width,
             *kv_width,
+            PIE_FORWARD_NO_VALUE,
         ),
-        OpKind::Rope { kind } => (
+        // Partial rope crosses as param1: the rotary channel count, 0 for
+        // the full rotation (no real partial width is 0 — the driver
+        // clamps to >= 2 — so the resting value cannot be mistaken).
+        OpKind::Rope { kind, partial } => (
             PieForwardOpKind::Rope,
             PIE_FORWARD_NO_NAME,
             PieForwardRopeKind::from(*kind) as u32,
-            0,
+            partial.unwrap_or(0),
+            PIE_FORWARD_NO_VALUE,
         ),
-        OpKind::KvAppend { layer } => {
-            (PieForwardOpKind::KvAppend, PIE_FORWARD_NO_NAME, *layer, 0)
+        OpKind::KvAppend { layer } => (
+            PieForwardOpKind::KvAppend,
+            PIE_FORWARD_NO_NAME,
+            *layer,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::Attention { layer } => (
+            PieForwardOpKind::Attention,
+            PIE_FORWARD_NO_NAME,
+            *layer,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::Swiglu { inter } => (
+            PieForwardOpKind::Swiglu,
+            PIE_FORWARD_NO_NAME,
+            *inter,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::LmHead { weight } => (
+            PieForwardOpKind::LmHead,
+            name(arena, weight),
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::ResidualAdd => (
+            PieForwardOpKind::ResidualAdd,
+            PIE_FORWARD_NO_NAME,
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::TopK { k } => (
+            PieForwardOpKind::TopK,
+            PIE_FORWARD_NO_NAME,
+            *k,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::WeightedSum { k } => (
+            PieForwardOpKind::WeightedSum,
+            PIE_FORWARD_NO_NAME,
+            *k,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::SigmoidGateAdd => (
+            PieForwardOpKind::SigmoidGateAdd,
+            PIE_FORWARD_NO_NAME,
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::SplitGdn { width0, width1 } => (
+            PieForwardOpKind::SplitGdn,
+            PIE_FORWARD_NO_NAME,
+            *width0,
+            *width1,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::CausalConv1d {
+            weight,
+            layer,
+            kernel,
+        } => (
+            PieForwardOpKind::CausalConv1d,
+            name(arena, weight),
+            *layer,
+            *kernel,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        // The one kind that names two weights: the a_log name rides in the
+        // weight slot, the dt_bias name as a param0 NAME INDEX (the table
+        // on `PieForwardOp` documents this).
+        OpKind::GdnPrep { a_log, dt_bias } => {
+            let a_log = name(arena, a_log);
+            let dt_bias = name(arena, dt_bias);
+            (
+                PieForwardOpKind::GdnPrep,
+                a_log,
+                dt_bias,
+                0,
+                PIE_FORWARD_NO_VALUE,
+            )
         }
-        OpKind::Attention { layer } => {
-            (PieForwardOpKind::Attention, PIE_FORWARD_NO_NAME, *layer, 0)
+        OpKind::GatedDelta { layer } => (
+            PieForwardOpKind::GatedDelta,
+            PIE_FORWARD_NO_NAME,
+            *layer,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::RmsnormGated { weight } => (
+            PieForwardOpKind::RmsnormGated,
+            name(arena, weight),
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::SplitQGate { heads, head_dim } => (
+            PieForwardOpKind::SplitQGate,
+            PIE_FORWARD_NO_NAME,
+            *heads,
+            *head_dim,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        OpKind::SigmoidGateMul => (
+            PieForwardOpKind::SigmoidGateMul,
+            PIE_FORWARD_NO_NAME,
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        // The stated launch: the KERNEL name rides the weight slot (the
+        // one name every Launch has), the weight names it consumes ride
+        // `aux_names` (a range of NAME indices in the flat id array, in
+        // signature order), and the state mark rides the params —
+        // param0 = store (0 none, 1 kv-cache, 2 recurrent), param1 = the
+        // state layer.
+        OpKind::Launch {
+            kernel,
+            weights,
+            state,
+        } => {
+            let kernel = name(arena, kernel);
+            let ids: Vec<u32> = weights.iter().map(|w| name(arena, w)).collect();
+            let aux = store_ids(arena, &ids);
+            let (store, layer) = match state {
+                None => (0, 0),
+                Some(StateRef {
+                    store: StateStore::KvCache,
+                    layer,
+                }) => (1, *layer),
+                Some(StateRef {
+                    store: StateStore::RecurrentState,
+                    layer,
+                }) => (2, *layer),
+            };
+            return OpParts {
+                kind: PieForwardOpKind::Launch,
+                weight_name: kernel,
+                param0: store,
+                param1: layer,
+                selector: PIE_FORWARD_NO_VALUE,
+                aux_names: aux,
+            };
         }
-        OpKind::Swiglu { inter } => (PieForwardOpKind::Swiglu, PIE_FORWARD_NO_NAME, *inter, 0),
-        OpKind::LmHead { weight } => (PieForwardOpKind::LmHead, name(arena, weight), 0, 0),
-    }
+        // The lowered branch over a runtime input: predicate in param0,
+        // region lengths in param1/... — then-count in param1, else-count
+        // as a one-entry aux run (the flat id array holds plain u32s;
+        // what a range means is the kind's contract, as with Launch).
+        OpKind::Guard {
+            pred,
+            then_ops,
+            else_ops,
+        } => {
+            let aux = store_ids(arena, &[*else_ops]);
+            return OpParts {
+                kind: PieForwardOpKind::Guard,
+                weight_name: PIE_FORWARD_NO_NAME,
+                param0: *pred as u32,
+                param1: *then_ops,
+                selector: PIE_FORWARD_NO_VALUE,
+                aux_names: aux,
+            };
+        }
+    })
 }
 
 /// Append an op's operand ids to the flat array and describe the run.
@@ -148,15 +357,17 @@ fn store_ids(arena: &mut PlanArena, ids: &[u32]) -> PieForwardIdRange {
 }
 
 fn flatten_op(arena: &mut PlanArena, interner: &mut Interner, op: &Op) -> PieForwardOp {
-    let (kind, weight_name, param0, param1) = flatten_kind(arena, interner, &op.kind);
+    let parts = flatten_kind(arena, interner, &op.kind);
     let inputs = store_ids(arena, &op.inputs);
     let outputs = store_ids(arena, &op.outputs);
     PieForwardOp {
-        kind,
+        kind: parts.kind,
         layer: op.layer.map_or(PIE_FORWARD_NO_LAYER, |l| l as i32),
-        weight_name,
-        param0,
-        param1,
+        weight_name: parts.weight_name,
+        param0: parts.param0,
+        param1: parts.param1,
+        selector: parts.selector,
+        aux_names: parts.aux_names,
         inputs,
         outputs,
     }

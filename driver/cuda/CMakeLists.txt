@@ -440,6 +440,7 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/glm5/glm5.cpp
   src/model/glm5/glm5_forward.cpp
   src/model/glm5/glm5_model.cpp
+  src/model/hook_sideband_arena.cpp
   src/model/kimi/kimi.cpp
   src/model/kimi/kimi_forward.cpp
   src/model/kimi/kimi_model.cpp
@@ -455,6 +456,8 @@ set(PIE_CUDA_MODEL_SOURCES
   src/model/nemotron_h/nemotron_h.cpp
   src/model/nemotron_h/nemotron_h_forward.cpp
   src/model/nemotron_h/nemotron_h_model.cpp
+  src/model/qwen3_5/declared_facts.cpp
+  src/model/qwen3_5/declared_forward.cpp
   src/model/qwen3_5/qwen3_5.cpp
   src/model/qwen3_5/qwen3_5_config.cpp
   src/model/qwen3_5/qwen3_5_forward.cpp
@@ -982,6 +985,10 @@ pie_add_cuda_target(test_decode_fused_write_parity
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_graph_padding_kv_canary
   SOURCES tests/test_graph_padding_kv_canary.cu
+  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  LIBS pie_driver_cuda_lib CUDA::cudart)
+pie_add_cuda_target(test_generated_lane_grid_padding
+  SOURCES tests/test_generated_lane_grid_padding.cu
   INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/tests
   LIBS pie_driver_cuda_lib CUDA::cudart)
 pie_add_cuda_target(test_decode_cobatch_chain

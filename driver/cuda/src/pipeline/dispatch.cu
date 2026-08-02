@@ -22,6 +22,7 @@
 #include <mutex>
 #include <thread>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -48,6 +49,7 @@
 #include "model/attn_observation.hpp"
 #include "model/attn_page_mask.hpp"
 #include "model/attn_score.hpp"
+#include "model/hook_sideband_arena.hpp"
 #include "model/lora.hpp"
 #include "store/kv_cache.hpp"
 
@@ -1431,6 +1433,14 @@ struct Dispatch::Impl {
     bool attn_page_mask_available = false;
     bool lora_available = false;
     std::function<void()> enable_kv_envelopes;
+    // Hook-graph replay (stage 6 increment 4): a static device table of
+    // layer indices [0, 1, …, model_layers). In prepared mode each
+    // occurrence's lane metadata points `layer_base` at `&table[L]` instead
+    // of relying on the eager path's per-invocation H2D memcpy of a STACK
+    // variable — a captured memcpy node would re-read that dead stack slot
+    // on every replay. Same values, address-stable, contents immutable.
+    std::uint32_t* hook_layer_table = nullptr;
+    std::uint32_t hook_layer_table_len = 0;
 };
 
 struct StagedLane {
@@ -1471,6 +1481,52 @@ struct StagedLane {
     std::vector<std::uint64_t> mtp_logits_bf16_rows;
     const std::uint8_t* row_valid = nullptr;
     std::uint32_t row_valid_offset = 0;
+};
+
+// ── Hook prepared mode (stage 6 increment 4 + eager unification) ────────────
+// One fire's hoisted attention-phase work, in body order. Filled by
+// `Dispatch::prepare_attention_phases` — run by the batch engine for EVERY
+// pure-decode hook fire, eager and graph alike — consumed by the
+// prepared-mode branch of `execute_attention_phase` — exactly once per
+// invocation, cursor-checked.
+
+// A body-side gather that materializes one lane's padded `[kv_max]` AttnScore
+// row from the layer's folded capture. Replaces the eager path's host-sized
+// cudaMallocAsync + memset + D2D copy (`resolve_lane_attn_score`), whose
+// capture-time sizes and offsets would go stale as the KV grows: here the
+// live extent comes from the DEVICE CSR the prepare pass refreshes per fire,
+// and the grid is a function of the program-declared ceiling alone.
+struct HookScorePadLaunch {
+    const float* folded = nullptr;              // arena score slot (stable)
+    const std::uint32_t* folded_indptr = nullptr;  // arena score-rows CSR
+    float* row = nullptr;                       // arena score-rows row
+    std::uint32_t request = 0;
+    std::uint32_t kv_max = 0;
+};
+
+struct HookPreparedGroup {
+    std::unique_ptr<generated::GeneratedStagePrepared> prepared;
+    std::vector<HookScorePadLaunch> score_pads;
+};
+
+struct HookPreparedInvocation {
+    std::uint32_t layer = 0;
+    std::vector<HookPreparedGroup> groups;
+    // OnAttn invocations whose stages read AttnScore: at capture time the
+    // prepared-mode execute validates the model actually published this
+    // layer's capture INTO the planned arena slot — the one moment the
+    // model's branch choice (windowed layer, xqa path, prefill capture) is
+    // observable. A mismatch is a loud throw, never a silently-stale row.
+    bool expects_scores = false;
+    const float* expected_folded = nullptr;
+    // Invocations whose stages write `attn_page_mask`: the prepared-mode
+    // execute must perform the resolver's HOST half — tagging the model's
+    // sink with `written_layer` so the body's compact branch fires — and
+    // validates the model's sink is the arena block the pass planned
+    // against (the addresses the captured kernels bake).
+    bool marks_mask = false;
+    const std::uint8_t* expected_mask_keep = nullptr;
+    std::uint32_t expected_mask_stride = 0;
 };
 
 struct StagedLaunch::State {
@@ -1525,6 +1581,18 @@ struct StagedLaunch::State {
     std::array<std::uint32_t, 4> phase_invocations{};
     bool active = true;
     bool failed = false;
+    // Hook-graph prepared mode (stage 6 increment 4). When set, every
+    // attention-phase invocation was prepared at fire level and
+    // `execute_attention_phase` only replays launches, cursor-checked
+    // against the exact (phase, layer) order the prepare pass recorded.
+    // `prepared_attn[phase - PTIR_STAGE_ON_ATTN_PROJ]`.
+    bool hook_graph_prepared = false;
+    std::array<std::vector<HookPreparedInvocation>, 2> prepared_attn;
+    std::array<std::size_t, 2> prepared_cursor{};
+    // Host CSR of folded score offsets, uploaded to the arena's score-rows
+    // block by the prepare pass; owned here so the upload's source outlives
+    // the enqueue.
+    std::vector<std::uint32_t> hook_folded_offsets_h;
 };
 
 namespace {
@@ -1723,6 +1791,9 @@ struct NotifyContext {
 };
 
 Dispatch::Impl::~Impl() {
+    if (hook_layer_table != nullptr) {
+        cudaFree(hook_layer_table);
+    }
     if (d_fixed_decode_kills != nullptr) {
         cudaFree(d_fixed_decode_kills);
     }
@@ -2483,6 +2554,33 @@ PreparedCursor lane_ticket_window(
         break;
     }
     return cursor;
+}
+
+// Hook-graph mode's device-resolved AttnScore materialization (stage 6
+// increment 4). One padded `[kv_max]` row per (layer, lane), gathered from
+// the layer's folded capture INSIDE the body: the live extent comes from the
+// device CSR (refreshed before every replay by the captured
+// `LayerScoreCapture` upload reading prepare-refreshed host storage), the
+// grid from the program-declared ceiling alone — so the recorded launch is
+// replay-stable while the eager path's host-sized malloc+memset+memcpy
+// (`resolve_lane_attn_score`) is not. Slack beyond the live extent reads as
+// 0.0, the intrinsic's defined value for positions that do not exist —
+// byte-identical to the eager path's zero-filled row.
+__global__ void k_hook_attn_score_pad(
+    const float* __restrict__ folded,
+    const std::uint32_t* __restrict__ folded_indptr,
+    std::uint32_t request,
+    float* __restrict__ row,
+    std::uint32_t kv_max) {
+    const std::uint32_t begin = folded_indptr[request];
+    const std::uint32_t end = folded_indptr[request + 1];
+    const std::uint32_t kv_len = end >= begin ? end - begin : 0u;
+    for (std::uint32_t index =
+             blockIdx.x * blockDim.x + threadIdx.x;
+         index < kv_max;
+         index += gridDim.x * blockDim.x) {
+        row[index] = index < kv_len ? folded[begin + index] : 0.0f;
+    }
 }
 
 __global__ void cast_query_bf16_to_f32(
@@ -4602,6 +4700,9 @@ void execute_declared_phase(
             .finalize = false,
             .time_sections = probing,
         };
+        const bool attention_phase =
+            phase == PTIR_STAGE_ON_ATTN_PROJ ||
+            phase == PTIR_STAGE_ON_ATTN;
         auto execute_group = [&](ExecutionGroup& group,
                                  cudaStream_t target_stream) {
             Task& first = *group.first;
@@ -4615,13 +4716,42 @@ void execute_declared_phase(
                     "registered PTIR stage has no generated execution: " +
                     generated_reason);
             }
-            GroupedLaunchResult result =
-                generated::run_generated_stage(
+            GroupedLaunchResult result;
+            if (attention_phase) {
+                // Attention phases through the prepare/body seam with stable
+                // per-stage buffers (stage 6 increment 1), interleaved at
+                // hook time. Since the eager unification this branch runs
+                // only for fires the fire-level prepare pass VETOED (see
+                // `execute_attention_phase`'s fallback comment) — prepared
+                // pure-decode hook fires consume the fire-level cursor
+                // instead and never come through here. Same seam either way:
+                // `prepare_generated_stage` does every piece of host work
+                // (metadata build, channel-cursor reads, elision analysis,
+                // side-table uploads, pack + upload) and
+                // `launch_generated_stage` is a host-work-free body reading
+                // only prepared state — no rotating rings and no
+                // cudaEventSynchronize on this path.
+                const auto prepared = generated::prepare_generated_stage(
+                    group.bindings,
+                    *first.executable,
+                    launch.owner->generated_runtime,
+                    target_stream,
+                    execution_options,
+                    generated::PreparedBufferMode::kStablePerStage);
+                result = generated::launch_generated_stage(*prepared);
+            } else {
+                // Prologue / Epilogue: the ring-backed combined wrapper,
+                // deliberately untouched by the eager unification.
+                // TODO(stage6-plan.md increment 1): migrate them onto the
+                // prepared kStablePerStage path too and retire the rotating
+                // rings entirely.
+                result = generated::run_generated_stage_ring(
                     group.bindings,
                     *first.executable,
                     launch.owner->generated_runtime,
                     target_stream,
                     execution_options);
+            }
             if (probing && result.t_build_us >= 0) {
                 auto bump = [](std::int64_t& total, std::int64_t part) {
                     total = (total < 0 ? 0 : total) + part;
@@ -5159,6 +5289,725 @@ void Dispatch::update_launch_geometry(
     }
 }
 
+namespace {
+
+// FNV-ish accumulator for the hook-graph replay fingerprint. Everything a
+// captured body BAKES — device addresses recorded as kernel arguments and
+// grid geometry — flows through this; the batch engine recaptures whenever
+// the value changes, which is the growth/generation/instance-churn
+// invalidation in one comparison.
+inline void hook_fp_mix(std::uint64_t& hash, std::uint64_t value) {
+    hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 12) + (hash >> 4);
+    hash *= 0x100000001b3ull;
+}
+
+inline void hook_fp_mix_ptr(std::uint64_t& hash, const void* pointer) {
+    hook_fp_mix(hash, reinterpret_cast<std::uintptr_t>(pointer));
+}
+
+void hook_fp_mix_shape(std::uint64_t& hash, const GroupedRowShape& shape) {
+    hook_fp_mix(hash, shape.max_rows);
+    hook_fp_mix(hash, shape.max_columns);
+    hook_fp_mix(hash, shape.rows.max_numel);
+    hook_fp_mix(hash, shape.rows.elements_per_extent);
+    hook_fp_mix(hash, shape.rows.extent);
+    hook_fp_mix(hash, shape.columns.max_numel);
+    hook_fp_mix(hash, shape.columns.elements_per_extent);
+    hook_fp_mix(hash, shape.columns.extent);
+}
+
+// Mix every field of a prepared launch that the captured body bakes into a
+// recorded kernel node: grids, block-shape scalars, value ids, and the
+// device-side argument block addresses.
+void hook_fp_mix_prepared(
+    std::uint64_t& hash,
+    const generated::GeneratedStagePrepared& prepared) {
+    hook_fp_mix(hash, prepared.lane_count);
+    hook_fp_mix(hash, prepared.padded_lane_count);
+    hook_fp_mix(hash, prepared.value_count);
+    hook_fp_mix_ptr(hash, prepared.device_header);
+    hook_fp_mix_ptr(hash, prepared.device_lanes);
+    hook_fp_mix_ptr(hash, prepared.device_readiness);
+    hook_fp_mix_ptr(hash, prepared.device_readiness_slots);
+    hook_fp_mix_ptr(hash, prepared.device_scratch);
+    hook_fp_mix_ptr(hash, prepared.ring_full);
+    hook_fp_mix_ptr(hash, prepared.ring_head);
+    hook_fp_mix_ptr(hash, prepared.ring_tail);
+    hook_fp_mix_ptr(hash, prepared.ring_cap1);
+    hook_fp_mix(hash, prepared.readiness_diagnose);
+    hook_fp_mix(hash, prepared.arg_header);
+    hook_fp_mix(hash, prepared.arg_lanes);
+    hook_fp_mix(hash, prepared.arg_channels);
+    hook_fp_mix(hash, prepared.arg_descriptors);
+    hook_fp_mix(hash, prepared.arg_params);
+    hook_fp_mix(hash, prepared.arg_offsets);
+    hook_fp_mix(hash, prepared.arg_scratch);
+    hook_fp_mix(hash, prepared.arg_value_count);
+    hook_fp_mix(hash, prepared.arg_scratch_stride);
+    hook_fp_mix(hash, prepared.arg_temporary_offset);
+    hook_fp_mix(hash, prepared.arg_pending);
+    hook_fp_mix(hash, prepared.arg_intrinsic_bases);
+    hook_fp_mix(hash, prepared.arg_intrinsic_modes);
+    hook_fp_mix(hash, prepared.arg_intrinsic_widths);
+    hook_fp_mix(hash, prepared.arg_intrinsic_strides);
+    hook_fp_mix(hash, prepared.arg_intrinsic_offsets);
+    hook_fp_mix(hash, prepared.regions.size());
+    for (const auto& region : prepared.regions) {
+        hook_fp_mix(hash, static_cast<std::uint64_t>(region.kind));
+        hook_fp_mix_ptr(hash, region.region);
+        hook_fp_mix(hash, region.nucleus_segments);
+        hook_fp_mix(hash, region.nucleus.rows);
+        hook_fp_mix(hash, region.nucleus.len);
+        hook_fp_mix(hash, region.nucleus.logits_kind);
+        hook_fp_mix_ptr(hash, region.device_dests);
+        hook_fp_mix(hash, region.mask_dtype);
+        hook_fp_mix_ptr(hash, region.device_envelopes);
+        hook_fp_mix(hash, region.max_pages);
+        hook_fp_mix(hash, region.scan_blocks);
+        hook_fp_mix_shape(hash, region.shape_a);
+        hook_fp_mix_shape(hash, region.shape_b);
+        hook_fp_mix(hash, region.dynamic_shape.max_numel);
+        hook_fp_mix(hash, region.dynamic_shape.elements_per_extent);
+        hook_fp_mix(hash, region.dynamic_shape.extent);
+        hook_fp_mix(hash, region.value_a);
+        hook_fp_mix(hash, region.value_b);
+        hook_fp_mix(hash, region.out_a);
+        hook_fp_mix(hash, region.out_b);
+        hook_fp_mix(hash, region.matmul_grid);
+        hook_fp_mix(hash, region.topk_rows);
+        hook_fp_mix(hash, region.topk_length);
+        hook_fp_mix(hash, region.topk_k);
+        hook_fp_mix(hash, region.topk_is_sort ? 1u : 0u);
+        hook_fp_mix(hash, region.topk_vocab);
+    }
+}
+
+// The eager path's per-stage AttnScore width walk (mirrors
+// `execute_declared_phase`'s value_base loop): the declared ceiling the pad
+// row is sized by. Returns 0 when the stage reads no scores; returns
+// nullopt on a width conflict the eager path would refuse.
+std::optional<std::uint64_t> hook_stage_attn_score_width(
+    const plan::StagePlan& stage,
+    const GroupedLaneBinding& binding) {
+    std::uint64_t attn_score_kv_max = 0;
+    std::uint32_t value_base = 0;
+    for (const auto& normalized : stage.ops) {
+        if (normalized.op.tag == PTIR_OP_INTRINSIC_VAL &&
+            normalized.op.intr == PTIR_INTR_ATTN_SCORE) {
+            if (value_base >= stage.value_types.size()) {
+                return std::nullopt;
+            }
+            const std::uint64_t declared = grouped_numel(
+                stage.value_types[value_base], binding);
+            if (attn_score_kv_max != 0 && attn_score_kv_max != declared) {
+                return std::nullopt;
+            }
+            attn_score_kv_max = declared;
+        }
+        value_base += normalized.op.results;
+    }
+    return attn_score_kv_max;
+}
+
+}  // namespace
+
+std::uint64_t Dispatch::prepare_attention_phases(
+    StagedLaunch& launch,
+    const HookReplayPrepare& in) {
+    StagedLaunch::State& state = *launch.state_;
+    // Veto diagnostics ([hook-graph] evidence): every 0 return names its
+    // reason under PIE_HOOK_GRAPH_TRACE, so an eager fallback is always
+    // attributable.
+    auto veto = [](const char* reason) -> std::uint64_t {
+        static const bool trace = [] {
+            const char* v = std::getenv("PIE_HOOK_GRAPH_TRACE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (trace) {
+            std::fprintf(
+                stderr, "[hook-graph] prepare veto reason=%s\n", reason);
+        }
+        return 0;
+    };
+    if (!state.active || state.failed || state.hook_graph_prepared) {
+        return veto("launch state");
+    }
+    // NOTE: `in.stream` may be the legacy default stream (nullptr) — the
+    // engine's submission stream — which is a valid stream handle for every
+    // enqueue this pass performs.
+    if (in.observation == nullptr || !in.observation->usable()) {
+        return veto("no usable observation");
+    }
+    const std::uint32_t layers = impl_->model_layers;
+    if (layers == 0 || !impl_->attention_hook_coverage) {
+        return veto("no attention hook coverage");
+    }
+    const model::AttentionObservation& obs = *in.observation;
+    if (obs.total_tokens != obs.num_requests) {
+        // Decode-only by contract (the caller gates on `is_pure_decode` too;
+        // this is the seam's own restatement): the sideband planners below
+        // are decode-shaped — `prepare_decode_score_capture` sizes one query
+        // row per request, while a prefill fire's body publishes the PREFILL
+        // score capture, whose window-row carve lands the folded row at a
+        // different arena address than the plan would bake. Non-decode hook
+        // fires run the legacy interleaved eager body.
+        return veto("non-decode fire");
+    }
+
+    constexpr std::uint8_t kPhases[2] = {
+        PTIR_STAGE_ON_ATTN_PROJ, PTIR_STAGE_ON_ATTN};
+
+    // ── Feasibility scan — read-only; a 0 return here has no side effects
+    // and the caller runs the eager body (which reproduces, loudly, any
+    // refusal the eager path would have made anyway). Excluded from v0
+    // capture: Query readers (the bf16→f32 cast allocates in the body),
+    // page-mask sinks and envelope_dot (per-fire device side tables +
+    // host-side mask control flow), scalable nucleus (per-fire workspace
+    // allocations), and logits-family intrinsics (no logits exist in an
+    // attention phase).
+    bool any_attn_score = false;
+    bool any_page_mask = false;
+    for (const std::uint8_t phase : kPhases) {
+        for (const auto& lane_ptr : state.lanes) {
+            const StagedLane& lane = *lane_ptr;
+            if (lane.plans == nullptr || lane.plan_identities == nullptr ||
+                lane.generated_program == nullptr) {
+                return veto("lane has no compiled plans");
+            }
+            for (const plan::StagePlan* stage :
+                 (*lane.phase_plans)[phase]) {
+                if (stage->ops.empty()) continue;
+                if (stage_uses_intrinsic(*stage, PTIR_INTR_QUERY) ||
+                    stage_uses_intrinsic(*stage, PTIR_INTR_LOGITS) ||
+                    stage_uses_intrinsic(*stage, PTIR_INTR_MTP_LOGITS) ||
+                    stage_uses_intrinsic(*stage, PTIR_INTR_MTP_DRAFTS)) {
+                    return veto("stage reads Query/logits intrinsics");
+                }
+                if (stage_calls_kernel(*stage, "envelope_dot") ||
+                    stage_calls_sink(*stage, "lora")) {
+                    return veto("stage calls envelope_dot/lora");
+                }
+                if (stage_calls_sink(*stage, "attn_page_mask")) {
+                    // The mask SINK is replayable: its destination rows are
+                    // arena-stable, its consumer branch in the model body
+                    // (`FirePageMask::written_for`) is host-STRUCTURAL —
+                    // tagged by the resolver whenever the stage carries the
+                    // sink, never read back from device state — and the
+                    // compaction that honours it is device-resolved against
+                    // the live CSR. (stage6-plan.md's v0 sketch excluded
+                    // this class on the belief the branch read device-era
+                    // state; it does not — see resolve_lane_page_mask.)
+                    any_page_mask = true;
+                }
+                for (const auto& region : stage->fused.regions) {
+                    if (region.library &&
+                        region.library_op == PTIR_LIBRARY_NUCLEUS_SAMPLE &&
+                        !grouped_nucleus_library_supported(*stage, region)) {
+                        return veto("scalable nucleus region");
+                    }
+                }
+                const std::size_t stage_index = static_cast<std::size_t>(
+                    stage - lane.plans->data());
+                if (stage_index >= lane.generated_program->stages.size() ||
+                    lane.generated_program->stages[stage_index] == nullptr) {
+                    return veto("stage has no generated executable");
+                }
+                if (stage_uses_intrinsic(*stage, PTIR_INTR_ATTN_SCORE)) {
+                    // Scores exist only at OnAttn; anywhere else the eager
+                    // resolver throws.
+                    if (phase != PTIR_STAGE_ON_ATTN) {
+                        return veto("AttnScore outside OnAttn");
+                    }
+                    any_attn_score = true;
+                }
+            }
+        }
+    }
+    if (any_attn_score &&
+        (!in.wants_attn_score || in.arena == nullptr ||
+         in.num_q_heads == 0)) {
+        return veto("score fire without capture wiring");
+    }
+    if (any_page_mask && (!in.wants_page_mask || in.arena == nullptr)) {
+        return veto("mask fire without mask wiring");
+    }
+
+    // ── Page-mask sideband plan: mirror `FirePageMask`'s carve so the
+    // per-lane sink destinations (and the compaction outputs the captured
+    // attention reads) are known — and the arena pre-grown — before the
+    // body constructs the real thing.
+    model::PageMaskCapturePlan mask_plan;
+    if (any_page_mask) {
+        mask_plan = model::prepare_page_mask_capture(
+            in.arena, obs, in.stream);
+        if (!mask_plan.ok ||
+            mask_plan.num_requests !=
+                static_cast<std::uint32_t>(obs.num_requests)) {
+            return veto("page-mask plan failed");
+        }
+    }
+
+    // Request-boundary resolution per lane (mirrors the eager resolvers): a
+    // sideband-consuming lane that does not start at a request boundary
+    // vetoes here, and the eager body then makes the same refusal loudly.
+    std::vector<int> lane_request(state.lanes.size(), -1);
+    for (std::size_t lane_index = 0;
+         lane_index < state.lanes.size();
+         ++lane_index) {
+        const StagedLane& lane = *state.lanes[lane_index];
+        for (int r = 0; r < obs.num_requests; ++r) {
+            if (obs.qo_indptr_h[r] == lane.token_start) {
+                lane_request[lane_index] = r;
+                break;
+            }
+        }
+    }
+    if (any_page_mask) {
+        for (const std::uint8_t phase : kPhases) {
+            for (std::size_t lane_index = 0;
+                 lane_index < state.lanes.size();
+                 ++lane_index) {
+                const StagedLane& lane = *state.lanes[lane_index];
+                for (const plan::StagePlan* stage :
+                     (*lane.phase_plans)[phase]) {
+                    if (!stage->ops.empty() &&
+                        stage_calls_sink(*stage, "attn_page_mask") &&
+                        lane_request[lane_index] < 0) {
+                        return veto("mask lane off request boundary");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Score sideband plan (still side-effect-free on the launch): size
+    // the pad rows, refresh the capture's host CSR, pre-grow the arena so
+    // nothing grows inside a captured region.
+    struct ScoreRowNeed {
+        std::size_t occurrence = 0;
+        std::size_t lane = 0;
+        std::uint64_t kv_max = 0;
+        std::uint32_t request = 0;
+        std::size_t row_offset = 0;  // filled after the carve
+    };
+    std::vector<ScoreRowNeed> score_rows;
+    model::DecodeScoreCapturePlan score_plan;
+    const std::uint32_t* folded_indptr_d = nullptr;
+    std::uint8_t* score_rows_base = nullptr;
+    if (any_attn_score) {
+        score_plan = model::prepare_decode_score_capture(
+            in.arena, obs, in.num_q_heads, in.stream);
+        if (!score_plan.ok ||
+            score_plan.num_requests !=
+                static_cast<std::uint32_t>(obs.num_requests)) {
+            return veto("score capture plan failed");
+        }
+        std::size_t max_occurrences = 0;
+        for (const auto& lane_ptr : state.lanes) {
+            max_occurrences = std::max(
+                max_occurrences,
+                (*lane_ptr->phase_plans)[PTIR_STAGE_ON_ATTN].size());
+        }
+        for (std::size_t occurrence = 0;
+             occurrence < max_occurrences;
+             ++occurrence) {
+            for (std::size_t lane_index = 0;
+                 lane_index < state.lanes.size();
+                 ++lane_index) {
+                StagedLane& lane = *state.lanes[lane_index];
+                const auto& stages =
+                    (*lane.phase_plans)[PTIR_STAGE_ON_ATTN];
+                if (occurrence >= stages.size()) continue;
+                const plan::StagePlan& stage = *stages[occurrence];
+                if (stage.ops.empty()) continue;
+                if (!stage_uses_intrinsic(stage, PTIR_INTR_ATTN_SCORE)) {
+                    continue;
+                }
+                const GroupedLaneBinding sizing_binding =
+                    make_staged_binding(
+                        lane, stage, nullptr, 0, nullptr, 0, nullptr);
+                const auto width =
+                    hook_stage_attn_score_width(stage, sizing_binding);
+                if (!width.has_value() || *width == 0) {
+                    return veto("AttnScore width conflict");
+                }
+                // Request boundary + declared-ceiling checks, mirroring
+                // `resolve_lane_attn_score` — re-run before EVERY replay,
+                // so a request outgrowing its program's ceiling falls back
+                // to the eager body and its loud refusal.
+                int request = -1;
+                for (int r = 0; r < obs.num_requests; ++r) {
+                    if (obs.qo_indptr_h[r] == lane.token_start) {
+                        request = r;
+                        break;
+                    }
+                }
+                if (request < 0) {
+                    return veto("score lane off request boundary");
+                }
+                const std::uint32_t kv_len =
+                    score_plan.folded_offsets_h[request + 1] -
+                    score_plan.folded_offsets_h[request];
+                if (static_cast<std::uint64_t>(kv_len) > *width) {
+                    return veto("kv_len exceeds program score ceiling");
+                }
+                score_rows.push_back(ScoreRowNeed{
+                    occurrence, lane_index, *width,
+                    static_cast<std::uint32_t>(request), 0});
+            }
+        }
+        if (score_rows.empty()) return veto("no score rows sized");
+
+        // Carve the score-rows block: the folded-offset device CSR, then
+        // one padded row per (occurrence, lane) — shared by every layer
+        // (stream order serializes pad → consume → next layer's pad).
+        auto align256 = [](std::size_t n) {
+            return (n + 255u) & ~static_cast<std::size_t>(255u);
+        };
+        const std::size_t csr_bytes =
+            (static_cast<std::size_t>(obs.num_requests) + 1) *
+            sizeof(std::uint32_t);
+        std::size_t total = align256(csr_bytes);
+        for (auto& need : score_rows) {
+            need.row_offset = total;
+            total += align256(
+                static_cast<std::size_t>(need.kv_max) * sizeof(float));
+        }
+        score_rows_base = static_cast<std::uint8_t*>(in.arena->acquire(
+            model::HookSidebandArena::Region::ScoreRows, total, in.stream));
+        if (score_rows_base == nullptr) {
+            return veto("score-rows arena acquire failed");
+        }
+        in.arena->release(model::HookSidebandArena::Region::ScoreRows);
+        folded_indptr_d =
+            reinterpret_cast<const std::uint32_t*>(score_rows_base);
+        state.hook_folded_offsets_h.assign(
+            score_plan.folded_offsets_h,
+            score_plan.folded_offsets_h + obs.num_requests + 1);
+        CUDA_CHECK(cudaMemcpyAsync(
+            score_rows_base,
+            state.hook_folded_offsets_h.data(),
+            csr_bytes,
+            cudaMemcpyHostToDevice,
+            in.stream));
+    }
+
+    // ── Layer table (device-resident layer intrinsic; see Impl comment). ──
+    if (impl_->hook_layer_table_len < layers) {
+        std::vector<std::uint32_t> iota(layers);
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            iota[layer] = layer;
+        }
+        std::uint32_t* table = nullptr;
+        CUDA_CHECK(cudaMalloc(
+            reinterpret_cast<void**>(&table),
+            static_cast<std::size_t>(layers) * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemcpy(
+            table, iota.data(),
+            static_cast<std::size_t>(layers) * sizeof(std::uint32_t),
+            cudaMemcpyHostToDevice));
+        if (impl_->hook_layer_table != nullptr) {
+            cudaFree(impl_->hook_layer_table);
+        }
+        impl_->hook_layer_table = table;
+        impl_->hook_layer_table_len = layers;
+    }
+
+    // ── Commit pass: prepare every (layer, phase, occurrence, group) in the
+    // exact order the body will consume them, applying channel effects at
+    // the same points the eager execute would. From here on, failure is a
+    // failed launch (never a silent eager fallback: cursors and overlays
+    // have advanced).
+    std::uint64_t fingerprint = 0xcbf29ce484222325ull;
+    hook_fp_mix(fingerprint, layers);
+    hook_fp_mix(fingerprint, state.lanes.size());
+    hook_fp_mix(fingerprint, in.hook_free_prefix_rows);
+    hook_fp_mix(fingerprint, in.num_q_heads);
+    hook_fp_mix(fingerprint, in.wants_attn_score ? 1u : 0u);
+    hook_fp_mix_ptr(fingerprint, impl_->hook_layer_table);
+    hook_fp_mix_ptr(fingerprint, score_plan.folded);
+    hook_fp_mix_ptr(fingerprint, score_plan.indptr_d);
+    hook_fp_mix_ptr(fingerprint, score_plan.indptr_h_data);
+    hook_fp_mix_ptr(fingerprint, score_rows_base);
+    // The mask carve: every address and the stride are baked by the captured
+    // sink kernel, the seeding memset, the compaction kernel and the
+    // attention that reads its outputs. Stride grows with the page count, so
+    // page growth recaptures — the honest cost of a host-sized carve.
+    hook_fp_mix_ptr(fingerprint, mask_plan.keep);
+    hook_fp_mix(fingerprint, mask_plan.stride);
+    hook_fp_mix_ptr(fingerprint, mask_plan.out_indices);
+    hook_fp_mix_ptr(fingerprint, mask_plan.out_indptr);
+    hook_fp_mix_ptr(fingerprint, mask_plan.out_last_lens);
+    for (const auto& lane_ptr : state.lanes) {
+        hook_fp_mix(fingerprint, lane_ptr->bound->program_hash);
+        hook_fp_mix_ptr(fingerprint, lane_ptr->bound);
+        hook_fp_mix(fingerprint, lane_ptr->token_start);
+    }
+
+    std::uint32_t stable_slot = 1;
+    state.prepared_attn[0].clear();
+    state.prepared_attn[1].clear();
+    state.prepared_cursor = {0, 0};
+    try {
+        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+            for (const std::uint8_t phase : kPhases) {
+                HookPreparedInvocation invocation;
+                invocation.layer = layer;
+                std::size_t max_occurrences = 0;
+                for (const auto& lane_ptr : state.lanes) {
+                    max_occurrences = std::max(
+                        max_occurrences,
+                        (*lane_ptr->phase_plans)[phase].size());
+                }
+                for (std::size_t occurrence = 0;
+                     occurrence < max_occurrences;
+                     ++occurrence) {
+                    struct PreparedTask {
+                        StagedLane* lane = nullptr;
+                        std::size_t lane_index = 0;
+                        const plan::StagePlan* plan = nullptr;
+                        const generated::FusedStageExecutable* executable =
+                            nullptr;
+                        const GroupedStageStaticPlan* group_plan = nullptr;
+                        GroupedLaneBinding binding;
+                        const std::vector<std::uint32_t>* topology = nullptr;
+                        const HookScorePadLaunch* pad = nullptr;
+                        bool complete = false;
+                    };
+                    std::vector<PreparedTask> tasks;
+                    std::vector<HookScorePadLaunch> task_pads;
+                    tasks.reserve(state.lanes.size());
+                    task_pads.reserve(score_rows.size());
+                    // Two passes so `task_pads` never reallocates under the
+                    // `pad` pointers.
+                    for (std::size_t lane_index = 0;
+                         lane_index < state.lanes.size();
+                         ++lane_index) {
+                        StagedLane& lane = *state.lanes[lane_index];
+                        const auto& stages = (*lane.phase_plans)[phase];
+                        if (occurrence >= stages.size()) continue;
+                        const plan::StagePlan& stage = *stages[occurrence];
+                        if (stage.ops.empty()) continue;
+                        const std::size_t stage_index =
+                            static_cast<std::size_t>(
+                                &stage - lane.plans->data());
+                        GroupedLaneBinding binding = make_staged_binding(
+                            lane, stage, nullptr, 0, nullptr, 0,
+                            impl_->hook_layer_table + layer);
+                        const HookScorePadLaunch* pad = nullptr;
+                        if (phase == PTIR_STAGE_ON_ATTN &&
+                            stage_uses_intrinsic(
+                                stage, PTIR_INTR_ATTN_SCORE)) {
+                            const auto need = std::find_if(
+                                score_rows.begin(), score_rows.end(),
+                                [&](const ScoreRowNeed& candidate) {
+                                    return candidate.occurrence ==
+                                               occurrence &&
+                                           candidate.lane == lane_index;
+                                });
+                            if (need == score_rows.end()) {
+                                throw std::runtime_error(
+                                    "hook-graph prepare lost a score row "
+                                    "it sized");
+                            }
+                            auto* row = reinterpret_cast<float*>(
+                                score_rows_base + need->row_offset);
+                            binding.attn_score_base = row;
+                            task_pads.push_back(HookScorePadLaunch{
+                                score_plan.folded,
+                                folded_indptr_d,
+                                row,
+                                need->request,
+                                static_cast<std::uint32_t>(need->kv_max),
+                            });
+                            pad = &task_pads.back();
+                        }
+                        if (stage_calls_sink(stage, "attn_page_mask")) {
+                            // The resolver's device half
+                            // (resolve_lane_page_mask minus the host tag,
+                            // which the prepared-mode execute applies):
+                            // request-strided row into the planned mask
+                            // carve.
+                            binding.page_mask = GroupedLanePageMask{
+                                mask_plan.keep +
+                                    static_cast<std::size_t>(
+                                        lane_request[lane_index]) *
+                                        mask_plan.stride,
+                                mask_plan.stride};
+                        }
+                        tasks.push_back(PreparedTask{
+                            .lane = &lane,
+                            .lane_index = lane_index,
+                            .plan = &stage,
+                            .executable = lane.generated_program
+                                              ->stages[stage_index]
+                                              .get(),
+                            .group_plan =
+                                impl_->grouped_plans
+                                    .at(lane.generated_program
+                                            ->stages[stage_index]
+                                            ->runtime_id)
+                                    .get(),
+                            .binding = binding,
+                            .topology = &lane.bound->stage_topologies.at(
+                                stage_index),
+                            .pad = pad,
+                        });
+                    }
+                    // Group identically to `execute_declared_phase`:
+                    // signature + channel topology + accumulator admission.
+                    for (std::size_t first_index = 0;
+                         first_index < tasks.size();
+                         ++first_index) {
+                        if (tasks[first_index].complete) continue;
+                        PreparedTask& first = tasks[first_index];
+                        std::vector<PreparedTask*> members;
+                        std::vector<GroupedLaneBinding> bindings;
+                        members.push_back(&first);
+                        bindings.push_back(first.binding);
+                        GroupedStageAccumulator accumulator(
+                            *first.group_plan);
+                        std::string reason;
+                        if (!accumulator.try_add(first.binding, &reason)) {
+                            throw std::runtime_error(
+                                "PTRP stage is not executable by the "
+                                "generic CUDA backend: " + reason);
+                        }
+                        for (std::size_t candidate = first_index + 1;
+                             candidate < tasks.size();
+                             ++candidate) {
+                            PreparedTask& next = tasks[candidate];
+                            if (next.complete ||
+                                next.plan->signature_hash !=
+                                    first.plan->signature_hash ||
+                                *next.topology != *first.topology) {
+                                continue;
+                            }
+                            reason.clear();
+                            if (!accumulator.try_add(
+                                    next.binding, &reason)) {
+                                continue;
+                            }
+                            bindings.push_back(next.binding);
+                            members.push_back(&next);
+                        }
+                        for (PreparedTask* member : members) {
+                            member->complete = true;
+                        }
+                        const GroupedExecutionOptions execution_options{
+                            .reset_commits = false,
+                            .pull_tickets = false,
+                            .finalize = false,
+                            .time_sections = false,
+                        };
+                        HookPreparedGroup group;
+                        group.prepared = generated::prepare_generated_stage(
+                            bindings,
+                            *first.executable,
+                            impl_->generated_runtime,
+                            in.stream,
+                            execution_options,
+                            generated::PreparedBufferMode::kStablePerStage,
+                            stable_slot++);
+                        if (!group.prepared->allocations.values.empty()) {
+                            // The feasibility scan is supposed to exclude
+                            // every per-fire-allocating stage shape; a
+                            // capture over stream-ordered frees would
+                            // replay dangling addresses.
+                            throw std::runtime_error(
+                                "hook-graph prepare produced per-fire "
+                                "device allocations; stage shape is not "
+                                "replayable");
+                        }
+                        for (PreparedTask* member : members) {
+                            if (member->pad != nullptr) {
+                                group.score_pads.push_back(*member->pad);
+                            }
+                            record_stage_channel_effects(
+                                *member->lane, *member->plan);
+                        }
+                        hook_fp_mix(fingerprint, first.plan->signature_hash);
+                        hook_fp_mix(
+                            fingerprint, first.executable->runtime_id);
+                        hook_fp_mix(fingerprint, members.size());
+                        for (const auto& pad : group.score_pads) {
+                            hook_fp_mix_ptr(fingerprint, pad.folded);
+                            hook_fp_mix_ptr(fingerprint, pad.folded_indptr);
+                            hook_fp_mix_ptr(fingerprint, pad.row);
+                            hook_fp_mix(fingerprint, pad.request);
+                            hook_fp_mix(fingerprint, pad.kv_max);
+                        }
+                        hook_fp_mix_prepared(fingerprint, *group.prepared);
+                        invocation.groups.push_back(std::move(group));
+                    }
+                }
+                invocation.expects_scores =
+                    phase == PTIR_STAGE_ON_ATTN &&
+                    std::any_of(
+                        invocation.groups.begin(),
+                        invocation.groups.end(),
+                        [](const HookPreparedGroup& group) {
+                            return !group.score_pads.empty();
+                        });
+                invocation.expected_folded = score_plan.folded;
+                if (any_page_mask) {
+                    bool marks = false;
+                    for (const auto& lane_ptr : state.lanes) {
+                        const auto& stages =
+                            (*lane_ptr->phase_plans)[phase];
+                        for (const plan::StagePlan* stage : stages) {
+                            if (!stage->ops.empty() &&
+                                stage_calls_sink(
+                                    *stage, "attn_page_mask")) {
+                                marks = true;
+                            }
+                        }
+                    }
+                    invocation.marks_mask = marks;
+                    invocation.expected_mask_keep = mask_plan.keep;
+                    invocation.expected_mask_stride = mask_plan.stride;
+                }
+                state
+                    .prepared_attn[phase - PTIR_STAGE_ON_ATTN_PROJ]
+                    .push_back(std::move(invocation));
+            }
+        }
+    } catch (...) {
+        state.failed = true;
+        throw;
+    }
+    // The body's per-layer hook invocations are accounted here — the
+    // prepared-mode `execute_attention_phase` only replays launches, and on
+    // a graph REPLAY it does not run at all. `finish`'s coverage check
+    // (every declared attention phase ran at every layer) is thereby
+    // asserted by this pass's construction instead.
+    state.phase_invocations[PTIR_STAGE_ON_ATTN_PROJ] = layers;
+    state.phase_invocations[PTIR_STAGE_ON_ATTN] = layers;
+    state.hook_graph_prepared = true;
+    return fingerprint == 0 ? 1 : fingerprint;
+}
+
+void Dispatch::verify_hook_capture_consumed(StagedLaunch& launch) const {
+    StagedLaunch::State& state = *launch.state_;
+    if (!state.hook_graph_prepared) {
+        throw std::runtime_error(
+            "hook-graph capture verification on an unprepared launch");
+    }
+    for (std::size_t phase = 0; phase < 2; ++phase) {
+        if (state.prepared_cursor[phase] !=
+            state.prepared_attn[phase].size()) {
+            throw std::runtime_error(
+                "hook-graph capture consumed " +
+                std::to_string(state.prepared_cursor[phase]) + " of " +
+                std::to_string(state.prepared_attn[phase].size()) +
+                " prepared attention invocations (phase index " +
+                std::to_string(phase) +
+                "): the model body did not invoke its hooks at every "
+                "layer, so the captured graph is incomplete");
+        }
+    }
+}
+
 void Dispatch::execute_attention_phase(
     StagedLaunch& launch,
     std::uint8_t phase,
@@ -5174,6 +6023,91 @@ void Dispatch::execute_attention_phase(
         throw std::runtime_error("model hook invoked a non-attention PTIR phase");
     }
     StagedLaunch::State& state = *launch.state_;
+    if (state.hook_graph_prepared) {
+        // Prepared mode — THE path for pure-decode hook fires, eager and
+        // graph alike (stage 6 increment 4; eager unification in
+        // `run_forward_dispatch`): the fire-level pass already did every
+        // piece of host work for this invocation, in this exact order. What
+        // remains — what an eager body executes and what a capturing stream
+        // records — is launches against prepared state, on the stream the
+        // model body handed the hook (the capture stream, under capture).
+        // Retrieval is exact-order by construction: a cursor per phase,
+        // loud throws on any divergence from the prepared sequence.
+        const std::size_t phase_index =
+            static_cast<std::size_t>(phase - PTIR_STAGE_ON_ATTN_PROJ);
+        auto& invocations = state.prepared_attn[phase_index];
+        const std::size_t at = state.prepared_cursor[phase_index];
+        if (at >= invocations.size() || invocations[at].layer != layer) {
+            state.failed = true;
+            throw std::runtime_error(
+                "hook-graph prepared phase order mismatch: phase " +
+                std::to_string(static_cast<int>(phase)) + " layer " +
+                std::to_string(layer) + " does not match prepared entry " +
+                std::to_string(at) + " of " +
+                std::to_string(invocations.size()));
+        }
+        ++state.prepared_cursor[phase_index];
+        HookPreparedInvocation& invocation = invocations[at];
+        try {
+            if (invocation.marks_mask) {
+                // The resolver's host half (resolve_lane_page_mask): tag
+                // the model's sink so its compact branch fires for this
+                // layer — and prove the model carved the SAME arena block
+                // the prepared kernels bake, the one moment that is
+                // observable (capture time; a replayed body never runs
+                // this code, and the tag then lives inside the recorded
+                // branch structure).
+                model::AttentionMaskSink* sink = sideband.mask_sink;
+                if (sink == nullptr || !sink->usable() ||
+                    sink->keep != invocation.expected_mask_keep ||
+                    sink->stride != invocation.expected_mask_stride) {
+                    throw std::runtime_error(
+                        "hook-graph prepared attn_page_mask expected the "
+                        "planned sideband carve; the model body published "
+                        "a different mask sink");
+                }
+                sink->written_layer = static_cast<int>(layer);
+            }
+            if (invocation.expects_scores) {
+                const model::AttentionScores* scores = sideband.scores;
+                if (scores == nullptr || !scores->usable() ||
+                    scores->layer != layer ||
+                    scores->values != invocation.expected_folded) {
+                    throw std::runtime_error(
+                        "hook-graph prepared OnAttn expected this layer's "
+                        "score capture in the planned sideband slot; the "
+                        "model body published " +
+                        std::string(scores == nullptr ? "nothing"
+                                                      : "a different capture"));
+                }
+            }
+            for (auto& group : invocation.groups) {
+                for (const HookScorePadLaunch& pad : group.score_pads) {
+                    const std::uint32_t blocks =
+                        std::min<std::uint32_t>(
+                            (pad.kv_max + 255u) / 256u, 65535u);
+                    k_hook_attn_score_pad<<<blocks, 256, 0, stream>>>(
+                        pad.folded, pad.folded_indptr, pad.request,
+                        pad.row, pad.kv_max);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                generated::launch_generated_stage(*group.prepared, stream);
+            }
+        } catch (...) {
+            state.failed = true;
+            throw;
+        }
+        return;
+    }
+    // Legacy interleaved fallback: reached only when the fire-level prepare
+    // pass VETOED this fire (`prepare_attention_phases` returned 0 — Query
+    // readers like quest, lora/envelope_dot, scalable nucleus, non-decode
+    // fires, off-boundary lanes) or when the frame never wired the seam.
+    // Prepared pure-decode hook fires — eager or graph — never reach this
+    // branch. It cannot be deleted while those veto classes exist: a
+    // Query-reading stage is unhoistable by construction (the Query tensor
+    // is produced by THIS layer's kernels, mid-body, and the bf16→f32 cast
+    // below allocates per fire).
     bool needs_query = false;
     for (const auto& lane : state.lanes) {
         for (const plan::StagePlan* stage :
@@ -5271,6 +6205,25 @@ bool Dispatch::finish(
             state.phase_invocations[phase] != impl_->model_layers) {
             throw std::runtime_error(
                 "PTIR attention phase did not execute at every model layer");
+        }
+    }
+    if (state.hook_graph_prepared) {
+        // Prepared mode: 0 consumed = a graph REPLAY (the recorded body ran
+        // on the GPU, not through these cursors); fully consumed = the
+        // capture fire. Anything in between means the model body stopped
+        // invoking hooks mid-fire — a structural failure the eager
+        // invocation counter above can no longer see (the prepare pass
+        // pre-credits it).
+        for (std::size_t phase_index = 0; phase_index < 2; ++phase_index) {
+            const std::size_t consumed = state.prepared_cursor[phase_index];
+            const std::size_t total =
+                state.prepared_attn[phase_index].size();
+            if (consumed != 0 && consumed != total) {
+                throw std::runtime_error(
+                    "hook-graph prepared attention phases were partially "
+                    "consumed (" + std::to_string(consumed) + " of " +
+                    std::to_string(total) + ")");
+            }
         }
     }
     for (std::size_t program = 0; program < program_count; ++program) {
@@ -6637,6 +7590,44 @@ std::string describe_uncommitted_lane(
         message += " [" + refused + "])";
     }
     return message;
+}
+
+int Dispatch::dense_mask_scope_violation(const pie_native::LaunchView& view,
+                                         bool allow_structured_masks) const {
+    const std::size_t n_prog = view.ptir_program_hashes.size();
+    if (n_prog <= 1 || view.ptir_program_instances.size() != n_prog) {
+        return -1;
+    }
+    const Impl& s = *impl_;
+    for (std::size_t p = 0; p < n_prog; ++p) {
+        const std::uint64_t iid = view.ptir_program_instances.data()[p];
+        const auto it = s.instances.find(iid);
+        // Unknown instances / missing traces fail elsewhere with their own
+        // diagnostics; this check answers only the mask-scope question.
+        if (it == s.instances.end() || it->second.trace == nullptr) continue;
+        // The ACK'd class — not a trace sniff — decides which programs
+        // resolve descriptors from device cells (RV-6, mirrors
+        // `resolve_descriptors`).
+        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST) continue;
+        const Trace& trace = *it->second.trace;
+        for (const PortBinding& binding : trace.ports) {
+            if (binding.port != kPortAttnMask || binding.is_const) continue;
+            // Mirror `resolve_attention_mask`: a statically recognized
+            // structured mask lowers to a runtime window override and never
+            // packs a dense device mask.
+            const auto descriptor =
+                structured_mask_descriptor(trace, binding.channel);
+            const bool direct =
+                allow_structured_masks &&
+                (descriptor.kind == StructuredMaskKind::Causal ||
+                 (descriptor.kind == StructuredMaskKind::SlidingWindow &&
+                  descriptor.window > 0) ||
+                 (descriptor.kind == StructuredMaskKind::SinkWindow &&
+                  descriptor.window > 0));
+            if (!direct) return static_cast<int>(p);
+        }
+    }
+    return -1;
 }
 
 bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,

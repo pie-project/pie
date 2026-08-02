@@ -977,6 +977,7 @@ mod tests {
                         max_page_refs: 64,
                     },
                     device_geometry_port_mask: 0,
+                    model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
                 },
                 driver::DriverBackend::Dummy(driver::DummyDriver::new(DummyDriverOptions {
                     operation_log: Some(operation_log),
@@ -994,6 +995,7 @@ mod tests {
                 },
                 1,
                 1,
+                pie_driver_abi::ModelSiteSummary::default(),
             );
 
             let program_id = crate::scheduler::register_program(driver_id, dummy_program())

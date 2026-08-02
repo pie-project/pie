@@ -56,6 +56,7 @@
 #include "model/gemma4/gemma4_audio_adapter.hpp"
 #include "model/gemma4/gemma4_vision_adapter.hpp"
 #include "model/glm5/glm5_forward.hpp"
+#include "model/hook_sideband_arena.hpp"
 #include "model/kimi/kimi_forward.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/loaded_model.hpp"
@@ -69,6 +70,7 @@
 #include "model/workspace.hpp"
 #include "ops/gemm.hpp"
 #include "pipeline/registry.hpp"
+#include "pie_forward/plan.hpp"
 #include "store/recurrent_state_cache.hpp"
 #include "store/swap_pool.hpp"
 
@@ -127,6 +129,73 @@ void publish_terminal(PieTerminalCell* cell, std::uint32_t outcome) {
     cell->reserved0 = 0;
     std::atomic_ref<std::uint32_t>(cell->outcome).store(
         outcome, std::memory_order_release);
+}
+
+// Walk a validated declared plan and emit its model-structural expert-site
+// summary: one (experts, top_k) pair per distinct per-token selector
+// parameterization, first-appearance order. This is the C++ mirror of the
+// engine's `fire_plan::site_table::derive_sites` (whose tests pin the
+// derivation, including the dedup and both refusal invariants below); the
+// summary crosses the capabilities handshake as the `model_site_summary`
+// row so the engine's fire planner consumes the DRIVER's validated plan
+// instead of re-tracing from binding facts it does not have.
+//
+// The invariants mirror the Rust panics: a selector without a `TopK`
+// producer, or router logits without a trailing load-time-constant width,
+// is a tracer bug — the builder's `matmul_per_token` contract rules both
+// out for every in-vocabulary trace — and throwing here fails the load
+// loudly rather than mis-reporting silently.
+std::vector<std::pair<std::uint32_t, std::uint32_t>>
+derive_expert_site_summary(const pie_forward::ForwardPlan& plan) {
+    using pie_forward::PieForwardDimKind;
+    using pie_forward::PieForwardOpKind;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> params;
+    for (std::size_t i = 0; i < plan.op_count(); ++i) {
+        const pie_forward::PieForwardOp& op = plan.op(i);
+        if (op.kind != PieForwardOpKind::Matmul ||
+            op.selector == pie_forward::PIE_FORWARD_NO_VALUE) {
+            continue;
+        }
+        const pie_forward::PieForwardOp* producer = nullptr;
+        for (std::size_t j = 0; j < plan.op_count() && producer == nullptr;
+             ++j) {
+            for (std::uint32_t out : plan.outputs(plan.op(j))) {
+                if (out == op.selector) {
+                    producer = &plan.op(j);
+                    break;
+                }
+            }
+        }
+        if (producer == nullptr ||
+            producer->kind != PieForwardOpKind::TopK) {
+            throw std::runtime_error(
+                std::string(plan.family()) +
+                ": selector value has no TopK producer; matmul_per_token "
+                "requires a dyn PerToken selector, which only topk creates");
+        }
+        const std::uint32_t top_k = producer->param0;
+        const pie_forward::ForwardPlan::IdSpan logits_in =
+            plan.inputs(*producer);
+        if (logits_in.size == 0) {
+            throw std::runtime_error(
+                std::string(plan.family()) +
+                ": TopK op consumes the router logits");
+        }
+        const pie_forward::PieForwardValue& logits = plan.value(logits_in[0]);
+        if (logits.rank == 0 ||
+            logits.dims[logits.rank - 1].kind != PieForwardDimKind::Const) {
+            throw std::runtime_error(
+                std::string(plan.family()) +
+                ": router logits trailing dim must be a load-time constant "
+                "(the expert count the selector indexes)");
+        }
+        const std::uint32_t experts = logits.dims[logits.rank - 1].value;
+        const std::pair<std::uint32_t, std::uint32_t> entry{experts, top_k};
+        if (std::find(params.begin(), params.end(), entry) == params.end()) {
+            params.push_back(entry);
+        }
+    }
+    return params;
 }
 
 std::size_t cuda_vmm_handle_bytes() {
@@ -1083,6 +1152,15 @@ int Context::Impl::load_model(
     }
     auto& ws = *ws_p;
 
+    // Grow-only device arena for the hook sidebands (per-layer score capture
+    // + per-fire page mask). Owned here, beside the Workspace whose lifetime
+    // it mirrors, and wired onto the batch engine below; it replaces the
+    // per-fire/per-layer cudaMallocAsync churn those captures used to pay.
+    // It allocates lazily on the first hook fire (nothing for the many
+    // configurations whose programs never observe attention), so it is not
+    // charged to the workspace arena allocator.
+    auto* sideband_arena_p = own_emplace<model::HookSidebandArena>();
+
     // KV-cache shape genuinely differs per family (MLA-backed families use
     // a 1x1 placeholder KvCache; Gemma-4 has per-layer head_dim + KV
     // sharing; Nemotron-H only allocates pages for its attention layers).
@@ -1600,6 +1678,7 @@ int Context::Impl::load_model(
                   ));
     }
     executor_p->dispatch = &registry_->dispatch();
+    executor_p->sideband_arena = sideband_arena_p;
     executor_ = executor_p;
     const bool has_usable_mtp_logits =
         has_mtp_logits && static_cast<bool>(executor_p->system_drafter);
@@ -1919,6 +1998,27 @@ int Context::Impl::load_model(
         // kv_cache is only a 1x1 compatibility placeholder.
         kv_handle = nullptr;
     }
+    // The declared-plan site summary (`model_site_summary`): the
+    // model-structural divergence sites of the traced + VALIDATED forward
+    // plan, when the model holds one (PIE_DECLARED_FORWARD opted in and the
+    // validation passed). Empty otherwise — declared forward off, the
+    // validation refused, a family without a declared trace, or a dense
+    // plan — which the engine treats as "no model-structural sites known"
+    // (today's behavior). One line states the outcome either way, so a boot
+    // log always answers whether the summary was present-but-empty or
+    // absent-because-unplanned.
+    nlohmann::json expert_sites = nlohmann::json::array();
+    const pie_forward::ForwardPlan* declared_plan = model_->declared_plan();
+    if (declared_plan != nullptr) {
+        for (const auto& [experts, top_k] :
+             derive_expert_site_summary(*declared_plan)) {
+            expert_sites.push_back(
+                {{"experts", experts}, {"top_k", top_k}});
+        }
+    }
+    std::cerr << "[pie-driver-cuda] model_site_summary: declared_plan="
+              << (declared_plan != nullptr ? "yes" : "no")
+              << " expert_sites=" << expert_sites.size() << "\n";
     nlohmann::json caps = {
         {"abi_version", PIE_DRIVER_ABI_VERSION},
         {"total_pages", c.total_pages},
@@ -1937,6 +2037,8 @@ int Context::Impl::load_model(
         {"has_attn_score", has_attn_score},
         {"has_attn_page_mask", has_attn_page_mask},
         {"has_lora", has_lora},
+        {"model_site_summary",
+         nlohmann::json{{"expert_sites", std::move(expert_sites)}}},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but
@@ -2199,6 +2301,31 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
             std::max(kv_required, required_kv_pages(expansions[i].launch));
         state_required = std::max(
             state_required, required_state_slots(expansions[i].launch));
+    }
+    // v1 mask scope, checked at ADMISSION — before the arena commit and
+    // before any prepare-time mutation, so refusal is a clean status with
+    // NO side effects. A device-geometry program carrying a dense device
+    // mask composes only SOLO; the runtime scheduler batches such fires
+    // alone (`LaunchGrouping`'s mask exclusions), so a violating step is a
+    // scheduler contract breach. The old defence — `prepare_step`'s
+    // resolve-time RetryableLaunchError — fired AFTER `begin_host` had
+    // applied the wave's channel tickets: the failure poisoned every lane
+    // in the frame and the dead instances leaked pages until later frames
+    // hit the physical budget ceiling (Stage 2 verdict, liveness seam 2).
+    if (registry_ != nullptr && executor_ != nullptr) {
+        for (std::size_t i = 0; i < step_count; ++i) {
+            const int offending =
+                registry_->dispatch().dense_mask_scope_violation(
+                    views[i], executor_->forward_fn.supports_runtime_window);
+            if (offending >= 0) {
+                std::cerr << "[pie-driver-cuda] frame admission rejected: "
+                          << "step " << i << " program " << offending
+                          << " carries a dense device mask in a "
+                          << "multi-program batch (v1 mask scope is solo "
+                          << "only; the scheduler must not compose this)\n";
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
     }
     // Folded admission: EXHAUSTED/IMPOSSIBLE return as statuses with no
     // side effects; the engine's lane retries EXHAUSTED in place.

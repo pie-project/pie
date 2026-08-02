@@ -1,0 +1,342 @@
+{
+  "family": "qwen3_5_moe_mlp_block",
+  "values": [
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 256
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8
+        }
+      ],
+      "dtype": "I32",
+      "dyn_axis": "PerToken"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8
+        },
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8
+        },
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 8
+        },
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 512
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 2048
+        }
+      ],
+      "dtype": "BF16"
+    }
+  ],
+  "ops": [
+    {
+      "kind": {
+        "Rmsnorm": {
+          "weight": "layer.0.mlp_norm",
+          "variant": "Gemma"
+        }
+      },
+      "inputs": [
+        0
+      ],
+      "outputs": [
+        1
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.router",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        2
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "TopK": {
+          "k": 8
+        }
+      },
+      "inputs": [
+        2
+      ],
+      "outputs": [
+        3,
+        4
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.expert.{e}.gate_up",
+          "beta_one": false,
+          "selector": 3
+        }
+      },
+      "inputs": [
+        1,
+        3
+      ],
+      "outputs": [
+        5
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 512
+        }
+      },
+      "inputs": [
+        5
+      ],
+      "outputs": [
+        6
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.expert.{e}.down",
+          "beta_one": false,
+          "selector": 3
+        }
+      },
+      "inputs": [
+        6,
+        3
+      ],
+      "outputs": [
+        7
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "WeightedSum": {
+          "k": 8
+        }
+      },
+      "inputs": [
+        4,
+        7
+      ],
+      "outputs": [
+        8
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.shared_expert.gate_up",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        9
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Swiglu": {
+          "inter": 512
+        }
+      },
+      "inputs": [
+        9
+      ],
+      "outputs": [
+        10
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.shared_expert.down",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        10
+      ],
+      "outputs": [
+        11
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Matmul": {
+          "weight": "layer.0.shared_expert_gate",
+          "beta_one": false
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        12
+      ],
+      "layer": 0
+    },
+    {
+      "kind": "SigmoidGateAdd",
+      "inputs": [
+        11,
+        12,
+        8
+      ],
+      "outputs": [
+        13
+      ],
+      "layer": 0
+    },
+    {
+      "kind": "ResidualAdd",
+      "inputs": [
+        13,
+        0
+      ],
+      "outputs": [
+        14
+      ],
+      "layer": 0
+    }
+  ]
+}

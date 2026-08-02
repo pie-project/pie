@@ -11,12 +11,17 @@ namespace pie_forward {
 /// `PieForwardOp::weight_name` when the op references no weight.
 constexpr static const uint32_t PIE_FORWARD_NO_NAME = UINT32_MAX;
 
+/// `PieForwardOp::selector` when the op selects no per-token weights —
+/// every op except the expert-indexed `Matmul`s of an MoE trace.
+constexpr static const uint32_t PIE_FORWARD_NO_VALUE = UINT32_MAX;
+
 /// `PieForwardOp::layer` for prologue/epilogue ops (embed, final norm,
 /// lm_head). Signed so the resting value cannot collide with a real layer.
 constexpr static const int32_t PIE_FORWARD_NO_LAYER = -1;
 
-/// Inline dim capacity of [`PieForwardValue`]. Every shape the tracer emits
-/// today is rank 2; 4 leaves headroom without an arena run per value.
+/// Inline dim capacity of [`PieForwardValue`]. The tracer emits rank-2
+/// shapes plus the MoE trace's rank-3 route-expanded `[Tokens, k, d]`
+/// values; 4 leaves headroom without an arena run per value.
 constexpr static const size_t PIE_FORWARD_MAX_DIMS = 4;
 
 enum class PieForwardStatus : uint32_t {
@@ -61,6 +66,71 @@ enum class PieForwardOpKind : uint32_t {
   Attention = 7,
   Swiglu = 8,
   LmHead = 9,
+  /// `residual += x` (post-norm placement's separate landing). Appended
+  /// per the discipline above — the nine kinds before it keep their
+  /// wire values.
+  ResidualAdd = 10,
+  /// Router top-k + softmax + renormalize (one launch in the hand-written
+  /// MoE pass). First of the `dyn` kinds — the declared executors do NOT
+  /// consume these; their op-kind switches throw on them via the loud
+  /// default arm, which is the intended v0 behaviour (the grouped-GEMM
+  /// emission is a later, much larger lift).
+  TopK = 11,
+  /// Per-token combine of the k routed expert outputs.
+  WeightedSum = 12,
+  /// `out = base + sigmoid(gate) * x` (shared-expert landing).
+  SigmoidGateAdd = 13,
+  /// Two-way GDN split (`[rows, w0 + w1]` → two results). First of the
+  /// GDN kinds (the `pie_forward_trace_qwen3_5_gdn` fragment) — like the
+  /// dyn kinds above, the declared executors do NOT consume these; their
+  /// op-kind switches throw on them via the loud default arm.
+  SplitGdn = 14,
+  /// Depthwise causal conv1d + fused SiLU against the layer's implicit
+  /// PER-REQUEST conv state.
+  CausalConv1d = 15,
+  /// Post-conv GDN prep: q/k/v/g/beta from the packed conv output and
+  /// the a/b projections plus the a_log/dt_bias parameters (five
+  /// results; the one kind that names TWO weights — see the op table).
+  GdnPrep = 16,
+  /// The gated-delta recurrence against the layer's implicit PER-REQUEST
+  /// recurrent state. Opaque like `Attention`.
+  GatedDelta = 17,
+  /// Per-head gated RMSNorm: `w * rmsnorm(x) * silu(gate)`, plain fold.
+  RmsnormGated = 18,
+  /// Interleaved per-head `[query | gate]` split of the 2×-wide gated q
+  /// projection (qwen3.5 full attention; NOT a row split — the halves
+  /// interleave at head granularity). First of the full-attention kinds
+  /// (the `pie_forward_trace_qwen3_5_full_attn` fragment / the
+  /// `pie_forward_trace_qwen3_5_hybrid` model) — like the dyn and GDN
+  /// kinds above, the declared executors do NOT consume these; their
+  /// op-kind switches throw on them via the loud default arm.
+  SplitQGate = 19,
+  /// `out = x * sigmoid(gate)`, elementwise — the full-attention output
+  /// gate. A multiply with NO residual: distinct from `SigmoidGateAdd`.
+  SigmoidGateMul = 20,
+  /// RETIRED (rung 1's per-kernel kind, absorbed into [`Self::Launch`]
+  /// within the same unreleased arc). Never emitted; the discriminant
+  /// stays reserved per the appended-only rule.
+  QkvDecodeFusedPost = 21,
+  /// RETIRED — see [`Self::QkvDecodeFusedPost`].
+  RopeTableBuild = 22,
+  /// A STATED kernel launch — the ONE kind every lowered trace uses for
+  /// every kernel its class arms call (north-star-dsl.md; raw kernel
+  /// signatures, `dsl::cuda`). The kernel's launcher symbol rides the
+  /// weight slot as a name index; the weight names it consumes ride
+  /// `aux_names` (name indices, signature order); param0 is the
+  /// implicit-state store it addresses (0 none, 1 kv-cache,
+  /// 2 recurrent) and param1 that state's layer. A dumb consumer
+  /// resolves the symbol in its name→launcher registry and launches —
+  /// adding a kernel never grows this enum again.
+  Launch = 23,
+  /// The lowered branch over a per-fire RUNTIME input (`GuardPred` in
+  /// param0 as a wire value; then-region op count in param1; else-region
+  /// op count as a one-entry `aux_names` run). The `then_ops` ops after
+  /// this one run when the predicate holds, the `else_ops` after those
+  /// when it does not; regions are flat (no nesting) and produce no
+  /// values consumed outside. The ONLY branch a class trace carries.
+  Guard = 24,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -74,6 +144,39 @@ enum class PieForwardRopeKind : uint32_t {
   Standard = 0,
   /// Llama3/YaRN-style frequency scaling.
   Yarn = 1,
+};
+
+/// Mirrors [`crate::facts::NormPlacement`].
+enum class PieForwardNormPlacement : uint32_t {
+  Pre = 0,
+  /// OLMo-2/3: norm the sub-layer OUTPUT, then a separate residual add.
+  Post = 1,
+};
+
+/// Mirrors [`crate::facts::QkNorm`]. `Off`/`PerHead` keep the wire values
+/// the field had as a bool (0/1), so a caller that treated it as "non-zero
+/// is per-head qk-norm" still states the same facts.
+enum class PieForwardQkNorm : uint32_t {
+  Off = 0,
+  PerHead = 1,
+  /// One RMSNorm over the flattened `[heads * head_dim]` q/k projection
+  /// (OLMo-2) — different arithmetic from per-head.
+  Global = 2,
+};
+
+/// Mirrors [`crate::trace::FireClass`]; same appended-only discriminant
+/// rule as [`PieForwardOpKind`], same input-side `uint32_t` crossing rule
+/// as every enum here.
+enum class PieForwardFireClass : uint32_t {
+  Decode = 0,
+  Prefill = 1,
+};
+
+/// Mirrors [`crate::trace::GuardPred`] — the values `Guard.param0`
+/// carries; same appended-only discriminant rule as [`PieForwardOpKind`].
+enum class PieForwardGuardPred : uint32_t {
+  /// The fire carries explicit KV-write descriptors (`has_write_desc`).
+  HasWriteDesc = 0,
 };
 
 /// The llama_like facts, as C states them. Mirrors
@@ -101,8 +204,11 @@ struct PieForwardLlamaLikeFacts {
   uint32_t rope;
   /// A [`super::types::PieForwardNormVariant`] value.
   uint32_t norm_variant;
-  /// Per-head RMSNorm on Q/K before rope; non-zero is true.
-  uint8_t qk_norm;
+  /// A [`super::types::PieForwardNormPlacement`] value.
+  uint32_t norm_placement;
+  /// A [`super::types::PieForwardQkNorm`] value. (Formerly a 0/1 bool;
+  /// `Off`/`PerHead` keep those wire values.)
+  uint32_t qk_norm;
   /// The deployment bound one packed QKV projection; non-zero is true.
   uint8_t fused_qkv;
   /// The lm_head weight is the embedding table; non-zero is true.
@@ -154,17 +260,45 @@ struct PieForwardIdRange {
 /// | `Embed`          | embedding table      | —                            | —          |
 /// | `Matmul`         | weight               | `beta_one` (0/1)             | —          |
 /// | `Rmsnorm`        | weight               | [`PieForwardNormVariant`]    | —          |
-/// | `RmsnormPerHead` | weight               | `head_dim`                   | —          |
+/// | `RmsnormPerHead` | weight               | `head_dim`                   | [`PieForwardNormVariant`] |
 /// | `SplitQkv`       | none                 | `q_width`                    | `kv_width` |
-/// | `Rope`           | none                 | [`PieForwardRopeKind`]       | —          |
+/// | `Rope`           | none                 | [`PieForwardRopeKind`]       | partial rotary width (0 = full) |
 /// | `KvAppend`       | none                 | cache layer                  | —          |
 /// | `Attention`      | none                 | cache layer                  | —          |
 /// | `Swiglu`         | none                 | `inter`                      | —          |
 /// | `LmHead`         | weight               | —                            | —          |
+/// | `ResidualAdd`    | none                 | —                            | —          |
+/// | `TopK`           | none                 | `k`                          | —          |
+/// | `WeightedSum`    | none                 | `k`                          | —          |
+/// | `SigmoidGateAdd` | none                 | —                            | —          |
+/// | `SplitGdn`       | none                 | `width0`                     | `width1`   |
+/// | `CausalConv1d`   | conv (weight + bias) | state layer                  | `kernel`   |
+/// | `GdnPrep`        | a_log                | dt_bias NAME index           | —          |
+/// | `GatedDelta`     | none                 | state layer                  | —          |
+/// | `RmsnormGated`   | weight               | —                            | —          |
+/// | `SplitQGate`     | none                 | `heads`                      | `head_dim` |
+/// | `SigmoidGateMul` | none                 | —                            | —          |
+/// | `Launch`         | KERNEL symbol        | state store (0/1/2)          | state layer |
+///
+/// `Launch` additionally carries its consumed weight names in
+/// `aux_names` — see the field.
+///
+/// `RmsnormPerHead`'s param1 and `Rope`'s param1 are serde-additive on the
+/// Rust side (default `Plain` / absent) and appended-param-additive here:
+/// both rest at 0 on every trace that predates them, so a pre-qwen3.5
+/// consumer reading only param0 still reads what it always did. A partial
+/// `Rope` (param1 != 0) rotates only the first param1 channels of each
+/// head (`launch_rope_partial_bf16`'s `rotary_dim`).
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
-/// separately and the flattening does not get to decide they coincide.
+/// separately and the flattening does not get to decide they coincide; the
+/// GDN state ops (`CausalConv1d`, `GatedDelta`) restate theirs for the same
+/// reason — param0 is the layer of the implicit PER-REQUEST conv/recurrent
+/// slab the op reads and advances (the trace crate's `OpKind::state_ref`
+/// marking, pie-application-plan.md §5.4). `GdnPrep` is the one kind whose
+/// launch reads two parameter tensors, so its param0 is a SECOND
+/// [`PieForwardPlan::names`] index (the dt_bias name), not a width.
 struct PieForwardOp {
   PieForwardOpKind kind;
   /// The layer this op belongs to, or [`PIE_FORWARD_NO_LAYER`] for
@@ -175,6 +309,20 @@ struct PieForwardOp {
   uint32_t weight_name;
   uint32_t param0;
   uint32_t param1;
+  /// The per-token selector: for an expert-indexed `Matmul` (whose
+  /// `weight_name` is then a template, `layer.0.expert.{e}.gate_up`) the
+  /// value id of the `TopK` index output that resolves `{e}` per token;
+  /// [`PIE_FORWARD_NO_VALUE`] for every other op. The selector is also
+  /// the op's last input, so a dataflow walk needs no special case; this
+  /// field states which input selects rather than flows. The dyn marker
+  /// crosses the ABI only here and as the producing `TopK` op — a
+  /// per-value flag would duplicate what these two already state.
+  uint32_t selector;
+  /// `Launch` only: the weight names the stated kernel consumes, as a
+  /// range of NAME indices in the flat id array (the same array the
+  /// operand ranges index — ids are just u32s; what a range means is
+  /// the field's contract). Empty for every other kind.
+  PieForwardIdRange aux_names;
   /// Values consumed, in operand order.
   PieForwardIdRange inputs;
   /// Values produced (`SplitQkv` produces three, `KvAppend` none).
@@ -229,6 +377,106 @@ struct PieForwardPlan {
   void *owner;
 };
 
+/// The CUDA backend facts for a LOWERED llama_like trace, as C states
+/// them. Mirrors [`crate::facts::LlamaLikeCudaFacts`] field for field;
+/// same input-side rules as [`PieForwardLlamaLikeFacts`] (the bools are
+/// `uint8_t`, non-zero is true).
+///
+/// The driver fills this from its OWN derivation (env, kernel-support
+/// predicates, binding, cache format) at cold start — the same terms its
+/// executor booleans compute today — and the returned class traces then
+/// STATE every kernel, which is what lets the executor go dumb
+/// (north-star-dsl.md, migration rung 2).
+struct PieForwardLlamaLikeCudaFacts {
+  /// XQA decode eligibility; non-zero is true.
+  uint8_t xqa_decode;
+  /// The fused decode-QKV epilogue's load-time terms hold.
+  uint8_t decode_fused_post;
+  /// The workspace carries a rope table.
+  uint8_t rope_table;
+  /// FlashInfer's decode set lacks this GQA ratio.
+  uint8_t force_prefill_path;
+};
+
+/// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35MoeMlpFacts`] field for field; same input-side
+/// rules as [`PieForwardLlamaLikeFacts`].
+struct PieForwardQwen35MoeMlpFacts {
+  uint32_t hidden;
+  uint32_t num_experts;
+  uint32_t top_k;
+  uint32_t moe_intermediate;
+  /// 0 means no shared expert (the qwen3_moe shape).
+  uint32_t shared_expert_intermediate;
+  /// A [`super::types::PieForwardNormVariant`] value.
+  uint32_t norm_variant;
+};
+
+/// The qwen3_5 GDN-block facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35GdnFacts`] field for field; same input-side rules
+/// as [`PieForwardLlamaLikeFacts`].
+struct PieForwardQwen35GdnFacts {
+  uint32_t hidden;
+  uint32_t key_heads;
+  uint32_t value_heads;
+  uint32_t key_head_dim;
+  uint32_t value_head_dim;
+  uint32_t conv_kernel;
+  /// The deployment bound the fused `in_proj_qkvz`/`in_proj_ba` banks
+  /// (`PIE_QWEN35_FUSED_GDN_PROJ`); non-zero is true.
+  uint8_t fused_in_proj;
+  /// A [`super::types::PieForwardNormVariant`] value.
+  uint32_t norm_variant;
+};
+
+/// The qwen3_5 full-attention block facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35FullAttnFacts`] field for field; same input-side
+/// rules as [`PieForwardLlamaLikeFacts`].
+struct PieForwardQwen35FullAttnFacts {
+  uint32_t hidden;
+  uint32_t q_heads;
+  uint32_t kv_heads;
+  uint32_t head_dim;
+  /// Partial-rotary width: the leading channels of each head that
+  /// rotate. Must be in `1..=head_dim`.
+  uint32_t rotary_dim;
+  /// The deployment bound the fused `[2q | k | v]` bank
+  /// (`PIE_QWEN35_FUSED_FULL_ATTN_QGKV`); non-zero is true.
+  uint8_t fused_qkv;
+  /// A [`super::types::PieForwardNormVariant`] value.
+  uint32_t norm_variant;
+};
+
+/// The qwen3_5 HYBRID model facts, as C states them. Mirrors
+/// [`crate::facts::Qwen35HybridFacts`], with the MLP enum flattened the way
+/// C states a sum type: `mlp_is_moe` selects which of
+/// `dense_intermediate` / `moe` is read (the other is ignored). Same
+/// input-side rules as [`PieForwardLlamaLikeFacts`].
+struct PieForwardQwen35HybridFacts {
+  uint32_t layers;
+  /// One full-attention layer every Nth (at the end of each block);
+  /// `1` means every layer. Must be non-zero.
+  uint32_t full_attn_interval;
+  uint32_t vocab;
+  /// The lm_head weight is the embedding table; non-zero is true.
+  uint8_t tied_embeddings;
+  /// A [`super::types::PieForwardNormVariant`] value (the final norm's
+  /// fold; block norms carry their own inside the sub-facts).
+  uint32_t norm_variant;
+  /// The full-attention layer kind.
+  PieForwardQwen35FullAttnFacts attn;
+  /// The GDN linear-attention layer kind.
+  PieForwardQwen35GdnFacts gdn;
+  /// Non-zero: the MLP is the MoE block (`moe`); zero: dense
+  /// (`dense_intermediate`).
+  uint8_t mlp_is_moe;
+  /// The dense MLP's intermediate width; read only when `mlp_is_moe`
+  /// is zero, and must then be non-zero.
+  uint32_t dense_intermediate;
+  /// The MoE MLP facts; read only when `mlp_is_moe` is non-zero.
+  PieForwardQwen35MoeMlpFacts moe;
+};
+
 extern "C" {
 
 /// Trace the llama_like family against `facts` and publish the traced form
@@ -245,8 +493,101 @@ extern "C" {
 PieForwardStatus pie_forward_trace_llama_like(const PieForwardLlamaLikeFacts *facts,
                                               PieForwardPlan *out_plan);
 
+/// Trace the LOWERED llama_like — the same text as
+/// [`pie_forward_trace_llama_like`], with the CUDA backend facts and a
+/// fire class in hand, so the class arms run and the traced form states
+/// kernels (`QkvDecodeFusedPost`, `RopeTableBuild`, `Attention.param1`;
+/// north-star-dsl.md). Call once per class the deployment fires; the
+/// semantic entry remains the parity reference.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardLlamaLikeFacts`] / [`PieForwardLlamaLikeCudaFacts`];
+/// `out_plan` is null or a writable slot. `class` is a
+/// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
+/// enum rule); anything else answers `InvalidArgument`.
+PieForwardStatus pie_forward_trace_llama_like_cuda(const PieForwardLlamaLikeFacts *facts,
+                                                   const PieForwardLlamaLikeCudaFacts *cuda,
+                                                   uint32_t class_,
+                                                   PieForwardPlan *out_plan);
+
+/// Trace the qwen3_5_moe MoE MLP-block FRAGMENT against `facts` and publish
+/// the traced form into `*out_plan`.
+///
+/// The result is the first traced form carrying `dyn` ops (`TopK`,
+/// expert-selecting `Matmul`s, `WeightedSum`, `SigmoidGateAdd`). The
+/// declared executors do NOT consume these — their op-kind switches throw
+/// on any kind past their vocabulary — so this entry point exists for the
+/// toolchain side (planning, tests, cross-language pinning), not for
+/// emission; the grouped-GEMM emission is a later, much larger lift.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35MoeMlpFacts`];
+/// `out_plan` is null or a writable slot.
+PieForwardStatus pie_forward_trace_qwen3_5_moe_mlp(const PieForwardQwen35MoeMlpFacts *facts,
+                                                   PieForwardPlan *out_plan);
+
+/// Trace the qwen3_5 GDN (gated-deltanet) linear-attention block FRAGMENT
+/// against `facts` and publish the traced form into `*out_plan`.
+///
+/// The result carries the GDN vocabulary (`SplitGdn`, `CausalConv1d`,
+/// `GdnPrep`, `GatedDelta`, `RmsnormGated`) — and the first ops that
+/// address PER-REQUEST state (the conv/recurrent slabs, implicit behind
+/// `CausalConv1d`/`GatedDelta`'s layer, exactly as the KV cache is behind
+/// `KvAppend`'s). The declared executors do NOT consume these — their
+/// op-kind switches throw on any kind past their vocabulary — so this
+/// entry point exists for the toolchain side (planning, tests,
+/// cross-language pinning), not for emission.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35GdnFacts`];
+/// `out_plan` is null or a writable slot.
+PieForwardStatus pie_forward_trace_qwen3_5_gdn(const PieForwardQwen35GdnFacts *facts,
+                                               PieForwardPlan *out_plan);
+
+/// Trace the qwen3_5 FULL-attention block FRAGMENT against `facts` and
+/// publish the traced form into `*out_plan`.
+///
+/// The result carries the full-attention vocabulary (`SplitQGate`,
+/// `SigmoidGateMul`, the partial `Rope` and the Gemma-fold
+/// `RmsnormPerHead`) alongside `KvAppend`/`Attention` marking the layer's
+/// KV cache. The declared executors do NOT consume these — their op-kind
+/// switches throw on any kind past their vocabulary — so, like the MoE and
+/// GDN fragments, this entry point exists for the toolchain side (planning,
+/// tests, cross-language pinning), not for emission.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35FullAttnFacts`];
+/// `out_plan` is null or a writable slot.
+PieForwardStatus pie_forward_trace_qwen3_5_full_attn(const PieForwardQwen35FullAttnFacts *facts,
+                                                     PieForwardPlan *out_plan);
+
+/// Trace the full qwen3_5 HYBRID model against `facts` and publish the
+/// traced form into `*out_plan` — the first whole-model entry point beyond
+/// llama_like: embed → per-layer {GDN or full attention, per the
+/// checkpoint's layer schedule; dense or MoE MLP} → final norm → lm_head.
+///
+/// The result composes every vocabulary the fragments introduced (dyn MoE
+/// ops when the facts say MoE, the GDN per-request-state ops, the
+/// full-attention gate/partial-rope ops), so the declared executors refuse
+/// it loudly; the entry point serves the toolchain side.
+///
+/// # Safety
+///
+/// `facts` is null or points at a readable [`PieForwardQwen35HybridFacts`];
+/// `out_plan` is null or a writable slot.
+PieForwardStatus pie_forward_trace_qwen3_5_hybrid(const PieForwardQwen35HybridFacts *facts,
+                                                  PieForwardPlan *out_plan);
+
 /// Free the storage behind a plan header filled by
-/// [`pie_forward_trace_llama_like`], and reset the header to empty.
+/// [`pie_forward_trace_llama_like`], [`pie_forward_trace_qwen3_5_moe_mlp`],
+/// [`pie_forward_trace_qwen3_5_gdn`],
+/// [`pie_forward_trace_qwen3_5_full_attn`] or
+/// [`pie_forward_trace_qwen3_5_hybrid`], and reset the header to empty.
 ///
 /// Safe to call with null, with a header that was never filled, or twice
 /// with the same header (the first call empties it).

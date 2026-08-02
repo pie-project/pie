@@ -29,6 +29,12 @@ pub struct AddedToken {
     pub id: u32,
     pub content: String,
     pub special: bool,
+    /// Consume whitespace immediately before the token when matching
+    /// (Hugging Face `lstrip`). The consumed whitespace is not encoded.
+    pub lstrip: bool,
+    /// Consume whitespace immediately after the token when matching
+    /// (Hugging Face `rstrip`). The consumed whitespace is not encoded.
+    pub rstrip: bool,
 }
 
 /// Whether an already-known whole piece bypasses BPE merging.
@@ -45,6 +51,22 @@ impl BpeMode {
     }
 }
 
+/// How the sentencepiece dummy prefix (`normalizer_to` marker) is injected
+/// while encoding a `ByteFallbackReplace` pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DummyPrefix {
+    /// No marker is prepended (Gemma).
+    None,
+    /// Prepend one marker to every encoded text segment, unconditionally
+    /// (HF `Prepend` normalizer; the legacy Llama-2/Phi-3 shape).
+    EverySegment,
+    /// Prepend one marker only to a segment that starts the input, and only
+    /// when it does not already begin with the marker after space
+    /// replacement (HF `Metaspace` pre-tokenizer with
+    /// `prepend_scheme: "first"`; Mistral).
+    FirstSegment,
+}
+
 /// Compiled tokenizer behavior for the modern model families supported by Pie.
 #[derive(Debug)]
 pub(crate) enum Pipeline {
@@ -54,11 +76,20 @@ pub(crate) enum Pipeline {
         splitters: Vec<fancy_regex::Regex>,
         bpe_mode: BpeMode,
     },
-    /// Gemma-style space marker normalization with byte fallback on decode.
+    /// Sentencepiece-style space marker normalization with byte fallback on
+    /// decode. Covers Gemma (`DummyPrefix::None`), the legacy Llama-2/Phi-3
+    /// shape (`DummyPrefix::EverySegment` + decoder `Strip`), and the
+    /// Mistral Metaspace shape (`DummyPrefix::FirstSegment` + decoder
+    /// `Strip`).
     ByteFallbackReplace {
         normalizer_from: String,
         normalizer_to: String,
         unk_token_id: Option<u32>,
+        /// Dummy-prefix injection mode for encoded text segments.
+        dummy_prefix: DummyPrefix,
+        /// Remove one leading `normalizer_from` from the decoded stream
+        /// (HF decoder `Strip { start: 1 }`, undoing the dummy prefix).
+        strip_decoder_marker: bool,
     },
     /// Minimal char-level path used by grammar fixtures and `from_vocab`.
     RawChar,
@@ -108,10 +139,11 @@ pub struct Tokenizer {
 
     pipeline: Pipeline,
 
-    // Added / special tokens (sorted for binary_search)
+    // Added / special tokens (`special_token_ids` sorted for binary_search;
+    // `added_tokens` aligned with the matcher's pattern indices)
     special_token_ids: Vec<u32>,
     added_token_matcher: Option<AhoCorasick>,
-    added_token_ids: Vec<u32>,
+    added_tokens: Vec<AddedToken>,
 
     grammar: OnceLock<GrammarVocabulary>,
 }
@@ -128,6 +160,9 @@ pub struct TokenizerDecoder {
     skip_special: bool,
     pending_utf8: Vec<u8>,
     fallback_run: Vec<u8>,
+    /// Whether the pipeline's decoder `Strip` still has to inspect the first
+    /// emitted output of this stream. Disarms after the first non-empty chunk.
+    strip_armed: bool,
 }
 
 impl Tokenizer {
@@ -149,16 +184,16 @@ impl Tokenizer {
         special_token_ids.sort_unstable();
 
         // Build an Aho-Corasick matcher for added/special tokens.
-        let (added_token_matcher, added_token_ids) = if !added_tokens.is_empty() {
+        let added_token_matcher = if !added_tokens.is_empty() {
             let patterns: Vec<&str> = added_tokens.iter().map(|t| t.content.as_str()).collect();
-            let matcher = AhoCorasick::builder()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(&patterns)
-                .context("building added-token matcher")?;
-            let ids: Vec<u32> = added_tokens.iter().map(|t| t.id).collect();
-            (Some(matcher), ids)
+            Some(
+                AhoCorasick::builder()
+                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                    .build(&patterns)
+                    .context("building added-token matcher")?,
+            )
         } else {
-            (None, vec![])
+            None
         };
 
         Ok(Tokenizer {
@@ -166,7 +201,7 @@ impl Tokenizer {
             pipeline,
             special_token_ids,
             added_token_matcher,
-            added_token_ids,
+            added_tokens,
             grammar: OnceLock::new(),
         })
     }
@@ -214,7 +249,18 @@ impl Tokenizer {
             skip_special,
             pending_utf8: Vec::new(),
             fallback_run: Vec::new(),
+            strip_armed: self.strips_decoder_marker(),
         }
+    }
+
+    fn strips_decoder_marker(&self) -> bool {
+        matches!(
+            self.pipeline,
+            Pipeline::ByteFallbackReplace {
+                strip_decoder_marker: true,
+                ..
+            }
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -234,20 +280,34 @@ impl Tokenizer {
             return;
         }
         let Some(matcher) = &self.added_token_matcher else {
-            self.encode_text(text, ids);
+            self.encode_text(text, true, ids);
             return;
         };
 
         let mut last_end = 0;
         for matched in matcher.find_iter(text) {
-            if matched.start() > last_end {
-                self.encode_text(&text[last_end..matched.start()], ids);
+            let token = &self.added_tokens[matched.pattern().as_usize()];
+            let mut segment_end = matched.start().max(last_end);
+            if token.lstrip {
+                // The whitespace run before the token joins the match.
+                let segment = &text[last_end..segment_end];
+                segment_end = last_end + segment.trim_end_matches(char::is_whitespace).len();
             }
-            ids.push(self.added_token_ids[matched.pattern().as_usize()]);
-            last_end = matched.end();
+            if segment_end > last_end {
+                // A segment starts the input iff it begins at byte 0; any
+                // segment after an added token cannot.
+                self.encode_text(&text[last_end..segment_end], last_end == 0, ids);
+            }
+            ids.push(token.id);
+            last_end = last_end.max(matched.end());
+            if token.rstrip {
+                // The whitespace run after the token joins the match.
+                let rest = &text[last_end..];
+                last_end += rest.len() - rest.trim_start_matches(char::is_whitespace).len();
+            }
         }
         if last_end < text.len() {
-            self.encode_text(&text[last_end..], ids);
+            self.encode_text(&text[last_end..], last_end == 0, ids);
         }
     }
 
@@ -273,7 +333,7 @@ impl Tokenizer {
         }
     }
 
-    fn encode_text(&self, text: &str, ids: &mut Vec<u32>) {
+    fn encode_text(&self, text: &str, starts_input: bool, ids: &mut Vec<u32>) {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { nfc, splitters, .. } => {
                 let text = if *nfc && is_nfc_quick(text.chars()) != IsNormalized::Yes {
@@ -286,6 +346,7 @@ impl Tokenizer {
             Pipeline::ByteFallbackReplace {
                 normalizer_from,
                 normalizer_to,
+                dummy_prefix,
                 ..
             } => {
                 let text = if text.contains(normalizer_from.as_str()) {
@@ -293,7 +354,24 @@ impl Tokenizer {
                 } else {
                     Cow::Borrowed(text)
                 };
-                self.encode_piece(&text, ids);
+                let prepend = match dummy_prefix {
+                    DummyPrefix::None => false,
+                    DummyPrefix::EverySegment => true,
+                    // Metaspace `prepend_scheme: "first"`: only the segment
+                    // starting the input, and only when the replaced text
+                    // does not already begin with the marker.
+                    DummyPrefix::FirstSegment => {
+                        starts_input && !text.starts_with(normalizer_to.as_str())
+                    }
+                };
+                if prepend {
+                    let mut prefixed = String::with_capacity(normalizer_to.len() + text.len());
+                    prefixed.push_str(normalizer_to);
+                    prefixed.push_str(&text);
+                    self.encode_piece(&prefixed, ids);
+                } else {
+                    self.encode_piece(&text, ids);
+                }
             }
             Pipeline::RawChar => self.encode_piece(text, ids),
         }
@@ -372,13 +450,18 @@ impl Tokenizer {
             Pipeline::ByteFallbackReplace {
                 normalizer_from,
                 normalizer_to,
+                strip_decoder_marker,
                 ..
-            } => self.decode_byte_fallback(
-                ids,
-                skip_special,
-                normalizer_to.as_bytes(),
-                normalizer_from.as_bytes(),
-            ),
+            } => {
+                let strip_prefix = strip_decoder_marker.then_some(normalizer_from.as_bytes());
+                self.decode_byte_fallback(
+                    ids,
+                    skip_special,
+                    normalizer_to.as_bytes(),
+                    normalizer_from.as_bytes(),
+                    strip_prefix,
+                )
+            }
             Pipeline::ByteLevelRegex { .. } | Pipeline::RawChar => {
                 self.decode_raw(ids, skip_special)
             }
@@ -404,6 +487,7 @@ impl Tokenizer {
         skip_special: bool,
         decoder_pattern: &[u8],
         decoder_content: &[u8],
+        strip_prefix: Option<&[u8]>,
     ) -> String {
         let mut output = Vec::with_capacity(ids.len() * 4);
         let mut fallback_bytes = Vec::new();
@@ -423,6 +507,11 @@ impl Tokenizer {
             }
         }
         flush_byte_fallback(&mut fallback_bytes, &mut output);
+        if let Some(prefix) = strip_prefix
+            && output.starts_with(prefix)
+        {
+            output.drain(..prefix.len());
+        }
         bytes_to_string(output)
     }
 
@@ -603,6 +692,7 @@ impl TokenizerDecoder {
                 }
             }
         }
+        self.apply_stream_strip(&mut output);
         bytes_to_string(output)
     }
 
@@ -617,6 +707,7 @@ impl TokenizerDecoder {
                 flush_byte_fallback(&mut self.fallback_run, &mut output);
             }
         }
+        self.apply_stream_strip(&mut output);
         bytes_to_string(output)
     }
 
@@ -624,6 +715,24 @@ impl TokenizerDecoder {
     pub fn reset(&mut self) {
         self.pending_utf8.clear();
         self.fallback_run.clear();
+        self.strip_armed = self.tokenizer.strips_decoder_marker();
+    }
+
+    /// Decoder `Strip` on the stream: inspect the first non-empty output and
+    /// remove one leading marker, mirroring `Strip { start: 1 }` over the
+    /// fused decode of the whole stream.
+    fn apply_stream_strip(&mut self, output: &mut Vec<u8>) {
+        if !self.strip_armed || output.is_empty() {
+            return;
+        }
+        self.strip_armed = false;
+        if let Pipeline::ByteFallbackReplace {
+            normalizer_from, ..
+        } = &self.tokenizer.pipeline
+            && output.starts_with(normalizer_from.as_bytes())
+        {
+            output.drain(..normalizer_from.len());
+        }
     }
 }
 
@@ -795,21 +904,37 @@ mod tests {
     }
 
     fn make_byte_fallback_tokenizer(vocab: &[(&str, u32)], merges: &[(&str, &str)]) -> Tokenizer {
+        make_sentencepiece_tokenizer(vocab, merges, DummyPrefix::None, vec![])
+    }
+
+    fn make_sentencepiece_tokenizer(
+        vocab: &[(&str, u32)],
+        merges: &[(&str, &str)],
+        dummy_prefix: DummyPrefix,
+        added_tokens: Vec<AddedToken>,
+    ) -> Tokenizer {
         let vocab_map: HashMap<String, u32> =
             vocab.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         let merge_pairs: Vec<(String, String)> = merges
             .iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
-        let bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, false).unwrap();
+        let mut bpe = bpe::BpeTable::from_vocab_and_merges(&vocab_map, &merge_pairs, false).unwrap();
+        for at in &added_tokens {
+            bpe.insert_added(at.content.as_bytes().to_vec(), at.id)
+                .unwrap();
+        }
+        let strip_decoder_marker = dummy_prefix != DummyPrefix::None;
         Tokenizer::new(
             bpe,
             Pipeline::ByteFallbackReplace {
                 normalizer_from: " ".into(),
                 normalizer_to: "▁".into(),
                 unk_token_id: None,
+                dummy_prefix,
+                strip_decoder_marker,
             },
-            vec![],
+            added_tokens,
         )
         .unwrap()
     }
@@ -893,11 +1018,15 @@ mod tests {
                     id: 3,
                     content: "<s>".into(),
                     special: true,
+                    lstrip: false,
+                    rstrip: false,
                 },
                 AddedToken {
                     id: 4,
                     content: "</s>".into(),
                     special: true,
+                    lstrip: false,
+                    rstrip: false,
                 },
             ],
         );
@@ -983,5 +1112,113 @@ mod tests {
         assert_eq!(decoder.feed(&[5, 6, 7, 8]), "");
         assert_eq!(decoder.finish(), "����");
         assert_eq!(tokenizer.decode(&[5, 6, 7, 8], false), "����");
+    }
+
+    const SP_VOCAB: &[(&str, u32)] = &[("a", 0), ("▁", 1), ("b", 2), ("▁a", 3), ("▁b", 4)];
+    const SP_MERGES: &[(&str, &str)] = &[("▁", "a"), ("▁", "b")];
+
+    fn sp_added(id: u32, content: &str, lstrip: bool, rstrip: bool) -> AddedToken {
+        AddedToken {
+            id,
+            content: content.into(),
+            special: true,
+            lstrip,
+            rstrip,
+        }
+    }
+
+    #[test]
+    fn sentencepiece_prepend_and_strip_roundtrip() {
+        let tok = make_sentencepiece_tokenizer(SP_VOCAB, SP_MERGES, DummyPrefix::EverySegment, vec![]);
+        // Dummy prefix: "a b" → "▁a▁b" → [▁a, ▁b]; Strip undoes it on decode.
+        let ids = tok.encode("a b");
+        assert_eq!(ids, vec![3, 4]);
+        assert_eq!(tok.decode(&ids, false), "a b");
+        // A real leading space survives the round-trip.
+        let ids = tok.encode(" a");
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(tok.decode(&ids, false), " a");
+        assert_eq!(tok.encode(""), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn sentencepiece_strip_applies_only_at_stream_start() {
+        let tok = make_sentencepiece_tokenizer(
+            SP_VOCAB,
+            SP_MERGES,
+            DummyPrefix::EverySegment,
+            vec![sp_added(5, "<s>", false, false)],
+        );
+        // First decoded char is not the marker → nothing is stripped.
+        assert_eq!(tok.decode(&[5, 3], false), "<s> a");
+        // Skipping the special token exposes the marker → it is stripped.
+        assert_eq!(tok.decode(&[5, 3], true), "a");
+    }
+
+    #[test]
+    fn sentencepiece_added_token_lstrip_rstrip() {
+        let tok = make_sentencepiece_tokenizer(
+            SP_VOCAB,
+            SP_MERGES,
+            DummyPrefix::EverySegment,
+            vec![sp_added(5, "<e>", false, true), sp_added(6, "<l>", true, false)],
+        );
+        // rstrip: the whitespace after <e> joins the match and is not encoded.
+        assert_eq!(tok.encode("a <e> b"), vec![3, 1, 5, 4]);
+        assert_eq!(tok.encode("<e>\n\t b"), vec![5, 4]);
+        // lstrip: the whitespace before <l> joins the match and is not encoded.
+        assert_eq!(tok.encode("a \n<l>"), vec![3, 6]);
+        // Without the flags the whitespace still encodes (control case).
+        let plain = make_sentencepiece_tokenizer(
+            SP_VOCAB,
+            SP_MERGES,
+            DummyPrefix::EverySegment,
+            vec![sp_added(5, "<e>", false, false)],
+        );
+        assert_eq!(plain.encode("a <e> b"), vec![3, 1, 5, 1, 4]);
+    }
+
+    #[test]
+    fn incremental_sentencepiece_strip_matches_full_decode() {
+        let tokenizer = Arc::new(make_sentencepiece_tokenizer(
+            SP_VOCAB,
+            SP_MERGES,
+            DummyPrefix::EverySegment,
+            vec![sp_added(5, "<s>", false, false)],
+        ));
+        let mut decoder = tokenizer.decoder(false);
+        assert_eq!(decoder.feed(&[3]), "a");
+        assert_eq!(decoder.feed(&[4]), " b");
+        assert_eq!(decoder.finish(), "");
+
+        decoder.reset();
+        let mut incremental = String::new();
+        for id in [5u32, 3, 4] {
+            incremental.push_str(&decoder.feed(&[id]));
+        }
+        incremental.push_str(&decoder.finish());
+        assert_eq!(incremental, tokenizer.decode(&[5, 3, 4], false));
+        assert_eq!(incremental, "<s> a b");
+    }
+
+    #[test]
+    fn metaspace_first_prefixes_only_the_input_start() {
+        let tok = make_sentencepiece_tokenizer(
+            SP_VOCAB,
+            SP_MERGES,
+            DummyPrefix::FirstSegment,
+            vec![sp_added(5, "<s>", false, false)],
+        );
+        // Dummy prefix at the very start of the input.
+        assert_eq!(tok.encode("a b"), vec![3, 4]);
+        // Already starts with the marker after space replacement → no prefix.
+        assert_eq!(tok.encode(" a"), vec![3]);
+        assert_eq!(tok.encode("▁a"), vec![3]);
+        // Segments after an added token never receive the prefix.
+        assert_eq!(tok.encode("<s>a"), vec![5, 0]);
+        assert_eq!(tok.encode("<s> a"), vec![5, 3]);
+        assert_eq!(tok.encode("a<s>a"), vec![3, 5, 0]);
+        // Strip still removes one leading space on decode.
+        assert_eq!(tok.decode(&[3, 4], false), "a b");
     }
 }

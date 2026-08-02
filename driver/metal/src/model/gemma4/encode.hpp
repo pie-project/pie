@@ -30,9 +30,8 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const Gemma4Psos& g4)
 /// Its grid and threadgroup, from the geometry and this dispatch's layer.
 void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Threadgroup& tg);
 
-/// `run_ends[i]`: the last ordinal of the concurrency run containing `i`. What
-/// the colourer needs to know about which barriers the encoder will drop.
-std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag);
+// gemma4_run_ends moved to scratch.hpp: it is pure (the colourer's host-side
+// contract) and the encoder below is just one of its readers.
 
 /// Walk the DAG with a real encoder.
 void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,

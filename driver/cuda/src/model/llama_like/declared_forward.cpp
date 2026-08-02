@@ -1,6 +1,7 @@
 #include "model/llama_like/declared_forward.hpp"
 
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -11,7 +12,9 @@
 
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
+#include "kernels/head_dim_pad.hpp"
 #include "kernels/kv_paged.hpp"
+#include "kernels/residual_add.hpp"
 #include "kernels/rmsnorm.hpp"
 #include "kernels/rope.hpp"
 #include "kernels/split_packed.hpp"
@@ -24,9 +27,11 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
+using pie_forward::PieForwardNormPlacement;
 using pie_forward::PieForwardNormVariant;
 using pie_forward::PieForwardOp;
 using pie_forward::PieForwardOpKind;
+using pie_forward::PieForwardQkNorm;
 using pie_forward::PieForwardRopeKind;
 
 // A plan weight name split into its layer index and field: "layer.3.qkv" →
@@ -81,58 +86,86 @@ const DeviceTensor* require(const DeviceTensor* t, std::string_view name) {
     return t;
 }
 
-// Cursor advance for the fused decode-QKV peephole: the ONE kernel just
-// launched (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) computed the
-// plan ops
-//   SplitQkv, RmsnormPerHead(q_norm), RmsnormPerHead(k_norm),
-//   Rope(Standard), KvAppend(layer)
-// so the walk must not launch them again. family.rs's layer body emits
-// exactly this run after Matmul(qkv) whenever fused_qkv && qk_norm — both
-// of which the peephole's predicate requires — so the adjacency is checked
-// op by op, kinds AND payloads, and a mismatch throws: a trace whose shape
-// drifted must fail, not silently half-fuse (the kernel's side effects are
-// already in ws.q and the paged cache).
-//
-// Returns the index of the KvAppend; the loop's `++i` then lands on
-// Attention.
-std::size_t skip_fused_decode_qkv_ops(
-    const pie_forward::ForwardPlan& plan, std::size_t i, int layer)
-{
-    const auto expect = [&](std::size_t at, PieForwardOpKind kind,
-                            const char* what) -> const PieForwardOp& {
-        if (at >= plan.op_count() || plan.op(at).kind != kind) {
-            throw std::runtime_error(
-                std::string("declared forward: fused decode-QKV peephole "
-                            "expected ") + what +
-                " at op " + std::to_string(at) +
-                " after Matmul(qkv); the trace's shape drifted from "
-                "family.rs's fused_qkv layer body");
-        }
-        return plan.op(at);
-    };
-    expect(i + 1, PieForwardOpKind::SplitQkv, "SplitQkv");
-    const PieForwardOp& qn = expect(
-        i + 2, PieForwardOpKind::RmsnormPerHead, "RmsnormPerHead(q_norm)");
-    const PieForwardOp& kn = expect(
-        i + 3, PieForwardOpKind::RmsnormPerHead, "RmsnormPerHead(k_norm)");
-    const PieForwardOp& rope = expect(
-        i + 4, PieForwardOpKind::Rope, "Rope(Standard)");
-    const PieForwardOp& append = expect(
-        i + 5, PieForwardOpKind::KvAppend, "KvAppend");
-    const ParsedWeightName qn_nm = parse_weight_name(plan.weight_name(qn));
-    const ParsedWeightName kn_nm = parse_weight_name(plan.weight_name(kn));
-    if (qn_nm.field != "q_norm" || qn_nm.layer != layer ||
-        kn_nm.field != "k_norm" || kn_nm.layer != layer ||
-        rope.param0 !=
-            static_cast<std::uint32_t>(PieForwardRopeKind::Standard) ||
-        static_cast<int>(append.param0) != layer) {
-        throw std::runtime_error(
-            "declared forward: fused decode-QKV peephole matched op kinds "
-            "but not their payloads at layer " + std::to_string(layer) +
-            "; the trace's shape drifted from family.rs's fused_qkv "
-            "layer body");
+// The launcher registry's vocabulary: every kernel a class trace may
+// STATE as a `Launch` op (dsl::cuda's raw signatures), one enum value per
+// launcher symbol. `resolve_launch_kernel` is the registry lookup; the
+// executor's Launch arm switches on the result and BINDS — buffers,
+// plans, staging — without choosing. A symbol outside this vocabulary
+// means the trace and this executor drifted; `build` validates every
+// stated symbol at model load so that drift fails at boot, not mid-fire.
+enum class LaunchKernel {
+    RopeStandardTable,
+    QkvDecodeQkNormRopeWriteKv,
+    QkRmsnormRope,
+    AttentionXqaDecodePrepared,
+    AttentionFlashinferDecode,
+    DequantKvCacheLayerToBf16Active,
+    AttentionFlashinferPrefill,
+    WriteKvExplicit,
+    WriteKvToPages,
+};
+
+LaunchKernel resolve_launch_kernel(std::string_view kernel) {
+    if (kernel == "launch_rope_standard_table") {
+        return LaunchKernel::RopeStandardTable;
     }
-    return i + 5;
+    if (kernel == "launch_qkv_decode_qk_norm_rope_write_kv_bf16") {
+        return LaunchKernel::QkvDecodeQkNormRopeWriteKv;
+    }
+    if (kernel == "launch_qk_rmsnorm_rope_bf16") {
+        return LaunchKernel::QkRmsnormRope;
+    }
+    if (kernel == "launch_attention_xqa_decode_bf16_prepared") {
+        return LaunchKernel::AttentionXqaDecodePrepared;
+    }
+    if (kernel == "dispatch_attention_flashinfer_decode") {
+        return LaunchKernel::AttentionFlashinferDecode;
+    }
+    if (kernel == "launch_dequant_kv_cache_layer_to_bf16_active") {
+        return LaunchKernel::DequantKvCacheLayerToBf16Active;
+    }
+    if (kernel == "dispatch_attention_flashinfer_prefill_bf16") {
+        return LaunchKernel::AttentionFlashinferPrefill;
+    }
+    if (kernel == "launch_write_kv_explicit_bf16") {
+        return LaunchKernel::WriteKvExplicit;
+    }
+    if (kernel == "launch_write_kv_to_pages") {
+        return LaunchKernel::WriteKvToPages;
+    }
+    throw std::runtime_error(
+        "declared forward: stated kernel '" + std::string(kernel) +
+        "' is not in this executor's registry (the trace and the driver "
+        "drifted)");
+}
+
+// Boot validation: every Launch symbol a class trace states must resolve.
+void validate_stated_kernels(const pie_forward::ForwardPlan& plan) {
+    const std::size_t n = plan.op_count();
+    for (std::size_t i = 0; i < n; ++i) {
+        const PieForwardOp& op = plan.op(i);
+        if (op.kind == PieForwardOpKind::Launch) {
+            (void)resolve_launch_kernel(plan.weight_name(op));
+        }
+    }
+}
+
+// Rung 3 (north-star-dsl.md): the static C++ form of the class traces,
+// emitted by `cargo run -p pie-forward --bin emit-cuda` and committed.
+// Uses the helpers above (require, make_weight_view); the digest constant
+// it defines names the deployment it was emitted from, and the dispatch
+// in `llama_like_forward_declared` runs it only on exact match.
+#include "model/llama_like/generated/qwen3_0_6b.inc"
+
+// PIE_DECLARED_FORWARD_GENERATED=1 routes digest-matched fires through
+// the generated static form instead of the interpreter walk — the third
+// leg of the parity proof (hand-written ≡ interpreter ≡ generated).
+bool generated_forward_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_DECLARED_FORWARD_GENERATED");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
 }
 
 }  // namespace
@@ -140,7 +173,8 @@ std::size_t skip_fused_decode_qkv_ops(
 LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
-    const Qwen3Weights& w)
+    const Qwen3Weights& w,
+    const KvCache& cache)
 {
     LlamaLikeDeclaredPlan out;
 
@@ -148,10 +182,15 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // returns empty and the model keeps the hand-written path. Each line
     // names the hand-written feature it stands in for.
     if (fwd_cfg.rope_kind != RopeKind::Standard) return out;   // YaRN/M-RoPE
-    if (fwd_cfg.norm_placement != NormPlacement::Pre) return out;  // OLMo-3
+    // Post-norm placement (olmo2/olmo3) is admitted: the trace carries the
+    // matmul(beta=0) → rmsnorm → residual_add triplet and the executor
+    // launches the hand-written post-norm block's kernels.
     if (fwd_cfg.use_qkv_bias) return out;                      // Qwen-2 bias
     if (fwd_cfg.tp_size > 1) return out;                       // all-reduces
-    if (cfg.head_dim != cfg.head_dim_kernel) return out;       // Phi-3 pad
+    // Padded head_dim (Phi-3-mini, 96 → 128) is admitted: the pad/strip
+    // launches around KV-write/attention are emitter knowledge (the trace
+    // speaks the logical head_dim throughout), handled in the executor
+    // exactly as the hand-written `head_dim_padded` branches.
     if (w.layers.empty() ||
         w.layers.size() != static_cast<std::size_t>(cfg.num_hidden_layers)) {
         return out;
@@ -168,17 +207,35 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         }
         if ((layer.qkv_proj_fused != nullptr) != fused_qkv) return out;
     }
+    // q/k-norm convention, from the bound tensor shape — the same evidence
+    // the hand-written `rmsnorm_qk` dispatches on, resolved once here
+    // because the trace states the convention as a fact:
+    //   * per-head (qwen3): weight `[head_dim]` → RmsnormPerHead ops;
+    //   * global (olmo2): weight `[heads * head_dim]` → plain row Rmsnorm
+    //     over the flattened projection.
+    // Anything else (mixed conventions across layers, an unexpected shape)
+    // falls back to the hand-written path.
+    PieForwardQkNorm qk_norm = PieForwardQkNorm::Off;
     if (fwd_cfg.use_qk_norm) {
-        // The trace's RmsnormPerHead is the per-head convention (weight
-        // shape [head_dim]); the global-norm convention (OLMo-2 7B+) is a
-        // different op the family does not declare yet.
-        const DeviceTensor* qn = w.layers[0].q_norm;
-        const DeviceTensor* kn = w.layers[0].k_norm;
-        const bool per_head =
-            qn != nullptr && kn != nullptr &&
-            qn->shape().size() == 1 && qn->shape()[0] == cfg.head_dim &&
-            kn->shape().size() == 1 && kn->shape()[0] == cfg.head_dim;
-        if (!per_head) return out;
+        const int Hq_w = cfg.num_attention_heads * cfg.head_dim;
+        const int Hk_w = cfg.num_key_value_heads * cfg.head_dim;
+        const auto convention_of =
+            [&](const DeviceTensor* t, int flat) -> PieForwardQkNorm {
+            if (t == nullptr || t->shape().size() != 1) {
+                return PieForwardQkNorm::Off;  // no representable convention
+            }
+            if (t->shape()[0] == cfg.head_dim) return PieForwardQkNorm::PerHead;
+            if (t->shape()[0] == flat) return PieForwardQkNorm::Global;
+            return PieForwardQkNorm::Off;
+        };
+        qk_norm = convention_of(w.layers[0].q_norm, Hq_w);
+        if (qk_norm == PieForwardQkNorm::Off) return out;
+        for (const auto& layer : w.layers) {
+            if (convention_of(layer.q_norm, Hq_w) != qk_norm ||
+                convention_of(layer.k_norm, Hk_w) != qk_norm) {
+                return out;
+            }
+        }
     }
 
     pie_forward::PieForwardLlamaLikeFacts facts{};
@@ -192,7 +249,11 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     facts.rope = static_cast<std::uint32_t>(PieForwardRopeKind::Standard);
     facts.norm_variant =
         static_cast<std::uint32_t>(PieForwardNormVariant::Plain);
-    facts.qk_norm = fwd_cfg.use_qk_norm ? 1 : 0;
+    facts.norm_placement = static_cast<std::uint32_t>(
+        fwd_cfg.norm_placement == NormPlacement::Post
+            ? PieForwardNormPlacement::Post
+            : PieForwardNormPlacement::Pre);
+    facts.qk_norm = static_cast<std::uint32_t>(qk_norm);
     facts.fused_qkv = fused_qkv ? 1 : 0;
     // A binding fact, like fused_qkv: bind_llama_like aliases lm_head to
     // embed when the checkpoint ties them, so pointer equality is the truth.
@@ -200,6 +261,66 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
 
     out.plan = pie_forward::ForwardPlan::trace_llama_like(facts);
     out.fused_qkv = fused_qkv;
+
+    // The CUDA backend facts, derived ONCE from this deployment — the
+    // same terms the executor's `use_*_path` booleans and the fused
+    // predicate computed per fire, now computed here and handed to the
+    // declaration, whose class arms STATE the kernels (rung 2,
+    // north-star-dsl.md). Term provenance on each line.
+    pie_forward::PieForwardLlamaLikeCudaFacts cuda{};
+    // context.cpp:1419 derives fwd_cfg.use_xqa_decode (env + kernel
+    // support + all-full-attention); prepare adds the cache-format terms
+    // (llama_like.cpp:693) — all load-time.
+    cuda.xqa_decode = (fwd_cfg.use_xqa_decode &&
+                       cache.format().is_native_bf16() &&
+                       !cache.hnd_layout())
+                          ? 1
+                          : 0;
+    // The fused decode-QKV epilogue's load-time terms
+    // (declared_forward.cpp's old peephole predicate, minus what the
+    // build gate above already excluded: bias, per-head-shape checks —
+    // qk_norm was resolved from the bound shapes right here).
+    cuda.decode_fused_post = (decode_fused_post_enabled() &&
+                              cache.format().is_native_bf16() &&
+                              cfg.head_dim == cfg.head_dim_kernel)
+                                 ? 1
+                                 : 0;
+    // workspace.cpp:33 allocates ws.rope_table unconditionally; the
+    // executor still checks emptiness loudly at the table launch.
+    cuda.rope_table = 1;
+    cuda.force_prefill_path = fwd_cfg.force_prefill_path ? 1 : 0;
+
+    out.decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::Decode);
+    out.prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::Prefill);
+    // Drift between the declaration's stated kernels and this executor's
+    // registry fails at model load, not mid-fire.
+    validate_stated_kernels(out.decode);
+    validate_stated_kernels(out.prefill);
+
+    // The digest naming what these traces were taken from — the same
+    // format `pie_forward::emit_cuda::facts_digest` embeds in the
+    // generated .inc (one format, two printers; the three-way parity gate
+    // holds them together). A generated TU runs only on exact match.
+    out.facts_digest =
+        "llama_like/h" + std::to_string(facts.hidden) +
+        "/l" + std::to_string(facts.layers) +
+        "/qh" + std::to_string(facts.q_heads) +
+        "/kvh" + std::to_string(facts.kv_heads) +
+        "/hd" + std::to_string(facts.head_dim) +
+        "/i" + std::to_string(facts.intermediate) +
+        "/v" + std::to_string(facts.vocab) +
+        "/rope" + std::to_string(facts.rope) +
+        "/nv" + std::to_string(facts.norm_variant) +
+        "/np" + std::to_string(facts.norm_placement) +
+        "/qk" + std::to_string(facts.qk_norm) +
+        "/fq" + std::to_string(facts.fused_qkv) +
+        "/te" + std::to_string(facts.tied_embeddings) +
+        "/xqa" + std::to_string(cuda.xqa_decode) +
+        "/dfp" + std::to_string(cuda.decode_fused_post) +
+        "/rt" + std::to_string(cuda.rope_table) +
+        "/fpp" + std::to_string(cuda.force_prefill_path);
     return out;
 }
 
@@ -232,7 +353,36 @@ void llama_like_forward_declared(
     bool has_write_desc,
     int runtime_window_left)
 {
-    const pie_forward::ForwardPlan& plan = declared.plan;
+    // Rung 3: the static form, when opted in and emitted for exactly this
+    // deployment. Byte-for-byte the same launches as the interpreter walk
+    // below — the parity gate's third leg proves it — with every choice
+    // resolved at EMISSION time instead of at walk time.
+    if (generated_forward_enabled() &&
+        declared.facts_digest != kGeneratedForDigest &&
+        std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
+        // Silent non-engagement is this path's failure mode; say why.
+        std::fprintf(stderr,
+                     "[declared-forward-generated] digest mismatch:\n"
+                     "  live:    %s\n  emitted: %s\n",
+                     declared.facts_digest.c_str(), kGeneratedForDigest);
+    }
+    if (generated_forward_enabled() &&
+        declared.facts_digest == kGeneratedForDigest) {
+        (is_pure_decode ? generated_llama_like_decode
+                        : generated_llama_like_prefill)(
+            w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
+            token_ids, positions, qo_indptr,
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            qo_indptr_h, kv_page_indptr_h,
+            total_tokens, num_requests,
+            logit_row_indices_d, num_logit_rows,
+            w_page_d, w_off_d, row_valid_d, has_write_desc);
+        return;
+    }
+    // Rung 2: the fire's class picks its trace, and the trace states every
+    // kernel — nothing below derives a path (north-star-dsl.md).
+    const pie_forward::ForwardPlan& plan =
+        is_pure_decode ? declared.decode : declared.prefill;
     // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
     // it a silent fallback to the hand-written path would be
     // indistinguishable from a passing A/B run.
@@ -250,27 +400,38 @@ void llama_like_forward_declared(
     const int I = cfg.intermediate_size;
     const int V = cfg.vocab_size;
     const int d = cfg.head_dim;
+    const int dk = cfg.head_dim_kernel;  // padded HEAD_DIM the attention
+                                         // kernel runs at (Phi-3: 96 → 128)
+    const bool head_dim_padded = (d != dk);
     const int num_q_heads = cfg.num_attention_heads;
     const int num_kv_heads = cfg.num_key_value_heads;
     const float eps = cfg.rms_norm_eps;
+    // Post-norm placement (olmo2): decides which buffer each projection
+    // reads/writes and how the block norms route — the same buffer walk as
+    // the hand-written `post_norm` branches, stated once here.
+    const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
     // Inherit cublas's stream so every launch lands on the captured graph,
     // for the reason llama_like_forward_paged states at its stream setup.
     cudaStream_t stream = cublas.stream();
-    // No head-dim padding on this path (build gate), so the dispatch picks
-    // its own `1/sqrt(head_dim)`.
-    const float sm_scale_override = -1.f;
+    // With padding the attention kernel runs at `dk` but the softmax must
+    // stay scaled to the real head dim — `1/sqrt(d)`, the hand-written
+    // override. Unpadded, -1 lets the dispatch pick `1/sqrt(dk)` (== d).
+    const float sm_scale_override = head_dim_padded
+        ? (1.0f / std::sqrt(static_cast<float>(d)))
+        : -1.f;
+    // Padded Q/K/V staging (the hand-written `attn_q`/... indirection):
+    // GEMM in/out buffers stay at `d`; the KV write and attention consume
+    // the zero-padded `dk` copies, and the o_proj reads the stripped
+    // output. All identity when the model's head_dim is a dispatch value.
+    void* const attn_q = head_dim_padded ? ws.q_padded.data() : ws.q.data();
+    void* const attn_k = head_dim_padded ? ws.k_padded.data() : ws.k.data();
+    void* const attn_v = head_dim_padded ? ws.v_padded.data() : ws.v.data();
+    void* const attn_out_buf =
+        head_dim_padded ? ws.attn_out_padded.data() : ws.attn_out.data();
 
-    // Attention path choice: the same booleans the hand-written body derives
-    // from the plan_state the (unchanged) prepare hook filled. Custom-mask
-    // and hook branches are absent because the caller's gate excluded them.
-    const bool use_xqa_decode_path =
-        is_pure_decode && plan_state.use_xqa_decode;
-    const bool use_decode_path =
-        is_pure_decode &&
-        (!fwd_cfg.force_prefill_path || use_xqa_decode_path);
-    const bool use_prefill_decode_path =
-        use_decode_path && !use_xqa_decode_path &&
-        plan_state.use_prefill_decode_plan;
+    // The plan caches the (unchanged) prepare hook filled. The executor no
+    // longer chooses between them — each stated attention kernel's handler
+    // BINDS the cache its contract needs, loudly null-checked.
     const ops::DecodePlanCache* decode_plan =
         plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;
     const ops::PrefillPlanCache* prefill_decode_plan =
@@ -279,28 +440,38 @@ void llama_like_forward_declared(
     const ops::PrefillPlanCache* prefill_plan =
         plan_state.prefill_plan ? plan_state.prefill_plan.get() : nullptr;
 
-    if (use_xqa_decode_path) {
-        ops::prepare_attention_xqa_decode_bf16(
-            kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            R, cache.page_size(), plan_state.xqa_max_pages_per_seq,
-            attn_ws, stream);
+    const std::size_t op_count = plan.op_count();
+
+    // A stated kernel obligates its prepare: XQA's fire-wide prepare runs
+    // iff the trace states the XQA launch (a scan, not a derivation).
+    for (std::size_t i = 0; i < op_count; ++i) {
+        const PieForwardOp& op = plan.op(i);
+        if (op.kind == PieForwardOpKind::Launch &&
+            plan.weight_name(op) ==
+                "launch_attention_xqa_decode_bf16_prepared") {
+            ops::prepare_attention_xqa_decode_bf16(
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                R, cache.page_size(), plan_state.xqa_max_pages_per_seq,
+                attn_ws, stream);
+            break;
+        }
     }
 
     // Whether the gate_up Matmul took the fused binding; decides which
     // swiglu kernel the following Swiglu op launches (the hand-written
     // `use_fused_gu` pairing).
     bool gate_up_used_fused = false;
-
-    // Rope-table state for the fused decode-QKV peephole: built once per
-    // fire on the first layer whose peephole fires (the hand-written
-    // `rope_table_ready` latch), reused by every later layer. Stays null
-    // when the workspace carries no table — the fused kernel then derives
-    // cos/sin from theta itself, exactly as the hand-written branch does.
-    bool rope_table_ready = false;
-    const float* rope_table = nullptr;
-
-    const std::size_t op_count = plan.op_count();
+    // Guard skip state: when a taken then-region ends, the else-region is
+    // dead and the walk jumps it (regions are flat — the builder refuses
+    // nesting — so one pending skip suffices).
+    std::size_t guard_else_at = SIZE_MAX;
+    std::size_t guard_else_len = 0;
     for (std::size_t i = 0; i < op_count; ++i) {
+        if (i == guard_else_at) {
+            guard_else_at = SIZE_MAX;
+            i += guard_else_len;
+            if (i >= op_count) break;
+        }
         const PieForwardOp& op = plan.op(i);
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
@@ -322,14 +493,43 @@ void llama_like_forward_declared(
             const ParsedWeightName nm = parse_weight_name(name);
             if (nm.field == "attn_norm") {
                 const auto& layer = layer_of(w, nm, name);
-                kernels::launch_rmsnorm_bf16(
-                    ws.y.data(), require(layer.attn_norm, name)->data(),
-                    ws.norm_x.data(), N, H, eps, stream);
+                if (post_norm) {
+                    // Post-norm: the o_proj OUTPUT (in norm_x, the
+                    // hand-written scratch) is normed into norm_y; the
+                    // following ResidualAdd lands it on the stream.
+                    kernels::launch_rmsnorm_bf16(
+                        ws.norm_x.data(), require(layer.attn_norm, name)->data(),
+                        ws.norm_y.data(), N, H, eps, stream);
+                } else {
+                    kernels::launch_rmsnorm_bf16(
+                        ws.y.data(), require(layer.attn_norm, name)->data(),
+                        ws.norm_x.data(), N, H, eps, stream);
+                }
             } else if (nm.field == "mlp_norm") {
                 const auto& layer = layer_of(w, nm, name);
+                if (post_norm) {
+                    // Post-norm: the down_proj OUTPUT (in norm_x) → norm_y.
+                    kernels::launch_rmsnorm_bf16(
+                        ws.norm_x.data(), require(layer.mlp_norm, name)->data(),
+                        ws.norm_y.data(), N, H, eps, stream);
+                } else {
+                    kernels::launch_rmsnorm_bf16(
+                        ws.y.data(), require(layer.mlp_norm, name)->data(),
+                        ws.norm_y.data(), N, H, eps, stream);
+                }
+            } else if (nm.field == "q_norm") {
+                // Global qk-norm (olmo2): ONE row RMSNorm over the
+                // flattened [N, heads * head_dim] projection, in place —
+                // the hand-written `rmsnorm_qk` global branch, verbatim.
+                const auto& layer = layer_of(w, nm, name);
                 kernels::launch_rmsnorm_bf16(
-                    ws.y.data(), require(layer.mlp_norm, name)->data(),
-                    ws.norm_y.data(), N, H, eps, stream);
+                    ws.q.data(), require(layer.q_norm, name)->data(),
+                    ws.q.data(), N, Hq, eps, stream);
+            } else if (nm.field == "k_norm") {
+                const auto& layer = layer_of(w, nm, name);
+                kernels::launch_rmsnorm_bf16(
+                    ws.k.data(), require(layer.k_norm, name)->data(),
+                    ws.k.data(), N, Hk, eps, stream);
             } else if (nm.layer < 0 && nm.field == "final_norm") {
                 // Deferred to LmHead: the hand-written epilogue interleaves
                 // the final norm with the logit-row gather (norm is row-wise,
@@ -346,107 +546,63 @@ void llama_like_forward_declared(
             const ParsedWeightName nm = parse_weight_name(name);
             const auto& layer = layer_of(w, nm, name);
             const float beta = op.param0 != 0 ? 1.f : 0.f;
+            // What the attention/MLP projections read: pre-norm reads the
+            // normed copies (norm_x for QKV, norm_y for gate/up), post-norm
+            // reads the residual stream raw — the hand-written `qkv_in` /
+            // `mlp_in` indirections.
+            const void* const qkv_in =
+                post_norm ? ws.y.data() : ws.norm_x.data();
+            const void* const mlp_in =
+                post_norm ? ws.y.data() : ws.norm_y.data();
             if (nm.field == "qkv") {
-                // Fused decode-QKV peephole. The trace deliberately stays
-                // unfused: fusion is the EMITTER's decision, never the
-                // author's or the trace's (pie-application-plan.md §5.1 —
-                // "a fused edge cannot be a merge point", so fusion and
-                // merging must be chosen together, by the planner; and
-                // stage1-notes.md, where `fused_decode_qkv_post` became a
-                // row-count gate for exactly that reason). This is the
-                // knowledge the trace does not carry, so the emitter
-                // re-derives it here: when the adjacency Matmul(qkv) +
-                // SplitQkv + RmsnormPerHead x2 + Rope + KvAppend holds AND
-                // the hand-written predicate holds, launch the ONE fused
-                // kernel the hand-written path would.
-                //
-                // The predicate is the hand-written `fused_decode_qkv_post`
-                // (llama_like.cpp), term for term. Two of its terms are
-                // resolved by this path's caller gate rather than dropped:
-                //   * `fast_rows > 0` — hooks are null here (gate), so
-                //     Stage 1's hook-free prefix is every row: fast_rows ==
-                //     R, the unfused tail is empty, and the all-fused case
-                //     is the only one this executor needs.
-                //   * `!has_custom_mask` — the gate excludes custom masks.
-                const bool q_norm_is_per_head =
-                    layer.q_norm && layer.q_norm->shape().size() == 1 &&
-                    layer.q_norm->shape()[0] == d;
-                const bool k_norm_is_per_head =
-                    layer.k_norm && layer.k_norm->shape().size() == 1 &&
-                    layer.k_norm->shape()[0] == d;
-                const bool use_fused_qkv =
-                    layer.qkv_proj_fused != nullptr && !ws.qkv_fused.empty();
-                const bool fused_decode_qkv_post =
-                    use_fused_qkv &&
-                    R > 0 &&  // fast_rows > 0, with fast_rows == R (above)
-                    decode_fused_post_enabled() &&
-                    is_pure_decode &&
-                    (!has_write_desc ||
-                     (w_page_d != nullptr && w_off_d != nullptr)) &&
-                    cache.format().is_native_bf16() &&
-                    cfg.head_dim == cfg.head_dim_kernel &&  // !padded
-                    !fwd_cfg.use_qkv_bias &&
-                    fwd_cfg.use_qk_norm &&
-                    q_norm_is_per_head && k_norm_is_per_head &&
-                    fwd_cfg.rope_kind == RopeKind::Standard;
+                // The packed GEMM, nothing else: whether the fused
+                // decode-QKV epilogue follows is the DECLARATION's arm
+                // (dsl::cuda::qkv_decode_qk_norm_rope_write_kv), stated as
+                // the next Launch op — the peephole that used to re-derive
+                // it here is deleted (rung 2, north-star-dsl.md).
                 ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
+                    qkv_in,
                     ops::WeightView(*require(layer.qkv_proj_fused, name)),
                     ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-                if (fused_decode_qkv_post) {
-                    if (!rope_table_ready && !ws.rope_table.empty()) {
-                        kernels::launch_rope_standard_table(
-                            positions,
-                            static_cast<float*>(ws.rope_table.data()),
-                            N, d, cfg.rope_theta, stream);
-                        rope_table =
-                            static_cast<const float*>(ws.rope_table.data());
-                        rope_table_ready = true;
-                    }
-                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
-                        ws.qkv_fused.data(),
-                        ws.q.data(),
-                        cache.k(nm.layer), cache.v(nm.layer),
-                        layer.q_norm->data(), layer.k_norm->data(),
-                        positions,
-                        rope_table,
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        has_write_desc ? w_page_d : nullptr,
-                        has_write_desc ? w_off_d : nullptr,
-                        row_valid_d,
-                        R, num_q_heads, num_kv_heads, d,
-                        cache.page_size(), cache.hnd_layout(),
-                        cfg.rope_theta, eps, stream);
-                    // The kernel owns everything through the KV write;
-                    // advance past those plan ops (validated, or throw).
-                    i = skip_fused_decode_qkv_ops(plan, i, nm.layer);
-                }
             } else if (nm.field == "q_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
+                    qkv_in,
                     make_weight_view(require(layer.q_proj, name),
                                      layer.q_proj_quant),
                     ws.q.data(), N, Hq, H);
             } else if (nm.field == "k_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
+                    qkv_in,
                     make_weight_view(require(layer.k_proj, name),
                                      layer.k_proj_quant),
                     ws.k.data(), N, Hk, H);
             } else if (nm.field == "v_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
-                    ws.norm_x.data(),
+                    qkv_in,
                     make_weight_view(require(layer.v_proj, name),
                                      layer.v_proj_quant),
                     ws.v.data(), N, Hk, H);
             } else if (nm.field == "o_proj") {
-                // Residual accumulate folded into the GEMM (beta from the
-                // trace's beta_one), exactly the hand-written T==1 branch.
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.attn_out.data(),
-                    make_weight_view(require(layer.o_proj, name),
-                                     layer.o_proj_quant),
-                    ws.y.data(), N, H, Hq, beta);
+                if (post_norm) {
+                    // Post-norm: o_proj lands in the norm_x scratch (the
+                    // trace's beta_one is 0 here); Rmsnorm(attn_norm) +
+                    // ResidualAdd land it on the stream — the hand-written
+                    // post-norm block, same buffers, same order.
+                    ops::gemm_act_x_w(cublas.handle(),
+                        ws.attn_out.data(),
+                        make_weight_view(require(layer.o_proj, name),
+                                         layer.o_proj_quant),
+                        ws.norm_x.data(), N, H, Hq, beta);
+                } else {
+                    // Residual accumulate folded into the GEMM (beta from
+                    // the trace's beta_one), exactly the hand-written T==1
+                    // branch.
+                    ops::gemm_act_x_w(cublas.handle(),
+                        ws.attn_out.data(),
+                        make_weight_view(require(layer.o_proj, name),
+                                         layer.o_proj_quant),
+                        ws.y.data(), N, H, Hq, beta);
+                }
             } else if (nm.field == "gate_up") {
                 // The trace declares one packed matmul either way; whether
                 // the binding materialised it fused is this emitter's call,
@@ -456,27 +612,37 @@ void llama_like_forward_declared(
                     !ws.gate_up_fused.empty();
                 if (gate_up_used_fused) {
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.norm_y.data(),
+                        mlp_in,
                         ops::WeightView(*layer.gate_up_proj_fused),
                         ws.gate_up_fused.data(), N, 2 * I, H);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.norm_y.data(),
+                        mlp_in,
                         make_weight_view(require(layer.gate_proj, name),
                                          layer.gate_proj_quant),
                         ws.gate.data(), N, I, H);
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.norm_y.data(),
+                        mlp_in,
                         make_weight_view(require(layer.up_proj, name),
                                          layer.up_proj_quant),
                         ws.up.data(), N, I, H);
                 }
             } else if (nm.field == "down") {
-                ops::gemm_act_x_w(cublas.handle(),
-                    ws.gate.data(),
-                    make_weight_view(require(layer.down_proj, name),
-                                     layer.down_proj_quant),
-                    ws.y.data(), N, H, I, beta);
+                if (post_norm) {
+                    // Post-norm: down_proj → norm_x scratch (beta 0), then
+                    // Rmsnorm(mlp_norm) + ResidualAdd — as o_proj above.
+                    ops::gemm_act_x_w(cublas.handle(),
+                        ws.gate.data(),
+                        make_weight_view(require(layer.down_proj, name),
+                                         layer.down_proj_quant),
+                        ws.norm_x.data(), N, H, I, beta);
+                } else {
+                    ops::gemm_act_x_w(cublas.handle(),
+                        ws.gate.data(),
+                        make_weight_view(require(layer.down_proj, name),
+                                         layer.down_proj_quant),
+                        ws.y.data(), N, H, I, beta);
+                }
             } else {
                 throw_unknown_weight(name);
             }
@@ -490,39 +656,12 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::RmsnormPerHead: {
-            // Peephole: RmsnormPerHead(q) + RmsnormPerHead(k) + Rope
-            // adjacency is what the hand-written `fuse_qk_norm_rope` branch
-            // computes with ONE kernel, and bf16 rounding differs between
-            // the fused kernel and a norm+rope pair — parity requires the
-            // same launch, not just the same math.
-            const bool fuse =
-                i + 2 < op_count &&
-                plan.op(i + 1).kind == PieForwardOpKind::RmsnormPerHead &&
-                plan.op(i + 2).kind == PieForwardOpKind::Rope &&
-                plan.op(i + 2).param0 ==
-                    static_cast<std::uint32_t>(PieForwardRopeKind::Standard);
-            if (fuse) {
-                const std::string_view q_name = plan.weight_name(op);
-                const std::string_view k_name =
-                    plan.weight_name(plan.op(i + 1));
-                const ParsedWeightName q_nm = parse_weight_name(q_name);
-                const ParsedWeightName k_nm = parse_weight_name(k_name);
-                if (q_nm.field != "q_norm" || k_nm.field != "k_norm") {
-                    throw_unknown_weight(q_nm.field != "q_norm" ? q_name
-                                                                : k_name);
-                }
-                const auto& layer = layer_of(w, q_nm, q_name);
-                kernels::launch_qk_rmsnorm_rope_bf16(
-                    ws.q.data(), ws.k.data(),
-                    require(layer.q_norm, q_name)->data(),
-                    require(layer.k_norm, k_name)->data(),
-                    positions, N, num_q_heads, num_kv_heads, d,
-                    cfg.rope_theta, eps, stream);
-                i += 2;  // consumed the second RmsnormPerHead and the Rope
-                break;
-            }
             // Standalone per-head norm: in place, one row per head — the
-            // hand-written `rmsnorm_qk` per-head branch.
+            // hand-written `rmsnorm_qk` per-head branch. (The fused
+            // norm+rope kernel is no longer a peephole here: the
+            // declaration's lowered arm STATES it —
+            // dsl::cuda::qk_rmsnorm_rope — so a class trace never carries
+            // the triple this arm used to match.)
             const std::string_view name = plan.weight_name(op);
             const ParsedWeightName nm = parse_weight_name(name);
             const auto& layer = layer_of(w, nm, name);
@@ -559,6 +698,19 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::KvAppend: {
+            // Padded head_dim: the cache stores `dk`-wide cells, so Q/K/V
+            // are zero-padded to the `*_padded` staging buffers first —
+            // the hand-written pad block, same launch order (q, k, v),
+            // placed exactly where it sits there: after rope, before the
+            // write. Identity when unpadded (`attn_*` alias ws.q/k/v).
+            if (head_dim_padded) {
+                kernels::launch_pad_head_dim_bf16(
+                    ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
+                kernels::launch_pad_head_dim_bf16(
+                    ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);
+                kernels::launch_pad_head_dim_bf16(
+                    ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
+            }
             auto kv_view = cache.layer_view(static_cast<int>(op.param0));
             if (has_write_desc) {
                 // Explicit-descriptor write, N cells (one per query token) —
@@ -569,14 +721,14 @@ void llama_like_forward_declared(
                 // at replay time.
                 kernels::launch_write_kv_explicit_bf16(
                     kv_view,
-                    ws.k.data(), ws.v.data(),
+                    attn_k, attn_v,
                     w_page_d, w_off_d, N, stream, row_valid_d);
             } else {
                 // Page-derived append (the hand-written non-write-desc
                 // branch): position re-derived from the page table.
                 kernels::launch_write_kv_to_pages(
                     kv_view,
-                    ws.k.data(), ws.v.data(),
+                    attn_k, attn_v,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
                     N, R, stream, row_valid_d);
@@ -584,71 +736,221 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::Attention: {
-            const int L = static_cast<int>(op.param0);
-            auto kv_view = cache.layer_view(L);
-            // Same per-layer window resolution as the hand-written body;
-            // runtime_window_left is -2 on this path (gate) so the
-            // config-driven values decide.
-            const int layer_window_left = runtime_window_left >= -1
-                ? runtime_window_left
-                : (!fwd_cfg.per_layer_window_left.empty() &&
-                   L < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[L]
-                    : fwd_cfg.sliding_window;
-            if (use_xqa_decode_path) {
-                ops::launch_attention_xqa_decode_bf16_prepared(
-                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
-                    ws.attn_out.data(),
+            // A class trace states its attention kernel as a Launch op;
+            // the semantic kind reaching this executor means the trace
+            // and the executor drifted (rung 2, north-star-dsl.md).
+            throw std::runtime_error(
+                "declared forward: semantic Attention op in a class trace "
+                "(the declaration must state the attention kernel)");
+        }
+        case PieForwardOpKind::Launch: {
+            // The dumb arm: resolve the STATED launcher symbol and bind.
+            // Each handler is the corresponding branch of the old path
+            // cascade, minus the choosing; the state layer rides param1.
+            const int L = static_cast<int>(op.param1);
+            switch (resolve_launch_kernel(plan.weight_name(op))) {
+            case LaunchKernel::RopeStandardTable: {
+                if (ws.rope_table.empty()) {
+                    throw std::runtime_error(
+                        "declared forward: trace states the rope table "
+                        "build but the workspace carries no table");
+                }
+                kernels::launch_rope_standard_table(
+                    positions,
+                    static_cast<float*>(ws.rope_table.data()),
+                    N, d, cfg.rope_theta, stream);
+                break;
+            }
+            case LaunchKernel::QkvDecodeQkNormRopeWriteKv: {
+                // aux_names = [q_norm, k_norm], signature order; the
+                // second INPUT, when present, is the rope-table value —
+                // the trace says whether the table exists, so no latch.
+                const auto aux = plan.aux_names(op);
+                if (aux.size != 2) {
+                    throw std::runtime_error(
+                        "declared forward: fused decode-QKV launch names "
+                        + std::to_string(aux.size) + " weights, wants 2");
+                }
+                const std::string_view q_name = plan.name(aux[0]);
+                const std::string_view k_name = plan.name(aux[1]);
+                const ParsedWeightName q_nm = parse_weight_name(q_name);
+                if (q_nm.field != "q_norm") throw_unknown_weight(q_name);
+                const auto& layer = layer_of(w, q_nm, q_name);
+                const float* table =
+                    plan.inputs(op).size >= 2 && !ws.rope_table.empty()
+                        ? static_cast<const float*>(ws.rope_table.data())
+                        : nullptr;
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(q_nm.layer), cache.v(q_nm.layer),
+                    require(layer.q_norm, q_name)->data(),
+                    require(layer.k_norm, k_name)->data(),
+                    positions,
+                    table,
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
                     R, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+                break;
+            }
+            case LaunchKernel::QkRmsnormRope: {
+                const auto aux = plan.aux_names(op);
+                if (aux.size != 2) {
+                    throw std::runtime_error(
+                        "declared forward: fused qk-norm+rope launch names "
+                        + std::to_string(aux.size) + " weights, wants 2");
+                }
+                const std::string_view q_name = plan.name(aux[0]);
+                const std::string_view k_name = plan.name(aux[1]);
+                const ParsedWeightName q_nm = parse_weight_name(q_name);
+                if (q_nm.field != "q_norm") throw_unknown_weight(q_name);
+                const auto& layer = layer_of(w, q_nm, q_name);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    ws.q.data(), ws.k.data(),
+                    require(layer.q_norm, q_name)->data(),
+                    require(layer.k_norm, k_name)->data(),
+                    positions, N, num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                break;
+            }
+            case LaunchKernel::AttentionXqaDecodePrepared: {
+                auto kv_view = cache.layer_view(L);
+                ops::launch_attention_xqa_decode_bf16_prepared(
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
+                    R, num_q_heads, num_kv_heads, dk,
                     cache.page_size(), plan_state.xqa_max_pages_per_seq,
                     attn_ws, stream, sm_scale_override);
-            } else if (use_prefill_decode_path) {
-                if (prefill_decode_plan == nullptr) {
-                    throw std::runtime_error(
-                        "declared forward: prefill-decode path has no plan");
-                }
-                const int num_pages_in_batch = kv_page_indptr_h[R];
-                kernels::launch_dequant_kv_cache_layer_to_bf16_active(
-                    kv_view, kv_page_indices, num_pages_in_batch, stream);
-                ops::dispatch_attention_flashinfer_prefill_bf16(
-                    *prefill_decode_plan,
-                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
-                    ws.attn_out.data(),
-                    qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    attn_ws, stream, /*logits_soft_cap=*/0.f,
-                    sm_scale_override);
-            } else if (use_decode_path) {
+                break;
+            }
+            case LaunchKernel::AttentionFlashinferDecode: {
                 if (decode_plan == nullptr) {
                     throw std::runtime_error(
-                        "declared forward: decode path has no plan");
+                        "declared forward: trace states the flashinfer "
+                        "decode kernel but prepare built no decode plan");
                 }
+                auto kv_view = cache.layer_view(L);
+                // Same per-layer window resolution as the hand-written
+                // body; runtime_window_left is -2 on this path (gate) so
+                // the config-driven values decide.
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     L < static_cast<int>(
+                             fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[L]
+                        : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
                     *decode_plan,
-                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_q, kv_view, attn_out_buf,
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
-            } else if (plan_state.use_prefill_plan && prefill_plan != nullptr) {
+                break;
+            }
+            case LaunchKernel::DequantKvCacheLayerToBf16Active: {
+                auto kv_view = cache.layer_view(L);
                 const int num_pages_in_batch = kv_page_indptr_h[R];
                 kernels::launch_dequant_kv_cache_layer_to_bf16_active(
                     kv_view, kv_page_indices, num_pages_in_batch, stream);
+                break;
+            }
+            case LaunchKernel::WriteKvExplicit: {
+                auto kv_view = cache.layer_view(L);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view, attn_k, attn_v,
+                    w_page_d, w_off_d, N, stream, row_valid_d);
+                break;
+            }
+            case LaunchKernel::WriteKvToPages: {
+                auto kv_view = cache.layer_view(L);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, attn_k, attn_v,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d);
+                break;
+            }
+            case LaunchKernel::AttentionFlashinferPrefill: {
+                // Mechanical plan binding, not a choice: prepare builds
+                // `prefill_plan` for prefill-shaped fires and
+                // `prefill_decode_plan` for the decode-shaped
+                // force_prefill fallback — the fire's shape names which
+                // one this stated kernel runs against.
+                const ops::PrefillPlanCache* pp =
+                    is_pure_decode ? prefill_decode_plan : prefill_plan;
+                if (pp == nullptr) {
+                    throw std::runtime_error(
+                        "declared forward: trace states the flashinfer "
+                        "prefill kernel but prepare built no plan for "
+                        "this fire shape");
+                }
+                auto kv_view = cache.layer_view(L);
                 ops::dispatch_attention_flashinfer_prefill_bf16(
-                    *prefill_plan,
-                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
-                    ws.attn_out.data(),
+                    *pp,
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
                     attn_ws, stream, /*logits_soft_cap=*/0.f,
                     sm_scale_override);
+                break;
+            }
+            }
+            // The attention launches land in the padded staging buffer
+            // when the head dim is padded; strip before the o_proj GEMM
+            // reads `[N, num_q*d]` — mechanical staging, as the pad in
+            // KvAppend (the hand-written post-attention strip).
+            const bool is_attention_out =
+                plan.outputs(op).size == 1 &&
+                (plan.weight_name(op) ==
+                     "launch_attention_xqa_decode_bf16_prepared" ||
+                 plan.weight_name(op) ==
+                     "dispatch_attention_flashinfer_decode" ||
+                 plan.weight_name(op) ==
+                     "dispatch_attention_flashinfer_prefill_bf16");
+            if (is_attention_out && head_dim_padded) {
+                kernels::launch_strip_head_dim_bf16(
+                    attn_out_buf, ws.attn_out.data(),
+                    N, num_q_heads, d, dk, stream);
+            }
+            break;
+        }
+        case PieForwardOpKind::Guard: {
+            // The one branch a class trace carries — over a runtime input
+            // (closed predicate vocabulary, `PieForwardGuardPred`).
+            // param1 = then-region op count; the else count rides a
+            // one-entry aux run.
+            const auto aux = plan.aux_names(op);
+            if (aux.size != 1) {
+                throw std::runtime_error(
+                    "declared forward: Guard aux run has " +
+                    std::to_string(aux.size) + " entries, wants 1");
+            }
+            const std::uint32_t then_ops = op.param1;
+            const std::uint32_t else_ops = aux[0];
+            bool cond;
+            switch (op.param0) {
+            case static_cast<std::uint32_t>(
+                pie_forward::PieForwardGuardPred::HasWriteDesc):
+                cond = has_write_desc;
+                break;
+            default:
+                throw std::runtime_error(
+                    "declared forward: guard predicate " +
+                    std::to_string(op.param0) +
+                    " is not in this executor's vocabulary");
+            }
+            if (cond) {
+                // Fall into the then-region; jump the else when it ends.
+                guard_else_at = i + 1 + then_ops;
+                guard_else_len = else_ops;
             } else {
-                ops::launch_attention_flashinfer_prefill(
-                    ws.q.data(), kv_view, ws.attn_out.data(),
-                    qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    qo_indptr_h, kv_page_indptr_h,
-                    N, R, num_q_heads, attn_ws, stream, layer_window_left,
-                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                // Jump the then-region; ++i lands on the first else op.
+                i += then_ops;
             }
             break;
         }
@@ -661,6 +963,17 @@ void llama_like_forward_declared(
                     ws.gate.data(), ws.up.data(), ws.gate.data(),
                     N * I, stream);
             }
+            break;
+        }
+        case PieForwardOpKind::ResidualAdd: {
+            // The post-norm landing: `y += norm_y` — the sub-layer's
+            // normed output (Rmsnorm above wrote norm_y) accumulated onto
+            // the residual stream by its own launch, exactly the
+            // hand-written `launch_residual_add_bf16` calls after the
+            // attn_norm and mlp_norm blocks.
+            kernels::launch_residual_add_bf16(
+                ws.y.data(), ws.norm_y.data(),
+                static_cast<std::size_t>(N) * H, stream);
             break;
         }
         case PieForwardOpKind::LmHead: {

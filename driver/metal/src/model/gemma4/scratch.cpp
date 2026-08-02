@@ -16,6 +16,7 @@
 
 #include "scratch.hpp"
 
+#include "../../batch/scratch_color.hpp"
 #include "decode_step.hpp"
 
 namespace pie::metal::gemma4 {
@@ -257,6 +258,75 @@ ScratchPlan build_gemma4_scratch(const std::vector<Dispatch>& dag, const Gemma4G
     plan.value_count = next_value;
     (void)g;
     return plan;
+}
+
+namespace {
+
+/// Dispatches that may run together: same layer, mutually independent, all
+/// reading something produced before the group starts and writing distinct
+/// values. This is an explicit list rather than something derived, for the same
+/// reason qwen3.5's is — the scratch dataflow does not model the KV pages, so
+/// "independent" cannot be read off it.
+int concurrency_group(Kind k) {
+    switch (k) {
+        case Kind::QmvQ:
+        case Kind::QmvK:
+        case Kind::QmvV:
+            return 1;  // all three read the attention norm's output
+        case Kind::QNorm:
+        case Kind::KNorm:
+        case Kind::VNorm:
+            return 2;  // each rewrites its own tensor in place
+        case Kind::RopeQ:
+        case Kind::RopeK:
+            return 3;  // q and k, disjoint
+        case Kind::QmvGate:
+        case Kind::QmvUp:
+            return 4;  // both read the FFN norm's output
+        default:
+            return 0;  // runs alone
+    }
+}
+
+}  // namespace
+
+std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag) {
+    std::vector<int> ends(dag.size());
+    for (std::size_t i = 0; i < dag.size(); ++i) ends[i] = static_cast<int>(i);
+    std::size_t i = 0;
+    while (i < dag.size()) {
+        const int group = concurrency_group(dag[i].kind);
+        std::size_t j = i;
+        if (group != 0) {
+            while (j + 1 < dag.size() && dag[j + 1].layer == dag[i].layer &&
+                   concurrency_group(dag[j + 1].kind) == group) {
+                ++j;
+            }
+        }
+        for (std::size_t k = i; k <= j; ++k) ends[k] = static_cast<int>(j);
+        i = j + 1;
+    }
+    return ends;
+}
+
+ScratchColoring color_gemma4_scratch(const std::vector<Dispatch>& dag, const ScratchPlan& plan,
+                                     bool no_recycle) {
+    std::vector<pie::metal::scratch::Use> uses;
+    uses.reserve(plan.uses.size());
+    for (const Use& u : plan.uses) {
+        uses.push_back({u.ordinal, u.bind_index, u.value, u.is_write});
+    }
+    const auto colored = pie::metal::scratch::color_live_ranges(uses, gemma4_run_ends(dag),
+                                                               plan.value_count, no_recycle);
+    ScratchColoring out;
+    out.colors_used = colored.colors_used;
+    out.hazard_free = colored.hazard_free;
+    out.per_dispatch.resize(dag.size());
+    for (const Use& u : plan.uses) {
+        out.per_dispatch[std::size_t(u.ordinal)].push_back(
+            {u.bind_index, colored.color[std::size_t(u.value)]});
+    }
+    return out;
 }
 
 }  // namespace pie::metal::gemma4

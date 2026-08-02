@@ -236,6 +236,17 @@ pub(crate) struct PendingRequest {
     /// wire class so the driver's hook-free fast prefix
     /// (`StageHooks::hook_free_prefix_rows`) covers every hook-free lane.
     pub(crate) hook_program: bool,
+    /// Whether this fire's program carries the pass-wide `lora`
+    /// configuration sink. Stamped at launch admission from the tracked
+    /// instance, exactly like `hook_program`; fire planning reads it as the
+    /// WEIGHT-class divergence fact (`fire_plan::MemberFacts::lora`).
+    pub(crate) lora_program: bool,
+    /// Whether this fire's program writes the `attn_page_mask` sink.
+    /// Stamped at launch admission from the tracked instance, exactly like
+    /// `hook_program`; `LaunchGrouping` reads it to keep page-mask fires
+    /// out of batches with multi-token rows (and vice versa) — the driver
+    /// throws on a written mask off the pure-decode path.
+    pub(crate) page_mask_program: bool,
     pub(crate) prelaunch_copy: Option<crate::driver::KvCopyPlan>,
     pub(crate) prelaunch_state_copy: Option<StateCopyPlan>,
     /// Vesuvius frame identity: which lane/frame/slot this fire belongs to.
@@ -315,8 +326,10 @@ impl PendingRequest {
             pipeline_id,
             prebuilt,
             // Not known at construction: stamped at launch admission, where
-            // the tracked instance's program flag is available.
+            // the tracked instance's program flags are available.
             hook_program: false,
+            lora_program: false,
+            page_mask_program: false,
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
@@ -326,6 +339,17 @@ impl PendingRequest {
 
     pub(crate) fn wire_row_count(&self) -> usize {
         self.request.qo_indptr.len().saturating_sub(1)
+    }
+
+    /// Whether any qo row of this fire carries more than one token — i.e.
+    /// the fire is NOT pure decode. Derived from `qo_indptr` the same way
+    /// `wire_row_count` reads it: consecutive entries bound each row's
+    /// token span.
+    fn has_multi_token_row(&self) -> bool {
+        self.request
+            .qo_indptr
+            .windows(2)
+            .any(|w| w[1].saturating_sub(w[0]) > 1)
     }
 
     fn requires_solo_submission(&self) -> bool {
@@ -382,10 +406,29 @@ pub(crate) struct LaunchGrouping {
     has_solo_submission: bool,
     has_user_mask: bool,
     has_device_geometry: bool,
+    /// A member's program writes the `attn_page_mask` sink.
+    has_page_mask: bool,
+    /// A member carries a qo row spanning more than one token (chunk
+    /// prefill / multi-token step).
+    has_multi_token: bool,
 }
 
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
-    request.has_user_mask && request.masks.is_empty()
+    request.has_user_mask && request.masks.is_empty() && !request.structured_device_mask
+}
+
+/// Whether this plan's mask keeps it out of composed batches. Wire (BRLE)
+/// masks index the wire request layout composition replaces, and a genuinely
+/// dense device mask has no per-lane compose path — both block. A device
+/// mask that statically recognizes as STRUCTURED
+/// (`structured_device_mask`, the Stage 2 item A relax) does not: the
+/// driver re-recognizes it from the trace at admission
+/// (`Dispatch::dense_mask_scope_violation` returns clean) and lowers it per
+/// lane at prepare, filling mask-free co-batched lanes with causal — one
+/// fire instead of two serialized waves, which the Stage 2 measurement put
+/// at 1.8-2.3x per token for the plain lanes under the old solo regime.
+fn mask_blocks_composition(request: &crate::driver::LaunchPlan) -> bool {
+    request.has_user_mask && !(request.masks.is_empty() && request.structured_device_mask)
 }
 
 impl LaunchGrouping {
@@ -421,7 +464,11 @@ impl LaunchGrouping {
         // request layout, which composition replaces (driver fails loud).
         // A DENSE-masked device-resolved fire is stricter still: unlike a
         // host-derived channel mask, it has no wire BRLE rows and the composed
-        // path cannot merge it with another program.
+        // path cannot merge it with another program. A STRUCTURED device
+        // mask (`mask_blocks_composition` false) is exempt from all of these
+        // clauses — Stage 2 item A: the driver packs per-lane structured
+        // masks for the whole composed batch, so such a fire co-batches like
+        // an unmasked one.
         let masked_device_geometry = has_dense_device_mask(&request.request);
         let wire_mask_on_device_geometry = request.request.has_user_mask
             && !request.request.masks.is_empty()
@@ -430,8 +477,26 @@ impl LaunchGrouping {
             && (masked_device_geometry
                 || wire_mask_on_device_geometry
                 || (self.has_user_mask && self.has_device_geometry)
-                || (request.request.has_user_mask && self.has_device_geometry)
+                || (mask_blocks_composition(&request.request) && self.has_device_geometry)
                 || (request.request.device_resolved_geometry && self.has_user_mask))
+        {
+            return false;
+        }
+        // Invariant: a batch containing an `attn_page_mask`-writing program
+        // is pure decode. The driver honours a written mask only on the
+        // paged decode path and THROWS mid-body otherwise
+        // (llama_like.cpp ~:1040, "attn_page_mask was written but this
+        // layer does not take the paged decode path"), killing every lane
+        // in the fire — so a chunk-prefill lane co-batched with a
+        // quest-class decode lane is a whole-wave failure. This clause
+        // converts that throw into a scheduling decision: page-mask
+        // programs and multi-token rows never share a group, in either
+        // admission order. Deliberately narrow — hook programs WITHOUT the
+        // page-mask sink (e.g. snapkv score capture, which is legal on
+        // prefill) keep co-batching with multi-token fires freely.
+        if self.count != 0
+            && ((request.page_mask_program && self.has_multi_token)
+                || (request.has_multi_token_row() && self.has_page_mask))
         {
             return false;
         }
@@ -459,8 +524,14 @@ impl LaunchGrouping {
         self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
         self.page_refs = self.page_refs.saturating_add(usage.page_refs);
         self.has_solo_submission |= request.requires_solo_submission();
-        self.has_user_mask |= request.request.has_user_mask;
+        // A structured device mask never blocks composition (item A), so it
+        // must not poison the group's mask bit either — otherwise a masked
+        // lane admitted first would still exclude every later
+        // device-geometry lane through the group-state clauses.
+        self.has_user_mask |= mask_blocks_composition(&request.request);
         self.has_device_geometry |= request.request.device_resolved_geometry;
+        self.has_page_mask |= request.page_mask_program;
+        self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
             || self.count >= limits.max_forward_requests
@@ -768,6 +839,26 @@ enum LaneReply {
     },
 }
 
+/// Program-lifetime divergence facts, derived once at registration from the
+/// launch package. These are the per-program halves of fire planning's
+/// [`MemberFacts`](super::fire_plan::MemberFacts): stamped onto the tracked
+/// instance at bind commit, and from there onto each fire at launch
+/// admission. A missing registration degrades every flag to `false` — the
+/// row just doesn't join the corresponding fast path.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProgramFacts {
+    /// Declares an attention-hook stage (OnAttnProj/OnAttn).
+    attention_hooks: bool,
+    /// Carries the pass-wide `lora` configuration sink.
+    lora_sink: bool,
+    /// Writes the `attn_page_mask` sink (Quest-class page eviction; the
+    /// sink call sits in an OnAttnProj stage, but placement is not part of
+    /// the fact — any stage counts, mirroring `lora_sink`). The driver only
+    /// honours a written mask on the paged decode path, so this is the
+    /// grouping fact that keeps such programs out of multi-token batches.
+    page_mask_sink: bool,
+}
+
 /// The worker-side half of a control that the lane finished executing.
 enum LaneCommit {
     /// Nothing to commit — the lane already sent the response (pure driver
@@ -775,11 +866,11 @@ enum LaneCommit {
     /// closes, failed binds after lane-side rollback).
     None,
     /// A standalone program registration succeeded on the lane: record the
-    /// program's attention-hook flag in the worker's `program_attention` map
+    /// program's divergence facts in the worker's `program_facts` map
     /// (the response already went out lane-side).
     ProgramRegistered {
         program_id: crate::driver::instance::ProgramId,
-        attention_hooks: bool,
+        facts: ProgramFacts,
     },
     /// A successful bind: insert the instance, THEN respond (launch admission
     /// reads `instances` on the worker thread, so respond-after-insert is the
@@ -788,9 +879,9 @@ enum LaneCommit {
         pipeline_id: Option<ProcessId>,
         bound: BoundInstance,
         /// A program this combined control registered on the lane, with its
-        /// attention-hook flag — committed to `program_attention` before the
-        /// instance insert so `TrackedInstance` sees it.
-        registered_program: Option<(crate::driver::instance::ProgramId, bool)>,
+        /// divergence facts — committed to `program_facts` before the
+        /// instance insert so `TrackedInstance` sees them.
+        registered_program: Option<(crate::driver::instance::ProgramId, ProgramFacts)>,
         respond: BindRespond,
     },
     /// A bind control completed without creating an instance.
@@ -1047,6 +1138,51 @@ impl DriverLane {
             .any(|stage| stage.kind == 1 || stage.kind == 2)
     }
 
+    /// Whether the program carries the pass-wide `lora` configuration sink:
+    /// a `SinkCall` op in any stage whose name-table entry is `"lora"`
+    /// (`pie_ir::registry::KNOWN_SINKS`). Read off the launch package's
+    /// stage ops directly (`LaunchOp.code` is the PTIR wire tag,
+    /// `name_index` points into the program-wide name table) rather than
+    /// the grouped-plan `PIE_STAGE_REQUIRES_LORA` flag, whose derivation
+    /// walk can abort early on a stage the grouped path rejects.
+    fn declares_lora_sink(plan: &ProgramRegistration) -> bool {
+        Self::declares_sink(plan, "lora")
+    }
+
+    /// Whether the program writes the `attn_page_mask` sink. Same
+    /// derivation as `declares_lora_sink`; the sink's T11-legal home is an
+    /// OnAttnProj stage, but the scan deliberately covers every stage — the
+    /// fact is "this program writes the mask", not "where".
+    fn declares_page_mask_sink(plan: &ProgramRegistration) -> bool {
+        Self::declares_sink(plan, "attn_page_mask")
+    }
+
+    /// A `SinkCall` op in any stage whose name-table entry is `sink`
+    /// (`pie_ir::registry::KNOWN_SINKS`). Read off the launch package's
+    /// stage ops directly (`LaunchOp.code` is the PTIR wire tag,
+    /// `name_index` points into the program-wide name table).
+    fn declares_sink(plan: &ProgramRegistration, sink: &str) -> bool {
+        plan.launch.stages.iter().any(|stage| {
+            stage.ops.iter().any(|op| {
+                op.code == u16::from(pie_ir::op::tags::SINK_CALL)
+                    && plan
+                        .launch
+                        .names
+                        .get(op.name_index as usize)
+                        .is_some_and(|name| name == sink)
+            })
+        })
+    }
+
+    /// The divergence facts a registration commits program-lifetime.
+    fn program_facts(plan: &ProgramRegistration) -> ProgramFacts {
+        ProgramFacts {
+            attention_hooks: Self::declares_attention_hooks(plan),
+            lora_sink: Self::declares_lora_sink(plan),
+            page_mask_sink: Self::declares_page_mask_sink(plan),
+        }
+    }
+
     /// The driver half of the old `dispatch_ordered_item`: everything a
     /// control does against the driver and the lane-owned `channels` set,
     /// with worker-map effects returned as a [`LaneCommit`]. Failures respond
@@ -1132,11 +1268,11 @@ impl DriverLane {
                             );
                         }
                         // Even on a cancelled RPC the program stays registered
-                        // driver-lifetime, so its hook flag is still worth
-                        // recording.
+                        // driver-lifetime, so its divergence facts are still
+                        // worth recording.
                         LaneCommit::ProgramRegistered {
                             program_id,
-                            attention_hooks: Self::declares_attention_hooks(&plan),
+                            facts: Self::program_facts(&plan),
                         }
                     }
                     Err(error) => {
@@ -1324,9 +1460,8 @@ impl DriverLane {
                 }
                 let probe_t1 = bind_probe.then(Instant::now);
                 let program_registered = program.is_some();
-                let program_attention_hooks = program
-                    .as_ref()
-                    .map(|plan| Self::declares_attention_hooks(plan));
+                let registered_program_facts =
+                    program.as_ref().map(|plan| Self::program_facts(plan));
                 if let Some(plan) = &program {
                     match driver.register_program(plan) {
                         Ok(program_id) => bind.program_id = program_id,
@@ -1382,8 +1517,8 @@ impl DriverLane {
                         LaneCommit::BindInstance {
                             pipeline_id,
                             bound,
-                            registered_program: program_attention_hooks
-                                .map(|attention_hooks| (bind.program_id, attention_hooks)),
+                            registered_program: registered_program_facts
+                                .map(|facts| (bind.program_id, facts)),
                             respond: BindRespond::ChannelsBind {
                                 registered,
                                 program_id: bind.program_id,
@@ -2265,7 +2400,20 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         request_timeout_secs: u64,
         frame_size: usize,
+        model_site_summary: pie_driver_abi::ModelSiteSummary,
     ) -> Self {
+        // The driver's validated-plan site summary (capabilities handshake),
+        // mapped into the fire planner's vocabulary once at spawn; every
+        // sealed frame merges these sites via `plan_fire_with_model`.
+        // Informational this increment (nothing consumes the site vec yet).
+        let model_sites = super::fire_plan::site_table::summary_sites(&model_site_summary);
+        if !model_sites.is_empty() {
+            tracing::info!(
+                driver_id,
+                sites = model_sites.len(),
+                "scheduler holds model-structural site(s) from the driver's declared plan"
+            );
+        }
         let (tx, rx) = crossbeam::channel::unbounded::<SchedulerItem>();
         let stats = Arc::new(SchedulerStats::default());
         let handle = SchedulerHandle {
@@ -2294,6 +2442,7 @@ impl BatchScheduler {
                     limits,
                     stats_for_loop,
                     frame_size,
+                    model_sites,
                 );
             })
             .expect("spawn pie-sched thread");
@@ -2323,6 +2472,7 @@ impl BatchScheduler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         driver_id: DriverId,
         rx: crossbeam::channel::Receiver<SchedulerItem>,
@@ -2331,6 +2481,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: Arc<SchedulerStats>,
         frame_size: usize,
+        model_sites: Vec<super::fire_plan::Site>,
     ) {
         let lane_reply_tx = nudge_tx.clone();
         let nudge_waker = std::task::Waker::from(Arc::new(NudgeWaker {
@@ -2344,12 +2495,13 @@ impl BatchScheduler {
         let mut lane_inflight: u64 = 0;
         let mut lane_token: u64 = 0;
         let mut instances = HashMap::new();
-        // Program-lifetime attention-hook flags, mirroring `instances`:
+        // Program-lifetime divergence facts, mirroring `instances`:
         // populated when a registration commits back from the lane, read at
         // bind commit to stamp the tracked instance (and from there each
-        // fire at admission) so the batch layout can sort hook-carrying rows
-        // last within their wire class.
-        let mut program_attention: HashMap<crate::driver::instance::ProgramId, bool> =
+        // fire at admission) so fire planning sees each member's axes —
+        // hook-carrying rows sort last within their wire class, lora rows
+        // mark the WEIGHT-class site.
+        let mut program_facts: HashMap<crate::driver::instance::ProgramId, ProgramFacts> =
             HashMap::new();
         let mut pending = PendingQueue::default();
         let mut scan_cache = ScanCache::default();
@@ -2427,7 +2579,7 @@ impl BatchScheduler {
                             &mut in_flight_launches,
                             &mut in_flight_control,
                             &mut instances,
-                            &mut program_attention,
+                            &mut program_facts,
                             &mut frame_policy,
                             &nudge_tx,
                         );
@@ -2475,6 +2627,7 @@ impl BatchScheduler {
                 &mut scan_cache,
                 &mut slot_buffer,
                 stopping,
+                &model_sites,
             );
             progress |= dispatched;
             if probe {
@@ -2676,7 +2829,7 @@ impl BatchScheduler {
                         &mut in_flight_launches,
                         &mut in_flight_control,
                         &mut instances,
-                        &mut program_attention,
+                        &mut program_facts,
                         &mut frame_policy,
                         &nudge_tx,
                     );
@@ -2916,12 +3069,16 @@ impl BatchScheduler {
                     }
                     launch.completion.reject_unsubmitted(message);
                 } else {
-                    // Stamp the attention-hook flag off the tracked instance
-                    // (admission just validated the id): the batch layout
-                    // sorts hook-carrying rows last within their wire class
-                    // so the driver's hook-free fast prefix is maximal.
+                    // Stamp the program's divergence facts off the tracked
+                    // instance (admission just validated the id): fire
+                    // planning sorts hook-carrying rows last within their
+                    // wire class so the driver's hook-free fast prefix is
+                    // maximal, and reads the lora flag as the WEIGHT-class
+                    // site fact.
                     if let Some(instance) = instances.get(&launch.instance_id) {
-                        launch.hook_program = instance.hook_program;
+                        launch.hook_program = instance.facts.attention_hooks;
+                        launch.lora_program = instance.facts.lora_sink;
+                        launch.page_mask_program = instance.facts.page_mask_sink;
                     }
                     // The default single-slot deployment: every tracked fire
                     // IS a one-fire frame. Synthesizing the stamp at accept
@@ -3335,6 +3492,7 @@ impl BatchScheduler {
         scan_cache: &mut ScanCache,
         slot_buffer: &mut SlotBuffer,
         stopping: bool,
+        model_sites: &[super::fire_plan::Site],
     ) -> (bool, Option<Duration>) {
         let probe_disp = super::fire_timing_enabled();
         let disp_started = probe_disp.then(Instant::now);
@@ -3353,6 +3511,7 @@ impl BatchScheduler {
             limits,
             stats,
             stopping,
+            model_sites,
         );
         if let Some(started) = disp_started {
             super::LOOP_PHASES
@@ -3824,6 +3983,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         stopping: bool,
+        model_sites: &[super::fire_plan::Site],
     ) -> (bool, Option<Duration>) {
         let mut progress = false;
         let mut wait_hint: Option<Duration> = None;
@@ -3908,6 +4068,7 @@ impl BatchScheduler {
                 limits,
                 stats,
                 &waves,
+                model_sites,
             );
             if let Some(post_started) = post_started {
                 super::LOOP_PHASES
@@ -3962,6 +4123,7 @@ impl BatchScheduler {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn post_frame(
         slot_buffer: &mut SlotBuffer,
         driver_lane: &DriverLane,
@@ -3974,6 +4136,7 @@ impl BatchScheduler {
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
         waves: &[Vec<u64>],
+        model_sites: &[super::fire_plan::Site],
     ) -> (bool, bool) {
         let mut progress = false;
         let sub = super::fire_timing_enabled().then(Instant::now);
@@ -4082,7 +4245,7 @@ impl BatchScheduler {
         }
         let nonempty_waves = survivors.iter().filter(|w| !w.is_empty()).count();
         let (submission, requests) =
-            batch::build_frame_submission(survivors, limits, page_size, stats);
+            batch::build_frame_submission(survivors, limits, page_size, stats, model_sites);
         // How many waves a sealed frame actually carries. ABI v14 has a frame
         // carry k steps the driver runs as one closed system, and the guest does
         // submit `live_slots` fires per frame -- but this reports
@@ -4705,7 +4868,7 @@ impl BatchScheduler {
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut Option<PendingControl>,
         instances: &mut HashMap<u64, TrackedInstance>,
-        program_attention: &mut HashMap<crate::driver::instance::ProgramId, bool>,
+        program_facts: &mut HashMap<crate::driver::instance::ProgramId, ProgramFacts>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
     ) {
@@ -4766,11 +4929,8 @@ impl BatchScheduler {
             }
             LaneReply::ControlDone { token, commit } => match commit {
                 LaneCommit::None => {}
-                LaneCommit::ProgramRegistered {
-                    program_id,
-                    attention_hooks,
-                } => {
-                    program_attention.insert(program_id, attention_hooks);
+                LaneCommit::ProgramRegistered { program_id, facts } => {
+                    program_facts.insert(program_id, facts);
                 }
                 LaneCommit::BindFinished { pipeline_id } => {
                     frame_policy.on_bind_completed(pipeline_id);
@@ -4785,9 +4945,9 @@ impl BatchScheduler {
                     // Record the combined control's program registration
                     // FIRST (even if the bind commit below refuses): the
                     // program is driver-lifetime either way, and the tracked
-                    // instance's flag reads this map.
-                    if let Some((program_id, attention_hooks)) = registered_program {
-                        program_attention.insert(program_id, attention_hooks);
+                    // instance's flags read this map.
+                    if let Some((program_id, facts)) = registered_program {
+                        program_facts.insert(program_id, facts);
                     }
                     if instances.contains_key(&bound.instance_id) {
                         // Practically unreachable: driver-assigned ids are
@@ -4812,13 +4972,14 @@ impl BatchScheduler {
                     }
                     let instance_id = bound.instance_id;
                     // Missing map entry (program registered before this code
-                    // shipped, or an unregistered id) degrades to `false`:
-                    // the row just doesn't join the hook-free fast prefix.
-                    let hook_program = program_attention
+                    // shipped, or an unregistered id) degrades to all-false:
+                    // the row just doesn't join the hook-free fast prefix or
+                    // the lora site.
+                    let facts = program_facts
                         .get(&bound.program_id)
                         .copied()
-                        .unwrap_or(false);
-                    instances.insert(instance_id, TrackedInstance::from_bound(&bound, hook_program));
+                        .unwrap_or_default();
+                    instances.insert(instance_id, TrackedInstance::from_bound(&bound, facts));
                     // Respond AFTER the insert: launch admission reads
                     // `instances` on this thread, so the guest's first fire
                     // (sent only after this response) is always admissible.
@@ -4972,19 +5133,19 @@ struct TrackedInstance {
     wait_slots: Arc<crate::driver::instance::BoundWaitSlots>,
     in_flight: usize,
     next_target_epoch: u64,
-    /// Whether the bound program declares an attention-hook stage
-    /// (OnAttnProj/OnAttn); copied onto each fire at launch admission.
-    hook_program: bool,
+    /// The bound program's divergence facts (attention-hook stage,
+    /// lora sink); copied onto each fire at launch admission.
+    facts: ProgramFacts,
 }
 
 impl TrackedInstance {
-    fn from_bound(bound: &BoundInstance, hook_program: bool) -> Self {
+    fn from_bound(bound: &BoundInstance, facts: ProgramFacts) -> Self {
         Self {
             pacing_wait_id: bound.pacing_wait_id,
             wait_slots: bound.wait_slots(),
             in_flight: 0,
             next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
-            hook_program,
+            facts,
         }
     }
 
@@ -5192,15 +5353,21 @@ mod tests {
         crate::driver::BoundInstance,
         Vec<Arc<crate::driver::ChannelEndpoint>>,
     )> {
+        // The dummy fixture's site summary stands in for the summary a real
+        // driver's capabilities would report; spawn the scheduler with the
+        // same one, exactly as `scheduler::build_driver_scheduler` reads it
+        // off the registered `DriverSpec`.
+        let summary = options.model_site_summary.clone();
         let driver_id = driver::register_driver_backend(
             DriverSpec {
                 num_kv_pages: 16,
                 limits,
                 device_geometry_port_mask: 0,
+                model_site_summary: summary.clone(),
             },
             DriverBackend::Dummy(crate::driver::DummyDriver::new(options)),
         );
-        let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1, 1);
+        let scheduler = BatchScheduler::new(driver_id, driver_id, 16, limits, 1, 1, summary);
         let program_id = crate::scheduler::register_program(driver_id, dummy_program()).await?;
         let endpoints = register_test_channels(driver_id, [7, 8]).await?;
         let bound = crate::scheduler::bind_instance(
@@ -5377,7 +5544,7 @@ mod tests {
         let mut launches = VecDeque::new();
         let mut control = None;
         let mut instances = HashMap::new();
-        let mut program_attention = HashMap::new();
+        let mut program_facts = HashMap::new();
         let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
 
         BatchScheduler::apply_lane_reply(
@@ -5394,7 +5561,7 @@ mod tests {
             &mut launches,
             &mut control,
             &mut instances,
-            &mut program_attention,
+            &mut program_facts,
             &mut frame_policy,
             &rollback_tx,
         );
@@ -5415,6 +5582,57 @@ mod tests {
                 .published(pacing_wait_id)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn program_facts_derive_hooks_and_lora_from_the_launch_package() {
+        use pie_driver_abi::plan::{LaunchOp, LaunchPackage, LaunchStage};
+
+        let plan = ProgramRegistration {
+            launch: LaunchPackage {
+                names: vec!["attn_page_mask".to_string(), "lora".to_string()],
+                stages: vec![
+                    // Prologue carrying the pass-wide lora sink (its one
+                    // T11-legal home).
+                    LaunchStage {
+                        kind: 0,
+                        ops: vec![LaunchOp {
+                            code: u16::from(pie_ir::op::tags::SINK_CALL),
+                            name_index: 1,
+                            ..LaunchOp::default()
+                        }],
+                        ..LaunchStage::default()
+                    },
+                    // An OnAttn hook stage.
+                    LaunchStage {
+                        kind: 2,
+                        ..LaunchStage::default()
+                    },
+                ],
+                ..LaunchPackage::default()
+            },
+            ..ProgramRegistration::default()
+        };
+        let facts = DriverLane::program_facts(&plan);
+        assert!(facts.attention_hooks);
+        assert!(facts.lora_sink);
+        assert!(!facts.page_mask_sink);
+
+        // A sink call naming "attn_page_mask" flips the page-mask axis and
+        // ONLY that axis; a hook-free program stays hook-free.
+        let mut masked = plan.clone();
+        masked.launch.stages.truncate(1);
+        masked.launch.stages[0].ops[0].name_index = 0;
+        let facts = DriverLane::program_facts(&masked);
+        assert!(!facts.attention_hooks);
+        assert!(!facts.lora_sink);
+        assert!(facts.page_mask_sink);
+
+        // An empty registration (no launch package) degrades to all-false.
+        let facts = DriverLane::program_facts(&ProgramRegistration::default());
+        assert!(!facts.attention_hooks);
+        assert!(!facts.lora_sink);
+        assert!(!facts.page_mask_sink);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5581,6 +5799,53 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|entry| entry.starts_with("launch-shape tokens=2 programs=1"))
+        );
+        Ok(())
+    }
+
+    /// Dummy-path end-to-end for the capabilities site handshake: a
+    /// scheduler spawned from a driver whose fixture reports a populated
+    /// `model_site_summary` (the MoE shape a real CUDA driver would derive
+    /// from its validated plan) seals and launches a real frame. The
+    /// summary maps into fire-plan sites at spawn
+    /// (`site_table::summary_sites`) and `build_frame_submission`'s merge
+    /// assert — active in this debug-build test — verifies the sealed
+    /// frame's plan carried them; the launch completing normally pins that
+    /// a populated summary is informational and changes no scheduling
+    /// behavior.
+    #[tokio::test(flavor = "current_thread")]
+    async fn populated_model_site_summary_flows_through_a_real_launch() -> anyhow::Result<()> {
+        let operation_log = Arc::new(Mutex::new(Vec::new()));
+        let (driver_id, _scheduler, bound, _endpoints) =
+            setup_scheduler_with_options(DummyDriverOptions {
+                model_site_summary: pie_driver_abi::ModelSiteSummary {
+                    expert_sites: vec![pie_driver_abi::ExpertSiteSummary {
+                        experts: 256,
+                        top_k: 8,
+                    }],
+                },
+                operation_log: Some(operation_log.clone()),
+                ..DummyDriverOptions::default()
+            })
+            .await?;
+
+        let completion = bound.reserve_completion();
+        crate::scheduler::submit_async(
+            dummy_launch(),
+            driver_id,
+            bound.instance_id,
+            0,
+            None,
+            completion.clone(),
+        )?;
+        timeout(Duration::from_secs(5), completion).await??;
+        assert!(
+            operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.starts_with("launch-shape tokens=1 programs=1")),
+            "the fire launches exactly as without a summary"
         );
         Ok(())
     }
@@ -6296,6 +6561,7 @@ mod tests {
             &mut ScanCache::default(),
             &mut SlotBuffer::new(),
             false,
+            &[],
         );
         assert!(progress);
         assert!(
@@ -6529,6 +6795,7 @@ mod tests {
                     max_page_refs: 64,
                 },
                 device_geometry_port_mask: 0,
+                model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             },
             DriverBackend::Dummy(crate::driver::DummyDriver::new(
                 DummyDriverOptions::default(),
@@ -6545,6 +6812,7 @@ mod tests {
             },
             1,
             1,
+            pie_driver_abi::ModelSiteSummary::default(),
         );
         let exporter_bytes = TraceContainer {
             names: vec!["shared".to_string()],
@@ -7232,6 +7500,296 @@ mod tests {
         );
     }
 
+    /// The Stage 2 liveness seam (verdict note, finding 2): a POOLED
+    /// device-geometry masked decode fire (naive-masked's shape — prebuilt,
+    /// zero-row `qo_indptr = [0, 0]`, `AttnMask` channel bound, geometry
+    /// resolved on device) must never share a step with wire fires, in
+    /// EITHER admission order. `fire_device_geometry` builds this plan and
+    /// stamps `device_resolved_geometry`; before that stamp landed, the
+    /// host-lowered (BRLE) shape of the mask classified as an ordinary
+    /// "co-batches freely" wire mask, the scheduler composed it with wire
+    /// fires, and the driver's v1 mask scope threw
+    /// `RetryableLaunchError("ptir: dense device mask in a multi-program
+    /// batch requires solo retry")` — poisoning the wave and leaking the
+    /// dead lanes' pages. Observed twice live under mixed masked+plain
+    /// load.
+    #[test]
+    fn launch_grouping_refuses_pooled_masked_device_geometry_mixes() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        // naive-masked's decode plan, as `fire_device_geometry` builds it:
+        // `host_lowered` selects the two per-fire mask lowerings — the
+        // seed/host-derivable fire ships wire BRLE rows
+        // (`FireAttnMask::Host`), a device-derived fire ships none
+        // (`FireAttnMask::Device`, the dense device mask).
+        let pooled_masked = |instance: u64, host_lowered: bool| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.prebuilt = true;
+            request.request = LaunchPlan {
+                qo_indptr: vec![0, 0],
+                has_user_mask: true,
+                device_resolved_geometry: true,
+                ..LaunchPlan::default()
+            };
+            if host_lowered {
+                request.request.masks =
+                    vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+                request.request.mask_indptr = vec![0, 1];
+            }
+            assert!(
+                !request.requires_solo_submission(),
+                "the b=1 pooled fire is not structurally solo; only the \
+                 mask clauses keep it out of shared batches"
+            );
+            request
+        };
+        let envelope_decode = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.device_resolved_geometry = true;
+            request
+        };
+
+        for host_lowered in [true, false] {
+            // Masked fire first: no wire fire, prefill chunk, or envelope
+            // decode lane may join behind it.
+            let masked = pooled_masked(1, host_lowered);
+            let mut grouping = LaunchGrouping::default();
+            assert!(grouping.accepts(&masked, limits, 16));
+            grouping.push(&masked, limits, 16);
+            assert!(
+                !grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 2), limits, 16),
+                "a wire decode fire must not join a pooled masked \
+                 device-geometry fire (host_lowered={host_lowered})"
+            );
+            let mut prefill = dummy_launch_request(ProcessId::new_v4(), 3);
+            prefill.request = dummy_prefill(64);
+            assert!(
+                !grouping.accepts(&prefill, limits, 16),
+                "a chunk-prefill fire must not join a pooled masked \
+                 device-geometry fire (host_lowered={host_lowered})"
+            );
+            assert!(
+                !grouping.accepts(&envelope_decode(4), limits, 16),
+                "an envelope decode lane must not join a pooled masked \
+                 device-geometry fire (host_lowered={host_lowered})"
+            );
+
+            // Wire fire first: the masked fire defers instead of joining —
+            // the exact composition observed live (mixed load, a plain
+            // lane's wire fire already grouped).
+            let mut grouping = LaunchGrouping::default();
+            grouping.push(
+                &dummy_launch_request(ProcessId::new_v4(), 5),
+                limits,
+                16,
+            );
+            assert!(
+                !grouping.accepts(&pooled_masked(6, host_lowered), limits, 16),
+                "a pooled masked device-geometry fire must not join wire \
+                 fires (host_lowered={host_lowered})"
+            );
+
+            // Liveness: the deferred fire still heads its own fresh group.
+            let fresh = LaunchGrouping::default();
+            assert!(
+                fresh.accepts(&pooled_masked(7, host_lowered), limits, 16),
+                "the refused masked fire stays schedulable solo \
+                 (host_lowered={host_lowered})"
+            );
+        }
+    }
+
+    /// Stage 2 item A: a pooled device-geometry fire whose device mask
+    /// statically recognizes as STRUCTURED (`structured_device_mask`,
+    /// naive-masked's `mask_mode=structured` shape, attention-sink /
+    /// sliding-window-attention's real producers) CO-BATCHES — with
+    /// envelope decode lanes, wire decode fires, and other structured
+    /// fires, in either admission order. The driver fills the mask-free
+    /// lanes' descriptors with causal and packs per lane. A genuinely
+    /// dense (unrecognized) device mask keeps the solo contract, and wire
+    /// (BRLE) masks stay out of composed batches — both pinned by
+    /// `launch_grouping_refuses_pooled_masked_device_geometry_mixes`; the
+    /// wire-mask exclusion is re-pinned here against a structured group.
+    #[test]
+    fn launch_grouping_co_batches_structured_device_masks() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        let structured_masked = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.prebuilt = true;
+            request.request = LaunchPlan {
+                qo_indptr: vec![0, 0],
+                has_user_mask: true,
+                structured_device_mask: true,
+                device_resolved_geometry: true,
+                ..LaunchPlan::default()
+            };
+            request
+        };
+        let envelope_decode = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.device_resolved_geometry = true;
+            request
+        };
+
+        // Structured fire first: envelope decode, wire decode, and a second
+        // structured fire all join (the mixed repro's composition, one wave).
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&structured_masked(1), limits, 16));
+        assert!(
+            !grouping.push(&structured_masked(1), limits, 16),
+            "a structured device mask must not close the group"
+        );
+        assert!(
+            grouping.accepts(&envelope_decode(2), limits, 16),
+            "an envelope decode lane co-batches behind a structured-masked fire"
+        );
+        grouping.push(&envelope_decode(2), limits, 16);
+        assert!(
+            grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 3), limits, 16),
+            "a wire decode fire co-batches behind a structured-masked fire"
+        );
+        assert!(
+            grouping.accepts(&structured_masked(4), limits, 16),
+            "two structured-masked fires co-batch (per-lane descriptors)"
+        );
+
+        // Envelope decode first: the structured fire joins (the reverse
+        // admission order).
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&envelope_decode(5), limits, 16);
+        assert!(
+            grouping.accepts(&structured_masked(6), limits, 16),
+            "a structured-masked fire joins envelope decode lanes"
+        );
+        grouping.push(&structured_masked(6), limits, 16);
+        assert!(
+            grouping.accepts(&envelope_decode(7), limits, 16),
+            "later envelope lanes still join after the structured admit"
+        );
+
+        // The structured bit relaxes ONLY the structured shape: a dense
+        // device mask in the same group state still refuses, in both orders.
+        let dense_masked = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request = LaunchPlan {
+                qo_indptr: vec![0, 0],
+                has_user_mask: true,
+                device_resolved_geometry: true,
+                ..LaunchPlan::default()
+            };
+            request
+        };
+        assert!(
+            !grouping.accepts(&dense_masked(8), limits, 16),
+            "a dense device mask must not ride a structured co-batch"
+        );
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&dense_masked(9), limits, 16);
+        assert!(
+            !grouping.accepts(&structured_masked(10), limits, 16),
+            "a structured fire must not join a dense-masked solo group"
+        );
+
+        // Wire (BRLE) masks still index the wire layout: they never join a
+        // structured device-geometry group, in either order.
+        let wire_masked = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.has_user_mask = true;
+            request.request.masks =
+                vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+            request.request.mask_indptr = vec![0, 1];
+            request
+        };
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&structured_masked(11), limits, 16);
+        assert!(
+            !grouping.accepts(&wire_masked(12), limits, 16),
+            "a wire-masked fire must not join a structured device-geometry group"
+        );
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&wire_masked(13), limits, 16);
+        assert!(
+            !grouping.accepts(&structured_masked(14), limits, 16),
+            "a structured fire must not join a wire-masked group"
+        );
+    }
+
+    /// The page-mask/pure-decode grouping invariant: an
+    /// `attn_page_mask`-writing program shares a batch only with
+    /// single-token (decode) rows — the driver throws on a written mask off
+    /// the paged decode path, so mixing would kill the whole fire.
+    #[test]
+    fn launch_grouping_keeps_page_mask_programs_pure_decode() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        let make_page_mask_decode = |instance| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.page_mask_program = true;
+            request
+        };
+        let make_chunk_prefill = |instance| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request = dummy_prefill(64);
+            request
+        };
+
+        // Page-mask decode + plain single-token decode co-batch.
+        let quest = make_page_mask_decode(1);
+        let decode = dummy_launch_request(ProcessId::new_v4(), 2);
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&quest, limits, 16));
+        grouping.push(&quest, limits, 16);
+        assert!(
+            grouping.accepts(&decode, limits, 16),
+            "a page-mask program must keep co-batching with pure-decode lanes"
+        );
+
+        // Page-mask first, chunk prefill second: the prefill is refused
+        // from THIS group (deferred to the next wave), not dropped — a
+        // fresh group takes it.
+        let prefill = make_chunk_prefill(3);
+        assert!(
+            !grouping.accepts(&prefill, limits, 16),
+            "a multi-token fire must not join a page-mask batch: the driver \
+             throws on a written mask off the pure-decode path"
+        );
+        let fresh = LaunchGrouping::default();
+        assert!(
+            fresh.accepts(&prefill, limits, 16),
+            "the refused prefill stays schedulable on its own wave"
+        );
+
+        // Order independence: multi-token first, page-mask second also
+        // splits.
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&prefill, limits, 16));
+        grouping.push(&prefill, limits, 16);
+        assert!(
+            !grouping.accepts(&make_page_mask_decode(4), limits, 16),
+            "a page-mask program must not join a batch holding multi-token rows"
+        );
+
+        // Narrowness: a hook program WITHOUT the page-mask sink (snapkv
+        // score capture — legal on prefill) still co-batches with
+        // multi-token fires.
+        let mut hook_only = dummy_launch_request(ProcessId::new_v4(), 5);
+        hook_only.hook_program = true;
+        assert!(
+            grouping.accepts(&hook_only, limits, 16),
+            "plain hook programs stay freely mixable with prefill"
+        );
+    }
+
     /// Rotating held launches behind wave work must move the WHOLE contiguous
     /// launch prefix in one call. A partial rotation reorders a pipeline's
     /// run-ahead siblings; dispatch then defers the out-of-order head
@@ -7388,6 +7946,7 @@ mod tests {
             limits,
             &stats,
             &waves,
+            &[],
         );
         assert!(progress, "the drop is progress");
         assert!(!posted, "nothing launches for a cancelled fire");
@@ -7480,6 +8039,7 @@ mod tests {
             &mut ScanCache::default(),
             &mut SlotBuffer::new(),
             false,
+            &[],
         );
         assert!(progress, "the copy dispatch is progress");
         assert!(
@@ -7717,6 +8277,7 @@ mod tests {
                 &mut ScanCache::default(),
                 &mut SlotBuffer::new(),
                 false,
+                &[],
             );
             pending.len()
         };

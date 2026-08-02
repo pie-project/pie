@@ -1,6 +1,9 @@
 #include "model/qwen3_5/qwen3_5_model.hpp"
 
+#include <cstdio>
 #include <utility>
+
+#include "model/qwen3_5/declared_forward.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -34,6 +37,17 @@ Qwen35Model::Qwen35Model(
     caps_.graph_padding_kv_write_safe  = true;
     caps_.supports_compact_logits      = true;
     caps_.supports_small_prefill_graph = supports_small_prefill_graph;
+
+    // Declared executor: trace + structurally validate the hybrid
+    // declaration against this deployment's config and bindings, now
+    // rather than on first fire (the facts are load-time facts —
+    // llama_like_model.cpp's reasoning). An unrepresentable config leaves
+    // `declared_` empty with the reason logged once and body() keeps the
+    // hand-written path; a validated plan is consumed by body()'s
+    // eligibility gate below.
+    if (qwen35_declared_forward_enabled()) {
+        declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
+    }
 }
 
 void Qwen35Model::prepare(AttentionWorkspace& attn_ws,
@@ -50,6 +64,87 @@ void Qwen35Model::body(Workspace& ws,
                        AttentionWorkspace& attn_ws,
                        ops::CublasHandle& cublas,
                        const ForwardFn::ForwardInputs& in) {
+    // The declared executor covers the hand-written TP=1 base pass —
+    // decode AND prefill fires (arc 3; mixed prefill+decode fires are the
+    // same qo_indptr-windowed prefill shape) — anything it cannot express
+    // falls back, per fire, to the hand-written body below. Build-time
+    // exclusions (TP>1, quantized projections, irregular layer schedule,
+    // mixed fused bindings, ...) already left `declared_` empty. Each term
+    // names the hand-written per-fire service the walk does not mirror;
+    // `fallback_reason` keeps the exclusion honest in the trace log (a
+    // silent fallback would be indistinguishable from a passing A/B run).
+    const char* fallback_reason = nullptr;
+    if (static_cast<bool>(declared_)) {
+        const int qgkv_dim =
+            2 * hf_config_.num_attention_heads * hf_config_.head_dim +
+            2 * hf_config_.num_key_value_heads * hf_config_.head_dim;
+        if (in.stage_hooks != nullptr) {
+            fallback_reason = "stage hooks attached";
+        } else if (in.lora != nullptr) {
+            // The plan has no correction op; running the walk would
+            // silently drop the adapter (llama_like's reasoning). The
+            // hand-written qwen3_5 body ignores lora too, but the honest
+            // gate is exclusion, not shared omission.
+            fallback_reason = "lora fire";
+        } else if (in.custom_mask_d != nullptr) {
+            fallback_reason = "custom mask";
+        } else if (in.rs_buffer_write || in.rs_buffer_fold) {
+            // Excluded by DESIGN, not backlog — the Stage-2 recon verdict
+            // (stage1-notes.md, "RS-buffer solo relax: rejected"):
+            // FoldBuffered is unbatchable by WIT contract (the driver
+            // rejects a batch mixing folded and forward rows) and Buffer
+            // has zero production callers, so the per-slab host-driven
+            // memcpy loops stay a hand-written service the walk does not
+            // mirror.
+            fallback_reason =
+                "rs-buffer write/fold fire (stage-2 verdict: unbatchable "
+                "by contract / zero callers)";
+        } else if (in.has_write_desc &&
+                   (in.w_page_d == nullptr || in.w_off_d == nullptr)) {
+            // Same guard the hand-written explicit-write validation makes.
+            fallback_reason = "write descriptors missing";
+        } else if (declared_.fused_full_attn_qgkv &&
+                   (ws.gate_up_fused.empty() ||
+                    ws.gate_up_fused.numel() <
+                        static_cast<std::size_t>(in.total_tokens) *
+                            qgkv_dim)) {
+            // The trace committed to the fused qgkv bank; a workspace that
+            // cannot stage it would make the hand-written body fall back
+            // to the unfused GEMMs per layer — a shape the fused trace
+            // cannot express (the hand-written `use_fused_qgkv` check).
+            fallback_reason = "fused qgkv staging buffer unavailable";
+        }
+        // (MTP draft fires need no term here: drafting enters through
+        // wire_system_drafter's own entry points, never body(). The
+        // MTP-adjacent shapes that DO route through body() are declared
+        // since this arc: state-only fires (num_logit_rows < 0), frozen
+        // verify (state_cache_.verify_frozen() read inside the walk), and
+        // commit-advance fires (commit_advance_gather_d threaded below as
+        // the walk's commit_lens; its rs_buffer_fold flavor stays behind
+        // the rs-buffer term above).)
+        if (fallback_reason == nullptr) {
+            qwen3_5_forward_declared(
+                declared_, weights_, hf_config_, fwd_cfg_, plan_state_,
+                ws, la_ws_, kv, state_cache_, attn_ws, cublas,
+                in.token_ids, in.positions,
+                in.qo_indptr_d, in.kv_page_indices_d,
+                in.kv_page_indptr_d, in.kv_last_page_lens_d,
+                in.qo_indptr_h, in.kv_page_indptr_h,
+                in.total_tokens, in.num_requests, in.is_pure_decode,
+                in.w_page_d, in.w_off_d, in.row_valid_d, in.has_write_desc,
+                in.slot_ids_h, in.is_fresh_h, in.slot_ids_d, in.is_fresh_d,
+                in.logit_row_indices_d, in.num_logit_rows,
+                in.commit_advance_gather_d);
+            return;
+        }
+        if (qwen35_declared_exec_trace_enabled()) {
+            std::fprintf(stderr,
+                         "[declared-qwen35-exec] fallback N=%d R=%d "
+                         "decode=%d reason=%s\n",
+                         in.total_tokens, in.num_requests,
+                         in.is_pure_decode ? 1 : 0, fallback_reason);
+        }
+    }
     qwen3_5_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,
         ws, la_ws_, kv, state_cache_,

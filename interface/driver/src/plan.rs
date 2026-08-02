@@ -56,6 +56,15 @@ pub struct LaunchPlan {
     pub single_token_mode: bool,
     pub device_resolved_geometry: bool,
     pub has_user_mask: bool,
+    /// A device-derived mask (`has_user_mask` with no wire `masks` rows)
+    /// whose producing op chain statically recognizes as a structured mask
+    /// (`causal_mask` / `sliding_window_mask` / `sink_window_mask`, seen
+    /// through reshapes) — the same walk the driver performs
+    /// (`pie_native::launch::structured_mask_descriptor`). A scheduler fact
+    /// only: the driver re-derives the structure from its adopted trace and
+    /// lowers it per lane, so nothing on the launch wire consumes this.
+    #[serde(default)]
+    pub structured_device_mask: bool,
     /// Exclusive physical KV page high-water required before this launch.
     #[serde(default)]
     pub required_kv_pages: u32,

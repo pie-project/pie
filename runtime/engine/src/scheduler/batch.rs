@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use pie_driver_abi::PieTerminalCell;
 
+use super::fire_plan;
 use super::stats::SchedulerStats;
 use super::wire;
 use super::worker::PendingRequest;
@@ -240,6 +241,7 @@ pub(crate) fn build_frame_submission(
     limits: SchedulerLimits,
     page_size: u32,
     stats: &SchedulerStats,
+    model_sites: &[fire_plan::Site],
 ) -> (FrameSubmission, Vec<Box<PendingRequest>>) {
     let mut step_groups: Vec<Vec<Box<PendingRequest>>> = Vec::new();
     for wave in waves {
@@ -288,10 +290,56 @@ pub(crate) fn build_frame_submission(
         // driver's hook-free prefix (`StageHooks::hook_free_prefix_rows`)
         // is the fused fast path, and a leading hook-free run that spans
         // ALL hook-free lanes makes that prefix maximal instead of ending
-        // at whichever hook lane happened to arrive first. Stable sort
-        // keeps arrival order otherwise.
-        let mut group = group;
-        group.sort_by_key(|req| (req.request.device_resolved_geometry, req.hook_program));
+        // at whichever hook lane happened to arrive first. Stable order
+        // keeps arrival otherwise. The permutation comes from the fire
+        // planner — the same key the inline sort here used to apply,
+        // generalized so the next divergence axis lands as planner data
+        // (`fire_plan::MemberFacts`) instead of a wider sort key; the
+        // plan's per-site lowerings are not consumed yet (v0).
+        let facts: Vec<fire_plan::MemberFacts> = group
+            .iter()
+            .enumerate()
+            .map(|(arrival, req)| fire_plan::MemberFacts {
+                hook_program: req.hook_program,
+                lora: req.lora_program,
+                device_resolved_geometry: req.request.device_resolved_geometry,
+                arrival,
+            })
+            .collect();
+        // `model_sites` is the driver's own statement, from its validated
+        // declared plan through the capabilities handshake (the site_table
+        // module doc's wiring; `fire_plan::site_table::summary_sites` maps
+        // the reported summary into the vocabulary). Empty — every dense
+        // model, every driver without a declared plan — reduces this to
+        // the old `plan_fire` exactly. The merged sites stay INFORMATIONAL
+        // this increment: nothing consumes the site vec downstream (v0),
+        // so the assert below is the site's only reader.
+        let plan = fire_plan::plan_fire_with_model(&facts, model_sites);
+        debug_assert_eq!(
+            plan.sites.len(),
+            2 + model_sites.len(),
+            "the merged plan carries both member-fact sites and every model site"
+        );
+        debug_assert_eq!(
+            plan.member_order,
+            {
+                let mut order: Vec<usize> = (0..group.len()).collect();
+                order.sort_by_key(|&i| {
+                    (
+                        group[i].request.device_resolved_geometry,
+                        group[i].hook_program,
+                    )
+                });
+                order
+            },
+            "fire plan order must equal the stable sort it replaced"
+        );
+        let mut slots: Vec<Option<Box<PendingRequest>>> = group.into_iter().map(Some).collect();
+        let group: Vec<Box<PendingRequest>> = plan
+            .member_order
+            .iter()
+            .map(|&index| slots[index].take().expect("member_order is a permutation"))
+            .collect();
         let wire_count = group
             .iter()
             .take_while(|req| !req.request.device_resolved_geometry)
@@ -385,6 +433,8 @@ mod tests {
             pipeline_id: None,
             prebuilt,
             hook_program: false,
+            lora_program: false,
+            page_mask_program: false,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
@@ -406,6 +456,44 @@ mod tests {
             single_token_mode: true,
             ..LaunchPlan::default()
         }
+    }
+
+    /// The driver-reported model sites are INFORMATIONAL this increment
+    /// (nothing consumes a fire plan's site vec downstream — v0): sealing a
+    /// frame with an MoE summary's expert site merged produces a submission
+    /// identical to sealing without it, while the debug assert inside
+    /// `build_frame_submission` pins that the merged plan really carried
+    /// the site through `plan_fire_with_model`.
+    #[test]
+    fn model_sites_are_informational_for_the_submission() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let waves = || {
+            vec![vec![
+                pending(wire_decode(11, 3), 1, false),
+                pending(wire_decode(22, 4), 2, false),
+            ]]
+        };
+        let stats = SchedulerStats::default();
+        let (without_sites, retired) = build_frame_submission(waves(), limits, 16, &stats, &[]);
+        assert_eq!(retired.len(), 2);
+
+        let model_sites = [fire_plan::expert_weights_site(256, 8)];
+        let (with_sites, retired) =
+            build_frame_submission(waves(), limits, 16, &stats, &model_sites);
+        assert_eq!(retired.len(), 2);
+        // Terminal cells are per-completion heap pointers, distinct between
+        // the two constructions by nature; everything else must agree.
+        let scrub = |mut submission: FrameSubmission| {
+            for step in &mut submission.steps {
+                step.terminal_cells.clear();
+            }
+            submission
+        };
+        assert_eq!(scrub(without_sites), scrub(with_sites));
     }
 
     #[test]

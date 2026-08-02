@@ -29,7 +29,9 @@
 #include "kernels/graph_pad.hpp"
 #include "kernels/pack_dense_mask.hpp"
 #include "model/loaded_model.hpp"
+#include "model/attn_observation.hpp"
 #include "model/attn_score.hpp"
+#include "model/hook_sideband_arena.hpp"
 #include "model/lora.hpp"
 #include "model/stage_hooks.hpp"
 #include "store/kv_cache.hpp"
@@ -932,7 +934,12 @@ void prepare_step(
         if (s.dg_resolved) {
             // v1 mask scope: a dense device mask (AttnMask channel)
             // composes only SOLO — the runtime scheduler batches such
-            // fires alone; fail loud if the contract is violated.
+            // fires alone, and `Context::Impl::launch` refuses a violating
+            // step at ADMISSION (`Dispatch::dense_mask_scope_violation`,
+            // side-effect-free, before any channel ticket is applied).
+            // This resolve-time throw is the unreachable backstop: by now
+            // `begin_host` has mutated wave state, so failing here poisons
+            // the whole frame.
             if (s.rpg.per_program.size() > 1) {
                 for (std::size_t p = 0; p < s.rpg.per_program.size(); ++p) {
                     if (s.rpg.is_device_geometry[p] &&
@@ -1015,11 +1022,31 @@ void prepare_step(
         effective_structured_masks = s.composed.structured_masks;
     const auto mask_coverage = pipeline::structured_mask_coverage(
         effective_structured_masks);
+    // Stage 2 item A: MIXED coverage — structured-masked lanes co-batched
+    // with mask-free lanes — packs per-lane structured masks instead of
+    // refusing the step. A mask-free decode/prefill lane attends causally
+    // by construction (its KV extent never exceeds position+1), so its
+    // absent descriptor fills with Causal and the per-lane pack kernel
+    // (`launch_pack_structured_mask`, kind==1) reproduces its semantics
+    // exactly. The recon's alternative — admitting the mix only when the
+    // SHARED runtime-window override succeeds — was REJECTED by
+    // measurement (stage1-notes.md, Stage 2 "Measured"): the override was
+    // no cheaper than the packed-mask path end-to-end at these scales, and
+    // one shared window cannot express per-lane structure anyway; a filled
+    // mix therefore always takes the pack path below, never the override.
+    // Genuinely dense device masks cannot reach this seam: the scheduler
+    // batches them solo and `Context::Impl::launch` refuses a violating
+    // step at admission (`Dispatch::dense_mask_scope_violation`).
+    bool filled_causal_coverage = false;
     if (mask_coverage ==
         pipeline::StructuredMaskCoverage::Mixed) {
-        throw pipeline::RetryableLaunchError(
-            "explicit PTIR masks cannot share one runtime override with "
-            "ordinary wire requests");
+        for (auto& descriptor : effective_structured_masks) {
+            if (!descriptor) {
+                descriptor.kind =
+                    pie_native::launch::StructuredMaskKind::Causal;
+            }
+        }
+        filled_causal_coverage = true;
     }
     const auto effective_first = std::find_if(
         effective_structured_masks.begin(),
@@ -1044,18 +1071,23 @@ void prepare_step(
     const std::span<const std::uint32_t> sptr_view  = s.composed_ready ? std::span<const std::uint32_t>(s.composed.sampling_indptr)   : sptr_view_orig;
     if (effective_first != effective_structured_masks.end() &&
         engine.forward_fn.supports_runtime_window) {
-        const auto window = pipeline::runtime_window_for_tail_aligned(
-            effective_structured_masks,
-            pos_view,
-            qo_view,
-            kvpp_view,
-            kvlpl_view,
-            static_cast<std::uint32_t>(kv_cache.page_size()));
-        if (window.has_value()) {
-            use_structured_mask = true;
-            s.structured_window_left = *window;
-        } else {
+        if (filled_causal_coverage) {
+            // Filled mixed coverage packs per lane (rationale above).
             pack_structured_mask = true;
+        } else {
+            const auto window = pipeline::runtime_window_for_tail_aligned(
+                effective_structured_masks,
+                pos_view,
+                qo_view,
+                kvpp_view,
+                kvlpl_view,
+                static_cast<std::uint32_t>(kv_cache.page_size()));
+            if (window.has_value()) {
+                use_structured_mask = true;
+                s.structured_window_left = *window;
+            } else {
+                pack_structured_mask = true;
+            }
         }
     }
     s.dispatch_view = view;
@@ -1296,14 +1328,22 @@ void prepare_step(
     const auto fmask_view  = view.flattened_masks.as<std::uint32_t>();
     const auto mskptr_view = view.mask_indptr.as<std::uint32_t>();
     if (!fmask_view.empty()) {
+        // A SOLO device-geometry program with `has_user_mask` shipped its
+        // host-lowered (BRLE) mask on the wire: decode it against the
+        // RESOLVED geometry. In a MULTI-program device-geometry batch the
+        // wire rows cannot be the device lane's mask — the scheduler keeps
+        // host-lowered device-geometry masks solo
+        // (`wire_mask_on_device_geometry`), and a structured device mask
+        // (item A, the only masked device-geometry shape that co-batches)
+        // ships NO wire rows. The rows are then the WIRE lanes' synthesized
+        // causal masks (mask elision turns off for the whole batch once any
+        // member sets `has_user_mask`), interpreted against the wire
+        // layout: pure causal decodes to nothing and the structured pack
+        // covers the batch. Anything non-causal here is a scheduler breach
+        // — fail loud below rather than silently dropping a mask.
         const bool resolved_custom_wire =
-            s.dg_resolved && view.has_user_mask;
-        if (resolved_custom_wire &&
-            view.ptir_program_hashes.size() > 1) {
-            throw std::runtime_error(
-                "ptir: host-derived masks on device geometry require a "
-                "solo program");
-        }
+            s.dg_resolved && view.has_user_mask &&
+            view.ptir_program_hashes.size() == 1;
         const auto qo_span = std::span<const std::uint32_t>(
             resolved_custom_wire ? qo_view.data() : qo_view_orig.data(),
             resolved_custom_wire ? qo_view.size() : qo_view_orig.size());
@@ -1321,10 +1361,33 @@ void prepare_step(
             resolved_custom_wire
                 ? kvlpl_view.size()
                 : kvlpl_view_orig.size());
+        // In a composed multi-program batch the wire layout ends with the
+        // device-resolved programs' placeholder rows (zero-token rows the
+        // fire plan orders last); they carry no wire masks but would fail
+        // the causal walk structurally (`qo_len <= 0`). Restrict the walk
+        // to the HOST-class prefix — the only rows wire masks can belong
+        // to.
+        std::size_t causal_rows = qo_span.size() - 1;
+        if (s.dg_resolved && !resolved_custom_wire &&
+            view.ptir_program_row_indptr.size() ==
+                s.rpg.is_device_geometry.size() + 1) {
+            std::size_t wire_rows = 0;
+            for (std::size_t p = 0;
+                 p < s.rpg.is_device_geometry.size();
+                 ++p) {
+                if (s.rpg.is_device_geometry[p]) break;
+                wire_rows = view.ptir_program_row_indptr.data()[p + 1];
+            }
+            causal_rows = std::min<std::size_t>(causal_rows, wire_rows);
+        }
         bool pure_causal =
             pie_cuda_driver::brle::is_pure_causal(
                 fmask_view, mskptr_view,
-                qo_span, kvpp_span, kvlpl_span,
+                qo_span.first(causal_rows + 1),
+                kvpp_span.first(
+                    std::min(kvpp_span.size(), causal_rows + 1)),
+                kvlpl_span.first(
+                    std::min(kvlpl_span.size(), causal_rows)),
                 kv_cache.page_size());
         if (!pure_causal && !view.has_user_mask && is_pure_decode) {
             std::vector<std::uint32_t> logical_kv_lens;
@@ -1352,10 +1415,28 @@ void prepare_step(
                 s.mask_indptr_count =
                     static_cast<int>(decoded.mask_indptr.size());
                 s.have_custom_mask = true;
+            } else if (view.has_user_mask) {
+                // Composed multi-program batch carrying NON-causal wire
+                // rows: a wire-masked fire rode a device-geometry batch,
+                // which the composed path cannot honour (rationale above).
+                throw std::runtime_error(
+                    "ptir: non-causal wire masks cannot ride a composed "
+                    "device-geometry batch (scheduler must keep "
+                    "wire-masked fires out)");
             }
         }
     }
 
+    // A wire (BRLE) custom mask and a structured pack target the same
+    // persistent buffers; the scheduler never composes the two, so a
+    // collision is a composition bug that must fail loud, not silently
+    // drop the structured lanes' masks.
+    if (pack_structured_mask && s.have_custom_mask) {
+        throw std::runtime_error(
+            "ptir: structured mask pack collides with staged wire custom "
+            "masks (wire-masked and structured-masked lanes must not "
+            "compose)");
+    }
     if (pack_structured_mask && !s.have_custom_mask) {
         const int lanes = static_cast<int>(qo_view.size()) - 1;
         std::vector<std::uint32_t> klen(
@@ -1526,7 +1607,11 @@ void prepare_step(
             s.fR_real,
             s.img_num_images,
             s.aud_num_clips,
-            s.has_attention_stages,
+            // Stage 6 increment 4: hook fires that MAY replay a graph pad
+            // to the lattice like plain decode — same lockstep rule as the
+            // dispatcher (`run_forward_dispatch`). Fires the dispatch-side
+            // prepare pass later vetoes just run eagerly, padded.
+            hook_fire_blocks_graph(engine, s.has_attention_stages),
             engine.dispatch->launch_wants_lora(s.dispatch_view));
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
@@ -2289,12 +2374,45 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             ? engine.dispatch->launch_lora_table(*s.staged)
             : model::LoraTable{};
 
+    // Fire-level observation for the hook-graph prepare pass (stage 6
+    // increment 4): the same KV geometry `ForwardFn::invoke_body` attaches
+    // to the body's hooks copy, materialized here because the prepare pass
+    // runs BEFORE the body (and before capture). Host pointers are the
+    // frame's resolved spans, device pointers the persistent inputs — both
+    // outlive the fire.
+    const model::AttentionObservation hook_observation{
+        .kv = &engine.kv_cache,
+        .kv_page_indices_d = reinterpret_cast<const std::uint32_t*>(
+            pi.kv_page_indices.data()),
+        .kv_page_indptr_d = reinterpret_cast<const std::uint32_t*>(
+            pi.kv_page_indptr.data()),
+        .kv_last_page_lens_d = reinterpret_cast<const std::uint32_t*>(
+            pi.kv_last_page_lens.data()),
+        .qo_indptr_h = s.h_qo_forward,
+        .kv_page_indptr_h = s.h_kvpp_forward,
+        .kv_last_page_lens_h = s.h_kvlpl_forward,
+        .num_requests = s.forward_R,
+        .total_tokens = s.forward_N,
+    };
     struct StageHookContext {
         pipeline::Dispatch* dispatch = nullptr;
         pipeline::StagedLaunch* launch = nullptr;
+        const model::AttentionObservation* observation = nullptr;
+        model::HookSidebandArena* arena = nullptr;
+        std::uint32_t num_q_heads = 0;
+        std::uint32_t hook_free_prefix_rows = 0;
+        bool wants_attn_score = false;
+        bool wants_page_mask = false;
     } stage_hook_context{
         engine.dispatch,
         s.staged.get(),
+        &hook_observation,
+        engine.sideband_arena,
+        static_cast<std::uint32_t>(
+            engine.loaded_model.hf_config().num_attention_heads),
+        engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
+        engine.dispatch->launch_wants_attn_score(s.dispatch_view),
+        engine.dispatch->launch_wants_page_mask(s.dispatch_view),
     };
     const model::StageHooks stage_hooks{
         .context = &stage_hook_context,
@@ -2305,6 +2423,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             engine.dispatch->launch_wants_page_mask(s.dispatch_view),
         .hook_free_prefix_rows =
             engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
+        .sideband_arena = engine.sideband_arena,
         .execute = [](
             void* opaque,
             model::StageHookPoint point,
@@ -2328,7 +2447,35 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 query_is_f32,
                 sideband);
         },
+        .prepare_replay = [](void* opaque, cudaStream_t stream)
+            -> std::uint64_t {
+            auto& context =
+                *static_cast<StageHookContext*>(opaque);
+            return context.dispatch->prepare_attention_phases(
+                *context.launch,
+                pipeline::Dispatch::HookReplayPrepare{
+                    .observation = context.observation,
+                    .arena = context.arena,
+                    .num_q_heads = context.num_q_heads,
+                    .hook_free_prefix_rows =
+                        context.hook_free_prefix_rows,
+                    .wants_attn_score = context.wants_attn_score,
+                    .wants_page_mask = context.wants_page_mask,
+                    .stream = stream,
+                });
+        },
+        .verify_replay_capture = [](void* opaque) {
+            auto& context =
+                *static_cast<StageHookContext*>(opaque);
+            context.dispatch->verify_hook_capture_consumed(
+                *context.launch);
+        },
     };
+    // Fire boundary for the sideband arena's PIE_SIDEBAND_TRACE counters —
+    // only hook fires draw from it, so only they mark the boundary.
+    if (s.has_attention_stages && engine.sideband_arena != nullptr) {
+        engine.sideband_arena->begin_fire();
+    }
     run_forward_dispatch(
         engine, ForwardDispatchInputs{
             .forward_R = s.forward_R,
@@ -2381,6 +2528,15 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .precomputed_embeddings = s.precomputed_embeddings,
             .stage_hooks =
                 s.has_attention_stages ? &stage_hooks : nullptr,
+            // Partitions hook exec storage by the fire's program multiset
+            // (order-independent): distinct hook programs sharing one
+            // (R, N, variant) prepare different baked state and must not
+            // invalidate each other's captures.
+            .hook_program_set_hash = s.has_attention_stages
+                ? hook_program_set_hash(
+                      s.dispatch_view.ptir_program_hashes.data(),
+                      s.dispatch_view.ptir_program_hashes.size())
+                : 0,
             .lora = lora_table.usable() ? &lora_table : nullptr,
         });
     dump_rs("POST");

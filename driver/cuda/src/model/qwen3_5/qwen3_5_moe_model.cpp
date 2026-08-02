@@ -1,6 +1,9 @@
 #include "model/qwen3_5/qwen3_5_moe_model.hpp"
 
+#include <cstdio>
 #include <utility>
+
+#include "model/qwen3_5/declared_forward.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -36,6 +39,14 @@ Qwen35MoeModel::Qwen35MoeModel(
     caps_.graph_padding_kv_write_safe  = true;
     caps_.supports_compact_logits      = true;
     caps_.supports_small_prefill_graph = supports_small_prefill_graph;
+
+    // Declared executor: same cold-start trace + validation as the dense
+    // model (qwen3_5_model.cpp) — the two classes do not share a
+    // construction site, so each opts in here. body() never consumes the
+    // MoE plan this slice (no MoE emission arms yet; see body()).
+    if (qwen35_declared_forward_enabled()) {
+        declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
+    }
 }
 
 void Qwen35MoeModel::prepare(AttentionWorkspace& attn_ws,
@@ -52,6 +63,20 @@ void Qwen35MoeModel::body(Workspace& ws,
                           AttentionWorkspace& attn_ws,
                           ops::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
+    // Arc-2 decode slice: the MoE model ALWAYS falls back this slice. Its
+    // validated plan carries the dyn MoE vocabulary (TopK, selector
+    // Matmuls, WeightedSum, SigmoidGateAdd) which the executor's op-kind
+    // switch has no emission rule for — the grouped-GEMM emission is a
+    // later, much larger lift (commit 9c54b9b6's list). The trace-gated
+    // line keeps the exclusion visible in A/B runs.
+    if (static_cast<bool>(declared_) &&
+        qwen35_declared_exec_trace_enabled()) {
+        std::fprintf(stderr,
+                     "[declared-qwen35-exec] fallback N=%d R=%d decode=%d "
+                     "reason=moe emission arms absent this slice\n",
+                     in.total_tokens, in.num_requests,
+                     in.is_pure_decode ? 1 : 0);
+    }
     qwen3_5_moe_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,
         ws, la_ws_, moe_ws_, kv, state_cache_,

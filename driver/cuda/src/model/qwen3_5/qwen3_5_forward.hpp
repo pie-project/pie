@@ -104,6 +104,21 @@ struct Qwen3_5PlanState {
     bool use_prefill_plan = false;
 };
 
+// GDN prefill recurrence-family knobs (env-gated, read once). Shared with
+// the declared executor so both paths select the recurrence lowering from
+// the same predicate terms:
+//   * cached-prefill max tokens (PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS,
+//     default 0 = off);
+//   * warp-tiled max tokens (PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS,
+//     default 64);
+//   * warp-tiled state-persist re-enable
+//     (PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST — the STOPGAP for the
+//     warp-tiled kernel's multi-token state fold; see the note in
+//     linear_attn_layer_body).
+int qwen35_gdn_cached_prefill_max_tokens();
+int qwen35_gdn_warp_tiled_max_tokens();
+bool qwen35_gdn_warp_tiled_state_persist_enabled();
+
 // Refresh the decode plan for the current fire. Caller is expected to
 // invoke this BEFORE either a direct forward call OR a graph replay,
 // outside any capture region. No-op when `is_pure_decode == false`.

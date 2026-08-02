@@ -175,6 +175,8 @@ impl TiktokenTokenizerConfig {
                 id,
                 content,
                 special,
+                lstrip: false,
+                rstrip: false,
             });
         }
         Ok(tokens)

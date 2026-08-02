@@ -55,6 +55,7 @@ void ForwardFn::attach_model(model::IModel* m) {
     supports_compact_logits      = caps.supports_compact_logits;
     supports_small_prefill_graph = caps.supports_small_prefill_graph;
     supports_runtime_window       = caps.supports_runtime_window;
+    supports_hook_graph_capture   = caps.supports_hook_graph_capture;
 }
 
 void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
@@ -266,7 +267,8 @@ cudaGraphExec_t capture_forward_graph_exec(
     const std::uint32_t* w_page_d,
     const std::uint32_t* w_off_d,
     bool has_write_desc,
-    int runtime_window_left)
+    int runtime_window_left,
+    const model::StageHooks* stage_hooks)
 {
     auto& pi = engine.inputs;
 
@@ -308,6 +310,14 @@ cudaGraphExec_t capture_forward_graph_exec(
         fwd_in.row_valid_d = pi.row_valid.data();
         fwd_in.has_write_desc = has_write_desc;
         fwd_in.runtime_window_left = runtime_window_left;
+        // Hook capture (stage 6 increment 4): the body's per-layer hook
+        // invocations run inside the recorded region. `invoke_body` attaches
+        // the observation to a body-local hooks copy exactly as on the eager
+        // path — the observation's HOST pointers are consumed by host code
+        // at capture time only; its DEVICE pointers (the persistent-input
+        // KV CSRs) are replay-stable per key by the same argument the plain
+        // captured body makes for every other `pi.*` buffer.
+        fwd_in.stage_hooks = stage_hooks;
         engine.forward_fn.invoke_body(
             engine.ws, engine.kv_cache, engine.attn_ws, engine.cublas,
             fwd_in);
@@ -545,6 +555,61 @@ ForwardInputViews make_forward_input_views(
     };
 }
 
+namespace {
+
+bool hook_graph_trace_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_HOOK_GRAPH_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+bool hook_graphs_disabled() {
+    static const bool disabled = [] {
+        const char* v = std::getenv("PIE_DISABLE_HOOK_GRAPHS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return disabled;
+}
+
+// PIE_HOOK_GRAPH_TRACE=1 evidence counters ([hook-graph] log lines).
+struct HookGraphCounters {
+    std::uint64_t captures = 0;
+    std::uint64_t replays = 0;
+    std::uint64_t prepare_vetoes = 0;
+    std::uint64_t recaptures = 0;
+    std::uint64_t bans = 0;
+};
+HookGraphCounters g_hook_graph_counters;
+
+}  // namespace
+
+bool hook_fire_blocks_graph(
+    const BatchEngine& engine,
+    bool has_stage_hooks) {
+    if (!has_stage_hooks) return false;
+    if (hook_graphs_disabled()) return true;
+    // Increment-4 scope: hook fires on a capture-safe (llama_like) body may
+    // replay — including page-mask fires (snapkv/h2o decode): the mask
+    // consumer branch in the model body is host-STRUCTURAL (tagged whenever
+    // the program's stage carries the sink — see resolve_lane_page_mask),
+    // the mask carve is arena-stable, and the compaction is device-resolved
+    // against the live CSR. Quest stays on the legacy interleaved body via
+    // the dispatch-side prepare veto on `envelope_dot` (its query envelope
+    // needs the body-time Query cast). TP stays off GRAPH replay: rank 0
+    // replaying a hook graph while followers replay plain ones has no
+    // replay-time branch agreement (`tp.cpp` hardcodes followers hook-free),
+    // and a divergent NCCL op order deadlocks — but rank 0's hook fires
+    // still run PREPARED, eagerly, through the unified seam (host-side
+    // hoisting only; the device stream sees the same launches).
+    if (!engine.forward_fn.supports_hook_graph_capture) return true;
+    if (engine.tp_comm != nullptr && engine.tp_comm->world_size() > 1) {
+        return true;
+    }
+    return false;
+}
+
 bool forward_graph_replay_eligible(
     const BatchEngine& engine,
     bool is_pure_decode,
@@ -592,6 +657,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     auto& pi = engine.inputs;
     auto& forward_fn = engine.forward_fn;
 
+    const bool has_hooks = in.stage_hooks != nullptr;
+    const bool hook_blocks = hook_fire_blocks_graph(engine, has_hooks);
     const bool graph_eligible = forward_graph_replay_eligible(
         engine,
         in.is_pure_decode,
@@ -605,8 +672,28 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.forward_R,
         in.num_images,
         in.num_clips,
-        in.stage_hooks != nullptr,
+        hook_blocks,
         in.lora != nullptr);
+    bool run_graph = graph_eligible;
+    std::uint64_t hook_fingerprint = 0;
+    // Eager-path unification (the increment-4 "future point"): the
+    // fire-level `prepare_replay` pass runs for EVERY pure-decode hook fire
+    // — eager and graph alike — so both modes drive the attention phases
+    // through the same prepare-then-launch seam and the in-body
+    // `execute_attention_phase` is a cursor-checked launch replay either
+    // way; graph mode merely adds capture on top. Restricted to pure decode
+    // because that is the fire class the prepare pass's sideband planners
+    // model (`prepare_decode_score_capture` is decode-shaped; a prefill
+    // fire's body publishes the PREFILL score capture, which carves a
+    // different arena block than the plan expects) — exactly the class
+    // graph mode has always prepared. A 0 return (veto: Query readers,
+    // lora/envelope_dot, scalable nucleus, off-boundary lanes, …) has no
+    // side effects and the fire runs the legacy interleaved eager body,
+    // which reproduces any refusal loudly.
+    bool hook_prepared = false;
+    HookGraphKeyState* hook_state = nullptr;
+    HookGraphKeyState::Entry* hook_entry = nullptr;
+    ForwardGraphKey key{};
     if (graph_eligible) {
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
@@ -615,20 +702,106 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 /*small_spec=*/false,
                 /*rs_verify=*/false,
                 in.have_custom_mask,
-                graph_layout);
-        const ForwardGraphKey key{
+                graph_layout,
+                /*has_hooks=*/has_hooks);
+        key = ForwardGraphKey{
             in.forward_R,
             in.forward_N,
             graph_variant,
         };
-        cudaGraphExec_t exec = engine.graph_cache->get(key);
-        if (exec == nullptr) {
+    }
+    if (has_hooks) {
+        if (in.stage_hooks->prepare_replay != nullptr && in.is_pure_decode) {
+            hook_fingerprint = in.stage_hooks->prepare_replay(
+                in.stage_hooks->context, cublas.stream());
+            hook_prepared = hook_fingerprint != 0;
+            if (!hook_prepared) {
+                ++g_hook_graph_counters.prepare_vetoes;
+                if (hook_graph_trace_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[hook-graph] prepare veto R=%d N=%d "
+                        "-> legacy eager (vetoes=%llu)\n",
+                        in.forward_R, in.forward_N,
+                        static_cast<unsigned long long>(
+                            g_hook_graph_counters.prepare_vetoes));
+                }
+            }
+        }
+        if (!hook_prepared) {
+            run_graph = false;
+        } else if (run_graph) {
+            hook_state = &engine.hook_graph_states[key];
+            // Exec storage is partitioned by the fire's program-set hash:
+            // snapkv and h2o at one (R, N, variant) prepare different
+            // baked state, and a single slot would ping-pong recaptures.
+            hook_entry = hook_state->find(in.hook_program_set_hash);
+            if (hook_state->banned ||
+                (hook_entry != nullptr && hook_entry->banned)) {
+                // A ban is a capture-cost economy, not a correctness veto:
+                // the fire still runs PREPARED, just eagerly — same
+                // launches, no capture churn.
+                run_graph = false;
+            }
+        }
+    }
+    if (has_hooks && !run_graph && hook_graph_trace_enabled()) {
+        static std::atomic<std::uint64_t> eager_logs{0};
+        if (eager_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+            std::fprintf(
+                stderr,
+                "[hook-graph] eager hook fire: prepared=%d blocks=%d "
+                "eligible=%d pure_decode=%d custom_mask=%d write_desc=%d "
+                "window=%d slots=%d R=%d N=%d wants_mask=%d cap=%d lora=%d\n",
+                hook_prepared ? 1 : 0,
+                hook_blocks ? 1 : 0, graph_eligible ? 1 : 0,
+                in.is_pure_decode ? 1 : 0, in.have_custom_mask ? 1 : 0,
+                in.has_write_desc ? 1 : 0, in.structured_window_left,
+                in.use_slots ? 1 : 0, in.forward_R, in.forward_N,
+                in.stage_hooks->wants_page_mask ? 1 : 0,
+                engine.forward_fn.supports_hook_graph_capture ? 1 : 0,
+                in.lora != nullptr ? 1 : 0);
+        }
+    }
+    if (run_graph) {
+        // Hook execs live in the per-program-set entries of
+        // `hook_graph_states`, NOT in the shared shape-keyed cache — two hook
+        // programs at one (R, N, variant) capture different graphs.
+        cudaGraphExec_t exec = has_hooks
+            ? (hook_entry != nullptr ? hook_entry->exec : nullptr)
+            : engine.graph_cache->get(key);
+        const bool stale =
+            has_hooks && exec != nullptr &&
+            hook_entry->fingerprint != hook_fingerprint;
+        if (exec == nullptr || stale) {
             if (step_profile_enabled()) {
                 std::fprintf(stderr,
                              "[step-profile] graph capture R=%d N=%d variant=%u"
                              " (cache size %zu)\n",
                              key.num_requests, key.num_tokens, key.variant,
                              engine.graph_cache->size());
+            }
+            if (stale) {
+                ++g_hook_graph_counters.recaptures;
+                ++hook_entry->mismatches;
+                if (hook_entry->mismatches >
+                    HookGraphKeyState::kMaxMismatches) {
+                    // This fire still captures+launches correctly; future
+                    // fires of this program set stop paying ~10 ms per
+                    // capture. Other program sets on the key keep replaying.
+                    hook_entry->banned = true;
+                    ++g_hook_graph_counters.bans;
+                    if (hook_graph_trace_enabled()) {
+                        std::fprintf(
+                            stderr,
+                            "[hook-graph] BAN R=%d N=%d variant=%u "
+                            "ps=%016llx after %u fingerprint churns\n",
+                            key.num_requests, key.num_tokens, key.variant,
+                            static_cast<unsigned long long>(
+                                in.hook_program_set_hash),
+                            hook_entry->mismatches);
+                    }
+                }
             }
             exec = capture_forward_graph_exec(
                 engine,
@@ -651,8 +824,77 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 pi.w_page.data(),
                 pi.w_off.data(),
                 in.has_write_desc,
-                in.structured_window_left);
-            engine.graph_cache->put(key, exec);
+                in.structured_window_left,
+                has_hooks ? in.stage_hooks : nullptr);
+            if (has_hooks) {
+                // The capture is the one moment the model's per-layer hook
+                // coverage is observable; a body that skipped hooks would
+                // otherwise replay an incomplete graph forever.
+                if (in.stage_hooks->verify_replay_capture != nullptr) {
+                    in.stage_hooks->verify_replay_capture(
+                        in.stage_hooks->context);
+                }
+                if (hook_entry == nullptr) {
+                    hook_entry =
+                        hook_state->insert(in.hook_program_set_hash);
+                    if (hook_state->banned) {
+                        // Program-set churn ban (LRU thrash — more live
+                        // program sets than entry slots would recapture per
+                        // fire). This exec still launches below; future
+                        // fires of the key go eager.
+                        ++g_hook_graph_counters.bans;
+                        if (hook_graph_trace_enabled()) {
+                            std::fprintf(
+                                stderr,
+                                "[hook-graph] BAN R=%d N=%d variant=%u "
+                                "after %u program-set evictions\n",
+                                key.num_requests, key.num_tokens,
+                                key.variant, hook_state->evictions);
+                        }
+                    }
+                } else if (hook_entry->exec != nullptr) {
+                    // Stale recapture: replace this program set's exec.
+                    cudaGraphExecDestroy(hook_entry->exec);
+                }
+                hook_entry->exec = exec;
+                hook_entry->fingerprint = hook_fingerprint;
+                ++g_hook_graph_counters.captures;
+                if (hook_graph_trace_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[hook-graph] capture R=%d N=%d variant=%u "
+                        "ps=%016llx fp=%016llx%s (captures=%llu)\n",
+                        key.num_requests, key.num_tokens, key.variant,
+                        static_cast<unsigned long long>(
+                            in.hook_program_set_hash),
+                        static_cast<unsigned long long>(hook_fingerprint),
+                        stale ? " (fingerprint recapture)" : "",
+                        static_cast<unsigned long long>(
+                            g_hook_graph_counters.captures));
+                }
+            } else {
+                engine.graph_cache->put(key, exec);
+            }
+        } else if (has_hooks) {
+            // A clean replay proves the entry's baked state is stable again,
+            // so the churn ban only counts CONSECUTIVE stale fires. Without
+            // the reset, the legitimate one-recapture-per-new-instance
+            // cadence (instance churn re-bakes sideband addresses) would
+            // accumulate to a ban after ~kMaxMismatches requests, forcing
+            // eager forever on a healthy key.
+            hook_entry->mismatches = 0;
+            ++g_hook_graph_counters.replays;
+            if (hook_graph_trace_enabled()) {
+                std::fprintf(
+                    stderr,
+                    "[hook-graph] replay R=%d N=%d variant=%u ps=%016llx "
+                    "(replays=%llu)\n",
+                    key.num_requests, key.num_tokens, key.variant,
+                    static_cast<unsigned long long>(
+                        in.hook_program_set_hash),
+                    static_cast<unsigned long long>(
+                        g_hook_graph_counters.replays));
+            }
         }
         CUDA_CHECK(cudaGraphLaunch(exec, cublas.stream()));
         return;
@@ -715,6 +957,15 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.stage_hooks                  = in.stage_hooks;
     fwd_in.lora                         = in.lora;
     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
+    if (hook_prepared && in.stage_hooks->verify_replay_capture != nullptr) {
+        // Prepared-EAGER hook fire (the unified seam, no capture): the same
+        // coverage proof as capture time. The prepare pass pre-credited the
+        // per-layer invocation counters, so a body that stopped invoking its
+        // hooks would otherwise go unnoticed — `finish`'s partial-consumption
+        // check reads 0 consumed as "graph replay" and cannot distinguish a
+        // body that skipped every hook.
+        in.stage_hooks->verify_replay_capture(in.stage_hooks->context);
+    }
 }
 
 }  // namespace pie_cuda_driver

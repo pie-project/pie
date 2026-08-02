@@ -907,13 +907,21 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 let bound = &p.instance.program.bound;
                 let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
                 let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-                let attn_mask =
-                    match geometry::evaluate_attn_mask(bound, &mut known, &geometry.qo_indptr) {
-                        Ok(mask) => mask,
-                        Err(error) => {
-                            return Ok(Err(format!("pipeline: fire attention mask: {error}")));
-                        }
-                    };
+                // Device-geometry lowering: a statically structured mask
+                // classifies `Device { structured: true }` regardless of
+                // host derivability (item A — the driver re-derives it per
+                // lane from the trace, and wire BRLE rows would force the
+                // fire solo).
+                let attn_mask = match geometry::evaluate_attn_mask_device_geometry(
+                    bound,
+                    &mut known,
+                    &geometry.qo_indptr,
+                ) {
+                    Ok(mask) => mask,
+                    Err(error) => {
+                        return Ok(Err(format!("pipeline: fire attention mask: {error}")));
+                    }
+                };
                 (geometry, attn_mask)
             } else {
                 let bound = &p.instance.program.bound;
@@ -1270,6 +1278,62 @@ pub async fn submit_frame<C: FireContext>(
     if k == 1 {
         let (_, rep) = fired[0];
         return submit_pass_stamped(ctx, this, Resource::new_borrow(rep), None).await;
+    }
+    // Same-frame producer hazard (Stage 2 verdict, liveness seam 1): a
+    // DeviceGeometry-class pass resolves its descriptor ports from channel
+    // cells ON THE HOST at the driver's FramePrepare, and FramePrepare for
+    // EVERY step of a v14 frame runs before ANY step reaches the stream
+    // (driver context.cpp `launch`: an admitted frame is atomic, so all
+    // prepares precede all enqueues). A device-geometry fire behind another
+    // fire of the same frame therefore host-reads cells whose producing
+    // fire — in a run-ahead decode loop, its own previous fire, one slot
+    // earlier — is not even enqueued yet: the read fails
+    // (`descriptor_resolve.hpp` "not ready") and the whole frame poisons.
+    // The class is decided at bind (`inferlet::host::forward`, e.g. every
+    // dense-device-mask decode loop routes to pool-owned device geometry),
+    // so the hazard is structural per frame composition. Submit each fire
+    // as its own single-slot frame instead: one frame per lane seals per
+    // boundary, so the producer's frame is enqueued on-stream before the
+    // consumer's FramePrepare descriptor readback (which syncs that
+    // stream) — exactly the `PIE_FRAME_SIZE=1` shape that runs these
+    // passes correctly today, paid only by this lane.
+    let mut device_geometry_tail = false;
+    for &(_, rep) in fired.iter().skip(1) {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        if ctx.resources().get(&fwd)?.devgeo.is_some() {
+            device_geometry_tail = true;
+            break;
+        }
+    }
+    if device_geometry_tail {
+        for &(slot, rep) in &fired {
+            let (lane, seq) = {
+                let pipeline = ctx.resources().get(&this)?;
+                if pipeline.scope.is_closed() {
+                    return Ok(Err("pipeline: pipeline is closed".to_string()));
+                }
+                (pipeline.scope.scheduler_id(), pipeline.next_frame_seq())
+            };
+            let stamp = crate::scheduler::FrameStamp {
+                lane,
+                seq,
+                slot: 0,
+                fires: 1,
+            };
+            let pipeline: Resource<Pipeline> = Resource::new_borrow(this.rep());
+            let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+            match submit_pass_stamped(ctx, pipeline, fwd, Some(stamp)).await {
+                // A single-slot frame is arrival-complete on its own, so a
+                // mid-sequence failure strands nothing: the frames already
+                // submitted seal and drain without truncation bookkeeping.
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Ok(Err(format!("pipeline: frame slot {slot}: {error}")));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(Ok(()));
     }
     if let Err(error) = validate_frame(ctx, k, &fired)? {
         return Ok(Err(error));
@@ -2280,7 +2344,11 @@ async fn fire_device_geometry<C: FireContext>(
         let bound = &p.instance.program.bound;
         let (shadow, shadow_cells) = (&p.host_shadow, &p.cells);
         let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
-        geometry::evaluate_attn_mask(bound, &mut known, &mask_qo_indptr)
+        // Recognition precedes evaluation on this device-geometry path
+        // (item A): a structured mask classifies `Device { structured:
+        // true }` and co-batches; host-derivable unrecognized masks keep
+        // wire BRLE + the solo clauses below.
+        geometry::evaluate_attn_mask_device_geometry(bound, &mut known, &mask_qo_indptr)
     };
     let attn_mask = match attn_mask {
         Ok(mask) => mask,
@@ -2296,6 +2364,16 @@ async fn fire_device_geometry<C: FireContext>(
     req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
+    // This pass's geometry resolves ON DEVICE (the driver reads its port
+    // channels at frame prepare); stamp the plan so the scheduler's
+    // `LaunchGrouping` classifies it as device-resolved. Leaving the flag
+    // unset made a pooled masked decode fire look like an ordinary
+    // wire-masked fire — "custom wire masks co-batch freely" — and the
+    // scheduler co-batched it with wire fires into a multi-program batch
+    // the driver's v1 mask scope must refuse (frame.cpp "dense device mask
+    // in a multi-program batch requires solo retry"): the wave poisoned and
+    // the dead lanes leaked pages (Stage 2 verdict, liveness seam 2).
+    req.device_resolved_geometry = true;
     rs_prepared.apply_to(&mut req);
     attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);

@@ -214,6 +214,17 @@ void gemm_batched_act_x_w(
 // Grouped variant for sparse-MoE expert buckets. Each group has one GEMM
 // with a shared output width `N` and reduction dim `K`, but its own row count
 // `M_array[group]`.
+//
+// POINTER-ARRAY RESIDENCY (measured hazard): cublasGemmGroupedBatchedEx
+// does not consume the act/W/y pointer arrays synchronously at call time.
+// Transient host arrays handed to back-to-back grouped calls produced
+// illegal-address / misaligned-address faults (repro: lora grouped lanes;
+// a stream sync between calls or device-resident arrays both cure it).
+// Callers must pass DEVICE-RESIDENT pointer arrays whose slots are not
+// rewritten while a call may still read them — the nemotron_h MoE and the
+// llama_like lora grouping both stage through per-use device slots.
+// `M_array` and the internal int/scalar arrays are consumed at call time
+// and may be transient host memory.
 void gemm_grouped_act_x_wt_bf16(
     cublasHandle_t handle,
     const void* const* act_ptrs_host,

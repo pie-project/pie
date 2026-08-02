@@ -30,4 +30,26 @@ struct ScratchPlan {
 
 ScratchPlan build_gemma4_scratch(const std::vector<Dispatch>& dag, const Gemma4Geometry& g);
 
+/// `run_ends[i]`: the last ordinal of the concurrency run containing `i`. What
+/// the colourer needs to know about which barriers the encoder will drop; the
+/// encoder (`encode_gemma4_step`) reads the SAME derivation so the two cannot
+/// disagree.
+std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag);
+
+struct ScratchBind {
+    std::uint8_t bind_index = 0;
+    int color = -1;
+};
+
+struct ScratchColoring {
+    std::vector<std::vector<ScratchBind>> per_dispatch;
+    int colors_used = 0;
+    bool hazard_free = false;
+};
+
+/// Colour the dataflow's live ranges onto pool buffers, honouring the barriers
+/// the encoder will drop.
+ScratchColoring color_gemma4_scratch(const std::vector<Dispatch>& dag, const ScratchPlan& plan,
+                                     bool no_recycle = false);
+
 }  // namespace pie::metal::gemma4

@@ -18,61 +18,13 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "decode_consts.hpp"
+#include "scratch.hpp"
 
 namespace pie::metal::gemma4 {
 
-namespace {
-
-/// Dispatches that may run together: same layer, mutually independent, all
-/// reading something produced before the group starts and writing distinct
-/// values. This is an explicit list rather than something derived, for the same
-/// reason qwen3.5's is — the scratch dataflow does not model the KV pages, so
-/// "independent" cannot be read off it.
-int concurrency_group(Kind k) {
-    switch (k) {
-        case Kind::QmvQ:
-        case Kind::QmvK:
-        case Kind::QmvV:
-            return 1;  // all three read the attention norm's output
-        case Kind::QNorm:
-        case Kind::KNorm:
-        case Kind::VNorm:
-            return 2;  // each rewrites its own tensor in place
-        case Kind::RopeQ:
-        case Kind::RopeK:
-            return 3;  // q and k, disjoint
-        case Kind::QmvGate:
-        case Kind::QmvUp:
-            return 4;  // both read the FFN norm's output
-        default:
-            return 0;  // runs alone
-    }
-}
-
-std::vector<int> concurrent_run_ends(const std::vector<Dispatch>& dag) {
-    std::vector<int> ends(dag.size());
-    for (std::size_t i = 0; i < dag.size(); ++i) ends[i] = static_cast<int>(i);
-    std::size_t i = 0;
-    while (i < dag.size()) {
-        const int group = concurrency_group(dag[i].kind);
-        std::size_t j = i;
-        if (group != 0) {
-            while (j + 1 < dag.size() && dag[j + 1].layer == dag[i].layer &&
-                   concurrency_group(dag[j + 1].kind) == group) {
-                ++j;
-            }
-        }
-        for (std::size_t k = i; k <= j; ++k) ends[k] = static_cast<int>(j);
-        i = j + 1;
-    }
-    return ends;
-}
-
-}  // namespace
-
-std::vector<int> gemma4_run_ends(const std::vector<Dispatch>& dag) {
-    return concurrent_run_ends(dag);
-}
+// The concurrency-run derivation (concurrency_group / gemma4_run_ends) lives
+// in scratch.cpp now: it is pure, and the colourer and this encoder must read
+// the SAME derivation so they cannot disagree about which barriers drop.
 
 /// The shared `Kernel` a gemma4 kind borrows its pipeline from.
 ///
@@ -251,7 +203,7 @@ void launch_shape(const Dispatch& d, const Gemma4Geometry& g, Grid& grid, Thread
 void encode_gemma4_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                         const Gemma4Geometry& g, const DecodeStepPsos& base,
                         const Gemma4Psos& g4, int ordinal_base) {
-    const std::vector<int> run_ends = concurrent_run_ends(dag);
+    const std::vector<int> run_ends = gemma4_run_ends(dag);
     for (std::size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
         Grid grid;

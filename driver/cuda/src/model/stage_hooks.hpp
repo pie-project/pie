@@ -9,6 +9,7 @@ namespace pie_cuda_driver::model {
 struct AttentionObservation;
 struct AttentionScores;
 struct AttentionMaskSink;
+class HookSidebandArena;
 
 enum class StageHookPoint : std::uint8_t {
     OnAttnProj = 1,
@@ -83,6 +84,15 @@ struct StageHooks {
     // `Dispatch::launch_hook_free_prefix_rows`.
     std::uint32_t hook_free_prefix_rows = 0;
 
+    // The grow-only device arena the fire's sideband captures draw their
+    // buffers from (`hook_sideband_arena.hpp`). Engine-lifetime, owned beside
+    // `model::Workspace` in context.cpp and carried on the hooks because the
+    // sidebands only exist when hooks fire — the constructors that used to
+    // cudaMallocAsync per layer (`ScoreBuffers`, `FirePageMask`) acquire from
+    // it instead. Null means the launch path forgot to wire it; the captures
+    // then refuse loudly rather than silently reintroducing the churn.
+    HookSidebandArena* sideband_arena = nullptr;
+
     // The fire's KV geometry. Set by `ForwardFn::invoke_body` -- the single
     // choke point every family passes through -- on its own copy of the
     // frame's hooks, so it is valid exactly while the body runs and no model
@@ -99,6 +109,31 @@ struct StageHooks {
         cudaStream_t stream,
         bool query_is_f32,
         const StageHookSideband& sideband) = nullptr;
+
+    // Stage 6 increment 4 + eager unification — the fire-level prepare
+    // pass. The batch engine calls this for EVERY pure-decode hook fire,
+    // eager and graph alike, BEFORE the body runs (and before capture, on a
+    // capturing fire): the dispatch hoists every attention-phase PREPARE —
+    // host metadata build, channel-cursor reads, stable-buffer uploads,
+    // score-sideband sizing — to fire level, leaving the in-body `execute`
+    // calls a pure launch replay against prepared state; graph mode merely
+    // captures what the eager body would have launched anyway. Returns a
+    // nonzero fingerprint of every address and grid a captured body would
+    // bake (the batch engine recaptures on change), or 0 when this fire
+    // cannot run prepared and must take the legacy interleaved eager body.
+    // A 0 return has NO side effects on the launch.
+    // Null when the frame did not wire the seam (non-staged paths).
+    std::uint64_t (*prepare_replay)(
+        void* context,
+        cudaStream_t stream) = nullptr;
+
+    // Companion to `prepare_replay`: called by the batch engine right after
+    // CAPTURING a hook fire's body and right after every prepared-EAGER
+    // body, to assert the body consumed every prepared attention invocation
+    // (i.e. the model really invoked its hooks at every layer — the prepare
+    // pass pre-credits the coverage counter, so this is the only place the
+    // omission is visible). Throws on violation.
+    void (*verify_replay_capture)(void* context) = nullptr;
 };
 
 // `hooks` is the fire's hook set, threaded down from

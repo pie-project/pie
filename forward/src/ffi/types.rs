@@ -15,21 +15,27 @@
 //!
 //! Where the loader's plan needed a tagged union (`PieLoaderStorageOp`
 //! carries per-operation operand structs), the traced form does not: every
-//! op fits `kind + layer + weight name + two u32 params + operand ranges`,
-//! so [`PieForwardOp`] stays a plain struct and the per-kind meaning of the
-//! params is documented on it.
+//! op fits `kind + layer + weight name + two u32 params + selector +
+//! operand ranges`, so [`PieForwardOp`] stays a plain struct and the
+//! per-kind meaning of the params is documented on it.
 
+use crate::facts::{NormPlacement, QkNorm};
 use crate::trace::{DType, Dim, NormVariant, RopeKind};
 
 /// `PieForwardOp::weight_name` when the op references no weight.
 pub const PIE_FORWARD_NO_NAME: u32 = u32::MAX;
 
+/// `PieForwardOp::selector` when the op selects no per-token weights —
+/// every op except the expert-indexed `Matmul`s of an MoE trace.
+pub const PIE_FORWARD_NO_VALUE: u32 = u32::MAX;
+
 /// `PieForwardOp::layer` for prologue/epilogue ops (embed, final norm,
 /// lm_head). Signed so the resting value cannot collide with a real layer.
 pub const PIE_FORWARD_NO_LAYER: i32 = -1;
 
-/// Inline dim capacity of [`PieForwardValue`]. Every shape the tracer emits
-/// today is rank 2; 4 leaves headroom without an arena run per value.
+/// Inline dim capacity of [`PieForwardValue`]. The tracer emits rank-2
+/// shapes plus the MoE trace's rank-3 route-expanded `[Tokens, k, d]`
+/// values; 4 leaves headroom without an arena run per value.
 pub const PIE_FORWARD_MAX_DIMS: usize = 4;
 
 /// The op vocabulary, as stable wire values.
@@ -50,6 +56,80 @@ pub enum PieForwardOpKind {
     Attention = 7,
     Swiglu = 8,
     LmHead = 9,
+    /// `residual += x` (post-norm placement's separate landing). Appended
+    /// per the discipline above — the nine kinds before it keep their
+    /// wire values.
+    ResidualAdd = 10,
+    /// Router top-k + softmax + renormalize (one launch in the hand-written
+    /// MoE pass). First of the `dyn` kinds — the declared executors do NOT
+    /// consume these; their op-kind switches throw on them via the loud
+    /// default arm, which is the intended v0 behaviour (the grouped-GEMM
+    /// emission is a later, much larger lift).
+    TopK = 11,
+    /// Per-token combine of the k routed expert outputs.
+    WeightedSum = 12,
+    /// `out = base + sigmoid(gate) * x` (shared-expert landing).
+    SigmoidGateAdd = 13,
+    /// Two-way GDN split (`[rows, w0 + w1]` → two results). First of the
+    /// GDN kinds (the `pie_forward_trace_qwen3_5_gdn` fragment) — like the
+    /// dyn kinds above, the declared executors do NOT consume these; their
+    /// op-kind switches throw on them via the loud default arm.
+    SplitGdn = 14,
+    /// Depthwise causal conv1d + fused SiLU against the layer's implicit
+    /// PER-REQUEST conv state.
+    CausalConv1d = 15,
+    /// Post-conv GDN prep: q/k/v/g/beta from the packed conv output and
+    /// the a/b projections plus the a_log/dt_bias parameters (five
+    /// results; the one kind that names TWO weights — see the op table).
+    GdnPrep = 16,
+    /// The gated-delta recurrence against the layer's implicit PER-REQUEST
+    /// recurrent state. Opaque like `Attention`.
+    GatedDelta = 17,
+    /// Per-head gated RMSNorm: `w * rmsnorm(x) * silu(gate)`, plain fold.
+    RmsnormGated = 18,
+    /// Interleaved per-head `[query | gate]` split of the 2×-wide gated q
+    /// projection (qwen3.5 full attention; NOT a row split — the halves
+    /// interleave at head granularity). First of the full-attention kinds
+    /// (the `pie_forward_trace_qwen3_5_full_attn` fragment / the
+    /// `pie_forward_trace_qwen3_5_hybrid` model) — like the dyn and GDN
+    /// kinds above, the declared executors do NOT consume these; their
+    /// op-kind switches throw on them via the loud default arm.
+    SplitQGate = 19,
+    /// `out = x * sigmoid(gate)`, elementwise — the full-attention output
+    /// gate. A multiply with NO residual: distinct from `SigmoidGateAdd`.
+    SigmoidGateMul = 20,
+    /// RETIRED (rung 1's per-kernel kind, absorbed into [`Self::Launch`]
+    /// within the same unreleased arc). Never emitted; the discriminant
+    /// stays reserved per the appended-only rule.
+    QkvDecodeFusedPost = 21,
+    /// RETIRED — see [`Self::QkvDecodeFusedPost`].
+    RopeTableBuild = 22,
+    /// A STATED kernel launch — the ONE kind every lowered trace uses for
+    /// every kernel its class arms call (north-star-dsl.md; raw kernel
+    /// signatures, `dsl::cuda`). The kernel's launcher symbol rides the
+    /// weight slot as a name index; the weight names it consumes ride
+    /// `aux_names` (name indices, signature order); param0 is the
+    /// implicit-state store it addresses (0 none, 1 kv-cache,
+    /// 2 recurrent) and param1 that state's layer. A dumb consumer
+    /// resolves the symbol in its name→launcher registry and launches —
+    /// adding a kernel never grows this enum again.
+    Launch = 23,
+    /// The lowered branch over a per-fire RUNTIME input (`GuardPred` in
+    /// param0 as a wire value; then-region op count in param1; else-region
+    /// op count as a one-entry `aux_names` run). The `then_ops` ops after
+    /// this one run when the predicate holds, the `else_ops` after those
+    /// when it does not; regions are flat (no nesting) and produce no
+    /// values consumed outside. The ONLY branch a class trace carries.
+    Guard = 24,
+}
+
+/// Mirrors [`crate::trace::GuardPred`] — the values `Guard.param0`
+/// carries; same appended-only discriminant rule as [`PieForwardOpKind`].
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieForwardGuardPred {
+    /// The fire carries explicit KV-write descriptors (`has_write_desc`).
+    HasWriteDesc = 0,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as
@@ -113,6 +193,70 @@ impl TryFrom<u32> for NormVariant {
         Ok(match value {
             0 => Self::Plain,
             1 => Self::Gemma,
+            other => return Err(other),
+        })
+    }
+}
+
+/// Mirrors [`crate::facts::NormPlacement`].
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieForwardNormPlacement {
+    Pre = 0,
+    /// OLMo-2/3: norm the sub-layer OUTPUT, then a separate residual add.
+    Post = 1,
+}
+
+impl From<NormPlacement> for PieForwardNormPlacement {
+    fn from(value: NormPlacement) -> Self {
+        match value {
+            NormPlacement::Pre => Self::Pre,
+            NormPlacement::Post => Self::Post,
+        }
+    }
+}
+
+impl TryFrom<u32> for NormPlacement {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::Pre,
+            1 => Self::Post,
+            other => return Err(other),
+        })
+    }
+}
+
+/// Mirrors [`crate::facts::QkNorm`]. `Off`/`PerHead` keep the wire values
+/// the field had as a bool (0/1), so a caller that treated it as "non-zero
+/// is per-head qk-norm" still states the same facts.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieForwardQkNorm {
+    Off = 0,
+    PerHead = 1,
+    /// One RMSNorm over the flattened `[heads * head_dim]` q/k projection
+    /// (OLMo-2) — different arithmetic from per-head.
+    Global = 2,
+}
+
+impl From<QkNorm> for PieForwardQkNorm {
+    fn from(value: QkNorm) -> Self {
+        match value {
+            QkNorm::Off => Self::Off,
+            QkNorm::PerHead => Self::PerHead,
+            QkNorm::Global => Self::Global,
+        }
+    }
+}
+
+impl TryFrom<u32> for QkNorm {
+    type Error = u32;
+    fn try_from(value: u32) -> Result<Self, u32> {
+        Ok(match value {
+            0 => Self::Off,
+            1 => Self::PerHead,
+            2 => Self::Global,
             other => return Err(other),
         })
     }
@@ -272,17 +416,45 @@ pub struct PieForwardIdRange {
 /// | `Embed`          | embedding table      | —                            | —          |
 /// | `Matmul`         | weight               | `beta_one` (0/1)             | —          |
 /// | `Rmsnorm`        | weight               | [`PieForwardNormVariant`]    | —          |
-/// | `RmsnormPerHead` | weight               | `head_dim`                   | —          |
+/// | `RmsnormPerHead` | weight               | `head_dim`                   | [`PieForwardNormVariant`] |
 /// | `SplitQkv`       | none                 | `q_width`                    | `kv_width` |
-/// | `Rope`           | none                 | [`PieForwardRopeKind`]       | —          |
+/// | `Rope`           | none                 | [`PieForwardRopeKind`]       | partial rotary width (0 = full) |
 /// | `KvAppend`       | none                 | cache layer                  | —          |
 /// | `Attention`      | none                 | cache layer                  | —          |
 /// | `Swiglu`         | none                 | `inter`                      | —          |
 /// | `LmHead`         | weight               | —                            | —          |
+/// | `ResidualAdd`    | none                 | —                            | —          |
+/// | `TopK`           | none                 | `k`                          | —          |
+/// | `WeightedSum`    | none                 | `k`                          | —          |
+/// | `SigmoidGateAdd` | none                 | —                            | —          |
+/// | `SplitGdn`       | none                 | `width0`                     | `width1`   |
+/// | `CausalConv1d`   | conv (weight + bias) | state layer                  | `kernel`   |
+/// | `GdnPrep`        | a_log                | dt_bias NAME index           | —          |
+/// | `GatedDelta`     | none                 | state layer                  | —          |
+/// | `RmsnormGated`   | weight               | —                            | —          |
+/// | `SplitQGate`     | none                 | `heads`                      | `head_dim` |
+/// | `SigmoidGateMul` | none                 | —                            | —          |
+/// | `Launch`         | KERNEL symbol        | state store (0/1/2)          | state layer |
+///
+/// `Launch` additionally carries its consumed weight names in
+/// `aux_names` — see the field.
+///
+/// `RmsnormPerHead`'s param1 and `Rope`'s param1 are serde-additive on the
+/// Rust side (default `Plain` / absent) and appended-param-additive here:
+/// both rest at 0 on every trace that predates them, so a pre-qwen3.5
+/// consumer reading only param0 still reads what it always did. A partial
+/// `Rope` (param1 != 0) rotates only the first param1 channels of each
+/// head (`launch_rope_partial_bf16`'s `rotary_dim`).
 ///
 /// `KvAppend`/`Attention` restate the layer their kind addresses even though
 /// `layer` carries the bracketing layer, because the trace states both
-/// separately and the flattening does not get to decide they coincide.
+/// separately and the flattening does not get to decide they coincide; the
+/// GDN state ops (`CausalConv1d`, `GatedDelta`) restate theirs for the same
+/// reason — param0 is the layer of the implicit PER-REQUEST conv/recurrent
+/// slab the op reads and advances (the trace crate's `OpKind::state_ref`
+/// marking, pie-application-plan.md §5.4). `GdnPrep` is the one kind whose
+/// launch reads two parameter tensors, so its param0 is a SECOND
+/// [`PieForwardPlan::names`] index (the dt_bias name), not a width.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieForwardOp {
@@ -295,6 +467,20 @@ pub struct PieForwardOp {
     pub weight_name: u32,
     pub param0: u32,
     pub param1: u32,
+    /// The per-token selector: for an expert-indexed `Matmul` (whose
+    /// `weight_name` is then a template, `layer.0.expert.{e}.gate_up`) the
+    /// value id of the `TopK` index output that resolves `{e}` per token;
+    /// [`PIE_FORWARD_NO_VALUE`] for every other op. The selector is also
+    /// the op's last input, so a dataflow walk needs no special case; this
+    /// field states which input selects rather than flows. The dyn marker
+    /// crosses the ABI only here and as the producing `TopK` op — a
+    /// per-value flag would duplicate what these two already state.
+    pub selector: u32,
+    /// `Launch` only: the weight names the stated kernel consumes, as a
+    /// range of NAME indices in the flat id array (the same array the
+    /// operand ranges index — ids are just u32s; what a range means is
+    /// the field's contract). Empty for every other kind.
+    pub aux_names: PieForwardIdRange,
     /// Values consumed, in operand order.
     pub inputs: PieForwardIdRange,
     /// Values produced (`SplitQkv` produces three, `KvAppend` none).
