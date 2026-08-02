@@ -475,6 +475,7 @@ class Context::Impl {
         caps->json_len = device_facts_json_.size();
     }
     int load_model(const PieModelLoadDesc& load, PieDriverCaps* caps);
+    void report_load_failure(const std::string& what);
 
     int register_program(const PieProgramDesc& program, std::uint64_t* program_id);
     int register_channel(const PieChannelDesc& channel,
@@ -748,6 +749,21 @@ int Context::Impl::initialize(
     return PIE_STATUS_OK;
 }
 
+void Context::Impl::report_load_failure(const std::string& what) {
+    std::cerr << "[pie-driver-cuda] load_model failed on rank " << tp_rank_
+              << ": " << what << "\n";
+    pie_cuda_driver::tp_report_rank_failure(
+        tp_cpu_gate_key_, tp_rank_, "model load failed: " + what);
+    const char* keep = std::getenv("PIE_TP_NO_FAIL_STOP");
+    if (keep != nullptr && keep[0] != '0' && keep[0] != '\0') return;
+    if (tp_size_ <= 1) return;
+    std::cerr << "[pie-driver-cuda] a TP rank failed to load; the driver "
+                 "cannot serve — exiting\n";
+    std::cerr.flush();
+    std::fflush(nullptr);
+    std::_Exit(70);
+}
+
 int Context::Impl::load_model(
     const PieModelLoadDesc& load,
     PieDriverCaps* caps_out) {
@@ -755,6 +771,15 @@ int Context::Impl::load_model(
     ops::ScopedRuntimeQuantContext quant_scope(runtime_quant_context_);
     if (cfg_ == nullptr || load_attempted_) return PIE_STATUS_CLOSED;
     load_attempted_ = true;
+    // Fault injection for the load-failure path, which is otherwise only
+    // reachable by a genuine driver fault on one rank out of many.
+    if (const char* fail_rank = std::getenv("PIE_TP_TEST_FAIL_LOAD_RANK")) {
+        if (fail_rank[0] != '\0' && std::atoi(fail_rank) == tp_rank_) {
+            throw std::runtime_error(
+                "PIE_TP_TEST_FAIL_LOAD_RANK: injected load failure on rank " +
+                std::to_string(tp_rank_));
+        }
+    }
     Config& cfg = *cfg_;
     const bool verbose = cfg.runtime.verbose;
     NcclComm* tp_comm_ptr = tp_comm_;
@@ -2845,7 +2870,20 @@ void Context::fill_device_facts(PieDriverCaps* caps) const {
 
 int Context::load_model(const PieModelLoadDesc& load, PieDriverCaps* caps) {
     PIE_CUDA_BIND_DEVICE();
-    return impl_->load_model(load, caps);
+    try {
+        return impl_->load_model(load, caps);
+    } catch (const std::exception& e) {
+        impl_->report_load_failure(e.what());
+        throw;
+    } catch (...) {
+        // A rank that cannot load is a rank the group will wait for forever:
+        // its peers are parked in the startup barrier or in a collective, and
+        // nothing else will ever tell them. Report it the same way a lost rank
+        // during a frame is reported, which wakes the peers and aborts the
+        // communicators, then let the error carry on to the caller.
+        impl_->report_load_failure("unknown exception");
+        throw;
+    }
 }
 
 int Context::register_program(const PieProgramDesc& program, std::uint64_t* program_id) {
