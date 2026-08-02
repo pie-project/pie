@@ -606,6 +606,24 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Per-component ceiling on the wasmtime resource classes a COMPONENT
+/// multiplies. A component is not one core module: a Rust `wasm32-wasip2`
+/// guest is linked from the guest module plus the preview1 adapter plus a
+/// shim, and instantiating it takes one core-instance slot per module and one
+/// table slot per module that defines a table. Measured over all 34 inferlets
+/// pie ships, every one is exactly 3 core instances / 2 tables / 1 memory /
+/// 1 fiber stack.
+///
+/// Declaring the ceiling matters as much as its value: without it, a guest
+/// built from more modules than expected does not fail at instantiation, it
+/// silently divides the engine's effective inferlet capacity and then fails
+/// under load at a concurrency that depends on the traffic. With it, wasmtime
+/// rejects such a guest deterministically and names the limit.
+///
+/// The headroom over the measured 3/2 is cheap: these pools cost reserved
+/// address space for instance metadata, not committed memory or KV.
+const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
+
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     // wasmtime 46: `async_support` is a deprecated no-op (async is always
@@ -613,17 +631,35 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     // no explicit flags are needed to enable async host calls / fibers.
 
     // Every wasmtime knob comes from the caller — Python is the source
-    // of truth for defaults. The `wasm_max_instances` knob covers four
-    // wasmtime resource classes (pie uses one of each per inferlet).
+    // of truth for defaults. `wasm_max_instances` is a cap on concurrent
+    // INFERLETS, and each pool below is sized so that it can actually seat
+    // that many.
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
-    // Lockstep bump on the five "total_*" caps. wasmtime defaults all of them
-    // to 1000; pie uses exactly one of each per inferlet (one core instance,
-    // one component instance, one memory, one table, one async fiber stack).
-    pooling_config.total_core_instances(runtime.wasm_max_instances);
+    // One per inferlet, exactly: pie runs one component instance in one
+    // store with one linear memory and one async fiber stack. These are also
+    // the expensive pools — a memory slot reserves a whole wasm32 range so
+    // bounds checks can be elided — so they must not be inflated.
     pooling_config.total_component_instances(runtime.wasm_max_instances);
     pooling_config.total_memories(runtime.wasm_max_instances);
-    pooling_config.total_tables(runtime.wasm_max_instances);
     pooling_config.total_stacks(runtime.wasm_max_instances);
+    // Several per inferlet, however many core modules the component was
+    // linked from. Sizing these at `wasm_max_instances` capped pie at
+    // `wasm_max_instances / 3` concurrent inferlets: at 512-wide admission,
+    // where prewarm + bind hold ~1536 live inferlets, a 4096 pool ran out of
+    // core instances (1536 x 3 = 4608) and 55% of requests died with
+    // "maximum concurrent limit of 4096 for core instances reached".
+    pooling_config.max_core_instances_per_component(CORE_RESOURCES_PER_COMPONENT);
+    pooling_config.max_tables_per_component(CORE_RESOURCES_PER_COMPONENT);
+    pooling_config.total_core_instances(
+        runtime
+            .wasm_max_instances
+            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
+    );
+    pooling_config.total_tables(
+        runtime
+            .wasm_max_instances
+            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
+    );
     pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
     pooling_config
         .linear_memory_keep_resident(runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024));

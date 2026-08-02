@@ -365,7 +365,22 @@ def build_config(args: argparse.Namespace):
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
-            wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
+            # A pooling slot costs ~4 GiB of VIRTUAL address space (wasmtime
+            # reserves a full wasm32 range per memory so it can elide bounds
+            # checks), and Linux gives the process 128 TiB total. So this cap
+            # is bounded at ~32k slots no matter how much RAM the box has.
+            # Sizing it off num_requests blew through that: 12288 requests
+            # asked for 49156 slots = 212 TB and the engine panicked inside
+            # mmap before serving anything.
+            #
+            # The live instance count is bounded by ADMISSION, not by the
+            # total request count -- a process releases its slot when it
+            # exits. pie's spawn pipeline can hold prewarm + bind (2x the
+            # execution limit, double-buffered) + executing at once, so 4x
+            # the admission cap is the true ceiling. `None` means the engine
+            # falls back to max_forward_requests (R), which the 4096 floor
+            # already covers for any R <= 1024.
+            wasm_max_instances=max(4096, (max_concurrent_processes or 0) * 4),
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
         model=ModelConfig(
