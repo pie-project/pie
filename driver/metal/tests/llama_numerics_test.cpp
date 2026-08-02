@@ -305,6 +305,17 @@ struct Reference {
     std::vector<RefKv>& kv;
     std::vector<int> last_ids;
     Vec last_w;
+    /// How far the LAST selected expert's logit sat above the first rejected
+    /// one. When this is inside the router matvec's own error the selection is
+    /// genuinely ambiguous: fp32 and bf16 sort the two differently and the row
+    /// runs different experts, which is a property of the weights rather than
+    /// a fault in the driver.
+    float last_margin = 0.0f;
+    /// The SMALLEST margin any layer of the current step decided on. A routing
+    /// tie anywhere in the stack makes every dispatch after it on that row
+    /// incomparable, and it is layer 0's tie that matters most -- its
+    /// consequences reach the whole rest of the step.
+    float step_min_margin = 3.0e38f;
 
     /// Run one token, recording every dispatch's output by DAG position.
     Trace step(const std::vector<Dispatch>& dag, int token, int position) {
@@ -497,6 +508,18 @@ struct Reference {
                     for (int r = 0; r < kk; ++r) {
                         expert_w[std::size_t(r)] = rbf(chosen[std::size_t(r)] / sum);
                     }
+                    // `pool` now holds the rejected logits; the selected ones
+                    // were knocked out as they were taken.
+                    float best_rejected = -3.0e38f;
+                    for (int e = 0; e < g.n_experts; ++e) {
+                        best_rejected = std::max(best_rejected, pool[std::size_t(e)]);
+                    }
+                    float worst_selected = 3.0e38f;
+                    for (int r = 0; r < kk; ++r) {
+                        worst_selected = std::min(worst_selected, logits[std::size_t(expert_ids[std::size_t(r)])]);
+                    }
+                    last_margin = worst_selected - best_rejected;
+                    step_min_margin = std::min(step_min_margin, last_margin);
                     last_ids = expert_ids;
                     last_w = expert_w;
                     break;  // two outputs of different types; checked via the combine
@@ -698,9 +721,14 @@ void build_model(const LlamaGeometry& g, Model& m) {
 /// sees keys 0..r and nothing else. That is the entire claim the M>1 path
 /// makes, and it is checked here per DISPATCH rather than at the logits.
 void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
-              const std::string& kernels_dir, float tol, int rows = 1, bool paged = false) {
+              const std::string& kernels_dir, float tol, int rows = 1, bool paged = false,
+              int steps = 0) {
     std::printf("\n-- %s --\n", who);
     const int R = rows < 1 ? 1 : rows;
+    // `steps` is only meaningful at one row: it makes the sequential path run a
+    // sequence as long as a batched case's, which is what separates "the batch
+    // is wrong" from "a longer sequence simply accumulates more rounding".
+    const int S = steps > 0 ? steps : 0;
     if (paged) {
         g.paged_kv_enabled = true;
         g.kv_page_size = 32;
@@ -833,7 +861,12 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
                   m.wo,     m.wgate,  m.wup,    m.wdown, m.wrouter, m.n_attn,
                   m.n_ffn,  m.n_q,    m.n_k,    m.n_final, ref_kv};
 
-    const std::vector<int> tokens = {7, 130, 42, 901};
+    std::vector<int> tokens = {7, 130, 42, 901};
+    // Enough rows to fill a GEMM tile when the case asks for it. Arbitrary but
+    // fixed, and inside the vocabulary.
+    for (int i = 0; int(tokens.size()) < std::max(R, S); ++i) {
+        tokens.push_back((i * 137 + 11) % g.vocab);
+    }
     int first_bad = -1;
     std::string first_bad_name;
     float worst = 0.0f;
@@ -876,6 +909,7 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     // The row pitch is the M=1 trace's own length, which already carries the
     // expert-slot axis for the routed values -- a routed value is
     // [rows, k, width] and its M=1 trace is [k, width].
+    float worst_pristine = 0.0f;
     auto compare_all = [&](const Trace& want, int row, int label) {
         for (std::size_t i = 0; i < dag.size(); ++i) {
             const auto it = want.find(int(i));
@@ -894,10 +928,26 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
             ++compared;
             const float w1 = rel_l2(got, it->second);
             if (w1 > worst) worst = w1;
+            // Layer 0's Q/K/V read the token embedding, which is exact. They
+            // are therefore the ONLY dispatches whose error is their own rather
+            // than something they inherited, and at sixteen rows they are
+            // `affine_qmm_t`. Everything downstream of them sits behind
+            // attention, which is a softmax: it turns a small difference in the
+            // scores into a visibly different mixture of values, and that
+            // amplification is a property of the arithmetic, not evidence about
+            // the kernel. So the kernel under test gets its own tight bound.
+            if (dag[i].layer == 0 &&
+                (dag[i].kind == Kind::QmvQ || dag[i].kind == Kind::QmvK ||
+                 dag[i].kind == Kind::QmvV)) {
+                if (w1 > worst_pristine) worst_pristine = w1;
+            }
             if (w1 <= tol) continue;
             if (std::getenv("PIE_NUM_DEBUG") != nullptr) {
-                std::printf("    [dbg] row %d disp %zu kind %d layer %d rel_l2 %.4f got/want:",
-                            label, i, int(dag[i].kind), dag[i].layer, double(w1));
+                double ng = 0, nw = 0;
+                for (std::size_t e = 0; e < w; ++e) { ng += double(got[e]) * got[e]; nw += double(it->second[e]) * it->second[e]; }
+                std::printf("    [dbg] row %d disp %zu kind %d layer %d rel_l2 %.4f |g|/|w| %.4f got/want:",
+                            label, i, int(dag[i].kind), dag[i].layer, double(w1),
+                            nw > 0 ? std::sqrt(ng / nw) : 0.0);
                 for (std::size_t e = 0; e < w && e < 4; ++e) {
                     std::printf(" %.4f/%.4f", double(got[e]), double(it->second[e]));
                 }
@@ -917,14 +967,73 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     // against the decode the reference would have run at that position.
     if (R > 1) {
         std::vector<Trace> wants;
+        std::vector<std::vector<int>> want_ids;
+        std::vector<float> want_margin;
         for (int step = 0; step < R; ++step) {
+            ref.step_min_margin = 3.0e38f;
             wants.push_back(ref.step(dag, tokens[std::size_t(step)], step));
+            want_ids.push_back(ref.last_ids);
+            want_margin.push_back(ref.step_min_margin);
         }
         write_paged_io(0, R, tokens);
         ctx.run_step([&](StepEncoder& se) {
             encode_llama_step(se, dag, g, base, ll, /*ordinal_base=*/0, mbp, R, R);
         });
-        for (int r = 0; r < R; ++r) compare_all(wants[std::size_t(r)], r, r);
+        // A routed model can diverge for a reason that is not a bug in the
+        // batched path: two expert logits close enough that bf16 and fp32 sort
+        // them differently, after which the row runs different experts and
+        // every later dispatch disagrees. That is a property of random weights,
+        // not of the driver, so it is REPORTED rather than silently folded into
+        // the tolerance -- an unexplained routing difference and a real bug
+        // look identical at the residual.
+        // The margin below which the router's own arithmetic cannot decide.
+        // The routed matvec's measured relative error is a few percent, and the
+        // logits here are O(1), so two experts within this are a coin flip that
+        // fp32 and bf16 call differently.
+        const float kAmbiguous = 0.05f;
+        std::vector<bool> skip(std::size_t(R), false);
+        int ambiguous = 0;
+        if (g.is_moe() && plan.expert_ids_value >= 0) {
+            const auto& ids_slot =
+                b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_ids_value)])];
+            const auto* ids = static_cast<const std::int32_t*>(ids_slot.contents());
+            for (int r = 0; r < R && ids != nullptr; ++r) {
+                bool apart = false;
+                for (int e = 0; e < g.experts_per_token; ++e) {
+                    if (ids[r * g.experts_per_token + e] !=
+                        want_ids[std::size_t(r)][std::size_t(e)]) {
+                        apart = true;
+                    }
+                }
+                if (!apart) continue;
+                // A routing difference at a CLEAR margin is a real fault and is
+                // left to fail. Only a near-tie is excused, and it is excused
+                // loudly: every dispatch after the router on that row is
+                // computing a different expert's arithmetic and says nothing
+                // about this path.
+                if (want_margin[std::size_t(r)] < kAmbiguous) {
+                    skip[std::size_t(r)] = true;
+                    ++ambiguous;
+                    std::printf("    note: row %d routed differently at a margin of %.4f -- "
+                                "a tie the two precisions break differently; row excluded\n",
+                                r, double(want_margin[std::size_t(r)]));
+                } else {
+                    std::printf("    row %d routed differently at a margin of %.4f, which is "
+                                "NOT a tie\n", r, double(want_margin[std::size_t(r)]));
+                }
+            }
+        }
+        for (int r = 0; r < R; ++r) {
+            if (!skip[std::size_t(r)]) compare_all(wants[std::size_t(r)], r, r);
+        }
+        expect(ambiguous * 4 <= R, std::string(who) +
+               ": most rows routed the same way as the reference");
+
+        char msg3[256];
+        std::snprintf(msg3, sizeof msg3,
+                      "%s: the projections reading the exact embedding are within 2%% "
+                      "(worst rel_l2 %.4f)", who, double(worst_pristine));
+        expect(worst_pristine <= 0.02f, msg3);
 
         char msg2[256];
         std::snprintf(msg2, sizeof msg2,
@@ -936,7 +1045,8 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         return;
     }
 
-    for (int step = 0; step < int(tokens.size()); ++step) {
+    const int n_steps = S > 0 ? S : int(tokens.size());
+    for (int step = 0; step < n_steps; ++step) {
         if (paged) {
             write_paged_io(step, 1, tokens);
         } else {
@@ -1094,6 +1204,27 @@ int main() {
              /*rows=*/4, /*paged=*/true);
     run_case("qwen3-moe (routed, 4 rows in one fire)", moe, *ctx, kernels_dir, 0.06f,
              /*rows=*/4, /*paged=*/true);
+
+    // ── the GEMM ──
+    //
+    // Four rows is below `kQmmMinBatch`, so every projection above is still a
+    // matvec and the batched cases prove nothing about `affine_qmm_t`. Sixteen
+    // rows fills a tile, which switches the dense projections onto a different
+    // KERNEL -- not a wider launch of the same one -- and is the only thing
+    // here that exercises it.
+    // The control. Same sixteen tokens, same weights, but decoded ONE AT A TIME
+    // on the matvec path that the four-token cases already proved. Whatever
+    // rel_l2 this reports is the cost of the sequence alone -- attention at
+    // position 15 sums sixteen bf16 terms where position 3 summed four -- and
+    // is the floor the batched cases below have to be read against. Without it
+    // a tolerance wide enough for sixteen tokens looks like a tolerance widened
+    // to hide the GEMM.
+    run_case("llama-3 (dense, 16 sequential decodes: the control)", base_geometry(), *ctx,
+             kernels_dir, 0.12f, /*rows=*/1, /*paged=*/true, /*steps=*/16);
+    run_case("llama-3 (dense, 16 rows: the GEMM)", base_geometry(), *ctx, kernels_dir, 0.12f,
+             /*rows=*/16, /*paged=*/true);
+    run_case("qwen3-moe (routed, 16 rows: GEMM for the dense projections)", moe, *ctx,
+             kernels_dir, 0.12f, /*rows=*/16, /*paged=*/true);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
