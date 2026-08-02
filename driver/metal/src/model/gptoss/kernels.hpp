@@ -49,7 +49,14 @@ struct GptOssPsos {
     Pso qmv_tail{};
     Pso qmv_tail_bias{};
     Pso qmv_routed_bias{};
-    /// The router is 8-bit; mlx's predicate keeps it wider than everything else.
+    /// The router's matvec, at whatever width the checkpoint quantized it to.
+    /// `mlx_lm`'s predicate usually keeps it at 8 bits while everything else
+    /// goes to 4, but a uniformly-quantized checkpoint ships a 4-bit one --
+    /// `build_gptoss_psos` picks between `qmv_u8_bias` and `qmv_tail_bias` from
+    /// the width the staged tensors state.
+    Pso qmv_router{};
+    /// The 8-bit router matvec; mlx's predicate keeps it wider than everything
+    /// else. Held separately from `qmv_router` so the choice stays inspectable.
     Pso qmv_u8_bias{};
     Pso router_topk{};
     Pso swiglu{};
@@ -70,15 +77,21 @@ struct GptOssPsos {
 
     bool valid() const {
         return qmv_tail.valid() && qmv_tail_bias.valid() && qmv_routed_bias.valid() &&
-               qmv_u8_bias.valid() && router_topk.valid() && swiglu.valid() &&
-               expert_combine.valid() && sdpa_sink.valid() && rope_freqs.valid();
+               qmv_u8_bias.valid() && qmv_router.valid() && router_topk.valid() &&
+               swiglu.valid() && expert_combine.valid() && sdpa_sink.valid() &&
+               rope_freqs.valid();
     }
 };
 
 /// Compile them. `err` names the first one that failed, so a missing kernel is
 /// reported as itself rather than as a generic setup failure.
-bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, GptOssPsos& out,
-                       std::string* err);
+///
+/// `router_bits` selects the router's matvec: 8 for the width `mlx_lm`'s
+/// quantization predicate usually leaves it at, 4 for a uniformly-quantized
+/// checkpoint. It is refused rather than defaulted, because either kernel over
+/// the other's packing produces fluent wrong text instead of an error.
+bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int router_bits,
+                       GptOssPsos& out, std::string* err);
 
 /// The YaRN frequency table, `head_dim/2` entries.
 ///

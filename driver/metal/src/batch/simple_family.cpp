@@ -629,6 +629,20 @@ class GptOssEngine final : public SimpleFamilyEngine {
             return false;
         }
 
+        // The router's width is a property of the checkpoint, not of the config,
+        // so it is read off the tensors that were just staged. Refused rather
+        // than defaulted: the 4- and 8-bit matvecs read incompatible packings,
+        // and either over the other's bytes routes to the wrong experts, which
+        // survives as fluent wrong text instead of as an error.
+        g_.router_bits = gptoss::router_bits_from_weights(b_.weights);
+        if (g_.router_bits == 0) {
+            if (err) {
+                *err = "gpt-oss: could not solve the router's quantization width from "
+                       "`layers.0.mlp.router.{weight,scales}`";
+            }
+            return false;
+        }
+
         // Paged KV. gpt-oss has no M>1 path -- its MoE picks experts per ROW,
         // so a batched routed matmul is a different kernel rather than a wider
         // launch -- but paging is orthogonal to that: what it buys is SEVERAL
@@ -698,7 +712,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
             return false;
         }
 
-        if (!gptoss::build_gptoss_psos(ctx, kernels_dir, psos_, err)) return false;
+        if (!gptoss::build_gptoss_psos(ctx, kernels_dir, g_.router_bits, psos_, err)) return false;
         if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
         if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err)) return false;
 

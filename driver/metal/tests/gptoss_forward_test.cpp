@@ -242,6 +242,14 @@ int main(int argc, char** argv) {
     std::printf("    (%zu tensors staged)\n", b.weights.size());
     expect(!b.weights.empty(), "the checkpoint's tensors are staged into the heap");
 
+    // The router's quantization width comes off the staged tensors, not off
+    // `config.json` -- checkpoints ship both 4- and 8-bit routers and the two
+    // kernels read incompatible packings.
+    g.router_bits = router_bits_from_weights(b.weights);
+    std::printf("    (router is %d-bit)\n", g.router_bits);
+    expect(g.router_bits == 4 || g.router_bits == 8,
+           "the router's quantization width is solvable from the checkpoint");
+
     b.kv.resize(g.n_layers);
     for (int L = 0; L < g.n_layers; ++L) {
         const std::size_t bytes = gptoss_kv_bytes_per_layer(g, max_ctx, 2);
@@ -264,7 +272,7 @@ int main(int argc, char** argv) {
 
     GptOssPsos psos;
     DecodeStepPsos base;
-    if (!build_gptoss_psos(*ctx, kernels_dir, psos, &err) ||
+    if (!build_gptoss_psos(*ctx, kernels_dir, g.router_bits, psos, &err) ||
         !load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/false, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
