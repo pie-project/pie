@@ -23,6 +23,10 @@
 
 namespace pie::metal::gptoss {
 
+// Shared with the llama family's MoE path: the shape is a property of
+// `router_topk`, not of gpt-oss.
+using shared_kernels::router_topk_dispatch;
+
 using shared_kernels::RowGatherParams;
 using shared_kernels::elementwise_dispatch;
 
@@ -105,20 +109,6 @@ std::vector<float> yarn_inv_freq(const GptOssGeometry& g);
 float yarn_mscale(const GptOssGeometry& g);
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
-
-/// `router_topk`: one threadgroup per row, one lane per expert.
-///
-/// Rounded up to a whole simdgroup so no lane in the reduction is reading an
-/// uninitialised `part_v` slot, and capped at the 1024-thread threadgroup limit
-/// -- which is also the largest expert count this shape can serve. 32 here, 128
-/// on Qwen3-MoE; the kernel reduces across simdgroups, so both are correct.
-inline void router_topk_dispatch(int n_experts, Grid& g, Threadgroup& tg, int rows = 1) {
-    std::uint32_t w = std::uint32_t(n_experts < 1 ? 1 : n_experts);
-    w = (w + 31u) / 32u * 32u;
-    if (w > 1024u) w = 1024u;
-    g = Grid{w, std::uint32_t(rows < 1 ? 1 : rows), 1};
-    tg = Threadgroup{w, 1, 1};
-}
 
 /// `affine_qmv_u8_bias`: one simdgroup per output row.
 inline void qmv_u8_dispatch(int N, Grid& g, Threadgroup& tg, int rows = 1) {

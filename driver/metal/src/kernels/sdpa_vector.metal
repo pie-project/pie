@@ -135,3 +135,7 @@ template <typename T, int D, int V = D>
 instantiate_sdpa_decode(float32, float, 256, 256)
 instantiate_sdpa_decode(float16, half, 256, 256)
 instantiate_sdpa_decode(bfloat16, bfloat, 256, 256)
+// llama / mistral / qwen2 / qwen3 and the Qwen MoEs, all of which use a
+// 128-wide head. The template is parameterised on D precisely so a new head
+// width is an instantiation and not a kernel.
+instantiate_sdpa_decode(bfloat16, bfloat, 128, 128)

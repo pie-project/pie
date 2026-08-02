@@ -112,6 +112,7 @@ if(APPLE)
     src/model/gptoss/scratch.cpp
     src/model/gptoss/encode.cpp
     src/model/gptoss/bind.cpp
+    src/model/llama/kernels.cpp
     src/model/llama/scratch.cpp
     src/batch/simple_family.cpp
     src/model/qwen3_5/decode_step.cpp
@@ -565,6 +566,10 @@ if(APPLE)
   # cross-simdgroup path; Qwen3-MoE's 128 do, and the kernel was wrong there.
   add_metal_linked_test(router_topk_test tests/router_topk_test.cpp)
   target_compile_definitions(router_topk_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  # The llama family's kernels beyond the shared decode set, compiled on device.
+  add_metal_linked_test(llama_pso_test tests/llama_pso_test.cpp)
+  target_compile_definitions(llama_pso_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   # `heap_bind.cpp`'s `case K::Fill` on a real heap.
   add_metal_linked_test(loader_fill_test tests/loader_fill_test.cpp NEEDS_LOADER)
