@@ -408,6 +408,23 @@ add_test(NAME pipeline_launch_conformance_test
   COMMAND pipeline_launch_conformance_test
     ${CMAKE_CURRENT_SOURCE_DIR}/../fixtures)
 
+# ...and generating it is this suite's job, not the reader's. `driver/fixtures/`
+# is gitignored, so on a fresh checkout the images simply do not exist and the
+# conformance test fails for a reason that has nothing to do with the driver.
+# A CTest setup fixture emits them first. Skipped when cargo is absent, in
+# which case the test fails with its own message naming this command.
+find_program(PIE_CARGO_EXECUTABLE cargo)
+if(PIE_CARGO_EXECUTABLE)
+  add_test(NAME pipeline_launch_conformance_fixtures
+    COMMAND ${PIE_CARGO_EXECUTABLE} test -p pie-compiler-tests
+      --test cuda_golden emit_driver_test_kernel
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+  set_tests_properties(pipeline_launch_conformance_fixtures PROPERTIES
+    FIXTURES_SETUP pie_launch_images)
+  set_tests_properties(pipeline_launch_conformance_test PROPERTIES
+    FIXTURES_REQUIRED pie_launch_images)
+endif()
+
 # What this driver declares, and what `push_mlx_affine_u4` owes the qmv kernels
 # after the loader v2 `QuantSpec` field removal. Deliberately does NOT link
 # `pie_driver_metal_lib`: the schema is a header and the loader archive is

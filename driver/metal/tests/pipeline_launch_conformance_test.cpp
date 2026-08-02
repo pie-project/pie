@@ -302,6 +302,16 @@ int main(int argc, char** argv) {
     // whole file exists to prevent.
     expect(loaded == sizeof(kPrograms) / sizeof(kPrograms[0]),
            "every corpus program loaded (" + std::to_string(loaded) + ")");
+    if (loaded == 0) {
+        // `driver/fixtures/` is gitignored, so the images are absent on a fresh
+        // checkout. Say what writes them rather than leaving a wall of
+        // "cannot open" as the only clue.
+        std::fprintf(stderr,
+                     "no launch images in %s -- emit them with:\n"
+                     "  cargo test -p pie-compiler-tests --test cuda_golden "
+                     "emit_driver_test_kernel\n",
+                     dir.c_str());
+    }
 
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
