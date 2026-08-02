@@ -382,7 +382,6 @@ mod tests {
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
-            timing: None,
         })
     }
 

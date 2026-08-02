@@ -9,7 +9,8 @@
 //!
 //! RS mappings now publish at prepare, in slot order, under the store lock,
 //! so slot i+1 classifies against slot i's decision without waiting for it.
-//! This binary pins `PIE_FRAME_SIZE=3` and runs a GDN/hybrid model (the mock
+//! This binary pins `[model.scheduler] frame_size = 3` and runs a GDN/hybrid
+//! model (the mock
 //! reports a recurrent-state pool, so `model.is-linear()` is true) two ways:
 //!
 //!  * `generate-gdn` — one live RS slot per frame, the shape that used to be
@@ -17,9 +18,9 @@
 //!  * `generate-gdn-frame` — every slot of the 3-wide frame binds the same
 //!    RS working set. This is the shape the engine used to reject.
 //!
-//! It lives in its own test binary because `PIE_FRAME_SIZE` is read once into
-//! a `OnceLock` (`scheduler::configured_frame_size`), so k must be pinned
-//! before anything in the process touches the scheduler.
+//! It lives in its own test binary because the configured k is installed once
+//! into a `OnceLock` at bootstrap (`scheduler::configured_frame_size`), so it
+//! must be pinned before anything in the process touches the scheduler.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -56,26 +57,20 @@ const PROGRAMS: [&str; 3] = ["generate-gdn", "generate-gdn-frame", "gdn-foldcomm
 
 fn state() -> &'static TestState {
     STATE.get_or_init(|| {
-        // SAFETY: set before the runtime starts and before any scheduler
-        // entry point runs, and this binary is single-threaded until the
-        // tokio runtime below is created.
-        unsafe {
-            std::env::set_var("PIE_FRAME_SIZE", FRAME_SIZE.to_string());
-        }
-        assert_eq!(
-            pie_engine::scheduler::configured_frame_size(),
-            FRAME_SIZE,
-            "this binary must run at the pinned frame size"
-        );
-
         let rt = tokio::runtime::Runtime::new().unwrap();
         // EchoBehavior's token must be in-vocab for the 20-token fixture
         // tokenizer and neither `<eos>` (0) nor `<bos>` (1).
         let env = create_mock_env("test-model-gdn", 1, 64, Arc::new(EchoBehavior(7)))
-            .with_recurrent_state(RS_SLOTS, 4096);
+            .with_recurrent_state(RS_SLOTS, 4096)
+            .with_frame_size(FRAME_SIZE as u32);
         let config = env.config();
         rt.block_on(async {
             pie_engine::bootstrap::bootstrap(config).await.unwrap();
+            assert_eq!(
+                pie_engine::scheduler::configured_frame_size(),
+                FRAME_SIZE,
+                "this binary must run at the pinned frame size"
+            );
             for name in PROGRAMS {
                 inferlets::add_and_install(name).await;
             }

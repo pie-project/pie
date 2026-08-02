@@ -280,10 +280,6 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
 // wins (beta's per-edge hazard model: Device for true heap-RAW, None for ordering-only).
 static MTL4VisibilityOptions resolve_barrier_vis(BarrierVisibility req) {
     static const int override_mode = [] {
-        const char* e = getenv("PIE_BARRIER_VIS");
-        if (!e) return -1;
-        if (strcasecmp(e, "none") == 0 || strcmp(e, "0") == 0) return 0;
-        if (strcasecmp(e, "device") == 0 || strcmp(e, "1") == 0) return 1;
         return -1;
     }();
     const int mode = override_mode >= 0
@@ -1249,6 +1245,20 @@ Pso RawMetalContext::compile_pso_from_file(const std::string& path, const std::s
     return read_metal_source(path, source, error)
                ? compile_pso(source, fn, error)
                : Pso{};
+}
+
+Pso RawMetalContext::compile_precise_pso_from_file(const std::string& path,
+                                                   const std::string& fn,
+                                                   std::string* error) {
+    std::string source;
+    if (!read_metal_source(path, source, error)) return Pso{};
+    // Load-time transcode has to reproduce MLX's arithmetic bit for bit, and
+    // fast math rewrites `x / s` into `x * (1/s)` -- one ulp there moves a
+    // rounded 4-bit code by a whole step.
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    bool strict = false;
+    configure_ptir_math_options(options, strict);
+    return compile_pso_impl(*impl_, source, fn, options, nil, error);
 }
 
 Pso RawMetalContext::compile_ptir_pso(

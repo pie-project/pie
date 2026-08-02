@@ -79,14 +79,7 @@ void bind_routed_experts(const LoadedModel& engine, const std::string& lp, int e
 // row stride as an argument -- but is worth only ~0.3 ms more.
 } // namespace
 
-bool qwen35_fused_shared_scalar_gate_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_FUSED_SHARED_SCALAR_GATE");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+bool qwen35_fused_shared_scalar_gate_enabled() { return false; }
 
 namespace {
 
@@ -119,14 +112,7 @@ bool qwen35_mtp_int8_lm_head_enabled() {
     return enabled;
 }
 
-bool qwen35_moe_gate_up_swapped() {
-    static const bool swapped = [] {
-        const char* v = std::getenv("PIE_QWEN35_MOE_FLASHINFER");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return swapped;
-}
+bool qwen35_moe_gate_up_swapped() { return true; }
 
 Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();

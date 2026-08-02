@@ -54,20 +54,12 @@ struct KvLockTrace {
 
 impl KvLockTrace {
     fn new() -> Self {
-        let threshold_us = std::env::var("PIE_KV_LOCK_TRACE_THRESHOLD_US")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(KV_LOCK_TRACE_DEFAULT_THRESHOLD_US);
-        let output = std::env::var_os("PIE_KV_LOCK_TRACE_FILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(format!("/tmp/pie-kv-lock-trace-{}.csv", std::process::id()))
-            });
+        let output = PathBuf::from(format!("/tmp/pie-kv-lock-trace-{}.csv", std::process::id()));
         Self {
             records: crossbeam_queue::ArrayQueue::new(KV_LOCK_TRACE_CAPACITY),
             dropped: AtomicU64::new(0),
             dumped: AtomicBool::new(false),
-            threshold_ns: threshold_us.saturating_mul(1_000),
+            threshold_ns: KV_LOCK_TRACE_DEFAULT_THRESHOLD_US.saturating_mul(1_000),
             output,
         }
     }
@@ -119,6 +111,13 @@ impl KvLockTrace {
         serde_json::to_writer_pretty(File::create(metadata_path)?, &metadata)?;
         Ok(())
     }
+}
+
+/// Process-relative monotonic microseconds, used only to order KV lock
+/// trace records within one run.
+fn process_monotonic_us() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
 }
 
 fn kv_lock_trace_enabled() -> bool {
@@ -180,7 +179,7 @@ pub fn with_kv_lock<T>(
     let wait_started = Instant::now();
     let mut guard = store.lock();
     let wait_ns = u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let t_acquire_us = crate::scheduler::fire_timing_now_us();
+    let t_acquire_us = process_monotonic_us();
     let hold_started = Instant::now();
     let result = operation(&mut guard);
     let hold_ns = u64::try_from(hold_started.elapsed().as_nanos()).unwrap_or(u64::MAX);

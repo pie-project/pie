@@ -105,7 +105,7 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const GptOssPsos& go)
         case Kind::LmHead:
             return go.qmv_tail;
         case Kind::RouterGemv:
-            return go.qmv_u8_bias;
+            return go.qmv_router;
         case Kind::ExpertGate: case Kind::ExpertUp: case Kind::ExpertDown:
             return go.qmv_routed_bias;
         case Kind::RouterTopK:    return go.router_topk;
@@ -130,7 +130,7 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const GptOssPsos& go)
 
 void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Threadgroup& tg) {
     if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
-        if (d.kind == Kind::RouterGemv) {
+        if (d.kind == Kind::RouterGemv && g.router_bits == 8) {
             qmv_u8_dispatch(kn.N, grid, tg);
             return;
         }
@@ -290,7 +290,7 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
 
     if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
-        if (d.kind == Kind::RouterGemv) {
+        if (d.kind == Kind::RouterGemv && g.router_bits == 8) {
             qmv_u8_dispatch(kn.N, grid, tg, N);
             return;
         }

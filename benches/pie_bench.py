@@ -163,7 +163,6 @@ def is_cumulative_status_key(key: str) -> bool:
             "bypass_hits",
             "chain_drops",
             "chain_submits",
-            "cold_hold_fires",
             "cumulative_batch_latency_us",
             "escape_fires",
             "readiness_miss",
@@ -340,6 +339,16 @@ def build_config(args: argparse.Namespace):
         max_concurrent_processes = None  # serializer drops field → engine default
     else:
         max_concurrent_processes = args.concurrency
+    # Decouple the engine's admission cap from the client's offered
+    # concurrency. Setting them equal (the default above) means every request
+    # the client holds open is also admitted, so under KV oversubscription the
+    # whole fleet stays resident and thrashes. Overriding lets an experiment
+    # ask what the pool can actually sustain while the OFFERED load is
+    # unchanged -- the client still holds `--concurrency` requests open, they
+    # just queue for a seat.
+    _cap_override = os.environ.get("PIE_BENCH_ADMISSION_CAP")
+    if _cap_override:
+        max_concurrent_processes = int(_cap_override)
     requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
@@ -365,7 +374,22 @@ def build_config(args: argparse.Namespace):
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
-            wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
+            # A pooling slot costs ~4 GiB of VIRTUAL address space (wasmtime
+            # reserves a full wasm32 range per memory so it can elide bounds
+            # checks), and Linux gives the process 128 TiB total. So this cap
+            # is bounded at ~32k slots no matter how much RAM the box has.
+            # Sizing it off num_requests blew through that: 12288 requests
+            # asked for 49156 slots = 212 TB and the engine panicked inside
+            # mmap before serving anything.
+            #
+            # The live instance count is bounded by ADMISSION, not by the
+            # total request count -- a process releases its slot when it
+            # exits. pie's spawn pipeline can hold prewarm + bind (2x the
+            # execution limit, double-buffered) + executing at once, so 4x
+            # the admission cap is the true ceiling. `None` means the engine
+            # falls back to max_forward_requests (R), which the 4096 floor
+            # already covers for any R <= 1024.
+            wasm_max_instances=max(4096, (max_concurrent_processes or 0) * 4),
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
         model=ModelConfig(
@@ -1086,16 +1110,6 @@ async def run(args: argparse.Namespace):
                             inter_fire_samples,
                             average_key,
                         )
-                cold_hold_fires = model_status.get(
-                    "default.fire.quorum.cold_hold_fires", 0
-                )
-                if isinstance(cold_hold_fires, (int, float)):
-                    measured_average(
-                        model_status,
-                        "default.fire.quorum.cold_hold_us_sum",
-                        cold_hold_fires,
-                        "default.fire.quorum.cold_hold_us",
-                    )
                 wave_fires = model_status.get("default.fire.quorum.wave_fires", 0)
                 if isinstance(wave_fires, (int, float)):
                     measured_average(
@@ -1163,7 +1177,6 @@ async def run(args: argparse.Namespace):
                         or "active_pipelines" in key
                         or "missing_at_fire" in key
                         or "straggler" in key
-                        or "cold_hold" in key
                     ):
                         engine_config[key] = value
         except Exception:  # noqa: BLE001

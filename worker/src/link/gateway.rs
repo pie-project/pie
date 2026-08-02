@@ -310,14 +310,6 @@ impl WorkerControlServer {
     /// ensures the logical session's runtime broker + driver exist, then queues
     /// the turn. Errors map to `Accepted::Reject` (the gateway re-routes).
     async fn admit(&self, req: Request) -> Result<()> {
-        if std::env::var_os("PIE_BRIDGE_TRACE").is_some() {
-            eprintln!(
-                "[bridge] admit req_id={} session={} blobs={}",
-                req.req_id,
-                req.session,
-                req.blobs.len()
-            );
-        }
         // Blob bytes ride out-of-band over HTTP (design §9); fetch + verify here.
         // Feeding them into the runtime needs a runtime image API — a tracked
         // follow-on, so for now we verify integrity and log.
@@ -434,14 +426,6 @@ async fn run_turn(
     let proc_launch = is_process_launch(&req.message);
     let mut process_id: Option<String> = None;
 
-    let bridge_trace = std::env::var_os("PIE_BRIDGE_TRACE").is_some();
-    if bridge_trace {
-        eprintln!(
-            "[bridge] run_turn entry req_id={req_id} corr={corr:?} proc_launch={proc_launch} chunk={:?}",
-            upload_chunk_info(&req.message)
-        );
-    }
-
     // Chunked uploads (`AddProgram`) span many messages under one `corr_id`,
     // but only the FINAL chunk yields a `Response` — every intermediate chunk
     // is accepted as `InProgress` with no reply. Since `session_driver` runs
@@ -483,14 +467,8 @@ async fn run_turn(
                         return TurnEnd::Aborted;
                     }
                 };
-                if bridge_trace && !msgs.is_empty() {
-                    eprintln!("[bridge] req_id={req_id} drained {} runtime msg(s)", msgs.len());
-                }
                 for msg in msgs {
                     let terminal = turn_terminal(&msg, corr, proc_launch, &mut process_id);
-                    if bridge_trace {
-                        eprintln!("[bridge] req_id={req_id} push msg terminal={terminal}");
-                    }
                     match gateway.push_tokens(push_ctx(), req_id, Tokens::Chunk(msg)).await {
                         Ok(Control::Continue) => {}
                         Ok(Control::Abort) => {

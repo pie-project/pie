@@ -201,7 +201,8 @@ pub(crate) fn notify_process_quiesced(pid: ProcessId) {
 }
 
 /// A parked process acquired its execution permit: its first fire is
-/// imminent, and the frame seal waits for it by identity. Sent BEFORE the
+/// imminent, so it is a named join in flight and the cohort-boundary window
+/// stays open until it lands. Sent BEFORE the
 /// process's first fire enters the mailbox (same producer), so the policy
 /// sees consume-then-fire; a reordered arrival is harmless (the policy's
 /// staged guard skips a lane that already fired).
@@ -269,50 +270,6 @@ pub(crate) struct PendingRequest {
     /// `None` = an untracked/prebuilt rider — dispatched outside the
     /// sealed-wave order, never awaited.
     pub(crate) frame: Option<FrameStamp>,
-    pub(super) timing: Option<FireTimingState>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct FireTimingState {
-    submitted_us: u64,
-    enqueued_us: Option<u64>,
-    ready_us: Option<u64>,
-}
-
-impl FireTimingState {
-    fn new() -> Self {
-        Self {
-            submitted_us: super::fire_timing_now_us(),
-            enqueued_us: None,
-            ready_us: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct WaveTimingState {
-    wave_id: u64,
-    membership_hash: u64,
-    dispatch_started_us: u64,
-    batch_built_us: u64,
-    driver_started_us: u64,
-    launch_returned_us: u64,
-    decision_us: u64,
-    active_pipelines: usize,
-    missing_pipelines: usize,
-    candidate_count: usize,
-    deferred_pipelines: usize,
-    depth_capped_pipelines: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FireTimingSnapshot {
-    outcome_index: usize,
-    logical_fire_id: u64,
-    instance_id: u64,
-    process_id: Option<ProcessId>,
-    sampled_rows: usize,
-    timing: FireTimingState,
 }
 
 impl PendingRequest {
@@ -327,7 +284,6 @@ impl PendingRequest {
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
         prelaunch_state_copy: Option<StateCopyPlan>,
         frame: Option<FrameStamp>,
-        timing_enabled: bool,
     ) -> Self {
         let logical_fire_id = NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -342,7 +298,6 @@ impl PendingRequest {
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
-            timing: timing_enabled.then(FireTimingState::new),
         }
     }
 
@@ -442,8 +397,27 @@ pub(crate) struct LaunchGrouping {
     has_device_geometry: bool,
 }
 
+/// A fire the driver will resolve a DENSE per-cell attention mask for out of
+/// a descriptor channel. Such a fire composes only SOLO: the driver's
+/// multi-program batch has no way to merge one program's dense mask with
+/// another's geometry (v1 scope), and it throws
+/// `RetryableLaunchError("dense device mask in a multi-program batch")`
+/// rather than execute a wrong one.
+///
+/// `dense_device_mask` is the program's own binding — an `AttnMask` port
+/// sourced from a channel — and is the SAME predicate the driver resolves
+/// on. The second clause is the older inference (a user mask with no wire
+/// BRLE rows must be device-carried); it is kept because it covers fires
+/// whose mask is device-carried without the port binding being visible here.
+///
+/// The inference alone was not enough. `cuda_runahead_concurrent` runs 8
+/// pipelines of a sink/sliding-window decode program: every fire carried
+/// BOTH wire BRLE rows (`masks` non-empty, so the second clause is false)
+/// AND a channel-bound `AttnMask`, so the batcher merged them and the first
+/// concurrent step failed the driver's contract, poisoned descriptor
+/// channel 0, and lost all 8 streams.
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
-    request.has_user_mask && request.masks.is_empty()
+    request.dense_device_mask || (request.has_user_mask && request.masks.is_empty())
 }
 
 impl LaunchGrouping {
@@ -838,8 +812,6 @@ enum LaneReply {
     LaunchDone {
         token: u64,
         result: std::result::Result<SubmissionCompletion, String>,
-        driver_started_us: Option<u64>,
-        launch_returned_us: Option<u64>,
     },
     ControlDone {
         token: u64,
@@ -1018,8 +990,6 @@ impl DriverLane {
             match request {
                 LaneRequest::Launch { token, submission } => {
                     let LaneLaunch(submission) = submission;
-                    let timing_enabled = super::fire_timing_enabled();
-                    let driver_started_us = timing_enabled.then(super::fire_timing_now_us);
                     // Folded admission (ABI v14): EXHAUSTED retries in place —
                     // the lane is FIFO, so retrying here preserves global
                     // frame order (later frames must not overtake), and the
@@ -1062,33 +1032,13 @@ impl DriverLane {
                         }),
                         None => Err("driver has no backend installed".to_string()),
                     };
-                    let launch_returned_us = timing_enabled.then(super::fire_timing_now_us);
                     let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::LaunchDone {
                         token,
                         result,
-                        driver_started_us,
-                        launch_returned_us,
                     }));
                 }
                 LaneRequest::Control { token, item } => {
-                    let control_timing = super::fire_timing_full().then(|| {
-                        (
-                            BatchScheduler::item_kind(&item),
-                            super::fire_timing_now_us(),
-                        )
-                    });
                     let commit = Self::execute_control(&mut driver, &mut channels, item);
-                    if let Some((kind, started_us)) = control_timing {
-                        let finished_us = super::fire_timing_now_us();
-                        super::fire_timing_write(&serde_json::json!({
-                            "schema": 1,
-                            "source": "scheduler",
-                            "event": "control_dispatched",
-                            "kind": kind,
-                            "started_us": started_us,
-                            "occupancy_us": finished_us.saturating_sub(started_us),
-                        }));
-                    }
                     let _ = reply_tx.send(SchedulerItem::Lane(LaneReply::ControlDone {
                         token,
                         commit,
@@ -1344,12 +1294,6 @@ impl DriverLane {
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 };
-                // Section timing (diagnostic, PIE_FIRE_TIMING): the boundary
-                // grinds ~1k of these controls against the frame seal; this
-                // breakdown names the engine-side payer next to the driver's
-                // own `cuda_bind` record.
-                let bind_probe = super::fire_timing_full();
-                let probe_t0 = bind_probe.then(Instant::now);
                 let registered = match Self::register_channel_set(driver, channels, &plans) {
                     Ok(registered) => registered,
                     Err(error) => {
@@ -1372,7 +1316,6 @@ impl DriverLane {
                     Self::release_wait_slots([bind.pacing_wait_id]);
                     return LaneCommit::BindFinished { pipeline_id };
                 }
-                let probe_t1 = bind_probe.then(Instant::now);
                 let program_registered = program.is_some();
                 if let Some(plan) = &program {
                     match driver.register_program(plan) {
@@ -1412,20 +1355,8 @@ impl DriverLane {
                     }
                     return LaneCommit::BindFinished { pipeline_id };
                 }
-                let probe_t2 = bind_probe.then(Instant::now);
                 match driver.bind_instance(&bind) {
                     Ok(bound) => {
-                        if let (Some(t0), Some(t1), Some(t2)) = (probe_t0, probe_t1, probe_t2) {
-                            super::fire_timing_write(&serde_json::json!({
-                                "schema": 1,
-                                "source": "scheduler",
-                                "event": "engine_bind_breakdown",
-                                "channels": plans.len(),
-                                "set_us": t1.duration_since(t0).as_micros() as u64,
-                                "program_us": t2.duration_since(t1).as_micros() as u64,
-                                "bind_us": t2.elapsed().as_micros() as u64,
-                            }));
-                        }
                         LaneCommit::BindInstance {
                             pipeline_id,
                             bound,
@@ -1809,7 +1740,6 @@ struct PendingLaunchBatch {
     started: Instant,
     batch_size: u64,
     total_tokens: usize,
-    timing: Option<WaveTimingState>,
 }
 
 /// The control slot's lane lifecycle (async-completing controls only —
@@ -1832,7 +1762,93 @@ struct PendingControl {
     /// false for standalone copies — their pages are grant-pinned and no
     /// queued fire references them, so frames keep posting while
     /// suspend/restore traffic settles.
+    ///
+    /// It is also the exclusivity test: a control that holds launches needs
+    /// the whole in-flight set empty and blocks every other control while it
+    /// settles, exactly as the original single slot did.
     holds_launches: bool,
+}
+
+/// The async-completing controls the worker is waiting on — copies and pool
+/// resizes; lifecycle controls execute on the lane without ever entering
+/// here.
+///
+/// Two classes share this set. An **exclusive** control (a `PreLaunchCopy`,
+/// whose consumer fire is queued directly behind it, and a pool resize, whose
+/// pipe drain IS its ordering mechanism) keeps the original rule: it needs
+/// the set empty and, once posted, nothing else may join it.
+///
+/// **Standalone copies** — the residency planner's suspend/restore traffic —
+/// instead settle concurrently with one another. Nothing queued orders
+/// against them: their pages are grant-pinned and no queued fire can name
+/// one, which `pipe_concurrent_control` already relies on. So a single slot
+/// bought no safety, only a queue, and the queue was on the planner's
+/// critical path. Measured at 512-way KV contention: up to 7 restores wanted
+/// the slot at once (`restoring` p90 = 4, max = 7) and each H2D copy took
+/// 22.8 ms end to end against ~3.3 ms of transfer — 1.528 ms/page, versus
+/// 0.227 ms/page on the D2H side, which the planner itself issues strictly
+/// one at a time and which therefore never queued. The 6.7x asymmetry was
+/// the wait for this slot, not the device.
+///
+/// Nothing here needs a concurrency ceiling: the pending queue is the bound.
+/// Only copies the planner has already enqueued can be in flight, and the
+/// planner enqueues at most one per suspending or restoring process.
+#[derive(Default)]
+struct InFlightControls {
+    settling: Vec<PendingControl>,
+}
+
+impl InFlightControls {
+    fn is_empty(&self) -> bool {
+        self.settling.is_empty()
+    }
+
+    /// Whether anything is still settling.
+    fn is_settling(&self) -> bool {
+        !self.settling.is_empty()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, PendingControl> {
+        self.settling.iter()
+    }
+
+    /// Whether a standalone copy may be posted now: only an exclusive
+    /// control can refuse one.
+    fn admits_copy(&self) -> bool {
+        self.settling.iter().all(|control| !control.holds_launches)
+    }
+
+    /// Whether `item` may be posted into this set now. A standalone copy and
+    /// a lifecycle control are each refused only by an EXCLUSIVE control: the
+    /// copy addresses grant-pinned pages nothing queued can name, and a
+    /// lifecycle control never enters this set at all — it executes on the
+    /// lane, its driver order guaranteed by the lane FIFO. Blocking lifecycle
+    /// controls on a settling copy wedged the fleet: the planner's copies are
+    /// in flight almost continuously under churn, so every bind waited out the
+    /// whole strict-watchdog window (measured on `churn`: 270 binds at 1.0-2.4 s
+    /// end to end against a 59 us driver bind).
+    fn admits(&self, item: &QueuedItem) -> bool {
+        if BatchScheduler::standalone_copy(item) || BatchScheduler::lifecycle_control(item) {
+            !self.holds_launches()
+        } else {
+            self.is_empty()
+        }
+    }
+
+    /// Whether any settling control makes queued launches wait.
+    fn holds_launches(&self) -> bool {
+        self.settling.iter().any(|control| control.holds_launches)
+    }
+
+    fn push(&mut self, control: PendingControl) {
+        self.settling.push(control);
+    }
+
+    fn position_posted(&self, token: u64) -> Option<usize> {
+        self.settling.iter().position(
+            |control| matches!(control.state, ControlSlotState::Posted { token: t } if t == token),
+        )
+    }
 }
 
 /// What one pass over the pending queue tells the frame dispatcher — see
@@ -2091,7 +2107,6 @@ impl SchedulerHandle {
         pipeline_id: Option<ProcessId>,
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
         prelaunch_state_copy: Option<StateCopyPlan>,
-        timing_enabled: bool,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -2105,7 +2120,6 @@ impl SchedulerHandle {
                 prelaunch_copy,
                 prelaunch_state_copy,
                 None,
-                timing_enabled,
             ),
         })
     }
@@ -2131,7 +2145,6 @@ impl SchedulerHandle {
                 prelaunch_copy,
                 prelaunch_state_copy,
                 None,
-                super::fire_timing_full(),
             ),
         })
     }
@@ -2148,7 +2161,6 @@ impl SchedulerHandle {
         prelaunch_copy: Option<crate::driver::KvCopyPlan>,
         prelaunch_state_copy: Option<StateCopyPlan>,
         frame: Option<FrameStamp>,
-        timing_enabled: bool,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
             pending: PendingRequest::direct(
@@ -2162,7 +2174,6 @@ impl SchedulerHandle {
                 prelaunch_copy,
                 prelaunch_state_copy,
                 frame,
-                timing_enabled,
             ),
         })
     }
@@ -2438,12 +2449,12 @@ impl BatchScheduler {
         let mut slot_buffer = SlotBuffer::new();
         let mut terminated_processes: HashSet<ProcessId> = HashSet::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let mut stopping = false;
         // THE fire rule: the wait-for-all-active-lanes frame policy, one
         // instance per driver thread, mirroring `instances`/`channels` above.
         // Every backend and every k schedules the same way — at the default
-        // `PIE_FRAME_SIZE=1` a frame is one wave (each tracked fire admits as
+        // k=1 a frame is one wave (each tracked fire admits as
         // a synthesized single-slot frame); density comes from the sealed
         // epoch, throughput from run-ahead depth within it.
         let mut frame_policy = FramePolicy::new(
@@ -2464,14 +2475,6 @@ impl BatchScheduler {
 
         loop {
             let mut progress = false;
-            // Worker-pass timing probe (PIE_FIRE_TIMING): the generation
-            // boundary showed fires arriving within ~28 ms while waves
-            // started at ~+170 ms — this names which pass phase eats the
-            // difference (mailbox drain vs retire vs dispatch) and how the
-            // pending queue length scales it.
-            let probe = super::fire_timing_enabled();
-            let pass_started = Instant::now();
-            let mut mailbox_items: u32 = 0;
             // Epoch drain: a pass consumes only what was queued when it began.
             // A sustained producer flood (the next cohort's bring-up at a
             // generation boundary) otherwise keeps `try_recv` non-empty for
@@ -2481,17 +2484,9 @@ impl BatchScheduler {
             // boundary wave dispatches when the mailbox finally runs dry
             // instead of the pass after the last join lands.
             let mailbox_epoch = rx.len();
-            // Per-variant census (diagnostic, PIE_FIRE_TIMING): which item
-            // class the boundary epochs are made of, count and time — the
-            // flood's composition decides the next lever.
-            let mut census_n = [0u32; ITEM_CENSUS_KINDS.len()];
-            let mut census_ns = [0u64; ITEM_CENSUS_KINDS.len()];
             for _ in 0..mailbox_epoch {
                 let Ok(item) = rx.try_recv() else { break };
                 progress = true;
-                mailbox_items += 1;
-                let kind = if probe { item_census_idx(&item) } else { 0 };
-                let item_started = if probe { Some(Instant::now()) } else { None };
                 match item {
                     SchedulerItem::DebugDump { response } => {
                         let _ = response.send(Self::render_debug_dump(
@@ -2527,21 +2522,14 @@ impl BatchScheduler {
                         );
                     }
                 }
-                if let Some(item_started) = item_started {
-                    census_n[kind] += 1;
-                    census_ns[kind] += item_started.elapsed().as_nanos() as u64;
-                }
             }
-            let mailbox_done = Instant::now();
             progress |= Self::retire_ready_launches(
                 &mut in_flight_launches,
                 &mut instances,
-                &mut pending,
                 &stats,
                 &mut frame_policy,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
-            let retire_done = Instant::now();
             let (dispatched, wait_hint) = Self::dispatch_ready_items(
                 &lane,
                 &mut lane_inflight,
@@ -2559,63 +2547,17 @@ impl BatchScheduler {
                 stopping,
             );
             progress |= dispatched;
-            if probe {
-                let dispatch_ns = retire_done.elapsed().as_nanos() as u64;
-                let acc = &super::LOOP_PHASES;
-                acc.mailbox_ns.fetch_add(
-                    mailbox_done.duration_since(pass_started).as_nanos() as u64,
-                    Ordering::Relaxed,
-                );
-                acc.retire_ns.fetch_add(
-                    retire_done.duration_since(mailbox_done).as_nanos() as u64,
-                    Ordering::Relaxed,
-                );
-                acc.dispatch_ns.fetch_add(dispatch_ns, Ordering::Relaxed);
-                acc.passes.fetch_add(1, Ordering::Relaxed);
-                acc.pass_max_ns
-                    .fetch_max(pass_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                acc.mailbox_items
-                    .fetch_add(mailbox_items as u64, Ordering::Relaxed);
-            }
-            if probe {
-                let dispatch_us = retire_done.elapsed().as_micros() as u64;
-                let mailbox_us = mailbox_done.duration_since(pass_started).as_micros() as u64;
-                let retire_us = retire_done.duration_since(mailbox_done).as_micros() as u64;
-                if mailbox_us + retire_us + dispatch_us > 2_000 {
-                    let census: serde_json::Map<String, serde_json::Value> = ITEM_CENSUS_KINDS
-                        .iter()
-                        .zip(census_n.iter().zip(census_ns.iter()))
-                        .filter(|(_, (n, _))| **n > 0)
-                        .map(|(name, (n, ns))| {
-                            ((*name).to_string(), serde_json::json!([n, ns / 1_000]))
-                        })
-                        .collect();
-                    super::fire_timing_write(&serde_json::json!({
-                        "schema": 1,
-                        "source": "scheduler",
-                        "event": "worker_pass",
-                        "pass_started_us": super::fire_timing_now_us(),
-                        "mailbox_us": mailbox_us,
-                        "mailbox_items": mailbox_items,
-                        "census": census,
-                        "retire_us": retire_us,
-                        "dispatch_us": dispatch_us,
-                        "pending_len": pending.len(),
-                        "progress": progress,
-                    }));
-                }
-            }
             if stopping
                 && pending.is_empty()
                 && in_flight_launches.is_empty()
-                && in_flight_control.is_none()
+                && in_flight_control.is_empty()
                 && lane_inflight == 0
             {
                 break;
             }
 
-            // Cohort-boundary bind deferral: while the seal waits on a
-            // successor's arrival, hold back the bind permits that retiring
+            // Cohort-boundary bind deferral: while a successor's arrival is
+            // imminent, hold back the bind permits that retiring
             // processes return, so the staged cohort's working-set
             // declaration and prefill construction do not compete with the
             // boundary's own bring-up. Cleared the moment this pass has
@@ -2624,7 +2566,9 @@ impl BatchScheduler {
             crate::inferlet::process::set_bind_release_hold(
                 !stopping
                     && frame_policy.is_joining()
-                    && (progress || !in_flight_launches.is_empty() || in_flight_control.is_some()),
+                    && (progress
+                        || !in_flight_launches.is_empty()
+                        || in_flight_control.is_settling()),
             );
 
             if progress {
@@ -2635,7 +2579,7 @@ impl BatchScheduler {
 
             let item = if pending.is_empty()
                 && in_flight_launches.is_empty()
-                && in_flight_control.is_none()
+                && in_flight_control.is_empty()
                 && !stopping
             {
                 match rx.recv() {
@@ -2663,7 +2607,7 @@ impl BatchScheduler {
                         LaunchState::Failed(_) => armed = false,
                     }
                 }
-                if let Some(control) = in_flight_control.as_ref() {
+                for control in in_flight_control.iter() {
                     match &control.state {
                         ControlSlotState::Posted { .. } => {}
                         ControlSlotState::Ready(completion) => {
@@ -2682,13 +2626,7 @@ impl BatchScheduler {
                 // completion nudge in between.
                 let backstop = Duration::from_millis(250);
                 let recv_wait = wait_hint.map(|hold| hold.min(backstop)).unwrap_or(backstop);
-                let park_started = probe.then(Instant::now);
                 let parked = rx.recv_timeout(recv_wait);
-                if let Some(park_started) = park_started {
-                    super::LOOP_PHASES
-                        .park_ns
-                        .fetch_add(park_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                }
                 match parked {
                     Ok(item) => Some(item),
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
@@ -2700,7 +2638,7 @@ impl BatchScheduler {
                         // the wait's own cadence), so it never counts here.
                         let missed = in_flight_launches.front().is_some_and(|front| {
                             matches!(&front.state, LaunchState::Accepted(c) if c.is_settled())
-                        }) || in_flight_control.as_ref().is_some_and(|control| {
+                        }) || in_flight_control.iter().any(|control| {
                             matches!(&control.state, ControlSlotState::Ready(c) if c.is_settled())
                         });
                         if missed && !stopping && wait_hint.is_none() {
@@ -2790,7 +2728,7 @@ impl BatchScheduler {
     fn render_debug_dump(
         pending: &VecDeque<QueuedItem>,
         in_flight_launches: &VecDeque<PendingLaunchBatch>,
-        in_flight_control: &Option<PendingControl>,
+        in_flight_control: &InFlightControls,
         instances: &HashMap<u64, TrackedInstance>,
         frame_policy: &FramePolicy,
     ) -> String {
@@ -2844,21 +2782,19 @@ impl BatchScheduler {
                 batch.started.elapsed(),
             );
         }
-        match in_flight_control {
-            Some(control) => {
-                let state = match &control.state {
-                    ControlSlotState::Posted { token } => format!("posted(token={token})"),
-                    ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
-                };
-                let _ = writeln!(
-                    out,
-                    "in_flight_control: {} pipeline {:?} {state}",
-                    control.operation, control.pipeline_id,
-                );
-            }
-            None => {
-                let _ = writeln!(out, "in_flight_control: none");
-            }
+        if in_flight_control.is_empty() {
+            let _ = writeln!(out, "in_flight_control: none");
+        }
+        for control in in_flight_control.iter() {
+            let state = match &control.state {
+                ControlSlotState::Posted { token } => format!("posted(token={token})"),
+                ControlSlotState::Ready(c) => format!("settled={}", c.is_settled()),
+            };
+            let _ = writeln!(
+                out,
+                "in_flight_control: {} pipeline {:?} {state}",
+                control.operation, control.pipeline_id,
+            );
         }
         let _ = write!(out, "{}", frame_policy.debug_summary());
         out
@@ -2868,7 +2804,7 @@ impl BatchScheduler {
     fn enqueue_item(
         pending: &mut PendingQueue,
         terminated_processes: &mut HashSet<ProcessId>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         instances: &HashMap<u64, TrackedInstance>,
         limits: SchedulerLimits,
         page_size: u32,
@@ -2924,8 +2860,8 @@ impl BatchScheduler {
                     // ragged-boundary guard — see on_slotted_terminate).
                     frame_policy.on_slotted_terminate(pid);
                     let protected = in_flight_control
-                        .as_ref()
-                        .filter(|control| control.process_id == Some(pid))
+                        .iter()
+                        .find(|control| control.process_id == Some(pid))
                         .and_then(|control| control.logical_completion.clone());
                     if let Some(completion) = &protected {
                         completion.request_cancel();
@@ -2957,15 +2893,6 @@ impl BatchScheduler {
             SchedulerItem::Launch {
                 pending: mut launch,
             } => {
-                if let Some(timing) = launch.timing.as_mut() {
-                    let now = super::fire_timing_now_us();
-                    timing.enqueued_us = Some(now);
-                    let lag = now.saturating_sub(timing.submitted_us) * 1_000;
-                    let acc = &super::LOOP_PHASES;
-                    acc.lag_ns.fetch_add(lag, Ordering::Relaxed);
-                    acc.lag_n.fetch_add(1, Ordering::Relaxed);
-                    acc.lag_max_ns.fetch_max(lag, Ordering::Relaxed);
-                }
                 let validation = AdmissionLimits::new(limits, page_size);
                 let rejection = if launch.completion.cancel_requested() {
                     Some("logical fire cancelled before scheduler admission".to_string())
@@ -3035,9 +2962,6 @@ impl BatchScheduler {
                             launch.request.token_ids.len(),
                             launch.wire_row_count(),
                         );
-                    }
-                    if let Some(timing) = launch.timing.as_mut() {
-                        timing.ready_us = Some(super::fire_timing_now_us());
                     }
                     Self::queue_attempt(pending, launch);
                 }
@@ -3417,7 +3341,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
@@ -3426,8 +3350,6 @@ impl BatchScheduler {
         slot_buffer: &mut SlotBuffer,
         stopping: bool,
     ) -> (bool, Option<Duration>) {
-        let probe_disp = super::fire_timing_enabled();
-        let disp_started = probe_disp.then(Instant::now);
         let (mut progress, wait_hint) = Self::dispatch_frame_work(
             scan_cache,
             slot_buffer,
@@ -3444,15 +3366,6 @@ impl BatchScheduler {
             stats,
             stopping,
         );
-        if let Some(started) = disp_started {
-            super::LOOP_PHASES
-                .disp_frame_ns
-                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
-        let mut rot_ns = 0u64;
-        let mut rot_n = 0u64;
-        let mut busy_ns = 0u64;
-        let mut busy_n = 0u64;
         // Busy-close rotations this pass: bounded so a queue of nothing but
         // busy closes breaks out instead of spinning.
         let mut close_rotations = 0usize;
@@ -3473,14 +3386,13 @@ impl BatchScheduler {
         // the planner's suspend/restore copies are in flight almost
         // continuously under churn, so every bind waited out the whole
         // strict-watchdog window, its process sat in `staged` for the
-        // duration, and `is_joining()` therefore held the seal that would
-        // have retired the traffic the copy is waiting behind. Measured on
+        // duration, and the cohort-boundary window it therefore held open
+        // (which then still held the seal) stalled the very traffic the copy
+        // was waiting behind. Measured on
         // `churn`: every one of 270 binds took 1.0-2.4 s end to end against
         // a 59 us driver bind, and the probe found the slot held by a
         // tracked KV copy in 100% of the samples.
-        let slot_blocks_lifecycle = in_flight_control
-            .as_ref()
-            .is_some_and(|control| control.holds_launches);
+        let slot_blocks_lifecycle = in_flight_control.holds_launches();
         loop {
             let Some(item) = pending.front() else {
                 break;
@@ -3493,7 +3405,7 @@ impl BatchScheduler {
                     // it.
                     if Self::rotate_launch_for_wave_work(
                         pending,
-                        in_flight_control.is_none(),
+                        in_flight_control.is_empty(),
                         !slot_blocks_lifecycle,
                     ) {
                         progress = true;
@@ -3511,7 +3423,8 @@ impl BatchScheduler {
                     // pipelines' credits ragged (V6 iteration 3).
                     // A close needs no control slot either (see
                     // `slot_blocks_lifecycle`), only its own instance
-                    // quiesced.
+                    // quiesced — a settling standalone copy addresses
+                    // grant-pinned pages no close can name.
                     if slot_blocks_lifecycle {
                         break;
                     }
@@ -3521,13 +3434,8 @@ impl BatchScheduler {
                         // progress (a rotation changes nothing dispatchable;
                         // the bind-completed lane reply that empties
                         // `pending_binds` is the wake that re-checks).
-                        let rot_t = probe_disp.then(Instant::now);
                         let rot_stop = close_rotations >= pending.len()
                             || !pending.iter().skip(1).any(Self::rotation_target);
-                        if let Some(t) = rot_t {
-                            rot_ns += t.elapsed().as_nanos() as u64;
-                            rot_n += 1;
-                        }
                         if rot_stop {
                             break;
                         }
@@ -3536,15 +3444,10 @@ impl BatchScheduler {
                         pending.push_back(item);
                         continue;
                     }
-                    let busy_t = probe_disp.then(Instant::now);
                     let busy = instances
                         .get(&id)
                         .is_some_and(|tracked| tracked.in_flight != 0)
                         || Self::instance_has_queued_work(pending, id);
-                    if let Some(t) = busy_t {
-                        busy_ns += t.elapsed().as_nanos() as u64;
-                        busy_n += 1;
-                    }
                     if !busy {
                         let item = pending.pop_front().expect("close front");
                         Self::post_control(
@@ -3573,7 +3476,6 @@ impl BatchScheduler {
                     // spin: at a cohort boundary the queue front is hundreds
                     // of busy closes, so every pass rotated the whole queue
                     // and the loop paid it thousands of times over.
-                    let rot_t = probe_disp.then(Instant::now);
                     let rot_stop = close_rotations >= pending.len()
                         || !pending.iter().skip(1).any(|item| {
                             !matches!(
@@ -3581,10 +3483,6 @@ impl BatchScheduler {
                                 QueuedItem::CloseInstance { .. } | QueuedItem::CloseChannels { .. }
                             )
                         });
-                    if let Some(t) = rot_t {
-                        rot_ns += t.elapsed().as_nanos() as u64;
-                        rot_n += 1;
-                    }
                     if rot_stop {
                         break;
                     }
@@ -3595,13 +3493,8 @@ impl BatchScheduler {
                 QueuedItem::CloseChannels { .. } if hold_closes => {
                     // Same bounded rotation as a held instance close; no
                     // progress claim (see the CloseInstance hold branch).
-                    let rot_t = probe_disp.then(Instant::now);
                     let rot_stop = close_rotations >= pending.len()
                         || !pending.iter().skip(1).any(Self::rotation_target);
-                    if let Some(t) = rot_t {
-                        rot_ns += t.elapsed().as_nanos() as u64;
-                        rot_n += 1;
-                    }
                     if rot_stop {
                         break;
                     }
@@ -3609,33 +3502,14 @@ impl BatchScheduler {
                     let item = pending.pop_front().expect("close front");
                     pending.push_back(item);
                 }
-                // A standalone copy waiting out the control slot must not sit
-                // on the front and block the lifecycle controls behind it:
-                // copies dispatch out of band from ANY queue position (see
-                // the scan below the loop), so their position is free to
-                // give up. Bounded, and no progress claim — a rotation
-                // dispatches nothing (same discipline as a held close).
-                _ if in_flight_control.is_some() && Self::standalone_copy(item) => {
-                    if close_rotations >= pending.len()
-                        || !pending.iter().skip(1).any(Self::lifecycle_control)
-                    {
-                        break;
-                    }
-                    close_rotations += 1;
-                    let item = pending.pop_front().expect("copy front");
-                    pending.push_back(item);
-                }
-                // Single control slot: a settling copy/resize blocks the
-                // next control that NEEDS the slot (the slot only ever holds
-                // async-completing controls now — lifecycle controls execute
-                // on the lane without occupying it, their driver order
-                // guaranteed by the lane FIFO, so they pass a standalone
-                // copy freely).
-                _ if slot_blocks_lifecycle
-                    || (in_flight_control.is_some() && !Self::lifecycle_control(item)) =>
-                {
-                    break;
-                }
+                // A settling exclusive control (a `PreLaunchCopy` or a
+                // pool resize) blocks the next control. Standalone copies and
+                // lifecycle controls are refused by nothing else — see
+                // `InFlightControls::admits`. The front-rotation this arm used
+                // to need is gone with the single slot: a copy that cannot post
+                // is blocked by an exclusive control, and so is everything
+                // behind it, so giving up its position buys nothing.
+                _ if !in_flight_control.admits(item) => break,
                 _ if !in_flight_launches.is_empty() && !Self::pipe_concurrent_control(item) => {
                     break;
                 }
@@ -3663,11 +3537,20 @@ impl BatchScheduler {
         // copies ARE the residency planner's forward progress — leaving
         // them positional starved the very traffic that unsticks a held
         // frame (CONTENTION_FOLLOWUP.md §12).
-        let copy_t = probe_disp.then(Instant::now);
-        if in_flight_control.is_none()
-            && let Some(index) = pending.iter().position(|item| Self::standalone_copy(item))
-            && let Some(item) = pending.remove(index)
-        {
+        //
+        // They also pipeline: the sweep keeps posting while no exclusive
+        // control holds the set, so a restore never waits out an unrelated
+        // copy's device time. Serialized, the wait WAS the cost — 22.8 ms
+        // per H2D restore against ~3.3 ms of transfer at 512-way
+        // contention. The queue bounds the depth: only what the planner
+        // enqueued can be posted.
+        while in_flight_control.admits_copy() {
+            let Some(index) = pending.iter().position(|item| Self::standalone_copy(item)) else {
+                break;
+            };
+            let Some(item) = pending.remove(index) else {
+                break;
+            };
             Self::post_control(
                 driver_lane,
                 lane_inflight,
@@ -3678,15 +3561,6 @@ impl BatchScheduler {
                 item,
             );
             progress = true;
-        }
-        if let Some(t) = copy_t {
-            let acc = &super::LOOP_PHASES;
-            acc.disp_copy_ns
-                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            acc.disp_rot_ns.fetch_add(rot_ns, Ordering::Relaxed);
-            acc.disp_rot_n.fetch_add(rot_n, Ordering::Relaxed);
-            acc.disp_busy_ns.fetch_add(busy_ns, Ordering::Relaxed);
-            acc.disp_busy_n.fetch_add(busy_n, Ordering::Relaxed);
         }
         (progress, wait_hint)
     }
@@ -3720,7 +3594,7 @@ impl BatchScheduler {
         lane_inflight: &mut u64,
         lane_token: &mut u64,
         instances: &mut HashMap<u64, TrackedInstance>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         frame_policy: &mut FramePolicy,
         item: QueuedItem,
     ) {
@@ -3809,11 +3683,12 @@ impl BatchScheduler {
         }
         *lane_token += 1;
         let token = *lane_token;
-        // Async-completing controls hold the single control slot from POST:
-        // the copy's coupled consumer launch (and any later control) must
-        // not pass it, exactly as before the lane existed. Exactly the
-        // standalone copies do NOT hold launches — one classification,
-        // shared with the out-of-band dispatch that relies on it.
+        // Async-completing controls enter the in-flight set from POST: an
+        // exclusive one (the copy's coupled consumer launch, a resize) must
+        // not be passed by any later control, exactly as before the lane
+        // existed. Exactly the standalone copies do NOT hold launches — one
+        // classification, shared with the out-of-band dispatch and the
+        // concurrency rule in `InFlightControls` that both rely on it.
         let holds_launches = !Self::standalone_copy(&item);
         match &item {
             QueuedItem::PreLaunchCopy {
@@ -3822,7 +3697,7 @@ impl BatchScheduler {
                 process_id,
                 pipeline_id,
             } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: Some(logical_completion.clone()),
                     process_id: *process_id,
@@ -3833,7 +3708,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyKv { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -3844,7 +3719,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyKvTracked { completion, .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -3855,7 +3730,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::CopyState { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -3866,7 +3741,7 @@ impl BatchScheduler {
                 });
             }
             QueuedItem::ResizePool { .. } => {
-                *in_flight_control = Some(PendingControl {
+                in_flight_control.push(PendingControl {
                     state: ControlSlotState::Posted { token },
                     logical_completion: None,
                     process_id: None,
@@ -3954,7 +3829,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &Option<PendingControl>,
+        in_flight_control: &InFlightControls,
         page_size: u32,
         limits: SchedulerLimits,
         stats: &Arc<SchedulerStats>,
@@ -3972,28 +3847,17 @@ impl BatchScheduler {
             // frames under it. A settling standalone copy holds nothing
             // (`PendingControl::holds_launches`) — frames keep posting
             // while suspend/restore traffic settles.
-            if in_flight_control
-                .as_ref()
-                .is_some_and(|control| control.holds_launches)
-            {
+            if in_flight_control.holds_launches() {
                 break;
             }
             // Run-ahead depth in FRAMES: the enqueue horizon. Retirement
             // frees a slot; posting never waits on completion beyond this
             // backpressure.
-            if in_flight_launches.len() >= frame::configured_max_in_flight() {
+            if in_flight_launches.len() >= frame::configured_dispatch_depth() {
                 break;
             }
             let now = Instant::now();
-            let probe = super::fire_timing_enabled();
             let scan = Self::scan_queue(scan_cache, pending, stopping);
-            if probe {
-                let acc = &super::LOOP_PHASES;
-                acc.scan_ns
-                    .fetch_add(now.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                acc.scans.fetch_add(1, Ordering::Relaxed);
-            }
-            let plan_started = probe.then(Instant::now);
             let mut rider_batch = false;
             let waves: Vec<Vec<u64>> = if stopping {
                 // Shutdown drain: the boundary gate waits for arrivals that
@@ -4023,22 +3887,28 @@ impl BatchScheduler {
                     }
                     FramePlan::Park => break,
                     FramePlan::Terminate(pids) => {
-                        // Submit-deadline breach. The policy has already
-                        // dropped these lanes from the wait-set, so the
+                        // Abandoned pipeline. This is NOT the submit
+                        // deadline: that one only leashes (drops the lane
+                        // from the wait-set and lets it rejoin), so a guest
+                        // that is merely slow never lands here. Reaching this
+                        // means the lane was silent for the whole silence
+                        // timeout without ever calling `forward.park()`, so
+                        // nothing but a wedged process is being reclaimed.
+                        // The policy has already dropped these lanes, so the
                         // `continue` re-plans a gather that no longer waits
-                        // on them; the terminate itself is asynchronous and
-                        // arrives back as the usual leave.
+                        // on them; the terminate is asynchronous and arrives
+                        // back as the usual leave.
                         for pid in pids {
                             tracing::error!(
                                 pid = %pid,
-                                "scheduler: terminating process for submit-deadline breach \
-                                 (held the frame wait-set without submitting; a pipeline that \
-                                 intends to stop must call forward.park())"
+                                "scheduler: terminating abandoned pipeline (silent for the \
+                                 whole silence timeout without submitting and without \
+                                 calling forward.park())"
                             );
                             crate::inferlet::process::terminate(
                                 pid,
-                                Err("submit deadline exceeded: the pipeline held a frame's \
-                                     wait-set without submitting and without parking"
+                                Err("pipeline abandoned: silent past the silence timeout \
+                                     without submitting and without parking"
                                     .to_string()),
                             );
                         }
@@ -4046,12 +3916,6 @@ impl BatchScheduler {
                     }
                 }
             };
-            if let Some(plan_started) = plan_started {
-                super::LOOP_PHASES
-                    .plan_ns
-                    .fetch_add(plan_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-            let post_started = probe.then(Instant::now);
             #[allow(clippy::let_and_return)]
             let (frame_progress, posted) = Self::post_frame(
                 slot_buffer,
@@ -4066,11 +3930,6 @@ impl BatchScheduler {
                 stats,
                 &waves,
             );
-            if let Some(post_started) = post_started {
-                super::LOOP_PHASES
-                    .post_ns
-                    .fetch_add(post_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
             progress |= frame_progress;
             if !posted {
                 if stopping || !frame_progress {
@@ -4089,12 +3948,6 @@ impl BatchScheduler {
     /// settled/stale, assemble the v14 frame submission, and post it as ONE
     /// launch. Returns (progress, posted-a-frame).
     #[allow(clippy::too_many_arguments)]
-    /// Cached so the frame path does not pay an environment lookup per frame.
-    fn frame_shape_trace() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("PIE_FRAME_SHAPE").is_some())
-    }
-
     /// Whether a queued fire still belongs in the frame being built; settles
     /// it with a rejection if not.
     fn admits_to_frame(
@@ -4133,7 +3986,6 @@ impl BatchScheduler {
         waves: &[Vec<u64>],
     ) -> (bool, bool) {
         let mut progress = false;
-        let sub = super::fire_timing_enabled().then(Instant::now);
         // One map, carrying BOTH the wave and the in-wave position: the
         // position is the sealed wave's id order (lane admission order), so
         // carrying it here lets the sort below compare plain integers. The
@@ -4148,14 +4000,7 @@ impl BatchScheduler {
                 slot_of.insert(fire_id, (index, position));
             }
         }
-        let t_drain = sub.map(|t| {
-            super::LOOP_PHASES
-                .post_map_ns
-                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            Instant::now()
-        });
         let mut kept: VecDeque<QueuedItem> = VecDeque::with_capacity(pending.len());
-        let drained = pending.len() as u64;
         // Place by slot rather than push-then-sort. `position` is already a
         // permutation of `0..wave.len()`, so the sealed order is recovered by
         // writing each request straight into its slot: one move per fire,
@@ -4189,13 +4034,6 @@ impl BatchScheduler {
             }
         }
         pending.replace(kept);
-        let t_filter = t_drain.map(|t| {
-            let acc = &super::LOOP_PHASES;
-            acc.post_drain_ns
-                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            acc.post_drain_n.fetch_add(drained, Ordering::Relaxed);
-            Instant::now()
-        });
         // Compact the slots and drop settled/cancelled/stale fires in one
         // pass — the frame posts without them.
         let mut survivors: Vec<Vec<Box<PendingRequest>>> = Vec::with_capacity(waves.len());
@@ -4217,77 +4055,16 @@ impl BatchScheduler {
                 progress = true;
             }
         }
-        if let Some(t) = t_filter {
-            super::LOOP_PHASES
-                .post_filter_ns
-                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
         if survivors.iter().all(Vec::is_empty) {
             return (progress, false);
         }
-        let t_tail = sub.map(|_| Instant::now());
-        let timing_enabled = super::fire_timing_enabled();
-        let dispatch_started_us = timing_enabled.then(super::fire_timing_now_us);
-        if let Some(now_us) = dispatch_started_us {
-            for request in survivors.iter_mut().flatten() {
-                if let Some(timing) = request.timing.as_mut()
-                    && timing.ready_us.is_none()
-                {
-                    timing.ready_us = Some(now_us);
-                }
-            }
-        }
-        let nonempty_waves = survivors.iter().filter(|w| !w.is_empty()).count();
         let (submission, requests) =
             batch::build_frame_submission(survivors, limits, page_size, stats);
-        // How many waves a sealed frame actually carries. ABI v14 has a frame
-        // carry k steps the driver runs as one closed system, and the guest does
-        // submit `live_slots` fires per frame -- but this reports
-        // `nonempty_waves=1` at every k, so each fire becomes its own frame and
-        // every decode step pays a host round trip (2.31ms of a 25.6ms step at
-        // 32 lanes, measured driver-side with PIE_METAL_GPU_METER).
-        if Self::frame_shape_trace() {
-            use std::sync::atomic::{AtomicU64, Ordering as O};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let n = N.fetch_add(1, O::Relaxed) + 1;
-            if n % 256 == 0 {
-                eprintln!(
-                    "[frame-shape] n={n} nonempty_waves={nonempty_waves} steps={}",
-                    submission.steps.len()
-                );
-            }
-        }
         let batch_size = requests.len() as u64;
         let total_tokens = requests
             .iter()
             .map(|req| req.request.token_ids.len())
             .sum::<usize>();
-        let batch_built_us = timing_enabled.then(super::fire_timing_now_us);
-        let membership_hash = if timing_enabled {
-            fire_membership_hash(requests.iter().map(|request| &request.logical_fire_id))
-        } else {
-            0
-        };
-        let wave_timing = dispatch_started_us.map(|dispatch_started_us| WaveTimingState {
-            wave_id: 0,
-            membership_hash,
-            dispatch_started_us,
-            batch_built_us: batch_built_us.unwrap_or(dispatch_started_us),
-            driver_started_us: dispatch_started_us,
-            launch_returned_us: dispatch_started_us,
-            decision_us: 0,
-            active_pipelines: 0,
-            missing_pipelines: 0,
-            candidate_count: requests.len(),
-            deferred_pipelines: 0,
-            depth_capped_pipelines: 0,
-        });
-        if let Some(t) = t_tail {
-            super::LOOP_PHASES
-                .post_tail_ns
-                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
-        let t_tail = sub.map(|_| Instant::now());
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
                 instance.in_flight += 1;
@@ -4301,32 +4078,18 @@ impl BatchScheduler {
             started: Instant::now(),
             batch_size,
             total_tokens,
-            timing: wave_timing,
         });
         *lane_inflight += 1;
         driver_lane.post(LaneRequest::Launch {
             token,
             submission: LaneLaunch(submission),
         });
-        if super::sched_trace_enabled() {
-            super::sched_trace_write(format_args!(
-                "frame dispatched={batch_size} tokens={total_tokens} pending={} in_flight={}",
-                pending.len(),
-                in_flight_launches.len(),
-            ));
-        }
-        if let Some(t) = t_tail {
-            super::LOOP_PHASES
-                .post_tail_ns
-                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        }
         (true, true)
     }
 
     fn retire_ready_launches(
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         instances: &mut HashMap<u64, TrackedInstance>,
-        pending: &mut PendingQueue,
         stats: &Arc<SchedulerStats>,
         frame_policy: &mut FramePolicy,
     ) -> bool {
@@ -4355,42 +4118,12 @@ impl BatchScheduler {
             // deadline from here so the wave they waited on is not charged
             // to them (see `FramePolicy::on_frame_retired`).
             frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
-            let native_complete_us = retired.timing.as_ref().map(|_| super::fire_timing_now_us());
-            let timing_snapshots = retired
-                .timing
-                .as_ref()
-                .map(|_| Self::fire_timing_snapshots(&retired.requests));
-            let sub = super::fire_timing_enabled().then(Instant::now);
             for request in &retired.requests {
                 if let Some(instance) = instances.get_mut(&request.instance_id) {
                     instance.in_flight = instance.in_flight.saturating_sub(1);
                 }
             }
-            if let Some(mark) = sub {
-                let acc = &super::LOOP_PHASES;
-                acc.retire_instances_ns
-                    .fetch_add(mark.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                acc.retire_n
-                    .fetch_add(retired.requests.len() as u64, Ordering::Relaxed);
-            }
             if let Some(message) = launch_failure {
-                if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
-                    (retired.timing, native_complete_us, timing_snapshots)
-                {
-                    let settled_us = super::fire_timing_now_us();
-                    Self::emit_fire_timing(
-                        &snapshots,
-                        timing,
-                        false,
-                        native_complete_us,
-                        settled_us,
-                        &vec!["launch_error"; snapshots.len()],
-                        retired.batch_size,
-                        retired.total_tokens,
-                        Self::queued_untracked_riders(pending),
-                        &[],
-                    );
-                }
                 let message = format!("direct launch rejected: {message}");
                 for request in &retired.requests {
                     request.completion.reject_unsubmitted(message.clone());
@@ -4401,30 +4134,15 @@ impl BatchScheduler {
             let result = result.expect("accepted batch carries a settled result");
             match result {
                 Ok(()) => {
-                    let t_mark = sub.map(|_| Instant::now());
                     for request in &retired.requests {
                         request.completion.mark_native_retired();
                     }
-                    let t_resolve = t_mark.map(|t| {
-                        super::LOOP_PHASES
-                            .retire_mark_ns
-                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        Instant::now()
-                    });
-                    if retired.timing.is_some() {
-                        super::LAST_RESOLVE_US
-                            .store(super::fire_timing_now_us(), Ordering::Relaxed);
-                    }
                     let requests = std::mem::take(&mut retired.requests);
                     let mut outcomes = Vec::with_capacity(requests.len());
-                    let mut token_instance_ids = Vec::new();
                     for request in &requests {
                         match request.completion.resolve_from_terminal() {
                             Ok(WorkItemAttemptOutcome::Committed) => {
                                 outcomes.push("committed");
-                                if !request.request.sampling_indices.is_empty() {
-                                    token_instance_ids.push(request.instance_id);
-                                }
                             }
                             Ok(WorkItemAttemptOutcome::Failed) => {
                                 outcomes.push("failed");
@@ -4455,41 +4173,7 @@ impl BatchScheduler {
                             }
                         }
                     }
-                    let t_drop = t_resolve.map(|t| {
-                        super::LOOP_PHASES
-                            .retire_resolve_ns
-                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        Instant::now()
-                    });
                     drop(requests);
-                    let t_emit = t_drop.map(|t| {
-                        super::LOOP_PHASES
-                            .retire_drop_ns
-                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        Instant::now()
-                    });
-                    if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
-                        (retired.timing, native_complete_us, timing_snapshots)
-                    {
-                        let settled_us = super::fire_timing_now_us();
-                        Self::emit_fire_timing(
-                            &snapshots,
-                            timing,
-                            true,
-                            native_complete_us,
-                            settled_us,
-                            &outcomes,
-                            retired.batch_size,
-                            retired.total_tokens,
-                            Self::queued_untracked_riders(pending),
-                            &token_instance_ids,
-                        );
-                    }
-                    if let Some(t) = t_emit {
-                        super::LOOP_PHASES
-                            .retire_emit_ns
-                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    }
                     stats::record_fire_stats(
                         stats,
                         retired.started.elapsed(),
@@ -4499,23 +4183,6 @@ impl BatchScheduler {
                 }
 
                 Err(err) => {
-                    if let (Some(timing), Some(native_complete_us), Some(snapshots)) =
-                        (retired.timing, native_complete_us, timing_snapshots)
-                    {
-                        let settled_us = super::fire_timing_now_us();
-                        Self::emit_fire_timing(
-                            &snapshots,
-                            timing,
-                            true,
-                            native_complete_us,
-                            settled_us,
-                            &vec!["completion_error"; snapshots.len()],
-                            retired.batch_size,
-                            retired.total_tokens,
-                            Self::queued_untracked_riders(pending),
-                            &[],
-                        );
-                    }
                     tracing::warn!(?err, "direct launch completion closed before callback");
                     for request in &retired.requests {
                         request.completion.reject(format!(
@@ -4533,329 +4200,41 @@ impl BatchScheduler {
     }
 
     /// Unstamped (rider) launches currently queued — the fire-timing
-    /// `untracked_ready` gauge. Riders dispatch outside sealed waves, so a
-    /// monotonic climb here means untracked work is starving behind the
-    /// fleet (the successor of the old quorum W1 leak gate).
-    fn queued_untracked_riders(pending: &VecDeque<QueuedItem>) -> usize {
-        pending
-            .iter()
-            .filter(|item| matches!(item, QueuedItem::Launch(request) if request.frame.is_none()))
-            .count()
-    }
-
-    fn fire_timing_snapshots(requests: &[Box<PendingRequest>]) -> Vec<FireTimingSnapshot> {
-        requests
-            .iter()
-            .enumerate()
-            .filter_map(|(outcome_index, request)| {
-                request.timing.map(|timing| FireTimingSnapshot {
-                    outcome_index,
-                    logical_fire_id: request.logical_fire_id,
-                    instance_id: request.instance_id,
-                    process_id: request.process_id,
-                    sampled_rows: request.request.sampling_indices.len(),
-                    timing,
-                })
-            })
-            .collect()
-    }
-
-    fn emit_fire_timing(
-        requests: &[FireTimingSnapshot],
-        timing: WaveTimingState,
-        cuda_submitted: bool,
-        native_complete_us: u64,
-        settled_us: u64,
-        outcomes: &[&str],
-        batch_size: u64,
-        total_tokens: usize,
-        untracked_ready: usize,
-        token_instance_ids: &[u64],
-    ) {
-        let committed = outcomes
-            .iter()
-            .filter(|&&outcome| outcome == "committed")
-            .count();
-        let retried = outcomes
-            .iter()
-            .filter(|&&outcome| outcome == "retry")
-            .count();
-        let failed = outcomes.len().saturating_sub(committed + retried);
-        let acc = &super::LOOP_PHASES;
-        let take = |cell: &std::sync::atomic::AtomicU64| cell.swap(0, Ordering::Relaxed);
-        let (loop_mailbox, loop_retire, loop_dispatch, loop_park) = (
-            take(&acc.mailbox_ns) / 1_000,
-            take(&acc.retire_ns) / 1_000,
-            take(&acc.dispatch_ns) / 1_000,
-            take(&acc.park_ns) / 1_000,
-        );
-        let (loop_passes, loop_items) = (take(&acc.passes), take(&acc.mailbox_items));
-        let (loop_lag, loop_lag_max, loop_lag_n, loop_pass_max) = (
-            take(&acc.lag_ns) / 1_000,
-            take(&acc.lag_max_ns) / 1_000,
-            take(&acc.lag_n),
-            take(&acc.pass_max_ns) / 1_000,
-        );
-        let mut subs: Vec<u64> = requests.iter().map(|r| r.timing.submitted_us).collect();
-        subs.sort_unstable();
-        let pick = |q: usize| subs.get(subs.len() * q / 100).copied().unwrap_or(0);
-        let sub_min = subs.first().copied().unwrap_or(0);
-        let sub_max = subs.last().copied().unwrap_or(0);
-        let (sub_p50, sub_p90) = (pick(50), pick(90));
-        let sub_lanes: Vec<serde_json::Value> = requests
-            .iter()
-            .map(|r| {
-                serde_json::json!([
-                    r.instance_id,
-                    timing
-                        .dispatch_started_us
-                        .saturating_sub(r.timing.submitted_us)
-                ])
-            })
-            .collect();
-        let enq_max = requests
-            .iter()
-            .filter_map(|r| r.timing.enqueued_us)
-            .max()
-            .unwrap_or(0);
-        let gacc = &super::GUEST_PHASES;
-        let (wake_woken, wake_empty) = (take(&gacc.wake_woken), take(&gacc.wake_empty));
-        let (guest_resume, guest_resume_max, guest_resume_n) = (
-            take(&gacc.resume_ns) / 1_000,
-            take(&gacc.resume_max_ns) / 1_000,
-            take(&gacc.resume_n),
-        );
-        let (guest_wake, guest_work, guest_work_max, guest_n) = (
-            take(&gacc.wake_ns) / 1_000,
-            take(&gacc.work_ns) / 1_000,
-            take(&gacc.work_max_ns) / 1_000,
-            take(&gacc.n),
-        );
-        let (retire_instances, retire_mark, retire_resolve, retire_drop, retire_emit, retire_n) = (
-            take(&acc.retire_instances_ns) / 1_000,
-            take(&acc.retire_mark_ns) / 1_000,
-            take(&acc.retire_resolve_ns) / 1_000,
-            take(&acc.retire_drop_ns) / 1_000,
-            take(&acc.retire_emit_ns) / 1_000,
-            take(&acc.retire_n),
-        );
-        let (loop_scan, loop_plan, loop_post, loop_scans) = (
-            take(&acc.scan_ns) / 1_000,
-            take(&acc.plan_ns) / 1_000,
-            take(&acc.post_ns) / 1_000,
-            take(&acc.scans),
-        );
-        let (post_map, post_drain, post_filter, post_tail, post_drain_n) = (
-            take(&acc.post_map_ns) / 1_000,
-            take(&acc.post_drain_ns) / 1_000,
-            take(&acc.post_filter_ns) / 1_000,
-            take(&acc.post_tail_ns) / 1_000,
-            take(&acc.post_drain_n),
-        );
-        let (disp_frame, disp_rot, disp_rot_n, disp_busy, disp_busy_n, disp_copy) = (
-            take(&acc.disp_frame_ns) / 1_000,
-            take(&acc.disp_rot_ns) / 1_000,
-            take(&acc.disp_rot_n),
-            take(&acc.disp_busy_ns) / 1_000,
-            take(&acc.disp_busy_n),
-            take(&acc.disp_copy_ns) / 1_000,
-        );
-        let mut record = serde_json::json!({
-            "schema": 1,
-            "source": "scheduler",
-            "event": "scheduler_wave",
-            "planner_parks_total": crate::planner::planner()
-                .map(|planner| planner.park_census().0)
-                .unwrap_or(0),
-            "planner_parked_now": crate::planner::planner()
-                .map(|planner| planner.park_census().1)
-                .unwrap_or(0),
-            "wave_id": timing.wave_id,
-            "membership_hash": timing.membership_hash,
-            "cuda_submitted": cuda_submitted,
-            "fire_count": batch_size,
-            "batch_size": batch_size,
-            "tokens": total_tokens,
-            "committed": committed,
-            "retried": retried,
-            "failed": failed,
-            "dispatch_started_us": timing.dispatch_started_us,
-            "batch_built_us": timing.batch_built_us,
-            "driver_started_us": timing.driver_started_us,
-            "launch_returned_us": timing.launch_returned_us,
-            "native_complete_us": native_complete_us,
-            "settled_us": settled_us,
-            "batch_build_us": timing
-                .batch_built_us
-                .saturating_sub(timing.dispatch_started_us),
-            "driver_submit_us": timing
-                .launch_returned_us
-                .saturating_sub(timing.driver_started_us),
-            "native_inflight_us": native_complete_us
-                .saturating_sub(timing.launch_returned_us),
-            "retire_settle_us": settled_us.saturating_sub(native_complete_us),
-            "decision_us": timing.decision_us,
-            "active_pipelines": timing.active_pipelines,
-            "missing_pipelines": timing.missing_pipelines,
-            "candidate_count": timing.candidate_count,
-            "deferred_pipelines": timing.deferred_pipelines,
-            "depth_capped_pipelines": timing.depth_capped_pipelines,
-            // Queued rider gauge: unstamped launches awaiting dispatch
-            // outside the sealed waves (0 in an all-tracked fleet).
-            "untracked_ready": untracked_ready,
-        });
-        if let Some(object) = record.as_object_mut() {
-            for (key, value) in [
-                ("loop_mailbox_us", loop_mailbox),
-                ("loop_retire_us", loop_retire),
-                ("loop_dispatch_us", loop_dispatch),
-                ("loop_park_us", loop_park),
-                ("loop_passes", loop_passes),
-                ("loop_items", loop_items),
-                ("loop_scan_us", loop_scan),
-                ("loop_plan_us", loop_plan),
-                ("loop_post_us", loop_post),
-                ("post_map_us", post_map),
-                ("post_drain_us", post_drain),
-                ("post_filter_us", post_filter),
-                ("post_tail_us", post_tail),
-                ("post_drain_n", post_drain_n),
-                ("retire_instances_us", retire_instances),
-                ("retire_mark_us", retire_mark),
-                ("retire_resolve_us", retire_resolve),
-                ("retire_drop_us", retire_drop),
-                ("retire_emit_us", retire_emit),
-                ("retire_n", retire_n),
-                ("loop_scans", loop_scans),
-                ("disp_frame_us", disp_frame),
-                ("disp_rot_us", disp_rot),
-                ("disp_rot_n", disp_rot_n),
-                ("disp_busy_us", disp_busy),
-                ("disp_busy_n", disp_busy_n),
-                ("disp_copy_us", disp_copy),
-                (
-                    "loop_lag_us",
-                    if loop_lag_n > 0 {
-                        loop_lag / loop_lag_n
-                    } else {
-                        0
-                    },
-                ),
-                ("loop_lag_max_us", loop_lag_max),
-                ("loop_lag_n", loop_lag_n),
-                ("loop_pass_max_us", loop_pass_max),
-                ("sub_min_us", sub_min),
-                ("sub_max_us", sub_max),
-                (
-                    "guest_wake_us",
-                    if guest_n > 0 { guest_wake / guest_n } else { 0 },
-                ),
-                (
-                    "guest_work_us",
-                    if guest_n > 0 { guest_work / guest_n } else { 0 },
-                ),
-                ("guest_work_max_us", guest_work_max),
-                ("guest_n", guest_n),
-                (
-                    "guest_resume_us",
-                    if guest_resume_n > 0 {
-                        guest_resume / guest_resume_n
-                    } else {
-                        0
-                    },
-                ),
-                ("guest_resume_max_us", guest_resume_max),
-                ("wake_woken", wake_woken),
-                ("wake_empty", wake_empty),
-                ("sub_p50_us", sub_p50),
-                ("sub_p90_us", sub_p90),
-                ("enq_max_us", enq_max),
-            ] {
-                object.insert(key.to_string(), serde_json::json!(value));
-            }
-        }
-        if std::env::var_os("PIE_WAVE_LANES").is_some() {
-            record["sub_lanes"] = serde_json::Value::Array(sub_lanes);
-        }
-        if super::ledger_timing_enabled() {
-            record["token_instance_ids"] = serde_json::json!(token_instance_ids);
-        }
-        super::fire_timing_write(&record);
-        if !super::fire_timing_per_fire() {
-            return;
-        }
-        for request in requests {
-            let outcome = outcomes
-                .get(request.outcome_index)
-                .copied()
-                .unwrap_or("unknown");
-            let fire = request.timing;
-            super::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "scheduler",
-                "event": "scheduler_fire",
-                "wave_id": timing.wave_id,
-                "logical_fire_id": request.logical_fire_id,
-                "instance_id": request.instance_id,
-                "process_id": request.process_id,
-                "sampled_rows": request.sampled_rows,
-                "attempt": 1,
-                "preparation_retries": 0,
-                "outcome": outcome,
-                "submitted_us": fire.submitted_us,
-                "enqueued_us": fire.enqueued_us,
-                "prepare_started_us": null,
-                "prepared_us": null,
-                "ready_us": fire.ready_us,
-                "native_complete_us": native_complete_us,
-                "settled_us": settled_us,
-                "submit_to_enqueue_us": fire
-                    .enqueued_us
-                    .map(|value| value.saturating_sub(fire.submitted_us)),
-                "prepare_us": 0,
-                "ready_to_dispatch_us": fire.ready_us
-                    .map(|ready| timing.dispatch_started_us.saturating_sub(ready)),
-            }));
-        }
-    }
-
-    fn retire_ready_control(in_flight_control: &mut Option<PendingControl>) -> bool {
-        let operation = in_flight_control
-            .as_ref()
-            .map(|pending| pending.operation)
-            .unwrap_or("control operation");
-        let Some(result) = in_flight_control
-            .as_ref()
-            .and_then(|pending| match &pending.state {
+    /// Retire every settled control this pass. Concurrent standalone copies
+    /// settle in device order, not post order, so the sweep cannot stop at
+    /// the first control that is still outstanding.
+    fn retire_ready_control(in_flight_control: &mut InFlightControls) -> bool {
+        let mut retired = false;
+        let mut index = 0;
+        while index < in_flight_control.settling.len() {
+            let ready = match &in_flight_control.settling[index].state {
                 // Still waiting for the lane's reply to install the driver
-                // completion (or clear the slot on rejection).
+                // completion (or drop the entry on rejection).
                 ControlSlotState::Posted { .. } => None,
                 ControlSlotState::Ready(completion) => completion.check(),
-            })
-        else {
-            return false;
-        };
-        if let Some(tracked) = in_flight_control
-            .as_ref()
-            .and_then(|pending| pending.tracked_completion.as_ref())
-        {
-            tracked.resolve(&result);
-        }
-        if let Err(ref err) = result {
-            tracing::warn!(
-                ?err,
-                operation,
-                "direct control completion closed before callback"
-            );
-            if let Some(logical) = in_flight_control
-                .as_ref()
-                .and_then(|pending| pending.logical_completion.as_ref())
-            {
-                logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
+            };
+            let Some(result) = ready else {
+                index += 1;
+                continue;
+            };
+            let pending = in_flight_control.settling.remove(index);
+            let operation = pending.operation;
+            if let Some(tracked) = pending.tracked_completion.as_ref() {
+                tracked.resolve(&result);
             }
+            if let Err(ref err) = result {
+                tracing::warn!(
+                    ?err,
+                    operation,
+                    "direct control completion closed before callback"
+                );
+                if let Some(logical) = pending.logical_completion.as_ref() {
+                    logical.reject_unsubmitted(format!("pre-launch {operation} failed: {err:#}"));
+                }
+            }
+            retired = true;
         }
-        *in_flight_control = None;
-        true
+        retired
     }
 
     /// Apply a driver-lane reply on the worker thread: fill in a posted
@@ -4865,19 +4244,14 @@ impl BatchScheduler {
         reply: LaneReply,
         lane_inflight: &mut u64,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        in_flight_control: &mut Option<PendingControl>,
+        in_flight_control: &mut InFlightControls,
         instances: &mut HashMap<u64, TrackedInstance>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &crossbeam::channel::Sender<SchedulerItem>,
     ) {
         *lane_inflight = lane_inflight.saturating_sub(1);
         match reply {
-            LaneReply::LaunchDone {
-                token,
-                result,
-                driver_started_us,
-                launch_returned_us,
-            } => {
+            LaneReply::LaunchDone { token, result } => {
                 let Some(batch) = in_flight_launches.iter_mut().find(
                     |batch| matches!(batch.state, LaunchState::Posted { token: t } if t == token),
                 ) else {
@@ -4901,26 +4275,9 @@ impl BatchScheduler {
                                 instance.next_target_epoch = epoch + 1;
                             }
                         }
-                        if let Some(timing) = batch.timing.as_mut() {
-                            timing.wave_id = completion.wait_id();
-                            if let Some(at) = driver_started_us {
-                                timing.driver_started_us = at;
-                            }
-                            if let Some(at) = launch_returned_us {
-                                timing.launch_returned_us = at;
-                            }
-                        }
                         batch.state = LaunchState::Accepted(completion);
                     }
                     Err(message) => {
-                        if let (Some(timing), Some(at)) =
-                            (batch.timing.as_mut(), launch_returned_us)
-                        {
-                            timing.launch_returned_us = at;
-                            if let Some(started) = driver_started_us {
-                                timing.driver_started_us = started;
-                            }
-                        }
                         batch.state = LaunchState::Failed(message);
                     }
                 }
@@ -5045,25 +4402,26 @@ impl BatchScheduler {
                     }
                 }
                 LaneCommit::AsyncControl { result } => {
-                    let holds_token = in_flight_control.as_ref().is_some_and(
-                        |control| matches!(control.state, ControlSlotState::Posted { token: t } if t == token),
-                    );
-                    if !holds_token {
+                    // Replies arrive in lane FIFO order, but several
+                    // standalone copies can be posted at once, so the reply
+                    // is matched to its own entry by token.
+                    let Some(index) = in_flight_control.position_posted(token) else {
                         tracing::error!(
                             token,
                             "lane async-control reply without a matching control slot"
                         );
                         return;
-                    }
+                    };
                     match result {
                         Ok(completion) => {
-                            if let Some(control) = in_flight_control.as_mut() {
-                                control.state = ControlSlotState::Ready(completion);
-                            }
+                            in_flight_control.settling[index].state =
+                                ControlSlotState::Ready(completion);
                         }
                         // The lane already rejected/resolved the control's
-                        // completions; the slot just frees.
-                        Err(_) => *in_flight_control = None,
+                        // completions; the entry just leaves.
+                        Err(_) => {
+                            in_flight_control.settling.remove(index);
+                        }
                     }
                 }
             },
@@ -5511,7 +4869,7 @@ mod tests {
         let (rollback_tx, rollback_rx) = crossbeam::channel::unbounded();
         let mut lane_inflight = 1;
         let mut launches = VecDeque::new();
-        let mut control = None;
+        let mut control = InFlightControls::default();
         let mut instances = HashMap::new();
         let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
 
@@ -5900,7 +5258,6 @@ mod tests {
             None,
             None,
             None,
-            false,
         );
         let mut pending: PendingQueue =
             VecDeque::from([QueuedItem::Launch(QueuedLaunch::new(Box::new(request)))]).into();
@@ -5956,7 +5313,6 @@ mod tests {
             None,
             Some(state_copy),
             None,
-            false,
         );
         let mut pending = PendingQueue::default();
         BatchScheduler::queue_attempt(&mut pending, request);
@@ -5991,7 +5347,6 @@ mod tests {
             None,
             None,
             None,
-            false,
         );
         assert!(request.preserves_inner_rows());
         assert!(request.requires_solo_submission());
@@ -6400,7 +5755,7 @@ mod tests {
         let mut lane_token = 0u64;
         let mut instances = HashMap::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let limits = SchedulerLimits {
             max_forward_requests: 64,
             max_forward_tokens: 64,
@@ -6897,7 +6252,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn two_pipelines_coalesce_into_one_wave_after_cold_hold() -> anyhow::Result<()> {
+    async fn two_pipelines_coalesce_into_one_wave() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound_a, _endpoints) = setup_scheduler_with_limits(
             DummyDriverOptions {
@@ -6915,8 +6270,7 @@ mod tests {
 
         // Submitted back-to-back, no await in between: both land in the
         // scheduler's queue before it next drains, so both `on_pipeline_
-        // request` calls land in the SAME wave-gather — no timing race
-        // with the 500us cold-hold window.
+        // request` calls land in the SAME wave-gather.
         let first = bound_a.reserve_completion();
         crate::scheduler::submit_async(
             dummy_launch(),
@@ -6936,10 +6290,10 @@ mod tests {
             second.clone(),
         )?;
 
-        // The wait-all quorum's bootstrap cold-hold gathers both pipelines'
-        // first requests into ONE dense wave (`requests=2`) instead of two
-        // solo fires — the dummy driver's launch-shape trace names the
-        // program count directly.
+        // The wait-all gate holds the seal until every member is ready, so
+        // both pipelines' first requests land in ONE dense wave
+        // (`requests=2`) instead of two solo fires — the dummy driver's
+        // launch-shape trace names the program count directly.
         let coalesced = timeout(Duration::from_secs(5), async {
             loop {
                 let hit = operation_log
@@ -7110,7 +6464,6 @@ mod tests {
                 None,
                 None,
                 None,
-                false,
             )?;
             if pipeline_id == pipeline_b {
                 timeout(Duration::from_secs(5), completion).await??;
@@ -7132,7 +6485,6 @@ mod tests {
             None,
             None,
             None,
-            false,
         )?;
         notify_pipeline_close(pipeline_a).await;
         timeout(Duration::from_secs(5), sibling).await??;
@@ -7289,7 +6641,6 @@ mod tests {
             None,
             None,
             None,
-            false,
         ))
     }
 
@@ -7364,6 +6715,31 @@ mod tests {
         assert!(
             !ordinary_group.accepts(&host_on_device, limits, 16),
             "resolved-geometry host masks remain incompatible with reordered wire rows"
+        );
+
+        // The wire rows above are an INFERENCE, not the binding. A program
+        // that binds `AttnMask` to a channel gets its dense mask resolved on
+        // device whether or not this fire also lowered BRLE rows, so the
+        // binding itself has to keep the fire solo. `cuda_runahead_concurrent`
+        // is the case: 8 pipelines of a sink/sliding-window decode program,
+        // every fire carrying BOTH wire rows and the channel binding, batched
+        // into one step that the driver rejects — the failed prepare poisons
+        // descriptor channel 0 and every stream is lost.
+        let mut bound_dense = dummy_launch_request(ProcessId::new_v4(), 6);
+        bound_dense.request.dense_device_mask = true;
+        bound_dense.request.has_user_mask = true;
+        bound_dense.request.masks = vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+        bound_dense.request.mask_indptr = vec![0, 1];
+        let mut grouping = LaunchGrouping::default();
+        assert!(
+            grouping.push(&bound_dense, limits, 16),
+            "a channel-bound dense mask seals its step even with wire rows"
+        );
+        let mut ordinary_group = LaunchGrouping::default();
+        ordinary_group.push(&dummy_launch_request(ProcessId::new_v4(), 7), limits, 16);
+        assert!(
+            !ordinary_group.accepts(&bound_dense, limits, 16),
+            "and never joins a step that already has a member"
         );
     }
 
@@ -7488,7 +6864,6 @@ mod tests {
             None,
             None,
             Some(stamp),
-            false,
         );
         let fire_id = request.logical_fire_id;
         // Row budget 1: the single-fire wave is structurally full and seals
@@ -7574,7 +6949,6 @@ mod tests {
             None,
             None,
             Some(stamp),
-            false,
         );
         let fire_id = request.logical_fire_id;
         // fires=2 with one arrival: the frame is still gathering, so the
@@ -7600,7 +6974,7 @@ mod tests {
         let mut lane_token = 0u64;
         let mut instances = HashMap::new();
         let mut in_flight_launches = VecDeque::new();
-        let mut in_flight_control = None;
+        let mut in_flight_control = InFlightControls::default();
         let limits = SchedulerLimits {
             max_forward_requests: 64,
             max_forward_tokens: 64,
@@ -7630,39 +7004,44 @@ mod tests {
             "the gathering frame must not post"
         );
         assert_eq!(
-            in_flight_control.as_ref().map(|control| control.operation),
+            in_flight_control
+                .iter()
+                .next()
+                .map(|control| control.operation),
             Some("tracked KV copy"),
             "the copy dispatches out-of-band past the launch and the resize"
         );
         assert_eq!(pending.len(), 2, "launch and resize keep their positions");
     }
 
-    /// A lifecycle control never takes the depth-1 control slot, so an
-    /// in-flight standalone copy must not delay one — nor may a queued copy
-    /// blocking the front. Under churn the planner's suspend/restore copies
-    /// are in flight nearly continuously, and gating binds on them made
-    /// every bind wait out the strict-watchdog window: the process stayed
-    /// in `staged`, `is_joining()` held the seal, and the seal held back
-    /// the very traffic the copy was settling behind.
+    /// Standalone copies pipeline instead of queueing for one slot. Nothing
+    /// queued orders against them, so the single control slot only ever made
+    /// each restore wait out the ones ahead of it: measured at 512-way KV
+    /// contention, up to 7 restores wanted the slot at once and each H2D
+    /// copy billed 22.8 ms against ~3.3 ms of transfer, while the D2H side —
+    /// which the planner already issues one at a time, so it never queued —
+    /// ran 6.7x cheaper per page. An exclusive control still takes the whole
+    /// set (the next test).
     #[test]
-    fn a_bind_dispatches_past_an_in_flight_and_a_queued_standalone_copy() {
+    fn concurrent_standalone_copies_all_dispatch_in_one_pass() {
+        let (copy_tx, _copy_rx) = tokio::sync::oneshot::channel();
+        let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
         let mut pending: PendingQueue = VecDeque::from([
             QueuedItem::CopyKvTracked {
                 plan: crate::driver::KvCopyPlan::default(),
                 completion: ControlCompletion::new(),
             },
-            QueuedItem::BindInstance {
-                pipeline_id: Some(ProcessId::new_v4()),
-                plan: InstanceBindingPlan {
-                    driver_id: 0,
-                    program_id: 0,
-                    requested_instance_id: 0,
-                    pacing_wait_id: 0,
-                    channel_ids: Vec::new(),
-                    seed_values: Vec::new(),
-                    geometry_class: pie_driver_abi::GeometryClass::Host,
-                },
-                response: tokio::sync::oneshot::channel().0,
+            QueuedItem::CopyKv {
+                plan: crate::driver::KvCopyPlan::default(),
+                response: copy_tx,
+            },
+            QueuedItem::CopyKvTracked {
+                plan: crate::driver::KvCopyPlan::default(),
+                completion: ControlCompletion::new(),
+            },
+            QueuedItem::ResizePool {
+                plan: PoolResizePlan::default(),
+                response: resize_tx,
             },
         ])
         .into();
@@ -7671,8 +7050,154 @@ mod tests {
         let mut lane_token = 0u64;
         let mut instances = HashMap::new();
         let mut in_flight_launches = VecDeque::new();
-        // The slot is taken by a settling standalone copy.
-        let mut in_flight_control = Some(PendingControl {
+        let mut in_flight_control = InFlightControls::default();
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+        let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            &mut in_flight_control,
+            16,
+            limits,
+            &stats,
+            &mut frame_policy,
+            &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
+            false,
+        );
+
+        assert!(progress);
+        assert_eq!(
+            in_flight_control.settling.len(),
+            3,
+            "every queued standalone copy is in flight after one pass"
+        );
+        assert_eq!(lane_inflight, 3, "each copy was posted to the lane");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the resize stays queued behind the settling copies"
+        );
+    }
+
+    /// The exclusivity half: an exclusive control (a `PreLaunchCopy`, whose
+    /// consumer fire is queued behind it, or a pool resize, whose pipe drain
+    /// IS its ordering mechanism) keeps the original single-slot rule in
+    /// both directions.
+    #[test]
+    fn an_exclusive_control_never_shares_the_in_flight_set() {
+        let settling = |holds_launches: bool| {
+            let mut controls = InFlightControls::default();
+            controls.push(PendingControl {
+                state: ControlSlotState::Posted { token: 1 },
+                logical_completion: None,
+                process_id: None,
+                pipeline_id: None,
+                tracked_completion: None,
+                operation: "settling",
+                holds_launches,
+            });
+            controls
+        };
+        let run = |mut in_flight_control: InFlightControls, item: QueuedItem| {
+            let mut pending: PendingQueue = VecDeque::from([item]).into();
+            let (lane, _lane_rx) = test_lane(None);
+            let mut lane_inflight = 1u64;
+            let mut lane_token = 1u64;
+            let mut instances = HashMap::new();
+            let mut in_flight_launches = VecDeque::new();
+            let limits = SchedulerLimits {
+                max_forward_requests: 64,
+                max_forward_tokens: 64,
+                max_page_refs: 64,
+            };
+            let stats = Arc::new(SchedulerStats::default());
+            let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+            BatchScheduler::dispatch_ready_items(
+                &lane,
+                &mut lane_inflight,
+                &mut lane_token,
+                &mut instances,
+                &mut pending,
+                &mut in_flight_launches,
+                &mut in_flight_control,
+                16,
+                limits,
+                &stats,
+                &mut frame_policy,
+                &mut ScanCache::default(),
+                &mut SlotBuffer::new(),
+                false,
+            );
+            (pending.len(), in_flight_control.settling.len())
+        };
+
+        assert_eq!(
+            run(
+                settling(true),
+                QueuedItem::CopyKvTracked {
+                    plan: crate::driver::KvCopyPlan::default(),
+                    completion: ControlCompletion::new(),
+                }
+            ),
+            (1, 1),
+            "a settling exclusive control admits no standalone copy"
+        );
+
+        let (resize_tx, _resize_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            run(
+                settling(false),
+                QueuedItem::ResizePool {
+                    plan: PoolResizePlan::default(),
+                    response: resize_tx,
+                }
+            ),
+            (1, 1),
+            "a resize waits for the settling copies to drain"
+        );
+    }
+
+    /// A lifecycle control never enters the in-flight set, so a settling
+    /// standalone copy must not delay one. Under churn the planner's
+    /// suspend/restore copies are in flight nearly continuously, and gating
+    /// binds on them made every bind wait out the strict-watchdog window: the
+    /// process stayed in `staged`, which pinned the cohort-boundary window
+    /// open (back when that still held the seal) and stalled the very traffic
+    /// the copy was settling behind.
+    #[test]
+    fn a_bind_dispatches_past_a_settling_standalone_copy() {
+        let mut pending: PendingQueue = VecDeque::from([QueuedItem::BindInstance {
+            pipeline_id: Some(ProcessId::new_v4()),
+            plan: InstanceBindingPlan {
+                driver_id: 0,
+                program_id: 0,
+                requested_instance_id: 0,
+                pacing_wait_id: 0,
+                channel_ids: Vec::new(),
+                seed_values: Vec::new(),
+                geometry_class: pie_driver_abi::GeometryClass::Host,
+            },
+            response: tokio::sync::oneshot::channel().0,
+        }])
+        .into();
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        let mut in_flight_control = InFlightControls::default();
+        in_flight_control.push(PendingControl {
             state: ControlSlotState::Posted { token: 1 },
             logical_completion: None,
             process_id: None,
@@ -7708,15 +7233,13 @@ mod tests {
 
         assert!(progress, "the bind dispatched");
         assert!(
-            !pending
-                .iter()
-                .any(|item| matches!(item, QueuedItem::BindInstance { .. })),
+            pending.is_empty(),
             "the bind must not wait out a copy it shares nothing with"
         );
         assert_eq!(
-            in_flight_control.as_ref().map(|control| control.operation),
-            Some("tracked KV copy"),
-            "the bind takes no control slot, so the copy still holds it"
+            in_flight_control.settling.len(),
+            1,
+            "the bind enters no in-flight set, so the copy is still alone"
         );
     }
 
@@ -7746,7 +7269,6 @@ mod tests {
                     slot: 0,
                     fires: 1,
                 }),
-                false,
             )
         };
         let request_a = stamped(lane_a, 7);
@@ -7824,7 +7346,6 @@ mod tests {
                 None,
                 None,
                 frame,
-                false,
             )
         };
         let stamped = make(Some(FrameStamp {
@@ -7901,7 +7422,6 @@ mod tests {
                 None,
                 None,
                 Some(stamp),
-                false,
             );
             let fire_id = request.logical_fire_id;
             let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
@@ -7913,7 +7433,8 @@ mod tests {
             let mut lane_token = 1u64;
             let mut instances = HashMap::new();
             let mut in_flight_launches = VecDeque::new();
-            let mut in_flight_control = Some(PendingControl {
+            let mut in_flight_control = InFlightControls::default();
+            in_flight_control.push(PendingControl {
                 state: ControlSlotState::Posted { token: 1 },
                 logical_completion: None,
                 process_id: None,

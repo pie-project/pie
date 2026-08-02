@@ -19,6 +19,21 @@ void bind_slot(RawMetalContext& ctx, int ord, std::uint8_t idx, const SlotHandle
 
 }  // namespace
 
+int router_bits_from_extents(std::uint64_t weight_bytes, std::uint64_t scale_bytes) {
+    if (weight_bytes == 0 || scale_bytes == 0) return 0;
+    const std::uint64_t denom = 4 * scale_bytes;
+    if (weight_bytes % denom != 0) return 0;
+    const std::uint64_t bits = weight_bytes / denom;
+    return (bits == 4 || bits == 8) ? int(bits) : 0;
+}
+
+int router_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights) {
+    const auto w = weights.find("layers.0.mlp.router.weight");
+    const auto s = weights.find("layers.0.mlp.router.scales");
+    if (w == weights.end() || s == weights.end()) return 0;
+    return router_bits_from_extents(w->second.size, s->second.size);
+}
+
 ScratchColoring color_gptoss_scratch(const std::vector<Dispatch>& dag, const ScratchPlan& plan,
                                      bool no_recycle) {
     std::vector<pie::metal::scratch::Use> uses;

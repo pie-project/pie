@@ -23,8 +23,5 @@ pub mod plan;
 pub mod testkit;
 pub mod types;
 pub mod verify;
+pub mod weight_store;
 
-/// Single source for the planner's debug-logging gate (`PIE_LOAD_PLANNER_DEBUG`).
-pub(crate) fn planner_debug_enabled() -> bool {
-    std::env::var_os("PIE_LOAD_PLANNER_DEBUG").is_some()
-}

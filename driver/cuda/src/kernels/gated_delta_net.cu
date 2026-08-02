@@ -54,50 +54,16 @@ __device__ __forceinline__ float warp_sum(float x) {
     return __shfl_sync(0xffffffffu, x, 0);
 }
 
-bool qwen_gdn_gqa_ilp2_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_GQA_ILP2");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool qwen_gdn_gqa_ilp2_enabled() { return false; }
 
-bool qwen_gdn_k_last_state_enabled() {
-    // Default OFF: storing state as [k, v] (V-last) — the layout used
-    // when KLast=false — lets threads indexed by v_idx access state at
-    // contiguous offsets within a warp (stride 1, fully coalesced).
-    // KLast=true stores [v, k] which forces a stride of K_d floats
-    // between adjacent threads' state reads, fracturing every warp's
-    // memory transaction into 32 cache-line accesses and amplifying
-    // HBM traffic by ~30x on the recurrent step.
-    //
-    // Measured on Qwen/Qwen3.5-4B (cuda_native, H100 PCIe, 512 reqs x
-    // 128 tok decode): KLast=true -> 1,414 tok/s; KLast=false -> 5,242
-    // tok/s (+271%). Prefill-heavy workload (1k-tok prompts, 8-tok
-    // output): KLast=true -> 29 tok/s; KLast=false -> 258 tok/s (+790%).
-    // Output is bit-identical under both layouts (sha256 matches).
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_K_LAST_STATE");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool qwen_gdn_k_last_state_enabled() { return false; }
 
 // Use the fused recurrent step kernel that caches state values in
 // registers across the two analytical phases, halving HBM traffic on
 // the state slab (2R+2W -> 1R+1W per element). Default OFF until
 // parity is verified across all (K_d, V_d) combinations the kernel is
 // instantiated for; turn ON for benchmarking the new path.
-bool qwen_gdn_fused_step_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_FUSED_STEP");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool qwen_gdn_fused_step_enabled() { return false; }
 
 // SMEM read-only step kernel: stages the BF16 state slab into shared
 // memory once, reads it from SMEM in both analytical phases, and
@@ -1714,15 +1680,7 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
     }
 }
 
-// Opt-in FLA-port path (PIE_QWEN35_GDN_FLA_STEP=1).
-inline bool qwen_gdn_fla_step_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_FLA_STEP");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool qwen_gdn_fla_step_enabled() { return false; }
 
 // ── FLA-style chunked prefill kernel (KLast=false / V-last storage) ──
 // State stays in per-thread registers across the whole T-token chunk,
@@ -2006,17 +1964,9 @@ __global__ void chunk_gated_delta_prefill_batched_gqa_fla_kernel(
     }
 }
 
-inline bool qwen_gdn_fla_prefill_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_FLA_PREFILL");
-        // Default ON: 9x speedup, bit-identical to the legacy kernel
-        // at production shapes (V_d=128, K_d<=128). Set the env var
-        // to '0' to fall back to the legacy per-token HBM kernel.
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+// 9x speedup over the legacy per-token HBM kernel, bit-identical at
+// production shapes (V_d=128, K_d<=128).
+constexpr bool qwen_gdn_fla_prefill_enabled() { return true; }
 
 }  // namespace
 

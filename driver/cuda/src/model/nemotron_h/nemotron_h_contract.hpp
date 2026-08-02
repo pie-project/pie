@@ -27,8 +27,7 @@ inline bool nemotron_h_tp_mamba_sharding_enabled(int tp_size) {
     if (tp_size <= 1) {
         return false;
     }
-    const char* disabled = std::getenv("PIE_NEMOTRON_DISABLE_TP_MAMBA_SHARD");
-    return disabled == nullptr || disabled[0] == '\0' || disabled[0] == '0';
+    return true;
 }
 
 namespace contract_detail {

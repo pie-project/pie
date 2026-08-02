@@ -40,30 +40,21 @@ inline void maybe_add_bias(
     kernels::launch_add_bias_bf16(out, bias_tensor->data(), N, dim, stream);
 }
 
-bool decode_full_attention_variant_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DECODE_FULL_ATTENTION");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+bool decode_full_attention_variant_enabled() { return true; }
 
-// Bug#2 A/B: the fused decode QKV+qk-norm+rope+KV-write kernel
-// (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
+// Bug#2 A/B: the fused QKV+qk-norm+rope+KV-write kernel
+// (`launch_qkv_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
 // suspect (the standalone BatchDecode attention is proven per-request-correct,
 // so the corruption is upstream in KV/Q production). PIE_CUDA_DECODE_FUSED_POST=0
 // falls back to the non-fused split-qkv + separate rope + `write_kv_to_pages`
 // (the verified `resolve_dst` path). If the fleet goes 8/8 with it off, the
 // fused kernel is the bug. Default on.
-bool decode_fused_post_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DECODE_FUSED_POST");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+//
+// The env var kept its `DECODE` name after the kernel was generalised to
+// prefill, so the switch is now the A/B for BOTH shapes: turning it off costs
+// ~10% of prefill wall. Existing runbooks keep working, which is why the name
+// was not churned.
+bool decode_fused_post_enabled() { return true; }
 
 inline void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,
@@ -489,13 +480,28 @@ void llama_like_forward_paged(
             layer.k_norm->shape()[0] == d;
         const bool use_fused_qkv = (layer.qkv_proj_fused != nullptr) &&
                                    !ws.qkv_fused.empty();
-        const bool fused_decode_qkv_post =
+        // The fused postprocess collapses split-qkv + qk-norm/rope +
+        // write-kv into one pass. It used to be gated on `is_pure_decode`
+        // purely because its KV-append arithmetic assumed one new token per
+        // request; the kernel now takes `qo_indptr` and resolves a token's
+        // slot the same way `write_kv_kernel` does, so prefill and mixed
+        // fires qualify too. The three replaced kernels were 16% of GPU time
+        // on a prefill-heavy fire, and they move 36 KiB per token per layer
+        // against the fused kernel's 16 KiB -- the chain reloads Q/K twice
+        // and K/V three times purely to hand data between passes.
+        //
+        // The remaining conditions are real capability limits, not shape
+        // limits: a stage hook or custom mask needs the unfused intermediates,
+        // a quantized/padded cache needs the separate write path, and
+        // qkv-bias / non-standard rope / non-per-head norms are simply not
+        // implemented in the kernel.
+        const bool fused_qkv_post =
             use_fused_qkv &&
             active_stage_hooks == nullptr &&
             decode_fused_post_enabled() &&
-            is_pure_decode &&
             !has_custom_mask &&
             (!has_write_desc || (w_page_d != nullptr && w_off_d != nullptr)) &&
+            (is_pure_decode || has_write_desc || qo_indptr != nullptr) &&
             native_bf16_kv_cache &&
             !head_dim_padded &&
             !fwd_cfg.use_qkv_bias &&
@@ -506,7 +512,7 @@ void llama_like_forward_paged(
             ops::gemm_act_x_w(cublas.handle(),
                 qkv_in, ops::WeightView(*layer.qkv_proj_fused),
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-            if (fused_decode_qkv_post) {
+            if (fused_qkv_post) {
                 if (!rope_table_ready && !ws.rope_table.empty()) {
                     kernels::launch_rope_standard_table(
                         positions,
@@ -516,18 +522,22 @@ void llama_like_forward_paged(
                         static_cast<const float*>(ws.rope_table.data());
                     rope_table_ready = true;
                 }
-                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                // Pure decode keeps passing `nullptr` for `qo_indptr` so its
+                // graph-captured launch is byte-for-byte what it was: the
+                // kernel then skips the request search entirely.
+                kernels::launch_qkv_qk_norm_rope_write_kv_bf16(
                     ws.qkv_fused.data(),
                     ws.q.data(),
                     cache.k(L), cache.v(L),
                     layer.q_norm->data(), layer.k_norm->data(),
                     positions,
                     rope_table,
+                    is_pure_decode ? nullptr : qo_indptr,
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
                     has_write_desc ? w_page_d : nullptr,
                     has_write_desc ? w_off_d : nullptr,
                     row_valid_d,
-                    R, num_q_heads_local, num_kv_heads_local, d,
+                    N, R, num_q_heads_local, num_kv_heads_local, d,
                     cache.page_size(), cache.hnd_layout(),
                     cfg.rope_theta, eps, stream);
             } else {
@@ -548,7 +558,7 @@ void llama_like_forward_paged(
                 ws.v.data(), N, Hk, H);
         }
 
-        if (!fused_decode_qkv_post && fwd_cfg.use_qkv_bias) {
+        if (!fused_qkv_post && fwd_cfg.use_qkv_bias) {
             maybe_add_bias(ws.q.data(), layer.q_bias, N, Hq, stream);
             maybe_add_bias(ws.k.data(), layer.k_bias, N, Hk, stream);
             maybe_add_bias(ws.v.data(), layer.v_bias, N, Hk, stream);
@@ -586,9 +596,9 @@ void llama_like_forward_paged(
             fwd_cfg.rope_kind == RopeKind::MRopeInterleaved &&
             vision != nullptr && vision->mrope_positions != nullptr &&
             q_norm_is_per_head && k_norm_is_per_head;
-        if (fused_decode_qkv_post) {
+        if (fused_qkv_post) {
             // Q was normalized/rotated and K/V were written directly to the
-            // paged cache by the fused decode postprocess above.
+            // paged cache by the fused QKV postprocess above.
         } else if (use_mrope) {
             // Qwen3-VL: fused per-head q/k RMSNorm + interleaved 3-axis M-RoPE.
             kernels::launch_qk_rmsnorm_mrope_bf16(
@@ -646,7 +656,7 @@ void llama_like_forward_paged(
         const void* attn_k   = ws.k.data();
         const void* attn_v   = ws.v.data();
         void* attn_out_buf   = ws.attn_out.data();
-        if (!fused_decode_qkv_post && head_dim_padded) {
+        if (!fused_qkv_post && head_dim_padded) {
             kernels::launch_pad_head_dim_bf16(
                 ws.q.data(), ws.q_padded.data(),
                 N, num_q_heads_local, d, dk, stream);
@@ -662,8 +672,8 @@ void llama_like_forward_paged(
             attn_out_buf = ws.attn_out_padded.data();
         }
         auto kv_view = cache.layer_view(L);
-        if (fused_decode_qkv_post) {
-            // Already written by launch_qkv_decode_qk_norm_rope_write_kv_bf16.
+        if (fused_qkv_post) {
+            // Already written by launch_qkv_qk_norm_rope_write_kv_bf16.
         } else if (has_write_desc) {
             // B2: explicit-descriptor KV write. Each query TOKEN writes its new
             // K/V into the program-supplied (physical page id `w_page_d[c]`,

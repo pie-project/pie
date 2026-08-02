@@ -68,6 +68,16 @@ struct GptOssGeometry {
     int q_group = 64;
     int q_bits = 4;
 
+    /// The router's quantization width, which is NOT `q_bits`: `mlx_lm`'s
+    /// quantization predicate leaves a 32 x 2880 router at 8 bits while
+    /// everything around it goes to 4, but a checkpoint quantized uniformly
+    /// ships a 4-bit one. Nothing in `config.json` says which, so this is
+    /// solved from the staged tensors (`router_bits_from_extents`) rather than
+    /// assumed -- an 8-bit kernel over 4-bit nibbles reads half the row as the
+    /// wrong values and routes to the wrong experts, which survives as fluent
+    /// wrong text rather than as a crash.
+    int router_bits = 8;
+
     int max_tokens = 1;
     int max_requests = 1;
     int max_slots = 1;

@@ -1,7 +1,7 @@
 //! **Piece-2 co-verify — carrier deep pre-submission × wait-for-all (capstone
 //! precondition C3, the carrier 8× lever).** Boots the 4090 + real CUDA driver +
 //! Qwen3-0.6B, selects the wait-for-all fire rule (`PIE_SCHED_POLICY=waitall`)
-//! at depth `PIE_SCHED_MAX_IN_FLIGHT=k`, launches an 8-pipeline fleet of bravo's
+//! at `[model.scheduler] frame_dispatch_depth = k`, launches an 8-pipeline fleet of bravo's
 //! device-resident deep-pre-submission decode (`decode_pipelined_deep(k)`), and
 //! asserts BOTH:
 //!
@@ -31,7 +31,7 @@
 //! Config knobs (finalized to bravo's `lowlevel-chat` pilot on
 //! `bravo-carrier-prod` — env-overridable):
 //!   PIE_DEEP_INFERLET = the deep-pre-submission inferlet pkg (default `lowlevel-chat`)
-//!   PIE_DEEP_DEPTH    = the chain depth k = the in-flight cap (default 4)
+//!   PIE_DEEP_DEPTH    = the chain depth k = the engine's dispatch depth (default 3)
 //!   PIE_DEEP_INPUT    = the launch input the pilot parses (default `"32 depth=<k>"`:
 //!                       `<max_tokens>` + `depth=<k>` pre-submission window)
 //!   PIE_DEEP_HARD=1   = hard-gate the density thresholds (byte-identity is always
@@ -48,15 +48,23 @@ use pie_client::client::Client;
 /// Fleet width — the 8-pipeline homogeneous decode fleet.
 const FLEET: usize = 8;
 
-/// Chain depth k = the in-flight cap. bravo's `decode_pipelined_deep(k)` submits
-/// a k-deep carrier chain up front; the wave fires k deep at cap=k. Overridable
-/// via `PIE_DEEP_DEPTH` (kept == `PIE_SCHED_MAX_IN_FLIGHT`).
+/// Chain depth k. bravo's `decode_pipelined_deep(k)` submits a k-deep carrier
+/// chain up front; the wave fires k deep when the engine's dispatch depth is
+/// also k, which is why this same value goes into `[model.scheduler]
+/// frame_dispatch_depth` at boot.
+///
+/// Default 3, not 4. The old default WAS 4, but the engine clamped its depth to
+/// 3 and said nothing, so the two sides silently disagreed and the "fires k
+/// deep at cap=k" premise did not hold on a default run. 4 is legal now (4 x
+/// frame_size 2 = 8 steps, under the driver's 13 staging slots), but the
+/// measured arm is 3 and the default should be an arm that was measured.
+/// Overridable via `PIE_DEEP_DEPTH`.
 fn depth() -> usize {
     std::env::var("PIE_DEEP_DEPTH")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&k| k >= 1)
-        .unwrap_or(4)
+        .unwrap_or(3)
 }
 
 /// The deep-pre-submission inferlet package name — bravo's `lowlevel-chat`
@@ -69,7 +77,7 @@ fn deep_inferlet() -> String {
 /// The launch input the pilot parses: `"<max_tokens> depth=<k>"` — bravo's
 /// `lowlevel-chat` reads the first whitespace token as `max_tokens` and
 /// `depth=<k>` as the deep carrier's pre-submission window (aligned to
-/// `PIE_SCHED_MAX_IN_FLIGHT=k`). Override via `PIE_DEEP_INPUT`.
+/// the engine's `frame_dispatch_depth`). Override via `PIE_DEEP_INPUT`.
 fn deep_input() -> String {
     std::env::var("PIE_DEEP_INPUT").unwrap_or_else(|_| format!("32 depth={}", depth()))
 }
@@ -92,12 +100,12 @@ fn pipeline_match_ok(json: &str) -> bool {
 #[ignore = "piece-2 co-verify: needs the 4090 + cuda + qwen-3-0.6b + decode_pipelined_deep"]
 async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
     let k = depth();
-    // Scheduler policy + cap MUST be selected pre-boot (OnceLock read at loop
-    // init). Wait-for-all + cap=k = the carrier's back-to-back firing depth.
+    // Wait-for-all + dispatch depth k = the carrier's back-to-back firing
+    // depth. The depth reaches the engine through `[model.scheduler]` at boot
+    // below; only the policy and the inferlet-side hint are still env.
     // SAFETY: set before any engine threads spawn.
     unsafe {
         std::env::set_var("PIE_SCHED_POLICY", "waitall");
-        std::env::set_var("PIE_SCHED_MAX_IN_FLIGHT", k.to_string());
         // Expose the depth to the inferlet build/launch side too (belt + braces
         // with the launch input, in case bravo's loop reads an env for depth).
         std::env::set_var("PIE_DEEP_DEPTH", k.to_string());
@@ -125,7 +133,7 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
     ));
     let manifest = ws.join(format!("{pkg}/Pie.toml"));
 
-    let pie = common::boot_4090().await?;
+    let pie = common::boot_4090_dispatch_depth(k as u32).await?;
     eprintln!(
         "[deep-coverify] booted, listen_addr={}  policy=waitall  cap={k}  inferlet={pkg}  input={input}",
         pie.listen_addr
@@ -218,7 +226,6 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
         q.avg_missing_at_fire
     );
     eprintln!("  escape_fires                   = {}", q.escape_fires);
-    eprintln!("  cold_hold_fires                = {}", q.cold_hold_fires);
     eprintln!("  ── carrier reduce-R (context) ──");
     eprintln!(
         "  post_dispatch_to_fire_us (avg) = {}   (host round-trip — the carrier's target)",

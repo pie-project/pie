@@ -217,35 +217,20 @@ async fn materialize_channel(
     this: Resource<Channel>,
     mode: ChannelReadMode,
 ) -> Anyhow<Result<Vec<u8>, String>> {
-    // Contention-probe: pid resolved once, only when tracing.
-    let trace_pid = if crate::planner::trace_enabled() {
-        Some(accessor.with(|mut access| access.get().id()))
-    } else {
-        None
-    };
     let mut settle_ready_take = true;
-    let mut woke_us = 0u64;
-    let take_wall = crate::scheduler::phase_start();
     loop {
-        let poll_cpu = crate::scheduler::phase_start();
         let state = accessor
             .with(|mut access| poll_channel(access.get(), &this, mode, false, settle_ready_take))?;
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::ChannelPoll, poll_cpu);
         let state = match state {
             ChannelPoll::Pending {
                 fires: Some(fires), ..
             } => {
                 let _finalize_guard = fires.finalize_guard().await;
-                let poll_cpu = crate::scheduler::phase_start();
                 let state = accessor.with(|mut access| {
                     poll_channel(access.get(), &this, mode, true, settle_ready_take)
                 })?;
-                crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::ChannelPoll, poll_cpu);
                 match state {
                     ChannelPoll::Finalize(op) => {
-                        if let Some(pid) = trace_pid {
-                            crate::planner::trace_mark!("build", pid, "rx-finalize");
-                        }
                         let finalized = crate::pipeline::fire::finalize_op_await(op).await?;
                         accessor.with(|mut access| {
                             crate::pipeline::fire::complete_finalize(access.get(), finalized);
@@ -261,11 +246,6 @@ async fn materialize_channel(
 
         match state {
             ChannelPoll::Ready(value) => {
-                accessor.with(|mut access| access.get().note_take_returned(woke_us));
-                crate::scheduler::wait_phase_add(
-                    crate::scheduler::WaitPhase::ChannelTake,
-                    take_wall,
-                );
                 return Ok(value);
             }
             ChannelPoll::Finalize(_) => unreachable!("finalizer gate required before FIFO pop"),
@@ -273,20 +253,11 @@ async fn materialize_channel(
                 settle_ready_take = true;
                 // A plain await: an idle channel wait holds no pooled
                 // state, so the planner can evict around it freely.
-                let progress_wall = crate::scheduler::phase_start();
                 if let Err(error) =
                     crate::pipeline::fire::await_channel_progress(&cell, fires.as_ref()).await
                 {
                     return Ok(Err(error));
                 }
-                crate::scheduler::wait_phase_add(
-                    crate::scheduler::WaitPhase::ChannelProgress,
-                    progress_wall,
-                );
-                if let Some(pid) = trace_pid {
-                    crate::planner::trace_mark!("build", pid, "rx-wake");
-                }
-                woke_us = crate::scheduler::fire_timing_now_us();
             }
         }
     }
@@ -321,7 +292,6 @@ impl ProcessCtx {
         }
         crate::inferlet::process::ensure_execution_admitted(self).await;
         crate::inferlet::process::gate::residency_gate(self).await?;
-        self.note_submit();
         crate::pipeline::fire::submit_frame(self, on, slot_reps).await
     }
 }
@@ -584,9 +554,6 @@ impl ProcessCtx {
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
         let readable_pages = attention.readable;
         let writable_pages = attention.writable;
-        let bind_timing = crate::scheduler::fire_timing_enabled()
-            .then(|| (self.id(), crate::scheduler::fire_timing_now_us()));
-        let mut bind_stages = [0u64; 5];
         {
             // Identity dedup + bind against the model profile (the old
             // register-program, now invisible): hash-deduped compile/bind
@@ -599,9 +566,6 @@ impl ProcessCtx {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
-            if bind_timing.is_some() {
-                bind_stages[0] = crate::scheduler::fire_timing_now_us();
-            }
             // Strict admission: the hash-deduped program compile above may
             // prewarm, but everything from here on creates per-instance
             // driver state (channel registration, instance bind) or claims
@@ -877,9 +841,6 @@ impl ProcessCtx {
             };
             let rs_reps = rs_working_sets.iter().map(Resource::rep).collect();
 
-            if bind_timing.is_some() {
-                bind_stages[1] = crate::scheduler::fire_timing_now_us();
-            }
 
             let instance_id = crate::pipeline::instance::next_instance_id();
             for (dense, cell) in cells.iter().enumerate() {
@@ -944,10 +905,6 @@ impl ProcessCtx {
                 reference_ptir: prog.bytes.clone(),
                 ..Default::default()
             };
-            if bind_timing.is_some() {
-                bind_stages[2] = crate::scheduler::fire_timing_now_us();
-                bind_stages[3] = bind_stages[2];
-            }
             let mut instance_seeds = Vec::new();
             let mut seed_values = Vec::new();
             for (dense, cell) in cells.iter().enumerate() {
@@ -1015,9 +972,6 @@ impl ProcessCtx {
                     return Ok(Err(format!("pipeline: channel {dense} endpoint: {error}")));
                 }
             }
-            if bind_timing.is_some() {
-                bind_stages[4] = crate::scheduler::fire_timing_now_us();
-            }
             for cell in &cells {
                 let mut cell = cell.lock().unwrap();
                 if cell.seeded {
@@ -1068,26 +1022,6 @@ impl ProcessCtx {
             };
             if let Err(error) = self.ctx().table.get_mut(&this)?.attach_bound(bound) {
                 return Ok(Err(format!("pipeline: {error}")));
-            }
-            if let Some((process_id, started_us)) = bind_timing {
-                let finished_us = crate::scheduler::fire_timing_now_us();
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "runtime",
-                    "event": "forward_pass_bound",
-                    "process_id": process_id,
-                    "instance_id": instance_id,
-                    "pass_resource": this.rep(),
-                    "bind_started_us": started_us,
-                    "bind_finished_us": finished_us,
-                    "bind_us": finished_us.saturating_sub(started_us),
-                    "program_compile_us": bind_stages[0].saturating_sub(started_us),
-                    "bind_validate_us": bind_stages[1].saturating_sub(bind_stages[0]),
-                    "channel_register_us": bind_stages[2].saturating_sub(bind_stages[1]),
-                    "program_register_us": bind_stages[3].saturating_sub(bind_stages[2]),
-                    "driver_bind_us": bind_stages[4].saturating_sub(bind_stages[3]),
-                    "bind_finalize_us": finished_us.saturating_sub(bind_stages[4]),
-                }));
             }
             Ok(Ok(()))
         }

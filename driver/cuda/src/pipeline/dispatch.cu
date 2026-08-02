@@ -340,11 +340,7 @@ struct NotifyContext;
 
 namespace {
 
-// PIE_DEBUG_PULL_VALIDATE=1 makes the pull-validate kernel name the ticket
-// that vetoed a fire, which is otherwise reported only as the generic
-// "ptir prologue or channel readiness did not commit".
-const std::uint32_t kDiagnosePullValidate =
-    std::getenv("PIE_DEBUG_PULL_VALIDATE") != nullptr ? 1u : 0u;
+constexpr std::uint32_t kDiagnosePullValidate = 0u;
 
 constexpr std::uint64_t kNoDescriptorReadyOffset =
     std::numeric_limits<std::uint64_t>::max();
@@ -2758,8 +2754,7 @@ void refill_commit_snapshot_pool(Dispatch::Impl& owner) {
             static_cast<void>(cudaGetLastError());
             return false;
         }
-        return properties.canMapHostMemory != 0 &&
-               std::getenv("PIE_CUDA_DISABLE_MAPPED_COMMITS") == nullptr;
+        return properties.canMapHostMemory != 0;
     }();
 
     void* host_slab = nullptr;
@@ -6281,12 +6276,7 @@ bool Dispatch::enqueue_fixed_decode(
     // NOT taken, which no assertion downstream can see. If the RS guard above
     // is ever re-tightened, this is what says so.
     //
-    // The env read is a function-local static, not a per-batch `getenv`: this
-    // runs once per decode step on the latency path, and reading the
-    // environment there measurably costs (~1.5% of single-request tok/s).
-    static const bool trace_template =
-        std::getenv("PIE_FIXED_DECODE_TRACE") != nullptr;
-    if (trace_template) {
+    if constexpr (false) {
         static std::once_flag once;
         std::call_once(once, [&] {
             std::cerr << "[pie-driver-cuda] fixed-decode template active: "
@@ -6453,10 +6443,7 @@ bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
         // resolve a chained descriptor: the host readback fallback cannot see a
         // value the producing fire has not committed yet, so a decode step that
         // reads the prefill's sampled token never became ready.
-        const bool trace_compose = [] {
-            const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
+        constexpr bool trace_compose = false;
         auto refuse = [&](const std::string& why) {
             if (trace_compose) {
                 std::fprintf(stderr, "[compose] refused: %s\n", why.c_str());

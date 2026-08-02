@@ -68,7 +68,7 @@ interface model {
     frame-size: func() -> u32;
 
     // How long (microseconds) a pipeline may hold a frame's wait-set without
-    // submitting before the engine terminates it for breach of contract.
+    // submitting before the engine stops waiting for it.
     //
     // A frame does not dispatch until every participating pipeline has
     // submitted its slot, so membership is a promise to keep submitting, and
@@ -98,12 +98,19 @@ interface model {
     // ON the clock, because during it the fleet is stalled on this pipeline
     // and nothing is owed back. Anything that can outlast this bound —
     // tokenizing a large document, compiling a grammar, an RPC, a decision
-    // that waits on another pipeline — must be preceded by `forward.park`
+    // that waits on another pipeline — should be preceded by `forward.park`
     // and is rejoined by simply submitting again. Parking is cheap and
     // unparking is implicit, so when in doubt, park.
     //
-    // Static, like frame-size and unlike channel-capacity: a number that can
-    // kill must not move.
+    // Overrunning it is not fatal. The engine simply stops waiting: the slot
+    // leaves the frame, already-submitted work still runs, and the next
+    // submit rejoins. What it costs is a boundary — so treat this as the
+    // budget that keeps you IN each frame, not as a deadline you die to.
+    // (Termination is reserved for a pipeline that goes silent for orders of
+    // magnitude longer without ever parking, i.e. an abandoned one.)
+    //
+    // Static, like frame-size and unlike channel-capacity: guests read it
+    // once and size their work against it, so it must not move.
     submit-deadline-us: func() -> u64;
 
     // Host-reader channel capacity, in cells, that lets one lane sustain the

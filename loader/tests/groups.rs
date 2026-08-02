@@ -429,26 +429,69 @@ fn a_group_composes_with_a_shard() {
     }
 }
 
-/// Which storage shape a group uses decides whether a checkpoint rewrite can
-/// make it streamable, so the loader states it rather than leaving the tool to
-/// infer it from names.
+/// Which storage shape a group uses decides whether it can be streamed at all,
+/// and the plan is where that shows: the loader states it in the bindings
+/// rather than leaving a reader to infer it from names.
 ///
 /// Streaming reads a weight where it lies, through a mapping, so an instance
 /// has to begin on a page of its own. When each instance is its own tensor,
-/// moving that tensor onto a page aligns the instance -- the instance *is* the
-/// tensor. When every instance is a band of one fused bank, moving the bank
-/// aligns instance 0 and no other: the rest begin at `base + i * stride`, and
-/// the stride is whatever the shape makes it. Nothing a rewrite can do to a
-/// bank's position changes that.
+/// placing that tensor on a page places the instance -- the instance *is* the
+/// tensor. When every instance is a band of one fused bank, placing the bank
+/// places instance 0 and no other: the rest begin at `base + i * stride`, and
+/// the stride is whatever the shape makes it. No choice of where to put the
+/// bank changes that, which is why the two shapes are not interchangeable.
 mod streamability {
     use super::*;
-    use pie_loader::checkpoint::align::streamable_tensors;
+    use std::collections::{BTreeSet, HashMap};
 
-    /// A bank is reported as a bank. Aligning it would produce a checkpoint
-    /// that loads, streams, and faults in all four experts to read one --
-    /// correct, slower than not streaming, and with nothing on disk to say so.
+    #[derive(Default)]
+    struct Streamable {
+        /// Tensors a group instance reads in full: the instance *is* the
+        /// tensor, so it can begin on a page of its own.
+        whole: BTreeSet<String>,
+        /// Fused banks. Every instance reads a slice of one tensor, so
+        /// instance 0 can begin on a page and no other: the rest start at
+        /// `base + i * stride`, and the stride is whatever the shape makes it
+        /// -- in GPT-OSS-20B, 4147200 bytes, which no page size divides.
+        banded: BTreeSet<String>,
+    }
+
+    /// Reads the distinction off the plan. A binding whose file offset is its
+    /// tensor's own offset reads that tensor whole; one that is displaced from
+    /// it reads a band.
+    fn streamable_tensors(
+        plan: &pie_loader::plan::LoadPlan,
+        metadata: &pie_loader::checkpoint::CheckpointMetadata,
+    ) -> Streamable {
+        let by_id: HashMap<_, _> = metadata.tensors.iter().map(|t| (t.id, t)).collect();
+        let mut out = Streamable::default();
+        for group in &plan.groups {
+            for instance in &group.bindings {
+                for binding in instance {
+                    let Some(tensor) = by_id.get(&binding.tensor_id) else {
+                        continue;
+                    };
+                    if binding.file_offset == tensor.file_offset {
+                        out.whole.insert(tensor.name.clone());
+                    } else {
+                        out.banded.insert(tensor.name.clone());
+                    }
+                }
+            }
+        }
+        // A bank whose instance 0 binds its base looks whole from that one
+        // binding. What settles it is any sibling binding that does not.
+        for name in &out.banded {
+            out.whole.remove(name);
+        }
+        out
+    }
+
+    /// A bank is reported as a bank. Streaming one would fault in all four
+    /// experts to read one -- correct, slower than not streaming, and with
+    /// nothing on disk to say so.
     #[test]
-    fn a_fused_bank_cannot_be_aligned_by_moving_it() {
+    fn a_fused_bank_cannot_be_paged_by_instance() {
         let expr = Expr::src("experts.bank").select(0, 1, 1);
         let metadata = fused_checkpoint();
         let plan = compile(&metadata, &contract(banded(expr)), target()).unwrap();
@@ -466,11 +509,11 @@ mod streamability {
         );
     }
 
-    /// Separately named instances are alignable, and every one of them is
-    /// named -- an aligner told about only some would leave the rest streaming
-    /// off unaligned pages.
+    /// Separately named instances are each pageable, and every one of them is
+    /// reported -- a reader told about only some would leave the rest streaming
+    /// off pages they share.
     #[test]
-    fn separately_named_instances_are_each_alignable() {
+    fn separately_named_instances_are_each_pageable() {
         let expr = Expr::src_indexed("experts.{}.w");
         let metadata = named_checkpoint();
         let plan = compile(&metadata, &contract(group(expr)), target()).unwrap();
@@ -486,7 +529,7 @@ mod streamability {
     }
 
     /// A contract with no groups declares nothing interchangeable, so there is
-    /// nothing to stream and aligning would only add padding.
+    /// nothing to stream.
     #[test]
     fn a_contract_without_groups_offers_nothing_to_stream() {
         let metadata = named_checkpoint();

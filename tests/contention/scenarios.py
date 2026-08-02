@@ -135,22 +135,28 @@ SCENARIOS: list[Scenario] = [
         # so three tries make a false "never fired" ~0.5% likely.
         repeat=3,
     ),
-    # Same path with the fleet four times wider than the pool can fund. Most
-    # of it is killed by the starvation rung, which is fine — the point is
-    # that the survivors still finish and `evict_rollbacks` stays bounded
-    # while eviction and the starvation rung run against each other.
+    # Same path with the fleet four times wider than the pool can fund. This
+    # used to require `starved`: most of the fleet was killed by the
+    # starvation rung and the point was that the survivors still finished.
+    # Making eviction a liveness rung (cebea17e4) retired that outcome on
+    # purpose — an unfundable fleet now PARKS to host DRAM instead of having
+    # requests destroyed — so the whole 256 completes with `starved` at 0
+    # (measured: parks 1837, serves 1808, evictions 24, failed 0). Requiring
+    # a kill here would pin a defect the planner deliberately removed, so the
+    # contract asserts the good outcome instead: everyone finishes, and
+    # eviction still runs against the rung with `evict_rollbacks` bounded.
     # `swapfull` is NOT required here: whether the host pool is actually
-    # refused a swap-out before the rung kills the victim is a race
-    # (observed 202 hits on one run, 0 on the next), and a flaky assertion
-    # is worse than no assertion. `tinyswap` above pins that path instead.
+    # refused a swap-out is a race (observed 202 hits on one run, 0 on the
+    # next), and a flaky assertion is worse than no assertion. `tinyswap`
+    # above pins that path instead.
     Scenario(
         name="tinyswap_thrash",
-        target="eviction racing the starvation rung on an unfundable fleet",
+        target="eviction parking an unfundable fleet instead of killing it",
         args=["--total-pages", "256", "--swap-pool-size", "32",
               "--num-requests", "256", "--concurrency", "64",
               "--max-tokens", "128"],
-        contract=Contract(max_wall_s=120, min_completed=16,
-                          require_counters=("starved", "evictions"),
+        contract=Contract(max_wall_s=120, min_completed=256, max_failed=0,
+                          require_counters=("parks", "evictions"),
                           max_counters={"evict_rollbacks": _ROLLBACK_CAP}),
     ),
     # ---- every page shared: ReclaimQuote -> AllShared -> NoEligibleVictim --
@@ -265,14 +271,16 @@ SCENARIOS: list[Scenario] = [
         contract=Contract(max_wall_s=300, min_completed=4096, max_failed=0),
         repeat=4,
     ),
-    # ---- restore path: retries exhausted -----------------------------------
+    # ---- restore path: heavy restore traffic, every one must land ----------
+    # Named for the `PIE_KV_RESTORE_RETRIES=1` it used to set, which never
+    # bought it anything: with `max_failed=0` it asserts that no restore fails
+    # under a deep swap pool, so it never reached an exhausted retry.
     Scenario(
-        name="restore1",
-        target="restore retry exhaustion",
+        name="restore",
+        target="restore under a deep swap pool",
         args=["--total-pages", "96", "--swap-pool-size", "512",
               "--num-requests", "256", "--concurrency", "128",
               "--max-tokens", "128"],
-        env={"PIE_KV_RESTORE_RETRIES": "1"},
         contract=Contract(max_wall_s=180, min_completed=256, max_failed=0),
     ),
     # ---- pool holds ~one resident: every admission needs a full eviction ---

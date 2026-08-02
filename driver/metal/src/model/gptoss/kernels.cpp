@@ -5,8 +5,8 @@
 
 namespace pie::metal::gptoss {
 
-bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, GptOssPsos& out,
-                       std::string* err) {
+bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int router_bits,
+                       GptOssPsos& out, std::string* err) {
     const std::string dir =
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
     struct Spec {
@@ -40,6 +40,23 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gpt
             }
             return false;
         }
+    }
+    // The router's width is the checkpoint's to state, and the two kernels read
+    // incompatible packings, so an unsolved width is refused here rather than
+    // defaulted to the common one.
+    switch (router_bits) {
+        case 8: out.qmv_router = out.qmv_u8_bias; break;
+        // The dense biased 4-bit matvec: the router is [n_experts, hidden] with
+        // a bias, which is the same shape as an attention projection.
+        case 4: out.qmv_router = out.qmv_tail_bias; break;
+        default:
+            if (err != nullptr) {
+                *err = "gpt-oss PSOs: the router's quantization width could not be solved "
+                       "from the checkpoint (got " +
+                       std::to_string(router_bits) +
+                       "); only 4- and 8-bit routers have a kernel here";
+            }
+            return false;
     }
     return true;
 }

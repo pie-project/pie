@@ -40,6 +40,9 @@ pie-controller = { path = "../../controller" }
 pie-gateway = { path = "../../gateway" }
 pie-worker = { path = "../../worker", default-features = false }
 pie-engine = { path = "../../runtime/engine" }  # program/manifest types for `pie inferlet`
+# `pie model optimize` — the host-side load-plan executor and checkpoint
+# writer. Pure Rust; needs no driver and no GPU.
+pie-loader = { path = "../../loader" }
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.

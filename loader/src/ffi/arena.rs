@@ -453,6 +453,9 @@ pub fn build(plan: &LoadPlan, cache_key: &str) -> *mut PieLoaderPlan {
         arena.attachments.push(PieLoaderQuantAttachmentView {
             tensor_id: attachment.tensor.0,
             scale_tensor_id: attachment.scale_tensor.0,
+            zero_point_tensor_id: attachment
+                .zero_point_tensor
+                .map_or(PIE_LOADER_NO_TENSOR, |id| id.0),
             granularity: PieLoaderQuantGranularity::from(attachment.granularity),
             group_size: attachment.group_size,
             channel_axis: attachment.channel_axis,

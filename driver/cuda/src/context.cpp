@@ -388,12 +388,6 @@ void tp_startup_cpu_barrier(const pie_cuda_driver::Config& cfg) {
 }
 
 int configured_mtp_num_drafts(const pie_cuda_driver::Config& cfg) {
-    static const int forced = [] {
-        const char* v = std::getenv("PIE_MTP_DRAFT_TOKENS");
-        if (v == nullptr || v[0] == '\0') return -1;
-        return std::clamp(std::atoi(v), 0, 32);
-    }();
-    if (forced >= 0) return forced;
     return std::clamp(cfg.model.mtp_num_drafts, 0, 32);
 }
 
@@ -566,8 +560,10 @@ class Context::Impl {
             if (stream != nullptr) cudaStreamSynchronize(stream);
         }
         if (swap_pool_ != nullptr) {
-            cudaStream_t stream = swap_pool_->stream();
-            if (stream != nullptr) cudaStreamSynchronize(stream);
+            for (cudaStream_t stream :
+                 {swap_pool_->stream(), swap_pool_->restore_stream()}) {
+                if (stream != nullptr) cudaStreamSynchronize(stream);
+            }
         }
         if (media_stream_ != nullptr) cudaStreamSynchronize(media_stream_);
     }
@@ -1000,10 +996,7 @@ int Context::Impl::load_model(
     // mode and the upfront lattice still runs, because turning those off
     // changes what the two TP ranks each decide to do and wedges the group.
     // Costs throughput; it is for measurement, not for serving.
-    const bool graph_replay_enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_NOGRAPHS");
-        return !(v != nullptr && v[0] != '\0' && v[0] != '0');
-    }();
+    constexpr bool graph_replay_enabled = true;
     const auto runtime_quant_scratch_base =
         runtime_quant_scratch_spec(engine, /*max_tokens=*/0);
 
@@ -1058,13 +1051,8 @@ int Context::Impl::load_model(
         plan_info.has_mtp
             ? mem_plan.max_requests * native_mtp_num_drafts
             : 0;
-    const long kv_page_cap = [&]() -> long {
-        if (const char* e = std::getenv("PIE_KV_PAGE_CAP")) {
-            const long v = std::atol(e);
-            if (v > 0) return v;
-        }
-        return static_cast<long>(cfg.batching.total_pages);
-    }();
+    // 0 = derive from `gpu_mem_utilization`; >0 is the operator's hard cap.
+    const long kv_page_cap = static_cast<long>(cfg.batching.total_pages);
     if (mem_plan.kv_page_bytes == 0) {
         std::cerr << "[pie-driver-cuda] zero KV page byte coefficient\n";
         return PIE_STATUS_UNSUPPORTED;
@@ -1449,12 +1437,8 @@ int Context::Impl::load_model(
         CUDA_CHECK(cudaGetDeviceProperties(&serving_prop, device_ordinal_));
         const bool prefill_decode_supported_head_dim =
             attn_head_dim_instantiated(hf.head_dim_kernel);
-        const bool force_prefill_decode_plan = [] {
-            const char* v = std::getenv("PIE_CUDA_PREFILL_DECODE_PLAN");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
         fwd_cfg.use_prefill_decode_plan =
-            (serving_prop.major >= 9 || force_prefill_decode_plan) &&
+            serving_prop.major >= 9 &&
             gqa_in_decode_set && !fwd_cfg.force_prefill_path &&
             prefill_decode_supported_head_dim &&
             fwd_cfg.sliding_window < 0 &&
@@ -1781,8 +1765,6 @@ int Context::Impl::load_model(
         workspace_allocator_->ensure_all();
         tp_startup_cpu_barrier(cfg);
 
-        const char* disabled =
-            std::getenv("PIE_CUDA_DISABLE_CUSTOM_ALL_REDUCE");
         const std::vector<void*> workspace_bases =
             workspace_allocator_->arena_bases();
         struct CustomArVote {
@@ -1791,16 +1773,15 @@ int Context::Impl::load_model(
         };
         const CustomArVote local{
             static_cast<std::uint8_t>(
-                (disabled == nullptr || std::strcmp(disabled, "1") != 0) &&
-                        // The custom all-reduce reads its peers' arenas through
-                        // direct peer mappings, so it needs the same working
-                        // peer path NCCL's P2P transport does. Where that path
-                        // is broken it does not fail loudly -- it reduces
-                        // whatever the mapping yields (zeros) or wedges. Refuse
-                        // it on measured evidence rather than on topology
-                        // claims; NCCL's host-staged fallback still works.
-                        pie_cuda_driver::p2p_transport_usable() &&
-                        !tp_group_devices_.empty() && !workspace_bases.empty()
+                // The custom all-reduce reads its peers' arenas through
+                // direct peer mappings, so it needs the same working peer
+                // path NCCL's P2P transport does. Where that path is broken
+                // it does not fail loudly -- it reduces whatever the mapping
+                // yields (zeros) or wedges. Refuse it on measured evidence
+                // rather than on topology claims; NCCL's host-staged
+                // fallback still works.
+                (pie_cuda_driver::p2p_transport_usable() &&
+                 !tp_group_devices_.empty() && !workspace_bases.empty())
                     ? 1
                     : 0),
             static_cast<std::uint32_t>(workspace_bases.size())};
@@ -2197,60 +2178,12 @@ int Context::Impl::validate_finalized_launch(
 namespace {
 
 struct StepProfile {
-    enum Phase { kPrepare = 0, kEnqueue, kSettle, kPhaseCount };
-    std::array<std::uint64_t, kPhaseCount> ns{};
-    std::array<std::uint64_t, kPhaseCount> hits{};
-
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
-    static StepProfile& instance() {
-        static StepProfile p;
-        return p;
-    }
-    ~StepProfile() {
-        if (!enabled()) return;
-        static const char* names[kPhaseCount] = {"prepare", "enqueue", "settle"};
-        for (int i = 0; i < kPhaseCount; ++i) {
-            if (hits[i] == 0) continue;
-            std::cerr << "[step-profile] " << names[i]
-                      << " calls=" << hits[i]
-                      << " total_ms=" << (static_cast<double>(ns[i]) / 1e6)
-                      << " avg_us=" << (static_cast<double>(ns[i]) / 1e3 / hits[i])
-                      << "\n";
-        }
-    }
+    enum Phase { kPrepare = 0, kEnqueue, kSettle };
 };
 
 class StepPhaseTimer {
   public:
-    explicit StepPhaseTimer(StepProfile::Phase phase)
-        : phase_(phase), on_(StepProfile::enabled()) {
-        if (on_) {
-            static const char* names[StepProfile::kPhaseCount] = {
-                "prepare", "enqueue", "settle"};
-            nvtxRangePushA(names[phase]);
-            start_ = std::chrono::steady_clock::now();
-        }
-    }
-    ~StepPhaseTimer() {
-        if (!on_) return;
-        nvtxRangePop();
-        auto& p = StepProfile::instance();
-        p.ns[phase_] += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start_).count());
-        ++p.hits[phase_];
-    }
-
-  private:
-    StepProfile::Phase phase_;
-    bool on_;
-    std::chrono::steady_clock::time_point start_;
+    explicit StepPhaseTimer(StepProfile::Phase) {}
 };
 
 }  // namespace
@@ -2319,27 +2252,6 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
         return PIE_STATUS_IMPOSSIBLE;
     }
     executor_->required_kv_pages = kv_required;
-    const char* assert_proportional =
-        std::getenv("PIE_CUDA_ASSERT_KV_COMMIT_PROPORTIONAL");
-    if (assert_proportional != nullptr && assert_proportional[0] != '\0' &&
-        assert_proportional[0] != '0' && kv_required > 0) {
-        const std::size_t committed = kv_allocator_->committed_bytes();
-        const std::size_t capacity = kv_allocator_->allocated_bytes();
-        kv_proportional_peak_required_pages_ = std::max(
-            kv_proportional_peak_required_pages_,
-            static_cast<std::size_t>(kv_required));
-        kv_proportional_planned_pages_ =
-            static_cast<std::size_t>(kv_cache_->num_pages());
-        kv_proportional_peak_committed_bytes_ = std::max(
-            kv_proportional_peak_committed_bytes_, committed);
-        kv_proportional_capacity_bytes_ = capacity;
-        if (kv_required * 2 < kv_cache_->num_pages() &&
-            committed * 2 >= capacity) {
-            std::cerr << "[pie-driver-cuda] short-context KV commit is not "
-                         "demand-proportional\n";
-            return PIE_STATUS_DRIVER_ERROR;
-        }
-    }
     // Stream work is SUCCESS-only for admitted frames (P4): any exception
     // past this point is a driver fault. Latch FAILED on the affected
     // steps' fires (every step for a prepare fault — nothing was enqueued;
@@ -2632,6 +2544,11 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
         const bool has_page_copies =
             copy.src_page_ids.len > 0 || copy.dst_page_ids.len > 0;
         cudaStream_t completion_stream = executor_->cublas.stream();
+        // Which swap stream this descriptor landed on. A restore (H2D) is
+        // issued on its own stream so it does not queue behind pending
+        // evictions, so the completion — and the mixed-descriptor join
+        // below — must follow the copy rather than assume `stream()`.
+        cudaStream_t swap_stream = swap_pool_ != nullptr ? swap_pool_->stream() : nullptr;
         std::vector<OwnedValue> keepalive;
         if (copy.src_page_ids.len > 0 || copy.dst_page_ids.len > 0) {
             const auto src = std::span<const std::uint32_t>(copy.src_page_ids.ptr, copy.src_page_ids.len);
@@ -2642,6 +2559,7 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
             } else if (copy.src_domain == PIE_MEMORY_DOMAIN_HOST_PINNED &&
                        copy.dst_domain == PIE_MEMORY_DOMAIN_CUDA_DEVICE) {
                 swap_pool_->copy_h2d_async(*kv_cache_, src, dst);
+                swap_stream = swap_pool_->restore_stream();
             } else if (copy.src_domain == PIE_MEMORY_DOMAIN_CUDA_DEVICE &&
                        copy.dst_domain == PIE_MEMORY_DOMAIN_CUDA_DEVICE) {
                 swap_pool_->copy_d2d_async(*kv_cache_, src, dst);
@@ -2690,7 +2608,7 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
             // them are posted only after the engine observes this
             // completion (ledger commit first) — host-side
             // happens-before covers the device.
-            enqueue_completion(swap_pool_->stream(), completion);
+            enqueue_completion(swap_stream, completion);
             return PIE_STATUS_OK;
         }
         if (has_page_copies) {
@@ -2699,7 +2617,7 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
             // copies — keep the join.
             cudaEvent_t swap_done = nullptr;
             CUDA_CHECK(cudaEventCreateWithFlags(&swap_done, cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventRecord(swap_done, swap_pool_->stream()));
+            CUDA_CHECK(cudaEventRecord(swap_done, swap_stream));
             CUDA_CHECK(cudaStreamWaitEvent(completion_stream, swap_done, 0));
             CUDA_CHECK(cudaEventDestroy(swap_done));
         }
@@ -2765,13 +2683,18 @@ int Context::Impl::resize_pool(const PiePoolResizeDesc& resize, PieCompletion co
             }
             CUDA_CHECK(stream_status);
         }
-        if (swap_pool_ != nullptr && swap_pool_->stream() != nullptr) {
-            const cudaError_t stream_status =
-                cudaStreamQuery(swap_pool_->stream());
-            if (stream_status == cudaErrorNotReady) {
-                return PIE_STATUS_UNSUPPORTED;
+        if (swap_pool_ != nullptr) {
+            // BOTH swap streams must be idle: an in-flight restore is as
+            // much a reason to refuse a resize as an in-flight eviction.
+            for (cudaStream_t stream :
+                 {swap_pool_->stream(), swap_pool_->restore_stream()}) {
+                if (stream == nullptr) continue;
+                const cudaError_t stream_status = cudaStreamQuery(stream);
+                if (stream_status == cudaErrorNotReady) {
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                CUDA_CHECK(stream_status);
             }
-            CUDA_CHECK(stream_status);
         }
         // The quiescence gate above IS the horizon-empty condition (Venus
         // D6): with the stream drained no frame is in flight, so no

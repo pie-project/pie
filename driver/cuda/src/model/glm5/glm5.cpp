@@ -9,14 +9,7 @@
 
 namespace pie_cuda_driver::model {
 
-bool glm5_moe_gate_up_swapped() {
-    static const bool swapped = [] {
-        const char* v = std::getenv("PIE_GLM5_MOE_FLASHINFER");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return swapped;
-}
+bool glm5_moe_gate_up_swapped() { return true; }
 
 
 namespace {

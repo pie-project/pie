@@ -11,7 +11,7 @@
 //! HOW the overlap is driven: the `runahead` inferlet decodes through
 //! `collect_tokens_pipelined`, which eager-one-ahead SUBMITS the consumer (t+1)
 //! BEFORE awaiting the producer (t) — i.e. the consumer's inject is enqueued while
-//! the producer is still in flight (the overlap). `MAX_IN_FLIGHT=2` (one-step
+//! the producer is still in flight (the overlap). Dispatch depth 2 (one-step
 //! run-ahead active). So this harness EXTENDS `cuda_runahead`'s proven overlap —
 //! no separate overlap setup. The happy-path (no injection) is `cuda_runahead`
 //! itself (GREEN: `MATCH=true ANCHOR_OK=true CLEAR_OK=true`) = the non-degenerate

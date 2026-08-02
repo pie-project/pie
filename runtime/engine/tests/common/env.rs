@@ -90,6 +90,13 @@ pub struct MockEnv {
     /// completion from its own worker thread after this delay, so concurrent
     /// launches overlap exactly as far as the engine lets them run ahead.
     callback_delay_ms: u64,
+    /// Waves per frame (k) and the run-ahead window, installed through
+    /// `[model.scheduler]` exactly as a deployment would. A binary needing a
+    /// non-default k must still be its own test binary: the engine reads both
+    /// once into a `OnceLock`.
+    frame_size: u32,
+    frame_submit_depth: u32,
+    frame_dispatch_depth: u32,
     /// Dummy-driver operation log (shared across every device driver): op
     /// names plus `launch-shape tokens=N programs=P per=[..]` entries (batch
     /// totals plus per-program token spans) for geometry
@@ -104,6 +111,24 @@ impl MockEnv {
     pub fn with_recurrent_state(mut self, slots: usize, slot_bytes: u64) -> Self {
         self.rs_slots = slots;
         self.rs_slot_bytes = slot_bytes;
+        self
+    }
+
+    /// Pin the engine's dispatch depth. Must be called before
+    /// [`MockEnv::config`], with the same one-binary caveat as
+    /// [`MockEnv::with_frame_size`].
+    #[allow(dead_code)]
+    pub fn with_dispatch_depth(mut self, depth: u32) -> Self {
+        self.frame_dispatch_depth = depth;
+        self
+    }
+
+    /// Pin the frame size (k) this engine runs at. Must be called before
+    /// [`MockEnv::config`], and only from a test binary that touches the
+    /// scheduler nowhere else — k is installed into a `OnceLock` at bootstrap.
+    #[allow(dead_code)]
+    pub fn with_frame_size(mut self, frame_size: u32) -> Self {
+        self.frame_size = frame_size;
         self
     }
 
@@ -181,6 +206,10 @@ impl MockEnv {
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,
                     submit_deadline_us: 50_000,
+                    silence_timeout_secs: 30,
+                    frame_size: self.frame_size,
+                    frame_submit_depth: self.frame_submit_depth,
+                    frame_dispatch_depth: self.frame_dispatch_depth,
                 },
             },
             runtime: RuntimeConfig {
@@ -225,6 +254,9 @@ pub fn create_mock_env(
         rs_slots: 0,
         rs_slot_bytes: 0,
         callback_delay_ms: 0,
+        frame_size: 2,
+        frame_submit_depth: 3,
+        frame_dispatch_depth: 2,
         operation_log,
     }
 }

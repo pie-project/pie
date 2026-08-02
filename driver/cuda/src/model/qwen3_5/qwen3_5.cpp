@@ -27,14 +27,6 @@ const DeviceTensor* maybe(const LoadedModel& e, const std::string& name) {
     return e.has(name) ? &e.get(name) : nullptr;
 }
 
-bool fused_full_attn_qgkv_weights_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_FUSED_FULL_ATTN_QGKV");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
 
 // Qwen3.5 (multimodal config) nests the text tower under
 // `model.language_model.`; the vision tower lives under `model.visual.`
@@ -139,10 +131,6 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
             Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
             Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
-            if (fused_full_attn_qgkv_weights_enabled()) {
-                Lw.fa_qgkv_proj_fused =
-                    maybe(engine, fa + "qkv_proj.fused.weight");
-            }
             Lw.kv_layer = kv_slot++;
         } else {
             throw std::runtime_error(
@@ -178,9 +166,6 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
         Lw.fa_k_proj_quant = engine.quant_meta(fa + "k_proj.weight");
         Lw.fa_v_proj_quant = engine.quant_meta(fa + "v_proj.weight");
         Lw.fa_o_proj_quant = engine.quant_meta(fa + "o_proj.weight");
-        if (fused_full_attn_qgkv_weights_enabled()) {
-            Lw.fa_qgkv_proj_fused = maybe(engine, fa + "qkv_proj.fused.weight");
-        }
         Lw.gate_proj = &must(engine, lp + "mlp.gate_proj.weight");
         Lw.up_proj = &must(engine, lp + "mlp.up_proj.weight");
         Lw.down_proj = &must(engine, lp + "mlp.down_proj.weight");

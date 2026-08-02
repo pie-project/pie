@@ -284,12 +284,6 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     world_size_ = comm.world_size();
     same_process_ = same_process;
     max_bytes_ = max_bytes;
-    const char* custom_ar_disabled =
-        std::getenv("PIE_CUDA_DISABLE_CUSTOM_ALL_REDUCE");
-    if (custom_ar_disabled != nullptr &&
-        std::strcmp(custom_ar_disabled, "1") == 0) {
-        return;
-    }
     if (world_size_ < 2 || world_size_ > 8 || (world_size_ % 2) != 0) {
         throw std::runtime_error(
             "custom_all_reduce: vllm kernel supports world_size ∈ {2,4,6,8}; got " +

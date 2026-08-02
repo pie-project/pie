@@ -22,6 +22,22 @@ struct KvPages {
     SlotHandle v{};
 };
 
+/// The router's quantization width, solved from the two staged tensors.
+///
+/// `layers.0.mlp.router.weight` holds `n_experts * packed_cols` u32 words and
+/// `.scales` holds `n_experts * groups` bf16, so with a group of 64 the width
+/// falls straight out of the byte counts:
+///
+///     bits = 32 * packed_cols / (groups * 64) = weight_bytes / (4 * scale_bytes)
+///
+/// The same solve the contract does per tensor, done here because the PSO is
+/// chosen on this side. Returns 0 when either tensor is missing or the ratio is
+/// not a width these kernels have, so the caller refuses rather than guessing.
+int router_bits_from_extents(std::uint64_t weight_bytes, std::uint64_t scale_bytes);
+
+/// The same, looked up by name in a staged weight set.
+int router_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights);
+
 /// Everything staged before a step can be bound.
 struct BoundGptOss {
     std::unordered_map<std::string, SlotHandle> weights;

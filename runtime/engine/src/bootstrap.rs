@@ -169,9 +169,20 @@ pub struct SchedulerConfig {
     /// Wall-clock cap on a single forward-pass request, in seconds.
     pub request_timeout_secs: u64,
     /// How long a lane holding the frame wait-set may go without submitting
-    /// before it is terminated for breach of contract. See
+    /// before the leash drops it from the wait-set. Not a verdict. See
     /// `crate::scheduler::configured_submit_deadline`.
     pub submit_deadline_us: u64,
+    /// How long a lane may stay silent in total before its process is
+    /// terminated. See `crate::scheduler::configured_silence_timeout`.
+    pub silence_timeout_secs: u64,
+    /// Waves per frame (k). See `crate::scheduler::configured_frame_size`.
+    pub frame_size: u32,
+    /// Frames a guest keeps submitted into the engine. See
+    /// `crate::scheduler::configured_submit_depth`.
+    pub frame_submit_depth: u32,
+    /// Frames the engine keeps posted to the driver. See
+    /// `crate::scheduler::frame::configured_dispatch_depth`.
+    pub frame_dispatch_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -211,9 +222,6 @@ pub async fn bootstrap_with_listener(
 }
 
 async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
-    // The bootstrap edge is the ONLY place planner knobs leave the
-    // environment; everything downstream receives this value explicitly.
-    let planner_config = crate::planner::PlannerConfig::from_env();
     verify_config(&config)?;
     let mut active_guard = ActiveRuntimeGuard::acquire()?;
 
@@ -385,7 +393,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 0,
                 kv_swap_capable,
             )),
-            planner_config,
         ),
     );
     // Opt-in stall sampler: `PIE_CONTENTION_TRACE_MS=500` emits one line
@@ -409,17 +416,20 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 // boots with `skip_tracing` and installs no subscriber, so
                 // a tracing event here would go nowhere.
                 println!(
-                    "[planner-trace] queue={} head_pages={} head_kind={} accum={} \
+                    "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
-                     parks={} serves={} evictions={} \
+                     parks={} serves={} evictions={} deferrals={} \
                      evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} \
                      d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
                     d.queue.len(),
-                    d.queue.first().map_or(0, |w| w.pages),
-                    d.queue.first().map_or("-", |w| w.kind),
+                    d.unmet_queued,
+                    d.unmet_head_pages,
+                    d.unmet_head_kind,
+                    d.bypassable_entries,
+                    d.bypassable_pages,
                     d.accumulation,
                     d.device_pages_free,
                     d.device_pages_total,
@@ -431,6 +441,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.parks_total,
                     d.serves_total,
                     d.evictions_total,
+                    d.eviction_deferrals_total,
                     d.eviction_rollbacks_total,
                     d.restores_total,
                     d.restore_failures_total,
@@ -466,6 +477,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_submit_deadline(std::time::Duration::from_micros(
         scheduler.submit_deadline_us,
     ));
+    crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
+        scheduler.silence_timeout_secs,
+    ));
+    // Both are read once into a `OnceLock` and are guest-visible through
+    // `model.frame-size()` / `model.channel-capacity()`, so they must be
+    // installed before anything touches the scheduler.
+    crate::scheduler::set_frame_size(scheduler.frame_size as usize);
+    crate::scheduler::set_submit_depth(scheduler.frame_submit_depth as usize);
+    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(
         &drivers,
         kv_page_size as u32,
@@ -613,6 +633,24 @@ fn verify_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Per-component ceiling on the wasmtime resource classes a COMPONENT
+/// multiplies. A component is not one core module: a Rust `wasm32-wasip2`
+/// guest is linked from the guest module plus the preview1 adapter plus a
+/// shim, and instantiating it takes one core-instance slot per module and one
+/// table slot per module that defines a table. Measured over all 34 inferlets
+/// pie ships, every one is exactly 3 core instances / 2 tables / 1 memory /
+/// 1 fiber stack.
+///
+/// Declaring the ceiling matters as much as its value: without it, a guest
+/// built from more modules than expected does not fail at instantiation, it
+/// silently divides the engine's effective inferlet capacity and then fails
+/// under load at a concurrency that depends on the traffic. With it, wasmtime
+/// rejects such a guest deterministically and names the limit.
+///
+/// The headroom over the measured 3/2 is cheap: these pools cost reserved
+/// address space for instance metadata, not committed memory or KV.
+const CORE_RESOURCES_PER_COMPONENT: u32 = 16;
+
 fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     // wasmtime 46: `async_support` is a deprecated no-op (async is always
@@ -620,17 +658,35 @@ fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     // no explicit flags are needed to enable async host calls / fibers.
 
     // Every wasmtime knob comes from the caller — Python is the source
-    // of truth for defaults. The `wasm_max_instances` knob covers four
-    // wasmtime resource classes (pie uses one of each per inferlet).
+    // of truth for defaults. `wasm_max_instances` is a cap on concurrent
+    // INFERLETS, and each pool below is sized so that it can actually seat
+    // that many.
     let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
-    // Lockstep bump on the five "total_*" caps. wasmtime defaults all of them
-    // to 1000; pie uses exactly one of each per inferlet (one core instance,
-    // one component instance, one memory, one table, one async fiber stack).
-    pooling_config.total_core_instances(runtime.wasm_max_instances);
+    // One per inferlet, exactly: pie runs one component instance in one
+    // store with one linear memory and one async fiber stack. These are also
+    // the expensive pools — a memory slot reserves a whole wasm32 range so
+    // bounds checks can be elided — so they must not be inflated.
     pooling_config.total_component_instances(runtime.wasm_max_instances);
     pooling_config.total_memories(runtime.wasm_max_instances);
-    pooling_config.total_tables(runtime.wasm_max_instances);
     pooling_config.total_stacks(runtime.wasm_max_instances);
+    // Several per inferlet, however many core modules the component was
+    // linked from. Sizing these at `wasm_max_instances` capped pie at
+    // `wasm_max_instances / 3` concurrent inferlets: at 512-wide admission,
+    // where prewarm + bind hold ~1536 live inferlets, a 4096 pool ran out of
+    // core instances (1536 x 3 = 4608) and 55% of requests died with
+    // "maximum concurrent limit of 4096 for core instances reached".
+    pooling_config.max_core_instances_per_component(CORE_RESOURCES_PER_COMPONENT);
+    pooling_config.max_tables_per_component(CORE_RESOURCES_PER_COMPONENT);
+    pooling_config.total_core_instances(
+        runtime
+            .wasm_max_instances
+            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
+    );
+    pooling_config.total_tables(
+        runtime
+            .wasm_max_instances
+            .saturating_mul(CORE_RESOURCES_PER_COMPONENT),
+    );
     pooling_config.max_memory_size(runtime.wasm_max_memory_mb.saturating_mul(1024 * 1024));
     pooling_config
         .linear_memory_keep_resident(runtime.wasm_warm_memory_mb.saturating_mul(1024 * 1024));

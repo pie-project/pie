@@ -61,8 +61,9 @@ int current_device_major() {
 }
 
 flashinfer::mamba::SSUAlgorithm requested_algorithm() {
-    const char* v = std::getenv("PIE_NEMOTRON_FLASHINFER_SSU_ALGO");
-    if (v == nullptr || v[0] == '\0' || std::strcmp(v, "auto") == 0) {
+    return flashinfer::mamba::SSUAlgorithm::kAuto;
+    const char* v = "auto";
+    if (false) {
         return flashinfer::mamba::SSUAlgorithm::kAuto;
     }
     if (std::strcmp(v, "simple") == 0) {
