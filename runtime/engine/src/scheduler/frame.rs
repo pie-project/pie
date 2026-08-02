@@ -29,11 +29,20 @@
 //!   instead of sealing narrow epochs. A bind alone holds nothing: a
 //!   live rebinder is already wait-set-held through its lane, and an
 //!   unadmitted process cannot fire;
-//! - seals from every ready lane (deterministic first-fit in lane-id order
-//!   against the per-wave token/row budgets — pure arithmetic over declared
-//!   demand, never timing). A lane deferred by capacity is served in the
-//!   same structurally partitioned round without re-awaiting the lanes
-//!   already served ([`FramePolicy::round_served`], the quorum's round rule);
+//! - seals ONE partition per call from the ready lanes (deterministic
+//!   first-fit against the per-wave token/row budgets — pure arithmetic over
+//!   declared demand, never timing). The gate guards the OPENING of a
+//!   boundary, not each partition of it: a lane deferred by capacity is
+//!   served in a later partition of the same boundary without re-awaiting
+//!   the lanes already fired (the quorum's round rule), and — because the
+//!   partitions are sealed one at a time rather than all at once — a lane
+//!   whose earlier partition has RETIRED rejoins a later one with its next
+//!   frame. That is what makes a prefill-heavy boundary produce mixed
+//!   prefill+decode launches instead of prefill-only ones
+//!   (CONTENTION_FOLLOWUP §20.49). Every partition must advance the
+//!   boundary — a continuation-only partition is refused and control
+//!   returns to the gate — so a boundary closes in at most `lanes`
+//!   partitions and can never fire a narrow epoch;
 //! - seals EARLY and overlaps frames on-stream: the next frame seals the
 //!   moment the wait-all gate holds — normally while the current frame
 //!   executes — and its waves post behind the executing frame's tail at
@@ -206,6 +215,16 @@ struct LaneState {
     /// member the seal waits on), released only by close/terminate.
     awaited: bool,
     frames: VecDeque<PendingFrame>,
+    /// Whether this lane has already fired into the boundary currently open.
+    /// Cleared for every lane when the wait-all gate opens a boundary, set
+    /// when the lane is picked into a partition.
+    ///
+    /// A boundary is OPEN while some awaited lane has not fired into it. While
+    /// it is open the gate is not re-evaluated: those lanes were all ready when
+    /// the gate held, so no partition can be narrow. A lane that joins the
+    /// wait-set mid-boundary starts fired so it waits for the next gate —
+    /// which is where join gathering already happens.
+    fired_this_boundary: bool,
 }
 
 /// One sealed (immutable) frame, dispatched WHOLE: per-wave fire-id lists in
@@ -497,6 +516,10 @@ impl FramePolicy {
             owner,
             awaited: !suspended,
             frames: VecDeque::new(),
+            // `open_boundary` is the only thing that makes a lane owe: a lane
+            // arriving mid-boundary is not a member of it, and one arriving
+            // between boundaries is picked up by the next gate.
+            fired_this_boundary: true,
         });
         if lane.owner.is_none() {
             lane.owner = owner;
@@ -839,14 +862,53 @@ impl FramePolicy {
             .any(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete))
     }
 
-    /// Seal EVERY ready lane's front frame — the whole boundary at once,
-    /// first-fit in lane-id order against the per-wave row/token budgets,
-    /// partitioned into as many coexisting frames as the budgets require
-    /// (partitions post in seal order and pipeline on-stream). Exactly one
-    /// frame per lane per boundary keeps the fleet on one frame sequence.
-    /// Called only once the wait-all gate holds (no missing awaited lane,
-    /// no earmarked successor assembling); deterministic — no timing input beyond the
-    /// bootstrap cold hold.
+    /// Whether a boundary is currently open: some awaited lane has not yet
+    /// fired into it. While open, the wait-all gate is not re-evaluated —
+    /// every lane that still owes was ready when the gate held.
+    fn boundary_open(&self) -> bool {
+        self.lanes
+            .values()
+            .any(|lane| lane.awaited && !lane.fired_this_boundary)
+    }
+
+    /// Open a fresh boundary: every awaited lane owes it one frame.
+    fn open_boundary(&mut self) {
+        for lane in self.lanes.values_mut() {
+            lane.fired_this_boundary = false;
+        }
+    }
+
+    /// Close the open boundary without serving the rest of it: no owing lane
+    /// can seal (they are all mid-flight, idle or escaped), so control returns
+    /// to the wait-all gate rather than to a narrow continuation partition.
+    fn close_boundary(&mut self) {
+        for lane in self.lanes.values_mut() {
+            lane.fired_this_boundary = true;
+        }
+    }
+
+    /// Seal ONE partition of the open boundary — first-fit against the
+    /// per-wave row/token budgets, in this candidate order:
+    ///
+    /// 1. the lowest-id lane that still owes this boundary a frame (progress
+    ///    guarantee: every partition retires at least one, so a boundary
+    ///    closes in at most `lanes` partitions);
+    /// 2. lanes already served this boundary that have RESUBMITTED — their
+    ///    earlier partition retired and the guest answered. This is
+    ///    continuing work: on a decode step it costs one token, so it never
+    ///    crowds out (3);
+    /// 3. the remaining lanes that still owe the boundary a frame.
+    ///
+    /// Sealing one partition per call is what lets (2) exist at all. Sealing
+    /// the WHOLE boundary at once — as this did before — fixed every
+    /// partition's content at an instant when no fire had executed, so a
+    /// prefill-heavy boundary could only ever produce prefill-only launches
+    /// (CONTENTION_FOLLOWUP §20.49). The worker posts at most
+    /// `configured_max_in_flight()` frames, so partitions beyond that were
+    /// dispatched long after their content froze.
+    ///
+    /// Called only once the wait-all gate holds for a CLOSED boundary (no
+    /// missing awaited lane, no earmarked successor assembling).
     fn seal(&mut self, now: Instant) -> Option<FramePlan> {
         if !self.have_seal_candidate() {
             self.cold_hold_deadline = None;
@@ -875,28 +937,65 @@ impl FramePolicy {
             }
         }
         self.cold_hold_deadline = None;
+        // `plan_dispatch` calls in mid-boundary only while one IS open, so
+        // otherwise this call OPENS a boundary — but only if it actually
+        // seals, so a call that finds nothing sealable leaves the policy
+        // untouched and control at the gate.
+        let mid_boundary = self.boundary_open();
 
-        // One frame per lane per boundary: a lane whose SECOND frame is
-        // also already complete (back-to-back prefill chains) contributes
-        // only its front — the rest waits for the next boundary's gate.
-        let mut served: HashSet<ProcessId> = HashSet::new();
-        let mut sealed_any = false;
+        // ONE partition per call. Candidate order: the lowest-id lane that has
+        // not fired into this boundary first (progress guarantee: every
+        // partition retires at least one, so a boundary closes in at most
+        // `lanes` partitions), then lanes that already fired into it and have
+        // RESUBMITTED — continuing work, one token per decode row, so it never
+        // crowds out the rest — then the remaining lanes that have not fired.
+        // At a freshly opened boundary nothing has fired, so this is plain
+        // lane-id order.
+        let k = self.k;
+        let max_wave_rows = self.max_wave_rows;
+        let max_wave_tokens = self.max_wave_tokens;
         loop {
-            let mut waves: Vec<Vec<u64>> = vec![Vec::new(); self.k];
-            let mut fire_waves = HashMap::new();
-            let mut wave_tokens = vec![0usize; self.k];
-            let mut wave_rows = vec![0usize; self.k];
-            let mut members: HashSet<ProcessId> = HashSet::new();
-            for (lane_id, lane) in self.lanes.iter_mut() {
-                if served.contains(lane_id) {
+            let mut fresh: Vec<ProcessId> = Vec::new();
+            let mut continuing: Vec<ProcessId> = Vec::new();
+            for (lane_id, lane) in self.lanes.iter() {
+                if !lane.frames.front().is_some_and(PendingFrame::is_complete) {
                     continue;
                 }
+                if mid_boundary && lane.fired_this_boundary {
+                    continuing.push(*lane_id);
+                } else {
+                    fresh.push(*lane_id);
+                }
+            }
+            if mid_boundary && fresh.is_empty() {
+                // Nothing left that advances this boundary. Sealing the
+                // continuation lanes alone would be exactly the narrow epoch
+                // the wait-all rule exists to prevent: hand control back so
+                // the gate re-gathers.
+                return None;
+            }
+            let mut order: Vec<ProcessId> = Vec::with_capacity(fresh.len() + continuing.len());
+            let mut rest = fresh.as_slice();
+            if let Some((first, tail)) = fresh.split_first() {
+                order.push(*first);
+                rest = tail;
+            }
+            order.extend_from_slice(&continuing);
+            order.extend_from_slice(rest);
+
+            let mut waves: Vec<Vec<u64>> = vec![Vec::new(); k];
+            let mut fire_waves = HashMap::new();
+            let mut wave_tokens = vec![0usize; k];
+            let mut wave_rows = vec![0usize; k];
+            let mut members: HashSet<ProcessId> = HashSet::new();
+            let mut dropped_empty = false;
+            for lane_id in order {
+                let Some(lane) = self.lanes.get_mut(&lane_id) else {
+                    continue;
+                };
                 let Some(front) = lane.frames.front() else {
                     continue;
                 };
-                if !front.is_complete() {
-                    continue;
-                }
                 let live: Vec<&ArrivedFire> = front
                     .fires
                     .iter()
@@ -904,49 +1003,64 @@ impl FramePolicy {
                     .collect();
                 if live.is_empty() {
                     lane.frames.pop_front();
+                    dropped_empty = true;
                     continue;
                 }
                 let fits = live.iter().all(|fire| {
-                    let wave = (fire.slot as usize).min(self.k - 1);
-                    wave_rows[wave] + fire.rows.max(1) <= self.max_wave_rows
-                        && wave_tokens[wave] + fire.tokens <= self.max_wave_tokens
+                    let wave = (fire.slot as usize).min(k - 1);
+                    wave_rows[wave] + fire.rows.max(1) <= max_wave_rows
+                        && wave_tokens[wave] + fire.tokens <= max_wave_tokens
                 });
                 if !fits {
-                    // Over budget: the lane seals into this boundary's next
-                    // partition (the loop's next pass).
+                    // Over budget: the lane seals into a later partition.
                     continue;
                 }
                 for fire in live {
-                    let wave = (fire.slot as usize).min(self.k - 1);
+                    let wave = (fire.slot as usize).min(k - 1);
                     wave_rows[wave] += fire.rows.max(1);
                     wave_tokens[wave] += fire.tokens;
                     let fire_id = fire.fire_id.expect("live fire has an id");
                     waves[wave].push(fire_id);
                     fire_waves.insert(fire_id, wave);
                 }
-                members.insert(*lane_id);
+                members.insert(lane_id);
                 lane.frames.pop_front();
             }
             if fire_waves.is_empty() {
-                break;
+                // Nothing sealable. Retry only if a frame that turned out to
+                // hold no live fire was dropped — the lane's NEXT front may
+                // be sealable, and the old whole-boundary loop caught that.
+                if dropped_empty {
+                    continue;
+                }
+                self.lanes
+                    .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
+                return None;
             }
-            sealed_any = true;
             self.ever_sealed = true;
-            served.extend(members.iter().copied());
+            if !mid_boundary {
+                // Opened here, after the bootstrap cold hold, so a lane that
+                // landed during the hold is still gathered into it.
+                self.open_boundary();
+            }
+            for member in &members {
+                if let Some(lane) = self.lanes.get_mut(member) {
+                    lane.fired_this_boundary = true;
+                }
+            }
             self.record_sealed_waves(
                 waves.iter().filter(|wave| !wave.is_empty()).count(),
                 cold_hold_fired,
             );
-            cold_hold_fired = false;
             let _ = &fire_waves;
             self.sealed.push_back(SealedFrame {
                 waves,
                 members: members.iter().copied().collect(),
             });
+            self.lanes
+                .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
+            return Some(FramePlan::Dispatch(Vec::new()));
         }
-        self.lanes
-            .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
-        sealed_any.then(|| FramePlan::Dispatch(Vec::new()))
     }
 
     /// Structural capacity: a wave of the ready front frames already
@@ -1068,6 +1182,24 @@ impl FramePolicy {
             // reports a stalled gather but never evicts a member and
             // never fires a narrow epoch; membership changes only through
             // close/leave/first-fire events.
+            //
+            // The gate guards the OPENING of a boundary, not each of its
+            // partitions. While a boundary is open, every lane that still
+            // owes it a frame was ready when the gate held, so the next
+            // partition cannot be narrow — and re-gating there is exactly
+            // what used to force each boundary's whole content to be fixed
+            // before any of it executed (CONTENTION_FOLLOWUP §20.49).
+            if self.boundary_open() {
+                if let Some(plan) = self.seal(now) {
+                    match plan {
+                        FramePlan::Dispatch(_) => continue,
+                        plan => return plan,
+                    }
+                }
+                // Every remaining owing lane is unsealable (blocked in an
+                // executing partition): close the boundary and re-gate.
+                self.close_boundary();
+            }
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
@@ -1690,6 +1822,55 @@ mod tests {
         assert_eq!(frame_b[0], vec![41]);
         // Round closed at b's seal: the next epoch awaits BOTH lanes again.
         let queued = QueuedFireIds::default();
+        assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
+    }
+
+    /// A boundary is sealed one partition at a time, so a lane whose earlier
+    /// partition already RETIRED rejoins a later partition of the SAME
+    /// boundary. This is what lets a prefill-heavy boundary produce mixed
+    /// prefill+decode launches: sealing the whole boundary at once fixed
+    /// every partition's content before any of it had executed, so the
+    /// trailing partitions could only ever be prefill-only
+    /// (CONTENTION_FOLLOWUP §20.49).
+    #[test]
+    fn a_retired_lane_rejoins_a_later_partition_of_the_same_boundary() {
+        // 40-token wave budget: one 37-token prefill per partition.
+        let mut policy = FramePolicy::new(1, 64, 40, None);
+        let (a, b, c) = {
+            let mut ids = [pid(), pid(), pid()];
+            ids.sort_unstable();
+            (ids[0], ids[1], ids[2])
+        };
+        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 40, 37, 1);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 41, 37, 1);
+        policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 42, 37, 1);
+        let queued: QueuedFireIds = [40, 41, 42].into_iter().collect();
+        let FramePlan::Dispatch(p1) = drive_past_cold_hold(&mut policy, &queued) else {
+            panic!("expected the first partition");
+        };
+        assert_eq!(p1[0], vec![40], "first-fit admits lane a only");
+        let FramePlan::Dispatch(p2) = plan(&mut policy, &queued, Instant::now()) else {
+            panic!("expected the second partition");
+        };
+        assert_eq!(p2[0], vec![41]);
+
+        // Lane a's partition retires and the guest answers with a decode
+        // row. The boundary is still open (c has not fired into it), so a's
+        // decode rides along with c's prefill instead of paying for its own
+        // near-empty launch.
+        policy.on_fire_enqueued(stamp(a, 1, 0, 1), Some(a), 43, 1, 1);
+        let queued: QueuedFireIds = [42, 43].into_iter().collect();
+        let FramePlan::Dispatch(p3) = plan(&mut policy, &queued, Instant::now()) else {
+            panic!("expected the third partition");
+        };
+        assert_eq!(
+            p3[0],
+            vec![42, 43],
+            "the continuing decode joins the fresh prefill"
+        );
+
+        // Boundary closed at c's seal: the gate re-gathers everyone.
+        let queued: QueuedFireIds = QueuedFireIds::default();
         assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
     }
 
