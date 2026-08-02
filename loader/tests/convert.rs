@@ -92,10 +92,10 @@ fn convert_writes_a_zt_checkpoint() {
     assert_eq!(scales, [127, 128]);
 
     // And every tensor verifies against its own digest.
-    let reader = ztensor::Reader::open(&artifact).unwrap();
+    let reader = ztensor::Source::open(&artifact).unwrap();
     for name in ["w", "w_scale"] {
         assert!(
-            reader.verify(name, "data").unwrap(),
+            reader.tensor(name).unwrap().verify().unwrap().checked(),
             "{name} carries no digest"
         );
     }
@@ -103,7 +103,7 @@ fn convert_writes_a_zt_checkpoint() {
     // Provenance landed in the file's own attributes rather than a sidecar.
     let attributes = format!(
         "{:?}",
-        reader.manifest().attributes.as_ref().expect("provenance is recorded")
+        reader.attributes().as_ref().expect("provenance is recorded")
     );
     for key in [
         "pie_convert_compiler",

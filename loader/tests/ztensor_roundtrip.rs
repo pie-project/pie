@@ -43,7 +43,7 @@ fn bytes_at(metadata: &CheckpointMetadata, name: &str) -> Vec<u8> {
 fn write_zt(path: &Path, tensors: &[(&str, Vec<u64>, ztensor::DType, Vec<u8>)]) {
     let mut writer = ztensor::Writer::create(path).unwrap();
     for (name, shape, dtype, data) in tensors {
-        writer.add_dense(name, shape, *dtype, data).unwrap();
+        writer.add(*name, shape.to_vec(), *dtype, data).unwrap();
     }
     writer.finish().unwrap();
 }

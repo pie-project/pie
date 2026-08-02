@@ -2,11 +2,15 @@
 //!
 //! One reader for every format the loader accepts. `ztensor-compat` projects
 //! `.safetensors`, `.gguf`, `.npz`, `.pt`, `.h5` and `.onnx` into one object
-//! model — named objects, each a shape and a set of parts, each part a byte
+//! model — named tensors, each a shape and a set of parts, each part a byte
 //! range in some file — and this module is the translation of that model into
 //! the loader's [`CheckpointMetadata`]. The two are close enough that most of
-//! it is renaming: an object's part is a [`RawTensor`], its blob reference is
+//! it is renaming: a tensor's part is a [`RawTensor`], its address is
 //! `(file_id, file_offset, span_bytes)`.
+//!
+//! Nothing here reads tensor bytes, so nothing here maps a file: the source is
+//! *indexed*, which answers where every tensor lives for the cost of a header
+//! read rather than a mapping of the whole checkpoint.
 //!
 //! What is *not* renaming is the encoding. The loader's [`Encoding`] names a
 //! quantization scheme; zTensor names a layout profile and a logical type. The
@@ -15,17 +19,18 @@
 //!
 //! # Parts and names
 //!
-//! A zTensor object may carry several parts (a quantized weight is payload
+//! A zTensor tensor may carry several parts (a quantized weight is payload
 //! plus scales). The loader's tensor space is flat and name-addressed, so a
-//! multi-part object becomes one [`RawTensor`] per part: the `"data"` part
-//! keeps the object's name, and any other part is suffixed `.<part>`. That
+//! multi-part tensor becomes one [`RawTensor`] per part: the `"data"` part
+//! keeps the tensor's name, and any other part is suffixed `.<part>`. That
 //! matches how the same tensors are named in the checkpoints these files come
 //! from (`*_blocks` / `*_scales` in safetensors MXFP4), so a contract written
 //! against a converted checkpoint reads the same either way.
 
 use std::path::{Path, PathBuf};
 
-use ztensor::{DType as ZDType, Object, Part};
+use ztensor::cbor::Value;
+use ztensor::{DType as ZDType, Source};
 
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use crate::error::Error;
@@ -35,42 +40,10 @@ use crate::types::{
 
 /// Opens a checkpoint of any supported format and describes it.
 ///
-/// Only metadata is read: the projections map the file and parse its header,
-/// and bulk tensor bytes are never touched here.
+/// A `.zt` root that names shards brings them along; every other format is one
+/// file that describes itself.
 pub fn parse_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
-    let format = checkpoint_format(ztensor_compat::detect(path).map_err(zt_err)?);
-    let source = ztensor_compat::open_any(path).map_err(zt_err)?;
-    let manifest = source.manifest();
-
-    // A `.zt` model may name shards, and the manifest gives each part the
-    // shard index its bytes live in. The loader's file ids are dense and the
-    // shard table is keyed from 1, so index and id agree by construction.
-    let mut files = vec![CheckpointFile {
-        id: FileId(0),
-        path: path.to_string_lossy().into_owned(),
-        size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        format,
-    }];
-    for (&index, shard) in &manifest.shards {
-        files.push(CheckpointFile {
-            id: FileId(u32::try_from(index).map_err(|_| {
-                Error::Checkpoint(format!("shard index {index} does not fit a file id"))
-            })?),
-            path: shard_path(path, index).to_string_lossy().into_owned(),
-            size_bytes: shard.size,
-            format,
-        });
-    }
-
-    let mut tensors = Vec::new();
-    for (name, object) in &manifest.objects {
-        collect(&mut tensors, name, object, |part| {
-            u32::try_from(part.blob.shard)
-                .map(FileId)
-                .map_err(|_| Error::Checkpoint("shard index does not fit a file id".into()))
-        })?;
-    }
-    Ok(CheckpointMetadata { files, tensors })
+    describe(&ztensor_compat::index(path).map_err(zt_err)?)
 }
 
 /// Opens a set of files that together hold one checkpoint.
@@ -78,37 +51,61 @@ pub fn parse_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
 /// What a sharded snapshot is. Each file describes itself completely and none
 /// of them names the others, so the set is the caller's claim — HF states it
 /// in `model.safetensors.index.json`, which is a convention beside the format
-/// rather than anything inside it. [`ztensor::Composite`] is that shape: one
-/// name space over N sources, with the file each name came from recorded, and
-/// a name in two files refused rather than resolved by precedence.
-///
-/// The single-file case is not routed here. It would work, but it would also
-/// answer a question nobody asked — with one file there is no set to state.
+/// rather than anything inside it. So this takes a list, and a name in two
+/// files is refused rather than resolved by precedence.
 pub fn parse_checkpoint_files(paths: &[PathBuf]) -> Result<CheckpointMetadata, Error> {
-    let composite = ztensor_compat::open_all(paths).map_err(zt_err)?;
+    describe(&ztensor_compat::index_all(paths).map_err(zt_err)?)
+}
 
-    let mut files = Vec::with_capacity(paths.len());
-    for (index, path) in paths.iter().enumerate() {
+/// Turns an opened source into the loader's metadata.
+///
+/// The single-file and multi-file cases are one function because the source
+/// already resolved that difference: `stores()` is the files this checkpoint
+/// is made of, in the order that fixes their ids, and every tensor's address
+/// names the file it lives in.
+fn describe(source: &Source) -> Result<CheckpointMetadata, Error> {
+    let mut files = Vec::with_capacity(source.stores().len());
+    for (index, store) in source.stores().iter().enumerate() {
         files.push(CheckpointFile {
             id: FileId(u32::try_from(index).map_err(|_| {
                 Error::Checkpoint("checkpoint has more files than a file id holds".into())
             })?),
-            path: path.to_string_lossy().into_owned(),
-            size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-            format: checkpoint_format(ztensor_compat::detect(path).map_err(zt_err)?),
+            path: store.path().display().to_string(),
+            size_bytes: store.len(),
+            format: checkpoint_format(store.format()),
         });
     }
 
     let mut tensors = Vec::new();
-    for (index, name, object) in composite.objects() {
-        // Every part of a composite addresses its own file, so the source
-        // index is the whole of the file identity -- there is no shard table
-        // to consult, and a blob offset means what it meant in the file it
-        // came from.
-        let file = FileId(u32::try_from(index).map_err(|_| {
-            Error::Checkpoint("checkpoint has more files than a file id holds".into())
-        })?);
-        collect(&mut tensors, name, object, |_| Ok(file))?;
+    for tensor in source.tensors() {
+        for part_name in tensor.parts() {
+            let part = tensor.part(part_name).map_err(zt_err)?;
+            let name = if part_name == "data" {
+                tensor.name().to_string()
+            } else {
+                format!("{}.{part_name}", tensor.name())
+            };
+            // The loader addresses checkpoint bytes where they lie, so a part
+            // with no address cannot be planned at all — a compressed `.zt`
+            // part, a deflated zip entry, a chunked HDF5 dataset.
+            let at = part.locate().map_err(|_| {
+                Error::Checkpoint(format!(
+                    "{name}: this part has no address — the loader addresses checkpoint                      bytes where they lie; convert the file to a raw one first"
+                ))
+            })?;
+            let id = TensorId(u32::try_from(tensors.len()).map_err(|_| {
+                Error::Checkpoint("checkpoint has more tensors than a tensor id holds".into())
+            })?);
+            tensors.push(RawTensor {
+                id,
+                name,
+                file_id: FileId(at.store.0),
+                file_offset: at.offset,
+                span_bytes: at.len,
+                shape: shape_of(&tensor, part_name, &part)?,
+                encoding: encoding_of(&tensor, &part)?,
+            });
+        }
     }
     Ok(CheckpointMetadata { files, tensors })
 }
@@ -125,67 +122,20 @@ fn checkpoint_format(label: &str) -> CheckpointFormat {
     }
 }
 
-/// Appends one [`RawTensor`] per part of `object`.
-///
-/// A zTensor object may carry several parts and the loader's tensor space is
-/// flat, so the `"data"` part keeps the object's name and any other part is
-/// suffixed `.<part>` -- which is how the same tensors are named in the
-/// checkpoints they come from (`*_blocks` / `*_scales` in safetensors MXFP4).
-fn collect(
-    tensors: &mut Vec<RawTensor>,
-    name: &str,
-    object: &Object,
-    file_of: impl Fn(&Part) -> Result<FileId, Error>,
-) -> Result<(), Error> {
-    for (part_name, part) in &object.parts {
-        let tensor_name = if part_name == "data" {
-            name.to_string()
-        } else {
-            format!("{name}.{part_name}")
-        };
-        if part.encoding.is_some() {
-            return Err(Error::Checkpoint(format!(
-                "{tensor_name}: compressed parts cannot be planned — the loader \
-                 addresses checkpoint bytes where they lie; convert the file to a \
-                 raw one first"
-            )));
-        }
-        let id = TensorId(u32::try_from(tensors.len()).map_err(|_| {
-            Error::Checkpoint("checkpoint has more tensors than a tensor id holds".into())
-        })?);
-        tensors.push(RawTensor {
-            id,
-            name: tensor_name,
-            file_id: file_of(part)?,
-            file_offset: part.blob.offset,
-            span_bytes: part.blob.length,
-            shape: shape_of(object, part_name, part)?,
-            encoding: encoding_of(object, part)?,
-        });
-    }
-    Ok(())
-}
-
-/// `<stem>-<index:05>.zt` beside the root — the positional shard convention.
-fn shard_path(root: &Path, index: u64) -> std::path::PathBuf {
-    let dir = root.parent().unwrap_or(Path::new("."));
-    let stem = root
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "model".into());
-    dir.join(format!("{stem}-{index:05}.zt"))
-}
-
 /// The shape a part presents to the planner.
 ///
 /// The object's shape describes the *object*, and for a single-part object
 /// that is also the part's shape. A secondary part (scales beside a payload)
 /// has its own extent, which the loader needs as a shape of its own; it is
 /// derived from the bytes, since the object shape does not describe it.
-fn shape_of(object: &Object, part_name: &str, part: &Part) -> Result<Vec<i64>, Error> {
+fn shape_of(
+    tensor: &ztensor::Tensor<'_>,
+    part_name: &str,
+    part: &ztensor::Part<'_>,
+) -> Result<Vec<i64>, Error> {
     if part_name == "data" {
-        return object
-            .shape
+        return tensor
+            .shape()
             .iter()
             .map(|&d| {
                 i64::try_from(d)
@@ -193,8 +143,8 @@ fn shape_of(object: &Object, part_name: &str, part: &Part) -> Result<Vec<i64>, E
             })
             .collect();
     }
-    let width = part.dtype.width().max(1);
-    let elements = part.decoded_size() / width;
+    let width = part.dtype().width().max(1);
+    let elements = part.nbytes() / width;
     Ok(vec![i64::try_from(elements).map_err(|_| {
         Error::Checkpoint("part element count does not fit an i64".into())
     })?])
@@ -247,22 +197,23 @@ fn dtype_of(dtype: ZDType, ltype: Option<&str>) -> Result<DType, Error> {
 /// Layouts the loader has no scheme for are an error, not a guess — reading a
 /// quantized payload as raw bytes of its storage type is exactly the silent
 /// misinterpretation the object model exists to prevent.
-fn encoding_of(object: &Object, part: &Part) -> Result<Encoding, Error> {
-    let layout = object.layout.as_str();
-    let dtype = dtype_of(part.dtype, part.ltype.as_deref())?;
+fn encoding_of(tensor: &ztensor::Tensor<'_>, part: &ztensor::Part<'_>) -> Result<Encoding, Error> {
+    let layout = tensor.layout();
+    let attrs = tensor.attributes();
+    let dtype = dtype_of(part.dtype(), part.logical())?;
 
     // `dense` is the only layout whose parts are plain values.
     if layout == "dense" {
         return Ok(Encoding::Raw(dtype));
     }
 
-    let scheme = scheme_of(layout, object)?;
-    let group_size = attr_u64(object, "group_size")
-        .or_else(|| attr_u64(object, "block_size"))
-        .or_else(|| attr_u64(object, "elems_per_block"))
+    let scheme = scheme_of(layout, attrs)?;
+    let group_size = attr_u64(attrs, "group_size")
+        .or_else(|| attr_u64(attrs, "block_size"))
+        .or_else(|| attr_u64(attrs, "elems_per_block"))
         .unwrap_or_else(|| u64::from(scheme.default_group_size()));
-    let bits = attr_u64(object, "bits").unwrap_or_else(|| u64::from(scheme.default_bits()));
-    let axis = attr_u64(object, "axis").and_then(|a| u8::try_from(a).ok()).map(Axis);
+    let bits = attr_u64(attrs, "bits").unwrap_or_else(|| u64::from(scheme.default_bits()));
+    let axis = attr_u64(attrs, "axis").and_then(|a| u8::try_from(a).ok()).map(Axis);
 
     Ok(Encoding::Quant(
         QuantSpec {
@@ -292,9 +243,9 @@ fn encoding_of(object: &Object, part: &Part) -> Result<Encoding, Error> {
 /// A profile this function cannot resolve is refused. A plan cannot address
 /// bytes it cannot describe, and guessing is what the object model exists to
 /// prevent.
-fn scheme_of(layout: &str, object: &Object) -> Result<QuantScheme, Error> {
+fn scheme_of(layout: &str, attrs: Option<&Value>) -> Result<QuantScheme, Error> {
     if layout == "zt.quant_group/1" {
-        return affine_group_scheme(object);
+        return affine_group_scheme(attrs);
     }
     Ok(match layout {
         "zt.mx/1" => QuantScheme::Mxfp4E2M1E8M0,
@@ -320,17 +271,17 @@ fn scheme_of(layout: &str, object: &Object) -> Result<QuantScheme, Error> {
 /// combination does not name is refused rather than rounded to the nearest
 /// scheme: reading GPTQ codes as AWQ would decode every weight backwards
 /// within its word.
-fn affine_group_scheme(object: &Object) -> Result<QuantScheme, Error> {
+fn affine_group_scheme(attrs: Option<&Value>) -> Result<QuantScheme, Error> {
     let missing = |what: &str| {
         Error::Checkpoint(format!(
             "zt.quant_group/1 is parametric and its {what} attribute is required; \
              a decoder cannot be chosen without it"
         ))
     };
-    let bits = attr_u64(object, "bits").ok_or_else(|| missing("bits"))?;
-    let packing = attr_map(object, "packing").ok_or_else(|| missing("packing"))?;
+    let bits = attr_u64(attrs, "bits").ok_or_else(|| missing("bits"))?;
+    let packing = attr_map(attrs, "packing").ok_or_else(|| missing("packing"))?;
     let order = map_text(packing, "order").ok_or_else(|| missing("packing.order"))?;
-    let zero = attr_map(object, "zero_point").ok_or_else(|| missing("zero_point"))?;
+    let zero = attr_map(attrs, "zero_point").ok_or_else(|| missing("zero_point"))?;
     let form = map_text(zero, "form").ok_or_else(|| missing("zero_point.form"))?;
     let zero_packing = map_text(zero, "packing");
 
@@ -353,29 +304,23 @@ fn affine_group_scheme(object: &Object) -> Result<QuantScheme, Error> {
     })
 }
 
-fn attr_map<'a>(object: &'a Object, key: &str) -> Option<&'a [(ztensor::cbor::Value, ztensor::cbor::Value)]> {
-    object
-        .attributes
-        .as_ref()?
+fn attr_map<'a>(attrs: Option<&'a Value>, key: &str) -> Option<&'a [(Value, Value)]> {
+    attrs?
         .as_map()?
         .iter()
         .find(|(k, _)| k.as_text() == Some(key))
         .and_then(|(_, v)| v.as_map())
 }
 
-fn map_text<'a>(
-    entries: &'a [(ztensor::cbor::Value, ztensor::cbor::Value)],
-    key: &str,
-) -> Option<&'a str> {
+fn map_text<'a>(entries: &'a [(Value, Value)], key: &str) -> Option<&'a str> {
     entries
         .iter()
         .find(|(k, _)| k.as_text() == Some(key))
         .and_then(|(_, v)| v.as_text())
 }
 
-fn attr_u64(object: &Object, key: &str) -> Option<u64> {
-    let attrs = object.attributes.as_ref()?;
-    attrs
+fn attr_u64(attrs: Option<&Value>, key: &str) -> Option<u64> {
+    attrs?
         .as_map()?
         .iter()
         .find(|(k, _)| k.as_text() == Some(key))
@@ -385,71 +330,62 @@ fn attr_u64(object: &Object, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use ztensor::{BlobRef, Layout};
+    use ztensor::{cbor, DType as ZDType, Writer};
 
-    fn part(dtype: ZDType, ltype: Option<&str>, offset: u64, length: u64) -> Part {
-        Part {
-            dtype,
-            ltype: ltype.map(str::to_string),
-            blob: BlobRef {
-                shard: 0,
-                offset,
-                length,
-            },
-            encoding: None,
-            decoded_length: None,
-            digest: None,
-        }
-    }
-
-    /// The tensors one object lowers to, which is what every test here is
-    /// about: the translation from a zTensor object to the loader's flat,
-    /// name-addressed tensor space.
-    fn lower(name: &str, object: Object) -> Result<Vec<RawTensor>, Error> {
-        let mut tensors = Vec::new();
-        collect(&mut tensors, name, &object, |_| Ok(FileId(0)))?;
-        Ok(tensors)
+    /// Writes a file and describes it, which is the whole path this module is:
+    /// zTensor's object model in, the loader's flat tensor space out.
+    fn lower(name: &str, write: impl FnOnce(&mut Writer)) -> Result<Vec<RawTensor>, Error> {
+        let path = std::env::temp_dir().join(format!(
+            "pie-zt-{}-{name}-{}.zt",
+            std::process::id(),
+            name.len()
+        ));
+        let mut writer = Writer::options()
+            .canonical(false)
+            .align(65536)
+            .create(&path)
+            .unwrap();
+        write(&mut writer);
+        writer.finish().unwrap();
+        let described = parse_checkpoint(&path);
+        let _ = std::fs::remove_file(&path);
+        described.map(|m| m.tensors)
     }
 
     #[test]
-    fn dense_object_becomes_one_raw_tensor() {
-        let mut parts = BTreeMap::new();
-        parts.insert("data".to_string(), part(ZDType::BF16, None, 65536, 32));
-        let object = Object {
-            shape: vec![4, 4],
-            layout: Layout::Dense,
-            attributes: None,
-            parts,
-        };
-        let tensors = lower("w", object).unwrap();
+    fn a_dense_tensor_becomes_one_raw_tensor() {
+        let tensors = lower("dense", |w| {
+            w.add("w", [4u64, 4], ZDType::BF16, &[0u8; 32]).unwrap();
+        })
+        .unwrap();
         assert_eq!(tensors.len(), 1);
         let tensor = &tensors[0];
         assert_eq!(tensor.name, "w");
         assert_eq!(tensor.shape, vec![4, 4]);
-        assert_eq!(tensor.file_offset, 65536);
         assert_eq!(tensor.span_bytes, 32);
+        assert_eq!(tensor.file_offset % 65536, 0);
         assert_eq!(tensor.encoding, Encoding::Raw(DType::BF16));
     }
 
     #[test]
     fn secondary_parts_take_a_suffixed_name() {
-        let mut parts = BTreeMap::new();
-        parts.insert("data".to_string(), part(ZDType::U8, Some("f4_e2m1"), 65536, 512));
-        parts.insert(
-            "scales".to_string(),
-            part(ZDType::U8, Some("f8_e8m0"), 131072, 32),
-        );
-        let object = Object {
-            shape: vec![32, 32],
-            layout: Layout::from_name("zt.mx/1"),
-            attributes: Some(ztensor::cbor::Value::Map(vec![(
-                ztensor::cbor::Value::Text("block_size".into()),
-                ztensor::cbor::Value::Uint(32),
-            )])),
-            parts,
-        };
-        let tensors = lower("w", object).unwrap();
+        let tensors = lower("mx", |w| {
+            w.object("w")
+                .shape([32u64, 32])
+                .layout("zt.mx/1")
+                .attr("block_size", 32u64)
+                .part("data")
+                .dtype(ZDType::U8)
+                .logical("f4_e2m1")
+                .bytes(&[0u8; 512])
+                .part("scales")
+                .dtype(ZDType::U8)
+                .logical("f8_e8m0")
+                .bytes(&[0u8; 32])
+                .add()
+                .unwrap();
+        })
+        .unwrap();
         let names: Vec<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["w", "w.scales"]);
 
@@ -467,33 +403,70 @@ mod tests {
     }
 
     #[test]
-    fn unknown_layout_is_refused() {
-        let mut parts = BTreeMap::new();
-        parts.insert("data".to_string(), part(ZDType::U8, None, 65536, 32));
-        let object = Object {
-            shape: vec![32],
-            layout: Layout::from_name("vendor.mystery/1"),
-            attributes: None,
-            parts,
-        };
-        let err = lower("w", object).unwrap_err();
+    fn an_unknown_layout_is_refused() {
+        let err = lower("mystery", |w| {
+            w.object("w")
+                .shape([32u64])
+                .layout("vendor.mystery/1")
+                .part("data")
+                .dtype(ZDType::U8)
+                .bytes(&[0u8; 32])
+                .add()
+                .unwrap();
+        })
+        .unwrap_err();
         assert!(format!("{err}").contains("no loader quantization scheme"));
     }
 
     #[test]
-    fn compressed_parts_are_refused() {
-        let mut p = part(ZDType::U8, None, 65536, 16);
-        p.encoding = Some("zt.zstd-seekable/1".into());
-        p.decoded_length = Some(32);
-        let mut parts = BTreeMap::new();
-        parts.insert("data".to_string(), p);
-        let object = Object {
-            shape: vec![32],
-            layout: Layout::Dense,
-            attributes: None,
-            parts,
-        };
-        let err = lower("w", object).unwrap_err();
-        assert!(format!("{err}").contains("compressed parts"));
+    fn a_part_with_no_address_is_refused() {
+        // A compressed part is stored bytes, not tensor bytes: there is no
+        // range of the file the planner could point a device at.
+        let err = lower("zstd", |w| {
+            w.object("w")
+                .shape([32u64])
+                .part("data")
+                .dtype(ZDType::U8)
+                .encoding("zt.zstd-seekable/1")
+                .bytes(&[0u8; 32])
+                .add()
+                .unwrap();
+        })
+        .unwrap_err();
+        assert!(format!("{err}").contains("no address"), "{err}");
+    }
+
+    #[test]
+    fn attributes_choose_the_quantization_scheme() {
+        // `zt.quant_group/1` is parametric: the same layout id names different
+        // schemes depending on the packing and zero-point attributes.
+        let tensors = lower("awq", |w| {
+            w.object("w")
+                .shape([32u64, 32])
+                .layout("zt.quant_group/1")
+                .attr("bits", 4u64)
+                .attr(
+                    "packing",
+                    cbor::map([("order", "lsb_first")]),
+                )
+                .attr(
+                    "zero_point",
+                    cbor::map([("form", "tensor"), ("packing", "same_as_data")]),
+                )
+                .attr("group_size", 128u64)
+                .part("data")
+                .dtype(ZDType::U8)
+                .bytes(&[0u8; 512])
+                .add()
+                .unwrap();
+        })
+        .unwrap();
+        match &tensors[0].encoding {
+            Encoding::Quant(spec) => {
+                assert_eq!(spec.scheme, QuantScheme::AwqInt4);
+                assert_eq!(spec.group_size, 128);
+            }
+            other => panic!("expected a quantized payload, got {other:?}"),
+        }
     }
 }

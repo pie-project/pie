@@ -126,8 +126,8 @@ fn a_corrupt_artifact_is_caught_by_its_digest() {
     raw[65536] ^= 0xff;
     std::fs::write(&path, &raw).unwrap();
 
-    let reader = ztensor::Reader::open(&path).expect("still opens: the manifest is intact");
-    let err = reader.verify("w", "data").unwrap_err();
+    let reader = ztensor::Source::open(&path).expect("still opens: the manifest is intact");
+    let err = reader.tensor("w").unwrap().verify().unwrap_err();
     assert!(
         format!("{err}").contains("digest mismatch"),
         "expected a digest mismatch, got {err}"
@@ -213,11 +213,11 @@ fn the_artifact_names_parameters_not_schemes() {
     )
     .unwrap();
 
-    let reader = ztensor::Reader::open(&path).unwrap();
+    let reader = ztensor::Source::open(&path).unwrap();
     let object = reader.get("w").unwrap();
-    assert_eq!(object.layout.as_str(), "zt.quant_group/1");
+    assert_eq!(object.layout(), "zt.quant_group/1");
 
-    let attributes = object.attributes.as_ref().expect("parameters are recorded");
+    let attributes = object.attributes().expect("parameters are recorded");
     let rendered = format!("{attributes:?}");
     for parameter in ["bits", "group_size", "packing", "scale_form", "zero_point"] {
         assert!(rendered.contains(parameter), "missing {parameter}");

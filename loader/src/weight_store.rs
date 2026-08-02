@@ -34,10 +34,10 @@
 //! physical type the bytes are stored as, which is what makes the object
 //! well-formed to any reader.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ztensor::cbor::Value;
-use ztensor::{DType as ZDType, ObjectWriter, Reader, StreamPart, Writer};
+use ztensor::{DType as ZDType, Sink, Source, Writer};
 
 use crate::error::Error;
 use crate::types::DType;
@@ -130,9 +130,7 @@ pub struct Quant {
 pub struct ArtifactWriter {
     /// `None` only after [`finish`](ArtifactWriter::finish) has taken it.
     writer: Option<Writer>,
-    open: Option<ObjectWriter>,
-    path: PathBuf,
-    temporary: PathBuf,
+    open: Option<Sink>,
     key: String,
     tensors: Vec<Tensor>,
     views: Vec<View>,
@@ -156,13 +154,16 @@ impl ArtifactWriter {
                 Error::Checkpoint(format!("cannot create {}: {err}", parent.display()))
             })?;
         }
-        let temporary = path.with_extension(format!("zt.{}.partial", std::process::id()));
-        let writer = Writer::create_with_alignment(&temporary, ALIGN).map_err(zt)?;
+        // `publish` writes beside the destination and renames at the end, and
+        // removes the partial if this writer is dropped without finishing.
+        let writer = Writer::options()
+            .canonical(false)
+            .align(ALIGN)
+            .publish(path)
+            .map_err(zt)?;
         Ok(Self {
             writer: Some(writer),
             open: None,
-            path: path.to_path_buf(),
-            temporary,
             key: key.to_string(),
             tensors: Vec::new(),
             views: Vec::new(),
@@ -193,46 +194,40 @@ impl ArtifactWriter {
             Value::Text(RUNTIME_DTYPE.into()),
             Value::Text(tensor.runtime_dtype.clone()),
         )]);
-        let object = self
+        let nbytes = tensor.nbytes()?;
+        let mut object = self
             .writer()
-            .stream_object(
-                &tensor.name,
-                &shape,
-                "dense",
-                &[StreamPart {
-                    name: "data",
-                    dtype,
-                    ltype,
-                    length: tensor.nbytes()?,
-                }],
-                Some(attributes),
-            )
-            .map_err(zt)?;
-        self.open = Some(object);
+            .object(&tensor.name)
+            .shape(shape)
+            .attributes(attributes)
+            .part("data")
+            .dtype(dtype);
+        if let Some(ltype) = ltype {
+            object = object.logical(ltype);
+        }
+        self.open = Some(object.length(nbytes).stream().map_err(zt)?);
         self.tensors.push(tensor);
         Ok(())
     }
 
     /// Appends bytes to the open tensor.
     pub fn write(&mut self, chunk: &[u8]) -> Result<(), Error> {
-        let object = self
+        let sink = self
             .open
             .as_mut()
             .ok_or_else(|| Error::Checkpoint("no tensor is open".into()))?;
-        self.writer
-            .as_mut()
-            .expect("writer present")
-            .write_chunk(object, chunk)
-            .map_err(zt)
+        let writer = self.writer.as_mut().expect("writer present");
+        sink.write(writer, chunk).map_err(zt)
     }
 
     /// Closes the open tensor, which must have received its whole payload.
     pub fn end_tensor(&mut self) -> Result<(), Error> {
-        let object = self
+        let sink = self
             .open
             .take()
             .ok_or_else(|| Error::Checkpoint("no tensor is open".into()))?;
-        self.writer().end_object(object).map_err(zt)
+        let writer = self.writer.as_mut().expect("writer present");
+        sink.close(writer).map_err(zt)
     }
 
     fn writer(&mut self) -> &mut Writer {
@@ -269,21 +264,7 @@ impl ArtifactWriter {
         let mut writer = self.writer.take().expect("writer present");
         writer.set_attributes(Value::Map(vec![(Value::Text(RECORD.into()), record)]));
         writer.finish().map_err(zt)?;
-
-        std::fs::rename(&self.temporary, &self.path).map_err(|err| {
-            let _ = std::fs::remove_file(&self.temporary);
-            Error::Checkpoint(format!("cannot publish {}: {err}", self.path.display()))
-        })
-    }
-}
-
-impl Drop for ArtifactWriter {
-    fn drop(&mut self) {
-        // A writer dropped without `finish` never published; the partial file
-        // is nobody's.
-        if self.temporary.exists() {
-            let _ = std::fs::remove_file(&self.temporary);
-        }
+        Ok(())
     }
 }
 
@@ -292,7 +273,7 @@ impl Drop for ArtifactWriter {
 /// The file is mapped, so a tensor's bytes are a borrow of the mapping rather
 /// than a copy: the driver streams them to the device straight from here.
 pub struct Artifact {
-    reader: Reader,
+    source: Source,
     tensors: Vec<Tensor>,
     views: Vec<View>,
     quants: Vec<Quant>,
@@ -305,11 +286,9 @@ impl Artifact {
     /// Both refusals are misses rather than errors in the caller's eyes — the
     /// distinction the caller needs is only whether it has to recompute.
     pub fn open(path: &Path, expected_key: &str) -> Result<Self, Error> {
-        let reader = Reader::open(path).map_err(zt)?;
-        let attributes = reader
-            .manifest()
-            .attributes
-            .as_ref()
+        let source = Source::open(path).map_err(zt)?;
+        let attributes = source
+            .attributes()
             .ok_or_else(|| Error::Checkpoint("not a weight-store artifact".into()))?;
         let record = field(attributes, RECORD)
             .and_then(Value::as_map)
@@ -334,13 +313,13 @@ impl Artifact {
         }
 
         let mut tensors = Vec::new();
-        for (name, object) in reader.objects() {
-            let part = object.parts.get("data").ok_or_else(|| {
+        for tensor in source.tensors() {
+            let name = tensor.name();
+            let part = tensor.data().map_err(|_| {
                 Error::Checkpoint(format!("object {name:?} has no data part"))
             })?;
-            let runtime_dtype = object
-                .attributes
-                .as_ref()
+            let runtime_dtype = tensor
+                .attributes()
                 .and_then(|a| field(a, RUNTIME_DTYPE))
                 .and_then(Value::as_text)
                 .ok_or_else(|| {
@@ -348,12 +327,12 @@ impl Artifact {
                 })?;
             tensors.push(Tensor {
                 name: name.to_string(),
-                dtype: dtype_of(part.dtype, part.ltype.as_deref()).ok_or_else(|| {
+                dtype: dtype_of(part.dtype(), part.logical()).ok_or_else(|| {
                     Error::Checkpoint(format!("object {name:?} has an unreadable element type"))
                 })?,
                 runtime_dtype: runtime_dtype.to_string(),
-                shape: object
-                    .shape
+                shape: tensor
+                    .shape()
                     .iter()
                     .map(|&d| {
                         i64::try_from(d).map_err(|_| {
@@ -376,7 +355,7 @@ impl Artifact {
             .unwrap_or_default();
 
         Ok(Self {
-            reader,
+            source,
             tensors,
             views,
             quants,
@@ -397,7 +376,10 @@ impl Artifact {
 
     /// A tensor's bytes, borrowed from the mapping.
     pub fn bytes(&self, index: usize) -> Result<&[u8], Error> {
-        self.reader.view(&self.tensor(index)?.name, "data").map_err(zt)
+        self.source
+            .tensor(&self.tensor(index)?.name)
+            .and_then(|t| t.map())
+            .map_err(zt)
     }
 
     /// Where a tensor's bytes begin in the file. What a caller checks when it
@@ -405,10 +387,10 @@ impl Artifact {
     /// bytes themselves can answer.
     pub fn file_offset(&self, index: usize) -> Result<u64, Error> {
         let name = &self.tensor(index)?.name;
-        self.reader
-            .manifest()
-            .part(name, "data")
-            .map(|part| part.blob.offset)
+        self.source
+            .tensor(name)
+            .and_then(|t| t.locate())
+            .map(|at| at.offset)
             .map_err(zt)
     }
 
@@ -419,12 +401,12 @@ impl Artifact {
     /// part carrying no digest at all is `false` too — this writer puts one on
     /// every part, so its absence is not something to vouch for either.
     pub fn verify(&self, index: usize) -> Result<bool, Error> {
-        match self.reader.verify(&self.tensor(index)?.name, "data") {
-            Ok(checked) => Ok(checked),
-            Err(ztensor::Error::Reject {
-                rule: ztensor::Rule::Digest,
-                ..
-            }) => Ok(false),
+        let name = &self.tensor(index)?.name;
+        match self.source.tensor(name).and_then(|t| t.verify()) {
+            Ok(verified) => Ok(verified.checked()),
+            // A mismatch is a rejected file to zTensor and a cache miss here;
+            // both mean the same thing to the caller, which is recompute.
+            Err(err) if err.rule() == Some(ztensor::Rule::Digest) => Ok(false),
             Err(err) => Err(zt(err)),
         }
     }
@@ -650,7 +632,7 @@ fn dtype_named(name: &str) -> Result<DType, Error> {
 mod tests {
     use super::*;
 
-    fn tmpdir(tag: &str) -> PathBuf {
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("zt_wstore_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

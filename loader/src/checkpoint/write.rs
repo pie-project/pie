@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ztensor::cbor::Value;
-use ztensor::{DType as ZDType, PartDef};
+use ztensor::DType as ZDType;
 
 use crate::error::Error;
 use crate::types::{DType, Encoding, QuantScheme, TensorDecl};
@@ -216,10 +216,9 @@ pub fn write_zt(
         std::fs::create_dir_all(parent)
             .map_err(|err| Error::Checkpoint(format!("cannot create {}: {err}", parent.display())))?;
     }
-    // Publication is atomic: bytes go to a process-unique temporary and arrive
-    // by rename, so a run that dies mid-write leaves no file that parses.
-    let temporary = path.with_extension(format!("zt.{}.partial", std::process::id()));
-    let mut writer = ztensor::Writer::create(&temporary).map_err(zt_err)?;
+    // Publication is atomic: the writer puts bytes beside the target and moves
+    // them into place at the end, so a run that dies mid-write leaves nothing.
+    let mut writer = ztensor::Writer::publish(path).map_err(zt_err)?;
 
     if !metadata.is_empty() {
         writer.set_attributes(Value::Map(
@@ -246,30 +245,17 @@ pub fn write_zt(
             })
             .collect::<Result<_, _>>()?;
         let (layout, attributes) = profile_of(&decl.encoding)?;
-        writer
-            .add_object(
-                &decl.name,
-                &shape,
-                layout,
-                &[(
-                    "data",
-                    PartDef {
-                        dtype,
-                        ltype,
-                        encoding: None,
-                        data: tensor.bytes,
-                    },
-                )],
-                attributes,
-            )
-            .map_err(zt_err)?;
+        let mut object = writer.object(&decl.name).shape(shape).layout(layout);
+        if let Some(attributes) = attributes {
+            object = object.attributes(attributes);
+        }
+        object = object.part("data").dtype(dtype);
+        if let Some(ltype) = ltype {
+            object = object.logical(ltype);
+        }
+        object.bytes(tensor.bytes).add().map_err(zt_err)?;
     }
     writer.finish().map_err(zt_err)?;
-
-    std::fs::rename(&temporary, path).map_err(|err| {
-        let _ = std::fs::remove_file(&temporary);
-        Error::Checkpoint(format!("cannot publish {}: {err}", path.display()))
-    })?;
     Ok(())
 }
 
