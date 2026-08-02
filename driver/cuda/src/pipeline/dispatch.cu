@@ -6457,9 +6457,9 @@ bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
             const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        auto refuse = [&](const char* why) {
+        auto refuse = [&](const std::string& why) {
             if (trace_compose) {
-                std::fprintf(stderr, "[compose] refused: %s\n", why);
+                std::fprintf(stderr, "[compose] refused: %s\n", why.c_str());
                 std::fflush(stderr);
             }
             return false;
@@ -6514,7 +6514,9 @@ bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
             view.kv_translation.size())
             return refuse("kv_translation_indptr tail");
         if (view.ptir_kv_write_lower_bounds.size() != n_prog)
-            return refuse("kv_write_lower_bounds size");
+            return refuse("kv_write_lower_bounds size " +
+                          std::to_string(view.ptir_kv_write_lower_bounds.size()) +
+                          " != n_prog " + std::to_string(n_prog));
         if (view.ptir_kv_write_upper_bounds.size() != n_prog)
             return refuse("kv_write_upper_bounds size");
         ResolvedPrograms candidate;
