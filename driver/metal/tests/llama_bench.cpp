@@ -100,6 +100,20 @@ int argmax_of(const LogitsOut& out, std::uint32_t row) {
     return best;
 }
 
+/// A staged logits row, widened to f32 -- the whole row, because comparing two
+/// fires by their argmax alone cannot tell "a different answer" from "the same
+/// answer, one ulp apart".
+std::vector<float> row_of(const LogitsOut& out, std::uint32_t row) {
+    const auto* bf = static_cast<const std::uint16_t*>(out.device_contents) +
+                     std::size_t(out.device_row_offset + row) * std::size_t(out.vocab);
+    std::vector<float> v(out.vocab);
+    for (std::uint32_t i = 0; i < out.vocab; ++i) {
+        const std::uint32_t bits = std::uint32_t(bf[i]) << 16;
+        std::memcpy(&v[i], &bits, 4);
+    }
+    return v;
+}
+
 /// Fire `n` tokens and block until the GPU is done, so the time measured is the
 /// work and not the enqueue. Returns the greedy token, or -1 on failure.
 int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
@@ -142,8 +156,10 @@ int main(int argc, char** argv) {
     cfg.kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
     cfg.snapshot_dir = ckpt;
     cfg.vocab_size = facts.vocab_size;
-    cfg.max_forward_tokens = std::uint32_t(std::max(n_prompt, 1));
-    cfg.max_forward_requests = 1;
+    cfg.max_forward_tokens = std::uint32_t(std::max(n_prompt, 32));
+    // Two: the batch check below fires a pair in ONE pass, and a driver set up
+    // for one request would refuse it rather than answer it wrongly.
+    cfg.max_forward_requests = 2;
     cfg.kv_page_size = 32;
     // One sequence, so one sequence's worth of ring. The default is sized for a
     // 64-request fleet and does not scale with the model: at 48 layers it is
@@ -263,6 +279,132 @@ int main(int argc, char** argv) {
         }
     }
 
+
+    // ── do two sequences in one fire answer as they do alone? ──
+    //
+    // Every check above fires ONE sequence, which is the arrangement where
+    // ignoring the request axis still gives the right answer. `pie serve` does
+    // not do that: it packs several sequences into a pass, each attending its
+    // own pages from its own positions. The reference for the pair is the
+    // members THEMSELVES run separately -- no new oracle is needed, because
+    // batching is supposed to be an optimization and not a computation.
+    //
+    // The two prompts differ in LENGTH, so a fire that mixed up the row-to-
+    // request mapping cannot land on the right answer by symmetry; the shorter
+    // is a strict PREFIX of the longer, so a fire that leaked positions or
+    // pages between them would answer the longer one twice; and they take pages
+    // from a shared allocator in interleaved order, so neither member's page
+    // list is contiguous with the other's.
+    //
+    // The comparison is on the LOGITS ROW, not on the sampled token. Two fires
+    // that agree to within a bf16 ulp can still disagree on the argmax, and the
+    // first version of this check did exactly that: it called a two-ulp tie
+    // between " Paris" and " in" a batching bug. So the row's own top-two
+    // margin is measured against the two fires' observed disagreement, and the
+    // token is only gated on when the margin is the larger of the two.
+    {
+        // "The capital of France is Paris. The capital of Italy is" and its
+        // eight-token prefix "The capital of France is Paris. The".
+        const std::vector<std::uint32_t> long_p{785, 6722, 315, 9625,  374, 12095,
+                                                13,  576,  6722, 315, 6323, 374};
+        const std::vector<std::uint32_t> short_p(long_p.begin(), long_p.begin() + 8);
+        // The KV pool here is sized for one sequence, and nothing in this file
+        // frees a page, so each independent check starts the allocator over.
+        // That is sound because a fire WRITES the pages it names before reading
+        // them; what must never repeat is a page WITHIN one fire.
+        std::uint64_t next_id = 10;
+        const auto alone = [&](const std::vector<std::uint32_t>& p) {
+            std::uint32_t page = 0;
+            Seq c;
+            c.id = next_id++;
+            c.tokens = p;
+            MemberForwardDesc d = desc_for(c, std::uint32_t(p.size()), page_size, page);
+            LogitsOut out;
+            std::string err;
+            if (!exec.forward(d, out, &err)) {
+                std::printf("  FAIL  forward: %s\n", err.c_str());
+                return std::vector<float>();
+            }
+            return row_of(out, 0);
+        };
+        // The argmax, and how far it stands above the runner-up.
+        const auto top2 = [](const std::vector<float>& r) {
+            int b0 = 0, b1 = -1;
+            for (int i = 1; i < int(r.size()); ++i) {
+                if (r[i] > r[b0]) { b1 = b0; b0 = i; }
+                else if (b1 < 0 || r[i] > r[b1]) { b1 = i; }
+            }
+            return std::pair<int, float>(b0, r[b0] - r[b1]);
+        };
+        const auto pair = [&](const std::vector<std::uint32_t>& p0,
+                              const std::vector<std::uint32_t>& p1, const char* what) {
+            const std::vector<float> want0 = alone(p0);
+            const std::vector<float> want1 = alone(p1);
+            if (want0.empty() || want1.empty()) return false;
+            Seq a, b;
+            a.id = next_id++;
+            a.tokens = p0;
+            b.id = next_id++;
+            b.tokens = p1;
+            std::uint32_t page = 0;
+            std::vector<MemberForwardDesc> descs;
+            descs.push_back(desc_for(a, std::uint32_t(p0.size()), page_size, page));
+            descs.push_back(desc_for(b, std::uint32_t(p1.size()), page_size, page));
+            std::vector<LogitsOut> outs(2);
+            std::vector<std::uint8_t> ok(2, 0);
+            std::vector<std::string> errs(2);
+            exec.forward_batch(descs, outs, ok, errs);
+            if (ok[0] == 0 || ok[1] == 0) {
+                std::printf("  FAIL  one fire, %s: %s / %s\n", what, errs[0].c_str(),
+                            errs[1].c_str());
+                return false;
+            }
+            bool good = true;
+            const std::vector<float>* want[2] = {&want0, &want1};
+            for (int i = 0; i < 2; ++i) {
+                const std::vector<float> got = row_of(outs[i], 0);
+                const auto [want_tok, margin] = top2(*want[i]);
+                const auto [got_tok, _] = top2(got);
+                double num = 0.0;
+                double den = 0.0;
+                float dev = 0.0F;
+                for (std::size_t v = 0; v < got.size(); ++v) {
+                    const double d0 = double(got[v]) - double((*want[i])[v]);
+                    num += d0 * d0;
+                    den += double((*want[i])[v]) * double((*want[i])[v]);
+                    dev = std::max(dev, std::fabs(got[v] - (*want[i])[v]));
+                }
+                const double rel = std::sqrt(num / std::max(den, 1e-30));
+                // The row is the assertion. Two fires of the same sequence
+                // may differ by the arithmetic the batch shape chose -- a head
+                // that gathered two rows runs a GEMM where one row ran a matvec
+                // -- and that shows up at 1e-3 relative. A row that came from
+                // the wrong sequence, or from the wrong position of the right
+                // one, shows up near 1: the two live two orders of magnitude
+                // apart, with nothing in between to make 0.05 a delicate line.
+                const bool same_row = rel < 0.05;
+                // Only THEN is the token worth checking, and only when the
+                // row's own top-two margin clears what these two fires actually
+                // disagreed by. Below that, the argmax is a coin the test has
+                // no business calling: " Paris" and " in" after "The capital of
+                // France is" sit two bf16 ulps apart, and the first version of
+                // this check reported the coin landing differently as a bug.
+                const bool decisive = margin > 2.0F * dev;
+                const bool agree = got_tok == want_tok;
+                const bool bad = !same_row || (decisive && !agree);
+                if (bad) good = false;
+                std::printf("  %s  one fire, %s member %d: %d vs %d alone "
+                            "(margin %.3f, fires differ by %.3f, rel %.5f)%s\n",
+                            bad ? "FAIL" : (decisive ? "PASS" : "TIE "), what, i, got_tok,
+                            want_tok, double(margin), double(dev), rel,
+                            (same_row && !decisive) ? "  [ambiguous: token not gated]" : "");
+            }
+            return good;
+        };
+        bool good = pair(long_p, short_p, "long then short");
+        good = pair(short_p, long_p, "short then long") && good;
+        if (!good) return 1;
+    }
 
     // ── warm-up ──
     //
