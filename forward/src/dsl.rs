@@ -260,6 +260,13 @@ pub fn trace(
             match class {
                 FireClass::Decode => "decode",
                 FireClass::Prefill => "prefill",
+                // The service classes are qwen3_5's; llama_like has no
+                // spec-decode repair pass. The ffi entry rejects them
+                // before tracing; this is the same statement for direct
+                // Rust callers.
+                FireClass::CommitAdvance | FireClass::StateOnly => {
+                    panic!("llama_like has no CommitAdvance/StateOnly class")
+                }
             }
         ),
     };
@@ -588,28 +595,92 @@ impl std::ops::AddAssign<Val> for Val {
 
 // ── The runtime branch ─────────────────────────────────────────────────
 
-/// Record a [`OpKind::Guard`]: `then_f`'s ops run when `pred` holds at
-/// fire time, `else_f`'s when it does not. The ONE branch a lowered
-/// declaration may write over a runtime input — the predicate vocabulary
-/// is closed ([`GuardPred`]), the regions are flat, and neither region's
-/// values may escape (side-effect launches only; the builder has no way
-/// to stop a determined escape yet, so the discipline is reviewed, not
-/// enforced — a value-producing guard is a later design).
-pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f: impl FnOnce()) {
+/// An open [`OpKind::Guard`] chain: `.arm(pred, f)` regions are tried in
+/// order at fire time, `.otherwise(f)` closes the chain with the
+/// fallback region. The ONE branch a lowered declaration may write over
+/// runtime inputs — the predicate vocabulary is closed ([`GuardPred`]),
+/// the regions are flat and consecutive, and a region's OWN values may
+/// not escape (its launches are lowerings of the guard's outputs, which
+/// [`guarded_value`] created up front; the discipline is reviewed, not
+/// enforced).
+#[must_use = "a guard chain must be closed with .otherwise(..)"]
+pub struct GuardCtx {
+    t: Trace,
+    idx: usize,
+    arms: Vec<crate::trace::GuardArm>,
+    emitted: u32,
+}
+
+impl GuardCtx {
+    pub fn arm(mut self, pred: crate::trace::GuardPred, f: impl FnOnce()) -> Self {
+        f();
+        let total = {
+            let b = self.t.inner.borrow();
+            (b.op_count_now() - self.idx - 1) as u32
+        };
+        self.arms.push(crate::trace::GuardArm {
+            pred,
+            ops: total - self.emitted,
+        });
+        self.emitted = total;
+        self
+    }
+
+    pub fn otherwise(self, f: impl FnOnce()) {
+        f();
+        let mut b = self.t.inner.borrow_mut();
+        let total = (b.op_count_now() - self.idx - 1) as u32;
+        b.close_guard(self.idx, self.arms, total - self.emitted);
+    }
+}
+
+/// Open a side-effect-only guard chain.
+pub fn guarded(m: &M) -> GuardCtx {
+    guarded_on(&m.t)
+}
+
+pub(crate) fn guarded_on(t: &Trace) -> GuardCtx {
     let idx = {
-        let mut b = m.t.inner.borrow_mut();
+        let mut b = t.inner.borrow_mut();
         b.set_layer(None);
-        b.open_guard(pred)
+        b.open_guard(vec![]).0
     };
-    then_f();
-    let then_ops = {
-        let b = m.t.inner.borrow();
-        (b.op_count_now() - idx - 1) as u32
+    GuardCtx {
+        t: t.clone(),
+        idx,
+        arms: Vec::new(),
+        emitted: 0,
+    }
+}
+
+/// Open a VALUE-PRODUCING guard chain: the returned [`Val`]s are the
+/// guard's outputs — one producer whichever arm runs — and each region's
+/// launches are their lowerings, binding the same output buffer and
+/// recording no SSA outputs of their own.
+pub fn guarded_value(t: &Trace, layer: Option<u32>, shape: (Shape, DType)) -> (GuardCtx, Val) {
+    let (idx, outs) = {
+        let mut b = t.inner.borrow_mut();
+        b.set_layer(layer);
+        b.open_guard(vec![shape])
     };
-    else_f();
-    let mut b = m.t.inner.borrow_mut();
-    let else_ops = (b.op_count_now() - idx - 1) as u32 - then_ops;
-    b.close_guard(idx, then_ops, else_ops);
+    (
+        GuardCtx {
+            t: t.clone(),
+            idx,
+            arms: Vec::new(),
+            emitted: 0,
+        },
+        Val {
+            t: t.clone(),
+            id: outs[0],
+            layer,
+        },
+    )
+}
+
+/// Two-way sugar over [`GuardCtx`] — the 4a form llama_like writes.
+pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f: impl FnOnce()) {
+    guarded(m).arm(pred, then_f).otherwise(else_f);
 }
 
 // ── Raw kernel signatures ──────────────────────────────────────────────

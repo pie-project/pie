@@ -182,30 +182,31 @@ fn emit_class_fn(
     let mut i = 0;
     while i < plan.ops.len() {
         let op = &plan.ops[i];
-        if let OpKind::Guard {
-            pred,
-            then_ops,
-            else_ops,
-        } = &op.kind
-        {
-            let cond = match pred {
-                crate::trace::GuardPred::HasWriteDesc => "has_write_desc",
+        if let OpKind::Guard { arms, else_ops } = &op.kind {
+            let cond_of = |pred: &crate::trace::GuardPred| match pred {
+                crate::trace::GuardPred::HasWriteDesc => "has_write_desc".to_string(),
+                crate::trace::GuardPred::TokensLE(k) => format!("N <= {k}"),
+                crate::trace::GuardPred::TokensGT(k) => format!("N > {k}"),
             };
-            b.stmt(&format!("if ({cond}) {{"));
-            b.indent += 1;
-            for j in (i + 1)..(i + 1 + *then_ops as usize) {
-                emit_op(&mut b, &plan.ops[j], plan, facts, is_decode);
+            let mut region = i + 1;
+            for (n, arm) in arms.iter().enumerate() {
+                let kw = if n == 0 { "if" } else { "} else if" };
+                b.stmt(&format!("{kw} ({}) {{", cond_of(&arm.pred)));
+                b.indent += 1;
+                for j in region..(region + arm.ops as usize) {
+                    emit_op(&mut b, &plan.ops[j], plan, facts, is_decode);
+                }
+                b.indent -= 1;
+                region += arm.ops as usize;
             }
-            b.indent -= 1;
             b.stmt("} else {");
             b.indent += 1;
-            let else_start = i + 1 + *then_ops as usize;
-            for j in else_start..(else_start + *else_ops as usize) {
+            for j in region..(region + *else_ops as usize) {
                 emit_op(&mut b, &plan.ops[j], plan, facts, is_decode);
             }
             b.indent -= 1;
             b.stmt("}");
-            i += 1 + (*then_ops + *else_ops) as usize;
+            i = region + *else_ops as usize;
             continue;
         }
         emit_op(&mut b, op, plan, facts, is_decode);

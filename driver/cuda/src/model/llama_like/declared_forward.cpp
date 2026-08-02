@@ -920,38 +920,62 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::Guard: {
-            // The one branch a class trace carries — over a runtime input
-            // (closed predicate vocabulary, `PieForwardGuardPred`).
-            // param1 = then-region op count; the else count rides a
-            // one-entry aux run.
+            // The one branch a class trace carries — a CHAIN of arms over
+            // runtime inputs (closed predicate vocabulary,
+            // `PieForwardGuardPred`): param0 = arm count, aux run =
+            // [pred kind, payload, region len] per arm + trailing
+            // else-region len. Evaluate arms in order, run the first that
+            // holds (or the else), jump everything dead.
             const auto aux = plan.aux_names(op);
-            if (aux.size != 1) {
+            const std::uint32_t n_arms = op.param0;
+            if (aux.size != static_cast<std::size_t>(n_arms) * 3 + 1) {
                 throw std::runtime_error(
                     "declared forward: Guard aux run has " +
-                    std::to_string(aux.size) + " entries, wants 1");
+                    std::to_string(aux.size) + " entries for " +
+                    std::to_string(n_arms) + " arms");
             }
-            const std::uint32_t then_ops = op.param1;
-            const std::uint32_t else_ops = aux[0];
-            bool cond;
-            switch (op.param0) {
-            case static_cast<std::uint32_t>(
-                pie_forward::PieForwardGuardPred::HasWriteDesc):
-                cond = has_write_desc;
-                break;
-            default:
-                throw std::runtime_error(
-                    "declared forward: guard predicate " +
-                    std::to_string(op.param0) +
-                    " is not in this executor's vocabulary");
+            const auto pred_holds = [&](std::uint32_t kind,
+                                        std::uint32_t payload) -> bool {
+                switch (kind) {
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::HasWriteDesc):
+                    return has_write_desc;
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::TokensLE):
+                    return N <= static_cast<int>(payload);
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::TokensGT):
+                    return N > static_cast<int>(payload);
+                default:
+                    throw std::runtime_error(
+                        "declared forward: guard predicate kind " +
+                        std::to_string(kind) +
+                        " is not in this executor's vocabulary");
+                }
+            };
+            // Region layout: arm regions in order, then the else region.
+            std::size_t chosen_start = SIZE_MAX;
+            std::uint32_t chosen_len = 0;
+            std::size_t cursor = i + 1;
+            for (std::uint32_t a = 0; a < n_arms; ++a) {
+                const std::uint32_t len = aux[a * 3 + 2];
+                if (chosen_start == SIZE_MAX &&
+                    pred_holds(aux[a * 3], aux[a * 3 + 1])) {
+                    chosen_start = cursor;
+                    chosen_len = len;
+                }
+                cursor += len;
             }
-            if (cond) {
-                // Fall into the then-region; jump the else when it ends.
-                guard_else_at = i + 1 + then_ops;
-                guard_else_len = else_ops;
-            } else {
-                // Jump the then-region; ++i lands on the first else op.
-                i += then_ops;
+            const std::uint32_t else_len = aux[n_arms * 3];
+            if (chosen_start == SIZE_MAX) {
+                chosen_start = cursor;
+                chosen_len = else_len;
             }
+            const std::size_t total_end = cursor + else_len;
+            // Jump to the chosen region; when it ends, jump to total_end.
+            guard_else_at = chosen_start + chosen_len;
+            guard_else_len = total_end - guard_else_at;
+            i = chosen_start - 1;  // the loop's ++i lands on the region
             break;
         }
         case PieForwardOpKind::Swiglu: {

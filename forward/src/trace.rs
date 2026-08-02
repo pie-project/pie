@@ -128,21 +128,33 @@ pub enum RopeKind {
 
 /// The fire-shape class a LOWERED trace is specialized to (north-star-dsl.md).
 ///
-/// The one input that varies after model load: whether the fire is pure
-/// decode (every request contributes one token row) or prefill-shaped
-/// (anything else — the hand-written bodies treat mixed fires as one
-/// qo_indptr-windowed prefill, a decode row being an `Nr == 1` window).
-/// The toolchain traces a lowered declaration once per class, so inside
-/// the declaration a class arm is an ordinary trace-time `match` — the
-/// same mechanism that erases static facts, applied to the axis that
-/// used to be the driver's `is_pure_decode` boolean.
+/// What varies after model load and CHANGES WHICH OPS RUN: the toolchain
+/// traces a lowered declaration once per class, so inside the
+/// declaration a class arm is an ordinary trace-time `match` — the same
+/// mechanism that erases static facts, applied to the axes that used to
+/// be the drivers' `is_pure_decode` / `commit_advance` / `state_only`
+/// booleans. Anything that changes only a kernel's PARAMETER
+/// (`verify_frozen`'s write_state) is not a class; anything that changes
+/// a kernel choice per fire within one op list is a [`GuardPred`].
 ///
 /// Semantic traces ([`crate::family::llama_like`]) have no class: they
 /// serve every fire shape, and kernel choice stays with their consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FireClass {
+    /// Pure decode: every request contributes one token row.
     Decode,
+    /// Prefill-shaped (anything else — the hand-written bodies treat
+    /// mixed fires as one qo_indptr-windowed prefill, a decode row being
+    /// an `Nr == 1` window).
     Prefill,
+    /// The spec-decode repair pass (qwen3_5 MTP): ONLY each linear
+    /// layer's conv+prep+recurrence over the confirmed prefix, fed from
+    /// the verify stash — no embed, attention, MLP or epilogue. A
+    /// genuinely different pass, so a genuinely different trace.
+    CommitAdvance,
+    /// The speculative repair's whole-backbone flavor: everything except
+    /// the final-norm/lm_head epilogue.
+    StateOnly,
 }
 
 // (The short-lived `AttnKernel` enum — rung 1's `Attention.param1` tag —
@@ -150,21 +162,46 @@ pub enum FireClass {
 // every kernel, as an [`OpKind::Launch`] with the launcher's name. Raw
 // signatures, not enum tags; north-star-dsl.md.)
 
-/// A [`OpKind::Guard`]'s predicate: the ONE kind of branch a lowered
+/// A [`OpKind::Guard`] arm's predicate: the ONE kind of branch a lowered
 /// trace may carry — over a per-fire RUNTIME INPUT, closed-vocabulary so
 /// every predicate is emittable as a fixed C++ condition (rung 3's
 /// generated form spells it; the interpreter evaluates it). Trace-time
-/// facts never appear here — they resolved during tracing — and anything
-/// not in this vocabulary is not expressible, which is the point: a
-/// declaration cannot smuggle an open-ended runtime choice past the
-/// toolchain.
+/// facts never appear here — they resolved during tracing. Predicates
+/// may carry a load-time VALUE (the token thresholds: env-tunable
+/// driver constants, resolved into the trace like every fact) but never
+/// an open-ended expression: a declaration cannot smuggle an arbitrary
+/// runtime choice past the toolchain. Wire form: a (kind, payload) u32
+/// pair; kinds are appended-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u32)]
 pub enum GuardPred {
     /// The fire carries explicit KV-write descriptors (`w_page`/`w_off`),
     /// the graph-replay steering path — `has_write_desc` in every driver
-    /// signature.
-    HasWriteDesc = 0,
+    /// signature. Wire kind 0, payload unused.
+    HasWriteDesc,
+    /// `N <= k`: the fire's token rows within a threshold (the
+    /// warp-tiled prefill ceiling). Wire kind 1, payload `k`.
+    TokensLE(u32),
+    /// `N > k` (the cached-prefill floor). Wire kind 2, payload `k`.
+    TokensGT(u32),
+}
+
+impl GuardPred {
+    /// The ABI (kind, payload) pair.
+    pub fn wire(&self) -> (u32, u32) {
+        match *self {
+            GuardPred::HasWriteDesc => (0, 0),
+            GuardPred::TokensLE(k) => (1, k),
+            GuardPred::TokensGT(k) => (2, k),
+        }
+    }
+}
+
+/// One arm of a [`OpKind::Guard`] chain: the first arm whose predicate
+/// holds runs; `ops` is the arm's flat region length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardArm {
+    pub pred: GuardPred,
+    pub ops: u32,
 }
 
 /// One operation of the traced form.
@@ -367,19 +404,24 @@ pub enum OpKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<StateRef>,
     },
-    /// The one branch a lowered trace may carry: over a per-fire RUNTIME
-    /// INPUT ([`GuardPred`], closed vocabulary). The `then_ops` ops
-    /// immediately after this one run when the predicate holds, the
-    /// `else_ops` after those when it does not — flat regions, no
-    /// nesting (the builder enforces it), and no region may produce a
-    /// value consumed outside it (side-effect launches only; a
-    /// value-producing guard is a later design when a consumer exists).
-    /// The interpreter evaluates the predicate and skips the dead
-    /// region; rung 3's emitter spells `if (...) { … } else { … }` —
-    /// the ONLY `if` a generated file carries that the declaration wrote.
+    /// The one branch a lowered trace may carry: a CHAIN of arms over
+    /// per-fire RUNTIME INPUTS ([`GuardPred`], closed vocabulary) — the
+    /// first arm whose predicate holds runs, the trailing `else_ops`
+    /// region when none does. Regions are flat and consecutive (arm 0's
+    /// ops immediately after this op, then arm 1's, …, then the else's);
+    /// no nesting (the builder enforces it). The interpreter evaluates
+    /// the arms in order and jumps every dead region; rung 3's emitter
+    /// spells `if / else if / else` — the ONLY branch a generated file
+    /// carries that the declaration wrote.
+    ///
+    /// A guard may PRODUCE values (rung 4c: the recurrence three-way's
+    /// output): the values are the GUARD's outputs, and each region's
+    /// launches are its lowerings — they bind the same output buffer and
+    /// record no SSA outputs of their own, so dataflow sees one producer
+    /// whichever arm ran. A side-effect-only guard (the KV write) simply
+    /// has no outputs.
     Guard {
-        pred: GuardPred,
-        then_ops: u32,
+        arms: Vec<GuardArm>,
         else_ops: u32,
     },
 }
@@ -516,43 +558,43 @@ impl TraceBuilder {
         self.values[id as usize].shape.clone()
     }
 
-    /// Open a [`OpKind::Guard`]: records the op with zeroed region counts
-    /// and returns its index for [`Self::close_guard`] to patch once the
-    /// dsl has run both region closures. Nesting is refused here — flat
-    /// regions are the contract every consumer (interpreter skip logic,
-    /// emitter) relies on.
-    pub(crate) fn open_guard(&mut self, pred: GuardPred) -> usize {
+    /// Open a [`OpKind::Guard`] chain: records the op with empty arms
+    /// (and its output values, if any — created HERE so dataflow sees
+    /// one producer whichever arm runs) and returns its index for
+    /// [`Self::close_guard`] to patch once the dsl has run every region
+    /// closure. Nesting is refused — flat consecutive regions are the
+    /// contract every consumer (interpreter jump logic, emitter) relies
+    /// on.
+    pub(crate) fn open_guard(&mut self, out_shapes: Vec<(Shape, DType)>) -> (usize, Vec<ValueId>) {
         assert!(
             !self.in_guard,
             "nested guards are not part of the vocabulary (flat regions)"
         );
         self.in_guard = true;
-        self.push(
+        let outs = self.push(
             OpKind::Guard {
-                pred,
-                then_ops: 0,
+                arms: Vec::new(),
                 else_ops: 0,
             },
             vec![],
-            vec![],
+            out_shapes,
         );
-        self.ops.len() - 1
+        (self.ops.len() - 1, outs)
     }
 
     pub(crate) fn op_count_now(&self) -> usize {
         self.ops.len()
     }
 
-    pub(crate) fn close_guard(&mut self, guard_idx: usize, then_ops: u32, else_ops: u32) {
+    pub(crate) fn close_guard(&mut self, guard_idx: usize, arms: Vec<GuardArm>, else_ops: u32) {
         let OpKind::Guard {
-            then_ops: t,
+            arms: a,
             else_ops: e,
-            ..
         } = &mut self.ops[guard_idx].kind
         else {
             panic!("close_guard: not a guard at {guard_idx}");
         };
-        *t = then_ops;
+        *a = arms;
         *e = else_ops;
         self.in_guard = false;
     }

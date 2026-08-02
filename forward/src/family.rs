@@ -177,6 +177,9 @@ fn llama_like_text(
                 }
                 Some((_, FireClass::Decode)) => cuda::attention_flashinfer_decode(&q, &w.kv, q_w),
                 Some((_, FireClass::Prefill)) => cuda::attention_flashinfer_prefill(&q, &w.kv, q_w),
+                Some((_, FireClass::CommitAdvance | FireClass::StateOnly)) => {
+                    unreachable!("llama_like refuses the service classes at trace start")
+                }
                 None => attention(&q, &w.kv, q_w),
             };
             if post_norm {

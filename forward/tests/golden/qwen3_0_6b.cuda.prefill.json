@@ -3388,8 +3388,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -3609,8 +3613,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -3830,8 +3838,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -4051,8 +4063,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -4272,8 +4288,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -4493,8 +4513,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -4714,8 +4738,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -4935,8 +4963,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -5156,8 +5188,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -5377,8 +5413,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -5598,8 +5638,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -5819,8 +5863,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -6040,8 +6088,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -6261,8 +6313,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -6482,8 +6538,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -6703,8 +6763,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -6924,8 +6988,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -7145,8 +7213,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -7366,8 +7438,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -7587,8 +7663,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -7808,8 +7888,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -8029,8 +8113,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -8250,8 +8338,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -8471,8 +8563,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -8692,8 +8788,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -8913,8 +9013,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -9134,8 +9238,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
@@ -9355,8 +9463,12 @@
     {
       "kind": {
         "Guard": {
-          "pred": "HasWriteDesc",
-          "then_ops": 1,
+          "arms": [
+            {
+              "pred": "HasWriteDesc",
+              "ops": 1
+            }
+          ],
           "else_ops": 1
         }
       },
