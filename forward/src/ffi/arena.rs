@@ -324,6 +324,25 @@ fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -
                 aux_names: aux,
             };
         }
+        // The lowered branch over a runtime input: predicate in param0,
+        // region lengths in param1/... — then-count in param1, else-count
+        // as a one-entry aux run (the flat id array holds plain u32s;
+        // what a range means is the kind's contract, as with Launch).
+        OpKind::Guard {
+            pred,
+            then_ops,
+            else_ops,
+        } => {
+            let aux = store_ids(arena, &[*else_ops]);
+            return OpParts {
+                kind: PieForwardOpKind::Guard,
+                weight_name: PIE_FORWARD_NO_NAME,
+                param0: *pred as u32,
+                param1: *then_ops,
+                selector: PIE_FORWARD_NO_VALUE,
+                aux_names: aux,
+            };
+        }
     })
 }
 

@@ -29,6 +29,9 @@ include = [
     # argument of `pie_forward_trace_llama_like_cuda`. (Kernel statements
     # cross as `Launch` ops carrying launcher NAMES — no enum to export.)
     "PieForwardFireClass",
+    # Guard predicates cross in `Guard.param0`; no exported struct holds
+    # one by type.
+    "PieForwardGuardPred",
 ]
 
 [enum]

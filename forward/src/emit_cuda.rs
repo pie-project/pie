@@ -176,8 +176,40 @@ fn emit_class_fn(
         b.line("");
     }
 
-    for op in &plan.ops {
+    // Index walk: a Guard consumes its region ops into an emitted
+    // `if`/`else` — the ONLY branch the declaration wrote, spelled as the
+    // fixed condition its closed predicate names.
+    let mut i = 0;
+    while i < plan.ops.len() {
+        let op = &plan.ops[i];
+        if let OpKind::Guard {
+            pred,
+            then_ops,
+            else_ops,
+        } = &op.kind
+        {
+            let cond = match pred {
+                crate::trace::GuardPred::HasWriteDesc => "has_write_desc",
+            };
+            b.stmt(&format!("if ({cond}) {{"));
+            b.indent += 1;
+            for j in (i + 1)..(i + 1 + *then_ops as usize) {
+                emit_op(&mut b, &plan.ops[j], plan, facts, is_decode);
+            }
+            b.indent -= 1;
+            b.stmt("} else {");
+            b.indent += 1;
+            let else_start = i + 1 + *then_ops as usize;
+            for j in else_start..(else_start + *else_ops as usize) {
+                emit_op(&mut b, &plan.ops[j], plan, facts, is_decode);
+            }
+            b.indent -= 1;
+            b.stmt("}");
+            i += 1 + (*then_ops + *else_ops) as usize;
+            continue;
+        }
         emit_op(&mut b, op, plan, facts, is_decode);
+        i += 1;
     }
     b.line("}");
     b.out
@@ -186,6 +218,8 @@ fn emit_class_fn(
 #[derive(Default)]
 struct Body {
     out: String,
+    /// Extra indent levels while inside an emitted Guard region.
+    indent: usize,
 }
 
 impl Body {
@@ -196,6 +230,9 @@ impl Body {
     fn stmt(&mut self, s: &str) {
         for l in s.lines() {
             self.out.push_str("    ");
+            for _ in 0..self.indent {
+                self.out.push_str("    ");
+            }
             self.out.push_str(l);
             self.out.push('\n');
         }
@@ -455,6 +492,26 @@ fn emit_launch(
             b.stmt("    R, num_q_heads, num_kv_heads, d,");
             b.stmt("    cache.page_size(), cache.hnd_layout(),");
             b.stmt("    cfg.rope_theta, eps, stream);");
+        }
+        "launch_write_kv_explicit_bf16" => {
+            let layer = state.expect("kv write addresses kv state").layer;
+            b.stmt(&format!("{{"));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+            b.stmt("    kernels::launch_write_kv_explicit_bf16(");
+            b.stmt("        kv_view, ws.k.data(), ws.v.data(),");
+            b.stmt("        w_page_d, w_off_d, N, stream, row_valid_d);");
+            b.stmt("}");
+        }
+        "launch_write_kv_to_pages" => {
+            let layer = state.expect("kv write addresses kv state").layer;
+            b.stmt(&format!("{{"));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+            b.stmt("    kernels::launch_write_kv_to_pages(");
+            b.stmt("        kv_view, ws.k.data(), ws.v.data(),");
+            b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
+            b.stmt("        kv_last_page_lens,");
+            b.stmt("        N, R, stream, row_valid_d);");
+            b.stmt("}");
         }
         "launch_qk_rmsnorm_rope_bf16" => {
             let (q_norm, k_norm) = (&weights[0], &weights[1]);

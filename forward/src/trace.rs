@@ -150,6 +150,23 @@ pub enum FireClass {
 // every kernel, as an [`OpKind::Launch`] with the launcher's name. Raw
 // signatures, not enum tags; north-star-dsl.md.)
 
+/// A [`OpKind::Guard`]'s predicate: the ONE kind of branch a lowered
+/// trace may carry — over a per-fire RUNTIME INPUT, closed-vocabulary so
+/// every predicate is emittable as a fixed C++ condition (rung 3's
+/// generated form spells it; the interpreter evaluates it). Trace-time
+/// facts never appear here — they resolved during tracing — and anything
+/// not in this vocabulary is not expressible, which is the point: a
+/// declaration cannot smuggle an open-ended runtime choice past the
+/// toolchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum GuardPred {
+    /// The fire carries explicit KV-write descriptors (`w_page`/`w_off`),
+    /// the graph-replay steering path — `has_write_desc` in every driver
+    /// signature.
+    HasWriteDesc = 0,
+}
+
 /// One operation of the traced form.
 ///
 /// Weights are referenced by name; `layer` tags the ops that address
@@ -350,6 +367,21 @@ pub enum OpKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<StateRef>,
     },
+    /// The one branch a lowered trace may carry: over a per-fire RUNTIME
+    /// INPUT ([`GuardPred`], closed vocabulary). The `then_ops` ops
+    /// immediately after this one run when the predicate holds, the
+    /// `else_ops` after those when it does not — flat regions, no
+    /// nesting (the builder enforces it), and no region may produce a
+    /// value consumed outside it (side-effect launches only; a
+    /// value-producing guard is a later design when a consumer exists).
+    /// The interpreter evaluates the predicate and skips the dead
+    /// region; rung 3's emitter spells `if (...) { … } else { … }` —
+    /// the ONLY `if` a generated file carries that the declaration wrote.
+    Guard {
+        pred: GuardPred,
+        then_ops: u32,
+        else_ops: u32,
+    },
 }
 
 /// Which implicit store an op addresses. Both stores are per-layer and
@@ -450,6 +482,8 @@ pub struct TraceBuilder {
     values: Vec<ValueInfo>,
     ops: Vec<Op>,
     layer: Option<u32>,
+    /// A guard is open ([`Self::open_guard`]); nesting is refused.
+    in_guard: bool,
 }
 
 impl TraceBuilder {
@@ -459,6 +493,7 @@ impl TraceBuilder {
             values: Vec::new(),
             ops: Vec::new(),
             layer: None,
+            in_guard: false,
         }
     }
 
@@ -479,6 +514,47 @@ impl TraceBuilder {
     /// A value's shape, for dsl ops whose outputs mirror their inputs.
     pub(crate) fn value_shape(&self, id: ValueId) -> Shape {
         self.values[id as usize].shape.clone()
+    }
+
+    /// Open a [`OpKind::Guard`]: records the op with zeroed region counts
+    /// and returns its index for [`Self::close_guard`] to patch once the
+    /// dsl has run both region closures. Nesting is refused here — flat
+    /// regions are the contract every consumer (interpreter skip logic,
+    /// emitter) relies on.
+    pub(crate) fn open_guard(&mut self, pred: GuardPred) -> usize {
+        assert!(
+            !self.in_guard,
+            "nested guards are not part of the vocabulary (flat regions)"
+        );
+        self.in_guard = true;
+        self.push(
+            OpKind::Guard {
+                pred,
+                then_ops: 0,
+                else_ops: 0,
+            },
+            vec![],
+            vec![],
+        );
+        self.ops.len() - 1
+    }
+
+    pub(crate) fn op_count_now(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub(crate) fn close_guard(&mut self, guard_idx: usize, then_ops: u32, else_ops: u32) {
+        let OpKind::Guard {
+            then_ops: t,
+            else_ops: e,
+            ..
+        } = &mut self.ops[guard_idx].kind
+        else {
+            panic!("close_guard: not a guard at {guard_idx}");
+        };
+        *t = then_ops;
+        *e = else_ops;
+        self.in_guard = false;
     }
 
     /// The `+=` fold ([`crate::dsl`]): if `rhs` is the output of the op

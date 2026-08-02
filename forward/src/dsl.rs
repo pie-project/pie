@@ -321,6 +321,32 @@ impl std::ops::AddAssign<Val> for Val {
     }
 }
 
+// ── The runtime branch ─────────────────────────────────────────────────
+
+/// Record a [`OpKind::Guard`]: `then_f`'s ops run when `pred` holds at
+/// fire time, `else_f`'s when it does not. The ONE branch a lowered
+/// declaration may write over a runtime input — the predicate vocabulary
+/// is closed ([`GuardPred`]), the regions are flat, and neither region's
+/// values may escape (side-effect launches only; the builder has no way
+/// to stop a determined escape yet, so the discipline is reviewed, not
+/// enforced — a value-producing guard is a later design).
+pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f: impl FnOnce()) {
+    let idx = {
+        let mut b = m.t.inner.borrow_mut();
+        b.set_layer(None);
+        b.open_guard(pred)
+    };
+    then_f();
+    let then_ops = {
+        let b = m.t.inner.borrow();
+        (b.op_count_now() - idx - 1) as u32
+    };
+    else_f();
+    let mut b = m.t.inner.borrow_mut();
+    let else_ops = (b.op_count_now() - idx - 1) as u32 - then_ops;
+    b.close_guard(idx, then_ops, else_ops);
+}
+
 // ── Raw kernel signatures ──────────────────────────────────────────────
 
 /// The CUDA launchers a lowered declaration may state, one function per
@@ -465,6 +491,36 @@ pub mod cuda {
     pub fn attention_flashinfer_prefill(q: &Val, kv: &Kv, q_width: u32) -> Val {
         dequant(kv);
         attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
+    }
+
+    /// `kernels::launch_write_kv_explicit_bf16`: the explicit-descriptor
+    /// KV write (graph-replay steering; N cells, one per query token).
+    /// Stated inside the `HasWriteDesc` guard's then-region.
+    pub fn write_kv_explicit(k: &Val, v: &Val, kv: &Kv) {
+        record(
+            &kv.t,
+            Some(kv.l),
+            "launch_write_kv_explicit_bf16",
+            vec![],
+            kv_state(kv),
+            vec![k.id, v.id],
+            None,
+        );
+    }
+
+    /// `kernels::launch_write_kv_to_pages`: the page-derived append
+    /// (position re-derived from the page table). The `HasWriteDesc`
+    /// guard's else-region.
+    pub fn write_kv_to_pages(k: &Val, v: &Val, kv: &Kv) {
+        record(
+            &kv.t,
+            Some(kv.l),
+            "launch_write_kv_to_pages",
+            vec![],
+            kv_state(kv),
+            vec![k.id, v.id],
+            None,
+        );
     }
 
     fn dequant(kv: &Kv) {

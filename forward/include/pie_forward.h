@@ -124,6 +124,13 @@ enum class PieForwardOpKind : uint32_t {
   /// resolves the symbol in its name→launcher registry and launches —
   /// adding a kernel never grows this enum again.
   Launch = 23,
+  /// The lowered branch over a per-fire RUNTIME input (`GuardPred` in
+  /// param0 as a wire value; then-region op count in param1; else-region
+  /// op count as a one-entry `aux_names` run). The `then_ops` ops after
+  /// this one run when the predicate holds, the `else_ops` after those
+  /// when it does not; regions are flat (no nesting) and produce no
+  /// values consumed outside. The ONLY branch a class trace carries.
+  Guard = 24,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -163,6 +170,13 @@ enum class PieForwardQkNorm : uint32_t {
 enum class PieForwardFireClass : uint32_t {
   Decode = 0,
   Prefill = 1,
+};
+
+/// Mirrors [`crate::trace::GuardPred`] — the values `Guard.param0`
+/// carries; same appended-only discriminant rule as [`PieForwardOpKind`].
+enum class PieForwardGuardPred : uint32_t {
+  /// The fire carries explicit KV-write descriptors (`has_write_desc`).
+  HasWriteDesc = 0,
 };
 
 /// The llama_like facts, as C states them. Mirrors

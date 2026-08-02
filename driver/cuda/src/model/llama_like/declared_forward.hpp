@@ -15,15 +15,17 @@
 // fused kernels round differently from their unfused sequences.
 //
 // What remains driver-side, documented as remaining and why:
-//   * the `has_write_desc` KV-write mechanism (explicit descriptors vs
-//     page-derived) — a per-fire RUNTIME input; expressing it in the
-//     trace needs the `Guard` op (north-star-dsl.md), until which
-//     KvAppend's and the fused epilogue's write-mechanism branch stays;
 //   * pad/strip staging around KV-write/attention for padded head dims —
 //     buffer routing, the mechanical binding the dumbness criterion
 //     leaves with the driver;
 //   * per-layer window resolution and plan-cache binding — parameters OF
-//     the stated kernel, not choices between kernels.
+//     the stated kernel, not choices between kernels;
+//   * the fused decode-QKV epilogue's `has_write_desc ? w_page_d :
+//     nullptr` ternary — ARG binding of one stated kernel, not a kernel
+//     choice. (The KV-write mechanism itself — explicit vs page-derived,
+//     two different kernels — IS expressed now: the declaration's
+//     `HasWriteDesc` Guard states both arms, the first live Guard;
+//     rung 4a.)
 // Everything the trace cannot express yet (hooks, custom masks, TP,
 // vision, quantized projections, non-standard rope, qkv bias)
 // falls back to `llama_like_forward_paged` — the caller gates, `build`

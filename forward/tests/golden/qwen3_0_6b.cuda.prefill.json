@@ -3387,8 +3387,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 0
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        7,
+        5
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
         }
       },
       "inputs": [
@@ -3575,8 +3608,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 1
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        20,
+        18
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
         }
       },
       "inputs": [
@@ -3763,8 +3829,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 2
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        33,
+        31
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
         }
       },
       "inputs": [
@@ -3951,8 +4050,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 3
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        46,
+        44
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
         }
       },
       "inputs": [
@@ -4139,8 +4271,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 4
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        59,
+        57
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
         }
       },
       "inputs": [
@@ -4327,8 +4492,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 5
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        72,
+        70
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
         }
       },
       "inputs": [
@@ -4515,8 +4713,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 6
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        85,
+        83
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
         }
       },
       "inputs": [
@@ -4703,8 +4934,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 7
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [
+        98,
+        96
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
         }
       },
       "inputs": [
@@ -4891,8 +5155,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 8
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [
+        111,
+        109
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
         }
       },
       "inputs": [
@@ -5079,8 +5376,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 9
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [
+        124,
+        122
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
         }
       },
       "inputs": [
@@ -5267,8 +5597,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 10
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [
+        137,
+        135
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
         }
       },
       "inputs": [
@@ -5455,8 +5818,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 11
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
+        }
+      },
+      "inputs": [
+        150,
+        148
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
         }
       },
       "inputs": [
@@ -5643,8 +6039,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 12
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [
+        163,
+        161
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
         }
       },
       "inputs": [
@@ -5831,8 +6260,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 13
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [
+        176,
+        174
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
         }
       },
       "inputs": [
@@ -6019,8 +6481,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 14
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [
+        189,
+        187
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
         }
       },
       "inputs": [
@@ -6207,8 +6702,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 15
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
+        }
+      },
+      "inputs": [
+        202,
+        200
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
         }
       },
       "inputs": [
@@ -6395,8 +6923,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 16
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [
+        215,
+        213
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
         }
       },
       "inputs": [
@@ -6583,8 +7144,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 17
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [
+        228,
+        226
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
         }
       },
       "inputs": [
@@ -6771,8 +7365,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 18
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [
+        241,
+        239
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
         }
       },
       "inputs": [
@@ -6959,8 +7586,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 19
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
+        }
+      },
+      "inputs": [
+        254,
+        252
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
         }
       },
       "inputs": [
@@ -7147,8 +7807,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 20
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [
+        267,
+        265
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
         }
       },
       "inputs": [
@@ -7335,8 +8028,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 21
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [
+        280,
+        278
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
         }
       },
       "inputs": [
@@ -7523,8 +8249,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 22
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [
+        293,
+        291
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
         }
       },
       "inputs": [
@@ -7711,8 +8470,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 23
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
+        }
+      },
+      "inputs": [
+        306,
+        304
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
         }
       },
       "inputs": [
@@ -7899,8 +8691,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 24
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
+        }
+      },
+      "inputs": [
+        319,
+        317
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
         }
       },
       "inputs": [
@@ -8087,8 +8912,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 25
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
+        }
+      },
+      "inputs": [
+        332,
+        330
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
         }
       },
       "inputs": [
@@ -8275,8 +9133,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 26
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
+        }
+      },
+      "inputs": [
+        345,
+        343
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
         }
       },
       "inputs": [
@@ -8463,8 +9354,41 @@
     },
     {
       "kind": {
-        "KvAppend": {
-          "layer": 27
+        "Guard": {
+          "pred": "HasWriteDesc",
+          "then_ops": 1,
+          "else_ops": 1
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_explicit_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
+        }
+      },
+      "inputs": [
+        358,
+        356
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_write_kv_to_pages",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
         }
       },
       "inputs": [

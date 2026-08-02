@@ -11,7 +11,7 @@ use crate::facts::{
     Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::dsl::{self, attention, cuda, matmul, rmsnorm, rope, split_qkv, swiglu};
-use crate::trace::{DType, Dim, FireClass, ForwardPlan, NormVariant, RopeKind, Shape, TraceBuilder, ValueId};
+use crate::trace::{DType, Dim, FireClass, ForwardPlan, GuardPred, NormVariant, RopeKind, Shape, TraceBuilder, ValueId};
 
 /// The llama_like body — SEMANTIC form: no structural divergence, one
 /// trace serves every fire shape, kernel choice stays with the consumer.
@@ -141,7 +141,21 @@ fn llama_like_text(
                     };
                     rope(&q, &k, f.rope)
                 };
-                w.kv.append(&k, &v);
+                if m.lowering().is_some() {
+                    // The KV-write mechanism is a per-fire runtime input
+                    // (explicit descriptors when the fire steers a graph
+                    // replay, page-derived otherwise) — the first Guard:
+                    // the one branch the lowered form carries, both arms
+                    // stated (north-star-dsl.md).
+                    dsl::guard(
+                        m,
+                        GuardPred::HasWriteDesc,
+                        || cuda::write_kv_explicit(&k, &v, &w.kv),
+                        || cuda::write_kv_to_pages(&k, &v, &w.kv),
+                    );
+                } else {
+                    w.kv.append(&k, &v);
+                }
                 q
             };
             let a = match m.lowering() {

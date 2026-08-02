@@ -69,6 +69,7 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::SplitQGate { .. } => PieForwardOpKind::SplitQGate,
         OpKind::SigmoidGateMul => PieForwardOpKind::SigmoidGateMul,
         OpKind::Launch { .. } => PieForwardOpKind::Launch,
+        OpKind::Guard { .. } => PieForwardOpKind::Guard,
     }
 }
 

@@ -2294,13 +2294,16 @@ bool has_write_desc)
         require(w.layers[0].k_norm, "layer.0.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(0);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(0);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(0);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2381,13 +2384,16 @@ bool has_write_desc)
         require(w.layers[1].k_norm, "layer.1.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(1);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(1);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(1);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2468,13 +2474,16 @@ bool has_write_desc)
         require(w.layers[2].k_norm, "layer.2.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(2);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(2);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(2);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2555,13 +2564,16 @@ bool has_write_desc)
         require(w.layers[3].k_norm, "layer.3.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(3);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(3);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(3);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2642,13 +2654,16 @@ bool has_write_desc)
         require(w.layers[4].k_norm, "layer.4.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(4);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(4);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(4);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2729,13 +2744,16 @@ bool has_write_desc)
         require(w.layers[5].k_norm, "layer.5.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(5);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(5);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(5);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2816,13 +2834,16 @@ bool has_write_desc)
         require(w.layers[6].k_norm, "layer.6.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(6);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(6);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(6);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2903,13 +2924,16 @@ bool has_write_desc)
         require(w.layers[7].k_norm, "layer.7.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(7);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(7);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(7);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -2990,13 +3014,16 @@ bool has_write_desc)
         require(w.layers[8].k_norm, "layer.8.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(8);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(8);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(8);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3077,13 +3104,16 @@ bool has_write_desc)
         require(w.layers[9].k_norm, "layer.9.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(9);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(9);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(9);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3164,13 +3194,16 @@ bool has_write_desc)
         require(w.layers[10].k_norm, "layer.10.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(10);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(10);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(10);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3251,13 +3284,16 @@ bool has_write_desc)
         require(w.layers[11].k_norm, "layer.11.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(11);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(11);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(11);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3338,13 +3374,16 @@ bool has_write_desc)
         require(w.layers[12].k_norm, "layer.12.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(12);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(12);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(12);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3425,13 +3464,16 @@ bool has_write_desc)
         require(w.layers[13].k_norm, "layer.13.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(13);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(13);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(13);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3512,13 +3554,16 @@ bool has_write_desc)
         require(w.layers[14].k_norm, "layer.14.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(14);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(14);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(14);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3599,13 +3644,16 @@ bool has_write_desc)
         require(w.layers[15].k_norm, "layer.15.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(15);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(15);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(15);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3686,13 +3734,16 @@ bool has_write_desc)
         require(w.layers[16].k_norm, "layer.16.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(16);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(16);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(16);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3773,13 +3824,16 @@ bool has_write_desc)
         require(w.layers[17].k_norm, "layer.17.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(17);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(17);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(17);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3860,13 +3914,16 @@ bool has_write_desc)
         require(w.layers[18].k_norm, "layer.18.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(18);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(18);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(18);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -3947,13 +4004,16 @@ bool has_write_desc)
         require(w.layers[19].k_norm, "layer.19.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(19);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(19);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(19);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -4034,13 +4094,16 @@ bool has_write_desc)
         require(w.layers[20].k_norm, "layer.20.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(20);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(20);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(20);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -4121,13 +4184,16 @@ bool has_write_desc)
         require(w.layers[21].k_norm, "layer.21.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(21);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(21);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(21);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -4208,13 +4274,16 @@ bool has_write_desc)
         require(w.layers[22].k_norm, "layer.22.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(22);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(22);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(22);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -4295,13 +4364,16 @@ bool has_write_desc)
         require(w.layers[23].k_norm, "layer.23.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(23);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(23);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(23);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -4382,13 +4454,16 @@ bool has_write_desc)
         require(w.layers[24].k_norm, "layer.24.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(24);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(24);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(24);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -4469,13 +4544,16 @@ bool has_write_desc)
         require(w.layers[25].k_norm, "layer.25.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(25);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(25);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(25);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -4556,13 +4634,16 @@ bool has_write_desc)
         require(w.layers[26].k_norm, "layer.26.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(26);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(26);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(26);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
@@ -4643,13 +4724,16 @@ bool has_write_desc)
         require(w.layers[27].k_norm, "layer.27.k_norm")->data(),
         positions, N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, eps, stream);
-    {
-        auto kv_view = cache.layer_view(27);
-        if (has_write_desc) {
+    if (has_write_desc) {
+        {
+            auto kv_view = cache.layer_view(27);
             kernels::launch_write_kv_explicit_bf16(
                 kv_view, ws.k.data(), ws.v.data(),
                 w_page_d, w_off_d, N, stream, row_valid_d);
-        } else {
+        }
+    } else {
+        {
+            auto kv_view = cache.layer_view(27);
             kernels::launch_write_kv_to_pages(
                 kv_view, ws.k.data(), ws.v.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,

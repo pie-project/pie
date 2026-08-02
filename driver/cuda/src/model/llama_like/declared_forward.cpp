@@ -101,6 +101,8 @@ enum class LaunchKernel {
     AttentionFlashinferDecode,
     DequantKvCacheLayerToBf16Active,
     AttentionFlashinferPrefill,
+    WriteKvExplicit,
+    WriteKvToPages,
 };
 
 LaunchKernel resolve_launch_kernel(std::string_view kernel) {
@@ -124,6 +126,12 @@ LaunchKernel resolve_launch_kernel(std::string_view kernel) {
     }
     if (kernel == "dispatch_attention_flashinfer_prefill_bf16") {
         return LaunchKernel::AttentionFlashinferPrefill;
+    }
+    if (kernel == "launch_write_kv_explicit_bf16") {
+        return LaunchKernel::WriteKvExplicit;
+    }
+    if (kernel == "launch_write_kv_to_pages") {
+        return LaunchKernel::WriteKvToPages;
     }
     throw std::runtime_error(
         "declared forward: stated kernel '" + std::string(kernel) +
@@ -453,7 +461,17 @@ void llama_like_forward_declared(
     // swiglu kernel the following Swiglu op launches (the hand-written
     // `use_fused_gu` pairing).
     bool gate_up_used_fused = false;
+    // Guard skip state: when a taken then-region ends, the else-region is
+    // dead and the walk jumps it (regions are flat — the builder refuses
+    // nesting — so one pending skip suffices).
+    std::size_t guard_else_at = SIZE_MAX;
+    std::size_t guard_else_len = 0;
     for (std::size_t i = 0; i < op_count; ++i) {
+        if (i == guard_else_at) {
+            guard_else_at = SIZE_MAX;
+            i += guard_else_len;
+            if (i >= op_count) break;
+        }
         const PieForwardOp& op = plan.op(i);
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
@@ -840,6 +858,22 @@ void llama_like_forward_declared(
                     kv_view, kv_page_indices, num_pages_in_batch, stream);
                 break;
             }
+            case LaunchKernel::WriteKvExplicit: {
+                auto kv_view = cache.layer_view(L);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view, attn_k, attn_v,
+                    w_page_d, w_off_d, N, stream, row_valid_d);
+                break;
+            }
+            case LaunchKernel::WriteKvToPages: {
+                auto kv_view = cache.layer_view(L);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, attn_k, attn_v,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d);
+                break;
+            }
             case LaunchKernel::AttentionFlashinferPrefill: {
                 // Mechanical plan binding, not a choice: prepare builds
                 // `prefill_plan` for prefill-shaped fires and
@@ -882,6 +916,41 @@ void llama_like_forward_declared(
                 kernels::launch_strip_head_dim_bf16(
                     attn_out_buf, ws.attn_out.data(),
                     N, num_q_heads, d, dk, stream);
+            }
+            break;
+        }
+        case PieForwardOpKind::Guard: {
+            // The one branch a class trace carries — over a runtime input
+            // (closed predicate vocabulary, `PieForwardGuardPred`).
+            // param1 = then-region op count; the else count rides a
+            // one-entry aux run.
+            const auto aux = plan.aux_names(op);
+            if (aux.size != 1) {
+                throw std::runtime_error(
+                    "declared forward: Guard aux run has " +
+                    std::to_string(aux.size) + " entries, wants 1");
+            }
+            const std::uint32_t then_ops = op.param1;
+            const std::uint32_t else_ops = aux[0];
+            bool cond;
+            switch (op.param0) {
+            case static_cast<std::uint32_t>(
+                pie_forward::PieForwardGuardPred::HasWriteDesc):
+                cond = has_write_desc;
+                break;
+            default:
+                throw std::runtime_error(
+                    "declared forward: guard predicate " +
+                    std::to_string(op.param0) +
+                    " is not in this executor's vocabulary");
+            }
+            if (cond) {
+                // Fall into the then-region; jump the else when it ends.
+                guard_else_at = i + 1 + then_ops;
+                guard_else_len = else_ops;
+            } else {
+                // Jump the then-region; ++i lands on the first else op.
+                i += then_ops;
             }
             break;
         }
