@@ -463,6 +463,16 @@ target_include_directories(gptoss_decode_step_test PRIVATE
 target_link_libraries(gptoss_decode_step_test PRIVATE pie_driver_metal_lib)
 add_test(NAME gptoss_decode_step_test COMMAND gptoss_decode_step_test)
 
+# Llama: one DAG serving llama/mistral/qwen2/qwen3 and the Qwen MoEs. The claim
+# that these are one family and not four is a claim about this function, so it
+# is checked here rather than discovered in an encoder.
+add_executable(llama_decode_step_test tests/llama_decode_step_test.cpp)
+target_compile_features(llama_decode_step_test PRIVATE cxx_std_20)
+target_include_directories(llama_decode_step_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+add_test(NAME llama_decode_step_test COMMAND llama_decode_step_test)
+
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -549,6 +559,11 @@ if(APPLE)
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(decode_step_mb_test tests/decode_step_mb_test.cpp)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
+  # `router_topk` past one simdgroup. gpt-oss's 32 experts never exercised the
+  # cross-simdgroup path; Qwen3-MoE's 128 do, and the kernel was wrong there.
+  add_metal_linked_test(router_topk_test tests/router_topk_test.cpp)
+  target_compile_definitions(router_topk_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   # `heap_bind.cpp`'s `case K::Fill` on a real heap.
   add_metal_linked_test(loader_fill_test tests/loader_fill_test.cpp NEEDS_LOADER)
   # The host MSL emitter's whole corpus, through Apple's shader compiler. The

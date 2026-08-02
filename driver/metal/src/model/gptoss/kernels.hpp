@@ -106,10 +106,16 @@ float yarn_mscale(const GptOssGeometry& g);
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
 
-/// `router_topk`: one threadgroup, one lane per expert. 32 on this family, so a
-/// single simdgroup holds the whole distribution.
+/// `router_topk`: one threadgroup per row, one lane per expert.
+///
+/// Rounded up to a whole simdgroup so no lane in the reduction is reading an
+/// uninitialised `part_v` slot, and capped at the 1024-thread threadgroup limit
+/// -- which is also the largest expert count this shape can serve. 32 here, 128
+/// on Qwen3-MoE; the kernel reduces across simdgroups, so both are correct.
 inline void router_topk_dispatch(int n_experts, Grid& g, Threadgroup& tg, int rows = 1) {
-    const std::uint32_t w = std::uint32_t(n_experts < 32 ? 32 : n_experts);
+    std::uint32_t w = std::uint32_t(n_experts < 1 ? 1 : n_experts);
+    w = (w + 31u) / 32u * 32u;
+    if (w > 1024u) w = 1024u;
     g = Grid{w, std::uint32_t(rows < 1 ? 1 : rows), 1};
     tg = Threadgroup{w, 1, 1};
 }

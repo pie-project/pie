@@ -1,0 +1,234 @@
+// The llama families' DAG, as a shape.
+//
+// `build_llama_dag` is a pure function of the geometry, so this test needs no
+// Metal and no checkpoint — which is the point. The whole reason llama_like and
+// qwen3_moe are ONE family rather than two is that the difference between them
+// is three fields (`qk_norm`, `n_experts`, `experts_per_token`) and one branch
+// in this function. If that claim is wrong it is wrong here, cheaply, rather
+// than in an encoder against a 30B checkpoint.
+//
+// So what is pinned is exactly the four configurations the family exists to
+// serve, and the arithmetic relating them:
+//
+//   llama-3          dense, no qk-norm     — the baseline
+//   qwen3            dense, qk-norm        — +2 per layer
+//   qwen3-moe        routed, qk-norm       — dense FFN's 4 become 7
+//   mixtral-shaped   routed, no qk-norm    — proving the two axes are independent
+
+#include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "model/llama/decode_step.hpp"
+
+using pie::metal::llama::Dispatch;
+using pie::metal::llama::Kind;
+using pie::metal::llama::LlamaGeometry;
+using pie::metal::llama::build_llama_dag;
+using pie::metal::llama::build_llama_dag_mb;
+using pie::metal::llama::dag_stats;
+
+namespace {
+
+int g_pass = 0, g_fail = 0;
+void expect(bool ok, const std::string& what) {
+    if (ok) { ++g_pass; std::printf("  PASS  %s\n", what.c_str()); }
+    else    { ++g_fail; std::printf("  FAIL  %s\n", what.c_str()); }
+}
+
+void expect_eq(long long got, long long want, const std::string& what) {
+    if (got == want) { ++g_pass; std::printf("  PASS  %s (%lld)\n", what.c_str(), got); }
+    else {
+        ++g_fail;
+        std::printf("  FAIL  %s: got %lld, want %lld\n", what.c_str(), got, want);
+    }
+}
+
+LlamaGeometry base() {
+    LlamaGeometry g;
+    g.n_layers = 4;
+    g.hidden = 2048;
+    g.vocab = 128256;
+    g.n_q_heads = 16;
+    g.n_kv_heads = 4;
+    g.head_dim = 128;
+    g.intermediate = 8192;
+    return g;
+}
+
+int count(const std::vector<Dispatch>& dag, Kind k) {
+    int n = 0;
+    for (const Dispatch& d : dag) if (d.kind == k) ++n;
+    return n;
+}
+
+/// Ordinals must be dense, ordered and unique: they are the argument-table key,
+/// and a collision silently binds one dispatch's weights to another's.
+void check_ordinals(const std::vector<Dispatch>& dag, int base_ord, const std::string& who) {
+    bool ok = true;
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        if (dag[i].ordinal != base_ord + static_cast<int>(i)) ok = false;
+    }
+    expect(ok, who + ": ordinals dense and ordered from " + std::to_string(base_ord));
+}
+
+/// Every dispatch inside the body must name its layer, and everything outside
+/// it must not. A layer index leaking into the tail would make the LM head read
+/// a per-layer weight slot.
+void check_layer_tags(const std::vector<Dispatch>& dag, const LlamaGeometry& g,
+                      const std::string& who) {
+    bool ok = true;
+    std::map<int, int> per_layer;
+    for (const Dispatch& d : dag) {
+        const bool body = d.kind != Kind::EmbedGather && d.kind != Kind::RowGather &&
+                          d.kind != Kind::FinalRms && d.kind != Kind::LmHead &&
+                          d.kind != Kind::Argmax;
+        if (body) {
+            if (d.layer < 0 || d.layer >= g.n_layers) ok = false;
+            else ++per_layer[d.layer];
+        } else if (d.layer != -1) {
+            ok = false;
+        }
+    }
+    expect(ok, who + ": layer tags in range for the body, -1 for embed and tail");
+    bool uniform = per_layer.size() == std::size_t(g.n_layers);
+    for (const auto& [layer, n] : per_layer) {
+        if (n != per_layer.begin()->second) uniform = false;
+    }
+    expect(uniform, who + ": every layer emits the same dispatch count");
+}
+
+/// The per-layer cost, derived rather than transcribed, so a reader can check
+/// the expectation against the model instead of against the code.
+int expected_per_layer(const LlamaGeometry& g) {
+    int n = 0;
+    n += 1;                    // AttnNorm
+    n += 3;                    // Q, K, V
+    n += g.qk_norm ? 2 : 0;    // QNorm, KNorm
+    n += 2;                    // RopeQ, RopeK
+    n += 1;                    // KvAppend
+    n += 1;                    // Sdpa
+    n += 1;                    // QmvO
+    n += 1;                    // AttnResidual
+    n += 1;                    // FfnNorm
+    n += g.is_moe() ? 7 : 4;   // router+topk+gate+up+silu+down+combine, or gate+up+silu+down
+    n += 1;                    // FfnResidual
+    return n;
+}
+
+void check_family(const char* who, const LlamaGeometry& g) {
+    std::printf("\n-- %s --\n", who);
+    const std::vector<Dispatch> dag = build_llama_dag(g);
+
+    const int head = 1;               // EmbedGather
+    const int tail = 4;               // RowGather, FinalRms, LmHead, Argmax
+    const int per_layer = expected_per_layer(g);
+    expect_eq(static_cast<long long>(dag.size()),
+              head + static_cast<long long>(g.n_layers) * per_layer + tail,
+              std::string(who) + ": total dispatches");
+
+    check_ordinals(dag, 0, who);
+    check_layer_tags(dag, g, who);
+
+    expect_eq(count(dag, Kind::EmbedGather), 1, std::string(who) + ": one embedding");
+    expect_eq(count(dag, Kind::Argmax), 1, std::string(who) + ": one argmax");
+    expect_eq(count(dag, Kind::KvAppend), g.n_layers, std::string(who) + ": one kv append/layer");
+    expect_eq(count(dag, Kind::QNorm), g.qk_norm ? g.n_layers : 0,
+              std::string(who) + ": qk-norm presence follows the geometry");
+    expect_eq(count(dag, Kind::QNorm), count(dag, Kind::KNorm),
+              std::string(who) + ": q and k norms are paired");
+
+    // Dense and routed are exclusive: emitting both would run the FFN twice and
+    // the second would overwrite the first.
+    const int dense = count(dag, Kind::QmvGate);
+    const int routed = count(dag, Kind::ExpertGate);
+    expect(dense == 0 || routed == 0, std::string(who) + ": FFN is dense XOR routed");
+    expect_eq(g.is_moe() ? routed : dense, g.n_layers,
+              std::string(who) + ": one FFN per layer, of the right kind");
+    expect_eq(count(dag, Kind::ExpertCombine), g.is_moe() ? g.n_layers : 0,
+              std::string(who) + ": expert combine only when routed");
+    expect_eq(count(dag, Kind::RouterTopK), count(dag, Kind::Router),
+              std::string(who) + ": every router logit vector gets a top-k");
+
+    // Two residuals per layer: attention and FFN. A missing one is a model that
+    // still runs and still produces text.
+    expect_eq(count(dag, Kind::AttnResidual) + count(dag, Kind::FfnResidual), 2 * g.n_layers,
+              std::string(who) + ": two residual adds per layer");
+
+    const auto s = dag_stats(dag, g);
+    const int gemv_per_layer = 4 + (g.is_moe() ? 4 : 3);  // qkvo + (router,g,u,d) or (g,u,d)
+    expect_eq(s.gemv, gemv_per_layer * g.n_layers + 1, std::string(who) + ": matvec count");
+    expect_eq(s.routed, g.is_moe() ? 3 * g.n_layers : 0,
+              std::string(who) + ": routed matvec count");
+
+    // The tail is what a prefill saves: everything from RowGather on runs on the
+    // sampled rows, so it must come after the last layer, exactly once, in order.
+    std::vector<Kind> tail_kinds;
+    for (std::size_t i = dag.size() - 4; i < dag.size(); ++i) tail_kinds.push_back(dag[i].kind);
+    expect(tail_kinds == std::vector<Kind>{Kind::RowGather, Kind::FinalRms, Kind::LmHead,
+                                           Kind::Argmax},
+           std::string(who) + ": tail is gather, norm, head, argmax");
+
+    // The MB path must describe the SAME model — only the ordinals move.
+    const std::vector<Dispatch> mb = build_llama_dag_mb(g, 50000);
+    expect_eq(static_cast<long long>(mb.size()), static_cast<long long>(dag.size()),
+              std::string(who) + ": MB dag has the same length");
+    bool same_shape = true;
+    for (std::size_t i = 0; i < mb.size(); ++i) {
+        if (mb[i].kind != dag[i].kind || mb[i].layer != dag[i].layer) same_shape = false;
+    }
+    expect(same_shape, std::string(who) + ": MB dag is the decode dag, ordinals aside");
+    check_ordinals(mb, 50000, std::string(who) + " MB");
+}
+
+}  // namespace
+
+int main() {
+    std::printf("llama_decode_step_test — one family, four configurations\n");
+
+    LlamaGeometry llama3 = base();
+    check_family("llama-3 (dense, no qk-norm)", llama3);
+
+    LlamaGeometry qwen3 = base();
+    qwen3.qk_norm = true;
+    check_family("qwen3 (dense, qk-norm)", qwen3);
+
+    LlamaGeometry qwen3_moe = base();
+    qwen3_moe.qk_norm = true;
+    qwen3_moe.n_experts = 128;
+    qwen3_moe.experts_per_token = 8;
+    qwen3_moe.moe_intermediate = 768;
+    check_family("qwen3-moe (routed, qk-norm)", qwen3_moe);
+
+    LlamaGeometry moe_no_qknorm = base();
+    moe_no_qknorm.n_experts = 8;
+    moe_no_qknorm.experts_per_token = 2;
+    moe_no_qknorm.moe_intermediate = 14336;
+    check_family("routed, no qk-norm", moe_no_qknorm);
+
+    // The two axes are independent, and the arithmetic says so: turning qk-norm
+    // on costs 2 per layer whatever the FFN is, and going routed costs 3 per
+    // layer whatever the norms are.
+    std::printf("\n-- axis independence --\n");
+    const auto n = [](const LlamaGeometry& g) {
+        return static_cast<long long>(build_llama_dag(g).size());
+    };
+    expect_eq(n(qwen3) - n(llama3), 2 * llama3.n_layers, "qk-norm costs 2/layer (dense)");
+    expect_eq(n(qwen3_moe) - n(moe_no_qknorm), 2 * llama3.n_layers, "qk-norm costs 2/layer (routed)");
+    expect_eq(n(moe_no_qknorm) - n(llama3), 3 * llama3.n_layers, "routing costs 3/layer (no qk-norm)");
+    expect_eq(n(qwen3_moe) - n(qwen3), 3 * llama3.n_layers, "routing costs 3/layer (qk-norm)");
+
+    // `ffn_width` is the one geometry accessor the encoder trusts to pick
+    // between the dense and per-expert intermediate size.
+    expect_eq(qwen3_moe.ffn_width(), 768, "moe ffn_width is the per-expert width");
+    expect_eq(llama3.ffn_width(), 8192, "dense ffn_width is the intermediate size");
+
+    // Sampling can be off (the caller wants logits, not a token), and that must
+    // remove exactly the argmax.
+    expect_eq(static_cast<long long>(build_llama_dag(llama3, false).size()), n(llama3) - 1,
+              "with_argmax=false drops exactly one dispatch");
+
+    std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
+}

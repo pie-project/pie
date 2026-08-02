@@ -437,6 +437,10 @@ METAL_FUNC void qmv_gptoss_impl(
 gptoss_qmv_kernel(affine_qmv_tail, false, false)
 gptoss_qmv_kernel(affine_qmv_tail_bias, true, false)
 gptoss_qmv_kernel(affine_qmv_routed_bias, true, true)
+// Qwen3-MoE's experts carry no bias. Everything else about the routed path --
+// the stacked weights indexed by `expert_ids`, `tid.z` selecting the slot -- is
+// identical, so it is the same template with BIASED off rather than a kernel.
+gptoss_qmv_kernel(affine_qmv_routed, false, true)
 
 #define instantiate_gptoss_qmv(fn, name, itype, gs, b)                       \
   template [[host_name(#fn "_" #name "_gs_" #gs "_b_" #b)]]                   \
@@ -450,6 +454,7 @@ gptoss_qmv_kernel(affine_qmv_routed_bias, true, true)
 instantiate_gptoss_qmv(affine_qmv_tail, bfloat16, bfloat, 64, 4)
 instantiate_gptoss_qmv(affine_qmv_tail_bias, bfloat16, bfloat, 64, 4)
 instantiate_gptoss_qmv(affine_qmv_routed_bias, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_routed, bfloat16, bfloat, 64, 4)
 
 // ── 8-bit affine matvec (gpt-oss's router) ──────────────────────────────────
 //
