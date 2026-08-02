@@ -21,6 +21,8 @@ namespace pie_cuda_driver {
 
 struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
+    // Materialized-weight artifact cache for THIS model. Empty = disabled.
+    std::string weight_cache_dir;
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
     int mtp_num_drafts = 3;
@@ -44,7 +46,9 @@ struct ModelConfig {
 struct BatchingConfig {
     double gpu_mem_utilization = 0.90;
     std::string memory_profile = "auto";
-    std::uint32_t kv_page_size = 32;
+    // 0 = let the memory planner derive and score candidates; >0 pins it.
+    // Mirrors `total_pages`, which uses the same 0-means-derive convention.
+    std::uint32_t kv_page_size = 0;
     // Pinned host KV slots for swap-out. 0 = swap disabled.
     std::uint32_t swap_pool_size = 0;
     // KV cache storage format. "auto" preserves the historical bf16 cache.
@@ -79,6 +83,27 @@ struct Config {
     RuntimeConfig runtime;
 };
 
+/// The root every disk cache derives from, from `[cache] dir` -- normally
+/// `$PIE_HOME/cache`. Empty means the engine did not say, which happens when a
+/// driver is run against a hand-written TOML; the caches then fall back to
+/// their XDG derivation.
+inline std::string& mutable_cache_dir() {
+    static std::string dir;
+    return dir;
+}
+
+inline const std::string& cache_dir() { return mutable_cache_dir(); }
+
+/// This model's materialized-weight artifact directory, published by
+/// `load_config` because the artifact cache is built from a place that never
+/// sees a `Config`. Empty disables the cache.
+inline std::string& mutable_weight_cache_dir() {
+    static std::string dir;
+    return dir;
+}
+
+inline const std::string& weight_cache_dir() { return mutable_weight_cache_dir(); }
+
 inline int parse_cuda_device_id(const std::string& device) {
     const auto colon = device.find(':');
     const std::string id_str =
@@ -109,6 +134,11 @@ inline Config load_config(const std::filesystem::path& path) {
 
     if (auto m = tbl["model"].as_table()) {
         c.model.snapshot_dir  = (*m)["snapshot_dir"].value_or(std::string{});
+        c.model.weight_cache_dir =
+            (*m)["weight_cache_dir"].value_or(std::string{});
+        // Published before returning: the artifact cache is constructed from
+        // somewhere that never sees this Config.
+        mutable_weight_cache_dir() = c.model.weight_cache_dir;
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.mtp_num_drafts = static_cast<int>(
@@ -163,10 +193,11 @@ inline Config load_config(const std::filesystem::path& path) {
             (*b)["memory_profile"].value_or(c.batching.memory_profile);
         const auto kv_page_size =
             (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);
-        if (kv_page_size <= 0 ||
+        if (kv_page_size < 0 ||
             kv_page_size > std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error(
-                "config: [batching].kv_page_size must be in [1, u32::MAX]");
+                "config: [batching].kv_page_size must be in [0, u32::MAX] "
+                "(0 = derive)");
         }
         c.batching.kv_page_size =
             static_cast<std::uint32_t>(kv_page_size);
@@ -200,6 +231,11 @@ inline Config load_config(const std::filesystem::path& path) {
     if (auto r = tbl["runtime"].as_table()) {
         c.runtime.verbose = (*r)["verbose"].value_or(c.runtime.verbose);
     }
+    if (auto cache = tbl["cache"].as_table()) {
+        // Published before returning: the module, tuning and planner-profile
+        // caches are each built from somewhere that never sees this Config.
+        mutable_cache_dir() = (*cache)["dir"].value_or(std::string{});
+    }
 
     if (c.model.snapshot_dir.empty()) {
         throw std::runtime_error("config: [model].snapshot_dir is required");
@@ -213,14 +249,15 @@ inline Config load_config(const std::filesystem::path& path) {
         throw std::runtime_error(
             "config: [batching].gpu_mem_utilization must be in (0.0, 1.0]");
     }
+    // "balanced" and "capacity" are internal policy families that "auto"
+    // still evaluates; they are no longer nameable here. See
+    // `CudaMemoryProfile` in worker/src/config.rs for why.
     if (c.batching.memory_profile != "auto" &&
         c.batching.memory_profile != "latency" &&
-        c.batching.memory_profile != "balanced" &&
-        c.batching.memory_profile != "throughput" &&
-        c.batching.memory_profile != "capacity") {
+        c.batching.memory_profile != "throughput") {
         throw std::runtime_error(
             "config: [batching].memory_profile must be one of auto, "
-            "latency, balanced, throughput, capacity");
+            "latency, throughput");
     }
     if (c.distributed.tp_size < 1) {
         throw std::runtime_error("config: [distributed].tp_size must be >= 1");

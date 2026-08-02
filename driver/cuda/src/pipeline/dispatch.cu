@@ -193,13 +193,6 @@ class LaneWorkPool {
 
     static std::size_t worker_count() {
         static const std::size_t count = [] {
-            if (const char* raw = std::getenv("PIE_CUDA_LANE_WORKERS")) {
-                char* end = nullptr;
-                const long parsed = std::strtol(raw, &end, 10);
-                if (end != raw && parsed >= 0 && parsed <= 64) {
-                    return static_cast<std::size_t>(parsed);
-                }
-            }
             // Derivation: the per-lane tasks are short and memory-bound, so
             // wake latency (~10 us/worker) must stay well under the serial
             // pool being split (~0.7 ms at 256 lanes). A quarter of the

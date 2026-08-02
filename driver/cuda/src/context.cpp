@@ -750,8 +750,6 @@ void Context::Impl::report_load_failure(const std::string& what) {
               << ": " << what << "\n";
     pie_cuda_driver::tp_report_rank_failure(
         tp_cpu_gate_key_, tp_rank_, "model load failed: " + what);
-    const char* keep = std::getenv("PIE_TP_NO_FAIL_STOP");
-    if (keep != nullptr && keep[0] != '0' && keep[0] != '\0') return;
     if (tp_size_ <= 1) return;
     std::cerr << "[pie-driver-cuda] a TP rank failed to load; the driver "
                  "cannot serve — exiting\n";
@@ -2305,17 +2303,14 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
         // channel to tell the runtime "this driver is finished", and the
         // failure has now been surfaced to this frame's clients, so stop the
         // process rather than idle in a state no caller can distinguish from a
-        // hang. `PIE_TP_NO_FAIL_STOP=1` keeps it alive for debugging.
+        // hang.
         if (pie_cuda_driver::detail::g_tp_rank_failed.load(
                 std::memory_order_acquire)) {
-            const char* keep = std::getenv("PIE_TP_NO_FAIL_STOP");
-            if (keep == nullptr || keep[0] == '0' || keep[0] == '\0') {
-                std::cerr << "[pie-driver-cuda] TP group lost a rank; the "
-                             "driver cannot serve again — exiting\n";
-                std::cerr.flush();
-                std::fflush(nullptr);
-                std::_Exit(70);
-            }
+            std::cerr << "[pie-driver-cuda] TP group lost a rank; the "
+                         "driver cannot serve again — exiting\n";
+            std::cerr.flush();
+            std::fflush(nullptr);
+            std::_Exit(70);
         }
         return PIE_STATUS_OK;
     };

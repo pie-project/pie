@@ -131,6 +131,61 @@ fn insert_int(table: &mut toml::Table, key: &str, value: impl Into<i64>) {
     table.insert(key.into(), toml::Value::Integer(value.into()));
 }
 
+/// This model's materialized-weight artifact directory, installed once before
+/// any driver is created and written into every startup TOML from there.
+///
+/// Install-at-bootstrap rather than a parameter because the TOML writers sit
+/// five call layers below the only place holding a parsed `Config`. First
+/// writer wins, so a directory a live driver is already using cannot move.
+static WEIGHT_CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the resolved weight-artifact directory. The caller resolves the
+/// `$PIE_HOME/models` default, because `$PIE_HOME` is the bin/worker layer's
+/// to know and the driver has never been told it.
+pub fn set_weight_cache_dir(dir: String) {
+    let _ = WEIGHT_CACHE_DIR.set(dir);
+}
+
+fn weight_cache_dir() -> String {
+    WEIGHT_CACHE_DIR.get().cloned().unwrap_or_default()
+}
+
+/// The root every driver-side disk cache derives from: `$PIE_HOME/cache`.
+///
+/// Location is convention, not configuration -- there is no config field for
+/// it, and `$PIE_HOME` is the one lever that moves it. Before this the driver
+/// caches derived from `$XDG_CACHE_HOME`/`$HOME/.cache` instead, not as a
+/// choice but because the driver had never been told `$PIE_HOME`. That split
+/// pie's state across two roots: `pie serve` wrote programs, logs and
+/// optimized checkpoints under one and compiled PTIR, GEMM tuning and planner
+/// profiles under another.
+static CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the resolved cache root, before any driver is created. First writer
+/// wins, so a cache a live driver is already using cannot move.
+pub fn set_cache_dir(dir: String) {
+    let _ = CACHE_DIR.set(dir);
+}
+
+fn cache_dir() -> String {
+    CACHE_DIR.get().cloned().unwrap_or_default()
+}
+
+/// Emit `[cache] dir` into a driver's startup TOML.
+///
+/// Omitted when unset so a driver launched with a hand-written TOML (its own
+/// `dev.toml`, say) keeps the XDG derivation rather than losing its cache to
+/// an empty path.
+fn insert_cache_table(doc: &mut toml::Table) {
+    let dir = cache_dir();
+    if dir.is_empty() {
+        return;
+    }
+    let mut table = toml::Table::new();
+    insert_str(&mut table, "dir", dir);
+    insert_table(doc, "cache", table);
+}
+
 fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
     table.insert(key.into(), toml::Value::String(value.into()));
 }
@@ -163,9 +218,78 @@ fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
 /// but legal — different ports) don't clobber each other's TOML or
 /// aux sockets.
 pub fn launch_state_dir() -> PathBuf {
-    crate::paths::pie_home()
-        .join("standalone")
-        .join(std::process::id().to_string())
+    launch_state_root().join(std::process::id().to_string())
+}
+
+/// Root of the per-launch state directories. Public so `state::entries` names
+/// the same path the sweep walks -- a listing that pointed elsewhere would
+/// report nothing and reclaim nothing.
+pub fn launch_state_root() -> PathBuf {
+    crate::paths::pie_home().join("standalone")
+}
+
+/// Whether a process id is still running.
+///
+/// `kill(pid, 0)` delivers no signal and only reports reachability: `Ok` means
+/// alive, `EPERM` means alive but not ours, `ESRCH` means gone. Anything other
+/// than a definite `ESRCH` is treated as alive, because the cost of the two
+/// mistakes is not symmetric — a stale directory is a few bytes, deleting a
+/// live launch's startup TOML is a driver that cannot boot.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Remove `$PIE_HOME/standalone/<pid>` directories whose process is gone.
+///
+/// Each launch writes a driver startup TOML under its own pid and nothing ever
+/// removed it, so every `pie serve` left a directory behind for the life of
+/// the machine. Sweeping at boot rather than only at shutdown is what makes it
+/// bounded: the leak's whole population is launches that did NOT exit cleanly.
+///
+/// Best-effort throughout. A directory that cannot be read or removed is left
+/// alone: this runs on the boot path and must never be the reason a start
+/// fails.
+pub fn sweep_stale_launch_state() {
+    let root = launch_state_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let self_pid = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            // Not a pid directory — not ours to reason about.
+            continue;
+        };
+        if pid == self_pid || pid_is_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::debug!(?path, %error, "could not sweep stale launch state");
+        }
+    }
+}
+
+/// Remove this process's launch state directory. Called on clean shutdown; the
+/// boot sweep is what covers the unclean ones.
+pub fn remove_launch_state() {
+    let dir = launch_state_dir();
+    if let Err(error) = std::fs::remove_dir_all(&dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(?dir, %error, "could not remove launch state");
+    }
 }
 
 // `DriverCapabilities` is owned by `pie-driver-abi` (single source of truth
@@ -273,6 +397,7 @@ pub fn write_metal_startup_toml(
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", options.verbose);
     insert_table(&mut doc, "runtime", runtime);
+    insert_cache_table(&mut doc);
 
     write_toml_table(out_path, doc)
 }
@@ -318,6 +443,7 @@ pub(crate) fn write_cuda_startup_toml(
 
     let mut model = toml::Table::new();
     insert_str(&mut model, "snapshot_dir", path_string(snapshot_dir));
+    insert_str(&mut model, "weight_cache_dir", weight_cache_dir());
     insert_str(&mut model, "device", &opts.device);
     insert_str(&mut model, "dtype", opts.weight_dtype.clone());
     insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);
@@ -326,14 +452,20 @@ pub(crate) fn write_cuda_startup_toml(
         "stream_routed_experts",
         opts.stream_routed_experts,
     );
-    model.insert(
-        "expert_cache_gb".into(),
-        toml::Value::Float(opts.expert_cache_gb),
-    );
-    model.insert(
-        "expert_host_cache_gb".into(),
-        toml::Value::Float(opts.expert_host_cache_gb),
-    );
+    // Omitted when absent rather than written as a sentinel: the driver's
+    // own default IS the derivation, so an absent key and a "0 means derive"
+    // key would be two spellings of one thing.
+    // The driver still speaks GiB floats; the unit lives in the config type,
+    // not on the wire.
+    if let Some(size) = opts.expert_cache {
+        model.insert("expert_cache_gb".into(), toml::Value::Float(size.as_gib_f64()));
+    }
+    if let Some(size) = opts.expert_host_cache {
+        model.insert(
+            "expert_host_cache_gb".into(),
+            toml::Value::Float(size.as_gib_f64()),
+        );
+    }
     insert_bool(
         &mut model,
         "enable_system_speculation",
@@ -352,20 +484,23 @@ pub(crate) fn write_cuda_startup_toml(
         match opts.memory_profile {
             CudaMemoryProfile::Auto => "auto",
             CudaMemoryProfile::Latency => "latency",
-            CudaMemoryProfile::Balanced => "balanced",
             CudaMemoryProfile::Throughput => "throughput",
-            CudaMemoryProfile::Capacity => "capacity",
         },
     );
-    insert_int(&mut batching, "kv_page_size", opts.kv_page_size);
+    if let Some(size) = opts.kv_page_size {
+        insert_int(&mut batching, "kv_page_size", size);
+    }
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
-    insert_int(&mut batching, "total_pages", opts.total_pages);
+    if let Some(pages) = opts.total_pages {
+        insert_int(&mut batching, "total_pages", pages);
+    }
     insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", opts.verbose);
     insert_table(&mut doc, "runtime", runtime);
+    insert_cache_table(&mut doc);
 
     if let Some(tp) = tp {
         let mut distributed = toml::Table::new();
@@ -503,7 +638,7 @@ pub(crate) fn create_driver_backend_group(
                 "cuda group creation requires cuda-native rank options"
             ));
         };
-        if !opts.mtp_assistant_snapshot_dir.is_empty() {
+        if opts.mtp_assistant_snapshot_dir.is_some() {
             return Err(anyhow!(
                 "mtp_assistant_snapshot_dir is not supported by the single-model \
                  LoadPlan boot contract"
@@ -557,7 +692,7 @@ pub(crate) fn create_driver_backend(
     let (mut backend, runtime_quant, mxfp4_moe) = match options {
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
-            if !opts.mtp_assistant_snapshot_dir.is_empty() {
+            if opts.mtp_assistant_snapshot_dir.is_some() {
                 return Err(anyhow!(
                     "mtp_assistant_snapshot_dir is not supported by the single-model \
                      LoadPlan boot contract"
@@ -664,7 +799,7 @@ mod tests {
                 opts: DummyDriverOptions {
                     vocab_size: None,
                     arch_name: None,
-                    ready_timeout_s: 5.0,
+                    ready_timeout: crate::config::Duration::from_secs(5),
                 },
                 random_seed: 7,
                 activation_dtype: "f32".to_string(),
@@ -859,7 +994,7 @@ mod tests {
         let full_options = DriverOptions::CudaNative(CudaNativeDriverOptions {
             device: "cuda:0".to_string(),
             gpu_mem_utilization: 1.0,
-            memory_profile: CudaMemoryProfile::Capacity,
+            memory_profile: CudaMemoryProfile::Latency,
             total_pages: 1,
             ..Default::default()
         });
@@ -921,6 +1056,54 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_toml_carries_the_cache_root() {
+        // The driver derives every disk cache from this. Without it the caches
+        // fall back to XDG, which is what split pie's state across two roots.
+        //
+        // NOTE: this installs a process-global OnceLock that outlives the test,
+        // so every later test in this binary sees `[cache]` emitted. Nothing
+        // asserts its absence today; a test that needs it unset cannot share a
+        // process with this one.
+        set_cache_dir("/pie-home/cache".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("driver.toml");
+        let snap = dir.path().join("snapshot");
+        write_cuda_startup_toml(&out, &CudaNativeDriverOptions::default(), &snap, 0, None)
+            .unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(val["cache"]["dir"].as_str().unwrap(), "/pie-home/cache");
+    }
+
+    #[test]
+    fn the_sweep_reclaims_dead_pids_and_spares_live_ones() {
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test; PIE_HOME is read, never written, by
+        // the code under test.
+        unsafe { std::env::set_var("PIE_HOME", home.path()) };
+
+        let root = home.path().join("standalone");
+        let self_pid = std::process::id();
+        // A pid that cannot be running: pid 0 is the kernel's, never a
+        // reachable user process, so `kill(0, 0)` reports it as not ours.
+        let dead = root.join("999999999");
+        let live = root.join(self_pid.to_string());
+        let foreign = root.join("not-a-pid");
+        for d in [&dead, &live, &foreign] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("driver.toml"), "x").unwrap();
+        }
+
+        sweep_stale_launch_state();
+
+        assert!(!dead.exists(), "a dead pid's state must be reclaimed");
+        assert!(live.exists(), "the running process's own state must survive");
+        assert!(
+            foreign.exists(),
+            "a directory that is not a pid is not ours to remove"
+        );
+    }
+
+    #[test]
     fn cuda_startup_toml_matches_driver_schema() {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("cuda.toml");
@@ -946,15 +1129,18 @@ mod tests {
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
-        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
+        // Derived values are OMITTED, not written as a sentinel. The driver's
+        // own default is the derivation, so emitting `0 = derive` would be a
+        // second spelling of an absent key.
+        assert!(val["batching"].get("kv_page_size").is_none());
         assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["batching"]["gpu_mem_utilization"].as_float().unwrap(),
             0.90
         );
         assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
-        assert_eq!(val["batching"]["total_pages"].as_integer().unwrap(), 0);
-        assert_eq!(val["batching"].as_table().unwrap().len(), 6);
+        assert!(val["batching"].get("total_pages").is_none());
+        assert_eq!(val["batching"].as_table().unwrap().len(), 4);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         // Expert streaming is off unless an operator asks for it: for a model
         // that fits it is strictly slower, and it costs graph capture besides.
@@ -962,7 +1148,8 @@ mod tests {
             val["model"]["stream_routed_experts"].as_bool().unwrap(),
             false
         );
-        assert_eq!(val["model"]["expert_cache_gb"].as_float().unwrap(), 0.0);
+        assert!(val["model"].get("expert_cache_gb").is_none());
+        assert!(val["model"].get("expert_host_cache_gb").is_none());
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
     }
 

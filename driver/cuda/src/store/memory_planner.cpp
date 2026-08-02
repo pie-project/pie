@@ -141,8 +141,13 @@ std::vector<std::string> planner_policy_profiles(const std::string& profile) {
     if (!is_auto_memory_profile(profile)) {
         return {profile};
     }
-    // `auto` is not a fifth concrete layout. It evaluates the concrete
-    // policy families and chooses by the unified objective below.
+    // `auto` is not a third concrete layout. It evaluates the concrete policy
+    // families and chooses by the unified objective below.
+    //
+    // Four families, three nameable profiles: "balanced" and "capacity" stay
+    // in this search but can no longer be pinned from config. Keeping them
+    // here is what makes the value reduction free -- `auto` is the default, so
+    // narrowing its search would have changed what every deployment does.
     return {"latency", "balanced", "throughput", "capacity"};
 }
 
@@ -164,11 +169,10 @@ std::vector<int> derive_kv_page_size_candidates(
     const pie_cuda_driver::Config& cfg,
     const pie_cuda_driver::HfConfig& /*hf*/,
     const cudaDeviceProp& /*prop*/) {
-    if (const char* forced = std::getenv("PIE_CUDA_KV_PAGE_SIZE")) {
-        const int v = std::atoi(forced);
-        if (v > 0) {
-            return {v};
-        }
+    // A pinned page size is a single-candidate lattice: the operator has
+    // already made the choice this search exists to make.
+    if (cfg.batching.kv_page_size > 0) {
+        return {static_cast<int>(cfg.batching.kv_page_size)};
     }
     std::vector<int> xs;
     const int tp_size = std::max(1, cfg.distributed.tp_size);
@@ -256,15 +260,6 @@ void uniq_clip_desc(std::vector<int>& xs, int cap) {
 
 int prefill_candidate_cap(const cudaDeviceProp& prop) {
     return prop.major >= 12 ? 16384 : 8192;
-}
-
-int forced_prefill_tokens() {
-    static const int tokens = [] {
-        const char* v = std::getenv("PIE_CUDA_PREFILL_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::max(0, std::atoi(v));
-    }();
-    return tokens;
 }
 
 
@@ -373,7 +368,7 @@ CudaMemoryPlan plan_cuda_memory(
         global_per_kv_token_bytes >= 192ull * 1024ull;
     const int auto_decode_target =
         std::min(kv_heavy_auto_model ? 256 : 512, throughput_decode_target);
-    const int forced_prefill = forced_prefill_tokens();
+    constexpr int forced_prefill = 0;
     // Qwen3-8B on L40-class TP1 has a measured prefill-shape knee above the
     // generic 8k cap: 12k keeps the initial 512-request prompt wave in a
     // faster two-chunk cadence without shrinking decode residency below R=512.

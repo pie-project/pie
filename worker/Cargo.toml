@@ -109,3 +109,8 @@ pie-ir = { path = "../compiler/ir" }
 
 [build-dependencies]
 cmake = "0.1"
+
+# `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a
+# signal. Unix-only; the sweep is a no-op elsewhere.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

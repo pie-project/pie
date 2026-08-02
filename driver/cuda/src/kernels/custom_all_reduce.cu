@@ -667,10 +667,8 @@ void CustomAllReduce::all_reduce_bf16(const void* input, void* output,
     // sub-pointer works as long as the *base* was registered. We pass
     // the input pointer directly (kernel does its own offset math on
     // the registered RankData).
-    static const int block_limit =
-        env_int_clamped("PIE_CUDA_CUSTOM_AR_BLOCK_LIMIT", 36, 1, vllm::kMaxBlocks);
-    static const int threads =
-        env_warp_multiple_clamped("PIE_CUDA_CUSTOM_AR_THREADS", 512, 32, 512);
+    constexpr int block_limit = 36;
+    constexpr int threads = 512;
     impl_->allreduce<__nv_bfloat16>(
         stream,
         const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(input)),
@@ -715,8 +713,7 @@ void CustomAllReduce::all_reduce_residual_rmsnorm_bf16(
     params.stream = stream;
     params.pattern = AllReduceFusionPattern::kARResidualRMSNorm;
     params.trigger_completion_at_end = false;
-    static const bool use_fp32_acc =
-        env_bool_default("PIE_CUDA_FUSED_AR_NORM_FP32_ACC", true);
+    constexpr bool use_fp32_acc = true;
     CUDA_CHECK((pie_allreduce_fusion_op<__nv_bfloat16>(
         params, /*launch_with_pdl=*/false, use_fp32_acc)));
 }

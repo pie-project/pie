@@ -34,7 +34,6 @@ pub fn default_config_content() -> String {
         .replace("[model.scheduler]", "[worker.model.scheduler]")
         .replace("[model]", "[worker.model]")
         .replace("[server]", "[worker.server]")
-        .replace("[auth]", "[worker.auth]")
         .replace("[telemetry]", "[worker.telemetry]")
         .replace("[runtime]", "[worker.runtime]");
     format!("{STANDALONE_HEADER}{worker_body}")
@@ -66,9 +65,6 @@ python_snapshot = true
                                           # (default: the driver's max forward
                                           # requests, which is what fills a batch)
 
-[auth]
-enabled = false
-
 [telemetry]
 enabled = false
 endpoint = "http://localhost:4317"
@@ -78,8 +74,8 @@ service_name = "pie"
 # Tokio + wasmtime tuning. Defaults are pinned by pie (decoupled from
 # upstream wasmtime changes); edit any value to override.
 wasm_max_instances = 1000
-wasm_max_memory_mb = 4096
-wasm_warm_memory_mb = 0
+wasm_max_memory = "4GiB"
+wasm_warm_memory = "0B"
 wasm_warm_slots = 100
 
 # Filesystem. allow_fs = true mounts a per-process /scratch dir with full RW.
@@ -92,14 +88,14 @@ allow_network = true
 network_allowed_hosts = ["*"]
 
 # Uploads
-max_upload_mb = 256
+max_upload = "256MiB"
 
 [model]
 name = "default"
 hf_repo = "Qwen/Qwen3-0.6B"
 
 [model.scheduler]
-request_timeout_secs = 120
+request_timeout = "120s"
 "#;
 
 #[cfg(feature = "driver-cuda")]

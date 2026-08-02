@@ -35,11 +35,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use pie_bin::derive::derive_standalone;
-use pie_bin::{Mode, run_standalone};
+use pie_bin::{run_standalone};
 use pie_client::client::Client;
 
 /// The one standalone TOML (`[controller]`/`[gateway]`/`[worker]` sections); `derive_standalone`
-/// splits + hands each section to its role lib's `Config::parse`. `Mode::Local` pins the client edge
+/// splits + hands each section to its role lib's `Config::parse`. the config's loopback default pins the client edge
 /// to loopback but keeps the *configured port* (so `pie local` has a predictable address), so the test
 /// must itself request an ephemeral one — `[gateway] listen = 127.0.0.1:0` — else both checks collide on
 /// the `0.0.0.0:8080` default ("Address already in use"). `worker_listen` is already forced ephemeral by
@@ -56,8 +56,6 @@ fn standalone_toml(snapshot: &str) -> String {
          listen = \"127.0.0.1:0\"\n\
          \n\
          [worker]\n\
-         [worker.auth]\n\
-         enabled = false\n\
          \n\
          [worker.model]\n\
          name = \"smoke\"\n\
@@ -104,7 +102,7 @@ fn fixture_snapshot() -> String {
 
 async fn boot() -> Result<pie_bin::StandaloneHandle> {
     let (controller, gateway, worker) = derive_standalone(&standalone_toml(&fixture_snapshot()))?;
-    run_standalone(controller, gateway, worker, Mode::Local).await
+    run_standalone(controller, gateway, worker).await
 }
 
 fn build_direct_channel_inferlet() -> Result<(PathBuf, PathBuf)> {

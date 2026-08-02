@@ -207,6 +207,10 @@ impl WorkerHandle {
             WorkerKind::Decode(engine) => engine.shutdown().await,
             WorkerKind::Executor(executor) => executor.shutdown().await,
         }
+        // The startup TOMLs under `$PIE_HOME/standalone/<pid>` are read once at
+        // driver creation and never again, so they are dead the moment the
+        // drivers are down. The boot sweep covers the unclean exits.
+        crate::embedded_driver::remove_launch_state();
     }
 }
 
@@ -465,6 +469,30 @@ fn load_model_drivers(
     user_cfg: &config::Config,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<LoadedModelDrivers> {
+    // Process housekeeping, once per boot and before anything writes under
+    // `$PIE_HOME/standalone/<pid>`: reclaim the directories left by launches
+    // that did not exit cleanly.
+    crate::embedded_driver::sweep_stale_launch_state();
+
+    // Every driver-side disk cache derives from this. Resolved here because
+    // `$PIE_HOME` is the worker layer's to know; the driver has never been
+    // told it, which is the only reason those caches used to sit under XDG.
+    crate::embedded_driver::set_cache_dir(
+        crate::state::driver_cache_dir()
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    // Resolve the weight-artifact directory here, before any driver startup
+    // TOML is written. `$PIE_HOME` is this layer's to know: the driver has
+    // never been told it, which is why the old env-var form fell back to XDG.
+    let weight_cache_dir = if user_cfg.model.weight_cache_dir.is_empty() {
+        crate::paths::pie_home().join("models").to_string_lossy().into_owned()
+    } else {
+        user_cfg.model.weight_cache_dir.clone()
+    };
+    crate::embedded_driver::set_weight_cache_dir(weight_cache_dir);
+
     let (driver_groups, snapshot_dir) = {
         let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
@@ -763,7 +791,7 @@ fn build_partner_bootstrap(
         transfer: user_cfg.offload.transfer,
         model_idx,
         page_size: metadata.page_size,
-        request_timeout_secs: user_cfg.model.scheduler.request_timeout_secs,
+        request_timeout_secs: user_cfg.model.scheduler.request_timeout.as_secs(),
         max_outstanding: user_cfg.offload.max_outstanding_per_partner,
     })
 }

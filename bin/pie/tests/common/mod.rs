@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use pie_bin::derive::derive_standalone;
-use pie_bin::{Mode, run_standalone};
+use pie_bin::{run_standalone};
 
 /// Install a `tracing` subscriber driven by `RUST_LOG` so the inproc
 /// forward-path debug probes (`pie_engine::driver::inproc`) and any other `tracing`
@@ -106,8 +106,6 @@ pub fn cuda_standalone_toml_capped(
          listen = \"127.0.0.1:0\"\n\
          \n\
          [worker]\n\
-         [worker.auth]\n\
-         enabled = false\n\
          \n\
          [worker.model]\n\
          name = \"qwen3\"\n\
@@ -130,7 +128,7 @@ pub fn cuda_standalone_toml_capped(
 pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
     let snapshot = resolve_qwen3_snapshot()?;
     let (controller, gateway, worker) = derive_standalone(&cuda_standalone_toml(&snapshot))?;
-    run_standalone(controller, gateway, worker, Mode::Local).await
+    run_standalone(controller, gateway, worker).await
 }
 
 /// [`boot_4090`] at an explicit `[model.scheduler] frame_dispatch_depth` — the
@@ -145,7 +143,7 @@ pub async fn boot_4090_dispatch_depth(depth: u32) -> Result<pie_bin::StandaloneH
         cuda_standalone_toml(&snapshot)
     );
     let (controller, gateway, worker) = derive_standalone(&toml)?;
-    run_standalone(controller, gateway, worker, Mode::Local).await
+    run_standalone(controller, gateway, worker).await
 }
 
 /// [`boot_4090`] with a SMALL KV pool (low `gpu_mem_utilization`) so a modest
@@ -167,7 +165,7 @@ pub async fn boot_4090_kv_cap(total_pages: u32) -> Result<pie_bin::StandaloneHan
     let snapshot = resolve_qwen3_snapshot()?;
     let (controller, gateway, worker) =
         derive_standalone(&cuda_standalone_toml_capped(&snapshot, util, total_pages))?;
-    run_standalone(controller, gateway, worker, Mode::Local).await
+    run_standalone(controller, gateway, worker).await
 }
 
 pub async fn boot_4090_small_kv() -> Result<pie_bin::StandaloneHandle> {
@@ -228,8 +226,6 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
          listen = \"127.0.0.1:0\"\n\
          \n\
          [worker]\n\
-         [worker.auth]\n\
-         enabled = false\n\
          \n\
          [worker.model]\n\
          name = \"default\"\n\
@@ -254,7 +250,7 @@ pub async fn boot_4090_mtp(mtp_num_drafts: u32) -> Result<pie_bin::StandaloneHan
     let snapshot = resolve_qwen35_snapshot()?;
     let (controller, gateway, worker) =
         derive_standalone(&cuda_mtp_standalone_toml(&snapshot, mtp_num_drafts))?;
-    run_standalone(controller, gateway, worker, Mode::Local).await
+    run_standalone(controller, gateway, worker).await
 }
 
 /// K for the MTP suites, from `PIE_MTP_DRAFT_TOKENS`. A harness parameter, not
@@ -282,8 +278,6 @@ pub fn dummy_standalone_toml(hf_repo: &str) -> String {
          listen = \"127.0.0.1:0\"\n\
          \n\
          [worker]\n\
-         [worker.auth]\n\
-         enabled = false\n\
          \n\
          [worker.model]\n\
          name = \"qwen3\"\n\
@@ -305,7 +299,7 @@ pub fn dummy_standalone_toml(hf_repo: &str) -> String {
 pub async fn boot_dummy() -> Result<pie_bin::StandaloneHandle> {
     let snapshot = resolve_qwen3_snapshot()?;
     let (controller, gateway, worker) = derive_standalone(&dummy_standalone_toml(&snapshot))?;
-    run_standalone(controller, gateway, worker, Mode::Local).await
+    run_standalone(controller, gateway, worker).await
 }
 
 // ── Client submit (golf) ────────────────────────────────────────────────────

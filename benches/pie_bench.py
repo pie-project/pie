@@ -216,7 +216,7 @@ def build_config(args: argparse.Namespace):
     if args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
-            "ready_timeout_s": float(args.server_startup_timeout),
+            "ready_timeout": f"{int(args.server_startup_timeout)}s",
         }
         if args.memory_profile != "auto":
             driver_options["memory_profile"] = args.memory_profile
@@ -1254,7 +1254,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--memory-profile",
             default="auto",
-            choices=["auto", "latency", "balanced", "throughput", "capacity"],
+            choices=["auto", "latency", "throughput"],
         )
         sp.add_argument(
             "--kv-pages", type=int, default=2048,
