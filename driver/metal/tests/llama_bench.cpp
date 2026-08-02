@@ -239,7 +239,30 @@ int main(int argc, char** argv) {
             std::printf("\n");
             return 1;
         }
+
+        // Taps and timings are mutually exclusive, and not as a convenience:
+        // `PIE_METAL_GOLDEN_DIR` turns OFF pool recycling so every value keeps
+        // its own buffer, which changes the allocation the fire runs against.
+        // A number measured under it would be timing a different program. So
+        // when taps are asked for, this is the whole run -- and the dump then
+        // corresponds to exactly the token list printed here, rather than to
+        // whichever synthetic fire happened to go last.
+        if (std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr) {
+            // One more prefill, on its own pages, so what lands in the dump is
+            // the PROMPT's fire rather than the last of the gate's one-row
+            // decodes. The gate above has already run; this only re-publishes.
+            Seq d;
+            d.id = 2;
+            d.tokens = p;
+            std::uint32_t dpage = page;
+            fire(exec, d, std::uint32_t(p.size()), page_size, dpage, false);
+            std::printf("  taps dumped for:");
+            for (const std::uint32_t v : p) std::printf(" %u", v);
+            std::printf("\n  (no timings: golden taps disable pool recycling)\n");
+            return ok ? 0 : 1;
+        }
     }
+
 
     // ── warm-up ──
     //

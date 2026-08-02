@@ -86,11 +86,19 @@ bool llama_geometry(const SetupConfig& cfg, llama::LlamaGeometry& g, int max_ctx
 /// Which bind index carries each gemma4 kind's OUTPUT, and how wide it is.
 /// The names are `tests/parity/gemma4_mlx_taps.py`'s, so the engine's dump and
 /// the raw path's diff against the same reference.
-struct G4Tap {
+/// Which bind index carries a dispatch's OUTPUT, under what name, how wide.
+///
+/// One struct for every family, because the dump is a property of the SCRATCH
+/// COLOURING and not of the model: the colouring, the pool and the redirected
+/// last dispatch are the same three facts whatever the DAG computes. Each
+/// family supplies only what is actually its own -- which kinds are worth
+/// naming, and which of them are the head-row tail.
+struct Tap {
     const char* name;
     std::uint8_t out_bind;
     int width;
 };
+using G4Tap = Tap;
 
 bool g4_tap_for(const gemma4::Dispatch& d, const Gemma4Geometry& g, G4Tap& out) {
     using K = gemma4::Kind;
@@ -172,12 +180,23 @@ std::vector<std::size_t> g4_pool_elems(const std::vector<gemma4::Dispatch>& dag,
     return elems;
 }
 
-/// Only a colour's FINAL writer is named: the in-place kinds share a buffer with
-/// the tap before them, and publishing the earlier tensor under the earlier name
-/// reads as a divergence that is really the dump lying.
-void dump_g4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry& g,
-                  const gemma4::ScratchColoring& col, const std::vector<SlotHandle>& pool,
-                  const SlotHandle& logits, int rows, int head_rows) {
+/// Publish every tapped value in a DAG under `PIE_METAL_GOLDEN_DIR`.
+///
+/// Only a colour's FINAL writer is named. The in-place kinds (the ropes above
+/// all) share a buffer with the tap before them, so publishing the earlier
+/// tensor under the earlier name reads as a divergence that is really the dump
+/// lying. The LAST dispatch is re-pointed at the engine's own logits slot, so
+/// its pool colour is never written and dumping it would publish zeros under
+/// the name everything downstream depends on.
+///
+/// `tap_for` answers which values this family names; `is_tail` answers which of
+/// them have `head_rows` rows rather than `rows`, because a family that gathers
+/// the sampled positions before its head computes the tail on fewer rows than
+/// it computed the body.
+template <class Dispatch, class Coloring, class TapFor, class IsTail>
+void dump_taps_from(const std::vector<Dispatch>& dag, const Coloring& col,
+                    const std::vector<SlotHandle>& pool, const SlotHandle& logits, int rows,
+                    int head_rows, TapFor tap_for, IsTail is_tail) {
     const int n_pool = int(pool.size());
     const auto colour_of = [&](std::size_t di, std::uint8_t bind_index) {
         for (const auto& sb : col.per_dispatch[di]) {
@@ -187,23 +206,16 @@ void dump_g4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry
     };
     std::vector<int> last(std::size_t(n_pool < 0 ? 0 : n_pool), -1);
     for (std::size_t di = 0; di < dag.size(); ++di) {
-        G4Tap t{};
-        if (!g4_tap_for(dag[di], g, t)) continue;
+        Tap t{};
+        if (!tap_for(dag[di], t)) continue;
         const int c = colour_of(di, t.out_bind);
         if (c >= 0 && c < n_pool) last[std::size_t(c)] = int(di);
     }
     for (std::size_t di = 0; di < dag.size(); ++di) {
-        G4Tap t{};
-        if (!g4_tap_for(dag[di], g, t)) continue;
-        using K = gemma4::Kind;
-        const bool tail = dag[di].kind == K::RowGather || dag[di].kind == K::FinalRms ||
-                          dag[di].kind == K::LmHead || dag[di].kind == K::FinalSoftcap;
-        // The engine re-points the LAST dispatch at its own logits slot, so its
-        // pool colour is never written; dumping that colour publishes zeros
-        // under the name of the tensor everything downstream depends on.
-        const bool redirected = di + 1 == dag.size();
+        Tap t{};
+        if (!tap_for(dag[di], t)) continue;
         const void* src = nullptr;
-        if (redirected) {
+        if (di + 1 == dag.size()) {
             src = logits.valid() ? logits.contents() : nullptr;
         } else {
             const int c = colour_of(di, t.out_bind);
@@ -215,8 +227,21 @@ void dump_g4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry
         const std::string name = dag[di].layer < 0
             ? std::string(t.name)
             : std::to_string(dag[di].layer) + "." + t.name;
-        dump_golden_bf16(name, src, tail ? head_rows : rows, t.width, t.width);
+        dump_golden_bf16(name, src, is_tail(dag[di]) ? head_rows : rows, t.width, t.width);
     }
+}
+
+void dump_g4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry& g,
+                  const gemma4::ScratchColoring& col, const std::vector<SlotHandle>& pool,
+                  const SlotHandle& logits, int rows, int head_rows) {
+    dump_taps_from(
+        dag, col, pool, logits, rows, head_rows,
+        [&](const gemma4::Dispatch& d, Tap& t) { return g4_tap_for(d, g, t); },
+        [](const gemma4::Dispatch& d) {
+            using K = gemma4::Kind;
+            return d.kind == K::RowGather || d.kind == K::FinalRms || d.kind == K::LmHead ||
+                   d.kind == K::FinalSoftcap;
+        });
 }
 
 // ── gemma4 ──────────────────────────────────────────────────────────────────
@@ -467,11 +492,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
 /// Which bind index carries each gpt-oss kind's OUTPUT, and how wide it is.
 /// The names are `tests/parity/gptoss_mlx_taps.py`'s, so the engine's dump and
 /// the raw path's diff against the same reference.
-struct GoTap {
-    const char* name;
-    std::uint8_t out_bind;
-    int width;
-};
+using GoTap = Tap;
 
 bool go_tap_for(const gptoss::Dispatch& d, const GptOssGeometry& g, GoTap& out) {
     using K = gptoss::Kind;
@@ -504,52 +525,16 @@ bool go_tap_for(const gptoss::Dispatch& d, const GptOssGeometry& g, GoTap& out) 
     }
 }
 
-/// Only a colour's FINAL writer is named: the in-place kinds (both ropes) share
-/// a buffer with the tap before them, and publishing the earlier tensor under
-/// the earlier name reads as a divergence that is really the dump lying.
 void dump_go_taps(const std::vector<gptoss::Dispatch>& dag, const GptOssGeometry& g,
                   const gptoss::ScratchColoring& col, const std::vector<SlotHandle>& pool,
                   const SlotHandle& logits, int rows, int head_rows) {
-    const int n_pool = int(pool.size());
-    const auto colour_of = [&](std::size_t di, std::uint8_t bind_index) {
-        for (const auto& sb : col.per_dispatch[di]) {
-            if (sb.bind_index == bind_index) return int(sb.color);
-        }
-        return -1;
-    };
-    std::vector<int> last(std::size_t(n_pool < 0 ? 0 : n_pool), -1);
-    for (std::size_t di = 0; di < dag.size(); ++di) {
-        GoTap t{};
-        if (!go_tap_for(dag[di], g, t)) continue;
-        const int c = colour_of(di, t.out_bind);
-        if (c >= 0 && c < n_pool) last[std::size_t(c)] = int(di);
-    }
-    for (std::size_t di = 0; di < dag.size(); ++di) {
-        GoTap t{};
-        if (!go_tap_for(dag[di], g, t)) continue;
-        using K = gptoss::Kind;
-        const bool tail = dag[di].kind == K::FinalRms || dag[di].kind == K::LmHead;
-        // The engine re-points the LAST dispatch at its own logits slot, so the
-        // pool colour it was coloured into is never written. Dumping that
-        // colour publishes a buffer of zeros under the name of the tensor
-        // everything downstream depends on -- a divergence that is entirely the
-        // dump lying.
-        const bool redirected = di + 1 == dag.size();
-        const void* src = nullptr;
-        if (redirected) {
-            src = logits.valid() ? logits.contents() : nullptr;
-        } else {
-            const int c = colour_of(di, t.out_bind);
-            if (c < 0 || c >= n_pool || !pool[std::size_t(c)].valid()) continue;
-            if (last[std::size_t(c)] != int(di)) continue;
-            src = pool[std::size_t(c)].contents();
-        }
-        if (src == nullptr) continue;
-        const std::string name = dag[di].layer < 0
-            ? std::string(t.name)
-            : std::to_string(dag[di].layer) + "." + t.name;
-        dump_golden_bf16(name, src, tail ? head_rows : rows, t.width, t.width);
-    }
+    dump_taps_from(
+        dag, col, pool, logits, rows, head_rows,
+        [&](const gptoss::Dispatch& d, Tap& t) { return go_tap_for(d, g, t); },
+        [](const gptoss::Dispatch& d) {
+            using K = gptoss::Kind;
+            return d.kind == K::FinalRms || d.kind == K::LmHead;
+        });
 }
 
 /// The widest buffer a gpt-oss dispatch touches, in bf16 elements.
@@ -857,6 +842,81 @@ class GptOssEngine final : public SimpleFamilyEngine {
     SlotHandle logits_{};
 };
 
+/// Which values a llama layer publishes, under `tests/parity`'s names.
+///
+/// The bind index is NOT here: `ScratchPlan` already records which of a
+/// dispatch's buffers it writes, so asking the plan is both shorter and
+/// unfalsifiable, where a hand-written index that drifted would silently
+/// publish an INPUT under the output's name -- a divergence the reader would
+/// chase in the kernel.
+bool ll_tap_for(const llama::Dispatch& d, const llama::LlamaGeometry& g, Tap& out) {
+    using K = llama::Kind;
+    const int slots = g.experts_per_token > 0 ? g.experts_per_token : 1;
+    switch (d.kind) {
+        case K::EmbedGather:   out = {"embed",       0, g.hidden};                 return true;
+        case K::AttnNorm:      out = {"attn_norm",   0, g.hidden};                 return true;
+        case K::QmvQ:          out = {"q_proj",      0, g.q_width()};                return true;
+        case K::QmvK:          out = {"k_proj",      0, g.kv_width()};               return true;
+        case K::QmvV:          out = {"v_proj",      0, g.kv_width()};               return true;
+        case K::QNorm:         out = {"q_norm",      0, g.q_width()};                return true;
+        case K::KNorm:         out = {"k_norm",      0, g.kv_width()};               return true;
+        case K::RopeQ:         out = {"rope_q",      0, g.q_width()};                return true;
+        case K::RopeK:         out = {"rope_k",      0, g.kv_width()};               return true;
+        case K::Sdpa:          out = {"sdpa",        0, g.q_width()};                return true;
+        case K::QmvO:          out = {"o_proj",      0, g.hidden};                 return true;
+        case K::AttnResidual:  out = {"attn_out",    0, g.hidden};                 return true;
+        case K::FfnNorm:       out = {"ffn_norm",    0, g.hidden};                 return true;
+        case K::QmvGate:       out = {"gate_proj",   0, g.intermediate};           return true;
+        case K::QmvUp:         out = {"up_proj",     0, g.intermediate};           return true;
+        case K::SiluMul:       out = {"ffn_act",     0, g.intermediate};           return true;
+        case K::QmvDown:       out = {"ffn_out",     0, g.hidden};                 return true;
+        case K::Router:        out = {"router",      0, g.n_experts};              return true;
+        case K::ExpertGate:    out = {"expert_gate", 0, slots * g.moe_intermediate}; return true;
+        case K::ExpertUp:      out = {"expert_up",   0, slots * g.moe_intermediate}; return true;
+        case K::ExpertSiluMul: out = {"expert_act",  0, slots * g.moe_intermediate}; return true;
+        case K::ExpertDown:    out = {"expert_out",  0, slots * g.hidden};         return true;
+        case K::ExpertCombine: out = {"moe",         0, g.hidden};                 return true;
+        case K::FfnResidual:   out = {"layer_out",   0, g.hidden};                 return true;
+        case K::FinalRms:      out = {"final_norm",  0, g.hidden};                 return true;
+        case K::LmHead:        out = {"logits",      0, g.vocab};                  return true;
+        // `RouterTopK` writes two integer buffers, not an activation, and
+        // `KvAppend` writes the cache rather than the pool. Neither is a tensor
+        // the reference has a counterpart for.
+        default: return false;
+    }
+}
+
+void dump_ll_taps(const std::vector<llama::Dispatch>& dag, const llama::LlamaGeometry& g,
+                  const llama::ScratchPlan& plan, const model::ScratchColoring& col,
+                  const std::vector<SlotHandle>& pool, const SlotHandle& logits, int rows,
+                  int head_rows) {
+    // Dispatch position -> the bind index it WRITES, straight from the plan.
+    std::vector<int> writes(dag.size(), -1);
+    for (const llama::Use& u : plan.uses) {
+        if (u.is_write && u.index >= 0 && std::size_t(u.index) < writes.size()) {
+            writes[std::size_t(u.index)] = int(u.bind_index);
+        }
+    }
+    std::size_t di_of = 0;
+    dump_taps_from(
+        dag, col, pool, logits, rows, head_rows,
+        [&](const llama::Dispatch& d, Tap& t) {
+            // `dump_taps_from` walks the DAG in order twice, so recovering the
+            // position from the address is exact and avoids widening its
+            // signature for one family.
+            const std::size_t di = std::size_t(&d - dag.data());
+            (void)di_of;
+            if (!ll_tap_for(d, g, t)) return false;
+            if (writes[di] < 0) return false;
+            t.out_bind = std::uint8_t(writes[di]);
+            return true;
+        },
+        [](const llama::Dispatch& d) {
+            using K = llama::Kind;
+            return d.kind == K::RowGather || d.kind == K::FinalRms || d.kind == K::LmHead;
+        });
+}
+
 // ── the llama-shaped families ───────────────────────────────────────────────
 
 /// Llama, Mistral, Qwen2/3 and Qwen3-MoE.
@@ -1093,6 +1153,10 @@ class LlamaEngine final : public SimpleFamilyEngine {
     }
 
     SlotHandle logits_slot() const override { return logits_; }
+
+    void dump_taps(int rows) const override {
+        dump_ll_taps(dag_, g_, plan_, coloring_, b_.pool, logits_, rows, bound_head_rows_);
+    }
 
   private:
     llama::LlamaGeometry g_{};

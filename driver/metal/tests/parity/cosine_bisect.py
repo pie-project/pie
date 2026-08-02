@@ -8,7 +8,7 @@ tests/parity/gemma4_mlx_taps.py), the driver by src/batch/golden_tap.cpp (or
 tests/gemma4_forward_test.cpp). Identical names, identical shapes, so the
 comparison is name-by-name.
 
-Usage: cosine_bisect.py <ref_dir> <metal_dir> [--row N] [--family qwen3_5|gemma4]
+Usage: cosine_bisect.py <ref_dir> <metal_dir> [--row N] [--family qwen3_5|gemma4|gptoss|llama]
 """
 import sys
 import os
@@ -43,6 +43,25 @@ GO_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "rope_q", "rope_k",
             "layer_out"]
 
 
+# llama/mistral/qwen2/qwen3/qwen3-moe: one plain decoder block, with two
+# independent options. `q_norm`/`k_norm` appear only on qwen3, and the FFN is
+# either dense or routed -- so both spellings are listed and whichever the model
+# did not emit is skipped, the same way the gemma4 order carries taps only the
+# reference produces.
+LL_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
+            "rope_q", "rope_k", "sdpa", "o_proj", "attn_out", "ffn_norm",
+            "gate_proj", "up_proj", "ffn_act", "ffn_out",
+            "router", "expert_gate", "expert_up", "expert_act", "expert_out",
+            "moe", "layer_out"]
+
+
+def taps_llama(n_layers=48):
+    taps = [(-1, "embed")]
+    for L in range(n_layers):
+        taps += [(L, k) for k in LL_LAYER]
+    return taps + [(-1, "final_norm"), (-1, "logits")]
+
+
 def taps_qwen3_5(n_layers=24):
     taps = [(-1, "embed")]
     for L in range(n_layers):
@@ -63,6 +82,59 @@ def taps_gemma4(n_layers=35):
     for L in range(n_layers):
         taps += [(L, k) for k in G4_LAYER]
     return taps + [(-1, k) for k in G4_TAIL]
+
+
+# The four values a routed layer keeps ONE PER SLOT. Their slot order is the
+# router's tie-breaking, and two implementations resolve a near-tie differently
+# -- on Qwen3-30B-A3B the top two experts can sit 0.002 apart, inside the
+# routers' own disagreement. That reorders the stacks while selecting the SAME
+# experts, so `moe` and everything after it are unaffected.
+#
+# Comparing these in slot order would report a divergence that is entirely the
+# ordering, so they are matched slot to slot first. A genuinely different
+# SELECTION still shows, because then some slot has no counterpart to match.
+SLOT_TAPS = ("expert_gate", "expert_up", "expert_act", "expert_out")
+
+
+def align_slots(r, m, k):
+    """Match `m`'s k slots per row onto `r`'s and drop any that have no
+    counterpart, returning how many were dropped.
+
+    A slot either matches its counterpart at ~0.999 or scores ~0.3 against
+    everything -- two orders of magnitude apart -- so 0.9 separates them with
+    nothing near the line. An unmatched slot means the two routers chose a
+    DIFFERENT expert for it, which at the top-k boundary is a near-tie on the
+    smallest of the k weights; the caller reports the count rather than hiding
+    it, and `moe` is still compared in full.
+    """
+    rows = min(r.shape[0], m.shape[0])
+    rr = r[:rows].reshape(rows, k, -1)
+    mm = m[:rows].reshape(rows, k, -1)
+    keep_r, keep_m, dropped = [], [], 0
+    for i in range(rows):
+        a = rr[i] / (np.linalg.norm(rr[i], axis=1, keepdims=True) + 1e-30)
+        b = mm[i] / (np.linalg.norm(mm[i], axis=1, keepdims=True) + 1e-30)
+        c = a @ b.T
+        used_r, used_m = set(), set()
+        pairs = sorted(((c[x, y], x, y) for x in range(k) for y in range(k)),
+                       key=lambda t: -t[0])
+        row_r, row_m = [], []
+        for score, x, y in pairs:
+            if x in used_r or y in used_m:
+                continue
+            used_r.add(x)
+            used_m.add(y)
+            if score > 0.9:
+                row_r.append(rr[i][x])
+                row_m.append(mm[i][y])
+            else:
+                dropped += 1
+        keep_r.append(np.concatenate(row_r) if row_r else np.zeros(0, dtype=rr.dtype))
+        keep_m.append(np.concatenate(row_m) if row_m else np.zeros(0, dtype=mm.dtype))
+    width = min(min(len(x) for x in keep_r), min(len(x) for x in keep_m))
+    r2 = np.stack([x[:width] for x in keep_r])
+    m2 = np.stack([x[:width] for x in keep_m])
+    return r2, m2, dropped
 
 
 def cosine(a, b):
@@ -89,8 +161,25 @@ def main():
         taps = taps_gemma4()
     elif family == "gptoss":
         taps = taps_gptoss()
+    elif family == "llama":
+        taps = taps_llama()
     else:
         taps = taps_qwen3_5()
+
+    # How many experts a token routes to, read off the tensors rather than
+    # configured: `expert_out` is k stacked hidden-wide rows and `moe` is their
+    # weighted sum, so the ratio IS k.
+    slots = 0
+    for probe in taps:
+        eo = os.path.join(metal_dir, f"{probe[0]}.expert_out.npy")
+        mo = os.path.join(metal_dir, f"{probe[0]}.moe.npy")
+        if os.path.exists(eo) and os.path.exists(mo):
+            a, b = np.load(eo), np.load(mo)
+            if b.shape[-1] > 0 and a.shape[-1] % b.shape[-1] == 0:
+                slots = a.shape[-1] // b.shape[-1]
+            break
+    if slots > 1:
+        print(f"(routed: {slots} slots per token, matched slot-to-slot)")
 
     print(f"{'tap':<22} {'cos':>10} {'rel_l2':>10} {'ref_rms':>10} {'mtl_rms':>10}")
     print("-" * 66)
@@ -104,6 +193,12 @@ def main():
         r, m = np.load(rp), np.load(mp)
         r = r.reshape(r.shape[0], -1) if r.ndim > 1 else r.reshape(1, -1)
         m = m.reshape(m.shape[0], -1) if m.ndim > 1 else m.reshape(1, -1)
+        note = ""
+        if name in SLOT_TAPS and slots > 1 and r.shape[1] % slots == 0 and \
+                m.shape[1] % slots == 0:
+            r, m, dropped = align_slots(r, m, slots)
+            if dropped:
+                note = f"  [{dropped} slot(s) routed differently]"
         n = min(r.shape[0], m.shape[0])
         if row is not None:
             r, m = r[row:row + 1], m[row:row + 1]
@@ -128,7 +223,7 @@ def main():
         flag = "" if c > 0.99 else "   <-- DIVERGES"
         if c <= 0.99 and first_bad is None:
             first_bad = stem
-        print(f"{stem:<22} {c:>10.6f} {rel:>10.4f} {rr:>10.4f} {mr:>10.4f}{flag}")
+        print(f"{stem:<22} {c:>10.6f} {rel:>10.4f} {rr:>10.4f} {mr:>10.4f}{flag}{note}")
     print("-" * 66)
     print("first diverging tap:", first_bad or "none (all cos > 0.99)")
 
