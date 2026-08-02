@@ -45,10 +45,11 @@
 //! stream. That is a fact the contract states, not a guess about names.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::error::Error;
+use crate::error::{Error, OrOverflow};
 
 /// The alignment to write. 16 KiB is Apple silicon's page; x86-64 Linux uses 4
 /// KiB, which divides it, so one artifact is streamable on both. Padding to the
@@ -60,6 +61,58 @@ pub const STREAM_PAGE_BYTES: u64 = 16384;
 /// publishes and no contract claims; the leading and trailing underscores match
 /// safetensors' own `__metadata__` convention for "not a weight".
 pub const PAD_PREFIX: &str = "__pie_pad__.";
+
+/// Read only the safetensors framing (8-byte length + JSON header) from a file
+/// on disk. The bulk tensor bytes are never read.
+///
+/// Returns the framing and the file's size, which the caller needs anyway and
+/// which was already read here to bound the header.
+pub(crate) fn read_safetensors_header_prefix(path: &Path) -> Result<(Vec<u8>, u64), Error> {
+    let mut file = File::open(path)
+        .map_err(|err| Error::Checkpoint(format!("cannot open {}: {err}", path.display())))?;
+    let file_bytes = file
+        .metadata()
+        .map(|meta| meta.len())
+        .map_err(|err| Error::Checkpoint(format!("cannot stat {}: {err}", path.display())))?;
+    let mut len_buf = [0u8; LEN_PREFIX as usize];
+    file.read_exact(&mut len_buf).map_err(|err| {
+        Error::Checkpoint(format!(
+            "cannot read safetensors length header from {}: {err}",
+            path.display()
+        ))
+    })?;
+    let header_size = u64::from_le_bytes(len_buf);
+    // The declared size is the file's claim, not a fact about it, and it is
+    // read before anything can contradict it: an eight-byte file may say its
+    // header is 2^60 bytes. Sizing the buffer on that claim aborts the process
+    // on a malformed checkpoint, so the claim is bounded by the one number the
+    // file cannot lie about first.
+    let available = file_bytes.saturating_sub(LEN_PREFIX);
+    if header_size > available {
+        return Err(Error::Checkpoint(format!(
+            "safetensors header of {} declares {header_size} bytes but only {available} follow the length prefix",
+            path.display()
+        )));
+    }
+    let header_bytes = usize::try_from(header_size).or_overflow(format!(
+        "safetensors header size {header_size} too large in {}",
+        path.display()
+    ))?;
+    let framing = (LEN_PREFIX as usize)
+        .checked_add(header_bytes)
+        .or_overflow("safetensors framing size overflows usize")?;
+    let mut prefix = len_buf.to_vec();
+    prefix.resize(framing, 0);
+    file.read_exact(&mut prefix[LEN_PREFIX as usize..])
+        .map_err(|err| {
+            Error::Checkpoint(format!(
+                "cannot read safetensors JSON header from {}: {err}",
+                path.display()
+            ))
+        })?;
+    Ok((prefix, file_bytes))
+}
+
 
 /// Key under `__metadata__` holding the run of characters that pushes the data
 /// section itself onto a page. A tensor's position in the *file* is the data
@@ -213,7 +266,7 @@ fn align_file(
     seen: &mut BTreeSet<String>,
 ) -> Result<FileAlignment, Error> {
     let (prefix, bytes_before) =
-        crate::checkpoint::safetensors::read_safetensors_header_prefix(src)?;
+        read_safetensors_header_prefix(src)?;
     let header_json = &prefix[LEN_PREFIX as usize..];
     let value: serde_json::Value = serde_json::from_slice(header_json).map_err(|err| {
         Error::Checkpoint(format!(
@@ -395,7 +448,7 @@ fn write_shard(
 ) -> Result<(), Error> {
     let mut input = std::fs::File::open(src)
         .map_err(|err| Error::Checkpoint(format!("cannot open {}: {err}", src.display())))?;
-    let (prefix, _) = crate::checkpoint::safetensors::read_safetensors_header_prefix(src)?;
+    let (prefix, _) = read_safetensors_header_prefix(src)?;
     let src_data_start = prefix.len() as u64;
 
     let out = std::fs::File::create(dst)

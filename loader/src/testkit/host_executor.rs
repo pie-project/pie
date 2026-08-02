@@ -160,6 +160,25 @@ struct HostExecutor<'a, 'p> {
     read_bytes: u64,
 }
 
+/// Decode one GGUF `Q4_0` block: one F16 scale, then sixteen packed bytes whose
+/// low nibbles are elements 0..16 and high nibbles 16..32, each
+/// `(nibble − 8) × scale`.
+///
+/// The only block decoder the loader carries, and it is here rather than beside
+/// a reader because decoding is not reading: the runtime materialization is the
+/// driver's job, and this exists so the offline executor can check the driver's
+/// answer against an independent one.
+fn decode_gguf_q4_0_block_into(block: &[u8; 18], values: &mut [f32; 32]) {
+    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+    for i in 0..16 {
+        let packed = block[2 + i];
+        let lo = (packed & 0x0f) as i32 - 8;
+        let hi = ((packed >> 4) & 0x0f) as i32 - 8;
+        values[i] = scale * lo as f32;
+        values[i + 16] = scale * hi as f32;
+    }
+}
+
 impl HostExecutor<'_, '_> {
     fn execute(&mut self) -> Result<(), Error> {
         for id in &self.plan.schedule {
@@ -769,9 +788,8 @@ impl HostExecutor<'_, '_> {
     ///
     /// Only schemes whose scales live inside the block reach here — the
     /// validate pass admits exactly those — so the payload bytes are the whole
-    /// story and there is no factor operand to fetch. GGUF Q4_0 decodes
-    /// through [`crate::checkpoint::gguf::decode_gguf_q4_0_block`], the block
-    /// reference this crate already carries, and the `f32` values it yields
+    /// story and there is no factor operand to fetch. GGUF Q4_0 decodes through
+    /// [`decode_gguf_q4_0_block_into`] below, and the `f32` values it yields
     /// narrow to the scheme's logical `BF16` by round to nearest even.
     fn decode_bytes(
         &self,
@@ -822,7 +840,7 @@ impl HostExecutor<'_, '_> {
                 scope.spawn(move || {
                     let mut values = [0.0f32; 32];
                     for (block, out) in source.chunks_exact(18).zip(chunk.chunks_exact_mut(64)) {
-                        crate::checkpoint::gguf::decode_gguf_q4_0_block_into(
+                        decode_gguf_q4_0_block_into(
                             block.try_into().expect("chunks are 18 bytes"),
                             &mut values,
                         );

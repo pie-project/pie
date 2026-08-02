@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
-use pie_loader::checkpoint::safetensors::parse_safetensors_checkpoint;
+use pie_loader::checkpoint::zt::parse_checkpoint_files;
 use pie_loader::checkpoint::zt::parse_checkpoint;
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -72,7 +72,7 @@ fn reading_a_checkpoint_through_ztensor_stays_within_budget() {
     let files = vec![path.clone()];
 
     let native = time(RUNS, || {
-        let m = parse_safetensors_checkpoint(&files).unwrap();
+        let m = parse_checkpoint_files(&files).unwrap();
         std::hint::black_box(m.tensors.len());
     });
     let through_zt = time(RUNS, || {
@@ -133,7 +133,7 @@ fn reading_a_zt_artifact_is_not_slower_than_safetensors() {
 
     let st_files = vec![st_path];
     let safetensors = time(RUNS, || {
-        let m = parse_safetensors_checkpoint(&st_files).unwrap();
+        let m = parse_checkpoint_files(&st_files).unwrap();
         std::hint::black_box(m.tensors.len());
     });
     let zt = time(RUNS, || {

@@ -23,9 +23,9 @@
 //! from (`*_blocks` / `*_scales` in safetensors MXFP4), so a contract written
 //! against a converted checkpoint reads the same either way.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use ztensor::{DType as ZDType, Manifest, Object, Part};
+use ztensor::{DType as ZDType, Object, Part};
 
 use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use crate::error::Error;
@@ -38,9 +38,79 @@ use crate::types::{
 /// Only metadata is read: the projections map the file and parse its header,
 /// and bulk tensor bytes are never touched here.
 pub fn parse_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
-    let format = ztensor_compat::detect(path).map_err(zt_err)?;
+    let format = checkpoint_format(ztensor_compat::detect(path).map_err(zt_err)?);
     let source = ztensor_compat::open_any(path).map_err(zt_err)?;
-    metadata_of(source.manifest(), path, format)
+    let manifest = source.manifest();
+
+    // A `.zt` model may name shards, and the manifest gives each part the
+    // shard index its bytes live in. The loader's file ids are dense and the
+    // shard table is keyed from 1, so index and id agree by construction.
+    let mut files = vec![CheckpointFile {
+        id: FileId(0),
+        path: path.to_string_lossy().into_owned(),
+        size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        format,
+    }];
+    for (&index, shard) in &manifest.shards {
+        files.push(CheckpointFile {
+            id: FileId(u32::try_from(index).map_err(|_| {
+                Error::Checkpoint(format!("shard index {index} does not fit a file id"))
+            })?),
+            path: shard_path(path, index).to_string_lossy().into_owned(),
+            size_bytes: shard.size,
+            format,
+        });
+    }
+
+    let mut tensors = Vec::new();
+    for (name, object) in &manifest.objects {
+        collect(&mut tensors, name, object, |part| {
+            u32::try_from(part.blob.shard)
+                .map(FileId)
+                .map_err(|_| Error::Checkpoint("shard index does not fit a file id".into()))
+        })?;
+    }
+    Ok(CheckpointMetadata { files, tensors })
+}
+
+/// Opens a set of files that together hold one checkpoint.
+///
+/// What a sharded snapshot is. Each file describes itself completely and none
+/// of them names the others, so the set is the caller's claim — HF states it
+/// in `model.safetensors.index.json`, which is a convention beside the format
+/// rather than anything inside it. [`ztensor::Composite`] is that shape: one
+/// name space over N sources, with the file each name came from recorded, and
+/// a name in two files refused rather than resolved by precedence.
+///
+/// The single-file case is not routed here. It would work, but it would also
+/// answer a question nobody asked — with one file there is no set to state.
+pub fn parse_checkpoint_files(paths: &[PathBuf]) -> Result<CheckpointMetadata, Error> {
+    let composite = ztensor_compat::open_all(paths).map_err(zt_err)?;
+
+    let mut files = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        files.push(CheckpointFile {
+            id: FileId(u32::try_from(index).map_err(|_| {
+                Error::Checkpoint("checkpoint has more files than a file id holds".into())
+            })?),
+            path: path.to_string_lossy().into_owned(),
+            size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            format: checkpoint_format(ztensor_compat::detect(path).map_err(zt_err)?),
+        });
+    }
+
+    let mut tensors = Vec::new();
+    for (index, name, object) in composite.objects() {
+        // Every part of a composite addresses its own file, so the source
+        // index is the whole of the file identity -- there is no shard table
+        // to consult, and a blob offset means what it meant in the file it
+        // came from.
+        let file = FileId(u32::try_from(index).map_err(|_| {
+            Error::Checkpoint("checkpoint has more files than a file id holds".into())
+        })?);
+        collect(&mut tensors, name, object, |_| Ok(file))?;
+    }
+    Ok(CheckpointMetadata { files, tensors })
 }
 
 fn zt_err(err: ztensor::Error) -> Error {
@@ -55,70 +125,45 @@ fn checkpoint_format(label: &str) -> CheckpointFormat {
     }
 }
 
-/// Translates a zTensor manifest into the loader's checkpoint description.
+/// Appends one [`RawTensor`] per part of `object`.
 ///
-/// `path` is the file the manifest came from; a sharded model's shards are
-/// resolved by the same positional convention `Model::open` uses, so their
-/// paths follow from it.
-pub fn metadata_of(
-    manifest: &Manifest,
-    path: &Path,
-    format_label: &str,
-) -> Result<CheckpointMetadata, Error> {
-    let format = checkpoint_format(format_label);
-    let mut files = vec![CheckpointFile {
-        id: FileId(0),
-        path: path.to_string_lossy().into_owned(),
-        size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        format,
-    }];
-    // Shard index k is the k-th entry of the table, and the loader's file ids
-    // are dense, so the two agree by construction.
-    for (&index, shard) in &manifest.shards {
-        let shard_path = shard_path(path, index);
-        files.push(CheckpointFile {
-            id: FileId(u32::try_from(index).map_err(|_| {
-                Error::Checkpoint(format!("shard index {index} does not fit a file id"))
-            })?),
-            path: shard_path.to_string_lossy().into_owned(),
-            size_bytes: shard.size,
-            format,
+/// A zTensor object may carry several parts and the loader's tensor space is
+/// flat, so the `"data"` part keeps the object's name and any other part is
+/// suffixed `.<part>` -- which is how the same tensors are named in the
+/// checkpoints they come from (`*_blocks` / `*_scales` in safetensors MXFP4).
+fn collect(
+    tensors: &mut Vec<RawTensor>,
+    name: &str,
+    object: &Object,
+    file_of: impl Fn(&Part) -> Result<FileId, Error>,
+) -> Result<(), Error> {
+    for (part_name, part) in &object.parts {
+        let tensor_name = if part_name == "data" {
+            name.to_string()
+        } else {
+            format!("{name}.{part_name}")
+        };
+        if part.encoding.is_some() {
+            return Err(Error::Checkpoint(format!(
+                "{tensor_name}: compressed parts cannot be planned — the loader \
+                 addresses checkpoint bytes where they lie; convert the file to a \
+                 raw one first"
+            )));
+        }
+        let id = TensorId(u32::try_from(tensors.len()).map_err(|_| {
+            Error::Checkpoint("checkpoint has more tensors than a tensor id holds".into())
+        })?);
+        tensors.push(RawTensor {
+            id,
+            name: tensor_name,
+            file_id: file_of(part)?,
+            file_offset: part.blob.offset,
+            span_bytes: part.blob.length,
+            shape: shape_of(object, part_name, part)?,
+            encoding: encoding_of(object, part)?,
         });
     }
-
-    let mut tensors = Vec::new();
-    for (name, object) in &manifest.objects {
-        for (part_name, part) in &object.parts {
-            let tensor_name = if part_name == "data" {
-                name.clone()
-            } else {
-                format!("{name}.{part_name}")
-            };
-            if part.encoding.is_some() {
-                return Err(Error::Checkpoint(format!(
-                    "{tensor_name}: compressed parts cannot be planned — the loader \
-                     addresses checkpoint bytes where they lie; convert the file to a \
-                     raw one first"
-                )));
-            }
-            let id = TensorId(u32::try_from(tensors.len()).map_err(|_| {
-                Error::Checkpoint("checkpoint has more tensors than a tensor id holds".into())
-            })?);
-            tensors.push(RawTensor {
-                id,
-                name: tensor_name,
-                file_id: FileId(u32::try_from(part.blob.shard).map_err(|_| {
-                    Error::Checkpoint("shard index does not fit a file id".into())
-                })?),
-                file_offset: part.blob.offset,
-                span_bytes: part.blob.length,
-                shape: shape_of(object, part_name, part)?,
-                encoding: encoding_of(object, part)?,
-            });
-        }
-    }
-
-    Ok(CheckpointMetadata { files, tensors })
+    Ok(())
 }
 
 /// `<stem>-<index:05>.zt` beside the root — the positional shard convention.
@@ -358,14 +403,13 @@ mod tests {
         }
     }
 
-    fn manifest_with(name: &str, object: Object) -> Manifest {
-        let mut objects = BTreeMap::new();
-        objects.insert(name.to_string(), object);
-        Manifest {
-            attributes: None,
-            shards: BTreeMap::new(),
-            objects,
-        }
+    /// The tensors one object lowers to, which is what every test here is
+    /// about: the translation from a zTensor object to the loader's flat,
+    /// name-addressed tensor space.
+    fn lower(name: &str, object: Object) -> Result<Vec<RawTensor>, Error> {
+        let mut tensors = Vec::new();
+        collect(&mut tensors, name, &object, |_| Ok(FileId(0)))?;
+        Ok(tensors)
     }
 
     #[test]
@@ -378,10 +422,9 @@ mod tests {
             attributes: None,
             parts,
         };
-        let metadata =
-            metadata_of(&manifest_with("w", object), Path::new("m.zt"), "zt").unwrap();
-        assert_eq!(metadata.tensors.len(), 1);
-        let tensor = &metadata.tensors[0];
+        let tensors = lower("w", object).unwrap();
+        assert_eq!(tensors.len(), 1);
+        let tensor = &tensors[0];
         assert_eq!(tensor.name, "w");
         assert_eq!(tensor.shape, vec![4, 4]);
         assert_eq!(tensor.file_offset, 65536);
@@ -406,12 +449,11 @@ mod tests {
             )])),
             parts,
         };
-        let metadata =
-            metadata_of(&manifest_with("w", object), Path::new("m.zt"), "zt").unwrap();
-        let names: Vec<&str> = metadata.tensors.iter().map(|t| t.name.as_str()).collect();
+        let tensors = lower("w", object).unwrap();
+        let names: Vec<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["w", "w.scales"]);
 
-        let payload = metadata.tensor_by_name("w").unwrap();
+        let payload = tensors.iter().find(|t| t.name == "w").unwrap();
         match &payload.encoding {
             Encoding::Quant(spec) => {
                 assert_eq!(spec.scheme, QuantScheme::Mxfp4E2M1E8M0);
@@ -420,7 +462,7 @@ mod tests {
             other => panic!("expected a quantized payload, got {other:?}"),
         }
         // The scales part keeps its own dtype and its element count as shape.
-        let scales = metadata.tensor_by_name("w.scales").unwrap();
+        let scales = tensors.iter().find(|t| t.name == "w.scales").unwrap();
         assert_eq!(scales.shape, vec![32]);
     }
 
@@ -434,7 +476,7 @@ mod tests {
             attributes: None,
             parts,
         };
-        let err = metadata_of(&manifest_with("w", object), Path::new("m.zt"), "zt").unwrap_err();
+        let err = lower("w", object).unwrap_err();
         assert!(format!("{err}").contains("no loader quantization scheme"));
     }
 
@@ -451,7 +493,7 @@ mod tests {
             attributes: None,
             parts,
         };
-        let err = metadata_of(&manifest_with("w", object), Path::new("m.zt"), "zt").unwrap_err();
+        let err = lower("w", object).unwrap_err();
         assert!(format!("{err}").contains("compressed parts"));
     }
 }
