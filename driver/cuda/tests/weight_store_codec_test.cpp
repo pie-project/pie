@@ -1,10 +1,9 @@
-// The materialized-weight artifact (PIEWSTOR), against the two claims it makes.
+// The materialized-weight artifact, against the two claims it makes.
 //
 // The artifact is a snapshot of finished device weights, written after the
-// first load so a later boot can skip materializing them again. It had no test
-// at all, which is a bad state for a format: nothing here is validated by the
-// code that uses it, since a store restored from a corrupt file and a store
-// restored from a good one both just look like a store.
+// first load so a later boot can skip materializing them again. Nothing here is
+// validated by the code that uses it, since a store restored from a corrupt
+// file and a store restored from a good one both just look like a store.
 //
 // Two claims, and they are independent:
 //
@@ -13,23 +12,28 @@
 //      points into another's buffer, so a codec that restored views as copies
 //      would pass any per-tensor byte check and still double the memory.
 //
-//   2. Every blob begins on a page. This is what makes the artifact mappable:
-//      a blob on a page of its own can be handed to the device as a mapping of
-//      the file rather than a copy into device memory, which is what lets a
-//      weight be paged in on demand. It has to be its own page -- two blobs
-//      sharing one means faulting either drags in the other.
+//   2. Every payload begins on a page. This is what makes the artifact
+//      mappable: a payload on a page of its own can be handed to the device as
+//      a mapping of the file rather than a copy into device memory, which is
+//      what lets a weight be paged in on demand. It has to be its own page --
+//      two payloads sharing one means faulting either drags in the other.
 //
 // The second claim is about arithmetic that no caller can observe, which is
-// exactly the kind that rots. It is checked here by parsing the file's own
-// header rather than by asking the codec, so the test would notice a codec that
-// agreed with itself and with nothing else.
+// exactly the kind that rots. It is checked here against the file offsets the
+// artifact reports, and against a page size stated here rather than borrowed
+// from whatever the writer chose -- so a writer that dropped to 4 KiB would
+// fail this test instead of agreeing with itself.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
-#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 #include <cuda_runtime.h>
 
@@ -70,7 +74,10 @@ std::vector<std::uint8_t> read_back(const DeviceTensor& t)
 
 // Sizes that are deliberately not multiples of the alignment, so padding is
 // exercised: an artifact whose tensors happened to be page-sized would pass an
-// alignment check without the codec doing anything.
+// alignment check without the writer doing anything.
+//
+// `q` is a window into `arena` rather than a buffer of its own, which is the
+// relationship the round trip has to preserve.
 pie_cuda_driver::WeightStore build_store()
 {
     using namespace pie_cuda_driver;
@@ -79,89 +86,38 @@ pie_cuda_driver::WeightStore build_store()
     b.insert("a", filled(DType::BF16, {3, 101}, 0xA1));
     b.insert("b", filled(DType::BF16, {7, 13}, 0xB2));
     b.insert("c", filled(DType::FP32, {5}, 0xC3));
+
+    DeviceTensor arena = filled(DType::UINT8, {4096}, 0xD4);
+    void* window = static_cast<std::uint8_t*>(arena.data()) + 1024;
+    TensorDecl arena_spec;
+    arena_spec.name = "arena";
+    arena_spec.dtype = DType::UINT8;
+    arena_spec.shape = {4096};
+    arena_spec.ownership = TensorOwnershipKind::Owned;
+
+    TensorDecl view_spec;
+    view_spec.name = "q";
+    view_spec.dtype = DType::UINT8;
+    view_spec.shape = {512};
+    view_spec.ownership = TensorOwnershipKind::BorrowedView;
+    view_spec.backing_tensor = "arena";
+
+    b.insert("arena", std::move(arena), arena_spec);
+    b.insert("q", DeviceTensor::view(window, DType::UINT8, {512}), view_spec);
     b.finalize();
     return store;
 }
 
-// The header, parsed independently of the codec. Only as far as the two fields
-// this test is about; the rest is skipped by the same rules the writer used.
-// What a mapping needs, stated here rather than borrowed from the codec. If
-// the test asked `weight_codec::kBlobAlign` it would follow the codec down: a
-// change to 64 would leave every assertion true and every blob sharing a page
-// with its neighbours, which is the failure this file exists to prevent.
+// What a mapping needs, stated here rather than read from the writer. If this
+// asked the codec for its alignment, a change to 64 would leave every assertion
+// true and every payload sharing a page with its neighbours, which is the
+// failure this file exists to prevent.
 constexpr std::uint64_t kPageBytes = 16384;
 
-struct Header {
-    std::uint32_t version;
-    std::uint64_t num_owned;
-    std::uint64_t blob_section_bytes;
-    std::uint64_t blob_section_pos;
-    std::vector<std::uint64_t> blob_offsets;
-    std::vector<std::uint64_t> blob_sizes;
-};
-
-struct Cursor {
-    const char* p;
-    const char* end;
-
-    template <typename T>
-    T scalar()
-    {
-        T v{};
-        if (p + sizeof(T) > end) {
-            return v;
-        }
-        std::memcpy(&v, p, sizeof(T));
-        p += sizeof(T);
-        return v;
-    }
-    std::string str()
-    {
-        const auto n = scalar<std::uint32_t>();
-        if (p + n > end) {
-            p = end;
-            return {};
-        }
-        std::string s(p, p + n);
-        p += n;
-        return s;
-    }
-    void skip_shape()
-    {
-        const auto rank = scalar<std::uint32_t>();
-        p = (p + rank * sizeof(std::int64_t) > end)
-                ? end
-                : p + rank * sizeof(std::int64_t);
-    }
-};
-
-Header parse(const std::string& bytes)
+std::filesystem::path scratch()
 {
-    Cursor c{bytes.data(), bytes.data() + bytes.size()};
-    c.p += 8;  // magic
-    Header h{};
-    h.version = c.scalar<std::uint32_t>();
-    c.str();  // key
-    h.num_owned = c.scalar<std::uint64_t>();
-    c.scalar<std::uint64_t>();  // views
-    c.scalar<std::uint64_t>();  // quant entries
-    h.blob_section_bytes = c.scalar<std::uint64_t>();
-    h.blob_section_pos = c.scalar<std::uint64_t>();
-    for (std::uint64_t i = 0; i < h.num_owned; ++i) {
-        // One spec: name, dtype, shape, ownership, backing tensor -- then the
-        // blob triple. Spelled out rather than reusing the codec's reader, so a
-        // change to the layout has to be made in two places that disagree
-        // loudly rather than in one that stays quietly self-consistent.
-        c.str();                    // name
-        c.scalar<std::uint8_t>();   // dtype
-        c.skip_shape();
-        c.scalar<std::uint8_t>();   // ownership
-        c.str();                    // backing tensor
-        h.blob_sizes.push_back(c.scalar<std::uint64_t>());
-        h.blob_offsets.push_back(c.scalar<std::uint64_t>());
-        c.scalar<std::uint64_t>();  // checksum
-    }
-    return h;
+    return std::filesystem::temp_directory_path() /
+           ("pie_weight_codec_test_" + std::to_string(::getpid()));
 }
 
 }  // namespace
@@ -175,44 +131,65 @@ int main()
         return 0;
     }
 
+    const std::filesystem::path dir = scratch();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    const auto path = dir / "weights.zt";
+
     const std::string key = "test-key";
-    std::string bytes;
     {
         WeightStore store = build_store();
-        std::ostringstream out(std::ios::binary);
-        check(weight_codec::serialize_weight_store(store, key, out),
+        check(weight_codec::serialize_weight_store(store, key, path),
               "an ordinary store serializes");
-        bytes = out.str();
     }
-    check(!bytes.empty(), "the artifact is not empty");
+    check(std::filesystem::exists(path), "the artifact was published");
 
     // --- claim 2: everything a mapping would need to start on a page does ---
-    const Header h = parse(bytes);
-    check(h.version == weight_codec::kFormatVersion,
-          "the file states the version the codec writes");
-    check(h.num_owned == 3, "three owned roots");
-    check(h.blob_section_pos % kPageBytes == 0,
-          "the blob section begins on a page: " + std::to_string(h.blob_section_pos));
-    for (std::uint64_t i = 0; i < h.blob_offsets.size(); ++i) {
-        check(h.blob_offsets[i] % kPageBytes == 0,
-              "blob " + std::to_string(i) + " begins on a page of its own: " +
-                  std::to_string(h.blob_offsets[i]));
+    //
+    // Asked of the artifact itself through the loader's reader, which is a
+    // different path from the one the driver's restore takes.
+    {
+        pie_loader::PieLoaderWeightStore* opened = nullptr;
+        pie_loader::LoadPlanDiagnostics diags;
+        const auto status = pie_loader::pie_loader_weight_store_open(
+            pie_loader::borrow(path.string()), pie_loader::borrow(key), &opened,
+            diags.slot());
+        check(status == pie_loader::PieLoaderStatus::Ok,
+              "the artifact opens: " + diags.text());
+        if (opened != nullptr) {
+            check(opened->tensors.len == 4, "four tensors have bytes of their own");
+            check(opened->views.len == 1, "the window is recorded as a view");
+
+            bool any_unaligned_size = false;
+            // Sorted by where they landed, not by name: the tensors are
+            // reported in name order and written in whatever order the store
+            // iterated, so "the next one" is a question about the file.
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+            for (std::size_t i = 0; i < opened->tensors.len; ++i) {
+                const auto& t = opened->tensors.ptr[i];
+                check(t.file_offset % kPageBytes == 0,
+                      "payload " + std::to_string(i) +
+                          " begins on a page of its own: " +
+                          std::to_string(t.file_offset));
+                spans.emplace_back(t.file_offset, t.nbytes);
+                any_unaligned_size |= (t.nbytes % kPageBytes) != 0;
+            }
+            std::sort(spans.begin(), spans.end());
+            for (std::size_t i = 0; i + 1 < spans.size(); ++i) {
+                check(spans[i].first + spans[i].second <= spans[i + 1].first,
+                      "the payload at " + std::to_string(spans[i].first) +
+                          " runs into the next");
+            }
+            // The premise: without padding these would not be aligned, so the
+            // checks above would be measuring the tensors' sizes rather than
+            // the writer.
+            check(any_unaligned_size,
+                  "the fixture's tensors are not page-sized, so alignment had to "
+                  "be done");
+            pie_loader::pie_loader_weight_store_close(opened);
+        }
     }
-    // A blob's page is its own only if the next one starts past its end.
-    for (std::uint64_t i = 0; i + 1 < h.blob_offsets.size(); ++i) {
-        check(h.blob_offsets[i] + h.blob_sizes[i] <= h.blob_offsets[i + 1],
-              "blob " + std::to_string(i) + " does not run into the next");
-    }
-    check(h.blob_section_pos + h.blob_section_bytes <= bytes.size(),
-          "the blob section fits in the file");
-    // The premise: without padding these would not be aligned, so the checks
-    // above would be measuring the tensors' sizes rather than the codec.
-    bool any_unaligned_size = false;
-    for (const auto n : h.blob_sizes) {
-        any_unaligned_size |= (n % kPageBytes) != 0;
-    }
-    check(any_unaligned_size,
-          "the fixture's tensors are not page-sized, so alignment had to be done");
 
     // --- claim 1: what comes back is what went in ---
     {
@@ -220,12 +197,11 @@ int main()
         WeightStoreBuilder rb(restored);
         PinnedLanePool pool(2, 8ull << 20);
         const bool ok = weight_codec::restore_weight_store(
-            reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size(),
-            key, /*verify=*/true, rb, pool);
+            path, key, /*verify=*/true, rb, pool);
         check(ok, "the artifact restores");
         if (ok) {
             for (const auto& [name, byte] : std::vector<std::pair<std::string, std::uint8_t>>{
-                     {"a", 0xA1}, {"b", 0xB2}, {"c", 0xC3}}) {
+                     {"a", 0xA1}, {"b", 0xB2}, {"c", 0xC3}, {"arena", 0xD4}}) {
                 const auto it = restored.find(name);
                 if (it == restored.end()) {
                     check(false, "tensor " + name + " came back");
@@ -238,45 +214,98 @@ int main()
                 }
                 check(same, "tensor " + name + " came back with its own bytes");
             }
+
+            // The view is a window into the arena, not a copy of one: same
+            // allocation, same offset, and no memory of its own.
+            const auto arena = restored.find("arena");
+            const auto window = restored.find("q");
+            if (arena == restored.end() || window == restored.end()) {
+                check(false, "the arena and its window both came back");
+            } else {
+                check(!window->second.tensor.owns_memory(),
+                      "the window did not come back as a copy");
+                check(static_cast<const std::uint8_t*>(window->second.tensor.data()) ==
+                          static_cast<const std::uint8_t*>(arena->second.tensor.data()) +
+                              1024,
+                      "the window came back at its own offset into the arena");
+                check(window->second.spec.backing_tensor == "arena",
+                      "the window still names what it was cut from");
+            }
         }
     }
 
-    // --- a file that is not this format is a miss, not a crash ---
+    // --- a file that is not this artifact is a miss, not a crash ---
     {
         WeightStore restored;
         WeightStoreBuilder rb(restored);
         PinnedLanePool pool(2, 8ull << 20);
-        std::string wrong_key_file = bytes;
-        check(!weight_codec::restore_weight_store(
-                  reinterpret_cast<const std::uint8_t*>(wrong_key_file.data()),
-                  wrong_key_file.size(), "another-key", true, rb, pool),
+        check(!weight_codec::restore_weight_store(path, "another-key", true, rb, pool),
               "an artifact written for another plan is refused");
     }
     {
         WeightStore restored;
         WeightStoreBuilder rb(restored);
         PinnedLanePool pool(2, 8ull << 20);
-        std::string old_version = bytes;
-        const std::uint32_t stale = weight_codec::kFormatVersion - 1;
-        std::memcpy(old_version.data() + 8, &stale, sizeof(stale));
-        check(!weight_codec::restore_weight_store(
-                  reinterpret_cast<const std::uint8_t*>(old_version.data()),
-                  old_version.size(), key, true, rb, pool),
-              "an artifact in the previous layout is refused rather than misread");
+        check(!weight_codec::restore_weight_store(dir / "absent.zt", key, true, rb, pool),
+              "an artifact that is not there is refused");
     }
     {
         // Truncation is the shape a partial write leaves behind, and the one
         // that would otherwise be read as data.
+        const auto cut_path = dir / "cut.zt";
+        std::string bytes;
+        {
+            std::vector<char> raw(std::filesystem::file_size(path));
+            std::FILE* f = std::fopen(path.string().c_str(), "rb");
+            const std::size_t n = std::fread(raw.data(), 1, raw.size(), f);
+            std::fclose(f);
+            bytes.assign(raw.data(), n / 2);
+        }
+        std::FILE* out = std::fopen(cut_path.string().c_str(), "wb");
+        std::fwrite(bytes.data(), 1, bytes.size(), out);
+        std::fclose(out);
+
         WeightStore restored;
         WeightStoreBuilder rb(restored);
         PinnedLanePool pool(2, 8ull << 20);
-        const std::string cut = bytes.substr(0, bytes.size() / 2);
-        check(!weight_codec::restore_weight_store(
-                  reinterpret_cast<const std::uint8_t*>(cut.data()), cut.size(),
-                  key, true, rb, pool),
+        check(!weight_codec::restore_weight_store(cut_path, key, true, rb, pool),
               "a truncated artifact is refused");
     }
+    {
+        // Corruption inside a payload: the manifest still parses, so nothing
+        // but the digest can catch this. The byte to flip is the first payload's
+        // own first byte -- flipping a fixed offset would land in padding, which
+        // no digest covers and nothing should notice.
+        std::uint64_t payload_start = 0;
+        {
+            pie_loader::PieLoaderWeightStore* opened = nullptr;
+            pie_loader::pie_loader_weight_store_open(
+                pie_loader::borrow(path.string()), pie_loader::borrow(key), &opened,
+                nullptr);
+            if (opened != nullptr) {
+                payload_start = opened->tensors.ptr[0].file_offset;
+                pie_loader::pie_loader_weight_store_close(opened);
+            }
+        }
+        check(payload_start > 0, "the first payload has an offset to corrupt");
 
+        const auto rotten_path = dir / "rotten.zt";
+        std::filesystem::copy_file(path, rotten_path,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        std::FILE* f = std::fopen(rotten_path.string().c_str(), "r+b");
+        std::fseek(f, static_cast<long>(payload_start), SEEK_SET);
+        const unsigned char flip = 0x5a;
+        std::fwrite(&flip, 1, 1, f);
+        std::fclose(f);
+
+        WeightStore restored;
+        WeightStoreBuilder rb(restored);
+        PinnedLanePool pool(2, 8ull << 20);
+        check(!weight_codec::restore_weight_store(rotten_path, key, true, rb, pool),
+              "a corrupt payload is refused rather than loaded");
+    }
+
+    std::filesystem::remove_all(dir, ec);
     if (failures == 0) {
         std::cout << "weight_store_codec: all checks passed\n";
     }

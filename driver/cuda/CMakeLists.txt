@@ -1116,11 +1116,17 @@ if(PIE_LOADER_STATICLIB)
 endif()
 # The materialized-weight artifact's round trip and its page alignment. Needs a
 # device because the format's payload is device memory: serializing is a D2H of
-# every owned buffer.
-pie_add_cuda_target(test_weight_store_codec
-  SOURCES tests/weight_store_codec_test.cpp
-  INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
-  LIBS pie_driver_cuda_lib CUDA::cudart)
+# every owned buffer, and the staticlib because the file itself is the loader's.
+if(PIE_LOADER_STATICLIB)
+  pie_add_cuda_target(test_weight_store_codec
+    SOURCES tests/weight_store_codec_test.cpp
+    INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/src ${PIE_LOADER_INCLUDE_DIR}
+    LIBS pie_driver_cuda_lib CUDA::cudart ${PIE_LOADER_STATICLIB} dl pthread)
+else()
+  message(STATUS
+    "test_weight_store_codec: skipped (no libpie_loader.a; build one with "
+    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
+endif()
 # The non-compact ExtentWrite path. Header-only: it builds its own one-file
 # plan, so it needs the loader's headers but not the staticlib.
 pie_add_cuda_target(test_strided_copy
