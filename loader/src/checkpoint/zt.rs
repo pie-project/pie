@@ -211,7 +211,7 @@ fn encoding_of(object: &Object, part: &Part) -> Result<Encoding, Error> {
         return Ok(Encoding::Raw(dtype));
     }
 
-    let scheme = scheme_of(layout)?;
+    let scheme = scheme_of(layout, object)?;
     let group_size = attr_u64(object, "group_size")
         .or_else(|| attr_u64(object, "block_size"))
         .or_else(|| attr_u64(object, "elems_per_block"))
@@ -236,9 +236,26 @@ fn encoding_of(object: &Object, part: &Part) -> Result<Encoding, Error> {
 /// Layout profile id to quantization scheme.
 ///
 /// The `gguf.*` family is the projection of GGUF's block structs, kept
-/// verbatim; `zt.mx/1` is OCP Microscaling. A profile this table does not name
-/// is refused.
-fn scheme_of(layout: &str) -> Result<QuantScheme, Error> {
+/// verbatim; `zt.mx/1` is OCP Microscaling. `zt.quant_group/1` names a
+/// *family* — affine integers with a group scale — whose members differ in
+/// packing order and zero-point convention, which the profile does not
+/// distinguish; a file this loader wrote records which member it is in the
+/// object's `scheme` attribute, and that is what is read back here. A
+/// `zt.quant_group/1` object from elsewhere carries no such attribute and is
+/// refused rather than guessed at.
+///
+/// A profile this table does not name is refused.
+fn scheme_of(layout: &str, object: &Object) -> Result<QuantScheme, Error> {
+    if layout == "zt.quant_group/1" {
+        let named = attr_text(object, "scheme").ok_or_else(|| {
+            Error::Checkpoint(
+                "zt.quant_group/1 without a 'scheme' attribute: the profile names a \
+                 family, and which member decides how the payload is packed"
+                    .to_string(),
+            )
+        })?;
+        return scheme_from_name(named);
+    }
     Ok(match layout {
         "zt.mx/1" => QuantScheme::Mxfp4E2M1E8M0,
         "gguf.q4_0/1" => QuantScheme::GgufQ4_0,
@@ -254,6 +271,35 @@ fn scheme_of(layout: &str) -> Result<QuantScheme, Error> {
             )));
         }
     })
+}
+
+/// The affine-group members, by the name `write_zt` records.
+fn scheme_from_name(name: &str) -> Result<QuantScheme, Error> {
+    Ok(match name {
+        "AwqInt4" => QuantScheme::AwqInt4,
+        "GptqInt4" => QuantScheme::GptqInt4,
+        "MlxAffineU4" => QuantScheme::MlxAffineU4,
+        "Int4B8" => QuantScheme::Int4B8,
+        "Int8Symmetric" => QuantScheme::Int8Symmetric,
+        "Int8Asymmetric" => QuantScheme::Int8Asymmetric,
+        "Fp8E4M3" => QuantScheme::Fp8E4M3,
+        "Fp8E5M2" => QuantScheme::Fp8E5M2,
+        other => {
+            return Err(Error::Checkpoint(format!(
+                "scheme {other:?} is not one this loader knows"
+            )));
+        }
+    })
+}
+
+fn attr_text<'a>(object: &'a Object, key: &str) -> Option<&'a str> {
+    object
+        .attributes
+        .as_ref()?
+        .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_text() == Some(key))
+        .and_then(|(_, v)| v.as_text())
 }
 
 fn attr_u64(object: &Object, key: &str) -> Option<u64> {

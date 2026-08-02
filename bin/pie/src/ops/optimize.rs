@@ -6,9 +6,10 @@
 //! flag — the only knobs are operational (`--dry-run`, `--force`).
 //!
 //! Today the one derivable step is format normalization: a GGUF checkpoint's
-//! blocked tensors decode to plain dtypes and the result is written as
-//! safetensors under Pie's own cache, where the engine's family contracts can
-//! load it directly. Family-aware steps — offline quantization to the
+//! blocked tensors decode to plain dtypes and the result is written as a `.zt`
+//! checkpoint under Pie's own cache — pie's own artifact, so it is written in
+//! the format that carries page alignment and a per-tensor digest rather than
+//! the one other tools read. Family-aware steps — offline quantization to the
 //! configured scheme, page alignment for expert streaming — slot in behind
 //! the same command once the driver can author their contracts without
 //! booting a device (`author_contract` reads only the checkpoint table and
@@ -20,7 +21,8 @@ use anyhow::{Result, anyhow, bail};
 use clap::Args;
 
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
-use pie_loader::checkpoint::write::{WriteTensor, write_safetensors};
+use pie_loader::checkpoint::write::WriteTensor;
+use pie_loader::checkpoint::write_zt::write_zt;
 use pie_loader::contract::normalize::normalize_contract;
 use pie_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
@@ -56,7 +58,9 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
     // or a different revision lands beside the old one rather than over it.
     let digest = source_digest(&metadata);
     let out_dir = optimized_dir(&args.repo_id, digest);
-    let out_file = out_dir.join("model.safetensors");
+    // `.zt`: the artifact is pie's own, so it is written in the format that
+    // carries alignment and a digest rather than the one other tools read.
+    let out_file = out_dir.join("model.zt");
     if out_file.exists() && !args.force {
         println!(
             "{}: already optimized at {}",
@@ -111,7 +115,7 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
     if args.force {
         std::fs::remove_dir_all(&out_dir).ok();
     }
-    write_safetensors(&out_file, &provenance, &tensors)
+    write_zt(&out_file, &provenance, &tensors)
         .map_err(|err| anyhow!("cannot write the optimized checkpoint: {err}"))?;
 
     let bytes: u64 = tensors.iter().map(|tensor| tensor.bytes.len() as u64).sum();
