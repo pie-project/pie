@@ -39,15 +39,19 @@ constexpr std::size_t kDefaultLtWorkspaceBytes = 32ull * 1024ull * 1024ull;
 struct LtCtx;
 thread_local LtCtx* g_runtime_quant_context = nullptr;
 
-cublasComputeType_t bf16_compute_type() {
-    static const cublasComputeType_t ct = [] {
-        const char* v = std::getenv("PIE_CUBLAS_PRECISE");
-        if (v != nullptr && v[0] != '\0' && v[0] != '0')
-            return CUBLAS_COMPUTE_32F;
-        return CUBLAS_COMPUTE_32F_FAST_16BF;
-    }();
-    return ct;
-}
+// CUBLAS_COMPUTE_32F_FAST_16BF exists to let a matmul over *fp32* operands
+// round them to bf16 for the tensor cores. Operands that are already bf16 gain
+// nothing from it, and cuBLASLt has no algorithm at all for many bf16 shapes
+// under it -- the MLA absorb batches and the MoE expert batch among them. Its
+// heuristic query then fails on every call, and cuBLAS silently retries the
+// matmul in CUBLAS_COMPUTE_32F. That internal retry is not reliable when eight
+// rank threads take it at the same instant: when it loses the race the call
+// returns NOT_SUPPORTED or INTERNAL_ERROR, and if it happened inside a graph
+// capture the failure also invalidates the capture, so the next GEMM dies far
+// from the cause. That is what killed roughly one boot in ten at tp > 1.
+// CUBLAS_COMPUTE_32F is what bf16 operands should have been asking for all
+// along: same tensor cores, same fp32 accumulate, no fallback to race.
+cublasComputeType_t bf16_compute_type() { return CUBLAS_COMPUTE_32F; }
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* what) {
     if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
@@ -1288,6 +1292,39 @@ void gemm_bf16_cublas_impl(
     }
 }
 
+// Whether `cublasGemmGroupedBatchedEx` can serve a given shape is only
+// discoverable by calling it and looking at the status. That is fine on a plain
+// stream, but a failed cuBLAS call inside a stream capture INVALIDATES the
+// capture, and the next GEMM then dies with an unrelated INTERNAL_ERROR far from
+// the cause -- intermittently, because which shapes reach a capture first
+// depends on rank timing. So speculate only outside capture, remember the answer
+// per shape, and while capturing an untried shape go straight to the batched
+// path.
+struct GroupedBatchedSupport {
+    // -1 unknown, 0 unsupported, 1 supported.
+    int lookup(std::uint64_t key) {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto it = known.find(key);
+        return it == known.end() ? -1 : (it->second ? 1 : 0);
+    }
+
+    void store(std::uint64_t key, bool supported) {
+        std::lock_guard<std::mutex> lock(mu);
+        known.emplace(key, supported);
+    }
+
+    std::mutex mu;
+    std::unordered_map<std::uint64_t, bool> known;
+};
+
+bool stream_is_capturing(cublasHandle_t handle) {
+    cudaStream_t stream = nullptr;
+    if (cublasGetStream(handle, &stream) != CUBLAS_STATUS_SUCCESS) return true;
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) return true;
+    return status != cudaStreamCaptureStatusNone;
+}
+
 void gemm_batched_bf16_impl(
     cublasHandle_t handle,
     const void* const* act_ptrs_dev,
@@ -1299,7 +1336,16 @@ void gemm_batched_bf16_impl(
 {
     if (batch_count <= 0) return;
     const float alpha = 1.f;
-    if (use_cublas_grouped_batched_bf16()) {
+    const std::uint64_t grouped_key =
+        dense_key(M, N, K, beta) ^
+        (static_cast<std::uint64_t>(batch_count) * 0x9E3779B97F4A7C15ull);
+    auto& grouped_support = per_device_singleton<GroupedBatchedSupport>();
+    const int grouped_known = grouped_support.lookup(grouped_key);
+    const bool try_grouped =
+        use_cublas_grouped_batched_bf16() &&
+        (grouped_known == 1 ||
+         (grouped_known < 0 && !stream_is_capturing(handle)));
+    if (try_grouped) {
         const cublasOperation_t transa_array[1] = {CUBLAS_OP_T};
         const cublasOperation_t transb_array[1] = {CUBLAS_OP_N};
         const int m_array[1] = {N};
@@ -1320,6 +1366,10 @@ void gemm_batched_bf16_impl(
             y_ptrs_dev, CUDA_R_16BF, ldc_array,
             /*group_count=*/1, group_size,
             bf16_compute_type());
+        if (grouped_known < 0) {
+            grouped_support.store(grouped_key,
+                                  status == CUBLAS_STATUS_SUCCESS);
+        }
         if (status == CUBLAS_STATUS_SUCCESS) {
             return;
         }
@@ -1416,10 +1466,9 @@ void gemm_grouped_bf16_impl(
             group_size.data(),
             compute);
     };
-    cublasStatus_t status = run(CUBLAS_COMPUTE_32F_FAST_16BF);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        status = run(CUBLAS_COMPUTE_32F);
-    }
+    // No FAST_16BF attempt first: it has no algorithm for these shapes, and a
+    // failed call inside a graph capture invalidates the capture.
+    const cublasStatus_t status = run(bf16_compute_type());
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -2633,9 +2682,7 @@ void mla_absorb_q_to_latent_bf16(
         /*strideC=*/kv_lora_rank,
         /*batchCount=*/heads,
         bf16_compute_type(), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error("mla_absorb_q_to_latent_bf16: cuBLAS failed");
-    }
+    check(status, "mla_absorb_q_to_latent_bf16");
 }
 
 void mla_absorb_latent_to_v_bf16(
@@ -2646,7 +2693,7 @@ void mla_absorb_latent_to_v_bf16(
     if (tokens <= 0 || heads <= 0) return;
     const float alpha = 1.f, beta = 0.f;
     const auto* wv = static_cast<const __nv_bfloat16*>(kv_b_proj) +
-                     static_cast<long long>(qk_nope_dim) * kv_lora_rank;
+                 static_cast<long long>(qk_nope_dim) * kv_lora_rank;
     // Row-major C[T, v_dim] = A[T, kv_lora] @ W[v_dim, kv_lora]^T per head.
     const auto status = cublasGemmStridedBatchedEx(
         handle, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -2661,9 +2708,7 @@ void mla_absorb_latent_to_v_bf16(
         /*strideC=*/v_head_dim,
         /*batchCount=*/heads,
         bf16_compute_type(), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error("mla_absorb_latent_to_v_bf16: cuBLAS failed");
-    }
+    check(status, "mla_absorb_latent_to_v_bf16");
 }
 
 }  // namespace pie_cuda_driver::ops
