@@ -465,7 +465,11 @@ mod tests {
         let stores = registry::get(model, 0);
         let parent_id = stores.kv.lock().create_working_set();
         commit_fresh_pages(model, parent_id, 2, 1);
-        let child_id = stores.kv.lock().fork(parent_id).unwrap();
+        let child_id = stores
+            .kv
+            .lock()
+            .fork(parent_id, Default::default())
+            .unwrap();
 
         let parent = KvWorkingSet::new(model, 0, parent_id, 16);
         let child = KvWorkingSet::new(model, 0, child_id, 16);
@@ -491,7 +495,11 @@ mod tests {
         let model = fresh_model(4);
         let stores = registry::get(model, 0);
         let parent_id = stores.kv.lock().create_working_set();
-        let child_id = stores.kv.lock().fork(parent_id).unwrap();
+        let child_id = stores
+            .kv
+            .lock()
+            .fork(parent_id, Default::default())
+            .unwrap();
         let parent = KvWorkingSet::new(model, 0, parent_id, 16);
         let drained = Arc::new(AtomicBool::new(false));
         let drained_probe = Arc::clone(&drained);
