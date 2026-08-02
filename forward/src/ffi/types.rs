@@ -554,6 +554,11 @@ pub struct PieForwardPlan {
     /// The tracer's content hash ([`crate::ffi::compiler_version`]), so two
     /// plans compare as stale-vs-fresh without re-tracing.
     pub compiler_version: u64,
+    /// STRUCTURAL S-3: non-zero when the declaration states the depth
+    /// axis ([`crate::trace::ForwardPlan::depth_window`]) — layer-tagged
+    /// ops may run over the full-depth prefix window (or be skipped on a
+    /// uniform truncated fire), keyed on each op's own layer tag.
+    pub depth_window: u8,
     pub owner: *mut std::ffi::c_void,
 }
 
@@ -571,6 +576,7 @@ impl Default for PieForwardPlan {
             names: PieForwardNameSlice::default(),
             name_bytes: PieForwardBytes::default(),
             compiler_version: 0,
+            depth_window: 0,
             owner: std::ptr::null_mut(),
         }
     }

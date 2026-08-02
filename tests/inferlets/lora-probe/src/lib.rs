@@ -27,10 +27,11 @@ use serde::{Deserialize, Serialize};
 
 // Qwen3-0.6B adapter geometry: trace-known shape (a different rank is a
 // different traced program); the CONTENTS are per-instance data.
-const NUM_LAYERS: u32 = 28;
 const RANK: u32 = 8;
-const D_IN: u32 = 1024; // hidden_size
-const D_OUT: u32 = 2048; // q width = 16 heads * head_dim 128
+// Model geometry DEFAULTS (Qwen3-0.6B); override per model via args.
+const DEF_LAYERS: u32 = 28;
+const DEF_D_IN: u32 = 1024;
+const DEF_D_OUT: u32 = 2048;
 const SITE_Q: u32 = 1 << 0;
 
 #[derive(Deserialize)]
@@ -46,6 +47,36 @@ struct Input {
     /// Scale folded into B's seed contents. 0.0 = zero-B adapter.
     #[serde(default)]
     adapter_scale: f32,
+    /// Which surface attaches the adapter: "sink" (kernel::lora, the
+    /// original) or "adapter" (fwd.adapter, the PEFT v0a surface —
+    /// must be byte-identical: same channels, same lowering).
+    #[serde(default = "default_surface")]
+    surface: String,
+    /// Which sites carry adapters: "q" (the original single-site probe)
+    /// or "qv" (the per-site-pairs rung: distinct shapes per site,
+    /// adapter surface only).
+    #[serde(default = "default_sites")]
+    sites: String,
+    /// Model geometry overrides (defaults = Qwen3-0.6B).
+    #[serde(default)]
+    layers: Option<u32>,
+    #[serde(default)]
+    d_in: Option<u32>,
+    #[serde(default)]
+    d_out: Option<u32>,
+    /// Scale-vector deviation from ones (the scale/DoRA modes):
+    /// l = 1 + scale_l * pattern. 0.0 = ones (the multiplicative
+    /// identity).
+    #[serde(default)]
+    scale_l: f32,
+}
+
+fn default_sites() -> String {
+    "q".into()
+}
+
+fn default_surface() -> String {
+    "sink".into()
 }
 
 fn default_prompt() -> String {
@@ -112,6 +143,12 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let adapter_scale = input.adapter_scale;
+    #[allow(non_snake_case)]
+    let NUM_LAYERS: u32 = input.layers.unwrap_or(DEF_LAYERS);
+    #[allow(non_snake_case)]
+    let D_IN: u32 = input.d_in.unwrap_or(DEF_D_IN);
+    #[allow(non_snake_case)]
+    let D_OUT: u32 = input.d_out.unwrap_or(DEF_D_OUT);
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
@@ -137,6 +174,13 @@ async fn main(input: Input) -> Result<Output> {
         .collect();
     let b_host: Vec<f32> = (0..b_len as u32)
         .map(|i| pattern(i, 0x0b0b_b0b0, 0.5) * adapter_scale)
+        .collect();
+    // The v site's pair (per-site rung): SAME d_in and rank, its OWN
+    // d_out (v width) and its own deterministic contents.
+    const D_OUT_V: u32 = 1024; // kv width = 8 heads * head_dim 128
+    let bv_len = (NUM_LAYERS * D_OUT_V * RANK) as usize;
+    let bv_host: Vec<f32> = (0..bv_len as u32)
+        .map(|i| pattern(i, 0x0c0c_c0c0, 0.5) * adapter_scale)
         .collect();
     let make_lora_channels = |a_host: &Vec<f32>, b_host: &Vec<f32>| {
         (
@@ -186,14 +230,65 @@ async fn main(input: Input) -> Result<Output> {
         let (lora_a, lora_b) = make_lora_channels(&a_host, &b_host);
         let fwd_p = ForwardPass::new();
         // The configuration sink: reads are peeks (no edge onto the decode
-        // chain), SITES is trace-known placement.
-        fwd_p.prologue(move || {
-            intrinsics::kernel::lora(
-                lora_a.read(),
-                lora_b.read(),
-                Tensor::constant(SITE_Q),
-            );
-        });
+        // chain), SITES is trace-known placement. The "adapter" surface
+        // states the SAME thing through the PEFT v0a classifier.
+        if input.surface == "adapter" {
+            use inferlet::ptir::adapter::{mm, Site};
+            if input.sites != "scale_q" && input.sites != "dora_q" {
+                fwd_p
+                    .adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
+                    .map_err(|e| e.to_string())?;
+            }
+            if input.sites == "scale_q" || input.sites == "dora_q" {
+                use inferlet::ptir::adapter::scale;
+                let scale_l = input.scale_l;
+                let l = Channel::from_shaped(
+                    [NUM_LAYERS, D_OUT],
+                    (0..(NUM_LAYERS * D_OUT))
+                        .map(|i| 1.0f32
+                            + pattern(i, 0x0d0d_d0d0, 0.2) * scale_l)
+                        .collect::<Vec<f32>>())
+                    .named("lora_l_q");
+                if input.sites == "dora_q" {
+                    let (da, db) = make_lora_channels(&a_host, &b_host);
+                    fwd_p.adapter(Site::Q, |x, y| {
+                        scale(y + mm(&db, mm(&da, x)), &l)
+                    })
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    fwd_p.adapter(Site::Q, |_x, y| scale(y, &l))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            if input.sites == "qv" {
+                let av = Channel::from_shaped(
+                    [NUM_LAYERS, RANK, D_IN], a_host.clone())
+                    .named("lora_a_v");
+                let bv = Channel::from_shaped(
+                    [NUM_LAYERS, D_OUT_V, RANK], bv_host.clone())
+                    .named("lora_b_v");
+                fwd_p
+                    .adapter(Site::V, |x, y| y + mm(&bv, mm(&av, x)))
+                    .map_err(|e| e.to_string())?;
+            }
+        } else if input.surface == "clone" {
+            let (a2, b2) = (lora_a.clone(), lora_b.clone());
+            fwd_p.prologue(move || {
+                intrinsics::kernel::lora(
+                    a2.read(),
+                    b2.read(),
+                    Tensor::constant(SITE_Q),
+                );
+            });
+        } else {
+            fwd_p.prologue(move || {
+                intrinsics::kernel::lora(
+                    lora_a.read(),
+                    lora_b.read(),
+                    Tensor::constant(SITE_Q),
+                );
+            });
+        }
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
@@ -247,13 +342,52 @@ async fn main(input: Input) -> Result<Output> {
 
         let (lora_a, lora_b) = make_lora_channels(&a_host, &b_host);
         let fwd = ForwardPass::new();
-        fwd.prologue(move || {
-            intrinsics::kernel::lora(
-                lora_a.read(),
-                lora_b.read(),
-                Tensor::constant(SITE_Q),
-            );
-        });
+        if input.surface == "adapter" {
+            use inferlet::ptir::adapter::{mm, Site};
+            if input.sites != "scale_q" && input.sites != "dora_q" {
+                fwd.adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
+                    .map_err(|e| e.to_string())?;
+            }
+            if input.sites == "scale_q" || input.sites == "dora_q" {
+                use inferlet::ptir::adapter::scale;
+                let scale_l = input.scale_l;
+                let l = Channel::from_shaped(
+                    [NUM_LAYERS, D_OUT],
+                    (0..(NUM_LAYERS * D_OUT))
+                        .map(|i| 1.0f32
+                            + pattern(i, 0x0d0d_d0d0, 0.2) * scale_l)
+                        .collect::<Vec<f32>>())
+                    .named("lora_l_q");
+                if input.sites == "dora_q" {
+                    let (da, db) = make_lora_channels(&a_host, &b_host);
+                    fwd.adapter(Site::Q, |x, y| {
+                        scale(y + mm(&db, mm(&da, x)), &l)
+                    })
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    fwd.adapter(Site::Q, |_x, y| scale(y, &l))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            if input.sites == "qv" {
+                let av = Channel::from_shaped(
+                    [NUM_LAYERS, RANK, D_IN], a_host.clone())
+                    .named("lora_a_v");
+                let bv = Channel::from_shaped(
+                    [NUM_LAYERS, D_OUT_V, RANK], bv_host.clone())
+                    .named("lora_b_v");
+                fwd.adapter(Site::V, |x, y| y + mm(&bv, mm(&av, x)))
+                    .map_err(|e| e.to_string())?;
+            }
+        } else {
+            fwd.prologue(move || {
+                intrinsics::kernel::lora(
+                    lora_a.read(),
+                    lora_b.read(),
+                    Tensor::constant(SITE_Q),
+                );
+            });
+        }
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,

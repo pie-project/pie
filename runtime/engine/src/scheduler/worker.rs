@@ -458,6 +458,16 @@ pub(crate) struct LaunchGrouping {
     /// NS-2: a member carries hooks or a lora sink (the planner sends
     /// UNPLANNED for such fires, so a wire-masked envelope must not join).
     has_hook_or_lora: bool,
+    /// AC-2: hooks alone — masked envelopes now compose with lora
+    /// lanes (the correction is not a window axis), so the spatial
+    /// refusals key on hooks specifically.
+    has_hook: bool,
+    /// PQ-tree mixed half: a BOTH-WINDOW-AXES lane (masked+truncated)
+    /// tolerates only k-uniform groups (the uniform stamp is its one
+    /// correct lowering; a mixed group would silently drop its k).
+    has_both_axes: bool,
+    /// `Some(k_of_every_member)` while uniform; `None` after a mismatch.
+    uniform_k: Option<Option<u32>>,
 }
 
 /// NS-2 (the spatial mask fire): engine-side mirror of the driver's
@@ -577,9 +587,7 @@ impl LaunchGrouping {
         let spatial_composable_masked_envelope = spatial_mask_compose_enabled()
             && wire_mask_on_device_geometry
             && request.request.token_ids.len() <= 1
-            && !request.has_multi_token_row()
-            && !request.hook_program
-            && !request.lora_program;
+            && !request.has_multi_token_row();
         let wire_mask_on_device_geometry_blocks =
             wire_mask_on_device_geometry && !spatial_composable_masked_envelope;
         if self.count != 0
@@ -596,15 +604,22 @@ impl LaunchGrouping {
                     && ((!spatial_mixed_compose_enabled()
                          && self.has_multi_token)
                         || self.has_structured_mask
-                        || self.has_hook_or_lora
                         || self.has_masked_device_geometry))
                 || self.has_masked_device_geometry
                 || (self.has_wire_masked_envelope
                     && ((!spatial_mixed_compose_enabled()
                          && request.has_multi_token_row())
                         || request.request.structured_device_mask
-                        || request.hook_program
-                        || request.lora_program))
+                        || (request.hook_program
+                            && request.request.has_user_mask)))
+                // PQ-tree mixed half: joining would break k-uniformity
+                // for a both-axes lane (either side) — refuse, the lane
+                // solos with its uniform stamp intact.
+                || ((request.request.has_user_mask
+                    && request.request.max_layers.is_some()
+                    || self.has_both_axes)
+                    && self.count != 0
+                    && self.uniform_k != Some(request.request.max_layers))
                 || (wire_masked && self.has_structured_mask)
                 || (request.request.structured_device_mask && self.has_user_mask))
         {
@@ -696,6 +711,14 @@ impl LaunchGrouping {
             || (wire_masked_envelope && !spatial_relaxed);
         self.has_wire_masked_envelope |= spatial_relaxed;
         self.has_hook_or_lora |= request.hook_program || request.lora_program;
+        self.has_hook |= request.hook_program;
+        self.has_both_axes |=
+            request.request.has_user_mask && request.request.max_layers.is_some();
+        self.uniform_k = match self.uniform_k {
+            None if self.count == 0 => Some(request.request.max_layers),
+            Some(k) if k == request.request.max_layers => Some(k),
+            _ => None,
+        };
         self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)

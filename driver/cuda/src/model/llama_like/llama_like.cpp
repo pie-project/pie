@@ -232,7 +232,9 @@ struct LoraFireState {
         lanes.reserve(table.count);
         for (std::uint32_t i = 0; i < table.count; ++i) {
             const LoraLaneView& lane = table.lanes[i];
-            if (lane.a == nullptr || lane.b == nullptr) {
+            const bool scale_lane =
+                lane.form == LoraLaneView::Form::Scale;
+            if (lane.a == nullptr || (!scale_lane && lane.b == nullptr)) {
                 throw std::runtime_error(
                     "lora lane carries a null adapter address");
             }
@@ -259,7 +261,8 @@ struct LoraFireState {
                     std::to_string(lane.num_layers) + " layers, model has " +
                     std::to_string(cfg.num_hidden_layers));
             }
-            if (lane.d_in != static_cast<std::uint32_t>(H)) {
+            if (!scale_lane &&
+                lane.d_in != static_cast<std::uint32_t>(H)) {
                 throw std::runtime_error(
                     "lora adapter d_in " + std::to_string(lane.d_in) +
                     " != hidden size " + std::to_string(H));
@@ -276,6 +279,26 @@ struct LoraFireState {
             };
             require_width(kLoraSiteQ, Hq, "q");
             require_width(kLoraSiteV, Hk, "v");
+            if (scale_lane) {
+                // The SCALE form (IA3): stage the l vector's bf16 cast;
+                // no rank, no scratch, no grouping — apply() multiplies
+                // the span rows elementwise per consumed site.
+                if (lane.token_start > static_cast<std::uint32_t>(N) ||
+                    lane.token_count >
+                        static_cast<std::uint32_t>(N) - lane.token_start) {
+                    throw std::runtime_error(
+                        "lora scale lane token span exceeds the fire");
+                }
+                if (lane.token_count == 0) continue;
+                const std::size_t l_elems = static_cast<std::size_t>(
+                    lane.num_layers) * lane.d_out;
+                Lane out{&lane, nullptr, nullptr};
+                out.a_bf16 = arena.alloc(l_elems * 2);
+                lanes.push_back(out);
+                kernels::launch_cast_fp32_to_bf16(
+                    lane.a, out.a_bf16, l_elems, stream);
+                continue;
+            }
             if (lane.rank == 0 ||
                 lane.rank > static_cast<std::uint32_t>(I)) {
                 // The xA^T scratch below aliases ws.gate ([max_tokens, I]),
@@ -348,6 +371,10 @@ struct LoraFireState {
             lane_spans_disjoint()) {
             for (std::size_t i = 0; i < lanes.size(); ++i) {
                 const LoraLaneView& v = *lanes[i].view;
+                if (v.form == LoraLaneView::Form::Scale) {
+                    // Scale lanes are elementwise — nothing to group.
+                    continue;
+                }
                 Group* g = nullptr;
                 for (Group& cand : groups) {
                     if (cand.rank == static_cast<int>(v.rank) &&
@@ -590,6 +617,12 @@ struct LoraFireState {
             if (lane.grouped) continue;
             const LoraLaneView& v = *lane.view;
             const int t = static_cast<int>(v.token_count);
+            if (v.form == LoraLaneView::Form::Scale) {
+                // Applied in the scale pass BELOW — after every delta
+                // (solo and grouped) has landed, so a same-site
+                // low-rank + scale composes as s ⊙ (y + B(Ax)) — DoRA.
+                continue;
+            }
             const int R = static_cast<int>(v.rank);
             const auto* a_l = static_cast<const std::uint16_t*>(lane.a_bf16) +
                 static_cast<std::size_t>(layer) * R * v.d_in;
@@ -650,6 +683,29 @@ struct LoraFireState {
                     handle, base, base + g.nv,
                     const_cast<void* const*>(base + 2 * g.nv),
                     g.mv.data(), g.nv, g.d_out, g.rank, /*beta=*/1.f);
+            }
+        }
+        // ── The scale pass: AFTER every delta (solo + grouped), so a
+        // same-site low-rank + scale composes as s ⊙ (y + B(Ax)) —
+        // DoRA's order; a lone scale lane is IA3 unchanged. ──
+        for (const Lane& lane : lanes) {
+            const LoraLaneView& v = *lane.view;
+            if (v.form != LoraLaneView::Form::Scale) continue;
+            const int t = static_cast<int>(v.token_count);
+            const auto* l_l =
+                static_cast<const std::uint16_t*>(lane.a_bf16) +
+                static_cast<std::size_t>(layer) * v.d_out;
+            if ((v.sites_bits & kLoraSiteQ) != 0) {
+                kernels::launch_scale_rows_bf16(
+                    bf16_row(q_out,
+                             static_cast<int>(v.token_start), Hq),
+                    l_l, t, static_cast<int>(v.d_out), stream);
+            }
+            if ((v.sites_bits & kLoraSiteV) != 0) {
+                kernels::launch_scale_rows_bf16(
+                    bf16_row(v_out,
+                             static_cast<int>(v.token_start), Hk),
+                    l_l, t, static_cast<int>(v.d_out), stream);
             }
         }
     }
@@ -1849,7 +1905,14 @@ void llama_like_forward_paged(
         const std::uint32_t* attn_page_indptr = kv_page_indptr;
         const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
         if (page_mask.written_for(static_cast<std::uint32_t>(L))) {
-            if (!use_decode_path || decode_plan == nullptr) {
+            // AC-4: a SPATIAL fire's hooked lanes ride the prefix decode
+            // dispatch, which consumes the substituted views — the split
+            // branch is a paged-decode consumer too.
+            const bool spatial_decode_consumer =
+                plan_state.spatial_mask_split >= 0 &&
+                is_pure_decode && decode_plan != nullptr;
+            if ((!use_decode_path && !spatial_decode_consumer) ||
+                decode_plan == nullptr) {
                 throw std::runtime_error(
                     "attn_page_mask was written but this layer does not take "
                     "the paged decode path, which is the only one whose page "
@@ -1981,11 +2044,14 @@ void llama_like_forward_paged(
                             "spatial mask: split active but prepare built "
                             "no prefix decode plan");
                     } else {
+                        // AC-4: the ATTN page views (hook-narrowed when
+                        // sites ran, aliases of the raw CSRs otherwise)
+                        // — hooked prefix lanes keep their page masks.
                         ops::dispatch_attention_flashinfer_decode(
                             *decode_plan,
                             attn_q, kv_view, attn_out_buf,
-                            kv_page_indices, kv_page_indptr,
-                            kv_last_page_lens,
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
                             attn_ws, stream, layer_window_left,
                             /*logits_soft_cap=*/0.f, sm_scale_override);
                     }
@@ -2324,7 +2390,64 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
-    if (full_depth_rows != 0xffffffffu) {
+    if (full_depth_rows != 0xffffffffu &&
+        (has_custom_mask || hooks != nullptr)) {
+        // AC-1 (mask x depth), the stash/restore form: order is
+        // [plain | truncated | masked], so the full-depth rows are
+        // non-contiguous {[0, t_start) ∪ [m_start, N)}. Rather than
+        // window every kernel, layers [k, L) run FULL-N — the
+        // truncated middle computes discarded garbage (its [k, L) KV
+        // slabs are dead weight its own re-runs never read) — with the
+        // residual stream's truncated rows STASHED at layer k and
+        // RESTORED before the tail, so the one tail reads layer-k
+        // hidden for the truncated rows and layer-L for everyone else.
+        const int t_start = static_cast<int>(full_depth_rows);
+        // The truncated middle ends where the first full-depth suffix
+        // block begins — the hooked block when present (its start rides
+        // the hook-free-prefix word via fast_rows... the mask split is
+        // the v0 anchor; hooked+depth composition keeps m_start = the
+        // mask word since hooked lanes sort between).
+        // AC-5 anchor refinement: the middle ends at the HOOKED block
+        // when hooks are present (hook_free_prefix_rows — pure decode,
+        // row == lane), else at the MASKED block; with both, the
+        // earlier (order [plain | truncated | hooked | masked]).
+        const int m_start =
+            hooks != nullptr
+                ? std::min<int>(
+                      static_cast<int>(
+                          hooks->hook_free_prefix_rows),
+                      has_custom_mask
+                          ? plan_state.spatial_mask_split
+                          : R)
+                : plan_state.spatial_mask_split;
+        // t_start == 0 is legal: no plain block, the truncated middle
+        // starts at row 0 ([truncated | masked]).
+        if (layer_bound >= cfg.num_hidden_layers || t_start < 0 ||
+            m_start <= t_start || m_start > R || !is_pure_decode ||
+            (has_custom_mask && plan_state.spatial_mask_split < 0)) {
+            throw std::runtime_error(
+                "depth union (masked): planned shape and prepared "
+                "state drifted");
+        }
+        static DeviceBuffer<std::uint8_t> stash;
+        const std::size_t bytes =
+            static_cast<std::size_t>(m_start - t_start) * H * 2;
+        if (stash.size() < bytes) {
+            stash = DeviceBuffer<std::uint8_t>(bytes);
+        }
+        for (int L = 0; L < layer_bound; ++L) {
+            run_layer(L, N, R, decode_plan, attn_ws);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            stash.data(), bf16_row(ws.y.data(), t_start, H), bytes,
+            cudaMemcpyDeviceToDevice, stream));
+        for (int L = layer_bound; L < cfg.num_hidden_layers; ++L) {
+            run_layer(L, N, R, decode_plan, attn_ws);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            bf16_row(ws.y.data(), t_start, H), stash.data(), bytes,
+            cudaMemcpyDeviceToDevice, stream));
+    } else if (full_depth_rows != 0xffffffffu) {
         // The depth union (S-2): layers [0, k) run every row, layers
         // [k, L) run the full-depth prefix only, and the unchanged
         // full-N tail below is BOTH heads (the suffix rows' hidden

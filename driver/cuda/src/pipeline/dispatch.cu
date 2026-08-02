@@ -4186,9 +4186,20 @@ GroupedLanePageMask resolve_lane_page_mask(
 // Every disagreement throws. A silently unresolved lora is a request whose
 // adapter never applied while every sample still returns — the exact failure
 // class the sink-name bind gate exists to prevent.
-model::LoraLaneView resolve_lane_lora(
+// PER-SITE PAIRS (the adapter rung, north-star-dsl.md): a prologue may
+// carry MULTIPLE lora sinks — one (A, B, SITES) per projection site
+// set — and the lane contributes one table entry per sink over the
+// same token span. Site sets must be DISJOINT across the lane's sinks
+// (one pair per site; the consumer's per-entry width checks then bind
+// each site to its own d_out — the q+v case).
+std::vector<model::LoraLaneView> resolve_lane_lora_sinks(
     const StagedLane& lane,
-    const plan::StagePlan& stage) {
+    const plan::StagePlan& stage);
+
+model::LoraLaneView resolve_lane_lora_one(
+    const StagedLane& lane,
+    const plan::StagePlan& stage,
+    const plan::PlanOp* sink) {
     // Value id -> producing op, via the stage's flat result numbering (the
     // same walk the fused packer uses for its `bases` table).
     std::vector<std::uint32_t> bases(stage.ops.size());
@@ -4208,27 +4219,16 @@ model::LoraLaneView resolve_lane_lora(
             "lora sink argument has no producing op in its stage");
     };
 
-    const plan::PlanOp* sink = nullptr;
-    for (const auto& normalized : stage.ops) {
-        const auto& op = normalized.op;
-        if (op.tag != PTIR_OP_SINK_CALL) continue;
-        if (op.name_idx < stage.names.size() &&
-            stage.names[op.name_idx] == "lora") {
-            if (sink != nullptr) {
-                throw std::runtime_error(
-                    "lora sink appears twice in one prologue stage");
-            }
-            sink = &op;
-        }
-    }
     if (sink == nullptr) {
         throw std::runtime_error(
             "lora resolution ran on a stage without the sink");
     }
-    if (sink->args.size() != 3) {
+    if (sink->args.size() != 3 && sink->args.size() != 2) {
         throw std::runtime_error(
-            "lora sink does not have the (A, B, SITES) argument shape");
+            "lora sink is neither the (A, B, SITES) low-rank shape nor "
+            "the (L, SITES) scale shape");
     }
+    const bool scale_form = sink->args.size() == 2;
 
     // A and B are channel CONTENTS (an adapter swap is a re-seed, never a
     // re-trace), so the harvested address is the channel's committed cell —
@@ -4279,7 +4279,8 @@ model::LoraLaneView resolve_lane_lora(
     // SITES is trace-known placement (a `Tensor::constant` bitmask over the
     // model's site vocabulary): structure, not contents, so it lives in the
     // plan as a literal rather than behind a channel.
-    const plan::PlanOp& sites = producer(sink->args[2]);
+    const plan::PlanOp& sites =
+        producer(sink->args[scale_form ? 1 : 2]);
     if (sites.tag != PTIR_OP_CONST) {
         throw std::runtime_error(
             "lora SITES argument is not a trace-known constant");
@@ -4325,6 +4326,40 @@ model::LoraLaneView resolve_lane_lora(
         }
         return type;
     };
+    if (scale_form) {
+        // The SCALE form (IA3): `l` is [num_layers, d_out] f32, applied
+        // as `y = l ⊙ y` at the declared sites. `a` carries the l
+        // address; rank/d_in rest at zero (no GEMM, no scratch).
+        if (sink->args[0] >= stage.value_types.size()) {
+            throw std::runtime_error(
+                "lora scale sink L argument has no declared value type");
+        }
+        const plan::ValueType& l_type = stage.value_types[sink->args[0]];
+        if (l_type.dtype != PTIR_DT_F32 || l_type.dims.size() != 2) {
+            throw std::runtime_error(
+                "lora scale sink L argument is not f32 rank-2 "
+                "([num_layers, d_out])");
+        }
+        for (const auto& dim : l_type.dims) {
+            if (dim.symbolic || dim.value == 0) {
+                throw std::runtime_error(
+                    "lora scale sink L argument has a symbolic or zero "
+                    "dimension");
+            }
+        }
+        return model::LoraLaneView{
+            .a = channel_address(sink->args[0], "L"),
+            .b = nullptr,
+            .sites_bits = sites.lit_bits,
+            .token_start = lane.token_start,
+            .token_count = lane.token_count,
+            .num_layers = l_type.dims[0].value,
+            .rank = 0,
+            .d_in = 0,
+            .d_out = l_type.dims[1].value,
+            .form = model::LoraLaneView::Form::Scale,
+        };
+    }
     const plan::ValueType& a_type = static_dims_3(sink->args[0], "A");
     const plan::ValueType& b_type = static_dims_3(sink->args[1], "B");
     const std::uint32_t num_layers = a_type.dims[0].value;
@@ -4351,7 +4386,46 @@ model::LoraLaneView resolve_lane_lora(
         .rank = rank,
         .d_in = d_in,
         .d_out = d_out,
+        .form = model::LoraLaneView::Form::LowRank,
     };
+}
+
+std::vector<model::LoraLaneView> resolve_lane_lora_sinks(
+    const StagedLane& lane,
+    const plan::StagePlan& stage) {
+    std::vector<model::LoraLaneView> views;
+    // Disjointness is PER FORM: two low-rank pairs (or two scales) on
+    // one site are ambiguous and refuse; a low-rank + a scale on the
+    // SAME site compose in program order (DoRA: s ⊙ (y + B(Ax)) — the
+    // consumer applies every scale after every delta).
+    std::uint64_t claimed_lowrank = 0;
+    std::uint64_t claimed_scale = 0;
+    for (const auto& normalized : stage.ops) {
+        const auto& op = normalized.op;
+        if (op.tag != PTIR_OP_SINK_CALL) continue;
+        if (op.name_idx >= stage.names.size() ||
+            stage.names[op.name_idx] != "lora") {
+            continue;
+        }
+        model::LoraLaneView view = resolve_lane_lora_one(lane, stage, &op);
+        std::uint64_t& claimed =
+            view.form == model::LoraLaneView::Form::Scale
+                ? claimed_scale
+                : claimed_lowrank;
+        if ((view.sites_bits & claimed) != 0) {
+            throw std::runtime_error(
+                "lora sinks claim overlapping sites of one form in one "
+                "prologue (bits " +
+                std::to_string(view.sites_bits & claimed) + ")");
+        }
+        claimed |= view.sites_bits;
+        views.push_back(view);
+    }
+    if (views.empty()) {
+        throw std::runtime_error(
+            "lora resolution ran on a stage without the sink");
+    }
+    return views;
 }
 
 const float* resolve_lane_attn_score(
@@ -4632,9 +4706,14 @@ void execute_declared_phase(
                     throw std::runtime_error(
                         "lora sink resolved twice for one lane");
                 }
-                launch.lora_lanes.push_back(
-                    resolve_lane_lora(lane, stage));
-                launch.lora_lane_sources.push_back(&lane);
+                for (const model::LoraLaneView& view :
+                     resolve_lane_lora_sinks(lane, stage)) {
+                    // The sources array is parallel PER ENTRY (the span
+                    // re-stamp indexes it 1:1), so a multi-sink lane
+                    // contributes one source per view.
+                    launch.lora_lanes.push_back(view);
+                    launch.lora_lane_sources.push_back(&lane);
+                }
             }
             std::uint64_t attn_score_kv_max = 0;
             std::uint32_t value_base = 0;

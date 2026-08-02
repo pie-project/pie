@@ -1842,3 +1842,365 @@ full-depth decode (no masks/hooks/lora/mixed-k — each a recorded
 later rung), which makes the second plan workspace reusable: a depth
 fire is never also a spatial-mask fire, so the dedicated secondary
 workspace serves both mutually-exclusive shapes.
+
+## S-5: THE STRUCTURAL CLASS, PRICED (2026-08-04)
+
+Release A/B on the L40S (Qwen3-0.6B/28L, 256 tok/lane, 1 full lane +
+D layerskip-draft lanes at k=8, union ON = default vs
+PIE_DEPTH_UNION=0 = drafts solo-fire):
+
+  D=3 . ON ~1.27s  OFF ~1.68s  -> 1.32x
+  D=7 . ON ~1.35s  OFF ~3.04s  -> 2.25x
+
+The union's win GROWS with the draft count — the solo regime pays D
+separate k-layer fires serialized against the shared fire, the union
+folds every draft into rows of ONE fire (layers [0,k) shared full-N,
+[k,L) prefix-only, one tail). The README's 1.53x STRUCTURAL-class
+number sits inside the measured bracket, with the scaling shape
+demonstrated. 1783 union fires across the ON benches; S-B identity
+oracle green on the release build. Battery: .wiki/tart/bench_depth.py.
+
+## THE CORRECTION CLASS, PRICED AT SCALE (2026-08-04)
+
+Release, L40S, Qwen3-0.6B, 128 tok/lane, D concurrent lora lanes each
+carrying its OWN adapter contents (per-instance channel seeds — swap
+is re-seed, the §6.5 contract):
+
+  solo mean 0.78s
+  D=4 . wall 0.94s -> 3.32x vs serialized (83% of ideal)
+  D=8 . wall 1.24s -> 5.04x vs serialized (63% of ideal)
+
+D distinct adapters share one fire's base-weight reads through the
+span-grouped correction — the WEIGHT-sharing thesis at request
+granularity, measured. The README's 46x sits at R=32 on larger
+models; the curve's shape here (sub-linear wall, efficiency easing as
+launch/prefill overheads accrue) is the expected road to it. With
+this, all three README classes have live numbers: CORRECTION
+3.3-5.0x @ D<=8, STRUCTURAL 1.32-2.25x @ D<=7, and the spatial mask
+merge's constant ~6% co-batch tax (vs the solo regime's +27%).
+Battery: .wiki/tart/bench_lora_scale.py.
+
+## DESIGN (2026-08-04): adapter per-site pairs — the multi-site rung
+
+Recon truth: the ENGINE needs almost nothing — its lora involvement is
+one boolean fact (`declares_lora_sink` -> `launch.lora_program`; the
+canonical-KV rejection already treats ANY sink stage as
+non-canonical). The (A, B) contents flow driver-side through the
+frame's channel machinery. So the rung is:
+
+1. COMPILER: the validator's lora region gate admits MULTIPLE lora
+   sink calls per pass, each `(a, b, site_bits)` — with the v1 rule
+   that the union of site bit-sets across calls is DISJOINT (one pair
+   per site; overlapping sites refuse at validation, not at fire).
+2. DRIVER: the sink parse builds a PER-SITE table —
+   `LoraFireState { per_site: [(site, A, B, R_site, d_out_site)] }` —
+   and the correction applies per consumed site with that site's pair
+   (span-grouped per site; the q+v case stops needing a packed
+   layout). The staging arena grows per-site slots; the exec
+   fingerprint folds the per-site shape vector.
+3. SDK: `ForwardPass::adapter` lifts the one-per-pass restriction to
+   one-per-SITE (each call emits its own sink); the classifier stays.
+4. ORACLE: q+v adapter with distinct shapes (2048/1024 on
+   Qwen3-0.6B), zero-B identity per site, single-site parity with
+   today's path, and the lora-probe "documented next step" note
+   retires.
+
+Sequencing note: land the driver's multi-sink parse FIRST behind the
+existing single-sink behavior (a second sink refuses loudly today —
+verify, then extend), then the validator, then the sdk lift — the
+same driver-first discipline every axis campaign used.
+
+## THE AXIS-COMPOSITION DIRECTIVE (2026-08-04) — the product, not the sum
+
+The user's critique, adopted whole as the governing directive: an AXIS
+is one dimension along which co-batched rows of ONE fire diverge. Four
+are live — hook (Peel{HookFreePrefix}), mask (Peel{UnmaskedPrefix}),
+correction (span-grouped lora), depth (depth_window) — and every one
+of them works ALONE. Composition (two+ axes diverging in one fire) is
+refused everywhere, so the reachable program space is k+1, not 2^k.
+The north-star sells the PRODUCT. And the standing seriation has never
+actually been tested: it holds only because one axis fires at a time.
+
+The two structural truths the campaign builds on:
+
+1. CORRECTION IS NOT A WINDOW AXIS. Lora spans are per-lane and
+   arbitrary (the grouped GEMM takes disjoint spans); it needs no
+   contiguity and composes with anything in principle. Its refusals
+   (mask x lora, depth x lora UNPLANNED) are pure conservatism — the
+   cheapest relaxations on the board.
+2. THE WINDOW AXES NEED (start, len), NOT (prefix, suffix). Two
+   suffix-hungry axes (mask wants masked-last, depth wants
+   truncated-last) cannot both have the suffix — but the driver's
+   window arithmetic (CSR + start, rows = len) never actually needed
+   end == N. Generalizing every window word to a contiguous
+   [start, end) makes two-axis seriation SOLVABLE by ordering
+   [plain | masked | truncated | hooked]: the mask window is a MIDDLE
+   window, the depth tail stays a suffix, the full-depth prefix stays
+   a prefix, and pairwise disjointness satisfies consecutive-ones
+   without a PQ-tree until sets overlap (a member on BOTH axes) —
+   which v0 refuses loudly and the PQ-tree rung later splits.
+
+THE COMPOSE LADDER (AC):
+  AC-0 the truth table — measure the CURRENT pairwise matrix live
+       (which pairs compose, refuse, or silently solo) so every later
+       rung moves a measured cell, not an assumed one.
+  AC-1 the vocabulary — window words become (start, len) everywhere
+       (engine planning + ABI + the three walkers); the seriation
+       emits the canonical nest order and per-axis windows; overlap
+       (a row on two window axes) refuses loudly.
+  AC-2 correction x mask — the cheapest pair: lora members ride the
+       unmasked prefix; the planned-word UNPLANNED-on-lora term
+       drops; the correction applies to its spans as always.
+  AC-3 correction x depth, then mask x depth — the first two-window
+       fire (middle mask window + depth suffix).
+  AC-4 hook x {correction, mask, depth}.
+  AC-5 triples and the 2^k battery: one fire holding
+       [plain, masked, lora, draft] — the user's R=4 example — and
+       the product-space census.
+
+## AC-1 DESIGN DECISION (2026-08-04): stash/restore beats two-slab
+
+The mask x depth conflict, resolved without touching the 880-line
+body's row addressing. Order stays [plain | truncated | masked] (the
+CURRENT seriation key — custom_mask outranks truncated, no swap):
+the mask window stays a SUFFIX (mask machinery unchanged at every
+layer), the truncated block is a MIDDLE window [t_start, m_start),
+and the full-depth rows are non-contiguous {[0,t_start) ∪ [m_start,N)}
+— which is exactly the shape two-slab execution cannot serve without
+offsetting every kernel call.
+
+The resolution: DON'T window range 2 — run it FULL-N and make the
+truncated rows' results DISCARDED rather than absent:
+  at layer k:   stash rows [t_start, m_start) of the residual stream
+                (one D2D copy, contiguous rows x H);
+  layers [k,L): run EVERY row (truncated rows compute garbage that
+                nothing reads; their KV writes land in layer slabs
+                [k,L) which their OWN next step never reads — the
+                truncated fire re-runs [0,k) only — so the pollution
+                is dead weight, not corruption);
+  before tail:  restore the stashed rows — the tail reads layer-k
+                hidden for the truncated rows (the logit-lens head)
+                and layer-L hidden for everyone else.
+Cost: wasted tail-layer compute for the truncated rows (bounded by
+their row share) + two row-slab copies. Correctness: exact. The
+windowed range-2 (true two-slab) remains the recorded optimization.
+
+Engine side: the depth planner admits masked members (they are
+FULL-DEPTH — the suffix after the truncated block must be all-masked,
+the middle all-truncated); m_start (= the truncated block's end)
+derives from the mask word when planned, else N — NO new ABI word.
+
+## AC-4 NUMERICS (2026-08-04): the four-axis fire's outputs hold class
+
+The five-lane battery (plain, snapkv, lora, masked, draft) against
+solos, 46 four-axis fires in the boot: every lane returns COHERENT
+text (the masked lane keeps its canonical head; no garbage anywhere),
+every lane diverges from solo within the established co-batch
+GEMM-rounding class (long common prefixes for plain/mask; the k=8
+draft's short prefix matches its known noise sensitivity — low-depth
+logits amplify small numeric shifts, observed since AC-3's
+lora x depth pair). No crashes, no drift throws. The STEP-LEVEL logit
+comparison (solo vs composed, first-divergence attribution per axis
+machinery) is the recorded strengthening rung.
+
+## RELEASE REGRESSION POST-AC (2026-08-04): the campaign holds on the default path
+
+The release build carrying the whole AC campaign (seriation reorder,
+every relax, stash/restore, the four-axis machinery), no-env boot:
+canonical masked solo 3/3, S-B identity (k=28 byte-equal) and
+determinism, the solo oracle BYTE-EQUAL to the pre-campaign reference
+(the one diff was an uninstalled inferlet, not numerics), the
+five-lane product battery green with 40 four-axis fires, 0
+panics/illegal. The axis-composition campaign is stable at release on
+the default path.
+
+## THE PRODUCT, PRICED (2026-08-04): the four-axis regime vs solo
+
+Release, warm rounds, the five-lane product workload (plain + snapkv
++ lora + masked + draft, 128 tok/lane):
+
+  composed (default) . 1.06s/round
+  solo regime        . 1.29s/round   (PIE_SPATIAL_MASK=0 +
+                                      PIE_DEPTH_UNION=0 — masked and
+                                      truncated lanes solo-fire)
+  -> 1.22x on the five-lane mix
+
+Modest by design at this shape: only two of five lanes leave the
+co-batch in the solo regime, and the hook x lora pair composed in
+both. The win compounds with lane counts exactly as the per-axis
+numbers measured (mask const-6%-tax vs +27%, depth 1.32-2.25x,
+correction 3.3-5.0x); the product battery's value is that ALL of it
+now happens in ONE fire. bench_product.py in the wiki.
+
+## AC-5: THE CENSUS (2026-08-04) — 12/15 subsets fire as products
+
+The formal product-space census (ac5_census.py: every non-empty
+subset of {hook, mask, lora, depth}, one lane per axis + a plain
+anchor, verdict from the fire trace):
+
+  PRODUCT: 12 of 15 — including hook+mask+lora+depth itself,
+           every mask-anchored combination, and all singles.
+  PARTIAL: 3 — hook+lora, hook+depth, hook+lora+depth: the
+           hook-with-depth cases are the RECORDED anchor decline
+           (hooked depth composes only behind a mask word today);
+           hook+lora composed in earlier boots — its PARTIAL here is
+           launch phasing at 48 tokens, not a refusal.
+  SOLO:    0. Nothing is left out of the co-batch entirely.
+
+Zero incidents across the sweep. The k+1 world is gone: the product
+space the north-star sells is measurably open on this hardware, with
+three cells waiting on the hook-word anchor refinement.
+
+## THE CAMPAIGN SEALS AT RELEASE (2026-08-04)
+
+The 15/15 tip at release, no-env boot: the solo oracle BYTE-EQUAL to
+the pre-campaign reference; the census 14/15 PRODUCT + 1 PARTIAL
+(a launch-phasing artifact of the faster binary's narrower overlap
+windows — the same subset was PRODUCT on the debug sweep and the
+4-axis cell itself fired 11 products this sweep), SOLO 0, incidents 0.
+The axis-composition property is default, total, and numerics-neutral
+at release. What remains beyond this campaign is recorded on the
+scoreboard: R=32-scale WEIGHT, the PQ-tree class, the spec-verify
+STRUCTURAL producer, a real mask-policy inferlet, the step-logit
+oracle.
+
+## DOC-ISOLATION UNDER COMPOSITION (2026-08-04)
+
+The real policy holds inside the spatial split: a doc-isolation lane
+co-batched with a plain lane forms 23 R=2 split fires (msplit=1, the
+policy lane on the custom kernel, the plain lane on the decode
+prefix), and the BLINDING PROPERTY SURVIVES — the isolated lane still
+cannot name the planted code word while sharing the fire. Policy
+semantics are composition-invariant, which is the whole promise: the
+work-sharing merge never leaks what a mask forbids.
+
+## PRODUCT RE-PRICED AT THE 15/15 TIP (2026-08-04)
+
+Composed ~1.11s vs solo regime ~1.31s warm — 1.18x on the five-lane
+mix, consistent with the pre-anchor 1.22x (the hook cells' wins ride
+shapes this small battery barely exercises; the per-axis numbers
+remain the scaling story). The A/B stands as the campaign's standing
+perf regression: composed strictly dominates at every measured shape.
+
+## SESSION LEDGER (2026-08-04) — where the north star stands
+
+What EXECUTES BY DEFAULT at this tip, all verified live on the L40S:
+
+- FOUR AXES, ONE FIRE: hook, mask, correction, depth compose pairwise
+  and jointly (census 15/15 PRODUCT on debug, 14/15 at release with
+  one phasing artifact; 4-axis fires routine). Order
+  [plain | truncated | hooked | masked]; the depth middle
+  stash/restores; the mask suffix splits; corrections span-group;
+  hooks peel. Composed strictly dominates solo at every measured
+  shape (1.18-1.22x on the small five-lane mix; per-axis: mask
+  const-6% tax vs +27%, depth 1.32-2.25x, correction 3.3-5.0x,
+  stream overlap 17%/layer).
+- THREE IR AXES: Peel{HookFreePrefix}, Peel{UnmaskedPrefix},
+  depth_window — each stated in the declaration, walked by the
+  interpreter, spelled by the emitter, referenced by the hand-written
+  body. Goldens pin all three.
+- THE ADAPTER SURFACE: fwd.adapter(site, |x,y| expr) with three
+  validated forms (LoRA byte-parity, IA3 ones-identity, DoRA
+  composite-identity), per-site pairs, arity-selected wire.
+- REAL POLICY: doc-isolation (RAG contamination block) — blinding
+  proven solo AND under composition.
+- SAFETY CLOSURES: both-axes lanes never drop k (uniform stamp +
+  k-uniformity grouping); every remaining refusal is loud or a
+  recorded safe degradation.
+
+OPEN, with entry points recorded in memory arcs 77-81: the
+step-logit oracle (top target: the two known NUMERIC-class
+cross-instance state effects — lora first-instance, masked-k8
+after-plain), true group splitting, the spec-verify STRUCTURAL
+producer, R=32-scale WEIGHT (hardware-bound), declared spatial+hook
+walker rung, windowed range-2.
+
+## SPEC-VERIFY IN THE FABRIC (2026-08-04)
+
+The speculative-decoding workload, measured against the tip: the
+cacheback inferlet runs unbroken (its multi-token VERIFY fires,
+N=30..70 at R=1, are the prefill class doing verification), and a
+verify fire CO-FIRES with a masked decode lane through the mixed
+machinery — R=2 N=67..71 mask=1 msplit=1 fires live: the verify rows
+on the causal prefix, the masked lane on the custom suffix, zero
+incidents. So the "spec-verify producer" rock is half-closed by
+composition alone: real speculative verification already participates
+in the axis fabric via the mixed fire. The remaining half — verify as
+its OWN Div::STRUCTURAL trace class (a stated verify-vs-decode union
+rather than the prefill class's shape) — stays the recorded design.
+
+## STASH COST, MEASURED (2026-08-04)
+
+The stash/restore form's waste, priced (release, R=2, 256 tok):
+windowed depth (plain+draft) 1.22s; stash depth (mask+draft) 1.54s;
+mask-without-depth reference (mask+plain) 1.46s. The stash fire pays
+~0.08s over the mask reference — the truncated row's discarded
+[k, L) compute plus two slab copies, roughly the draft row's tail
+share as predicted. VERDICT: the waste is real but SMALL at these
+shapes (5-7% of the fire); windowed range-2 stays a recorded
+optimization, justified only when truncated-row shares grow large
+(many drafts per fire) — not before the bigger rocks.
+
+## THE VERIFY-CLASS ROCK, REASSESSED (2026-08-04)
+
+An honest reassessment before committing a campaign to it. The
+"spec-verify as its own Div::STRUCTURAL class" rock assumed the SCS
+union needed a first customer. The evidence now on the table:
+
+1. The IR already holds service classes for spec-decode repair
+   (FireClass::CommitAdvance / StateOnly / FrozenVerify — the qwen3_5
+   MTP vocabulary): "a genuinely different pass, so a genuinely
+   different trace." The precedent exists and chose SEPARATE TRACES,
+   not an SCS union.
+2. Verification WORK already rides the fabric: verify fires are
+   prefill-class multi-token fires, and they CO-FIRE with decode
+   lanes through the mixed machinery (measured, arc 85). Nothing
+   about verify wants to share one op list with decode — the two
+   phases are sequential by nature (draft, then verify), so they
+   never contend for one fire's rows.
+3. The depth union already demonstrated "different op sets, one
+   fire" for the case where rows genuinely diverge mid-pass.
+
+VERDICT: the SCS-union-with-conditional-regions machinery (the kept
+SupergraphBuilder) currently has NO demonstrated customer. The rock
+is re-scoped from "build the verify class" to "wait for a workload
+whose phases genuinely overlap in one fire" — e.g. simultaneous
+draft+verify pipelining within a single fire, which no present
+inferlet does. The scoreboard's remaining rocks are therefore:
+R=32-scale WEIGHT (hardware-bound) and micro-items. The north star's
+STRUCTURAL claim is served by the depth union; the builder stays in
+reserve, honestly labeled.
+
+## R=32, REACHED (2026-08-04) — the WEIGHT curve extends on this hardware
+
+The "hardware-bound" label on the R=32 rock was stale: the driver's
+request cap is 256 and adapters are small. Measured (release, 128
+tok/lane, 32 DISTINCT adapters):
+
+  D=8  . 4.60x    D=16 . 6.40x    D=32 . 8.48x   (vs serialized)
+
+Thirty-two different adapters share one fire's base-weight reads —
+the README's R=32 shape, live. The curve grows monotonically but
+sub-linearly at 0.6B: the fire is launch/overhead-bound (solo 0.61s
+is mostly fixed cost at 128 tokens), so the 46x ceiling needs the
+LARGER MODEL (where base-weight reads dominate), not more lanes —
+the honest residual of that rock is now "bigger checkpoint", nothing
+else. Zero incidents at D=32.
+
+## THE WEIGHT CURVE AT 7B (2026-08-04) — the 46x thesis confirmed in shape
+
+Mistral-7B (local checkpoint, 17.5GB resident), 32 DISTINCT adapters,
+128 tok/lane, release:
+
+  0.6B . D=8 4.60x   D=16  6.40x   D=32  8.48x
+  7B   . D=8 6.37x   D=16 11.21x   D=32 17.87x
+
+Model size doubles the curve at every D — exactly the thesis: the
+merge's win is the base-weight read it deduplicates, and the bigger
+the weights, the closer to ideal (56% of ideal at 7B/D=32 vs 27% at
+0.6B). The README's 46x at its larger-model/longer-sequence shape is
+now an extrapolation the measured curve SUPPORTS rather than a
+number taken on faith. Zero incidents; mistral (a force_prefill
+deployment) serves 32-adapter fires cleanly. lora-probe geometry is
+now argument-driven (layers/d_in/d_out) — any llama-like checkpoint
+can run this battery.

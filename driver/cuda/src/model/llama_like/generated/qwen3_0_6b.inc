@@ -43,12 +43,37 @@ const StageHooks* hooks,
 const LoraTable* lora,
 const std::uint32_t* peel_window_d,
 std::uint32_t unmasked_prefix_rows,
-const std::uint32_t* mask_suffix_qo_indptr_d)
+const std::uint32_t* mask_suffix_qo_indptr_d,
+std::uint32_t declared_max_layers,
+std::uint32_t declared_full_depth_rows)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
     const int N = total_tokens;
     const int R = num_requests;
+    // STRUCTURAL S-4: the depth axis, stated by the trace
+    // (ForwardPlan::depth_window) — per-layer scopes below
+    // shadow N/R on tail layers; uniform truncation skips
+    // them and the unchanged epilogue is the logit-lens head.
+    const int depth_k =
+        declared_max_layers != 0xffffffffu &&
+        declared_max_layers <
+            static_cast<std::uint32_t>(cfg.num_hidden_layers)
+            ? static_cast<int>(declared_max_layers)
+            : cfg.num_hidden_layers;
+    const bool depth_union =
+        depth_k < cfg.num_hidden_layers &&
+        declared_full_depth_rows != 0xffffffffu;
+    const int depth_split = depth_union
+        ? static_cast<int>(declared_full_depth_rows)
+        : N;
+    if (depth_union &&
+        (depth_split <= 0 || depth_split >= R ||
+         !plan_state.depth_prefix_decode_plan)) {
+        throw std::runtime_error(
+            "depth union (generated): planned split without "
+            "a usable prefix plan (gate drift)");
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
@@ -102,6 +127,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         positions,
         static_cast<float*>(ws.rope_table.data()),
         N, d, cfg.rope_theta, stream);
+    {
+    const bool depth_tail = depth_k <= 0;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].attn_norm, "layer.0.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -188,6 +219,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(0u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -203,8 +253,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -380,9 +430,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(0);
@@ -392,11 +446,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[0]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -596,9 +651,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(0);
@@ -608,11 +667,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[0]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -662,6 +722,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 1;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].attn_norm, "layer.1.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -748,6 +816,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(1u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -763,8 +850,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -940,9 +1027,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(1);
@@ -952,11 +1043,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[1]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -1156,9 +1248,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(1);
@@ -1168,11 +1264,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[1]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -1222,6 +1319,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 2;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].attn_norm, "layer.2.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -1308,6 +1413,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(2u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -1323,8 +1447,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -1500,9 +1624,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(2);
@@ -1512,11 +1640,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[2]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -1716,9 +1845,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(2);
@@ -1728,11 +1861,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[2]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -1782,6 +1916,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 3;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].attn_norm, "layer.3.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -1868,6 +2010,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(3u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -1883,8 +2044,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -2060,9 +2221,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(3);
@@ -2072,11 +2237,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[3]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -2276,9 +2442,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(3);
@@ -2288,11 +2458,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[3]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -2342,6 +2513,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 4;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].attn_norm, "layer.4.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -2428,6 +2607,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(4u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -2443,8 +2641,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -2620,9 +2818,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(4);
@@ -2632,11 +2834,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[4]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -2836,9 +3039,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(4);
@@ -2848,11 +3055,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[4]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -2902,6 +3110,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 5;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].attn_norm, "layer.5.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -2988,6 +3204,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(5u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -3003,8 +3238,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -3180,9 +3415,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(5);
@@ -3192,11 +3431,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[5]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -3396,9 +3636,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(5);
@@ -3408,11 +3652,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[5]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -3462,6 +3707,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 6;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].attn_norm, "layer.6.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -3548,6 +3801,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(6u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -3563,8 +3835,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -3740,9 +4012,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(6);
@@ -3752,11 +4028,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[6]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -3956,9 +4233,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(6);
@@ -3968,11 +4249,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[6]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -4022,6 +4304,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 7;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].attn_norm, "layer.7.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -4108,6 +4398,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(7u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -4123,8 +4432,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -4300,9 +4609,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(7);
@@ -4312,11 +4625,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[7]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -4516,9 +4830,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(7);
@@ -4528,11 +4846,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[7]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -4582,6 +4901,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 8;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].attn_norm, "layer.8.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -4668,6 +4995,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(8u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -4683,8 +5029,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -4860,9 +5206,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(8);
@@ -4872,11 +5222,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[8]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -5076,9 +5427,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(8);
@@ -5088,11 +5443,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[8]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -5142,6 +5498,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 9;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].attn_norm, "layer.9.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -5228,6 +5592,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(9u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -5243,8 +5626,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -5420,9 +5803,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(9);
@@ -5432,11 +5819,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[9]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -5636,9 +6024,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(9);
@@ -5648,11 +6040,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[9]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -5702,6 +6095,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 10;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].attn_norm, "layer.10.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -5788,6 +6189,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(10u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -5803,8 +6223,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -5980,9 +6400,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(10);
@@ -5992,11 +6416,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[10]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -6196,9 +6621,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(10);
@@ -6208,11 +6637,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[10]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -6262,6 +6692,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 11;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].attn_norm, "layer.11.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -6348,6 +6786,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(11u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -6363,8 +6820,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -6540,9 +6997,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(11);
@@ -6552,11 +7013,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[11]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -6756,9 +7218,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(11);
@@ -6768,11 +7234,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[11]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -6822,6 +7289,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 12;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].attn_norm, "layer.12.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -6908,6 +7383,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(12u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -6923,8 +7417,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -7100,9 +7594,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(12);
@@ -7112,11 +7610,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[12]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -7316,9 +7815,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(12);
@@ -7328,11 +7831,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[12]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -7382,6 +7886,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 13;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].attn_norm, "layer.13.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -7468,6 +7980,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(13u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -7483,8 +8014,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -7660,9 +8191,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(13);
@@ -7672,11 +8207,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[13]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -7876,9 +8412,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(13);
@@ -7888,11 +8428,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[13]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -7942,6 +8483,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 14;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].attn_norm, "layer.14.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -8028,6 +8577,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(14u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -8043,8 +8611,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -8220,9 +8788,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(14);
@@ -8232,11 +8804,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[14]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -8436,9 +9009,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(14);
@@ -8448,11 +9025,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[14]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -8502,6 +9080,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 15;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].attn_norm, "layer.15.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -8588,6 +9174,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(15u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -8603,8 +9208,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -8780,9 +9385,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(15);
@@ -8792,11 +9401,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[15]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -8996,9 +9606,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(15);
@@ -9008,11 +9622,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[15]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -9062,6 +9677,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 16;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].attn_norm, "layer.16.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -9148,6 +9771,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(16u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -9163,8 +9805,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -9340,9 +9982,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(16);
@@ -9352,11 +9998,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[16]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -9556,9 +10203,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(16);
@@ -9568,11 +10219,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[16]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -9622,6 +10274,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 17;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].attn_norm, "layer.17.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -9708,6 +10368,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(17u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -9723,8 +10402,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -9900,9 +10579,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(17);
@@ -9912,11 +10595,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[17]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -10116,9 +10800,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(17);
@@ -10128,11 +10816,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[17]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -10182,6 +10871,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 18;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].attn_norm, "layer.18.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -10268,6 +10965,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(18u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -10283,8 +10999,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -10460,9 +11176,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(18);
@@ -10472,11 +11192,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[18]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -10676,9 +11397,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(18);
@@ -10688,11 +11413,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[18]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -10742,6 +11468,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 19;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].attn_norm, "layer.19.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -10828,6 +11562,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(19u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -10843,8 +11596,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -11020,9 +11773,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(19);
@@ -11032,11 +11789,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[19]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -11236,9 +11994,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(19);
@@ -11248,11 +12010,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[19]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -11302,6 +12065,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 20;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].attn_norm, "layer.20.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11388,6 +12159,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(20u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -11403,8 +12193,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -11580,9 +12370,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(20);
@@ -11592,11 +12386,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[20]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -11796,9 +12591,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(20);
@@ -11808,11 +12607,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[20]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -11862,6 +12662,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 21;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].attn_norm, "layer.21.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11948,6 +12756,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(21u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -11963,8 +12790,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -12140,9 +12967,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(21);
@@ -12152,11 +12983,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[21]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -12356,9 +13188,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(21);
@@ -12368,11 +13204,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[21]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -12422,6 +13259,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 22;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].attn_norm, "layer.22.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12508,6 +13353,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(22u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -12523,8 +13387,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -12700,9 +13564,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(22);
@@ -12712,11 +13580,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[22]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -12916,9 +13785,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(22);
@@ -12928,11 +13801,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[22]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -12982,6 +13856,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 23;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].attn_norm, "layer.23.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13068,6 +13950,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(23u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -13083,8 +13984,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -13260,9 +14161,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(23);
@@ -13272,11 +14177,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[23]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -13476,9 +14382,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(23);
@@ -13488,11 +14398,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[23]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -13542,6 +14453,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 24;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].attn_norm, "layer.24.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13628,6 +14547,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(24u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -13643,8 +14581,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -13820,9 +14758,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(24);
@@ -13832,11 +14774,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[24]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -14036,9 +14979,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(24);
@@ -14048,11 +14995,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[24]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -14102,6 +15050,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 25;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].attn_norm, "layer.25.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -14188,6 +15144,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(25u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -14203,8 +15178,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -14380,9 +15355,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(25);
@@ -14392,11 +15371,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[25]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -14596,9 +15576,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(25);
@@ -14608,11 +15592,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[25]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -14662,6 +15647,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 26;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].attn_norm, "layer.26.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -14748,6 +15741,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(26u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -14763,8 +15775,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -14940,9 +15952,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(26);
@@ -14952,11 +15968,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[26]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -15156,9 +16173,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(26);
@@ -15168,11 +16189,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[26]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -15222,6 +16244,14 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 27;
+    if (!depth_tail || depth_union) {
+    const int N = depth_tail ? depth_split : total_tokens;
+    const int R = depth_tail ? depth_split : num_requests;
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].attn_norm, "layer.27.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -15308,6 +16338,25 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
+                if (page_mask.written_for(27u)) {
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "attn_page_mask was written but this layer does "
+                            "not take the paged decode path");
+                    }
+                    if (!ops::decode_plan_is_page_count_independent(
+                            *plan_state.decode_plan)) {
+                        throw std::runtime_error(
+                            "attn_page_mask requires a page-count-independent "
+                            "decode plan; this fire planned split-KV");
+                    }
+                    page_mask.compact(
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        static_cast<std::uint32_t>(R), stream);
+                    attn_page_indices = page_mask.page_indices();
+                    attn_page_indptr = page_mask.page_indptr();
+                    attn_last_page_lens = page_mask.last_page_lens();
+                }
                 if (!plan_state.decode_plan) {
                     throw std::runtime_error(
                         "spatial mask: split active but prepare built "
@@ -15323,8 +16372,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                     ops::dispatch_attention_flashinfer_decode(
                         *plan_state.decode_plan,
                         ws.q.data(), kv_view, ws.attn_out.data(),
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
+                        attn_page_indices, attn_page_indptr,
+                        attn_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
                 }
@@ -15500,9 +16549,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(27);
@@ -15512,11 +16565,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[27]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -15716,9 +16770,13 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            if (!plan_state.decode_plan) {
+            const ops::DecodePlanCache* depth_dp = depth_tail
+                ? plan_state.depth_prefix_decode_plan.get()
+                : plan_state.decode_plan.get();
+            if (depth_dp == nullptr) {
                 throw std::runtime_error(
-                    "generated forward: prepare built no decode plan");
+                    "generated forward: prepare built no decode "
+                    "plan for this depth range");
             }
             {
                 auto kv_view = cache.layer_view(27);
@@ -15728,11 +16786,12 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
                         ? fwd_cfg.per_layer_window_left[27]
                         : fwd_cfg.sliding_window;
                 ops::dispatch_attention_flashinfer_decode(
-                    *plan_state.decode_plan,
+                    *depth_dp,
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    attn_ws, stream, layer_window_left,
+                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
@@ -15782,6 +16841,8 @@ const std::uint32_t* mask_suffix_qo_indptr_d)
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
     // final_norm: deferred into the LmHead epilogue below.
     if (fwd_cfg.emit_logits) {
         // The hand-written epilogue, the interpreter's arm verbatim
@@ -15845,7 +16906,9 @@ const StageHooks* hooks,
 const LoraTable* lora,
 const std::uint32_t* peel_window_d,
 std::uint32_t unmasked_prefix_rows,
-const std::uint32_t* mask_suffix_qo_indptr_d)
+const std::uint32_t* mask_suffix_qo_indptr_d,
+std::uint32_t declared_max_layers,
+std::uint32_t declared_full_depth_rows)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
@@ -23436,12 +24499,37 @@ const LoraTable* lora,
 const std::uint32_t* peel_window_d,
 std::uint32_t unmasked_prefix_rows,
 const std::uint32_t* mask_suffix_qo_indptr_d,
+std::uint32_t declared_max_layers,
+std::uint32_t declared_full_depth_rows,
     batch::SupergraphBuilder& sg)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
     const int N = total_tokens;
     const int R = num_requests;
+    // STRUCTURAL S-4: the depth axis, stated by the trace
+    // (ForwardPlan::depth_window) — per-layer scopes below
+    // shadow N/R on tail layers; uniform truncation skips
+    // them and the unchanged epilogue is the logit-lens head.
+    const int depth_k =
+        declared_max_layers != 0xffffffffu &&
+        declared_max_layers <
+            static_cast<std::uint32_t>(cfg.num_hidden_layers)
+            ? static_cast<int>(declared_max_layers)
+            : cfg.num_hidden_layers;
+    const bool depth_union =
+        depth_k < cfg.num_hidden_layers &&
+        declared_full_depth_rows != 0xffffffffu;
+    const int depth_split = depth_union
+        ? static_cast<int>(declared_full_depth_rows)
+        : N;
+    if (depth_union &&
+        (depth_split <= 0 || depth_split >= R ||
+         !plan_state.depth_prefix_decode_plan)) {
+        throw std::runtime_error(
+            "depth union (generated): planned split without "
+            "a usable prefix plan (gate drift)");
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;

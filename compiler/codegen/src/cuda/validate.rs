@@ -60,7 +60,12 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
                 };
                 mask.dims.len() == 1 && stage.normalized.stage == Stage::OnAttnProj
             }
-            "lora" => args.len() == 3 && stage.normalized.stage == Stage::Prologue,
+            // 3 args = low-rank (A, B, SITES); 2 args = the SCALE form
+            // (L, SITES) — IA3 (the adapter per-form rung).
+            "lora" => {
+                (args.len() == 3 || args.len() == 2)
+                    && stage.normalized.stage == Stage::Prologue
+            }
             _ => false,
         };
     }
@@ -181,13 +186,14 @@ mod tests {
         second_party_region_supported(stage, region)
     }
 
-    /// `lora(a, b, sites)` is exactly three arguments: the scale is folded
-    /// into B's contents and the placement into SITES, so any other arity is
+    /// The adapter sink's two forms by arity: 3 = low-rank
+    /// `(A, B, SITES)`, 2 = SCALE `(L, SITES)` (IA3). Any other arity is
     /// a program disagreeing with the sink's ABI and is refused at bind
     /// rather than mid-fire.
     #[test]
-    fn lora_region_gate_holds_the_three_argument_shape() {
+    fn lora_region_gate_holds_the_form_arities() {
         assert!(prologue_sink_supported(lora_container(3)));
-        assert!(!prologue_sink_supported(lora_container(2)));
+        assert!(prologue_sink_supported(lora_container(2)));
+        assert!(!prologue_sink_supported(lora_container(1)));
     }
 }

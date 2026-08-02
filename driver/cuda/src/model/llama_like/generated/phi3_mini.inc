@@ -43,7 +43,9 @@ const StageHooks* hooks,
 const LoraTable* lora,
 const std::uint32_t* peel_window_d,
 std::uint32_t unmasked_prefix_rows,
-const std::uint32_t* mask_suffix_qo_indptr_d)
+const std::uint32_t* mask_suffix_qo_indptr_d,
+std::uint32_t declared_max_layers,
+std::uint32_t declared_full_depth_rows)
 {
     // Locals mirror the interpreter's preamble — PADDED shape
     // (Phi-3's 96 -> 128): the attention consumes zero-padded
@@ -8416,7 +8418,9 @@ const StageHooks* hooks,
 const LoraTable* lora,
 const std::uint32_t* peel_window_d,
 std::uint32_t unmasked_prefix_rows,
-const std::uint32_t* mask_suffix_qo_indptr_d)
+const std::uint32_t* mask_suffix_qo_indptr_d,
+std::uint32_t declared_max_layers,
+std::uint32_t declared_full_depth_rows)
 {
     // Locals mirror the interpreter's preamble — PADDED shape
     // (Phi-3's 96 -> 128): the attention consumes zero-padded
@@ -15926,6 +15930,8 @@ const LoraTable* lora,
 const std::uint32_t* peel_window_d,
 std::uint32_t unmasked_prefix_rows,
 const std::uint32_t* mask_suffix_qo_indptr_d,
+std::uint32_t declared_max_layers,
+std::uint32_t declared_full_depth_rows,
     batch::SupergraphBuilder& sg)
 {
     // Locals mirror the interpreter's preamble — PADDED shape

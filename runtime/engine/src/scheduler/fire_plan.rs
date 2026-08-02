@@ -340,9 +340,14 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
     member_order.sort_by_key(|&index| {
         let member = &members[index];
         (
+            // AC-4 order [plain | truncated | hooked | masked]: the mask
+            // window stays the outermost SUFFIX (its machinery is
+            // end-anchored), hooked lanes sit before it (the unfused
+            // QKV tail is the GENERAL path — masked rows riding it is
+            // correctness-neutral), the truncated middle before that.
             member.device_resolved_geometry,
-            member.hook_program,
             member.custom_mask,
+            member.hook_program,
             member.truncated,
             member.arrival,
         )
@@ -475,11 +480,12 @@ mod tests {
         let mask_site = site(&plan, SITE_ATTENTION_MASK);
         assert_eq!(mask_site.class, DivClass::Structural);
         assert_eq!(mask_site.lowering, Lowering::Prefix { fast_rows: 2 });
-        // Hooks stay OUTSIDE the mask key: a hooked member sorts after
-        // every unhooked one, masked or not.
+        // AC-4: the mask key is now OUTERMOST — a masked member sorts
+        // after every unmasked one, hooked or not (the hook tail is the
+        // general unfused path; the mask window keeps the end anchor).
         let mixed = vec![masked_member(0), member(true, false, false, 1)];
         let plan = plan_fire(&mixed);
-        assert_eq!(plan.member_order, vec![0, 1]);
+        assert_eq!(plan.member_order, vec![1, 0]);
     }
 
     fn site<'a>(plan: &'a FirePlan, name: &str) -> &'a Site {

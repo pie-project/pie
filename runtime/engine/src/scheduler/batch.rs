@@ -130,9 +130,16 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
     }
     let mut k: Option<u32> = None;
     for req in ordered.iter() {
-        if req.hook_program
-            || req.lora_program
-            || req.request.has_user_mask
+        // AC-3 (lora x depth): an UNTRUNCATED lora member rides the
+        // full-depth prefix freely — the correction is span-grouped and
+        // window-free, and the seriation keeps it out of the truncated
+        // tail. A single lane carrying BOTH axes still declines (its
+        // correction span would cross the depth window — the PQ-tree
+        // class, refused as safe degradation for now).
+        if (req.hook_program && req.request.max_layers.is_some())
+            || (req.lora_program && req.request.max_layers.is_some())
+            // AC-1: a lane on BOTH window axes is the PQ-tree class.
+            || (req.request.has_user_mask && req.request.max_layers.is_some())
             || req.request.token_ids.len() > ordered.len()
             || req
                 .request
@@ -148,8 +155,22 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
             }
         }
     }
-    let split = ordered.len() - truncated;
-    if ordered[split..]
+    // AC-1 order [plain | truncated | masked]: the truncated block is a
+    // MIDDLE window ending where the masked suffix starts; every member
+    // after it must be masked (full-depth), every truncated member
+    // contiguous. dsplit = the block's start; its end derives from the
+    // mask word driver-side.
+    // AC-4/AC-5: the full-depth suffix behind the truncated middle may
+    // hold hooked lanes then masked lanes (the seriation's order) —
+    // both are full-depth. The driver's stash window anchors on the
+    // mask word when present, the hook word otherwise.
+    let masked_tail = ordered
+        .iter()
+        .rev()
+        .take_while(|r| r.request.has_user_mask || r.hook_program)
+        .count();
+    let split = ordered.len() - masked_tail - truncated;
+    if ordered[split..ordered.len() - masked_tail]
         .iter()
         .any(|r| r.request.max_layers.is_none())
     {
@@ -174,7 +195,13 @@ fn planned_unmasked_prefix_wire_rows(
     ordered: &[Box<PendingRequest>],
     row_indptr: &[u32],
 ) -> u32 {
-    if ordered.iter().any(|req| req.hook_program || req.lora_program)
+    // AC-4: hooks no longer suppress the plan either — the order is
+    // [plain | truncated | hooked | masked], so the mask window is
+    // still the suffix and hooked lanes sit in the unmasked prefix. A
+    // lane on BOTH axes (a masked hook program) remains the refusal.
+    if ordered
+        .iter()
+        .any(|req| req.hook_program && req.request.has_user_mask)
         || !ordered.iter().any(|req| req.request.has_user_mask)
     {
         return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
@@ -561,8 +588,13 @@ pub(crate) fn build_frame_submission(
                 order.sort_by_key(|&i| {
                     (
                         group[i].request.device_resolved_geometry,
-                        group[i].hook_program,
                         group[i].request.has_user_mask,
+                        group[i].hook_program,
+                        // STRUCTURAL S-2 (found by AC-0: the lora x
+                        // depth pair PANICKED this parity assert — the
+                        // reference comparator must carry every
+                        // seriation term the plan's key carries).
+                        group[i].request.max_layers.is_some(),
                     )
                 });
                 order
@@ -638,6 +670,16 @@ pub(crate) fn build_frame_submission(
             merged_plan.max_layers = group
                 .iter()
                 .find_map(|r| r.request.max_layers);
+        } else if let Some(k) = group[0].request.max_layers {
+            // The uniform half of the PQ-tree cell: when EVERY member
+            // shares one truncation, the fire-level layer bound cuts
+            // every row — mask-compatible (the attention arms operate
+            // inside [0, k) unchanged) — so a declined SPLIT must not
+            // silently drop the members' k (found by the arc-78 probe:
+            // the wire merge discards per-member max_layers).
+            if group.iter().all(|r| r.request.max_layers == Some(k)) {
+                merged_plan.max_layers = Some(k);
+            }
         }
         steps.push(StepSubmission {
             plan: merged_plan,

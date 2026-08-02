@@ -121,9 +121,13 @@ void LlamaLikeModel::body(Workspace& ws,
         (!in.has_write_desc ||
          (in.w_page_d != nullptr && in.w_off_d != nullptr)) &&
         in.runtime_window_left == -2 &&
-        // STRUCTURAL v0 (S-1): truncated fires walk the hand-written
-        // body (the depth peel is the declared legs' recorded rung).
-        in.max_layers == 0xffffffffu &&
+        // STRUCTURAL S-4: truncated fires walk the declared trace when
+        // the DECLARATION states the depth axis for the fire's shape
+        // (pure-decode only; a truncated lane's prefill keeps the
+        // hand-written body).
+        (in.max_layers == 0xffffffffu ||
+         (in.is_pure_decode && declared_.decode &&
+          declared_.decode.view().depth_window != 0)) &&
         // The trace committed to the fused QKV binding; a workspace without
         // the packed buffer cannot honour it (same availability check the
         // hand-written `use_fused_qkv` makes).
@@ -147,7 +151,9 @@ void LlamaLikeModel::body(Workspace& ws,
             in.peel_window_d,
             in.unmasked_prefix_rows,
             in.mask_suffix_qo_indptr_d,
-            in.mask_suffix_kv_page_indptr_d);
+            in.mask_suffix_kv_page_indptr_d,
+            in.max_layers,
+            in.full_depth_rows);
         return;
     }
     llama_like_forward_paged(

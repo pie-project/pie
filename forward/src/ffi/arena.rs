@@ -472,6 +472,7 @@ pub fn build(plan: &ForwardPlan) -> PieForwardPlan {
         names,
         name_bytes,
         compiler_version: super::compiler_version(),
+        depth_window: u8::from(plan.depth_window),
         owner,
     }
 }

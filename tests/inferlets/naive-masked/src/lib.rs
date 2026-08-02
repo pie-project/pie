@@ -40,6 +40,14 @@ struct Input {
     ///                assembles wire rows + causal fill host-side
     #[serde(default = "default_mask_mode")]
     mask_mode: String,
+    /// STRUCTURAL: run only the first k layers (fire-level uniform
+    /// truncation — composes with every mask mode).
+    #[serde(default)]
+    max_layers: Option<u32>,
+    /// Step-logit probe: emit reduce_max(logits) per decode step into
+    /// `lg` — the fingerprint the state-effect oracle diffs.
+    #[serde(default)]
+    logit_probe: bool,
 }
 
 fn default_prompt() -> String {
@@ -68,6 +76,8 @@ struct Output {
     mask_mode: String,
     text: String,
     count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    lg: Vec<f32>,
 }
 
 /// One sampling step: temperature, then a Gumbel-max draw over the full vocab.
@@ -88,13 +98,20 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let mask_mode = input.mask_mode.clone();
+    let probe = input.logit_probe;
+    let mut lg: Vec<f32> = Vec::new();
     if !matches!(
         mask_mode.as_str(),
         "none" | "dense" | "structured" | "dense-prefill" | "dense-prefill-hole"
+            | "doc-isolation"
     ) {
         return Err(format!("unknown mask_mode: {mask_mode}"));
     }
-    let masked = matches!(mask_mode.as_str(), "dense" | "structured");
+    let masked = matches!(
+        mask_mode.as_str(),
+        "dense" | "structured" | "doc-isolation"
+    );
+
     let structured = mask_mode == "structured";
     let masked_prefill = matches!(mask_mode.as_str(), "dense-prefill" | "dense-prefill-hole");
     // The hole: knock column 1 out of the causal envelope for rows p >= 2.
@@ -110,6 +127,7 @@ async fn main(input: Input) -> Result<Output> {
             mask_mode,
             text: String::new(),
             count: 0,
+            lg: Vec::new(),
         });
     }
 
@@ -118,6 +136,11 @@ async fn main(input: Input) -> Result<Output> {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
+    // The first REAL mask policy through the spatial path: RAG document
+    // isolation — the prompt's first half is a "retrieved document" the
+    // decode queries must NOT attend to; the second half plus everything
+    // generated stays visible.
+    let doc_start: u32 = if mask_mode == "doc-isolation" { n / 2 } else { 0 };
     let pool_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
     let pool_len = pool_pages * page_size;
     let slots = ws
@@ -168,6 +191,9 @@ async fn main(input: Input) -> Result<Output> {
         });
 
         let fwd_p = ForwardPass::new();
+        if let Some(k) = input.max_layers {
+            fwd_p.set_max_layers(k)?;
+        }
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
@@ -211,13 +237,23 @@ async fn main(input: Input) -> Result<Output> {
         let klen = Channel::from(vec![n + 1; 1]).named("klen");
         let w_slot = Channel::from(vec![slot_n; 1]).named("w_slot");
         let w_off = Channel::from(vec![n % page_size; 1]).named("w_off");
-        // Causal row for the fire-0 query at position n: attend all j <= n.
-        let seed_mask: Vec<bool> = (0..pool_len).map(|j| j <= n).collect();
+        // Causal row for the fire-0 query at position n: attend all j <= n
+        // (doc-isolation additionally blocks j < doc_start).
+        let seed_mask: Vec<bool> =
+            (0..pool_len).map(|j| j >= doc_start && j <= n).collect();
         let mask = Channel::from_shaped([1, pool_len], seed_mask).named("mask");
+        let doc_row = Channel::from_shaped(
+            [pool_len],
+            (0..pool_len).map(|j| j >= doc_start).collect::<Vec<bool>>(),
+        )
+        .named("doc_row");
         let pages = Channel::from(pool_ids.clone()).named("pages");
         let page_indptr =
             Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
         let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
+        let lg_out = Channel::new([1], dtype::f32)
+            .capacity(8)
+            .named("lg_out");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
@@ -225,6 +261,9 @@ async fn main(input: Input) -> Result<Output> {
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
 
         let fwd = ForwardPass::new();
+        if let Some(k) = input.max_layers {
+            fwd.set_max_layers(k)?;
+        }
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
@@ -245,6 +284,9 @@ async fn main(input: Input) -> Result<Output> {
             let r = rng.take();
 
             let logits = intrinsics::logits();
+            if probe {
+                lg_out.put(&reduce_max(&logits));
+            }
             let token = step(logits, temperature, &r);
             let r_next = add(&r, iota(2));
 
@@ -274,6 +316,17 @@ async fn main(input: Input) -> Result<Output> {
                     let base_b = broadcast(reshape(&base, [1]), [pool_len]);
                     reshape(le(&col, &base_b), [1, pool_len])
                 };
+                // doc-isolation: AND the static document-boundary row in
+                // (a seeded channel read — the causal half evolves, the
+                // document block is a constant of the request).
+                let new_mask = if doc_start > 0 {
+                    reshape(
+                        and(&reshape(new_mask, [pool_len]), &doc_row.read()),
+                        [1, pool_len],
+                    )
+                } else {
+                    new_mask
+                };
                 mask.take();
                 mask.put(&new_mask);
             }
@@ -301,6 +354,14 @@ async fn main(input: Input) -> Result<Output> {
                 .get::<i32>()
                 .await
                 .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+            if probe {
+                let v = lg_out
+                    .take()
+                    .get::<f32>()
+                    .await
+                    .map_err(|e| format!("lg_out.take: {e}"))?[0];
+                lg.push(v);
+            }
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })
@@ -313,5 +374,6 @@ async fn main(input: Input) -> Result<Output> {
         mask_mode,
         text: wit_model::decode(&generated)?,
         count: generated.len(),
+        lg,
     })
 }

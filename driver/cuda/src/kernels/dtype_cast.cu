@@ -369,4 +369,40 @@ void launch_gptq_dequant_to_bf16(
         size_k, size_n, group_size);
 }
 
+namespace {
+
+__global__ void scale_rows_bf16_kernel(
+    __nv_bfloat16* buf,
+    const __nv_bfloat16* l,
+    int rows,
+    int width)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int r = blockIdx.y * blockDim.y + threadIdx.y;
+    if (r >= rows || c >= width) return;
+    const std::size_t i =
+        static_cast<std::size_t>(r) * width + c;
+    buf[i] = __float2bfloat16(
+        __bfloat162float(buf[i]) * __bfloat162float(l[c]));
+}
+
+}  // namespace
+
+void launch_scale_rows_bf16(
+    void*         buf_bf16,
+    const void*   l_bf16,
+    int           rows,
+    int           width,
+    cudaStream_t  stream)
+{
+    if (rows == 0 || width == 0) return;
+    constexpr int BX = 128, BY = 2;
+    const dim3 block(BX, BY);
+    const dim3 grid((width + BX - 1) / BX, (rows + BY - 1) / BY);
+    scale_rows_bf16_kernel<<<grid, block, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(buf_bf16),
+        static_cast<const __nv_bfloat16*>(l_bf16),
+        rows, width);
+}
+
 }  // namespace pie_cuda_driver::kernels

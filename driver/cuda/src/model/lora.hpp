@@ -79,6 +79,13 @@ struct LoraLaneView {
     std::uint32_t rank = 0;
     std::uint32_t d_in = 0;
     std::uint32_t d_out = 0;
+
+    /// The adapter FORM (the per-site rung's expression classes): the
+    /// sink's ARITY selects it — 3 args = low-rank `y += B(Ax)` (`a`/`b`
+    /// live, rank/d_in real), 2 args = SCALE `y = l ⊙ y` (IA3: `a`
+    /// holds the l vector `[num_layers, d_out]`, `b` null, rank/d_in 0).
+    enum class Form : std::uint32_t { LowRank = 0, Scale = 1 };
+    Form form = Form::LowRank;
 };
 
 /// The launch's resolved lora configuration: one entry per lane whose program
