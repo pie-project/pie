@@ -100,14 +100,38 @@ fn discover_gguf_file(snapshot_dir: &Path) -> Option<PathBuf> {
     ggufs.into_iter().next()
 }
 
-/// Parse a checkpoint directory's headers into a [`CheckpointMetadata`],
-/// picking the on-disk format (safetensors, else GGUF). Only headers are read;
-/// bulk tensor bytes are never mapped.
-pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, Error> {
-    if let Some(gguf) = discover_gguf_file(snapshot_dir)
-        && snapshot_dir.is_file()
+/// The single `.zt` checkpoint for a snapshot directory, if present.
+fn discover_zt_file(snapshot_dir: &Path) -> Option<PathBuf> {
+    if snapshot_dir.is_file()
+        && snapshot_dir
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zt"))
     {
-        return parse_gguf_checkpoint(&gguf);
+        return Some(snapshot_dir.to_path_buf());
+    }
+    let named = snapshot_dir.join("model.zt");
+    named.is_file().then_some(named)
+}
+
+/// Parse a checkpoint's headers into a [`CheckpointMetadata`]. Only headers
+/// are read; bulk tensor bytes are never mapped.
+///
+/// The reader is chosen by what is on disk, in the order a snapshot is likely
+/// to hold it: a `.zt` artifact (what `pie model optimize` writes), else the
+/// canonical HF safetensors layout, else GGUF. Formats beyond those three —
+/// `.pt`, `.npz`, `.h5`, `.onnx` — are read through [`zt::parse_checkpoint`]
+/// when named directly, since a snapshot directory has no convention for
+/// them.
+pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, Error> {
+    if let Some(zt) = discover_zt_file(snapshot_dir) {
+        return crate::checkpoint::zt::parse_checkpoint(&zt);
+    }
+    if snapshot_dir.is_file() {
+        if let Some(gguf) = discover_gguf_file(snapshot_dir) {
+            return parse_gguf_checkpoint(&gguf);
+        }
+        // A file that is not GGUF or `.zt`: let the projections identify it.
+        return crate::checkpoint::zt::parse_checkpoint(snapshot_dir);
     }
     // Safetensors takes precedence — it is the canonical HF snapshot format and
     // the C++ loader opens it first.
