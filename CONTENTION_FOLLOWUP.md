@@ -7633,3 +7633,138 @@ Handling the overflow is therefore the mechanism, not a fallback to one. The
 remaining work on this axis is to make the overflow rarer — §20.46 showed
 that breaking the fleet's synchronised retirement removes 80% of the
 starvation events without touching the pool — not to predict it.
+
+## 20.48 SGLang joins the comparison, and two harness defects that had to be fixed before its numbers meant anything
+
+The ledger had two engines in it. This section adds a third, SGLang 0.5.16,
+under the same contract the other two already run under: byte-identical
+prompts, a byte-identical arrival schedule, and a token-for-token identical KV
+budget. Getting to a number that could be quoted took two fixes, and both of
+them would have produced a *flattering* result for pie if they had been left
+alone. That is the reason they are written up ahead of the table.
+
+### The harness could not express the workload
+
+`benches/sglang_bench.py` predated the mixed-phase and output-spread shapes.
+It built one `sampling` dict and handed it to a single blocking
+`engine.generate(prompts, sampling)`, so:
+
+- every request got the same `max_new_tokens`. `P`, `M` and `Xs` are defined
+  by *unequal* per-request budgets, so those shapes could not be run at all;
+- there was no arrival pacing, so the `--arrival-rate` cells could not be run;
+- there was no streaming, so TTFT and inter-token gaps did not exist.
+
+It is rewritten to mirror the vLLM `tput` path exactly: `async_generate` with
+`stream=True`, an `ArrivalPacer`, and all requests offered at t=0 with the cap
+enforced engine-side by `max_running_requests` — the same vantage decision
+recorded at `vllm_bench.py:491`, and for the same reason (a client-side
+semaphore would stop the TTFT clock during queueing that pie's clock counts).
+
+The per-request budgets are built for **every absolute prompt index** and then
+sliced with the *same* `[warmup:]` slice as the prompts. This is deliberate
+paranoia: §20.45 invalidated all eight `M` cells because vLLM's harness indexed
+prompts absolutely and sampling params by measured-window index, so an odd
+`--warmup` flipped the mixed-phase parity. Building both from one index makes
+that class of bug unrepresentable rather than merely absent.
+
+### Defect 1: `max_total_tokens` is a cap, not a pin
+
+pie is given `--total-pages 8192` and vLLM `--num-gpu-blocks-override 8192
+--block-size 16`; both mean exactly 131072 KV tokens. SGLang's analogue is
+`max_total_tokens`, and it does **not** pin: SGLang takes the minimum of it and
+whatever `mem_fraction_static` leaves over, and says nothing at all when the
+memory-derived figure is the smaller one.
+
+At `mem_fraction_static=0.55` a requested 131072 silently became **123964** —
+a 5.4% KV handicap that would have been read as a throughput result. At 0.62
+the cap binds and the pool is exactly 131072.
+
+`build_engine` now asks the engine what it actually built
+(`get_server_info()["max_total_num_tokens"]`) and exits if it is not what was
+requested. A KV budget that is 5% short is not a slower engine.
+
+### Defect 2: SGLang caps decode CUDA graphs at batch 32 on this GPU
+
+The first full batch had SGLang at **7869 tok/s** on `Ds`/c128 against pie's
+23100 — a factor of 2.9. A 2.9x loss for a mature engine on plain decode is not
+a result, it is a bug, and the first suspect was our own harness.
+
+**Hypothesis 1 — the streamed vantage.** SGLang's `Engine` ships every token
+over ZMQ to a separate detokenizer process, so `stream=True` is not the nearly
+free vantage it is for vLLM's in-process `AsyncLLM`. `Ds` is also the
+highest-token-rate shape in the suite, which fits: the overhead would bite
+hardest exactly where it was measured. **Refuted.** Streamed 8382 vs
+non-streamed 8799 tok/s on the same workload — 5%, not 190%.
+
+**Hypothesis 2 — the log line nobody reads.** `Capturing batches (bs=32 ...)`,
+at a concurrency of 128. `server_args.py:4413-4421` keys the decode CUDA-graph
+ceiling off *total GPU memory*:
+
+| GPU memory | decode `max_bs`, tp<4 |
+|---|---|
+| < 20 GiB | 8 |
+| < 35 GiB | 24 |
+| **< 60 GiB (L40S is here)** | **32** |
+| < 90 GiB | 256 |
+
+So every decode batch above 32 ran eager. On a 0.6B model at batch 128, decode
+is entirely kernel-launch bound and that is the whole difference. Setting
+`--sglang-cuda-graph-max-bs 128` took the same workload from **8799 to 22310
+tok/s, a factor of 2.5**.
+
+This knob is now set to the cell's concurrency. The alternative — quoting
+SGLang at its shipped default — would have measured a hardware-tier constant
+tuned for large models on L40-class parts, not the engine. vLLM captures up to
+`max_num_seqs` and pie handles its own batch sizes, so leaving SGLang alone
+would have been the same category of error as the withdrawn `M` cells: a
+number that is real, reproducible, and about the wrong thing.
+
+(vLLM also failed to start in that first batch — `SWEEP_VLLM_MEM_UTIL` was left
+at 0.90 while a foreign tenant held 18 GiB. The sweep's default is now 0.55,
+which the harness comment already records as 0.20% from 0.90 on `X`/c128:
+5707 against 5696.)
+
+### The three-engine table
+
+ABBA generalises to `pie, vllm, sglang, sglang, vllm, pie`, which keeps every
+engine at the same mean position in the cell so linear drift still cancels.
+All three cells below carry `warnings: []`, 0 failures, and prompt/output token
+counts that are **identical to the token** across all three engines.
+
+| shape | pie | vLLM | SGLang | pie/vLLM | pie/SGLang |
+|---|---|---|---|---|---|
+| `Ds`/c128 — decode-heavy, short context | **22978** | 22388 | 22514 | **1.026** | **1.021** |
+| `P`/c128 — prefill-heavy | 3408 | **4147** | 3804 | 0.822 | 0.896 |
+| `X`/c256 — prefix-heavy, pool 152% oversubscribed | 4937 | 5675 | **5699** | 0.870 | 0.866 |
+
+TTFT p50 (ms) on the same runs: `Ds` 12390 / 11956 / 12371; `P` 10591 / 6345 /
+7594; `X` 11413 / 8575 / 10554 (pie / vLLM / SGLang).
+
+Reproducibility within a cell: SGLang's two runs differ by 0.01–0.08%, vLLM's
+by 0.05–0.5%, pie's by 0.3–1.5%. pie remains the noisiest of the three, which
+is why only ABBA cells are quotable for it.
+
+### What the third engine changes
+
+It separates *pie's* problems from *the shape's* problems, which two engines
+could not do.
+
+- **`Ds`: pie's win is real and it is over both.** 1.026 over vLLM and 1.021
+  over SGLang, with vLLM and SGLang within 0.6% of each other. Two independent
+  engines agreeing on the same number is much stronger evidence that pie's
+  decode path is genuinely ahead than one comparison was.
+- **`P`: prefill-heavy is not purely a pie defect.** SGLang loses to vLLM here
+  too (0.917), so some of the gap belongs to the shape. But pie loses to
+  SGLang as well (0.896), so most of it does not. The ordering vLLM > SGLang >
+  pie, with TTFT p50 6.3 s / 7.6 s / 10.6 s in the same order, says pie is last
+  on its own merits. The duty-cycle measurement — a lane holds a request for
+  610 ms of which only ~258 ms is compute, and a lane cannot run ahead past
+  its own prefill — remains the live explanation.
+- **`X`/c256: the KV-oversubscription loss is pie-specific.** SGLang (5699) and
+  vLLM (5675) land within 0.4% of each other while pie is 13% behind both.
+  Under a pool at 152% of demand, the two engines with an unbounded waiting
+  queue and step-level admission agree; the engine with a per-request lane does
+  not. This is the cleanest evidence yet that the deficit is structural to the
+  lane model and not a kernel or a tuning constant.
+
+`M` remains withdrawn and unmeasured on all three engines.

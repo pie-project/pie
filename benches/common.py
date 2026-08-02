@@ -502,6 +502,36 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--sglang-attention-backend", default=None)
     p.add_argument("--sglang-sampling-backend", default=None)
+    p.add_argument(
+        "--sglang-max-total-tokens",
+        type=int,
+        default=None,
+        help="Pin SGLang's KV pool to this many tokens. The cross-engine "
+             "analogue of pie's `--total-pages P` and vLLM's "
+             "`--num-gpu-blocks-override P --block-size B`: without it the "
+             "pool is sized from --gpu-mem-util and the three engines are "
+             "not given the same KV budget.",
+    )
+    p.add_argument(
+        "--sglang-page-size",
+        type=int,
+        default=None,
+        help="SGLang KV page size in tokens. Defaults to SGLang's own "
+             "default (1). Set to 16 to match vLLM's --block-size and pie's "
+             "page granularity so internal fragmentation is comparable too.",
+    )
+    p.add_argument(
+        "--sglang-cuda-graph-max-bs",
+        type=int,
+        default=None,
+        help="Largest decode batch SGLang captures a CUDA graph for. "
+             "SGLang's default is a hardware-tier heuristic keyed on total "
+             "GPU memory (32 on an L40S at tp<4), so a decode batch of 128 "
+             "runs eager and a small model loses most of its throughput to "
+             "launch overhead. vLLM captures up to max_num_seqs, so leaving "
+             "this at SGLang's default measures the heuristic, not the "
+             "engine. Set it to the concurrency.",
+    )
     p.add_argument("--sglang-disable-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--sglang-disable-piecewise-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
