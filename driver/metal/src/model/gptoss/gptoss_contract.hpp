@@ -109,6 +109,135 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
     return "layers." + std::string(layer) + "." + std::string(tail.substr(dot + 1));
 }
 
+/// Declare the experts the way the PUBLISHED checkpoint stores them.
+///
+/// Three things separate this from `mlx_lm`'s conversion of the same weights,
+/// and all three are why the experts cannot go through the generic loop:
+///
+///  * **The gate and up projections are one fused tensor, interleaved.**
+///    `gate_up_proj` holds gate at the even rows and up at the odd ones (HF's
+///    `gate_up[..., ::2]` and `[..., 1::2]`), so each half is a strided read
+///    rather than a slice, and one source tensor becomes two runtime ones.
+///  * **They are MXFP4**, stored as `_blocks` of E2M1 nibbles under `_scales`
+///    of E8M0 exponents, which no kernel here reads. They are decoded to values
+///    and re-encoded as the affine-U4 the matvecs do read -- the same two steps
+///    `mlx_lm convert --dequantize` then `-q` performs, done at load time
+///    instead of offline.
+///  * **The biases follow the same fusion**, so they split the same way.
+///
+/// `declared` counts up so the caller's "found no decoder tensors" check still
+/// sees these.
+inline void declare_mxfp4_experts(ModelContract& out, const std::vector<SourceTensor>& tensors,
+                                  std::size_t& declared) {
+    using namespace pie::metal::model::contract_detail;
+    constexpr std::string_view kBlocks = "_blocks";
+
+    const auto find = [&tensors](const std::string& name) -> const SourceTensor* {
+        for (const SourceTensor& raw : tensors) {
+            if (raw.name == name) return &raw;
+        }
+        return nullptr;
+    };
+
+    for (const SourceTensor& blocks : tensors) {
+        if (!ends_with(blocks.name, kBlocks)) continue;
+        const std::string base =
+            std::string(blocks.name.substr(0, blocks.name.size() - kBlocks.size()));
+        const SourceTensor* scales = find(base + "_scales");
+        if (scales == nullptr) {
+            fail("Metal GptOss: '" + std::string(blocks.name) +
+                 "' is an MXFP4 block tensor with no '_scales' beside it");
+        }
+        // `[experts, rows, groups, 16]` of nibbles against `[experts, rows,
+        // groups]` of exponents. The 16 is the block's bytes and is the one axis
+        // the two do not share.
+        if (blocks.shape.size() != 4 || scales->shape.size() != 3 || blocks.shape[3] != 16 ||
+            blocks.shape[0] != scales->shape[0] || blocks.shape[1] != scales->shape[1] ||
+            blocks.shape[2] != scales->shape[2]) {
+            fail("Metal GptOss: MXFP4 tensor '" + std::string(blocks.name) +
+                 "' is not shaped [experts, rows, groups, 16] against its scales");
+        }
+        const std::int64_t experts = blocks.shape[0];
+        const std::int64_t stored_rows = blocks.shape[1];
+        const std::int64_t cols = blocks.shape[2] * 32;
+
+        const std::optional<std::string> mapped = runtime_name(base);
+        if (!mapped.has_value()) continue;
+        const bool fused = ends_with(base, "gate_up_proj");
+        if (!fused && !ends_with(base, "down_proj")) {
+            fail("Metal GptOss: MXFP4 tensor '" + std::string(blocks.name) +
+                 "' is neither the fused gate/up projection nor the down projection");
+        }
+        // `layers.N.mlp.experts.gate_up_proj` -> `layers.N.mlp.experts.`
+        const std::string prefix =
+            mapped->substr(0, mapped->size() - (fused ? 12u : 9u));
+        const SourceTensor* bias = find(base + "_bias");
+
+        struct Half {
+            const char* name;
+            std::int64_t start;
+        };
+        const std::vector<Half> halves =
+            fused ? std::vector<Half>{{"gate_proj", 0}, {"up_proj", 1}}
+                  : std::vector<Half>{{"down_proj", 0}};
+        const std::int64_t rows = fused ? stored_rows / 2 : stored_rows;
+
+        // Decoded whole and split afterwards is not available: a strided read of
+        // a computed buffer is not lowered. So the split happens where a stride
+        // IS lowered -- on the source extent -- and each half is published as
+        // the plain bytes it is before anything reinterprets it, because a
+        // transmute that changes the element width may only rename a whole
+        // tensor. Both restrictions are satisfied by the same two steps, in this
+        // order: select, publish, then reinterpret the published name.
+        for (const Half& half : halves) {
+            const std::string name = prefix + half.name;
+            const auto select = [&](const std::string& source, std::int64_t axis_len,
+                                    std::vector<std::int64_t> shape,
+                                    const std::string& as) -> pie_loader::Node {
+                out.define(as,
+                           fused ? out.stride(out.src(source), /*axis=*/1, half.start, axis_len,
+                                              /*step=*/2)
+                                 : out.src(source),
+                           pie_loader::raw(PieLoaderDType::U8))
+                    .expect(std::move(shape))
+                    .internal();
+                return out.out(as);
+            };
+            const std::int64_t groups = blocks.shape[2];
+            const pie_loader::Node half_blocks =
+                select(std::string(blocks.name), rows, {experts, rows, groups, 16},
+                       name + ".mxfp4_blocks");
+            const pie_loader::Node half_scales =
+                select(std::string(scales->name), rows, {experts, rows, groups},
+                       name + ".mxfp4_exponents");
+
+            const std::vector<std::int64_t> shape{experts * rows, cols};
+            out.define(name + ".dequantized",
+                       mxfp4_values(out, half_blocks, half_scales, experts * rows, cols,
+                                    name + ".mxfp4_scales"),
+                       pie_loader::raw(PieLoaderDType::BF16))
+                .expect(shape)
+                .internal();
+            push_encoded_affine(out, out.out(name + ".dequantized"), experts * rows, cols,
+                                name + ".weight");
+            if (bias != nullptr) {
+                if (bias->shape.size() != 2 || bias->shape[0] != experts ||
+                    bias->shape[1] != stored_rows) {
+                    fail("Metal GptOss: '" + std::string(bias->name) +
+                         "' does not match the projection it biases");
+                }
+                out.define(name + ".bias",
+                           fused ? out.stride(out.src(std::string(bias->name)), /*axis=*/1,
+                                              half.start, rows, /*step=*/2)
+                                 : out.src(std::string(bias->name)),
+                           bias->encoding)
+                    .expect(std::vector<std::int64_t>{experts, rows});
+            }
+            ++declared;
+        }
+    }
+}
+
 }  // namespace contract_detail
 
 /// The `model_type` strings whose decoder this schema describes.
@@ -140,6 +269,15 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
 
     std::size_t declared = 0;
     for (const SourceTensor& raw : tensors) {
+        // The published checkpoint's MXFP4 experts are consumed as a pair and
+        // declared from the `_blocks` half, so the `_scales` half is not a
+        // tensor of its own here. `runtime_name` is not asked about either: the
+        // names they produce are the split projections', which no per-tensor
+        // mapping can state.
+        if (ends_with(raw.name, "_scales") || ends_with(raw.name, "_blocks") ||
+            ends_with(raw.name, "_bias")) {
+            continue;
+        }
         std::optional<std::string> output = runtime_name(raw.name);
         if (!output.has_value()) {
             continue;
@@ -196,11 +334,25 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                      std::to_string(bits) + "-bit, and only 4 and 8 are described here");
             }
             push_mlx_affine_stacked(out, raw, *scales, *biases, bits, std::move(*output));
+        } else if (ends_with(raw.name, ".weight") && raw.shape.size() == 2 &&
+                   is_raw(raw.encoding, PieLoaderDType::BF16)) {
+            // A projection the published checkpoint left in BF16. gpt-oss ships
+            // only its experts quantized, so the attention projections, the
+            // router, the embedding and the head arrive as values -- and every
+            // one of them is read by a quantized matvec here, so the loader
+            // quantizes them on the way in.
+            //
+            // Rank is what separates these from the norms, which are also
+            // `.weight` and also BF16 and must stay values: a norm is a vector,
+            // and there is no such thing as quantizing one under this scheme.
+            push_encoded_affine(out, out.src(std::string(raw.name)), raw.shape[0], raw.shape[1],
+                                std::move(*output));
         } else {
             push_direct(out, raw, std::move(*output));
         }
         ++declared;
     }
+    contract_detail::declare_mxfp4_experts(out, tensors, declared);
     if (declared == 0) {
         fail("Metal GptOss schema found no decoder tensors");
     }
