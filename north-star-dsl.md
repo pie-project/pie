@@ -121,9 +121,20 @@ peepholes, eligibility predicates, thresholds.
    fused predicate are deleted; the switch dispatches on op kind + stated
    variant only. Parity: byte-identical to the current executor on the
    full battery (which is itself byte-identical to hand-written).
-3. **Static C++ emission**: a Rust emitter walks the class trace and
-   writes the generated `.cpp` the driver builds — the proof of "statically
-   convertible". Parity: generated ≡ interpreter ≡ hand-written.
+3. **Static C++ emission** — DONE (2026-08-02): `emit_cuda.rs` walks the
+   class traces and writes `generated/qwen3_0_6b.inc` (committed,
+   regeneration-clean-tested) — 4.5k lines of straight-line C++, one
+   statement per op, the XQA-or-not question answered at emission, the
+   layer loop unrolled to `w.layers[17]`. The driver runs it under
+   `PIE_DECLARED_FORWARD_GENERATED=1` iff its live facts digest equals
+   the constant the file embeds; mismatch falls back to the interpreter,
+   loudly. Parity proven three ways on L40S: hand-written ≡ interpreter ≡
+   generated, byte-identical. The digest mechanism paid for itself on its
+   first run: the "measured" cuda-facts fixture had guessed xqa=true and
+   tied=true; the live digest said xqa0/te0, and the mismatch print — not
+   a human — caught it. The remaining runtime `if`s in the generated file
+   (has_write_desc, compact logits, gate_up binding) are transliterated
+   interpreter arms over runtime INPUTS, listed in declared_forward.hpp.
 4. **qwen3_5**: same treatment; the 16 executor arms and the GDN
    three-way choice move into the declaration's class arms; thresholds
    become `Guard`.

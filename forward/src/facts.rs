@@ -267,15 +267,25 @@ pub struct LlamaLikeCudaFacts {
 }
 
 impl LlamaLikeCudaFacts {
-    /// Qwen3-0.6B on L40S, default env (measured 2026-08-02, boot with
-    /// `PIE_DECLARED_FORWARD_TRACE=1`): gqa = 2 in the decode set, XQA
-    /// supported (head_dim 128, page 32, no window) and on by default,
-    /// fused post live (native bf16, unpadded, no bias), rope table
-    /// allocated. To be boot-validated against the driver's own
-    /// derivation when the dumb interpreter lands (migration rung 2).
+    /// Qwen3-0.6B on L40S, default env — MEASURED 2026-08-02 against the
+    /// driver's own derivation via the rung-3 digest print
+    /// (`PIE_DECLARED_FORWARD_TRACE=1` + `..._GENERATED=1`; the live
+    /// digest is the provenance):
+    /// `.../qk1/fq1/te0/xqa0/dfp1/rt1/fpp0`.
+    ///
+    /// `xqa_decode: false` — the first version of this constructor
+    /// guessed `true` from the geometry and called it measured; the
+    /// digest mechanism caught the lie on its first live run
+    /// (`fwd_cfg.use_xqa_decode` derives false on this deployment).
+    /// The decode class therefore states the FlashInfer decode kernel.
+    /// Note the deployment's BINDING also unties the lm_head
+    /// (`w.lm_head != w.embed`, live `te0`) even though the checkpoint's
+    /// config ties it — the model-facts fixture [`LlamaLikeFacts::qwen3_0_6b`]
+    /// keeps the config-level fact for the semantic goldens; emission
+    /// against the live deployment overrides it (`emit-cuda`).
     pub fn qwen3_0_6b_l40s() -> Self {
         Self {
-            xqa_decode: true,
+            xqa_decode: false,
             decode_fused_post: true,
             rope_table: true,
             force_prefill_path: false,

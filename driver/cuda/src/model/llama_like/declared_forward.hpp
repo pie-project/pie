@@ -81,6 +81,7 @@
 // entirely and reduce Stage 3's parity claim to the prefill step.
 
 #include <cstdint>
+#include <string>
 
 #include "model/llama_like/llama_like.hpp"
 #include "pie_forward/plan.hpp"
@@ -103,6 +104,10 @@ struct LlamaLikeDeclaredPlan {
     pie_forward::ForwardPlan plan;
     pie_forward::ForwardPlan decode;
     pie_forward::ForwardPlan prefill;
+    // What the class traces were taken from, in the format the generated
+    // .inc embeds (`emit_cuda::facts_digest`); rung 3's dispatch runs the
+    // static form only on exact match.
+    std::string facts_digest;
     // The binding fact the traces were taken against; the per-fire gate
     // re-checks it against the workspace (`ws.qkv_fused` may be empty even
     // when the weight is bound) and falls back on mismatch.

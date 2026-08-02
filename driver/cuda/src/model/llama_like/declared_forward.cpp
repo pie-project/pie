@@ -142,6 +142,24 @@ void validate_stated_kernels(const pie_forward::ForwardPlan& plan) {
     }
 }
 
+// Rung 3 (north-star-dsl.md): the static C++ form of the class traces,
+// emitted by `cargo run -p pie-forward --bin emit-cuda` and committed.
+// Uses the helpers above (require, make_weight_view); the digest constant
+// it defines names the deployment it was emitted from, and the dispatch
+// in `llama_like_forward_declared` runs it only on exact match.
+#include "model/llama_like/generated/qwen3_0_6b.inc"
+
+// PIE_DECLARED_FORWARD_GENERATED=1 routes digest-matched fires through
+// the generated static form instead of the interpreter walk — the third
+// leg of the parity proof (hand-written ≡ interpreter ≡ generated).
+bool generated_forward_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_DECLARED_FORWARD_GENERATED");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 LlamaLikeDeclaredPlan build_llama_like_declared_plan(
@@ -272,6 +290,29 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // registry fails at model load, not mid-fire.
     validate_stated_kernels(out.decode);
     validate_stated_kernels(out.prefill);
+
+    // The digest naming what these traces were taken from — the same
+    // format `pie_forward::emit_cuda::facts_digest` embeds in the
+    // generated .inc (one format, two printers; the three-way parity gate
+    // holds them together). A generated TU runs only on exact match.
+    out.facts_digest =
+        "llama_like/h" + std::to_string(facts.hidden) +
+        "/l" + std::to_string(facts.layers) +
+        "/qh" + std::to_string(facts.q_heads) +
+        "/kvh" + std::to_string(facts.kv_heads) +
+        "/hd" + std::to_string(facts.head_dim) +
+        "/i" + std::to_string(facts.intermediate) +
+        "/v" + std::to_string(facts.vocab) +
+        "/rope" + std::to_string(facts.rope) +
+        "/nv" + std::to_string(facts.norm_variant) +
+        "/np" + std::to_string(facts.norm_placement) +
+        "/qk" + std::to_string(facts.qk_norm) +
+        "/fq" + std::to_string(facts.fused_qkv) +
+        "/te" + std::to_string(facts.tied_embeddings) +
+        "/xqa" + std::to_string(cuda.xqa_decode) +
+        "/dfp" + std::to_string(cuda.decode_fused_post) +
+        "/rt" + std::to_string(cuda.rope_table) +
+        "/fpp" + std::to_string(cuda.force_prefill_path);
     return out;
 }
 
@@ -304,6 +345,32 @@ void llama_like_forward_declared(
     bool has_write_desc,
     int runtime_window_left)
 {
+    // Rung 3: the static form, when opted in and emitted for exactly this
+    // deployment. Byte-for-byte the same launches as the interpreter walk
+    // below — the parity gate's third leg proves it — with every choice
+    // resolved at EMISSION time instead of at walk time.
+    if (generated_forward_enabled() &&
+        declared.facts_digest != kGeneratedForDigest &&
+        std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
+        // Silent non-engagement is this path's failure mode; say why.
+        std::fprintf(stderr,
+                     "[declared-forward-generated] digest mismatch:\n"
+                     "  live:    %s\n  emitted: %s\n",
+                     declared.facts_digest.c_str(), kGeneratedForDigest);
+    }
+    if (generated_forward_enabled() &&
+        declared.facts_digest == kGeneratedForDigest) {
+        (is_pure_decode ? generated_llama_like_decode
+                        : generated_llama_like_prefill)(
+            w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
+            token_ids, positions, qo_indptr,
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            qo_indptr_h, kv_page_indptr_h,
+            total_tokens, num_requests,
+            logit_row_indices_d, num_logit_rows,
+            w_page_d, w_off_d, row_valid_d, has_write_desc);
+        return;
+    }
     // Rung 2: the fire's class picks its trace, and the trace states every
     // kernel — nothing below derives a path (north-star-dsl.md).
     const pie_forward::ForwardPlan& plan =

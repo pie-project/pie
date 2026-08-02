@@ -50,6 +50,7 @@
 //!   llama_like, its layer schedule a static match over the facts.
 
 pub mod dsl;
+pub mod emit_cuda;
 pub mod facts;
 pub mod family;
 pub mod ffi;
