@@ -111,6 +111,7 @@ def under_load(
 ) -> dict[str, Any]:
     """Fill the mask while the host is busy, which is the only state it is in."""
     import engrain
+    import engrain.internals
     import xgrammar as xg
     from transformers import AutoTokenizer
 
@@ -120,7 +121,7 @@ def under_load(
     vocabulary = load_vocabulary(model)
     instance = load_corpus()[schema_index]
 
-    ours = engrain.Compiler(vocabulary).compile_json_schema(instance["schema"])
+    ours = engrain.internals.Compiler(vocabulary).compile_json_schema(instance["schema"])
     info = xg.TokenizerInfo.from_huggingface(tokenizer, vocab_size=len(tokenizer))
     theirs = xg.GrammarCompiler(info).compile_json_schema(instance["schema"])
 
@@ -207,7 +208,7 @@ def capturability(model: str, schema_index: int, batch: int) -> Answer:
     vocabulary = load_vocabulary(model)
     instance = load_corpus()[schema_index]
 
-    ours = engrain.Compiler(vocabulary).compile_json_schema(instance["schema"])
+    ours = engrain.internals.Compiler(vocabulary).compile_json_schema(instance["schema"])
     device_batch = DeviceBatch(DeviceGrammar(ours), batch)
     device_batch.set_batch_configurations(
         {index: ours.matcher().configurations() for index in range(batch)}

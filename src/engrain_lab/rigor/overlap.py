@@ -68,6 +68,7 @@ def measure(
     model: str, schema_index: int, batch: int, repeats: int, warmup: int
 ) -> dict[str, Any]:
     import engrain
+    import engrain.internals
     import xgrammar as xg
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -81,7 +82,7 @@ def measure(
     network = AutoModelForCausalLM.from_pretrained(model, dtype=torch.bfloat16).cuda()
     network.eval()
 
-    compiled = engrain.Compiler(vocabulary).compile_json_schema(instance["schema"])
+    compiled = engrain.internals.Compiler(vocabulary).compile_json_schema(instance["schema"])
     device_grammar = DeviceGrammar(compiled)
     device_batch = DeviceBatch(device_grammar, batch)
     import random

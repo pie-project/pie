@@ -41,7 +41,7 @@ class CompiledGrammar:
     """Tables for one grammar, against one vocabulary."""
 
     @property
-    def approximations(self) -> list[str]:
+    def relaxations(self) -> list[str]:
         """Exactly what this grammar does not enforce, and empty when nothing.
 
         A mask may admit more than the grammar allows and never less, so a

@@ -26,24 +26,60 @@ except Exception:  # noqa: BLE001
     HAS_CUDA = False
 
 try:
-    import engrain
+    import support
 
     HAS_ENGRAIN = True
 except Exception:  # noqa: BLE001
     HAS_ENGRAIN = False
 
-INSTANCES = Path(__file__).resolve().parents[1] / "results" / "jsonschemabench-instances.json"
+INSTANCES = (
+    Path(__file__).resolve().parents[1] / "results" / "jsonschemabench-instances.json"
+)
 
 # Enough vocabulary to make the token-to-terminal mapping non-trivial without
 # pulling a tokenizer in: the pieces a JSON document is actually made of, plus
 # multi-character tokens that span several terminals and one that can be read
 # two ways.
 VOCABULARY = [
-    b"{", b"}", b"[", b"]", b":", b",", b'"', b" ", b"  ", b"\\n",
-    b'{"', b'":', b'","', b'":"', b'"}', b"true", b"false", b"null",
-    b"0", b"1", b"2", b"12", b"123", b"-", b".", b"e",
-    b"a", b"b", b"c", b"name", b"id", b"value", b"items",
-    b'"name"', b'"id"', b'"a"', b'"b"', b"ab", b"abc",
+    b"{",
+    b"}",
+    b"[",
+    b"]",
+    b":",
+    b",",
+    b'"',
+    b" ",
+    b"  ",
+    b"\\n",
+    b'{"',
+    b'":',
+    b'","',
+    b'":"',
+    b'"}',
+    b"true",
+    b"false",
+    b"null",
+    b"0",
+    b"1",
+    b"2",
+    b"12",
+    b"123",
+    b"-",
+    b".",
+    b"e",
+    b"a",
+    b"b",
+    b"c",
+    b"name",
+    b"id",
+    b"value",
+    b"items",
+    b'"name"',
+    b'"id"',
+    b'"a"',
+    b'"b"',
+    b"ab",
+    b"abc",
 ]
 
 
@@ -54,7 +90,6 @@ def _requirements():
         raise unittest.SkipTest("engrain is not built")
 
 
-
 # A differential run compares the two backends on the host, so nothing in it
 # can be recorded into a graph. Tests whose subject *is* the recording have
 # nothing to say in that mode.
@@ -62,6 +97,7 @@ NEEDS_CAPTURE = unittest.skipIf(
     os.environ.get("ENGRAIN_BACKEND", "").strip().lower() == "differential",
     "differential mode compares on the host and cannot capture",
 )
+
 
 class DeviceParserAgreement(unittest.TestCase):
     """The device mask equals the CPU matcher's, step by step."""
@@ -71,7 +107,7 @@ class DeviceParserAgreement(unittest.TestCase):
         from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = engrain.Compiler(VOCABULARY)
+        self.compiler = support.Compiler(VOCABULARY)
 
     def _walk(self, schema, document: bytes):
         """Feed `document` a token at a time, checking the mask at every step."""
@@ -111,7 +147,9 @@ class DeviceParserAgreement(unittest.TestCase):
 
             accepted = matcher.accept_token(token)
             batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
-            self.assertTrue(accepted, f"the matcher refused its own document at {steps}")
+            self.assertTrue(
+                accepted, f"the matcher refused its own document at {steps}"
+            )
             self.assertEqual(
                 sorted((s, tuple(k)) for s, k in matcher.configurations()),
                 sorted((s, tuple(k)) for s, k in batch.configurations(0)),
@@ -216,11 +254,19 @@ class MixedGrammarBatch(unittest.TestCase):
         from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = engrain.Compiler(VOCABULARY)
+        self.compiler = support.Compiler(VOCABULARY)
         self.schemas = [
-            {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+            {
+                "type": "object",
+                "properties": {"a": {"type": "integer"}},
+                "required": ["a"],
+            },
             {"type": "array", "items": {"type": "integer"}},
-            {"type": "object", "properties": {"b": {"type": "string"}}, "required": ["b"]},
+            {
+                "type": "object",
+                "properties": {"b": {"type": "string"}},
+                "required": ["b"],
+            },
         ]
         self.pool = [
             self.compiler.compile_json_schema(json.dumps(schema))
@@ -267,7 +313,6 @@ class MixedGrammarBatch(unittest.TestCase):
         self.assertFalse(torch.equal(masks[0], masks[1]))
 
     @NEEDS_CAPTURE
-
     def test_one_graph_serves_any_assignment(self):
         """A CUDA graph is a fixed sequence of launches.
 
@@ -280,14 +325,18 @@ class MixedGrammarBatch(unittest.TestCase):
         first = [0, 1, 2, 0, 1, 2]
         batch.set_grammars(first)
         matchers = [self.pool[first[i]].matcher(0) for i in range(6)]
-        batch.set_batch_configurations({i: matchers[i].configurations() for i in range(6)})
+        batch.set_batch_configurations(
+            {i: matchers[i].configurations() for i in range(6)}
+        )
         batch.fill_mask()
         batch.capture()
 
         second = [2, 2, 1, 1, 0, 0]
         batch.set_grammars(second)
         matchers = [self.pool[second[i]].matcher(0) for i in range(6)]
-        batch.set_batch_configurations({i: matchers[i].configurations() for i in range(6)})
+        batch.set_batch_configurations(
+            {i: matchers[i].configurations() for i in range(6)}
+        )
         replayed = batch.fill_mask().cpu()
 
         reference = torch.zeros(grammar.mask_words, dtype=torch.int32)
@@ -316,7 +365,7 @@ class RandomWalkAgreement(unittest.TestCase):
         from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = engrain.Compiler(VOCABULARY)
+        self.compiler = support.Compiler(VOCABULARY)
 
     def _walk(self, schema, walks=8, length=25):
         import random
@@ -402,7 +451,7 @@ class Rollback(unittest.TestCase):
         from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = engrain.Compiler(VOCABULARY)
+        self.compiler = support.Compiler(VOCABULARY)
         self.schema = {
             "type": "object",
             "properties": {"name": {"type": "string"}, "id": {"type": "integer"}},
@@ -490,7 +539,6 @@ class Rollback(unittest.TestCase):
         self.assertTrue(torch.equal(batch.fill_mask()[0].cpu(), reference))
 
     @NEEDS_CAPTURE
-
     def test_the_history_survives_a_captured_advance(self):
         """The advance keeps history from inside a CUDA graph.
 
@@ -551,11 +599,19 @@ class GrammarPool(unittest.TestCase):
         from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = engrain.Compiler(VOCABULARY)
+        self.compiler = support.Compiler(VOCABULARY)
         self.schemas = [
-            {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+            {
+                "type": "object",
+                "properties": {"a": {"type": "integer"}},
+                "required": ["a"],
+            },
             {"type": "array", "items": {"type": "integer"}},
-            {"type": "object", "properties": {"b": {"type": "string"}}, "required": ["b"]},
+            {
+                "type": "object",
+                "properties": {"b": {"type": "string"}},
+                "required": ["b"],
+            },
             {"type": "array", "items": {"type": "boolean"}},
         ]
 
@@ -588,7 +644,6 @@ class GrammarPool(unittest.TestCase):
         self.assertTrue(self._mask_matches(pool, batch, [0, 1, 2, 3], compiled))
 
     @NEEDS_CAPTURE
-
     def test_a_graph_survives_admission_into_spare_capacity(self):
         pool = self.DeviceGrammar()
         compiled = [self._compile(0), self._compile(1)]
@@ -597,7 +652,9 @@ class GrammarPool(unittest.TestCase):
         batch = pool.new_batch(2)
         batch.set_grammars([0, 1])
         matchers = [compiled[i].matcher(0) for i in (0, 1)]
-        batch.set_batch_configurations({i: m.configurations() for i, m in enumerate(matchers)})
+        batch.set_batch_configurations(
+            {i: m.configurations() for i, m in enumerate(matchers)}
+        )
         batch.fill_mask()
         batch.capture()
         before = pool.revision
@@ -633,7 +690,6 @@ class GrammarPool(unittest.TestCase):
         )
 
     @NEEDS_CAPTURE
-
     def test_a_recorded_graph_is_not_replayed_after_compaction(self):
         pool = self.DeviceGrammar()
         compiled = [self._compile(index) for index in range(3)]
@@ -642,7 +698,9 @@ class GrammarPool(unittest.TestCase):
         batch = pool.new_batch(2)
         batch.set_grammars([1, 2])
         matchers = [compiled[i].matcher(0) for i in (1, 2)]
-        batch.set_batch_configurations({i: m.configurations() for i, m in enumerate(matchers)})
+        batch.set_batch_configurations(
+            {i: m.configurations() for i, m in enumerate(matchers)}
+        )
         batch.fill_mask()
         batch.capture()
         self.assertEqual(batch.recorded, pool.revision)
@@ -651,7 +709,9 @@ class GrammarPool(unittest.TestCase):
         remap = pool.compact()
         self.assertNotEqual(batch.recorded, pool.revision)
         self.assertTrue(
-            self._mask_matches(pool, batch, [remap[1], remap[2]], [compiled[1], compiled[2]])
+            self._mask_matches(
+                pool, batch, [remap[1], remap[2]], [compiled[1], compiled[2]]
+            )
         )
 
 
@@ -668,7 +728,7 @@ class DraftWalk(unittest.TestCase):
         _requirements()
         from engrain._engine import DeviceGrammar
 
-        self.compiler = engrain.Compiler(VOCABULARY)
+        self.compiler = support.Compiler(VOCABULARY)
         self.compiled = self.compiler.compile_json_schema(
             json.dumps(
                 {
@@ -688,7 +748,6 @@ class DraftWalk(unittest.TestCase):
         )
 
     @NEEDS_CAPTURE
-
     def test_every_position_agrees_with_the_matcher(self):
         batch = 4
         pieces = [b'{"', b"name", b'":', b'"']
@@ -712,11 +771,12 @@ class DraftWalk(unittest.TestCase):
                 )
 
     @NEEDS_CAPTURE
-
     def test_the_walk_leaves_the_parse_where_it_found_it(self):
         device = self.pool.new_batch(2)
         matcher = self.compiled.matcher(0)
-        device.set_batch_configurations({row: matcher.configurations() for row in (0, 1)})
+        device.set_batch_configurations(
+            {row: matcher.configurations() for row in (0, 1)}
+        )
         before = [sorted(device.configurations(row)) for row in (0, 1)]
         device.capture_draft(3)
         device.walk_draft(self._draft([b'{"', b"name", b'":'], 2))
@@ -724,7 +784,6 @@ class DraftWalk(unittest.TestCase):
         self.assertEqual(before, after)
 
     @NEEDS_CAPTURE
-
     def test_a_draft_the_grammar_refuses_does_not_poison_the_rest(self):
         """A rejected position must not leave the sequence broken."""
         batch = 2
@@ -756,7 +815,7 @@ class PrecomputedVerdicts(unittest.TestCase):
         from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = engrain.Compiler(VOCABULARY)
+        self.compiler = support.Compiler(VOCABULARY)
 
     def _compiled(self, schema):
         return self.compiler.compile_json_schema(json.dumps(schema))
@@ -764,7 +823,11 @@ class PrecomputedVerdicts(unittest.TestCase):
     def test_a_pool_without_a_table_everywhere_turns_the_shortcut_off(self):
         pool = self.DeviceGrammar()
         item = self._compiled(
-            {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"],
+            }
         )
         pool.admit(item)
         # A grammar whose table was abandoned, faked by admitting one that has
@@ -773,7 +836,9 @@ class PrecomputedVerdicts(unittest.TestCase):
         tables.has_verdicts = 0
         pool.admit(tables)
         self.assertEqual(
-            pool.has_verdicts, 0, "one grammar without a table must disable the shortcut"
+            pool.has_verdicts,
+            0,
+            "one grammar without a table must disable the shortcut",
         )
         pool.admit(self._compiled({"type": "array", "items": {"type": "integer"}}))
         self.assertEqual(pool.has_verdicts, 0, "and it must not come back")
@@ -819,7 +884,7 @@ class ArenaPaging(unittest.TestCase):
         from engrain._engine import DeviceGrammar
 
         self.DeviceGrammar = DeviceGrammar
-        self.compiler = engrain.Compiler(VOCABULARY)
+        self.compiler = support.Compiler(VOCABULARY)
 
     def _schema(self, index):
         # Distinguishable, and different enough in size that a hole left by one
@@ -866,7 +931,6 @@ class ArenaPaging(unittest.TestCase):
         self.assertEqual(keep[2], 2, "the survivors must keep their identifiers")
 
     @NEEDS_CAPTURE
-
     def test_a_recorded_graph_survives_churn(self):
         """The property the whole design is for.
 
@@ -942,11 +1006,15 @@ class ArenaPaging(unittest.TestCase):
         pool.release(big)
         for identifier in small:
             pool.release(identifier)
-        self.assertEqual(pool.dead_fraction, 0.0, "freeing everything should leave no holes")
+        self.assertEqual(
+            pool.dead_fraction, 0.0, "freeing everything should leave no holes"
+        )
         self.assertEqual(sum(pool._used.values()), 0)
         again = pool.admit(self._compile(3))
         self.assertEqual(
-            sum(pool._extent[again].get(name, (0, 0))[1] for name in pool._extent[again]),
+            sum(
+                pool._extent[again].get(name, (0, 0))[1] for name in pool._extent[again]
+            ),
             size,
         )
 
@@ -967,7 +1035,7 @@ class CorpusAgreement(unittest.TestCase):
         # vocabulary lives in the benchmark, and a unit test should not download
         # a model.
         vocabulary = [bytes([value]) for value in range(256)]
-        compiler = engrain.Compiler(vocabulary)
+        compiler = support.Compiler(vocabulary)
         checked = 0
         for instance in instances[:3]:
             compiled = compiler.compile_json_schema(instance["schema"])
@@ -992,8 +1060,6 @@ class CorpusAgreement(unittest.TestCase):
         self.assertGreater(checked, 0)
 
 
-
-
 class FusedStep(unittest.TestCase):
     """The advance and the next fill as one graph.
 
@@ -1004,13 +1070,12 @@ class FusedStep(unittest.TestCase):
     """
 
     @NEEDS_CAPTURE
-
     def test_a_fused_step_masks_what_the_two_graphs_mask(self):
         import torch
 
         from engrain._engine import DeviceGrammar, DeviceBatch
 
-        compiler = engrain.Compiler([bytes([b]) for b in range(256)])
+        compiler = support.Compiler([bytes([b]) for b in range(256)])
         grammar = compiler.compile_json_schema(
             json.dumps(
                 {
@@ -1088,7 +1153,7 @@ class SizedForTheMachine(unittest.TestCase):
     def test_a_narrow_grammar_is_not_charged_for_a_wide_one(self):
         from engrain._engine import DeviceBatch, DeviceGrammar
 
-        compiler = engrain.Compiler([bytes([b]) for b in range(256)])
+        compiler = support.Compiler([bytes([b]) for b in range(256)])
         grammar = compiler.compile_json_schema(
             json.dumps({"type": "object", "properties": {"a": {"type": "integer"}}})
         )

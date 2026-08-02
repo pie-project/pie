@@ -19,3 +19,4 @@
 #include "memo.cuh"
 #include "fused.cuh"
 #include "compact.cuh"
+#include "apply.cuh"

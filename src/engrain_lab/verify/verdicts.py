@@ -16,11 +16,12 @@ import sys
 import numpy as np
 
 import engrain
+import engrain.internals
 
 
 def main() -> None:
     vocabulary = [bytes([b]) for b in range(256)]
-    compiler = engrain.Compiler(vocabulary)
+    compiler = engrain.internals.Compiler(vocabulary)
     schema = json.dumps({
         "type": "object",
         "properties": {"name": {"type": "string"}, "id": {"type": "integer"}},

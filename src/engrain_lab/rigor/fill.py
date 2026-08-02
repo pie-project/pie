@@ -55,6 +55,7 @@ def main() -> None:
     arguments = parser.parse_args()
 
     import engrain
+    import engrain.internals
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(arguments.model)
@@ -68,7 +69,7 @@ def main() -> None:
 
     instances = json.loads(arguments.instances.read_text())["instances"]
     schema = instances[arguments.schema_index]["schema"]
-    compiled = engrain.Compiler(vocabulary).compile_json_schema(schema)
+    compiled = engrain.internals.Compiler(vocabulary).compile_json_schema(schema)
     grammar = DeviceGrammar(compiled)
 
     print(

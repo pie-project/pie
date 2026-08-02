@@ -36,6 +36,7 @@ def _capture_is_possible() -> bool:
 
 def main() -> None:
     import engrain
+    import engrain.internals
     from transformers import AutoTokenizer
 
     from engrain._engine import DeviceGrammar
@@ -53,7 +54,7 @@ def main() -> None:
             vocabulary.append(b"")
 
     instances = json.loads(INSTANCES.read_text())["instances"]
-    compiler = engrain.Compiler(vocabulary)
+    compiler = engrain.internals.Compiler(vocabulary)
 
     pool = []
     chosen = []

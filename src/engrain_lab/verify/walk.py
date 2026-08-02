@@ -32,6 +32,7 @@ def allowed_tokens(row: torch.Tensor, vocabulary: int) -> list[int]:
 
 def main() -> None:
     import engrain
+    import engrain.internals
     from transformers import AutoTokenizer
 
     from engrain._engine import DeviceGrammar
@@ -87,7 +88,7 @@ def main() -> None:
         ]
     else:
         instances = json.loads(INSTANCES.read_text())["instances"]
-    compiler = engrain.Compiler(vocabulary)
+    compiler = engrain.internals.Compiler(vocabulary)
     rng = random.Random(20260727)
 
     total_steps = 0

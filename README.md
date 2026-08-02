@@ -44,56 +44,65 @@ python -m engrain_lab.rigor.latency       # the step, against XGrammar and llgui
 ## Use
 
 ```python
-import engrain, torch
+import engrain
 
-engine = engrain.Engine(vocabulary)            # bytes per token id
-grammar = engine.compile_json_schema(schema)      # or compile_regex(...)
+engine  = engrain.Engine(vocabulary)          # bytes per token id
+grammar = engine.compile(json_schema=schema)  # or regex=..., or ebnf=...
 
-batch = engine.batch(size=64)
-batch.set_grammars([grammar] * 64)
+slots = engine.slots(64)
+slots.admit(0, grammar)                       # a request arrives
 
-batch.capture()                                   # record the graphs, once
-
-while decoding:
-    mask = batch.step(sampled)                    # advance + fill, one replay
-    logits.masked_fill_(...)                      # your sampler
+while slots:
+    logits  = model(...)
+    tokens  = slots.sample(logits)            # the constraint is applied here
+    verdict = slots.commit(tokens)            # advance; the next mask is ready
+    slots.release(finished)                   # a request leaves
 ```
 
-`step` is `advance` then `fill_mask` as a single recording, which is the path a
-decode loop wants: only the sample sits between a fill and the advance that
-follows it, and nothing at all sits between that advance and the next fill.
-The two are also available separately.
+There is no `capture()` to remember: the first step records the graph and every
+step after replays it, with no host work and no synchronisation. The recording
+stays valid however slots are reassigned between steps, which is what makes it
+composable with a serving engine's own captured decode step.
 
-After `capture()`, all three are graph replays: no host work, no
-synchronisation, and the recording stays valid however the batch's grammars are
-reassigned between steps. That is what makes it composable with the engine's
-own captured decode step.
+### Slots, not a batch
 
-### Sampling from the set instead of the mask
+The rectangle is not an implementation detail, it is what makes the step
+capturable, so it is the thing you are given. `admit` puts a request in a slot
+and `release` takes it out — which is what continuous batching does, and what an
+API that resets the whole batch cannot express. Slots may hold different
+grammars, and the step is still one launch.
 
-A vocabulary-wide mask is the wrong shape for what reads it. At a structural
-position a schema admits a few hundred of a hundred and fifty thousand tokens,
-and the sampler that follows sorts and normalises all of them anyway.
+### What the grammar does not enforce
 
 ```python
-ids, counts, kind = batch.shortlist()             # all on the device
+grammar = engine.compile(json_schema=schema)
+if grammar.relaxations:
+    ...    # validate the finished document against exactly these
 ```
 
-`kind[i]` is 0 when `ids[i]` names what row `i` *admits* and 1 when it names
-what it *forbids* — whichever list is shorter, decided on the device, because
-a caller choosing for itself would have to read a count on the host.
+The mask may admit more than the source allows and never less. `relaxations`
+says, in words, which keywords this grammar stopped enforcing and why — and is
+empty when there is nothing to check. A constrained decoder that widens a
+schema without saying so is the failure this list exists to prevent.
 
-Measured on Qwen3's vocabulary at batch 512, against applying the mask to every
-row: **2.68x when every row is sparse, 1.05x when half are dense**, and 0.86x
-for the sync-free alternative of sampling both ways and selecting. The step
-distribution is bimodal — half of all steps admit under four thousand tokens
-and half admit nearly everything — so a mixed batch, which is what continuous
-batching gives, sits near parity. Acting on `kind` still costs one host
+### Handing the constraint to a sampler you do not own
+
+```python
+slots.apply(logits)      # -inf on every forbidden token, in place
+mask = slots.mask()      # or the packed bitmask itself, (slots, words)
+```
+
+Underneath, the allowed set is a device object rather than a mask on its way
+from the host, which is what would let a sampler read a few hundred candidates
+instead of a hundred and fifty thousand. Measured on Qwen3's vocabulary at
+batch 512 against applying the mask to every row: **2.68x when every row is
+sparse, 1.05x when half are dense**, and 0.86x for the sync-free alternative.
+The step distribution is bimodal — half of all steps admit under four thousand
+tokens and half admit nearly everything — so a mixed batch, which is what
+continuous batching gives, sits near parity. Acting on it still costs one host
 synchronisation, because a sampler's output shape is its row count. The set
-being resident is necessary and not sufficient.
-
-A batch may hold sequences under different grammars — which is what a serving
-batch looks like, since requests bring their own — and it is still one launch.
+being resident is necessary and not sufficient, and `sample` will change when a
+sampler accepts a device-side row count.
 
 ### Checking it
 
@@ -104,12 +113,18 @@ against it rather than trusted:
 matcher = grammar.matcher(0)
 reference = torch.zeros(engine.mask_words, dtype=torch.int32)
 matcher.fill_bitmask(reference)
-assert torch.equal(batch.fill_mask()[0].cpu(), reference)
+assert torch.equal(slots.mask()[0].cpu(), reference)
 ```
 
-`batch.problems()` returns `(terminated, overflow)` per sequence. `overflow`
-means a ceiling was reached and the mask that follows may be *narrower* than the
-grammar allows. Narrowing is the one failure this engine must never do quietly.
+`commit` returns a `Verdict`: `terminated` when the parser refused the token a
+slot was given, and `narrowed` when a ceiling was reached and the next mask may
+be *narrower* than the grammar allows. Narrowing is the one failure this engine
+must never commit quietly, so it is reported rather than absorbed. Both are
+device tensors; `verdict.ok` is the moment you choose to synchronise.
+
+The layers underneath — the compiler, the pool, the arena, the batch and its
+graph — are `engrain.internals`, and reaching for them is a statement that you
+want to make those decisions yourself.
 
 ## What it supports
 

@@ -166,9 +166,10 @@ def over_acceptance(
 ) -> tuple[list[Answer], list[WalkOutcome]]:
     """Generate under each engine's mask, then check with a real validator."""
     import engrain
+    import engrain.internals
     import jsonschema
 
-    our_compiler = engrain.Compiler(BYTE_VOCABULARY)
+    our_compiler = engrain.internals.Compiler(BYTE_VOCABULARY)
 
     engines: dict[str, Any] = {"engrain": None}
     bitmask = None
@@ -332,7 +333,7 @@ def mask_agreement(
 
     info = xg.TokenizerInfo.from_huggingface(tokenizer, vocab_size=len(tokenizer))
     xgrammar_compiler = xg.GrammarCompiler(info)
-    our_compiler = engrain.Compiler(vocabulary)
+    our_compiler = engrain.internals.Compiler(vocabulary)
 
     steps = 0
     identical = 0

@@ -94,7 +94,7 @@ pub struct Compiled {
     pub precision: Precision,
     /// What this grammar does not enforce, so the caller knows what a
     /// downstream check still has to do.
-    pub approximations: Vec<String>,
+    pub relaxations: Vec<String>,
 }
 
 /// What this grammar does not enforce, given the level it settled on and the
@@ -110,7 +110,7 @@ pub struct Compiled {
 /// allows it cannot also know no other branch does; `uniqueItems` compares an
 /// item with every earlier one, which is not a property of the prefix. Both
 /// are decidable on the finished document and cheap there.
-fn approximations(schema: &str, precision: Precision) -> Vec<String> {
+fn relaxations(schema: &str, precision: Precision) -> Vec<String> {
     let mut found = Vec::new();
     let Ok(value) = serde_json::from_str::<serde_json::Value>(schema) else {
         return found;
@@ -230,7 +230,7 @@ pub fn compile_json_schema(
                 return Ok(Compiled {
                     artifact,
                     precision,
-                    approximations: approximations(schema, precision),
+                    relaxations: relaxations(schema, precision),
                 });
             }
             // Report the last level's failure: it is the one that had the

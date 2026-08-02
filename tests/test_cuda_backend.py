@@ -85,7 +85,6 @@ class AKernelReachesTheDevice(unittest.TestCase):
             self._launch("en_no_such_kernel", self.count, 0)
 
 
-
 class TheDifferentialHarnessCanFail(unittest.TestCase):
     """A comparison that has never failed is a comparison nobody has tested.
 
@@ -101,16 +100,18 @@ class TheDifferentialHarnessCanFail(unittest.TestCase):
             raise unittest.SkipTest("no CUDA device")
         import json
 
-        import engrain
+        import support
 
         vocabulary = [bytes([i]) for i in range(256)]
-        self.engine = engrain.Engine(vocabulary)
+        self.engine = support.Engine(vocabulary)
         self.grammar = self.engine.compile_json_schema(
-            json.dumps({
-                "type": "object",
-                "properties": {"a": {"type": "string"}},
-                "required": ["a"],
-            })
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                    "required": ["a"],
+                }
+            )
         )
 
     def _batch_that_disagrees(self, path, field):
@@ -198,7 +199,6 @@ class TheBackendIsSelectable(unittest.TestCase):
         self.assertIsInstance(_engine.ported(), frozenset)
 
 
-
 class TheArenaStructDescribesThePool(unittest.TestCase):
     """Twenty-six pointers, packed by Python, read by a kernel.
 
@@ -218,9 +218,9 @@ class TheArenaStructDescribesThePool(unittest.TestCase):
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import engrain
+        import support
 
-        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
+        self.engine = support.Engine([bytes([i]) for i in range(256)])
         # Three different shapes, so a base that happened to be zero for one
         # grammar cannot hide a wrong field.
         self.grammars = [
@@ -305,12 +305,14 @@ class TheArenaStructDescribesThePool(unittest.TestCase):
         # the same event that invalidates a recorded graph.
         for size in range(4, 40):
             self.engine.compile_json_schema(
-                json.dumps({
-                    "type": "object",
-                    "properties": {
-                        f"p{n}": {"type": "string"} for n in range(size)
-                    },
-                })
+                json.dumps(
+                    {
+                        "type": "object",
+                        "properties": {
+                            f"p{n}": {"type": "string"} for n in range(size)
+                        },
+                    }
+                )
             )
             if self.pool.revision != revision:
                 break
@@ -319,7 +321,6 @@ class TheArenaStructDescribesThePool(unittest.TestCase):
             bool(torch.equal(self.pool.arena_struct(), held)),
             "the struct still holds the addresses from before the pool moved",
         )
-
 
 
 class TheCudaLocateAgreesWithTriton(unittest.TestCase):
@@ -337,9 +338,9 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import engrain
+        import support
 
-        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
+        self.engine = support.Engine([bytes([i]) for i in range(256)])
         self.grammars = [
             self.engine.compile_json_schema(json.dumps(schema))
             for schema in (
@@ -371,15 +372,34 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
 
         raw.found.fill_(_engine._NO_GROUP)
         _engine._locate_kernel[(raw.sweep_blocks,)](
-            grammar.group_offsets, grammar.group_set_kind, grammar.group_set_offset,
-            grammar.group_set_length, grammar.set_payload, grammar.verdict_offsets,
-            grammar.verdicts, grammar.verdict_stride, raw.lexer_state, raw.stack,
-            raw.depth, raw.config_count, raw.widest, raw.token, raw.grammar_of,
-            grammar.bases, raw.live_offsets, raw.found, raw.old_lexer,
-            raw.old_count, raw.old_stack,
-            ROWS=rows, CONFIGS=raw.configs, GROUP_BLOCK=_engine._GROUP_BLOCK,
-            SEARCH_STEPS=grammar.search_steps, STACK_STRIDE=grammar.max_stack,
-            HAS_VERDICTS=grammar.has_verdicts, NO_GROUP=_engine._NO_GROUP,
+            grammar.group_offsets,
+            grammar.group_set_kind,
+            grammar.group_set_offset,
+            grammar.group_set_length,
+            grammar.set_payload,
+            grammar.verdict_offsets,
+            grammar.verdicts,
+            grammar.verdict_stride,
+            raw.lexer_state,
+            raw.stack,
+            raw.depth,
+            raw.config_count,
+            raw.widest,
+            raw.token,
+            raw.grammar_of,
+            grammar.bases,
+            raw.live_offsets,
+            raw.found,
+            raw.old_lexer,
+            raw.old_count,
+            raw.old_stack,
+            ROWS=rows,
+            CONFIGS=raw.configs,
+            GROUP_BLOCK=_engine._GROUP_BLOCK,
+            SEARCH_STEPS=grammar.search_steps,
+            STACK_STRIDE=grammar.max_stack,
+            HAS_VERDICTS=grammar.has_verdicts,
+            NO_GROUP=_engine._NO_GROUP,
             VOCAB=grammar.vocab_size,
         )
         torch.cuda.synchronize()
@@ -432,7 +452,6 @@ class TheCudaLocateAgreesWithTriton(unittest.TestCase):
         self.assertEqual(int(raw.found[0]), _engine._NO_GROUP)
 
 
-
 class TheCudaCommitAgreesWithTriton(unittest.TestCase):
     """`en_commit` against `_commit_kernel`, on candidates a real advance made.
 
@@ -448,9 +467,9 @@ class TheCudaCommitAgreesWithTriton(unittest.TestCase):
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import engrain
+        import support
 
-        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
+        self.engine = support.Engine([bytes([i]) for i in range(256)])
         self.grammars = [
             self.engine.compile_json_schema(json.dumps(schema))
             for schema in (
@@ -487,9 +506,7 @@ class TheCudaCommitAgreesWithTriton(unittest.TestCase):
             for index in range(sequences):
                 allowed = self.grammars[index % 3].matcher(0).allowed_tokens()
                 tokens.append(allowed[step % len(allowed)] if allowed else 0)
-            raw.token.copy_(
-                torch.tensor(tokens, dtype=torch.int32, device="cuda")
-            )
+            raw.token.copy_(torch.tensor(tokens, dtype=torch.int32, device="cuda"))
             raw._advance_prepare_triton(grammar, raw.batch * raw.configs)
             torch.cuda.synchronize()
             candidates += int(raw.cand_count.sum())
@@ -530,7 +547,6 @@ class TheCudaCommitAgreesWithTriton(unittest.TestCase):
         self.assertGreater(int(raw.config_count[0]), 0)
 
 
-
 class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
     """`en_candidate` against `_candidate_kernel`.
 
@@ -550,9 +566,9 @@ class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import engrain
+        import support
 
-        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
+        self.engine = support.Engine([bytes([i]) for i in range(256)])
         self.grammars = [
             self.engine.compile_json_schema(json.dumps(schema))
             for schema in (
@@ -609,9 +625,7 @@ class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
                 for index in range(sequences):
                     allowed = matchers[index].allowed_tokens()
                     tokens.append(allowed[step % len(allowed)] if allowed else 0)
-                raw.token.copy_(
-                    torch.tensor(tokens, dtype=torch.int32, device="cuda")
-                )
+                raw.token.copy_(torch.tensor(tokens, dtype=torch.int32, device="cuda"))
                 raw._count_and_scan(
                     grammar, rows, raw.live_counts, raw.live_offsets, skip=0, unit=1
                 )
@@ -676,7 +690,6 @@ class TheCudaCandidateAgreesWithTriton(unittest.TestCase):
         )
 
 
-
 class TheCudaMaskSweepAgreesWithTriton(unittest.TestCase):
     """`en_mask` against `_mask_kernel`, over real parse states.
 
@@ -692,9 +705,9 @@ class TheCudaMaskSweepAgreesWithTriton(unittest.TestCase):
             raise unittest.SkipTest("no CUDA device or no kernels in this build")
         import json
 
-        import engrain
+        import support
 
-        self.engine = engrain.Engine([bytes([i]) for i in range(256)])
+        self.engine = support.Engine([bytes([i]) for i in range(256)])
         self.grammars = [
             self.engine.compile_json_schema(json.dumps(schema))
             for schema in (
@@ -757,9 +770,7 @@ class TheCudaMaskSweepAgreesWithTriton(unittest.TestCase):
                 for index in range(sequences):
                     allowed = matchers[index].allowed_tokens()
                     tokens.append(allowed[step % len(allowed)] if allowed else 0)
-                raw.token.copy_(
-                    torch.tensor(tokens, dtype=torch.int32, device="cuda")
-                )
+                raw.token.copy_(torch.tensor(tokens, dtype=torch.int32, device="cuda"))
                 raw._advance_triton()
                 torch.cuda.synchronize()
                 for index in range(sequences):

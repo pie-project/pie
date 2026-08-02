@@ -1,86 +1,103 @@
 """engrain - constrained decoding whose parser state lives on the GPU.
 
-A constrained decoder has to answer one question at every step: which of the
-model's tokens may come next? Every deployed system answers it on the host,
-which means the answer cannot be inside the CUDA graph a serving engine records
-for its decode step - a graph holds device work, and host work put inside it
-does not go in at all. This library moves the parser onto the device so that it
-can.
+A constrained decoder answers one question at every step: which of the model's
+tokens may come next? Every deployed system answers it on the host, which means
+the answer cannot be inside the CUDA graph a serving engine records for its
+decode step - a graph holds device work, and host work put inside it does not
+go in at all. This library moves the parser onto the device so that it can.
 
-The shortest useful program:
+The whole of a decode loop:
 
-    import engrain, torch
+    import engrain
 
-    engine = engrain.Engine(vocabulary)          # bytes per token id
-    grammar = engine.compile_json_schema(schema)    # or compile_regex(...)
+    engine  = engrain.Engine(vocabulary)          # bytes per token id
+    grammar = engine.compile(json_schema=schema)
 
-    batch = engine.batch(size=64)
-    batch.set_grammars([grammar] * 64)
+    slots = engine.slots(64)
+    slots.admit(0, grammar)                       # a request arrives
 
-    mask = batch.fill_mask()                        # (64, words) on the device
-    batch.advance(sampled_tokens)                   # (64,) on the device
+    while slots:
+        logits  = model(...)
+        tokens  = slots.sample(logits)            # the constraint is applied here
+        verdict = slots.commit(tokens)            # advance; next mask is ready
+        slots.release(finished)                   # a request leaves
 
-    # Or skip the vocabulary-wide mask entirely and sample from the set:
-    ids, counts = batch.allowed()                  # (64, cap), (64,) on device
+There is no `capture()` to remember: the first step records the graph and every
+step after replays it. `mask()` is there for an integration that must hand a
+bitmask to a sampler it does not own.
 
-`fill_mask` and `advance` are both capturable: call `batch.capture()` once and
-every later call replays a recorded graph, with no host work and no
-synchronisation on the path. That is the property the design exists for.
+**Slots, not a batch.** The rectangle is not an implementation detail, it is
+what makes the step capturable, so it is the thing you are given. A slot is
+where one request lives; `admit` puts a request in one and `release` takes it
+out, which is what continuous batching does and what an API that resets the
+whole batch cannot express.
 
-Three layers, and you can reach any of them:
-
-- `Engine` and `Batch` here, which is what a serving integration wants.
-- `CompiledGrammar.matcher()`, a host-side reference parser used to check the
-  device against, and to seed a sequence's state.
-- `DeviceGrammar` and `DeviceBatch` in `engrain.device`, which `Engine`
-  wraps and which expose the pool, the arena and the graph directly.
+Lower layers, when you need them: `grammar.matcher()` is a host-side reference
+parser, and `engrain.internals` exposes the compiler, the pool and the arena.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
 import threading as _threading
 from importlib import metadata as _metadata
 
-from engrain._engrain import (
-    CompiledGrammar,
-    CompileError,
-    Compiler,
-    Matcher,
-    pack_configurations,
-)
+from engrain._engrain import CompiledGrammar, CompileError, Matcher
 
 __all__ = [
-    "Batch",
     "CompileError",
     "CompiledGrammar",
-    "Compiler",
     "Engine",
     "Matcher",
-    "pack_configurations",
+    "Slots",
+    "Verdict",
     "__version__",
 ]
 
-# One source, which is the wheel's own metadata. It had been written out in
-# three places - here, `pyproject.toml` and the Cargo workspace - and the
-# first of those is the one a caller reads.
 try:
     __version__ = _metadata.version("engrain")
 except _metadata.PackageNotFoundError:  # running from a checkout
     __version__ = "0.0.0+source"
 
 
+@dataclass(frozen=True)
+class Verdict:
+    """What happened to each slot when it consumed a token.
+
+    Held as device tensors, because reading one is a synchronisation and this
+    library exists not to make one. `ok` is the moment you choose to look.
+    """
+
+    terminated: object
+    """The parser refused the token this slot was given, per slot."""
+
+    narrowed: object
+    """A ceiling was reached, so the *next* mask for this slot may be narrower
+    than its grammar allows. Blocking a legal token is the one failure this
+    engine must not commit quietly, so it is reported rather than absorbed."""
+
+    @property
+    def ok(self) -> bool:
+        """True when nothing went wrong. **Synchronises with the device.**"""
+        return not bool(self.terminated.any()) and not bool(self.narrowed.any())
+
+    def failures(self) -> list[int]:
+        """Which slots have a problem. **Synchronises with the device.**"""
+        flagged = (self.terminated != 0) | (self.narrowed != 0)
+        return flagged.nonzero().flatten().tolist()
+
+
 class Engine:
     """A vocabulary, the grammars compiled against it, and their tables.
 
-    One engine per model. Grammars are admitted into a single device arena so
-    that a batch under many of them is one launch rather than one per grammar -
-    which is what a serving batch looks like, since requests bring their own.
+    One engine per model. Grammars live in a single device arena so that a step
+    holding many of them is one launch rather than one per grammar - which is
+    what a serving step looks like, since requests bring their own.
 
-    The arena is bounded by `table_budget_bytes` if you give one. Past it a
-    grammar no sequence is running under is evicted, and re-admitted from its
-    compiled form if it comes back; nothing moves and no identifier changes, so
-    a recorded graph survives the churn.
+    `table_budget_bytes` bounds the arena. Past it a grammar no slot is running
+    under is evicted and re-admitted from its compiled form if it comes back;
+    nothing moves and no identifier changes, so a recorded graph survives.
     """
 
     def __init__(
@@ -90,109 +107,122 @@ class Engine:
         max_configurations: int = 128,
         table_budget_bytes: int | None = None,
     ) -> None:
+        from engrain._engrain import Compiler
         from engrain.device import DeviceGrammar
 
-        self.compiler = Compiler(list(vocabulary))
+        self._compiler = Compiler(list(vocabulary))
         self._pool = DeviceGrammar(
             max_configs=max_configurations, budget_bytes=table_budget_bytes
         )
         self._ids: dict[int, tuple[int, int]] = {}
-        # Keyed on `id`, so the grammar has to stay alive for the key to mean
-        # anything; and a grammar the pool evicts is re-admitted from here.
         self._held: dict[int, CompiledGrammar] = {}
         self._lock = _threading.Lock()
 
-    def compile_json_schema(self, schema: str, **kwargs) -> CompiledGrammar:
-        """Compile a JSON Schema and put its tables on the device.
+    def compile(
+        self,
+        *,
+        json_schema: str | None = None,
+        regex: str | None = None,
+        ebnf: str | None = None,
+        root: str | None = None,
+        **options,
+    ) -> CompiledGrammar:
+        """Compile one grammar and put its tables on the device.
 
-        The mask may admit more than the schema allows, and never less, so a
-        caller that needs the schema itself checks the finished document. Read
-        `grammar.approximations` for what to check: it lists exactly what this
-        grammar does not enforce, and is empty when there is nothing to do.
+        Exactly one of `json_schema`, `regex` or `ebnf`. One verb rather than
+        three methods, because which front end lowered a grammar is not
+        something the rest of the API cares about.
 
-        Pass `exact=True` to enforce a declared property's type even where
-        `additionalProperties` is open. It is off by default because it costs
-        every object its own key terminal - compile p50 27 ms to 159 ms, and a
-        captured step at batch 512 from 72 us to 155 us.
+        **Read `grammar.relaxations` before you trust the mask.** It lists, in
+        words, what this grammar does *not* enforce - and it is empty when
+        there is nothing to check. The mask may admit more than the source
+        allows and never less, so a caller that needs the source itself
+        validates the finished document against exactly these.
 
-        Raises `CompileError` - a `ValueError` - carrying `stage`, one of
+        Useful options: `exact=True` on a schema enforces a declared property's
+        type even where `additionalProperties` is open, at several times the
+        compile cost; `lexer_states=` raises the DFA budget for a large
+        pattern.
+
+        Raises `CompileError` - a `ValueError` - carrying `.stage`, one of
         `lowering`, `lexer`, `productions`, `conflict` or `emit`. The stage is
-        the answer to what a caller should do: a budget may be raised and
-        retried, a lowering failure will not be. Set `ENGRAIN_WHY=1` in the
-        environment for the underlying diagnostic.
+        the answer to what to do next: a budget can be raised and retried, a
+        lowering failure cannot. `ENGRAIN_WHY=1` prints the diagnostic.
 
         A ceiling reached at *decode* time is not an exception - nothing can
-        raise from inside a graph replay - and is reported by `Batch.problems`.
+        raise from inside a graph replay - and arrives as `Verdict.narrowed`.
         """
-        return self._admitted(self.compiler.compile_json_schema(schema, **kwargs))
-
-    def compile_regex(self, pattern: str, **kwargs) -> CompiledGrammar:
-        """Compile a regular expression. Not everything here is JSON.
-
-        Bounded by the same `lexer_states` budget as a schema, because a
-        pattern is the one grammar a request supplies directly and a DFA is
-        exponential in the worst case. Raise it with `lexer_states=` when a
-        legitimate pattern needs it.
-        """
-        return self._admitted(self.compiler.compile_regex(pattern, **kwargs))
-
-    def compile_ebnf(self, source: str, root: str, **kwargs) -> CompiledGrammar:
-        return self._admitted(self.compiler.compile_ebnf(source, root, **kwargs))
-
-    def _admitted(self, grammar: CompiledGrammar) -> CompiledGrammar:
-        # Admitted as soon as it is compiled, rather than when a batch first
-        # uses it. A batch's buffers are sized from the pool - the mask width
-        # among them - so a pool holding nothing cannot size one, and the
-        # alternative was an API where `batch()` had to come second.
-        self.admit(grammar)
+        given = [
+            name
+            for name, value in (
+                ("json_schema", json_schema),
+                ("regex", regex),
+                ("ebnf", ebnf),
+            )
+            if value is not None
+        ]
+        if len(given) != 1:
+            raise TypeError(
+                "compile() takes exactly one of json_schema, regex or ebnf, "
+                f"got {given or 'none'}"
+            )
+        if json_schema is not None:
+            grammar = self._compiler.compile_json_schema(json_schema, **options)
+        elif regex is not None:
+            grammar = self._compiler.compile_regex(regex, **options)
+        else:
+            if root is None:
+                raise TypeError("compile(ebnf=...) needs root=")
+            grammar = self._compiler.compile_ebnf(ebnf, root, **options)
+        self._admit(grammar)
         return grammar
 
-    def admit(self, grammar: CompiledGrammar) -> int:
+    def _admit(self, grammar: CompiledGrammar) -> int:
         """Put a grammar's tables on the device and return its pool id.
 
-        Idempotent: a grammar already in the pool keeps the id it has, and one
-        the pool has since evicted is re-admitted rather than reported at an
-        identifier that now names something else.
-
-        Safe to call from several threads. A serving engine compiles on a
-        thread pool while a decode loop runs, and the check and the admission
+        Idempotent, and safe from several threads: a serving engine compiles on
+        a thread pool while a decode loop runs, so the check and the admission
         have to be one step or two requests take the same slot.
         """
         with self._lock:
             key = id(grammar)
             held = self._ids.get(key)
-            # The identifier alone does not identify a grammar across an
-            # eviction - the slot is reused, deliberately, so that nothing
-            # moves and a recorded graph survives. Ask whether it is still ours.
+            # An identifier does not identify a grammar across an eviction: the
+            # slot is reused, deliberately, so that nothing moves and a
+            # recorded graph survives. Ask whether it is still ours.
             if held is not None and self._pool.holds(*held):
                 return held[0]
             identifier = self._pool.admit(grammar)
             self._ids[key] = (identifier, self._pool.generation(identifier))
-            # Holding the grammar is what makes `id` a key at all: CPython
-            # reuses the address of a dropped object, so without this a caller
-            # who let a schema go out of scope could compile a different one,
-            # land on the same address, and be handed the first one's tables.
-            # It is also what an eviction needs to re-admit from.
+            # Holding the grammar is what makes `id` a key: CPython reuses the
+            # address of a dropped object, so without this a caller who let a
+            # schema go out of scope could compile another, land on the same
+            # address, and be handed the first one's tables. It is also what an
+            # eviction re-admits from.
             self._held[key] = grammar
             return identifier
 
-    def batch(self, size: int, *, rollback: int = 0) -> Batch:
-        """A batch of `size` sequences.
+    def slots(self, count: int, *, lookahead: int = 0) -> Slots:
+        """`count` places for requests to live in.
 
-        `rollback` is how many steps of history to keep, which speculative
-        decoding needs and an ordinary decode loop does not; it costs one
-        parse state per step kept.
+        `lookahead` is how many steps of history to keep so `rollback` can undo
+        them, which speculative decoding needs and an ordinary loop does not;
+        it costs one parse state per step kept.
+
+        The count is fixed for the life of the object because it is the shape
+        the CUDA graph is recorded against. Size it once, at the concurrency
+        the server is provisioned for, and use `admit` and `release`.
         """
         if not self._ids:
             raise RuntimeError(
-                "compile a grammar before making a batch: a batch's buffers "
-                "are sized from the grammars the engine holds"
+                "compile a grammar before asking for slots: their buffers are "
+                "sized from the grammars the engine holds"
             )
-        return Batch(self, self._pool.new_batch(size, rollback=rollback))
+        return Slots(self, self._pool.new_batch(count, rollback=lookahead))
 
     @property
     def mask_words(self) -> int:
-        """Words in one mask row, which is the vocabulary rounded up to 32."""
+        """Words in one mask row: the vocabulary rounded up to 32."""
         return self._pool.mask_words
 
     @property
@@ -200,182 +230,255 @@ class Engine:
         """What the tables occupy on the device, capacity included."""
         return self._pool.resident_bytes()
 
-    @property
-    def pool(self):
-        """The underlying `DeviceGrammar`, for callers that need the arena."""
-        return self._pool
 
+class Slots:
+    """Places a request lives in while it is being decoded.
 
-class Batch:
-    """Sequences being decoded, and the parse state of each.
-
-    A sequence's state is a *set* of configurations rather than one, because
-    scanning a generated lexicon is ambiguous - `{` may be a token or the start
-    of a longer one - and because a grammar may be ambiguous too. Everything
-    below carries the set.
+    Every operation is device-resident and none of them synchronises. The graph
+    is recorded on first use and replayed after, and the recording is valid for
+    any assignment of grammars to slots, which is why `admit` and `release` are
+    free to change it every step.
     """
 
     def __init__(self, engine: Engine, batch) -> None:
         self._engine = engine
-        self._batch = batch
+        self._raw = batch
+        self._live: set[int] = set()
+        self._mask = None
+        self._fresh = False
+        self._captured = False
+        self._capturable = True
 
-    def set_grammars(self, grammars: Iterable[CompiledGrammar | int]) -> None:
-        """Say which grammar each sequence is under, and reset them to its start.
+    # -- the request lifecycle ---------------------------------------------
 
-        Takes compiled grammars or pool ids. A grammar not yet on the device is
-        admitted here.
+    def admit(self, slot: int, grammar: CompiledGrammar) -> None:
+        """Put a request in `slot`, under `grammar`, at the start of it.
+
+        The slot may be free or hold a request being replaced; either way it is
+        reset. This is a host-to-device write of a few words, paid when a
+        request arrives rather than when a token is sampled.
         """
-        ids = [
-            item if isinstance(item, int) else self._engine.admit(item)
-            for item in grammars
-        ]
-        self._batch.set_grammars(ids)
+        self._check(slot)
+        identifier = self._engine._admit(grammar)
+        self._raw.grammar_of[slot] = identifier
+        # Writing one slot's grammar is still an assignment, and the batch
+        # refuses to fill an unassigned one once the pool holds more than a
+        # single grammar - correctly, since zero is a real identifier and an
+        # unassigned batch would mask every slot against whatever holds it.
+        self._raw.assigned = True
+        self._raw.set_configurations(slot, grammar.matcher(0).configurations())
+        self._live.add(slot)
+        self._fresh = False
 
-    def set_matchers(self, matchers: Sequence[Matcher]) -> None:
-        """Take each sequence's state from a host matcher.
+    def admit_all(self, grammars: Sequence[CompiledGrammar]) -> None:
+        """Fill every slot at once. For a benchmark or a fixed workload."""
+        if len(grammars) != len(self):
+            raise ValueError(f"{len(grammars)} grammars for {len(self)} slots")
+        self._raw.set_grammars([self._engine._admit(g) for g in grammars])
+        self._live = set(range(len(self)))
+        self._fresh = False
 
-        The fast path for an integration that keeps host matchers as well, and
-        the one a serving backend uses: the states go straight to the packer
-        rather than through Python lists.
+    def release(self, slot: int) -> None:
+        """Take the request out of `slot`. Its row stops meaning anything."""
+        self._check(slot)
+        self._live.discard(slot)
+
+    def resume(self, slot: int, matcher: Matcher) -> None:
+        """Put a slot into the state a host matcher is already in.
+
+        For an integration that keeps host matchers too - a request that was
+        preempted and is coming back, or a prompt consumed on the host.
         """
-        self._batch.set_matchers(list(matchers))
+        self._check(slot)
+        self._raw.set_configurations(slot, matcher.configurations())
+        self._live.add(slot)
+        self._fresh = False
 
-    def fill_mask(self):
-        """The allowed-token bitmask for every sequence, `(batch, words)`.
+    # -- the decode step ----------------------------------------------------
 
-        Stays on the device. Replays a recorded graph once `capture` has been
-        called, which is the deployed path.
+    def mask(self):
+        """The allowed-token bitmask, `(slots, words)`, on the device.
+
+        For an integration that must hand a bitmask to a sampler it does not
+        own. Prefer `sample` or `apply`, which do not make you unpack it.
         """
-        return self._batch.fill_mask()
+        self._ready()
+        if not self._fresh:
+            self._mask = self._raw.fill_mask()
+            self._fresh = True
+        return self._mask
 
-    def shortlist(self, capacity: int = 8192):
-        """The shorter of the two lists per sequence: `(ids, counts, kind)`.
+    def apply(self, logits) -> None:
+        """Set every forbidden token's logit to `-inf`, in place.
 
-        `kind[i]` is 0 when `ids[i]` names the tokens the sequence *admits* and
-        1 when it names the ones it *forbids*. Which one is smaller is a
-        property of where the parse is, and it is bimodal rather than spread:
-        a structural position admits a few hundred of a hundred and fifty
-        thousand, a position inside a string body forbids a few thousand, and
-        almost nothing sits between them.
-
-        This is what makes a constrained step cheap at *both* ends. Gathering
-        the allowed set is 8.9x the mask path when the set is small and 0.30x
-        when it is not, so a caller that always gathers is worse off than one
-        that never does. Here the short list is always short, so applying the
-        constraint is always a small operation.
-
-        Decided on the device. A caller choosing for itself would have to read
-        a count on the host, which is the synchronisation this engine exists
-        not to make.
-
-        **What this does not solve.** Acting on `kind` still costs a host
-        synchronisation, because a sampler's output shape is its row count and
-        `nonzero` has to be read to get one. Measured at batch 512 against
-        applying the mask to every row: 2.68x when every row is sparse, 1.05x
-        when half are dense - which is the steady state a real workload sits
-        at - and 0.86x for the sync-free alternative of sampling both ways and
-        selecting. The set being resident is necessary and not sufficient; the
-        sampler has to be able to ask for it raggedly, and today it cannot.
+        `logits` is `(slots, vocabulary)`, and its row may be wider than the
+        grammar's - a model's output is padded and a tokenizer's is not - in
+        which case the tail is left alone rather than assumed to match.
         """
-        return self._batch.compact(capacity, both=True)
+        import torch
 
-    def allowed(self, capacity: int = 4096):
-        """The allowed tokens as sorted ids, `(ids, counts)`, on the device.
+        from engrain import _engrain
 
-        The set the mask stands for, without the vocabulary-wide detour. A
-        sampler handed this draws from a few hundred candidates instead of
-        sorting a hundred and fifty thousand, which is how a constrained step
-        becomes cheaper than an unconstrained one rather than more expensive.
+        mask = self.mask()
+        if logits.dim() != 2 or logits.shape[0] != len(self):
+            raise ValueError(
+                f"logits must be ({len(self)}, vocabulary), got {tuple(logits.shape)}"
+            )
+        name = {
+            torch.float32: "en_apply_f32",
+            torch.float16: "en_apply_f16",
+        }.get(logits.dtype)
+        if name is None or not logits.is_cuda or not logits.is_contiguous():
+            self._apply_with_torch(logits, mask)
+            return
+        _engrain.cuda_launch(
+            name,
+            len(self),
+            256,
+            torch.cuda.current_stream().cuda_stream,
+            [mask.data_ptr(), logits.data_ptr()],
+            [
+                self._engine.mask_words,
+                min(logits.shape[1], self._raw.grammar.vocab_size),
+                logits.shape[1],
+            ],
+            grid_y=64,
+        )
 
-        `ids` is `(batch, capacity)` and only the first `counts[i]` entries of
-        row `i` mean anything. `counts` is the *true* size of each set even
-        where it exceeds `capacity`, so a caller can see that a row was
-        truncated and fall back to `fill_mask` for it - which is what the dense
-        regime wants anyway, since a JSON string body admits most of the
-        vocabulary and gathering it buys nothing.
+    def _apply_with_torch(self, logits, mask) -> None:
+        """The fallback for a dtype or a layout the kernel does not take."""
+        import torch
 
-        Call after `fill_mask` or `step`; it reads the mask those produced.
-        Prefer `shortlist` unless you know every row is sparse: this always
-        emits the allowed list, and for a row inside a string body that list
-        is nearly the whole vocabulary.
+        bits = torch.arange(32, device=mask.device, dtype=torch.int32)
+        flags = ((mask.unsqueeze(-1) >> bits) & 1).to(torch.bool).reshape(len(self), -1)
+        width = min(logits.shape[1], flags.shape[1])
+        logits[:, :width].masked_fill_(~flags[:, :width], float("-inf"))
+
+    def sample(
+        self,
+        logits,
+        *,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 0,
+        generator=None,
+    ):
+        """Draw one token per slot, from the tokens the grammar allows.
+
+        Returns `(slots,)` int32 on the device, ready for `commit`.
+
+        **What this is today.** The constraint is applied with a kernel and the
+        draw is `torch`'s. The gathered path - sampling from the allowed list
+        itself, which is what makes a constrained step cheaper than an
+        unconstrained one - is implemented underneath and measured: 2.68x on a
+        batch whose rows are all sparse, and 1.05x on the half-dense mixture a
+        real workload sits at, because a sampler's output shape is its row
+        count and choosing per row needs a host synchronisation this engine
+        will not make. When a sampler accepts a device-side row count this
+        method changes and its callers do not, which is what it is for.
         """
-        ids, counts, _ = self._batch.compact(capacity)
-        return ids, counts
+        import torch
 
-    def advance(self, tokens) -> None:
-        """Consume one sampled token per sequence, `(batch,)` on the device.
+        self.apply(logits)
+        work = logits.float()
+        if temperature != 1.0:
+            if temperature <= 0.0:
+                return work.argmax(dim=-1).to(torch.int32)
+            work = work / temperature
+        if top_k:
+            kept = work.topk(min(top_k, work.shape[-1]), dim=-1)
+            work = work.masked_fill(work < kept.values[:, -1:], float("-inf"))
+        probabilities = work.softmax(dim=-1)
+        if top_p < 1.0:
+            ordered, index = probabilities.sort(dim=-1, descending=True)
+            # Keep the first token past the threshold, so a single token whose
+            # mass already exceeds `top_p` is not sampled from an empty set.
+            drop = ordered.cumsum(dim=-1) - ordered > top_p
+            probabilities = torch.zeros_like(probabilities).scatter_(
+                -1, index, ordered.masked_fill(drop, 0.0)
+            )
+        drawn = torch.multinomial(probabilities, 1, generator=generator)
+        return drawn.flatten().to(torch.int32)
 
-        The tokens are never read on the host, so this does not synchronise.
+    def commit(self, tokens) -> Verdict:
+        """Consume one token per slot and get the next mask ready.
+
+        The whole of a decode step after sampling, in one graph replay: the
+        advance and the fill that follows it are recorded together, because
+        nothing sits between them. `tokens` is `(slots,)` on the device and is
+        never read on the host.
         """
-        self._batch.advance(tokens)
-
-    def step(self, tokens):
-        """Consume one sampled token per sequence and return the next mask.
-
-        The whole of a decode step after sampling, in one graph replay. Only
-        the sample sits between a fill and the advance that follows it, and
-        nothing at all sits between that advance and the next fill, so the two
-        are one recording - which is a replay's fixed cost saved per token.
-
-        Equivalent to `advance(tokens)` then `fill_mask()`, and returns what
-        `fill_mask` returns. This is the path to use in a decode loop.
-        """
-        return self._batch.advance_and_fill(tokens)
-
-    def capture(self) -> None:
-        """Record the fill, the advance, and the two together, as CUDA graphs.
-
-        Every later `fill_mask`, `advance` and `step` is a replay. The
-        recording is valid for any assignment of grammars to sequences and any
-        batch composition, which is why it can live inside a serving engine's
-        own graph; it is invalidated only when the pool's arrays move, and that
-        is detected rather than assumed.
-        """
-        self._batch.capture()
-        self._batch.capture_advance()
-        self._batch.capture_step()
+        self._ready()
+        self._mask = self._raw.advance_and_fill(tokens)
+        self._fresh = True
+        terminated, narrowed = self._raw.problems()
+        return Verdict(terminated=terminated, narrowed=narrowed)
 
     def rollback(self, steps: int) -> None:
-        """Undo `steps` advances. Needs `rollback` room at construction."""
-        self._batch.rollback(steps)
+        """Undo `steps` commits. Needs `lookahead` room at construction."""
+        self._raw.rollback(steps)
+        self._fresh = False
 
-    def configurations(self, sequence: int) -> list[tuple[int, list[int]]]:
-        """One sequence's parse states, as `(lexer state, parser stack)`.
+    # -- inspection ---------------------------------------------------------
 
-        A device-to-host copy. For checking against a reference matcher, not
-        for a decode loop.
+    def parses(self, slot: int) -> list[tuple[int, list[int]]]:
+        """One slot's parse states, as `(lexer state, parser stack)`.
+
+        A device-to-host copy, for checking against a reference matcher; not
+        for a decode loop. A slot holds a *set* because scanning a generated
+        lexicon is ambiguous - `{` may be a token or the start of a longer one
+        - and because a grammar may be ambiguous too.
         """
-        return self._batch.configurations(sequence)
-
-    def problems(self):
-        """`(terminated, overflow)`, one flag per sequence.
-
-        `terminated` means the parser refused the token it was given.
-        `overflow` means a ceiling was reached - the replay window, the
-        candidate slots, the configuration set - and the mask that follows may
-        be narrower than the grammar allows. Narrowing is the one failure this
-        engine must not do quietly, so it is reported here rather than absorbed.
-        """
-        return self._batch.problems()
+        return self._raw.configurations(slot)
 
     @property
-    def outgrown(self) -> bool:
-        """Has a grammar admitted since this batch was made outgrown it?
+    def live(self) -> frozenset[int]:
+        """Which slots hold a request."""
+        return frozenset(self._live)
 
-        A batch's buffers are sized from the pool's ceilings, and admitting a
-        grammar can raise one. A batch cannot resize itself - a recorded graph
-        holds the addresses it recorded, and you hold the mask tensor - so
-        make a new batch when this is true. Every operation checks it and
-        raises rather than letting a kernel index past a buffer, so ignoring
-        it is safe; asking is how you avoid the exception.
+    @property
+    def free(self) -> frozenset[int]:
+        """Which slots do not."""
+        return frozenset(range(len(self))) - self._live
+
+    def __len__(self) -> int:
+        return self._raw.batch
+
+    def __bool__(self) -> bool:
+        return bool(self._live)
+
+    # -- internals ----------------------------------------------------------
+
+    def _check(self, slot: int) -> None:
+        if not 0 <= slot < len(self):
+            raise IndexError(f"slot {slot} outside 0..{len(self) - 1}")
+        if self._raw.outgrown:
+            # A grammar admitted since these slots were made raised a ceiling
+            # they were sized from, and a kernel indexes what it is given. The
+            # engine refuses rather than reading past a buffer.
+            raise RuntimeError(
+                "a grammar admitted since these slots were made needs more "
+                "room than they have; ask the engine for new slots"
+            )
+
+    def _ready(self) -> None:
+        """Record the graph, once, on first use.
+
+        Capture is not something a caller should have to remember: forgetting
+        it costs a replay's worth of dispatch on every token and says nothing
+        about it. The differential backend cannot be captured - it compares on
+        the host, and a graph would hold whichever side ran last - so a refusal
+        is remembered rather than retried every step.
         """
-        return self._batch.outgrown
-
-    @property
-    def size(self) -> int:
-        return self._batch.batch
-
-    @property
-    def raw(self):
-        """The underlying `DeviceBatch`."""
-        return self._batch
+        if self._captured or not self._capturable:
+            return
+        if not self._live:
+            raise RuntimeError("admit a request before stepping")
+        try:
+            self._raw.fill_mask()
+            self._raw.capture()
+            self._raw.capture_step()
+        except RuntimeError:
+            self._capturable = False
+        else:
+            self._captured = True

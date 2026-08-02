@@ -3650,12 +3650,12 @@ class DeviceBatch:
         not the copy but turning each matcher's state into Python objects only
         to write them straight back out.
         """
-        import engrain
+        from engrain._engrain import pack_configurations
 
         rows = len(matchers)
         if rows == 0:
             return
-        lexer, depths, stacks, counts, width, deep = engrain.pack_configurations(
+        lexer, depths, stacks, counts, width, deep = pack_configurations(
             matchers, self.configs
         )
         if deep > self.grammar.max_stack:

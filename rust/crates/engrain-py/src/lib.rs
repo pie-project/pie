@@ -124,7 +124,7 @@ impl Compiler {
         Ok(CompiledGrammar {
             artifact: Arc::new(compiled.artifact),
             precision: format!("{:?}", compiled.precision),
-            approximations: compiled.approximations,
+            relaxations: compiled.relaxations,
             digest: self.digest,
         })
     }
@@ -141,7 +141,7 @@ impl Compiler {
         Ok(CompiledGrammar {
             artifact: Arc::new(compile(&self.vocabulary, grammar, lexer_states)?),
             precision: "n/a".to_string(),
-            approximations: Vec::new(),
+            relaxations: Vec::new(),
             digest: self.digest,
         })
     }
@@ -157,7 +157,7 @@ impl Compiler {
         Ok(CompiledGrammar {
             artifact: Arc::new(compile(&self.vocabulary, grammar, lexer_states)?),
             precision: "n/a".to_string(),
-            approximations: Vec::new(),
+            relaxations: Vec::new(),
             digest: self.digest,
         })
     }
@@ -181,7 +181,7 @@ pub struct CompiledGrammar {
     /// schema allows - that is the direction it must err in - so a caller that
     /// needs the schema itself has to check the finished document against
     /// these, and cannot do that without being told which they are.
-    approximations: Vec<String>,
+    relaxations: Vec<String>,
     /// The vocabulary this was compiled against, as a digest.
     digest: u64,
 }
@@ -246,8 +246,8 @@ impl CompiledGrammar {
     }
 
     #[getter]
-    fn approximations(&self) -> Vec<String> {
-        self.approximations.clone()
+    fn relaxations(&self) -> Vec<String> {
+        self.relaxations.clone()
     }
 
     #[getter]

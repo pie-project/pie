@@ -1,10 +1,9 @@
-"""The public API, exercised the way the documentation says to use it.
+"""The API a caller types, exercised the way the documentation says to use it.
 
-Everything else in this suite tests the engine through `engrain._engine`,
-which is the research entry point. These tests go through `engrain.Engine`
-and `engrain.Batch` instead, because that is what an artifact reviewer will
-type and what a serving integration will call, and an API that is only ever
-exercised by its own internals is not an API.
+An API that is only ever exercised by its own internals is not an API, so
+nothing here reaches past `engrain.Engine`, `engrain.Slots` and the objects
+they hand back. What the engine must *refuse* is in `test_internals.py`, one
+layer down, where the failures are visible.
 """
 
 from __future__ import annotations
@@ -24,10 +23,35 @@ except Exception:  # noqa: BLE001
 
 # Small enough to compile quickly, wide enough that a mask is not trivial.
 VOCABULARY = [
-    b"{", b"}", b"[", b"]", b":", b",", b'"', b" ",
-    b'{"', b'":', b'","', b'":"', b'"}', b"true", b"false", b"null",
-    b"0", b"1", b"2", b"12", b"-", b".",
-    b"a", b"b", b"ab", b"name", b"id", b'"name"', b'"id"',
+    b"{",
+    b"}",
+    b"[",
+    b"]",
+    b":",
+    b",",
+    b'"',
+    b" ",
+    b'{"',
+    b'":',
+    b'","',
+    b'":"',
+    b'"}',
+    b"true",
+    b"false",
+    b"null",
+    b"0",
+    b"1",
+    b"2",
+    b"12",
+    b"-",
+    b".",
+    b"a",
+    b"b",
+    b"ab",
+    b"name",
+    b"id",
+    b'"name"',
+    b'"id"',
 ]
 
 SCHEMA = json.dumps(
@@ -38,599 +62,362 @@ SCHEMA = json.dumps(
     }
 )
 
+NEEDS_CAPTURE = unittest.skipIf(
+    os.environ.get("ENGRAIN_BACKEND", "").strip().lower() == "differential",
+    "differential mode compares on the host and cannot capture",
+)
+
 
 def _requirements():
     if not HAVE_CUDA:
         raise unittest.SkipTest("no CUDA device")
 
 
+def _bits(mask, row: int, vocabulary: int) -> set[int]:
+    """The token ids a mask row holds, read on the host."""
+    words = mask[row].tolist()
+    return {
+        token for token in range(vocabulary) if (words[token >> 5] >> (token & 31)) & 1
+    }
 
-# A differential run compares the two backends on the host, so nothing in it
-# can be recorded into a graph. Tests whose subject *is* the recording have
-# nothing to say in that mode.
-NEEDS_CAPTURE = unittest.skipIf(
-    os.environ.get("ENGRAIN_BACKEND", "").strip().lower() == "differential",
-    "differential mode compares on the host and cannot capture",
-)
 
-class PublicApi(unittest.TestCase):
+class TheShortestUsefulProgram(unittest.TestCase):
+    """What the module docstring promises, run."""
+
     def setUp(self):
         _requirements()
         self.engine = engrain.Engine(VOCABULARY)
 
-    def test_the_shortest_useful_program(self):
-        """The example in the module docstring has to actually run."""
-        grammar = self.engine.compile_json_schema(SCHEMA)
-        batch = self.engine.batch(4)
-        batch.set_grammars([grammar] * 4)
+    def test_compile_admit_sample_commit(self):
+        grammar = self.engine.compile(json_schema=SCHEMA)
+        slots = self.engine.slots(4)
+        for slot in range(4):
+            slots.admit(slot, grammar)
 
-        mask = batch.fill_mask()
-        self.assertEqual(tuple(mask.shape), (4, self.engine.mask_words))
-        self.assertTrue(mask.is_cuda)
-        # A document must start with `{`, in one form or another, and nothing
-        # else - so the mask is neither empty nor everything.
-        allowed = int(mask[0].cpu().numpy().astype("uint32").sum() != 0)
-        self.assertEqual(allowed, 1)
+        logits = torch.zeros(4, len(VOCABULARY), device="cuda")
+        tokens = slots.sample(logits)
+        verdict = slots.commit(tokens)
 
-        opening = VOCABULARY.index(b"{")
-        batch.advance(torch.full((4,), opening, dtype=torch.int32, device="cuda"))
-        terminated, overflow = batch.problems()
-        self.assertEqual(int(terminated.sum()), 0)
-        self.assertEqual(int(overflow.sum()), 0)
+        self.assertTrue(verdict.ok)
+        self.assertEqual(verdict.failures(), [])
+        # A JSON object can only start one way in this vocabulary.
+        self.assertTrue(all(VOCABULARY[t].startswith(b"{") for t in tokens.tolist()))
 
-    def test_the_mask_is_the_reference_parser_s(self):
-        grammar = self.engine.compile_json_schema(SCHEMA)
-        batch = self.engine.batch(1)
-        batch.set_grammars([grammar])
-        matcher = grammar.matcher(0)
+    def test_no_capture_call_is_needed(self):
+        """The recording is the library's business, not the caller's."""
+        grammar = self.engine.compile(json_schema=SCHEMA)
+        slots = self.engine.slots(2)
+        slots.admit(0, grammar)
+        slots.admit(1, grammar)
+        first = slots.mask().clone()
+        tokens = slots.sample(torch.zeros(2, len(VOCABULARY), device="cuda"))
+        slots.commit(tokens)
+        slots.admit(0, grammar)
+        slots.admit(1, grammar)
+        # Back at the start, and the replayed graph gives the same answer as
+        # the eager first call did.
+        self.assertTrue(torch.equal(first, slots.mask()))
 
-        reference = torch.zeros(self.engine.mask_words, dtype=torch.int32)
-        for piece in (b'{"', b"name", b'":"', b"ab", b'","'):
-            token = VOCABULARY.index(piece)
-            reference.zero_()
-            matcher.fill_bitmask(reference)
-            self.assertTrue(torch.equal(batch.fill_mask()[0].cpu(), reference))
-            self.assertTrue(matcher.accept_token(token))
-            batch.advance(torch.tensor([token], dtype=torch.int32, device="cuda"))
+
+class OneVerbForEveryFrontEnd(unittest.TestCase):
+    def setUp(self):
+        _requirements()
+        self.engine = engrain.Engine([bytes([b]) for b in range(256)])
 
     def test_a_regex_is_a_grammar_too(self):
-        """Not only JSON - the same interface takes a pattern."""
-        engine = engrain.Engine([bytes([b]) for b in range(256)])
-        grammar = engine.compile_regex(r"[0-9]{2}-[0-9]{2}")
-        batch = engine.batch(1)
-        batch.set_grammars([grammar])
-        matcher = grammar.matcher(0)
-        for byte in b"12-34":
-            reference = torch.zeros(engine.mask_words, dtype=torch.int32)
-            matcher.fill_bitmask(reference)
-            self.assertTrue(torch.equal(batch.fill_mask()[0].cpu(), reference))
-            self.assertTrue(matcher.accept_token(byte))
-            batch.advance(torch.tensor([byte], dtype=torch.int32, device="cuda"))
-        self.assertTrue(matcher.can_terminate())
-
-    def test_one_batch_under_several_grammars(self):
-        """The case a serving batch has by default."""
-        grammars = [
-            self.engine.compile_json_schema(SCHEMA),
-            self.engine.compile_regex(r"[0-9]+"),
-        ]
-        batch = self.engine.batch(4)
-        batch.set_grammars([grammars[i % 2] for i in range(4)])
-        masks = batch.fill_mask().cpu()
-        # Rows under different grammars must differ: one starts a document,
-        # the other a number.
-        self.assertFalse(torch.equal(masks[0], masks[1]))
-        self.assertTrue(torch.equal(masks[0], masks[2]))
-
-    @NEEDS_CAPTURE
-
-    def test_a_captured_batch_replays_the_same_mask(self):
-        """The property the whole design is for."""
-        grammar = self.engine.compile_json_schema(SCHEMA)
-        batch = self.engine.batch(2)
-        batch.set_grammars([grammar, grammar])
-        before = batch.fill_mask().clone()
-        batch.capture()
-        self.assertTrue(torch.equal(batch.fill_mask(), before))
-
-    def test_the_engine_reports_what_it_costs(self):
-        self.assertEqual(self.engine.resident_bytes, self.engine.pool.resident_bytes())
-        grammar = self.engine.compile_json_schema(SCHEMA)
-        self.engine.admit(grammar)
-        self.assertGreater(self.engine.resident_bytes, 0)
-        # Admitting the same grammar twice must not admit it twice.
-        first = self.engine.admit(grammar)
-        self.assertEqual(first, self.engine.admit(grammar))
-
-    def test_a_refused_schema_says_why(self):
-        with self.assertRaises(ValueError) as refusal:
-            self.engine.compile_json_schema(json.dumps({"type": "object",
-                                                        "patternProperties": {
-                                                            "^a{0,70000}$": {}}}))
-        # The stage is the answer to what a caller should do next: a budget can
-        # be raised and retried, a lowering failure cannot.
-        self.assertIsInstance(refusal.exception, engrain.CompileError)
-        self.assertIn(refusal.exception.stage,
-                      {"lowering", "lexer", "productions", "conflict", "emit"})
-
-    def test_a_pattern_whose_automaton_explodes_is_refused_not_run(self):
-        # A regex is the one grammar a request hands over directly, and its
-        # DFA is exponential in the worst case. This path used to build it
-        # unbounded, which spends the server's memory instead of refusing.
-        with self.assertRaises(engrain.CompileError) as refusal:
-            self.engine.compile_regex("(a|b)*a" + "(a|b)" * 24)
-        self.assertEqual(refusal.exception.stage, "lexer")
-
-    def test_the_budget_can_be_raised_deliberately(self):
-        self.assertIsNotNone(
-            self.engine.compile_regex("(a|b)*a" + "(a|b)" * 8, lexer_states=100_000))
-
-
-
-
-class Approximations(unittest.TestCase):
-    """A widened mask is only safe if the caller is told how it widened."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.engine = engrain.Engine([bytes([b]) for b in range(256)])
-
-    def accepts(self, grammar, text: str) -> bool:
-        matcher = grammar.matcher(0)
-        for byte in text.encode():
-            if not matcher.accept_token(byte):
-                return False
-        return matcher.can_terminate()
-
-    def test_a_schema_it_enforces_exactly_declares_nothing(self):
-        schema = json.dumps(
-            {
-                "type": "object",
-                "properties": {"a": {"type": "string"}},
-                "additionalProperties": False,
-            }
+        grammar = self.engine.compile(regex=r"[0-9]{3}")
+        slots = self.engine.slots(1)
+        slots.admit(0, grammar)
+        self.assertEqual(
+            _bits(slots.mask(), 0, 256), set(range(ord("0"), ord("9") + 1))
         )
-        self.assertEqual(self.engine.compile_json_schema(schema).approximations, [])
 
-    def test_an_open_object_declares_that_a_declared_type_may_not_hold(self):
-        schema = json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
-        grammar = self.engine.compile_json_schema(schema)
-        # The declaration has to match what the mask actually does.
-        self.assertEqual(len(grammar.approximations), 1)
-        self.assertTrue(self.accepts(grammar, '{"a":1}'))
+    def test_exactly_one_source_is_required(self):
+        with self.assertRaises(TypeError):
+            self.engine.compile()
+        with self.assertRaises(TypeError):
+            self.engine.compile(json_schema=SCHEMA, regex="a")
+
+    def test_ebnf_needs_a_root(self):
+        with self.assertRaises(TypeError):
+            self.engine.compile(ebnf="start ::= 'a'")
+
+    def test_a_refused_schema_says_which_stage_refused_it(self):
+        with self.assertRaises(engrain.CompileError) as caught:
+            self.engine.compile(json_schema='{"type": "object", "$ref": "#/nope"}')
+        self.assertIn(
+            caught.exception.stage,
+            {"lowering", "lexer", "productions", "conflict", "emit"},
+        )
+
+
+class RelaxationsAreDeclared(unittest.TestCase):
+    """The mask may admit more than the source. It has to say when."""
+
+    def setUp(self):
+        _requirements()
+        self.engine = engrain.Engine([bytes([b]) for b in range(256)])
+
+    def test_a_closed_object_declares_nothing(self):
+        grammar = self.engine.compile(
+            json_schema=json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer"}},
+                    "required": ["a"],
+                    "additionalProperties": False,
+                }
+            )
+        )
+        self.assertEqual(grammar.relaxations, [])
+
+    def test_an_open_object_declares_the_type_it_stops_enforcing(self):
+        grammar = self.engine.compile(
+            json_schema=json.dumps(
+                {"type": "object", "properties": {"a": {"type": "integer"}}}
+            )
+        )
+        self.assertTrue(
+            any("additionalProperties" in note for note in grammar.relaxations)
+        )
 
     def test_exact_enforces_it_and_then_declares_nothing(self):
-        schema = json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
-        grammar = self.engine.compile_json_schema(schema, exact=True)
-        self.assertEqual(grammar.approximations, [])
-        self.assertFalse(self.accepts(grammar, '{"a":1}'))
-        self.assertTrue(self.accepts(grammar, '{"a":"x"}'))
-        # Widening is what a level may do; narrowing is not. A name that only
-        # shares a prefix with a declared one is still an additional property.
-        self.assertTrue(self.accepts(grammar, '{"ab":1}'))
-
-    def test_keywords_no_level_enforces_are_declared(self):
-        schema = json.dumps(
-            {"type": "array", "items": {"type": "integer"}, "uniqueItems": True}
-        )
-        declared = self.engine.compile_json_schema(schema).approximations
-        self.assertTrue(any("uniqueItems" in text for text in declared))
-
-    def test_a_schema_that_never_mentions_them_is_not_warned_about_them(self):
-        schema = json.dumps({"type": "array", "items": {"type": "integer"}})
-        self.assertEqual(self.engine.compile_json_schema(schema).approximations, [])
-
-
-class FusedStepThroughTheLibrary(unittest.TestCase):
-    """`Batch.step` is the decode path, so the library has to expose it."""
-
-    @NEEDS_CAPTURE
-
-    def test_step_agrees_with_advance_then_fill(self):
-        import torch
-
-        engine = engrain.Engine([bytes([b]) for b in range(256)])
-        schema = json.dumps(
+        source = json.dumps(
             {"type": "object", "properties": {"a": {"type": "integer"}}}
         )
-        grammar = engine.compile_json_schema(schema)
-
-        apart = engine.batch(2)
-        together = engine.batch(2)
-        for batch in (apart, together):
-            batch.set_grammars([grammar, grammar])
-            batch.fill_mask()
-            batch.capture()
-
-        steps = 0
-        for byte in b'{"a": 7}':
-            self.assertTrue(
-                torch.equal(apart.fill_mask(), together.fill_mask()),
-                f"masks diverge at step {steps}",
-            )
-            token = torch.full((2,), byte, dtype=torch.int32, device="cuda")
-            apart.advance(token)
-            together.step(token)
-            steps += 1
-        self.assertEqual(steps, 8)
+        self.assertEqual(
+            self.engine.compile(json_schema=source, exact=True).relaxations, []
+        )
 
 
-
-
-class WhatARehearsalMustNotLeaveBehind(unittest.TestCase):
-    """`capture` and `warmup` run the advance. A caller must not see it.
-
-    Recording a graph rehearses the advance on a synthetic token, and the
-    grammar refuses that token, so before this was fixed every sequence
-    reported itself terminated the moment the documented flow ran `capture()`
-    - and a serving engine polling `problems` to retire sequences would have
-    retired the whole batch on its first step.
-    """
-
+class SlotsAreWhereRequestsLive(unittest.TestCase):
     def setUp(self):
         _requirements()
-        self.engine = engrain.Engine(VOCABULARY)
-        self.grammar = self.engine.compile_json_schema(SCHEMA)
+        self.engine = engrain.Engine([bytes([b]) for b in range(256)])
+        self.digits = self.engine.compile(regex=r"[0-9]{3}")
+        self.letters = self.engine.compile(regex=r"[a-c]{3}")
 
-    @NEEDS_CAPTURE
+    def test_live_and_free_account_for_every_slot(self):
+        slots = self.engine.slots(4)
+        self.assertEqual(slots.free, frozenset(range(4)))
+        self.assertFalse(slots)
+        slots.admit(1, self.digits)
+        self.assertEqual(slots.live, frozenset({1}))
+        self.assertEqual(slots.free, frozenset({0, 2, 3}))
+        self.assertTrue(slots)
+        slots.release(1)
+        self.assertEqual(slots.live, frozenset())
 
-    def test_capture_leaves_no_sequence_terminated(self):
-        batch = self.engine.batch(size=4)
-        batch.set_grammars([self.grammar] * 4)
-        batch.capture()
-        terminated, overflow = batch.problems()
-        self.assertEqual(terminated.tolist(), [0, 0, 0, 0])
-        self.assertEqual(overflow.tolist(), [0, 0, 0, 0])
+    def test_one_slot_can_be_replaced_without_disturbing_the_others(self):
+        """This is continuous batching, and it is what the old API could not say."""
+        slots = self.engine.slots(3)
+        for slot in range(3):
+            slots.admit(slot, self.digits)
+        tokens = torch.tensor([ord("1")] * 3, dtype=torch.int32, device="cuda")
+        slots.commit(tokens)
+        before = slots.mask().clone()
 
-    def test_warmup_leaves_no_sequence_terminated(self):
-        batch = self.engine.batch(size=4)
-        batch.set_grammars([self.grammar] * 4)
-        batch.raw.warmup()
-        self.assertEqual(batch.problems()[0].tolist(), [0, 0, 0, 0])
+        # One request finishes and another arrives, under a different grammar.
+        slots.release(1)
+        slots.admit(1, self.letters)
+        after = slots.mask()
 
-    def test_set_grammars_clears_what_the_last_parse_reported(self):
-        batch = self.engine.batch(size=2)
-        batch.set_grammars([self.grammar] * 2)
-        batch.raw.terminated.fill_(1)
-        batch.raw.overflow.fill_(1)
-        batch.set_grammars([self.grammar] * 2)
-        self.assertEqual(batch.problems()[0].tolist(), [0, 0])
-        self.assertEqual(batch.problems()[1].tolist(), [0, 0])
-
-
-class TheEngineDoesNotConfuseTwoGrammars(unittest.TestCase):
-    def setUp(self):
-        _requirements()
-        self.engine = engrain.Engine(VOCABULARY)
-
-    def test_a_dropped_grammar_does_not_lend_its_slot_to_the_next(self):
-        # The admission cache is keyed on `id`, and CPython reuses the address
-        # of a dropped object - so unless a reference is held, a caller who let
-        # one schema go out of scope could compile another, land on the same
-        # address, and be handed the first one's tables.
-        import gc
-
-        first = self.engine.compile_json_schema(json.dumps({"type": "string"}))
-        first_id, address = self.engine.admit(first), id(first)
-        del first
-        gc.collect()
-        for _ in range(200):
-            other = self.engine.compile_json_schema(json.dumps({"type": "integer"}))
-            if self.engine.admit(other) == first_id:
-                self.fail("a different grammar was given an occupied slot")
-            if id(other) == address:
-                return
-
-
-class TheMatcherRefusesABufferItCannotWriteTo(unittest.TestCase):
-    """`fill_bitmask` writes through a pointer the caller supplies."""
-
-    def setUp(self):
-        _requirements()
-        self.engine = engrain.Engine(VOCABULARY)
-        self.grammar = self.engine.compile_json_schema(SCHEMA)
-        self.matcher = self.grammar.matcher(32)
-        self.words = self.grammar.bitset_words
-
-    def test_a_device_buffer_is_refused(self):
-        # Its `data_ptr` is a device address and this write is on the host.
-        with self.assertRaises(ValueError):
-            self.matcher.fill_bitmask(
-                torch.zeros(self.words, dtype=torch.int32, device="cuda")
+        self.assertEqual(_bits(after, 1, 256), set(range(ord("a"), ord("c") + 1)))
+        for untouched in (0, 2):
+            self.assertEqual(
+                _bits(before, untouched, 256), _bits(after, untouched, 256)
             )
 
-    def test_a_narrower_element_is_refused(self):
-        # `numel` passes while the buffer is a quarter of the bytes needed.
+    def test_a_slot_outside_the_range_is_refused(self):
+        slots = self.engine.slots(2)
+        with self.assertRaises(IndexError):
+            slots.admit(2, self.digits)
+
+    def test_stepping_before_admitting_anything_is_refused(self):
+        slots = self.engine.slots(2)
+        with self.assertRaises(RuntimeError):
+            slots.mask()
+
+    def test_slots_before_a_grammar_is_refused(self):
+        engine = engrain.Engine([bytes([b]) for b in range(256)])
+        with self.assertRaises(RuntimeError):
+            engine.slots(2)
+
+
+class ApplyIsTheMask(unittest.TestCase):
+    """The last mile the surface used to leave to the caller."""
+
+    def setUp(self):
+        _requirements()
+        self.engine = engrain.Engine([bytes([b]) for b in range(256)])
+        self.grammar = self.engine.compile(regex=r"[0-9]{3}")
+        self.slots = self.engine.slots(2)
+        self.slots.admit(0, self.grammar)
+        self.slots.admit(1, self.grammar)
+
+    def _survivors(self, logits, row):
+        return {
+            token
+            for token, value in enumerate(logits[row].tolist())
+            if value != float("-inf")
+        }
+
+    def test_it_leaves_exactly_the_tokens_the_mask_holds(self):
+        wanted = _bits(self.slots.mask(), 0, 256)
+        logits = torch.zeros(2, 256, device="cuda")
+        self.slots.apply(logits)
+        self.assertEqual(self._survivors(logits, 0), wanted)
+
+    def test_float16_agrees_with_float32(self):
+        wanted = _bits(self.slots.mask(), 0, 256)
+        half = torch.zeros(2, 256, device="cuda", dtype=torch.float16)
+        self.slots.apply(half)
+        self.assertEqual(self._survivors(half, 0), wanted)
+
+    def test_a_padded_row_keeps_its_tail(self):
+        """A model's vocabulary is padded and a tokenizer's is not.
+
+        Assuming they matched left the tail of every row as whatever it held,
+        which is a bug this integration has already met once.
+        """
+        logits = torch.zeros(2, 300, device="cuda")
+        self.slots.apply(logits)
+        self.assertTrue(torch.isfinite(logits[:, 256:]).all())
+
+    def test_a_wrong_shape_is_refused(self):
         with self.assertRaises(ValueError):
-            self.matcher.fill_bitmask(torch.zeros(self.words, dtype=torch.uint8))
-
-    def test_a_strided_buffer_is_refused(self):
-        # At least two elements, or the stride has nothing to skip over and a
-        # single element is contiguous by definition.
-        stride = torch.zeros(max(2, self.words) * 2, dtype=torch.int32)[::2]
-        self.assertFalse(stride.is_contiguous())
-        with self.assertRaises(ValueError):
-            self.matcher.fill_bitmask(stride)
-
-    def test_the_buffer_it_documents_is_accepted(self):
-        self.matcher.fill_bitmask(torch.zeros(self.words, dtype=torch.int32))
+            self.slots.apply(torch.zeros(5, 256, device="cuda"))
 
 
+class SampleDrawsOnlyWhatTheGrammarAllows(unittest.TestCase):
+    def setUp(self):
+        _requirements()
+        self.engine = engrain.Engine([bytes([b]) for b in range(256)])
+        self.grammar = self.engine.compile(regex=r"[0-9]{3}")
+        self.slots = self.engine.slots(8)
+        for slot in range(8):
+            self.slots.admit(slot, self.grammar)
 
-class ABatchThePoolOutgrew(unittest.TestCase):
-    """Admitting a grammar can raise a ceiling a live batch was sized from.
+    def test_every_draw_is_admissible(self):
+        digits = set(range(ord("0"), ord("9") + 1))
+        for temperature, top_p, top_k in ((1.0, 1.0, 0), (0.7, 0.9, 0), (1.0, 1.0, 5)):
+            logits = torch.randn(8, 256, device="cuda")
+            drawn = self.slots.sample(
+                logits, temperature=temperature, top_p=top_p, top_k=top_k
+            )
+            self.assertTrue(set(drawn.tolist()) <= digits, (temperature, top_p, top_k))
+            self.assertEqual(drawn.dtype, torch.int32)
 
-    Buffers do not overflow, they read past themselves - the kernels index
-    what they are given - so this has to be refused rather than flagged.
-    """
+    def test_zero_temperature_is_the_best_allowed_token(self):
+        logits = torch.full((8, 256), -1.0, device="cuda")
+        logits[:, ord("7")] = 5.0
+        logits[:, ord("Z")] = 9.0  # higher, and forbidden
+        drawn = self.slots.sample(logits, temperature=0.0)
+        self.assertEqual(set(drawn.tolist()), {ord("7")})
 
+
+class CommitReportsWhatHappened(unittest.TestCase):
+    def setUp(self):
+        _requirements()
+        self.engine = engrain.Engine([bytes([b]) for b in range(256)])
+        self.grammar = self.engine.compile(regex=r"[0-9]{3}")
+
+    def test_a_refused_token_is_named(self):
+        slots = self.engine.slots(2)
+        slots.admit(0, self.grammar)
+        slots.admit(1, self.grammar)
+        # `a` is not a digit; the parser must refuse it and say so.
+        verdict = slots.commit(
+            torch.tensor([ord("0"), ord("a")], dtype=torch.int32, device="cuda")
+        )
+        self.assertFalse(verdict.ok)
+        self.assertEqual(verdict.failures(), [1])
+
+    def test_the_next_mask_is_ready_without_asking(self):
+        slots = self.engine.slots(1)
+        slots.admit(0, self.grammar)
+        slots.commit(torch.tensor([ord("0")], dtype=torch.int32, device="cuda"))
+        self.assertEqual(
+            _bits(slots.mask(), 0, 256), set(range(ord("0"), ord("9") + 1))
+        )
+        slots.commit(torch.tensor([ord("1")], dtype=torch.int32, device="cuda"))
+        slots.commit(torch.tensor([ord("2")], dtype=torch.int32, device="cuda"))
+        # Three digits and the pattern is satisfied: nothing may follow.
+        self.assertEqual(_bits(slots.mask(), 0, 256), set())
+
+
+class TheDeviceAgreesWithTheReferenceParser(unittest.TestCase):
+    def setUp(self):
+        _requirements()
+        self.engine = engrain.Engine(VOCABULARY)
+        self.grammar = self.engine.compile(json_schema=SCHEMA)
+
+    def test_the_mask_is_the_matcher_s(self):
+        slots = self.engine.slots(1)
+        slots.admit(0, self.grammar)
+        matcher = self.grammar.matcher(0)
+        for _ in range(6):
+            wanted = set(matcher.allowed_tokens())
+            self.assertEqual(_bits(slots.mask(), 0, len(VOCABULARY)), wanted)
+            if not wanted:
+                break
+            token = min(wanted)
+            matcher.accept_token(token)
+            slots.commit(torch.tensor([token], dtype=torch.int32, device="cuda"))
+
+    def test_parses_agree_with_the_matcher(self):
+        slots = self.engine.slots(1)
+        slots.admit(0, self.grammar)
+        matcher = self.grammar.matcher(0)
+        mine = {(state, tuple(stack)) for state, stack in slots.parses(0)}
+        theirs = {(state, tuple(stack)) for state, stack in matcher.configurations()}
+        self.assertEqual(mine, theirs)
+
+    def test_resume_takes_a_matcher_s_state(self):
+        matcher = self.grammar.matcher(0)
+        for token, piece in enumerate(VOCABULARY):
+            if piece.startswith(b"{"):
+                matcher.accept_token(token)
+                break
+        slots = self.engine.slots(1)
+        slots.resume(0, matcher)
+        self.assertEqual(
+            _bits(slots.mask(), 0, len(VOCABULARY)), set(matcher.allowed_tokens())
+        )
+
+
+class LookaheadBuysRollback(unittest.TestCase):
+    def setUp(self):
+        _requirements()
+        self.engine = engrain.Engine([bytes([b]) for b in range(256)])
+        self.grammar = self.engine.compile(regex=r"[0-9]{3}")
+
+    def test_a_committed_token_can_be_undone(self):
+        slots = self.engine.slots(1, lookahead=2)
+        slots.admit(0, self.grammar)
+        before = slots.mask().clone()
+        slots.commit(torch.tensor([ord("5")], dtype=torch.int32, device="cuda"))
+        slots.rollback(1)
+        self.assertTrue(torch.equal(before, slots.mask()))
+
+
+class WhatTheEngineCosts(unittest.TestCase):
     def setUp(self):
         _requirements()
         self.engine = engrain.Engine(VOCABULARY)
 
-    def _wide(self):
-        return self.engine.compile_json_schema(json.dumps({
-            "type": "object",
-            "properties": {name: {"type": "string"} for name in "abcdefghijklmnop"},
-            "required": list("abcdefgh"),
-        }))
+    def test_it_reports_its_own_size(self):
+        self.assertEqual(self.engine.mask_words, 0)
+        self.engine.compile(json_schema=SCHEMA)
+        self.assertEqual(self.engine.mask_words, (len(VOCABULARY) + 31) // 32)
+        self.assertGreater(self.engine.resident_bytes, 0)
 
-    @NEEDS_CAPTURE
-
-    def test_a_wider_grammar_makes_a_live_batch_refuse(self):
-        narrow = self.engine.compile_json_schema(json.dumps({"type": "boolean"}))
-        batch = self.engine.batch(size=4)
-        batch.set_grammars([narrow] * 4)
-        batch.capture()
-        self.assertFalse(batch.outgrown)
-        wide = self._wide()
-        self.assertTrue(batch.outgrown)
-        with self.assertRaises(RuntimeError):
-            batch.set_grammars([wide] * 4)
-        with self.assertRaises(RuntimeError):
-            batch.fill_mask()
-
-    def test_and_a_new_batch_serves_it(self):
-        narrow = self.engine.compile_json_schema(json.dumps({"type": "boolean"}))
-        stale = self.engine.batch(size=4)
-        stale.set_grammars([narrow] * 4)
-        wide = self._wide()
-        fresh = self.engine.batch(size=4)
-        fresh.set_grammars([wide] * 4)
-        self.assertFalse(fresh.outgrown)
-        mask = fresh.fill_mask()
-        reference = torch.zeros(wide.bitset_words, dtype=torch.int32)
-        wide.matcher(32).fill_bitmask(reference)
-        self.assertTrue(bool((mask[0].cpu()[: wide.bitset_words] == reference).all()))
-
-
-
-class WrongMasksThatWouldNotRaise(unittest.TestCase):
-    """Three ways to get a mask that is simply about something else.
-
-    None of them is an overflow - the parse is perfectly happy - so none is
-    reachable by the flag that reports narrowing. They have to be refused.
-    """
-
-    def setUp(self):
-        _requirements()
-        self.engine = engrain.Engine(VOCABULARY)
-
-    def test_a_grammar_from_another_tokenizer_is_refused(self):
-        # Same size is not the same tokenizer: a grammar's groups are token
-        # ids, so a permuted vocabulary gives a mask wrong token by token.
-        other = engrain.Engine(list(reversed(VOCABULARY)))
-        foreign = other.compile_json_schema(SCHEMA)
-        ours = self.engine.compile_json_schema(SCHEMA)
-        self.assertNotEqual(foreign.vocabulary_digest, ours.vocabulary_digest)
-        with self.assertRaises(ValueError):
-            self.engine.admit(foreign)
-
-    def test_an_unassigned_batch_is_refused_once_the_pool_is_mixed(self):
-        first = self.engine.compile_json_schema(json.dumps({"type": "string"}))
-        # One grammar: slot 0 is right for every sequence, so this is allowed.
-        single = self.engine.batch(size=2)
-        self.assertEqual(single.fill_mask().shape[0], 2)
-        self.engine.compile_json_schema(json.dumps({"type": "integer"}))
-        mixed = self.engine.batch(size=2)
-        with self.assertRaises(RuntimeError):
-            mixed.fill_mask()
-        mixed.set_grammars([first, first])
-        self.assertEqual(mixed.fill_mask().shape[0], 2)
-
-    def test_a_released_grammar_cannot_be_assigned(self):
-        keep = self.engine.compile_json_schema(json.dumps({"type": "string"}))
-        gone = self.engine.compile_json_schema(json.dumps({"type": "integer"}))
-        batch = self.engine.batch(size=2)
-        identifier = self.engine.admit(gone)
-        self.engine.pool.release(identifier)
-        # The slot is still inside `count`; it holds nothing.
-        with self.assertRaises(ValueError):
-            batch.set_grammars([identifier, identifier])
-        batch.set_grammars([keep, keep])
-
-    def test_a_negative_id_is_refused(self):
-        self.engine.compile_json_schema(SCHEMA)
-        batch = self.engine.batch(size=2)
-        with self.assertRaises(ValueError):
-            batch.raw.set_grammars([-1, 0])
+    def test_compiling_the_same_grammar_twice_costs_one_slot(self):
+        grammar = self.engine.compile(json_schema=SCHEMA)
+        held = self.engine.resident_bytes
+        self.engine._admit(grammar)
+        self.assertEqual(held, self.engine.resident_bytes)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class ATokenOutsideTheVocabulary(unittest.TestCase):
-    """A sampled id the vocabulary does not have must refuse, not corrupt.
-
-    The tokens are never read on the host - that is the whole design - so a
-    caller that passes an id past the end of the vocabulary cannot be caught
-    there. A dense group set is indexed *by* the id, so one too large read
-    past its payload and took the CUDA context with it: not a wrong mask, a
-    dead process, and every other sequence in the batch with it.
-    """
-
-    def _batch(self):
-        _requirements()
-        engine = engrain.Engine(VOCABULARY)
-        grammar = engine.compile_json_schema(SCHEMA)
-        batch = engine.batch(size=4)
-        batch.set_grammars([grammar] * 4)
-        return engine, grammar, batch
-
-    def test_a_huge_id_refuses_and_leaves_the_others_alone(self):
-        _, grammar, batch = self._batch()
-        good = grammar.matcher(0).allowed_tokens()[0]
-        batch.advance(
-            torch.tensor([good, 10**9, -5, good], dtype=torch.int32, device="cuda")
-        )
-        torch.cuda.synchronize()
-        terminated, overflow = batch.problems()
-        self.assertEqual(terminated.tolist(), [0, 1, 1, 0])
-        # Not an overflow: nothing hit a ceiling, the token simply is not in
-        # the grammar. Reporting it as one would send a caller looking for a
-        # buffer to enlarge.
-        self.assertEqual(overflow.tolist(), [0, 0, 0, 0])
-
-    def test_the_batch_still_fills_afterwards(self):
-        _, grammar, batch = self._batch()
-        good = grammar.matcher(0).allowed_tokens()[0]
-        batch.advance(
-            torch.tensor([good, 2**31 - 1, good, good], dtype=torch.int32, device="cuda")
-        )
-        mask = batch.fill_mask()
-        torch.cuda.synchronize()
-        rows = mask.to(torch.int32).view(4, -1).ne(0).sum(1).tolist()
-        self.assertGreater(rows[0], 0)
-        self.assertEqual(rows[0], rows[2])
-
-
-class TheAllowedSetIsTheMask(unittest.TestCase):
-    """`allowed` must name exactly the tokens the mask admits, in order.
-
-    The set is what a fused sampler draws from, so a bit the compaction drops
-    is a token the model can never choose and a bit it invents is one the
-    grammar forbids. Checked against the mask itself rather than against a
-    second implementation of the same idea.
-    """
-
-    def _filled(self, size=6):
-        _requirements()
-        engine = engrain.Engine(VOCABULARY)
-        grammar = engine.compile_json_schema(SCHEMA)
-        batch = engine.batch(size=size)
-        batch.set_grammars([grammar] * size)
-        matchers = []
-        for row in range(size):
-            matcher = grammar.matcher(0)
-            for _ in range(row):
-                allowed = matcher.allowed_tokens()
-                if not allowed or not matcher.accept_token(allowed[0]):
-                    break
-            matchers.append(matcher)
-        batch.set_matchers(matchers)
-        return engine, batch, batch.fill_mask()
-
-    def test_it_names_exactly_the_bits_the_mask_sets(self):
-        engine, batch, mask = self._filled()
-        ids, counts = batch.allowed(4096)
-        torch.cuda.synchronize()
-        words = mask.view(batch.size, -1).cpu()
-        for row in range(batch.size):
-            wanted = [
-                token
-                for token in range(len(VOCABULARY))
-                if (int(words[row][token >> 5]) >> (token & 31)) & 1
-            ]
-            self.assertEqual(ids[row, : int(counts[row])].tolist(), wanted)
-
-    def test_no_bit_above_the_vocabulary_is_named(self):
-        # A row is a whole number of words, so its last one runs past the
-        # vocabulary. Those bits are nobody's token.
-        engine, batch, _ = self._filled()
-        ids, counts = batch.allowed(4096)
-        torch.cuda.synchronize()
-        for row in range(batch.size):
-            held = ids[row, : int(counts[row])]
-            if held.numel():
-                self.assertLess(int(held.max()), len(VOCABULARY))
-
-    def test_the_count_is_true_even_when_the_buffer_is_not(self):
-        # A caller that cannot tell a truncated list from a complete one
-        # samples from a prefix and never knows.
-        engine, batch, mask = self._filled()
-        _, full = batch.allowed(4096)
-        torch.cuda.synchronize()
-        expected = [int(x) for x in full]
-        ids, counts = batch.allowed(2)
-        torch.cuda.synchronize()
-        self.assertEqual([int(x) for x in counts], expected)
-        self.assertEqual(ids.shape[1], 2)
-
-    def test_a_capacity_of_zero_is_refused(self):
-        _, batch, _ = self._filled(size=2)
-        with self.assertRaises(ValueError):
-            batch.allowed(0)
-
-
-class TheShortlistIsWhicheverListIsShorter(unittest.TestCase):
-    """`shortlist` must name the forbidden tokens when those are fewer.
-
-    A row inside a JSON string body admits nearly the whole vocabulary, so its
-    allowed list is useless and its forbidden list is small. Getting the two
-    the wrong way round would hand a sampler the complement of what the
-    grammar permits, which is the worst possible failure and would still look
-    like a plausible list.
-    """
-
-    def _batch(self, admits_most: bool):
-        _requirements()
-        wide = [bytes([byte]) for byte in range(256)]
-        engine = engrain.Engine(wide)
-        grammar = engine.compile_json_schema(
-            json.dumps(
-                {
-                    "type": "object",
-                    "properties": {"s": {"type": "string"}},
-                    "required": ["s"],
-                }
-            )
-        )
-        batch = engine.batch(size=3)
-        batch.set_grammars([grammar] * 3)
-        matcher = grammar.matcher(0)
-        if admits_most:
-            # Into the string body, where almost every byte is a legal
-            # continuation.
-            for piece in b'{"s": "':
-                matcher.accept_token(piece)
-        batch.set_matchers([matcher] * 3)
-        return engine, batch, batch.fill_mask(), len(wide)
-
-    def _check(self, admits_most):
-        _, batch, mask, size = self._batch(admits_most)
-        ids, counts, kind = batch.raw.compact(4096, both=True)
-        torch.cuda.synchronize()
-        words = mask.view(batch.size, -1).cpu()
-        for row in range(batch.size):
-            bits = [
-                token
-                for token in range(size)
-                if (int(words[row][token >> 5]) >> (token & 31)) & 1
-            ]
-            wanted = bits if int(kind[row]) == 0 else [
-                token for token in range(size) if token not in set(bits)
-            ]
-            self.assertEqual(ids[row, : int(counts[row])].tolist(), wanted)
-            # And it really is the shorter one.
-            self.assertLessEqual(int(counts[row]) * 2, size + 1)
-        return int(kind[0]), int(counts[0])
-
-    def test_a_structural_position_lists_what_it_admits(self):
-        kind, _ = self._check(admits_most=False)
-        self.assertEqual(kind, 0)
-
-    def test_a_string_body_lists_what_it_forbids(self):
-        kind, count = self._check(admits_most=True)
-        self.assertEqual(kind, 1)
-        self.assertGreater(count, 0)

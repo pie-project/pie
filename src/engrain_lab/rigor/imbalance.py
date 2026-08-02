@@ -44,6 +44,7 @@ def distribution(schemas: int, batch: int, model: str) -> list[int]:
     from transformers import AutoTokenizer
 
     import engrain
+    import engrain.internals
     from engrain._engine import DeviceGrammar
 
     tokenizer = AutoTokenizer.from_pretrained(model)
@@ -56,7 +57,7 @@ def distribution(schemas: int, batch: int, model: str) -> list[int]:
             vocabulary.append(b"")
 
     instances = json.loads(INSTANCES.read_text())["instances"]
-    compiler = engrain.Compiler(vocabulary)
+    compiler = engrain.internals.Compiler(vocabulary)
     pool = DeviceGrammar()
 
     admitted = []

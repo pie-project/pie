@@ -24,6 +24,7 @@ INSTANCES = Path("results/jsonschemabench-instances.json")
 
 def main() -> None:
     import engrain
+    import engrain.internals
     from transformers import AutoTokenizer
 
     from engrain._engine import DeviceGrammar
@@ -43,7 +44,7 @@ def main() -> None:
             vocabulary.append(b"")
 
     instances = json.loads(INSTANCES.read_text())["instances"]
-    compiler = engrain.Compiler(vocabulary)
+    compiler = engrain.internals.Compiler(vocabulary)
 
     total_steps = 0
     schemas = 0

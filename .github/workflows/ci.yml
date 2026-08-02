@@ -64,13 +64,15 @@ jobs:
           import json
           import engrain
           engine = engrain.Engine([bytes([i]) for i in range(256)])
-          grammar = engine.compile_json_schema(
-              json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
+          grammar = engine.compile(
+              json_schema=json.dumps(
+                  {"type": "object", "properties": {"a": {"type": "string"}}}
+              )
           )
-          assert grammar.approximations is not None
+          assert grammar.relaxations is not None
           # The budget on the regex path, which is the one a request supplies.
           try:
-              engine.compile_regex("(a|b)*a" + "(a|b)" * 24)
+              engine.compile(regex="(a|b)*a" + "(a|b)" * 24)
           except engrain.CompileError as refusal:
               assert refusal.stage == "lexer", refusal.stage
           else:

@@ -440,13 +440,14 @@ def main() -> None:
     arguments = parser.parse_args()
 
     import engrain
+    import engrain.internals
     import xgrammar as xg
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(arguments.model)
     vocabulary = load_vocabulary(arguments.model)
     instances = load_corpus()
-    our_compiler = engrain.Compiler(vocabulary)
+    our_compiler = engrain.internals.Compiler(vocabulary)
     info = xg.TokenizerInfo.from_huggingface(tokenizer, vocab_size=len(tokenizer))
     their_compiler = xg.GrammarCompiler(info)
 

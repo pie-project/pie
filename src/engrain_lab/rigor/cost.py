@@ -42,6 +42,7 @@ KV_BYTES_PER_TOKEN = 32 * 2 * 8 * 128 * 2
 def measure(model: str, limit: int | None, lexer_states: int) -> dict[str, Any]:
     """Compile the corpus in both engines, timing and weighing each schema."""
     import engrain
+    import engrain.internals
     import xgrammar as xg
     from transformers import AutoTokenizer
 
@@ -51,7 +52,7 @@ def measure(model: str, limit: int | None, lexer_states: int) -> dict[str, Any]:
     if limit:
         instances = instances[:limit]
 
-    our_compiler = engrain.Compiler(vocabulary)
+    our_compiler = engrain.internals.Compiler(vocabulary)
     info = xg.TokenizerInfo.from_huggingface(tokenizer, vocab_size=len(tokenizer))
     their_compiler = xg.GrammarCompiler(info, cache_enabled=False)
 

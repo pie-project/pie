@@ -32,6 +32,7 @@ def main() -> None:
     arguments = parser.parse_args()
 
     import engrain
+    import engrain.internals
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(arguments.model)
@@ -43,7 +44,7 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             vocabulary.append(b"")
 
-    compiler = engrain.Compiler(vocabulary)
+    compiler = engrain.internals.Compiler(vocabulary)
     instances = json.loads(arguments.instances.read_text())["instances"]
 
     sizes: list[float] = []
