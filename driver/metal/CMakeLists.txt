@@ -577,6 +577,11 @@ if(APPLE)
   # Every slot the llama family's kernels declare, against a real argument
   # table. Catches the unbound-slot class, which is never a crash.
   add_metal_linked_test(llama_bind_test tests/llama_bind_test.cpp)
+  # The family's arithmetic, against an fp32 reference written from the .metal
+  # files. Synthesises its own MLX affine-U4 weights, so it needs no checkpoint.
+  add_metal_linked_test(llama_numerics_test tests/llama_numerics_test.cpp)
+  target_compile_definitions(llama_numerics_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   # `heap_bind.cpp`'s `case K::Fill` on a real heap.
   add_metal_linked_test(loader_fill_test tests/loader_fill_test.cpp NEEDS_LOADER)
   # The host MSL emitter's whole corpus, through Apple's shader compiler. The

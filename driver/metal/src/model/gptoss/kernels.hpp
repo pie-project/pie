@@ -121,9 +121,7 @@ inline void qmv_u8_dispatch(int N, Grid& g, Threadgroup& tg, int rows = 1) {
 /// `rows` folds onto the x axis, which the kernel already reads as the token
 /// row: the grid is in THREADS, so one threadgroup of 32 per row.
 inline void qmv_dispatch(int N, int slots, Grid& g, Threadgroup& tg, int rows = 1) {
-    g = Grid{32u * std::uint32_t(rows < 1 ? 1 : rows), std::uint32_t(N) / 4,
-             std::uint32_t(slots < 1 ? 1 : slots)};
-    tg = Threadgroup{32, 2, 1};
+    shared_kernels::routed_qmv_dispatch(N, slots, g, tg, rows);
 }
 
 /// `sdpa_vector_decode_sink`: one threadgroup of 1024 per query head. The grid

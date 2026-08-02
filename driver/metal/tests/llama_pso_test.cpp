@@ -103,10 +103,19 @@ int main() {
 
     // The slot axis is the whole difference from a dense matvec, and getting it
     // wrong means every row computes one expert instead of k.
+    //
+    // These numbers were WRONG here before `llama_numerics_test` ran the
+    // kernel: this asked for `g.y == N` and one simdgroup, and the kernel
+    // derives `out_row` from `tid.y * 8` across TWO simdgroups. That shape
+    // leaves four output rows in every eight unwritten and indexes up to 8N.
+    // Pinning a launch shape only pins it to whatever was believed, which is
+    // why the arithmetic below is stated against the kernel's own constants.
     routed_qmv_dispatch(768, 8, g, tg, 3);
-    expect_eq(g.y, 768, "routed qmv: one simdgroup per output row");
-    expect_eq(g.z, 24, "routed qmv: rows x experts_per_token slots");
-    expect_eq(tg.x, 32, "routed qmv: a simdgroup per threadgroup");
+    expect_eq(g.y, 768 / 4, "routed qmv: 8 output rows per threadgroup, 4 per simdgroup");
+    expect_eq(g.z, 8, "routed qmv: the slot axis is experts_per_token");
+    expect_eq(g.x, 32 * 3, "routed qmv: the token row rides tid.x, not the slot axis");
+    expect_eq(tg.x, 32, "routed qmv: a simdgroup is 32 lanes");
+    expect_eq(tg.y, 2, "routed qmv: two simdgroups, which is what out_row assumes");
 
     expert_combine_dispatch(2048, g, tg, 5);
     expect_eq(g.x, 2048, "combine: one thread per hidden element");

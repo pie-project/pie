@@ -28,7 +28,13 @@ namespace pie::metal::llama {
 
 // The dense matvec's launch shape is shared, not restated: `affine_qmv_fast`
 // is the same kernel for every family that dispatches it.
+using pie::metal::embed_dispatch;
+using pie::metal::kv_append_dispatch;
 using pie::metal::qmv_dispatch;
+using pie::metal::residual_dispatch;
+using pie::metal::rms_dispatch;
+using pie::metal::rope_dispatch;
+using pie::metal::sdpa_dispatch;
 
 Kernel shared_kind(Kind k, const LlamaGeometry& g) {
     switch (k) {
@@ -193,14 +199,21 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
     // tg {32,2,1} against a grid of TOTAL THREADS. Restating it as "one
     // threadgroup per 8 rows" gives each threadgroup one thread, which silently
     // skips 4 rows in 8 and 31/32 of K.
-    if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
+    //
+    // `is_routed` is asked FIRST because `qmv_kn` answers for the routed kinds
+    // too -- they have a K and an N like any other matvec. Falling into the
+    // dense shape on the strength of that leaves `grid.z` at 1, and `tid.z` is
+    // the expert slot: every slot after the first is never dispatched at all
+    // and its output stays whatever the pool held. The first expert is right,
+    // so the model still produces text.
+    if (const KN kn = qmv_kn(d.kind, g); kn.N != 0 && !is_routed(d.kind)) {
         qmv_dispatch(kn.N, grid, tg);
         return;
     }
 
     switch (d.kind) {
         case Kind::EmbedGather:
-            elementwise_dispatch(g.hidden, grid, tg);
+            embed_dispatch(g.hidden, grid, tg);
             return;
         case Kind::RowGather:
             grid = Grid{std::uint32_t(g.hidden), 1, 1};
@@ -209,42 +222,44 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
         case Kind::AttnNorm:
         case Kind::FfnNorm:
         case Kind::FinalRms:
-        case Kind::AttnResidual:
-        case Kind::FfnResidual: {
-            const int threads = (g.hidden + 3) / 4;
-            grid = Grid{std::uint32_t(threads), 1, 1};
-            tg = Threadgroup{std::uint32_t(threads), 1, 1};
+            rms_dispatch(g.hidden, 1, grid, tg);
             return;
-        }
         // Qwen3's qk-norms are per HEAD, over head_dim -- not one norm over the
         // whole projection. One threadgroup per head.
-        case Kind::QNorm: {
-            const int threads = (g.head_dim + 3) / 4;
-            grid = Grid{std::uint32_t(threads) * std::uint32_t(g.n_q_heads), 1, 1};
-            tg = Threadgroup{std::uint32_t(threads), 1, 1};
+        case Kind::QNorm:
+            rms_dispatch(g.head_dim, g.n_q_heads, grid, tg);
             return;
-        }
-        case Kind::KNorm: {
-            const int threads = (g.head_dim + 3) / 4;
-            grid = Grid{std::uint32_t(threads) * std::uint32_t(g.n_kv_heads), 1, 1};
-            tg = Threadgroup{std::uint32_t(threads), 1, 1};
+        case Kind::KNorm:
+            rms_dispatch(g.head_dim, g.n_kv_heads, grid, tg);
             return;
-        }
+        // NOT the norms' shape, which is what this used to borrow. `rms_norm`
+        // reads four elements per thread and `residual_add` reads one, so the
+        // norms' `hidden/4` threads leave three quarters of the residual stream
+        // holding whatever the pool buffer held before. That survives -- the
+        // first quarter is right, the model still emits tokens.
+        case Kind::AttnResidual:
+        case Kind::FfnResidual:
+            residual_dispatch(g.hidden, grid, tg);
+            return;
         case Kind::RopeQ:
-            grid = Grid{std::uint32_t(g.rotary_dims() / 2), std::uint32_t(g.n_q_heads), 1};
-            tg = Threadgroup{std::uint32_t(g.rotary_dims() / 2), 1, 1};
+            rope_dispatch(g.rotary_dims(), g.n_q_heads, grid, tg);
             return;
         case Kind::RopeK:
-            grid = Grid{std::uint32_t(g.rotary_dims() / 2), std::uint32_t(g.n_kv_heads), 1};
-            tg = Threadgroup{std::uint32_t(g.rotary_dims() / 2), 1, 1};
+            rope_dispatch(g.rotary_dims(), g.n_kv_heads, grid, tg);
             return;
         case Kind::KvAppend:
-            grid = Grid{std::uint32_t(g.head_dim), std::uint32_t(g.n_kv_heads), 1};
-            tg = Threadgroup{std::uint32_t(g.head_dim), 1, 1};
+            kv_append_dispatch(g.head_dim, g.n_kv_heads, grid, tg);
             return;
         case Kind::Sdpa:
-            grid = Grid{1024, std::uint32_t(g.n_q_heads), 1};
-            tg = Threadgroup{1024, 1, 1};
+            // The shared shape, not a restatement of it. `sdpa_vector_decode`
+            // reads the query head from `tid.x` -- the THREADGROUP's x -- and
+            // uses `tid.y` as the query's sequence index, which at decode is 0.
+            // Putting the head on y instead launches the right number of
+            // threads and computes the wrong thing: `kv_head_idx` is
+            // `tid.x / gqa_factor`, so every query head would read KV head 0.
+            // The output still lands per-head, so the symptom is not garbage --
+            // it is attention with the grouping collapsed.
+            sdpa_dispatch(g.n_q_heads, grid, tg);
             return;
         case Kind::SiluMul:
             elementwise_dispatch(g.intermediate, grid, tg);

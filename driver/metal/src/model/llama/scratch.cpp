@@ -312,10 +312,17 @@ std::vector<ValueExtent> llama_value_extents(const std::vector<Dispatch>& dag,
                 e.elems = g.n_experts;
                 break;
             case Kind::RouterTopK:
-                // Both outputs are k-wide, one int and one activation. The
-                // pool's element type is uniform, so the int side is sized in
-                // the same units and rounded up rather than special-cased.
-                e.elems = g.experts_per_token;
+                // Both outputs are k-wide, but they are not the same width:
+                // the weights are activations and the ids are `int32`, which is
+                // TWO of this pool's elements rather than one. The pool is
+                // measured in activation elements and allocated at two bytes
+                // each, so sizing the ids like the weights hands `router_topk`
+                // a buffer half the length it writes -- 16 bytes for a k=8
+                // model against the 32 it stores. Nothing here can tell the two
+                // values apart (one kind produces both), so the claim is the
+                // wider of them and the weights ride along at twice their need.
+                // That is k extra elements per routed layer.
+                e.elems = g.experts_per_token * 2;
                 break;
             case Kind::ExpertGate:
             case Kind::ExpertUp:

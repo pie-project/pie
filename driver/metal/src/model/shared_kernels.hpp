@@ -70,17 +70,26 @@ inline void expert_combine_dispatch(int hidden, Grid& g, Threadgroup& tg, int ro
     tg = Threadgroup{w < 256u ? w : 256u, 1, 1};
 }
 
-/// The routed matvec: one simdgroup per output row, `tid.z` selecting the slot.
+/// The routed matvec's launch shape.
 ///
-/// The slot axis is the whole difference from the dense matvec, and it is why
-/// the expert activations are `experts_per_token` times taller: every slot
-/// writes its own full-width result, and only `expert_combine` collapses them.
+/// The same row decomposition as the dense `qmv_dispatch`, because it is the
+/// same kernel body: `qmv_gptoss_impl` computes
+/// `out_row = tid.y * (num_simdgroups * results_per_simdgroup)` with
+/// `num_simdgroups` fixed at 2, so a threadgroup owns EIGHT output rows and
+/// needs two simdgroups to write them. One simdgroup covers only the first
+/// four, and `grid.y = N` then runs `out_row` up to 8N -- half the rows stale,
+/// and the write past the end of the buffer.
+///
+/// The two axes the dense shape does not have are the token row on `tid.x` and
+/// the expert slot on `tid.z`, and they are NOT interchangeable: the kernel
+/// selects its expert with `sel = row * slots_per_row + slot`, so folding the
+/// rows into the slot axis routes every row through row 0's experts.
 inline void routed_qmv_dispatch(int N, int experts_per_token, Grid& g, Threadgroup& tg,
                                 int rows = 1) {
-    const std::uint32_t slots = std::uint32_t(experts_per_token > 0 ? experts_per_token : 1) *
-                                std::uint32_t(rows > 0 ? rows : 1);
-    g = Grid{32u, std::uint32_t(N > 0 ? N : 1), slots};
-    tg = Threadgroup{32, 1, 1};
+    const std::uint32_t r = std::uint32_t(rows > 0 ? rows : 1);
+    const std::uint32_t slots = std::uint32_t(experts_per_token > 0 ? experts_per_token : 1);
+    g = Grid{32u * r, std::uint32_t(N > 0 ? N : 1) / 4u, slots};
+    tg = Threadgroup{32, 2, 1};
 }
 
 /// Bind a POD constant value into a fresh resident slot at (ordinal, index).
