@@ -42,83 +42,12 @@ fn contract_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/contracts/convert_bf16_to_mxfp4.json")
 }
 
+/// What `convert` writes, end to end. `.zt` is the only output: an MXFP4
+/// payload spans half its element count, and the scheme is named by the file
+/// rather than inferred from a dtype tag the way the interchange format
+/// required.
 #[test]
-fn convert_writes_a_safetensors_checkpoint_the_loader_reads_back() {
-    let root = std::env::temp_dir().join(format!("pie_convert_cli_{}", std::process::id()));
-    std::fs::remove_dir_all(&root).ok();
-    let snapshot = root.join("snapshot");
-    let out = root.join("converted");
-    write_snapshot(&snapshot);
-
-    let run = Command::new(env!("CARGO_BIN_EXE_pie-loader"))
-        .args(["convert", snapshot.to_str().unwrap()])
-        .arg(contract_path())
-        .arg(&out)
-        .arg("--safetensors")
-        .output()
-        .unwrap();
-    assert!(
-        run.status.success(),
-        "convert failed:\n{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-
-    // The converted checkpoint parses with the crate's own reader, which is
-    // the arithmetic that matters: `F4_E2M1` spans half its element count.
-    let parsed = parse_checkpoint_metadata(&out).unwrap();
-    let w = parsed.tensor_by_name("w").expect("payload is in the file");
-    assert_eq!(w.shape, vec![2, 32]);
-    assert_eq!(w.span_bytes, 32);
-    let s = parsed
-        .tensor_by_name("w_scale")
-        .expect("scales are in the file");
-    assert_eq!(s.shape, vec![2, 1]);
-    assert_eq!(s.span_bytes, 2);
-
-    // The bytes themselves: the host executor unit test's expectations, read
-    // back out of the published file.
-    let file = std::fs::read(out.join("model.safetensors")).unwrap();
-    let payload = &file[w.file_offset as usize..(w.file_offset + w.span_bytes) as usize];
-    #[rustfmt::skip]
-    let expected_row0: [u8; 16] = [
-        0x10, 0x32, 0x54, 0x76, 0x90, 0xBA, 0xDC, 0xFE,
-        0x10, 0x32, 0x54, 0x76, 0x11, 0x32, 0x54, 0x76,
-    ];
-    assert_eq!(&payload[..16], expected_row0);
-    assert_eq!(&payload[16..], [0x77u8; 16]);
-    let scales = &file[s.file_offset as usize..(s.file_offset + s.span_bytes) as usize];
-    assert_eq!(scales, [127, 128]);
-
-    // Provenance landed under `__metadata__`.
-    let header_len = u64::from_le_bytes(file[..8].try_into().unwrap()) as usize;
-    let header: serde_json::Value = serde_json::from_slice(&file[8..8 + header_len]).unwrap();
-    let metadata = header.get("__metadata__").expect("provenance is recorded");
-    for key in [
-        "pie_convert_compiler",
-        "pie_convert_contract",
-        "pie_convert_source",
-    ] {
-        assert!(metadata.get(key).is_some(), "missing {key}");
-    }
-
-    // A destination that exists is refused, not overwritten.
-    let rerun = Command::new(env!("CARGO_BIN_EXE_pie-loader"))
-        .args(["convert", snapshot.to_str().unwrap()])
-        .arg(contract_path())
-        .arg(&out)
-        .output()
-        .unwrap();
-    assert!(!rerun.status.success());
-
-    std::fs::remove_dir_all(&root).ok();
-}
-
-/// The default output: the same conversion as a `.zt` checkpoint. The payload
-/// arithmetic is the same one the safetensors test checks — `F4_E2M1` spans
-/// half its element count — but here the scheme is named by the file rather
-/// than inferred from a dtype tag.
-#[test]
-fn convert_writes_a_zt_checkpoint_by_default() {
+fn convert_writes_a_zt_checkpoint() {
     let root = std::env::temp_dir().join(format!("pie_convert_zt_{}", std::process::id()));
     std::fs::remove_dir_all(&root).ok();
     let snapshot = root.join("snapshot");
@@ -149,8 +78,7 @@ fn convert_writes_a_zt_checkpoint_by_default() {
         .expect("scales are in the file");
     assert_eq!(s.span_bytes, 2);
 
-    // The same bytes the interchange output carries, at the offsets this
-    // file declares.
+    // The bytes the host executor produced, at the offsets this file declares.
     let file = std::fs::read(&artifact).unwrap();
     let payload = &file[w.file_offset as usize..(w.file_offset + w.span_bytes) as usize];
     #[rustfmt::skip]
@@ -171,6 +99,28 @@ fn convert_writes_a_zt_checkpoint_by_default() {
             "{name} carries no digest"
         );
     }
+
+    // Provenance landed in the file's own attributes rather than a sidecar.
+    let attributes = format!(
+        "{:?}",
+        reader.manifest().attributes.as_ref().expect("provenance is recorded")
+    );
+    for key in [
+        "pie_convert_compiler",
+        "pie_convert_contract",
+        "pie_convert_source",
+    ] {
+        assert!(attributes.contains(key), "missing {key}");
+    }
+
+    // A destination that exists is refused, not overwritten.
+    let rerun = Command::new(env!("CARGO_BIN_EXE_pie-loader"))
+        .args(["convert", snapshot.to_str().unwrap()])
+        .arg(contract_path())
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!rerun.status.success(), "an existing destination was overwritten");
 
     std::fs::remove_dir_all(&root).ok();
 }

@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use pie_loader::checkpoint::write::WriteTensor;
-use pie_loader::checkpoint::write_zt::write_zt;
+use pie_loader::checkpoint::write::write_zt;
 use pie_loader::checkpoint::zt::parse_checkpoint;
 use pie_loader::types::{DType, Encoding, QuantScheme, QuantSpec, TensorDecl, TensorId, Visibility};
 

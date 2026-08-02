@@ -22,7 +22,7 @@ use clap::Args;
 
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
 use pie_loader::checkpoint::write::WriteTensor;
-use pie_loader::checkpoint::write_zt::write_zt;
+use pie_loader::checkpoint::write::write_zt;
 use pie_loader::contract::normalize::normalize_contract;
 use pie_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 

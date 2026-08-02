@@ -1,27 +1,31 @@
-//! Writing a safetensors checkpoint: the output side of `convert`.
+//! Writing a checkpoint: the output side of `convert` and `optimize`.
 //!
-//! The one place the loader authors a header rather than preserving one.
-//! `align` rewrites a checkpoint and keeps every header entry byte for byte;
-//! this module is for tensors that did not exist until a plan ran — a weight
-//! quantized on the host, and the scale tensor the encode published beside it.
+//! The one writer the loader has, and `.zt` is the one format it writes.
+//! There was a safetensors writer beside this, and what settled it is what the
+//! container can say: safetensors describes a tensor as a dtype tag over a
+//! shape, so a payload it has no tag for cannot be written at all — which made
+//! `convert` refuse every quantized output outside {MXFP4, FP8, INT8}. A `.zt`
+//! object carries a *layout*, so the scheme names itself and any scheme the
+//! loader can describe can be written down.
 //!
-//! What it writes is a checkpoint any safetensors reader accepts: tensors
-//! back to back, offsets contiguous, dtype tags from the reference
-//! implementation's vocabulary. An MXFP4 payload is tagged `F4_E2M1` over its
-//! *logical* shape — two elements per byte, the arithmetic `read.rs` checks on
-//! the way back in — and its scales stay the plain `U8` their declaration
-//! carries, because a converted checkpoint that only this repository could
-//! read would be a new format wearing a familiar extension (`align.rs` says
-//! the same about gaps).
+//! Three things come free with the format and are the reason it is the only
+//! one here:
 //!
-//! Publication is atomic: bytes go to a process-unique temporary and arrive by
-//! `rename`, so a run that dies mid-write leaves no file that parses. The rule
-//! that the destination must not already exist is the caller's, who knows what
-//! the destination is for; this module only refuses to tear a file.
+//! - **Alignment.** Canonical placement puts every tensor on a 64 KiB
+//!   boundary, so a written artifact is already streamable. The rewrite that
+//!   used to align a safetensors file afterwards — inventing filler tensors to
+//!   express a gap the format has no word for — is gone with it.
+//! - **Integrity.** Every tensor carries an XXH3 digest and the manifest
+//!   carries one of its own, so a cache that rots is an error at load rather
+//!   than a wrong answer.
+//! - **Provenance.** What the artifact was derived from goes in the file's
+//!   attributes instead of a sidecar or a directory name.
 
 use std::collections::BTreeMap;
-use std::io::{BufWriter, Write};
 use std::path::Path;
+
+use ztensor::cbor::Value;
+use ztensor::{DType as ZDType, PartDef};
 
 use crate::error::Error;
 use crate::types::{DType, Encoding, QuantScheme, TensorDecl};
@@ -32,160 +36,248 @@ pub struct WriteTensor<'a> {
     pub bytes: &'a [u8],
 }
 
-/// The safetensors dtype tag for a declaration, and the byte count its shape
-/// implies — stated together because the pair is the whole contract between
-/// tag and payload: `F4_E2M1` is the one tag whose element is half a byte.
-fn tag_and_span(decl: &TensorDecl) -> Result<(&'static str, u64), Error> {
-    let elements: i64 = decl.shape.iter().product();
-    if decl.shape.iter().any(|&extent| extent < 0) || elements < 0 {
-        return Err(Error::Checkpoint(format!(
-            "tensor {} has negative shape {:?}",
-            decl.name, decl.shape
-        )));
+/// The storage type and logical type a declaration's elements are stored as.
+///
+/// A quantized payload is bytes: the scheme says how to read them, and the
+/// layout on the object says which scheme. The one exception is MXFP4's
+/// payload, whose elements are half a byte — `f4_e2m1` says so, and the size
+/// equation the reader checks follows from it.
+fn storage_of(decl_dtype: DType, encoding: &Encoding) -> Result<(ZDType, Option<&'static str>), Error> {
+    if let Encoding::Quant(spec) = encoding {
+        return Ok(match spec.scheme {
+            QuantScheme::Mxfp4E2M1E8M0 => (ZDType::U8, Some("f4_e2m1")),
+            _ => (ZDType::U8, None),
+        });
     }
-    let elements = elements as u64;
-    match &decl.encoding {
-        Encoding::Raw(dtype) => {
-            let tag = match dtype {
-                DType::F32 => "F32",
-                DType::F16 => "F16",
-                DType::BF16 => "BF16",
-                DType::F8E4M3 => "F8_E4M3",
-                DType::F8E5M2 => "F8_E5M2",
-                // Written under the storage tag it will be read back as:
-                // `read.rs` maps `F8_E8M0` to `U8` on purpose, and a contract
-                // that decodes says so with `Transmute`.
-                DType::E8M0 => "F8_E8M0",
-                DType::I64 => "I64",
-                DType::I32 => "I32",
-                DType::I16 => "I16",
-                DType::I8 => "I8",
-                DType::U64 => "U64",
-                DType::U32 => "U32",
-                DType::U16 => "U16",
-                DType::U8 => "U8",
-                DType::Bool => "BOOL",
-            };
-            Ok((tag, elements * dtype.bytes()))
-        }
-        Encoding::Quant(spec) => match spec.scheme {
-            QuantScheme::Mxfp4E2M1E8M0 => {
-                if !elements.is_multiple_of(2) {
+    Ok(match decl_dtype {
+        DType::F32 => (ZDType::F32, None),
+        DType::F16 => (ZDType::F16, None),
+        DType::BF16 => (ZDType::BF16, None),
+        DType::F8E4M3 => (ZDType::U8, Some("f8_e4m3fn")),
+        DType::F8E5M2 => (ZDType::U8, Some("f8_e5m2")),
+        DType::E8M0 => (ZDType::U8, Some("f8_e8m0")),
+        DType::I64 => (ZDType::I64, None),
+        DType::I32 => (ZDType::I32, None),
+        DType::I16 => (ZDType::I16, None),
+        DType::I8 => (ZDType::I8, None),
+        DType::U64 => (ZDType::U64, None),
+        DType::U32 => (ZDType::U32, None),
+        DType::U16 => (ZDType::U16, None),
+        DType::U8 => (ZDType::U8, None),
+        DType::Bool => (ZDType::U8, Some("bool")),
+    })
+}
+
+/// The layout profile a declaration's encoding names, and the attributes
+/// that make it readable again.
+///
+/// `zt.quant_group/1` is parametric: what distinguishes AWQ from GPTQ from
+/// MLX-affine is the packing order, the scale form and the zero-point form,
+/// so those are written down and the scheme's *name* is not. A reader
+/// recovers the scheme by looking at the parameters, which is what keeps the
+/// file readable by something that never heard of pie's enum.
+fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Error> {
+    let Encoding::Quant(spec) = encoding else {
+        return Ok(("dense", None));
+    };
+    let spec = spec.clone().normalized();
+    let bits = u64::from(spec.normalized_bits());
+    let group = u64::from(spec.normalized_group_size());
+    let axis = u64::from(spec.channel_axis.map(|a| a.0).unwrap_or(0));
+
+    // The GGUF family is opaque: the block struct interleaves its scales with
+    // its codes, so the profile names the layout and carries the constants a
+    // reader needs to check sizes.
+    if let Some((elems, bytes)) = spec.block_layout() {
+        let name = match spec.scheme {
+            QuantScheme::GgufQ4_0 => "gguf.q4_0/1",
+            QuantScheme::GgufQ4K => "gguf.q4_k/1",
+            QuantScheme::GgufQ5_0 => "gguf.q5_0/1",
+            QuantScheme::GgufQ5K => "gguf.q5_k/1",
+            QuantScheme::GgufQ8_0 => "gguf.q8_0/1",
+            other => {
+                return Err(Error::Checkpoint(format!(
+                    "{other:?} reports a block layout but has no gguf profile"
+                )));
+            }
+        };
+        return Ok((
+            name,
+            Some(Value::Map(vec![
+                (Value::Text("elems_per_block".into()), Value::Uint(elems)),
+                (Value::Text("block_bytes".into()), Value::Uint(bytes)),
+            ])),
+        ));
+    }
+
+    match spec.scheme {
+        QuantScheme::None => Ok(("dense", None)),
+
+        // OCP Microscaling: its own profile, because the element is a
+        // sub-byte float and the scale form is fixed by that specification.
+        QuantScheme::Mxfp4E2M1E8M0 => Ok((
+            "zt.mx/1",
+            Some(Value::Map(vec![
+                (Value::Text("axis".into()), Value::Uint(axis)),
+                (Value::Text("block_size".into()), Value::Uint(group)),
+                (
+                    Value::Text("scale_form".into()),
+                    Value::Text("e8m0_exponent".into()),
+                ),
+            ])),
+        )),
+
+        // FP8 weights are not group-quantized codes: they are plain f8
+        // elements whose scales, when there are any, are a separate tensor a
+        // contract pairs with them. `dense` plus the logical type says that
+        // exactly.
+        QuantScheme::Fp8E4M3 | QuantScheme::Fp8E5M2 => Ok(("dense", None)),
+
+        // Everything else is a point in the affine-group space.
+        scheme => {
+            let (order, zero) = match scheme {
+                QuantScheme::AwqInt4 => ("lsb_first", zero_tensor("same_as_data")),
+                QuantScheme::GptqInt4 => ("msb_first", zero_tensor("same_as_data")),
+                QuantScheme::MlxAffineU4 => ("lsb_first", zero_tensor("plain")),
+                QuantScheme::Int4B8 => ("lsb_first", zero_implied(8)),
+                QuantScheme::Int8Symmetric => ("lsb_first", zero_none()),
+                QuantScheme::Int8Asymmetric => ("lsb_first", zero_tensor("plain")),
+                other => {
                     return Err(Error::Checkpoint(format!(
-                        "tensor {} is F4_E2M1 with an odd element count {elements}",
-                        decl.name
+                        "{other:?} has no zTensor layout profile"
                     )));
                 }
-                Ok(("F4_E2M1", elements / 2))
-            }
-            // Byte-wide schemes store one element per byte under the raw tag
-            // of their storage type; what makes them quantized — the factor
-            // tensor beside them — is the contract's statement, not the tag's.
-            QuantScheme::Fp8E4M3 => Ok(("F8_E4M3", elements)),
-            QuantScheme::Int8Symmetric => Ok(("I8", elements)),
-            other => Err(Error::Checkpoint(format!(
-                "tensor {}: safetensors has no tag for {other:?}",
-                decl.name
-            ))),
-        },
+            };
+            let word = if bits == 8 { "u8" } else { "u32" };
+            let word_bits = if bits == 8 { 8 } else { 32 };
+            let per_word = word_bits / bits.max(1);
+            let scale_form = match scheme {
+                QuantScheme::MlxAffineU4 | QuantScheme::AwqInt4 | QuantScheme::GptqInt4 => {
+                    "f16_factors"
+                }
+                _ => "f32_factors",
+            };
+            Ok((
+                "zt.quant_group/1",
+                Some(Value::Map(vec![
+                    (Value::Text("axis".into()), Value::Uint(axis)),
+                    (Value::Text("bits".into()), Value::Uint(bits)),
+                    (Value::Text("group_size".into()), Value::Uint(group)),
+                    (
+                        Value::Text("packing".into()),
+                        Value::Map(vec![
+                            (Value::Text("order".into()), Value::Text(order.into())),
+                            (Value::Text("per_word".into()), Value::Uint(per_word)),
+                            (Value::Text("word".into()), Value::Text(word.into())),
+                        ]),
+                    ),
+                    (
+                        Value::Text("scale_form".into()),
+                        Value::Text(scale_form.into()),
+                    ),
+                    (Value::Text("zero_point".into()), zero),
+                ])),
+            ))
+        }
     }
 }
 
-/// Write `tensors`, in order, as one safetensors file at `path`.
+fn zero_none() -> Value {
+    Value::Map(vec![(Value::Text("form".into()), Value::Text("none".into()))])
+}
+
+fn zero_implied(value: u64) -> Value {
+    Value::Map(vec![
+        (Value::Text("form".into()), Value::Text("implied".into())),
+        (Value::Text("value".into()), Value::Uint(value)),
+    ])
+}
+
+fn zero_tensor(packing: &str) -> Value {
+    Value::Map(vec![
+        (Value::Text("form".into()), Value::Text("tensor".into())),
+        (Value::Text("packing".into()), Value::Text(packing.into())),
+    ])
+}
+
+/// Writes `tensors` as one canonical `.zt` file at `path`.
 ///
-/// `metadata` lands under `__metadata__` when non-empty — provenance, not
-/// meaning; nothing this crate reads depends on it.
-pub fn write_safetensors(
+/// `metadata` lands in the file's attributes. Canonical form requires
+/// ascending names, so the tensors are sorted on the way out — which also
+/// makes the output byte-identical for identical input.
+pub fn write_zt(
     path: &Path,
     metadata: &BTreeMap<String, String>,
     tensors: &[WriteTensor<'_>],
 ) -> Result<(), Error> {
-    let cannot = |what: &str, err: std::io::Error| {
-        Error::Checkpoint(format!("cannot {what} {}: {err}", path.display()))
-    };
+    let zt_err = |err: ztensor::Error| Error::Checkpoint(err.to_string());
 
-    // Offsets first, so the header is complete before anything is written.
-    let mut entries = Vec::with_capacity(tensors.len());
-    let mut at = 0u64;
-    for tensor in tensors {
-        let (tag, span) = tag_and_span(tensor.decl)?;
-        if tensor.bytes.len() as u64 != span {
-            return Err(Error::Checkpoint(format!(
-                "tensor {} has {} bytes but its {tag} shape {:?} needs {span}",
-                tensor.decl.name,
-                tensor.bytes.len(),
-                tensor.decl.shape
-            )));
-        }
-        entries.push((tensor, tag, at, at + span));
-        at += span;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| Error::Checkpoint(format!("cannot create {}: {err}", parent.display())))?;
     }
+    // Publication is atomic: bytes go to a process-unique temporary and arrive
+    // by rename, so a run that dies mid-write leaves no file that parses.
+    let temporary = path.with_extension(format!("zt.{}.partial", std::process::id()));
+    let mut writer = ztensor::Writer::create(&temporary).map_err(zt_err)?;
 
-    // The header by hand, in entry order. `serde_json`'s map would sort the
-    // names, which is legal safetensors but would shuffle the file away from
-    // the order the caller chose — and the caller's order is the plan's, which
-    // is the one a reader diffing two conversions wants to see preserved.
-    let mut header = String::from("{");
     if !metadata.is_empty() {
-        header.push_str("\"__metadata__\":{");
-        for (index, (key, value)) in metadata.iter().enumerate() {
-            if index > 0 {
-                header.push(',');
-            }
-            header.push_str(&serde_json::to_string(key).expect("a string serializes"));
-            header.push(':');
-            header.push_str(&serde_json::to_string(value).expect("a string serializes"));
-        }
-        header.push('}');
-        if !entries.is_empty() {
-            header.push(',');
-        }
-    }
-    for (index, (tensor, tag, begin, end)) in entries.iter().enumerate() {
-        if index > 0 {
-            header.push(',');
-        }
-        header.push_str(&serde_json::to_string(&tensor.decl.name).expect("a string serializes"));
-        header.push_str(&format!(
-            ":{{\"dtype\":\"{tag}\",\"shape\":{:?},\"data_offsets\":[{begin},{end}]}}",
-            tensor.decl.shape
+        writer.set_attributes(Value::Map(
+            metadata
+                .iter()
+                .map(|(k, v)| (Value::Text(k.clone()), Value::Text(v.clone())))
+                .collect(),
         ));
     }
-    header.push('}');
 
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(directory).map_err(|err| cannot("create directory for", err))?;
-    let temporary = directory.join(format!(
-        ".{}.pie-write.{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("checkpoint"),
-        std::process::id()
-    ));
-    let write = || -> std::io::Result<()> {
-        let file = std::fs::File::create(&temporary)?;
-        let mut out = BufWriter::new(file);
-        out.write_all(&(header.len() as u64).to_le_bytes())?;
-        out.write_all(header.as_bytes())?;
-        for (tensor, ..) in &entries {
-            out.write_all(tensor.bytes)?;
-        }
-        out.into_inner()?.sync_all()
-    };
-    if let Err(err) = write() {
-        std::fs::remove_file(&temporary).ok();
-        return Err(cannot("write", err));
+    let mut ordered: Vec<&WriteTensor<'_>> = tensors.iter().collect();
+    ordered.sort_by(|a, b| a.decl.name.cmp(&b.decl.name));
+
+    for tensor in ordered {
+        let decl = tensor.decl;
+        let (dtype, ltype) = storage_of(decl.encoding.dtype(), &decl.encoding)?;
+        let shape: Vec<u64> = decl
+            .shape
+            .iter()
+            .map(|&d| {
+                u64::try_from(d).map_err(|_| {
+                    Error::Checkpoint(format!("tensor {} has negative extent {d}", decl.name))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let (layout, attributes) = profile_of(&decl.encoding)?;
+        writer
+            .add_object(
+                &decl.name,
+                &shape,
+                layout,
+                &[(
+                    "data",
+                    PartDef {
+                        dtype,
+                        ltype,
+                        encoding: None,
+                        data: tensor.bytes,
+                    },
+                )],
+                attributes,
+            )
+            .map_err(zt_err)?;
     }
+    writer.finish().map_err(zt_err)?;
+
     std::fs::rename(&temporary, path).map_err(|err| {
-        std::fs::remove_file(&temporary).ok();
-        cannot("publish", err)
-    })
+        let _ = std::fs::remove_file(&temporary);
+        Error::Checkpoint(format!("cannot publish {}: {err}", path.display()))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Axis, QuantSpec, TensorId, Visibility};
+    use crate::checkpoint::zt::parse_checkpoint;
+    use crate::types::{QuantSpec, TensorDecl, TensorId, Visibility};
 
     fn decl(name: &str, shape: Vec<i64>, encoding: Encoding) -> TensorDecl {
         TensorDecl {
@@ -193,81 +285,114 @@ mod tests {
             name: name.to_string(),
             shape,
             encoding,
-            alignment: 1,
-            visibility: Visibility::Public,
+            alignment: 64,
+            visibility: Visibility::default(),
         }
     }
 
-    /// The file this writes is read back by this crate's own parser, which is
-    /// the arithmetic that matters: `F4_E2M1` spans half its element count,
-    /// and an entry that lied about it would fail `read.rs`'s span check.
-    #[test]
-    fn a_written_checkpoint_parses_back_with_the_same_layout() {
-        let dir = std::env::temp_dir().join(format!("pie_write_rt_{}", std::process::id()));
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("zt_write_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
-        let payload = decl(
-            "w",
-            vec![2, 32],
-            Encoding::Quant(QuantSpec {
-                scheme: QuantScheme::Mxfp4E2M1E8M0,
-                logical_dtype: DType::BF16,
-                bits_per_element: 4,
-                group_size: 32,
-                channel_axis: Some(Axis(1)),
-            }),
-        );
-        let scales = decl("w_scale", vec![2, 2], Encoding::Raw(DType::U8));
-        let payload_bytes: Vec<u8> = (0..32).collect();
-        let scale_bytes = vec![127u8, 128, 126, 129];
-        let mut metadata = BTreeMap::new();
-        metadata.insert("pie_convert".to_string(), "test".to_string());
+    #[test]
+    fn dense_tensors_round_trip_through_the_reader() {
+        let dir = tmpdir("dense");
+        let path = dir.join("model.zt");
+        let a: Vec<u8> = (0..32u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let b = vec![7u8; 16];
+        let da = decl("a.weight", vec![8, 4], Encoding::Raw(DType::F32));
+        let db = decl("b.mask", vec![16], Encoding::Raw(DType::U8));
+        let mut meta = BTreeMap::new();
+        meta.insert("pie_optimize".into(), "normalize".into());
 
-        write_safetensors(
-            &dir.join("model.safetensors"),
-            &metadata,
+        write_zt(
+            &path,
+            &meta,
             &[
                 WriteTensor {
-                    decl: &payload,
-                    bytes: &payload_bytes,
+                    decl: &da,
+                    bytes: &a,
                 },
                 WriteTensor {
-                    decl: &scales,
-                    bytes: &scale_bytes,
+                    decl: &db,
+                    bytes: &b,
                 },
             ],
         )
         .unwrap();
 
-        let parsed = crate::checkpoint::read::parse_checkpoint_metadata(&dir).unwrap();
-        assert_eq!(parsed.tensors.len(), 2);
-        let w = parsed.tensor_by_name("w").unwrap();
-        assert_eq!(w.shape, vec![2, 32]);
-        assert_eq!(w.span_bytes, 32);
-        let s = parsed.tensor_by_name("w_scale").unwrap();
-        assert_eq!(s.shape, vec![2, 2]);
-        assert_eq!(s.span_bytes, 4);
-        assert_eq!(s.file_offset, w.file_offset + 32);
-        std::fs::remove_dir_all(dir).ok();
+        let read = parse_checkpoint(&path).unwrap();
+        assert_eq!(read.tensors.len(), 2);
+        let ta = read.tensor_by_name("a.weight").unwrap();
+        assert_eq!(ta.shape, vec![8, 4]);
+        assert_eq!(ta.encoding, Encoding::Raw(DType::F32));
+        assert_eq!(ta.span_bytes, a.len() as u64);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A payload byte count that disagrees with the declared shape is refused
-    /// before anything lands on disk.
+    /// The property safetensors cannot give: an MXFP4 payload written and
+    /// read back as MXFP4, with its group size intact.
     #[test]
-    fn a_span_mismatch_is_refused_and_writes_nothing() {
-        let dir = std::env::temp_dir().join(format!("pie_write_bad_{}", std::process::id()));
-        let tensor = decl("w", vec![4], Encoding::Raw(DType::F32));
-        let short = vec![0u8; 12];
-        let result = write_safetensors(
-            &dir.join("model.safetensors"),
+    fn a_quantized_payload_keeps_its_scheme() {
+        let dir = tmpdir("quant");
+        let path = dir.join("model.zt");
+        // 64 logical elements of f4_e2m1 = 32 bytes.
+        let payload = vec![0xabu8; 32];
+        let spec = QuantSpec {
+            scheme: QuantScheme::Mxfp4E2M1E8M0,
+            logical_dtype: DType::BF16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: None,
+        };
+        let d = decl("w", vec![2, 32], Encoding::Quant(spec));
+        write_zt(
+            &path,
             &BTreeMap::new(),
             &[WriteTensor {
-                decl: &tensor,
-                bytes: &short,
+                decl: &d,
+                bytes: &payload,
             }],
-        );
-        assert!(result.is_err());
-        assert!(!dir.join("model.safetensors").exists());
-        std::fs::remove_dir_all(dir).ok();
+        )
+        .unwrap();
+
+        let read = parse_checkpoint(&path).unwrap();
+        let w = read.tensor_by_name("w").unwrap();
+        match &w.encoding {
+            Encoding::Quant(got) => {
+                assert_eq!(got.scheme, QuantScheme::Mxfp4E2M1E8M0);
+                assert_eq!(got.group_size, 32);
+            }
+            other => panic!("expected a quantized encoding, got {other:?}"),
+        }
+        assert_eq!(w.shape, vec![2, 32]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two writes of the same tensors produce the same file, byte for byte —
+    /// which is what lets an artifact be addressed by its hash.
+    #[test]
+    fn the_output_is_byte_reproducible() {
+        let dir = tmpdir("repro");
+        let bytes: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
+        let d = decl("w", vec![256], Encoding::Raw(DType::U8));
+        let write_to = |name: &str| {
+            let path = dir.join(name);
+            write_zt(
+                &path,
+                &BTreeMap::new(),
+                &[WriteTensor {
+                    decl: &d,
+                    bytes: &bytes,
+                }],
+            )
+            .unwrap();
+            std::fs::read(&path).unwrap()
+        };
+        assert_eq!(write_to("a.zt"), write_to("b.zt"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

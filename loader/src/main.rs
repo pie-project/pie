@@ -9,7 +9,6 @@
 //! pie-loader verify  SNAPSHOT CONTRACT [options]        compile, then check the result
 //! pie-loader diff    SNAPSHOT CONTRACT GOLDEN [options] compile and compare to a dump
 //! pie-loader replay  SNAPSHOT CONTRACT [options]        execute the plan on the host
-//! pie-loader align   SNAPSHOT CONTRACT OUT [options]    rewrite it streamable
 //! pie-loader convert SNAPSHOT CONTRACT OUT [options]    execute, write a checkpoint
 //! ```
 //!
@@ -18,14 +17,15 @@
 //! authors one in C++ (`driver/*/src/model/<family>/<family>_contract.hpp`);
 //! `loader/tests/golden/contracts/` holds the ones the tests use.
 //!
-//! `align` is the one command that writes a checkpoint rather than reading
-//! one. A streamed weight is read by the device where it lies, through a
-//! mapping, so it has to begin on a page of its own -- and published
-//! checkpoints put essentially no tensor on a page. `align` rewrites the
-//! shards so the ones a driver can stream do, which is a property of the bytes'
-//! placement and not of what the checkpoint means: every tensor keeps its name,
-//! dtype, shape and contents. Which tensors those are comes from the contract's
-//! groups, so the tool is not guessing from names.
+//! `convert` is the one command that writes a checkpoint rather than reading
+//! one, and what it writes is `.zt`. There used to be a second writer and an
+//! `align` command beside it: a streamed weight is read by the device where it
+//! lies, through a mapping, so it has to begin on a page of its own, and
+//! published safetensors checkpoints put essentially no tensor on a page. That
+//! rewrite is gone because its output was, in the end, a checkpoint whose
+//! placement only pie relied on -- and `.zt` places every tensor on a page by
+//! construction, with no filler tensors invented to express a gap the format
+//! has no word for.
 //!
 //! `replay` is the strongest statement the loader can make about itself
 //! offline: it reads the checkpoint through the plan and reports what each
@@ -35,7 +35,7 @@
 //! `convert` is `replay` with the output kept: it executes the plan on the
 //! host — including runtime quantization, which is why it compiles against
 //! [`CONVERT_TILE_MAP_MASK`] rather than the host verification mask — and
-//! writes what came out as a new safetensors checkpoint. The contract is the
+//! writes what came out as a new `.zt` checkpoint. The contract is the
 //! conversion: whatever it declares (an MXFP4 payload and its scales, a cast,
 //! a fold) is what lands on disk, under the names it declares. The expensive
 //! encode then happens once, offline, and loading the converted checkpoint is
@@ -50,10 +50,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use pie_loader::checkpoint::CheckpointMetadata;
-use pie_loader::checkpoint::align::{STREAM_PAGE_BYTES, align_checkpoint, streamable_tensors};
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
-use pie_loader::checkpoint::write::{WriteTensor, write_safetensors};
-use pie_loader::checkpoint::write_zt::write_zt;
+use pie_loader::checkpoint::write::{WriteTensor, write_zt};
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
 use pie_loader::error::Error;
@@ -74,11 +72,7 @@ commands:
   verify  SNAPSHOT CONTRACT          compile, then check the plan against its contract
   diff    SNAPSHOT CONTRACT GOLDEN   compile and compare against a stored `dump` output
   replay  SNAPSHOT CONTRACT          compile and execute the plan against the checkpoint
-  align   SNAPSHOT CONTRACT OUT      write OUT: the same checkpoint, streamable
-  convert SNAPSHOT CONTRACT OUT      execute on the host, write OUT as a new checkpoint
-                                     (`.zt` by default; --safetensors for the
-                                     interchange format, which cannot tag every
-                                     scheme a plan can produce)
+  convert SNAPSHOT CONTRACT OUT      execute on the host, write OUT as a new `.zt`
 
 CONTRACT is a JSON ModelContract; see loader/tests/golden/contracts/.
 
@@ -130,10 +124,10 @@ fn run(args: &[String]) -> Result<(), Fail> {
         return Err(Fail::Usage(format!("{command} needs a contract file")));
     };
 
-    // `diff`, `align` and `convert` each take one extra positional before the
+    // `diff` and `convert` each take one extra positional before the
     // options.
     let (extra, rest) = match command.as_str() {
-        "diff" | "align" | "convert" => {
+        "diff" | "convert" => {
             let what = if command == "diff" {
                 "a golden dump"
             } else {
@@ -154,7 +148,6 @@ fn run(args: &[String]) -> Result<(), Fail> {
         "verify" => run_verify(&snapshot, &contract, &options),
         "diff" => diff(&snapshot, &contract, extra.as_deref().unwrap(), &options),
         "replay" => replay(&snapshot, &contract, &options),
-        "align" => align(&snapshot, &contract, extra.as_deref().unwrap(), &options),
         "convert" => convert(&snapshot, &contract, extra.as_deref().unwrap(), &options),
         other => Err(Fail::Usage(format!("unknown command '{other}'"))),
     }
@@ -181,21 +174,11 @@ struct Options {
     /// A driver's own `StorageTarget`, read from JSON, or none for the built-in
     /// stand-in.
     target: Option<StorageTarget>,
-    /// `convert` only: write the interchange format instead of `.zt`.
-    safetensors: bool,
 }
 
 impl Options {
     fn parse(args: &[String]) -> Result<Self, Fail> {
-        // The one named flag, taken out before the positionals are read so it
-        // can appear anywhere among them.
-        let safetensors = args.iter().any(|arg| arg == "--safetensors");
-        let args: Vec<&str> = args
-            .iter()
-            .map(String::as_str)
-            .filter(|arg| *arg != "--safetensors")
-            .collect();
-        let mut args = args.into_iter();
+        let mut args = args.iter().map(String::as_str);
         let backend = match args.next().unwrap_or("cuda") {
             "cuda" => BackendKind::Cuda,
             "metal" => BackendKind::Metal,
@@ -255,7 +238,6 @@ impl Options {
             tp_rank,
             tp_size,
             target,
-            safetensors,
         })
     }
 
@@ -333,79 +315,6 @@ fn compile(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resu
         started.elapsed()
     );
     Ok(plan)
-}
-
-/// Write a streamable copy of the checkpoint.
-///
-/// The set of tensors to put on pages is taken from the compiled plan's groups
-/// rather than from a name pattern. A group is a contract's statement that its
-/// instances are interchangeable, which is precisely the property that lets a
-/// driver hold one instance's weights instead of another's at run time -- so
-/// the tensors a group binds are the tensors streaming can page, as a fact the
-/// contract states rather than a guess about what `mlp.experts.` means.
-///
-/// Aligning everything would be the wrong policy and is not offered: padding
-/// costs a page per tensor, which disappears against a 132 MB expert bank and
-/// triples the size of a small one.
-fn align(
-    snapshot: &Path,
-    contract: &ModelContract,
-    out: &Path,
-    options: &Options,
-) -> Result<(), Fail> {
-    let metadata = parse_checkpoint_metadata(snapshot)?;
-    let plan = compile_load_plan(&metadata, contract, options.target())?;
-    let streamable = streamable_tensors(&plan, &metadata);
-    if streamable.whole.is_empty() && streamable.banded.is_empty() {
-        return Err(Fail::Failed(
-            "this contract declares no groups, so nothing in it can be streamed and \
-             aligning the checkpoint would only make it bigger"
-                .to_string(),
-        ));
-    }
-    // A fused bank cannot be aligned by moving it: its instances begin at
-    // `base + i * stride`, and the stride is whatever the shape makes it.
-    // Aligning it anyway would produce a checkpoint that loads, streams, and
-    // faults in the whole bank to read one expert -- correct, and slower than
-    // not streaming, with nothing on disk to explain why.
-    if !streamable.banded.is_empty() {
-        return Err(Fail::Failed(format!(
-            "{} of this contract's group tensors are fused banks, which aligning cannot \
-             separate: every instance reads a band of one tensor, so moving it puts \
-             instance 0 on a page and no other. First: {}",
-            streamable.banded.len(),
-            streamable.banded.iter().next().unwrap()
-        )));
-    }
-    let names = streamable.whole;
-
-    let report = align_checkpoint(snapshot, out, &names, STREAM_PAGE_BYTES)?;
-    for file in &report.files {
-        eprintln!(
-            "{}: {} tensors aligned, {} fillers, +{} bytes",
-            file.path.display(),
-            file.aligned,
-            file.fillers,
-            file.overhead_bytes()
-        );
-    }
-    // A name the plan resolved but the rewrite never saw means the two disagree
-    // about what is in the checkpoint, which would silently leave a streamed
-    // tensor unaligned -- correct, and slow in a way nothing would explain.
-    if !report.missing.is_empty() {
-        return Err(Fail::Failed(format!(
-            "{} tensor(s) the plan reads are not in the checkpoint's shards, first {}",
-            report.missing.len(),
-            report.missing[0]
-        )));
-    }
-    println!(
-        "{} aligned to {STREAM_PAGE_BYTES} bytes: {} tensors, {} bytes of padding",
-        out.display(),
-        report.aligned(),
-        report.overhead_bytes()
-    );
-    Ok(())
 }
 
 fn dump(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
@@ -502,7 +411,7 @@ fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resul
 }
 
 /// Execute the plan on the host and keep the output: write every public
-/// runtime tensor, in plan order, as a new safetensors checkpoint under `out`.
+/// runtime tensor, in plan order, as a new `.zt` checkpoint under `out`.
 ///
 /// The contract *is* the conversion. It names the output tensors, and its
 /// expressions say what each one is made of — a `Cast` into a quantized
@@ -598,19 +507,11 @@ fn convert(
         format!("{:016x}", pie_loader::cache_key::fnv1a(source.as_bytes())),
     );
 
-    // `.zt` by default: it can name every scheme the plan language admits,
-    // places tensors on pages without inventing filler tensors, and carries a
-    // digest. `--safetensors` is for a conversion meant to leave this
-    // repository — at the cost of the {MXFP4, FP8, INT8} tag limit.
-    let path = if options.safetensors {
-        let path = out.join("model.safetensors");
-        write_safetensors(&path, &provenance, &tensors)?;
-        path
-    } else {
-        let path = out.join("model.zt");
-        write_zt(&path, &provenance, &tensors)?;
-        path
-    };
+    // `.zt` is the only output: it can name every scheme the plan language
+    // admits, places tensors on pages without inventing filler tensors to
+    // express a gap, and carries a digest.
+    let path = out.join("model.zt");
+    write_zt(&path, &provenance, &tensors)?;
     let bytes: u64 = tensors.iter().map(|tensor| tensor.bytes.len() as u64).sum();
     println!(
         "{}: {} tensors, {bytes} bytes",

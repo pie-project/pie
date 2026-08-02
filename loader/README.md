@@ -36,14 +36,14 @@ pie-loader dump    SNAPSHOT CONTRACT          # the plan, as JSON
 pie-loader verify  SNAPSHOT CONTRACT          # check the plan against its contract
 pie-loader diff    SNAPSHOT CONTRACT GOLDEN   # compare against a stored dump
 pie-loader replay  SNAPSHOT CONTRACT          # execute on the CPU, against real bytes
-pie-loader align   SNAPSHOT CONTRACT OUT      # rewrite the checkpoint streamable
 pie-loader convert SNAPSHOT CONTRACT OUT      # execute on the CPU, write a checkpoint
 ```
 
 `convert` is offline weight conversion: the contract declares the output
 tensors (a `Cast` into a quantized encoding is how "quantize this" is
 spelled), the host executor runs the plan, and the result is written as a new
-safetensors checkpoint any reader accepts. Loading it afterwards is a cheaper
+`.zt` checkpoint — every tensor on a page, every payload digested, and the
+quantization scheme named by the file rather than guessed from a dtype tag. Loading it afterwards is a cheaper
 contract against the converted names. Every encode the plan language admits
 runs on the host: MXFP4 (`F4_E2M1` payload + `U8` block scales), per-channel
 FP8 (`F8_E4M3` + `F32` scales) and per-channel INT8 (`I8` + `F32` scales),
