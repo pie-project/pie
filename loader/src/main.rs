@@ -53,6 +53,7 @@ use pie_loader::checkpoint::CheckpointMetadata;
 use pie_loader::checkpoint::align::{STREAM_PAGE_BYTES, align_checkpoint, streamable_tensors};
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
 use pie_loader::checkpoint::write::{WriteTensor, write_safetensors};
+use pie_loader::checkpoint::write_zt::write_zt;
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
 use pie_loader::error::Error;
@@ -75,6 +76,9 @@ commands:
   replay  SNAPSHOT CONTRACT          compile and execute the plan against the checkpoint
   align   SNAPSHOT CONTRACT OUT      write OUT: the same checkpoint, streamable
   convert SNAPSHOT CONTRACT OUT      execute on the host, write OUT as a new checkpoint
+                                     (`.zt` by default; --safetensors for the
+                                     interchange format, which cannot tag every
+                                     scheme a plan can produce)
 
 CONTRACT is a JSON ModelContract; see loader/tests/golden/contracts/.
 
@@ -177,11 +181,21 @@ struct Options {
     /// A driver's own `StorageTarget`, read from JSON, or none for the built-in
     /// stand-in.
     target: Option<StorageTarget>,
+    /// `convert` only: write the interchange format instead of `.zt`.
+    safetensors: bool,
 }
 
 impl Options {
     fn parse(args: &[String]) -> Result<Self, Fail> {
-        let mut args = args.iter().map(String::as_str);
+        // The one named flag, taken out before the positionals are read so it
+        // can appear anywhere among them.
+        let safetensors = args.iter().any(|arg| arg == "--safetensors");
+        let args: Vec<&str> = args
+            .iter()
+            .map(String::as_str)
+            .filter(|arg| *arg != "--safetensors")
+            .collect();
+        let mut args = args.into_iter();
         let backend = match args.next().unwrap_or("cuda") {
             "cuda" => BackendKind::Cuda,
             "metal" => BackendKind::Metal,
@@ -241,6 +255,7 @@ impl Options {
             tp_rank,
             tp_size,
             target,
+            safetensors,
         })
     }
 
@@ -583,8 +598,19 @@ fn convert(
         format!("{:016x}", pie_loader::cache_key::fnv1a(source.as_bytes())),
     );
 
-    let path = out.join("model.safetensors");
-    write_safetensors(&path, &provenance, &tensors)?;
+    // `.zt` by default: it can name every scheme the plan language admits,
+    // places tensors on pages without inventing filler tensors, and carries a
+    // digest. `--safetensors` is for a conversion meant to leave this
+    // repository — at the cost of the {MXFP4, FP8, INT8} tag limit.
+    let path = if options.safetensors {
+        let path = out.join("model.safetensors");
+        write_safetensors(&path, &provenance, &tensors)?;
+        path
+    } else {
+        let path = out.join("model.zt");
+        write_zt(&path, &provenance, &tensors)?;
+        path
+    };
     let bytes: u64 = tensors.iter().map(|tensor| tensor.bytes.len() as u64).sum();
     println!(
         "{}: {} tensors, {bytes} bytes",

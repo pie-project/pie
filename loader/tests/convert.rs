@@ -43,7 +43,7 @@ fn contract_path() -> PathBuf {
 }
 
 #[test]
-fn convert_writes_a_checkpoint_the_loader_reads_back() {
+fn convert_writes_a_safetensors_checkpoint_the_loader_reads_back() {
     let root = std::env::temp_dir().join(format!("pie_convert_cli_{}", std::process::id()));
     std::fs::remove_dir_all(&root).ok();
     let snapshot = root.join("snapshot");
@@ -54,6 +54,7 @@ fn convert_writes_a_checkpoint_the_loader_reads_back() {
         .args(["convert", snapshot.to_str().unwrap()])
         .arg(contract_path())
         .arg(&out)
+        .arg("--safetensors")
         .output()
         .unwrap();
     assert!(
@@ -108,6 +109,68 @@ fn convert_writes_a_checkpoint_the_loader_reads_back() {
         .output()
         .unwrap();
     assert!(!rerun.status.success());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The default output: the same conversion as a `.zt` checkpoint. The payload
+/// arithmetic is the same one the safetensors test checks — `F4_E2M1` spans
+/// half its element count — but here the scheme is named by the file rather
+/// than inferred from a dtype tag.
+#[test]
+fn convert_writes_a_zt_checkpoint_by_default() {
+    let root = std::env::temp_dir().join(format!("pie_convert_zt_{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let snapshot = root.join("snapshot");
+    let out = root.join("converted");
+    write_snapshot(&snapshot);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_pie-loader"))
+        .args(["convert", snapshot.to_str().unwrap()])
+        .arg(contract_path())
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "convert failed:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let artifact = out.join("model.zt");
+    assert!(artifact.is_file(), "convert did not write {}", artifact.display());
+
+    let parsed = parse_checkpoint_metadata(&artifact).unwrap();
+    let w = parsed.tensor_by_name("w").expect("payload is in the file");
+    assert_eq!(w.shape, vec![2, 32]);
+    assert_eq!(w.span_bytes, 32);
+    let s = parsed
+        .tensor_by_name("w_scale")
+        .expect("scales are in the file");
+    assert_eq!(s.span_bytes, 2);
+
+    // The same bytes the interchange output carries, at the offsets this
+    // file declares.
+    let file = std::fs::read(&artifact).unwrap();
+    let payload = &file[w.file_offset as usize..(w.file_offset + w.span_bytes) as usize];
+    #[rustfmt::skip]
+    let expected_row0: [u8; 16] = [
+        0x10, 0x32, 0x54, 0x76, 0x90, 0xBA, 0xDC, 0xFE,
+        0x10, 0x32, 0x54, 0x76, 0x11, 0x32, 0x54, 0x76,
+    ];
+    assert_eq!(&payload[..16], expected_row0);
+    assert_eq!(&payload[16..], [0x77u8; 16]);
+    let scales = &file[s.file_offset as usize..(s.file_offset + s.span_bytes) as usize];
+    assert_eq!(scales, [127, 128]);
+
+    // And every tensor verifies against its own digest.
+    let reader = ztensor::Reader::open(&artifact).unwrap();
+    for name in ["w", "w_scale"] {
+        assert!(
+            reader.verify(name, "data").unwrap(),
+            "{name} carries no digest"
+        );
+    }
 
     std::fs::remove_dir_all(&root).ok();
 }
