@@ -544,10 +544,16 @@ struct MetalExecutor::Impl {
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
     std::vector<SlotHandle> prefill_scan_rows_{};
-    // A slot whose conv history was last written by the prefill's ping-pong may
-    // hold it in ConvStateOut; the paged decode writes in place and always
-    // leaves it in ConvState, so only the handover needs a copy.
+    // Which half of the GDN conv ping-pong holds each slot's history: 0 for
+    // `conv_state`, 1 for `conv_state_out`. THE record of that fact -- the
+    // prefill's per-token parity and the decode's per-fire one are both read
+    // from and written back to here, so a copy that moves a slot's history
+    // between the halves cannot desynchronize them.
     std::vector<std::uint8_t> conv_in_out_{};
+    // Which half `mb_dag_`'s GDN dispatches are currently bound to READ. One
+    // batched fire runs every row through one pair of dispatches, so every slot
+    // in it reads the same half and this is per-DAG rather than per-slot.
+    std::uint8_t mb_conv_parity_ = 0;
     Pso ptir_logits_copy_pso_{};
     std::uint32_t ptir_logits_capacity_rows_ = 0;
     std::uint32_t ptir_logits_next_row_ = 0;
@@ -785,11 +791,32 @@ void warn_once_if_the_gpu_leaked_memory_before_this_run() {
     }();
 }
 
+// What a weight that is COPIED into the heap costs the host while it is being
+// copied: the heap byte it becomes, and the mmap byte it is read from, at the
+// same time. Both are resident, so the process peaks at twice what the GPU
+// ends up holding, and it peaks there during load -- before the first
+// dispatch, and before anything else here has had a chance to refuse.
+//
+// Measured rather than assumed, because the doubling is not obvious from any
+// one number this file computes: Llama-3.2-1B is 0.65 GiB of weights and
+// peaks at 1.42 GiB (2.19x), gemma-4-e2b is 2.43 GiB and peaks at 4.90 GiB
+// (2.02x). Weights bound where they lie are exempt -- there is no second copy
+// of a tensor the GPU reads out of the mapping -- which is why the caller
+// passes the copied bytes and not the model.
+//
+// This is what six kernel panics on the 48 GiB M4 Pro were: a checkpoint of
+// 18.16 GiB passed a check that compared ~19 GiB against a quiet machine's
+// free memory and then peaked at 40.5 GiB, which took free memory to 60 MiB.
+// The panics differed -- a data abort on a PAC-mangled pointer, a WindowServer
+// watchdog, an assertion inside IOGPUGroupMemory -- and every one of them had
+// free memory under 200 MiB. The kernel dies of this in whatever way it
+// happens to die; what it does not do is give the byte back.
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
                       std::string* err,
-                      const ElasticBreakdown* parts = nullptr) {
+                      const ElasticBreakdown* parts = nullptr,
+                      std::size_t transient_copy_bytes = 0) {
     warn_once_if_the_gpu_leaked_memory_before_this_run();
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
@@ -817,8 +844,13 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
             ? 0  // a forced ceiling describes a device, not this machine
             : RawMetalContext::host_reclaimable_bytes();
     constexpr std::size_t kHostMargin = 2ull * 1024 * 1024 * 1024;
+    // The host bound is about the PEAK, not the steady state. The device
+    // ceiling above is right to ignore the copy -- the GPU never holds it --
+    // but the machine does hold it, and it is the larger of the two numbers
+    // for any checkpoint that has to be copied at all.
+    const std::size_t host_want = want + transient_copy_bytes;
     const bool host_bound =
-        reclaimable != 0 && want + kHostMargin > reclaimable && want <= limit;
+        reclaimable != 0 && host_want + kHostMargin > reclaimable && want <= limit;
 
     if (want <= limit && !host_bound) return true;
     if (err) {
@@ -829,10 +861,17 @@ bool fits_on_this_gpu(std::size_t heap_bytes,
             *err = "this model does not fit the memory this machine has left: "
                    "it needs " + gib(want) + " GiB resident (" +
                    gib(resident_weights) + " GiB of weights, " +
-                   gib(elastic_bytes) + " GiB of KV, state and scratch) and only " +
-                   gib(reclaimable) + " GiB is reclaimable. The GPU itself would "
-                   "hold " + gib(limit) + " GiB, so this is the machine, not the "
-                   "device: something else already has the memory. On macOS a "
+                   gib(elastic_bytes) + " GiB of KV, state and scratch)" +
+                   (transient_copy_bytes != 0
+                        ? " and " + gib(transient_copy_bytes) +
+                              " GiB more while it loads, because a weight that is copied "
+                              "into the heap is resident twice -- once in the heap and "
+                              "once in the mapping it is read from -- so the peak is " +
+                              gib(host_want) + " GiB and not " + gib(want) + " GiB"
+                        : "") +
+                   ", and only " + gib(reclaimable) + " GiB is reclaimable. The GPU "
+                   "itself would hold " + gib(limit) + " GiB, so this is the machine, "
+                   "not the device: something else already has the memory. On macOS a "
                    "previously wedged run is the usual cause -- it survives "
                    "kill -9, holds its pages, and is only cleared by a reboot.";
             return false;
@@ -967,8 +1006,17 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // A slab makes `streamed` mean something else: those bytes are read from an
     // mmap the GPU never sees, so they are neither allocated nor resident, and
     // adding them here would refuse exactly the models this exists to run.
+    //
+    // What IS resident twice is whatever had to be copied into the heap, and
+    // for these checkpoints that is nearly the whole model -- `extra` is KV and
+    // scratch, which is built rather than read, and a slab's budget is filled
+    // from the mapping a band at a time rather than all at once.
+    const std::size_t copied =
+        heap_bytes >= extra + (slab ? std::size_t(cfg.expert_slab_bytes) : 0)
+            ? heap_bytes - extra - (slab ? std::size_t(cfg.expert_slab_bytes) : 0)
+            : 0;
     if (!fits_on_this_gpu(slab ? heap_bytes : heap_bytes + streamed, 0,
-                          slab ? heap_bytes : weights, err)) {
+                          slab ? heap_bytes : weights, err, nullptr, copied)) {
         return false;
     }
     // Two marks, because between them lies the answer to "why is loading slow"
@@ -1157,8 +1205,11 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                      max_ctx_, mb(elastic_parts.kv_ring), mb(elastic_parts.kv_pool),
                      mb(elastic_parts.state), mb(elastic_parts.scratch));
     }
+    // `resident_weights` is exactly what gets copied: the model minus whatever
+    // is bound where it lies. Every one of those bytes is resident twice while
+    // the copy runs -- see `fits_on_this_gpu`.
     if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err,
-                          &elastic_parts))
+                          &elastic_parts, resident_weights))
         return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
@@ -1309,6 +1360,7 @@ void MetalExecutor::Impl::reset_state() {
         ctx_->zero_buffer_range(ks.k_pages, 0, ks.k_pages.size);
         ctx_->zero_buffer_range(ks.v_pages, 0, ks.v_pages.size);
     }
+    std::fill(conv_in_out_.begin(), conv_in_out_.end(), std::uint8_t{0});
     linear_state_slots_.reset_all();
 }
 
@@ -1350,6 +1402,7 @@ void MetalExecutor::Impl::reset_state(uint32_t slot) {
         ctx_->zero_buffer_range(
             gs.recurrent_state, recur_off, recur_stride);
     }
+    if (slot < conv_in_out_.size()) conv_in_out_[slot] = 0;
     linear_state_slots_.reset(slot);
 }
 
@@ -1421,6 +1474,8 @@ bool MetalExecutor::Impl::copy_state_slot(uint32_t src_slot, uint32_t dst_slot, 
     // (silently correct only when src/dst happened to share the same
     // parity by coincidence).
     linear_state_slots_.copy(src_slot, dst_slot);
+    if (src_slot < conv_in_out_.size() && dst_slot < conv_in_out_.size())
+        conv_in_out_[dst_slot] = conv_in_out_[src_slot];
     return true;
 }
 
@@ -1678,6 +1733,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             v_pages[size_t(L)] = kv_pool_.layers[size_t(L)].v_pages;
         }
         bind_decode_dag_mb(*ctx_, b_, mb_dag_, g_, k_pages, v_pages, gdn_prep_);
+        // That bind put the conv ping-pong back at its even half, so the
+        // decode's record of which half it is pointing at has to go back too --
+        // this runs again whenever the KV pool is resized, mid-serve.
+        mb_conv_parity_ = 0;
         const size_t prefill_scratch_row = size_t(scratch_widest_elems(g_)) * 2u;
         const size_t prefill_logits_row = size_t(g_.vocab) * 2u;
         for (size_t t = 0; t < prefill_dags_.size(); ++t) {
@@ -1693,17 +1752,17 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
             bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_,
                                std::max(1, g_.max_tokens));
             mb_bound_tokens_ = std::max(1, g_.max_tokens);
-            // Decode writes the shifted conv history straight back over the one
-            // it read.  Safe because each channel is read and written by the
-            // same thread, in that order, and prep and recurrent touch disjoint
-            // channels -- which saves copying every slot's whole conv slab back
-            // on the host after every single token.
-            alias_decode_conv_state_out(*ctx_, b_, mb_dag_);
             prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
                 bind_scratch(*ctx_, prefill_dags_[t], prefill_sched_, pool_.data(),
                              int(pool_.size()), t * prefill_scratch_row);
-                bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_);
+                // The row pitch reaches the mixture's params here: a prefill
+                // lays every value's rows a uniform `scratch_widest_elems`
+                // apart, and the routing group is the one thing that runs over
+                // all of them at once. At one row it is unread -- every index
+                // it multiplies is zero -- so the per-token walk is unaffected.
+                bind_decode_consts(*ctx_, prefill_dags_[t], g_, max_ctx_, gdn_prep_,
+                                   1, scratch_widest_elems(g_));
                 // A scan launched off row t's argument table reads its own
                 // length, so every row carries one.
                 prefill_scan_rows_[t] = ctx_->create_standalone_buffer(sizeof(std::int32_t));
@@ -2224,31 +2283,53 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));
+    if (conv_in_out_.size() < size_t(g_.max_slots))
+        conv_in_out_.assign(size_t(g_.max_slots), 0);
     for (const RequestSpan& sp : schedule.spans) {
         if (sp.rs_is_new) reset_state(sp.rs_slot);
         if (std::find(active_slots.begin(), active_slots.end(), sp.rs_slot) == active_slots.end())
             active_slots.push_back(sp.rs_slot);
     }
-    // The paged decode shifts the conv history in place -- each channel of each
-    // slot is read by exactly one thread before that same thread writes it, and
-    // a pure-decode fire gives every request its own slot -- so there is nothing
-    // to fold back afterwards.  The prefill still ping-pongs per prompt token,
-    // so a slot handed over mid-parity is copied once, here.
+    // One fire, one binding: every row of a batched decode goes through the
+    // same pair of GDN dispatches, so every slot in it has to read the same
+    // half of the ping-pong. A steady fleet already agrees -- its members
+    // stepped together -- and the copies below are the price of a member that
+    // joined at the other parity, which is a prompt-length-dependent fact about
+    // that member alone.
+    //
+    // The majority's half, not the first slot's: picking the first would let
+    // one arriving member move fourteen resident ones instead of itself.
+    std::size_t at_out = 0;
+    for (uint32_t slot : active_slots)
+        if (conv_in_out_[slot] != 0) ++at_out;
+    const std::uint8_t parity = at_out * 2 > active_slots.size() ? 1u : 0u;
     for (uint32_t slot : active_slots) {
-        if (slot >= conv_in_out_.size() || conv_in_out_[slot] == 0) continue;
-        conv_in_out_[slot] = 0;
+        if (conv_in_out_[slot] == parity) continue;
+        conv_in_out_[slot] = parity;
         const size_t off = size_t(slot) * g_.gdn_conv_stride_bytes();
-        // copy C -> A (different handles, same offset). A full-attention layer
-        // has no GDN slab; skip it exactly as the commit below does.
+        // A full-attention layer has no GDN slab; skip it exactly as the commit
+        // below does.
         for (auto& gs : b_.gdn) {
-            if (!gs.conv_state.valid() && !gs.conv_state_out.valid()) continue;
-            if (!gs.conv_state.valid() ||
-                !ctx_->copy_buffer_range(
-                    gs.conv_state, off,
-                    gs.conv_state_out, off,
-                    g_.gdn_conv_stride_bytes()))
+            if (!gs.conv_state.valid() || !gs.conv_state_out.valid()) continue;
+            const SlotHandle& dst = parity == 0 ? gs.conv_state : gs.conv_state_out;
+            const SlotHandle& src = parity == 0 ? gs.conv_state_out : gs.conv_state;
+            if (!ctx_->copy_buffer_range(dst, off, src, off, g_.gdn_conv_stride_bytes()))
                 return fail("failed to normalize GDN ping-pong state");
         }
+    }
+    // This used to alias ConvStateOut onto ConvState and shift the history in
+    // place, on the claim that each channel is read and written by the same
+    // thread. It is not: `gdn_prep` runs one threadgroup per VALUE head and
+    // `rep = Hv/Hk` value heads share a key head, so that head's window is read
+    // by `rep` threadgroups and written by one of them. In place, the writer
+    // shifts the window out from under its siblings. Both outcomes are finite
+    // numbers, so it surfaced as a fleet member disagreeing with its identical
+    // neighbours -- deterministic values, and which member lost varying run to
+    // run. Qwen3.6-27B is rep=3 and showed it from fifteen lanes; Qwen3.6-35B-
+    // A3B is rep=1 and never could.
+    if (mb_conv_parity_ != parity) {
+        bind_gdn_conv_parity(*ctx_, b_, mb_dag_, parity == 0);
+        mb_conv_parity_ = parity;
     }
 
     // Alternate the two arms fire by fire so both see the same machine.
@@ -2351,6 +2432,8 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     }
 
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
+    // The fire wrote every active slot's shifted history into the other half.
+    for (uint32_t slot : active_slots) conv_in_out_[slot] = std::uint8_t(parity ^ 1u);
     return true;
 }
 
@@ -2368,16 +2451,22 @@ bool MetalExecutor::Impl::run_prefill_step(
 
     // Reset once per request, before its first encoded token.  Do not reset in
     // the token loop: later prompt rows must consume the preceding GDN/KV state.
+    if (conv_in_out_.size() < size_t(g_.max_slots))
+        conv_in_out_.assign(size_t(g_.max_slots), 0);
     for (const RequestSpan& sp : schedule.spans)
         if (sp.rs_is_new) reset_state(sp.rs_slot);
 
-    std::vector<int> next_step(size_t(g_.max_slots), 0);
-    for (int s = 0; s < g_.max_slots; ++s) next_step[size_t(s)] = step_count_for(uint32_t(s));
+    // The parity comes from `conv_in_out_`, not from the slot's step count.
+    // They agree while nothing but stepping moves a slot's history, and the
+    // decode's normalizing copy is exactly the thing that does: a slot the
+    // decode moved between the halves has a step count that no longer predicts
+    // which one it is in, and a continuation prefill bound off that count would
+    // read the half it did not write.
+    std::vector<std::uint8_t> next_parity(conv_in_out_.begin(), conv_in_out_.end());
     for (int t = 0; t < schedule.N; ++t) {
         const uint32_t slot = schedule.slot_of_token[size_t(t)];
-        bind_prefill_gdn_state(*ctx_, b_, prefill_dags_[size_t(t)], slot,
-                               (next_step[slot] & 1) == 0);
-        ++next_step[slot];
+        bind_gdn_conv_parity(*ctx_, b_, prefill_dags_[size_t(t)], next_parity[slot] == 0);
+        next_parity[slot] ^= 1u;
     }
 
     // The GDN scan replaces the per-token chain only when the prompt is one
@@ -2425,6 +2514,14 @@ bool MetalExecutor::Impl::run_prefill_step(
     // Nothing failed and nothing was slow; the first token of every prompt was
     // simply the wrong one.
     std::string stage_err;
+    // The mixture's routing runs over the WHOLE prompt when it can, off row
+    // zero's argument tables, so row zero's `n` and `padded` have to be the
+    // fire's and not the one. Allocation-free: rebinding a const slot rewrites
+    // bytes at an address the table already holds.
+    if (g_.is_moe() && !prefill_dags_.empty() && schedule.N > 1) {
+        bind_token_consts(*ctx_, prefill_dags_.front(), g_, schedule.N,
+                          scratch_widest_elems(g_));
+    }
     bool stage_failed = false;
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
@@ -2476,12 +2573,8 @@ bool MetalExecutor::Impl::run_prefill_step(
             schedule.N);
     }
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
-    // The prompt's last token decides which half of the ping-pong holds the
-    // history; the paged decode reads ConvState, so record an odd handover.
-    if (conv_in_out_.size() < size_t(g_.max_slots))
-        conv_in_out_.assign(size_t(g_.max_slots), 0);
-    for (uint32_t slot : schedule.slot_of_token)
-        conv_in_out_[slot] = std::uint8_t(step_count_for(slot) & 1);
+    // Each token of a slot's prompt flipped that slot's half once.
+    for (uint32_t slot : schedule.slot_of_token) conv_in_out_[slot] ^= 1u;
     return true;
 }
 
@@ -2871,6 +2964,23 @@ std::uint32_t MetalExecutor::rs_slots() const {
 
 std::uint64_t MetalExecutor::rs_slot_bytes() const {
     return ready() ? impl_->rs_slot_bytes() : 0u;
+}
+
+std::uint32_t MetalExecutor::max_forward_tokens() const {
+    if (!ready()) return 0u;
+    // The paged qwen3.5 path binds its rows at setup and refuses a wider fire.
+    // The simple families replay a prompt internally and carry no such cap --
+    // their `DecodeGeometry::max_tokens` is the field's default 1, which is not
+    // a fire width, and reporting it would make a caller chunk a prompt one
+    // token at a time (measured: gpt-oss's 2048-token prefill fell from 755 to
+    // 89 tok/s).  0 means "no cap to respect", which is the truth for them.
+    if (impl_->is_simple()) {
+        const int rows = impl_->simple_engine()->paged()
+                             ? impl_->simple_engine()->max_rows()
+                             : 0;
+        return rows > 0 ? static_cast<std::uint32_t>(rows) : 0u;
+    }
+    return static_cast<std::uint32_t>(impl_->geometry().max_tokens);
 }
 
 std::uint64_t MetalExecutor::elastic_page_bytes() const {
@@ -4041,6 +4151,8 @@ bool MetalExecutor::ready() const { return false; }
 std::uint32_t MetalExecutor::vocab() const { return 0; }
 
 std::uint32_t MetalExecutor::rs_slots() const { return 0; }
+
+std::uint32_t MetalExecutor::max_forward_tokens() const { return 0; }
 
 std::uint64_t MetalExecutor::rs_slot_bytes() const { return 0; }
 std::uint64_t MetalExecutor::elastic_page_bytes() const { return 0; }

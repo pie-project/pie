@@ -544,6 +544,23 @@ struct FixedDecodeOutputs {
     // Monotonic device counter of fail-stopped lanes (chain kills); the
     // host mirrors it after each batch and reports growth loudly.
     std::uint32_t* chain_kills = nullptr;
+    // OR of `FixedDecodeKillReason` bits over every kill since boot. The
+    // counter alone says a lane was fail-stopped but not which of the eight
+    // containment predicates rejected it, and they fail for unrelated
+    // reasons -- a missing commit word is a lifecycle bug, `page_count !=
+    // expected_pages` a CSR/kv_len disagreement, a write outside
+    // [lower, upper) an endowment overrun. Without this the message names
+    // the check and not the cause.
+    std::uint32_t* kill_reasons = nullptr;
+    // Per-reason kill counts (8 slots, indexed by the bit position of
+    // `FixedDecodeKillReason`). A count rather than an OR because the kill
+    // cascades: a fail-stopped lane writes `commit[0]=0` for its successors,
+    // which then fail the commit check themselves. An OR cannot tell the one
+    // originating cause from the many derived ones; the counts can.
+    std::uint32_t* kill_reason_counts = nullptr;
+    // OR of the port indices that were not ready, so the message can say
+    // which of the seven inputs the producer had not published.
+    std::uint32_t* kill_ports = nullptr;
     std::uint32_t dummy_page = 0;
     std::uint32_t page_size = 0;
     std::uint32_t device_pages = 0;
@@ -567,6 +584,20 @@ __device__ const T* fixed_decode_pointer(std::uint64_t address) {
         static_cast<std::uintptr_t>(address));
 }
 
+// Why a lane failed containment. Reported as an OR across kills, so a run
+// that trips two different predicates is not mistaken for one cause seen
+// twice. Kept next to the checks that set them.
+enum FixedDecodeKillReason : std::uint32_t {
+    kKillCommit        = 1u << 0,   // pass_commit missing or zero
+    kKillPortNotReady  = 1u << 1,   // an input port's ready byte is 0
+    kKillTokenNull     = 1u << 2,   // token pointer null
+    kKillNullPointer   = 1u << 3,   // a geometry pointer null, or indptr[0] != 0
+    kKillPageCount     = 1u << 4,   // page_count zero, over capacity, or != ceil(kv_len)
+    kKillWriteSlot     = 1u << 5,   // w_slot past translation, or w_off past page
+    kKillWriteBounds   = 1u << 6,   // write position outside [lower, upper)
+    kKillTranslation   = 1u << 7,   // a translated page is past device_pages
+};
+
 __global__ void compose_fixed_decode(
     const FixedDecodeLane* lanes,
     std::uint32_t lane_count,
@@ -574,6 +605,8 @@ __global__ void compose_fixed_decode(
     extern __shared__ std::uint32_t page_offsets[];
     const std::uint32_t lane = threadIdx.x;
     bool valid = lane < lane_count;
+    std::uint32_t kill_reason = 0;
+    std::uint32_t not_ready_ports = 0;
     bool sentinel = false;
     std::uint32_t token = 0;
     const FixedDecodeLane* descriptor =
@@ -584,18 +617,28 @@ __global__ void compose_fixed_decode(
             fixed_decode_pointer<std::uint32_t>(
             descriptor->pass_commit);
         valid = commit != nullptr && *commit != 0;
+        if (!valid) kill_reason |= kKillCommit;
         for (std::size_t port = 0;
              port < kFixedDecodePortCount;
              ++port) {
             const auto* ready =
                 fixed_decode_pointer<std::uint8_t>(
                     descriptor->ready[port]);
-            if (ready != nullptr && *ready == 0) valid = false;
+            if (ready != nullptr && *ready == 0) {
+                valid = false;
+                kill_reason |= kKillPortNotReady;
+                // Which port, in the order `ports_in_lane` binds them:
+                // 0 embed_tokens, 1 positions, 2 pages, 3 page_indptr,
+                // 4 kv_len, 5 w_slot, 6 w_off. A kill that names the port
+                // names the producer, and the seven have different ones.
+                not_ready_ports |= 1u << port;
+            }
         }
         const auto* token_source =
             fixed_decode_pointer<std::uint32_t>(descriptor->token);
         if (token_source == nullptr) {
             valid = false;
+            kill_reason |= kKillTokenNull;
         } else {
             token = *token_source;
             sentinel =
@@ -631,6 +674,7 @@ __global__ void compose_fixed_decode(
             w_slot == nullptr || w_off == nullptr ||
             page_indptr[0] != 0) {
             valid = false;
+            kill_reason |= kKillNullPointer;
         } else {
             page_count = page_indptr[1];
             kv_len = *kv_len_source;
@@ -648,16 +692,29 @@ __global__ void compose_fixed_decode(
             if (page_count == 0 ||
                 page_count > descriptor->pages_capacity ||
                 page_count > descriptor->translation_len ||
-                page_count != expected_pages ||
-                logical_write_page >= descriptor->translation_len ||
-                write_offset >= output.page_size ||
-                logical_write_position < descriptor->write_lower_bound ||
+                page_count != expected_pages) {
+                valid = false;
+                kill_reason |= kKillPageCount;
+            }
+            if (logical_write_page >= descriptor->translation_len ||
+                write_offset >= output.page_size) {
+                valid = false;
+                kill_reason |= kKillWriteSlot;
+            }
+            if (logical_write_position < descriptor->write_lower_bound ||
                 logical_write_position >=
                     descriptor->write_upper_bound) {
                 valid = false;
+                kill_reason |= kKillWriteBounds;
+            }
+            if (!valid) {
+                // fall through to the fail-stop below
             } else {
                 write_page = translation[logical_write_page];
-                if (write_page >= output.device_pages) valid = false;
+                if (write_page >= output.device_pages) {
+                    valid = false;
+                    kill_reason |= kKillTranslation;
+                }
                 for (std::uint32_t page = 0;
                      page < page_count;
                      ++page) {
@@ -665,6 +722,7 @@ __global__ void compose_fixed_decode(
                     if (logical_page >= descriptor->translation_len ||
                         translation[logical_page] >= output.device_pages) {
                         valid = false;
+                        kill_reason |= kKillTranslation;
                         break;
                     }
                 }
@@ -685,6 +743,19 @@ __global__ void compose_fixed_decode(
         }
         if (output.chain_kills != nullptr) {
             atomicAdd(output.chain_kills, 1u);
+        }
+        if (output.kill_reasons != nullptr && kill_reason != 0) {
+            atomicOr(output.kill_reasons, kill_reason);
+        }
+        if (output.kill_ports != nullptr && not_ready_ports != 0) {
+            atomicOr(output.kill_ports, not_ready_ports);
+        }
+        if (output.kill_reason_counts != nullptr) {
+            for (std::uint32_t bit = 0; bit < 8; ++bit) {
+                if ((kill_reason >> bit) & 1u) {
+                    atomicAdd(&output.kill_reason_counts[bit], 1u);
+                }
+            }
         }
         page_count = 1;
         kv_len = 1;
@@ -1515,6 +1586,12 @@ struct Dispatch::Impl {
     // each batch and reported loudly when it grows.
     std::uint32_t* d_fixed_decode_kills = nullptr;
     std::uint32_t* h_fixed_decode_kills = nullptr;
+    std::uint32_t* d_fixed_decode_kill_reasons = nullptr;
+    std::uint32_t* h_fixed_decode_kill_reasons = nullptr;
+    std::uint32_t* d_fixed_decode_kill_counts = nullptr;
+    std::uint32_t* h_fixed_decode_kill_counts = nullptr;
+    std::uint32_t* d_fixed_decode_kill_ports = nullptr;
+    std::uint32_t* h_fixed_decode_kill_ports = nullptr;
     std::uint32_t fixed_decode_kills_reported = 0;
     // Same diagnostic for the decode-envelope compose path (RV-16).
     std::uint32_t* d_envelope_kills = nullptr;
@@ -1842,6 +1919,24 @@ struct NotifyContext {
 };
 
 Dispatch::Impl::~Impl() {
+    if (d_fixed_decode_kill_ports != nullptr) {
+        cudaFree(d_fixed_decode_kill_ports);
+    }
+    if (h_fixed_decode_kill_ports != nullptr) {
+        cudaFreeHost(h_fixed_decode_kill_ports);
+    }
+    if (d_fixed_decode_kill_counts != nullptr) {
+        cudaFree(d_fixed_decode_kill_counts);
+    }
+    if (h_fixed_decode_kill_counts != nullptr) {
+        cudaFreeHost(h_fixed_decode_kill_counts);
+    }
+    if (d_fixed_decode_kill_reasons != nullptr) {
+        cudaFree(d_fixed_decode_kill_reasons);
+    }
+    if (h_fixed_decode_kill_reasons != nullptr) {
+        cudaFreeHost(h_fixed_decode_kill_reasons);
+    }
     if (d_fixed_decode_kills != nullptr) {
         cudaFree(d_fixed_decode_kills);
     }
@@ -6472,6 +6567,28 @@ bool Dispatch::enqueue_fixed_decode(
         CUDA_CHECK(cudaMemset(state.d_fixed_decode_kills, 0, sizeof(std::uint32_t)));
         CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kills, sizeof(std::uint32_t)));
         *state.h_fixed_decode_kills = 0;
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kill_reasons,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kill_reasons, 0,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kill_reasons,
+                                  sizeof(std::uint32_t)));
+        *state.h_fixed_decode_kill_reasons = 0;
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kill_counts,
+                              8 * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kill_counts, 0,
+                              8 * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kill_counts,
+                                  8 * sizeof(std::uint32_t)));
+        std::memset(state.h_fixed_decode_kill_counts, 0,
+                    8 * sizeof(std::uint32_t));
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kill_ports,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kill_ports, 0,
+                              sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kill_ports,
+                                  sizeof(std::uint32_t)));
+        *state.h_fixed_decode_kill_ports = 0;
     }
     if (const std::uint32_t seen = *state.h_fixed_decode_kills;
         seen > state.fixed_decode_kills_reported) {
@@ -6479,9 +6596,45 @@ bool Dispatch::enqueue_fixed_decode(
         state.fixed_decode_kills_reported = seen;
         std::lock_guard<std::mutex> lock(state.stats_mutex);
         state.stats.fixed_decode_chain_kills += fresh;
+        const std::uint32_t why = *state.h_fixed_decode_kill_reasons;
+        std::string reasons;
+        const std::uint32_t* counts = state.h_fixed_decode_kill_counts;
+        const auto note = [&](std::uint32_t bit, const char* text) {
+            if ((why & bit) == 0) return;
+            if (!reasons.empty()) reasons += ", ";
+            reasons += text;
+            if (counts != nullptr) {
+                unsigned index = 0;
+                while ((bit >> index) != 1u) ++index;
+                reasons += " x" + std::to_string(counts[index]);
+            }
+        };
+        note(kKillCommit, "pass_commit missing/zero");
+        note(kKillPortNotReady, "input port not ready");
+        note(kKillTokenNull, "token pointer null");
+        note(kKillNullPointer, "geometry pointer null or indptr[0]!=0");
+        note(kKillPageCount, "page_count != ceil(kv_len/page_size) or over capacity");
+        note(kKillWriteSlot, "w_slot/w_off outside the translation or page");
+        note(kKillWriteBounds, "write position outside [lower, upper)");
+        note(kKillTranslation, "translated page >= device_pages");
+        if (const std::uint32_t ports = *state.h_fixed_decode_kill_ports;
+            ports != 0) {
+            static const char* const kPortNames[] = {
+                "embed_tokens", "positions", "pages", "page_indptr",
+                "kv_len", "w_slot", "w_off"};
+            reasons += " [ports:";
+            for (std::size_t i = 0; i < 7; ++i) {
+                if ((ports >> i) & 1u) {
+                    reasons += " ";
+                    reasons += kPortNames[i];
+                }
+            }
+            reasons += "]";
+        }
+        if (reasons.empty()) reasons = "unattributed";
         std::cerr << "[pie-driver-cuda] fixed-decode compose FAIL-STOPPED "
-                  << fresh << " lane(s): geometry/containment inconsistency; "
-                  << "the affected chains are killed (successors dummy-run)\n";
+                  << fresh << " lane(s): " << reasons
+                  << "; the affected chains are killed (successors dummy-run)\n";
     }
 
     const FixedDecodeLane* device_lanes =
@@ -6502,6 +6655,9 @@ bool Dispatch::enqueue_fixed_decode(
         .rs_slot_ids = buffers.rs_slot_ids,
         .sample_indices = buffers.sample_indices,
         .chain_kills = state.d_fixed_decode_kills,
+        .kill_reasons = state.d_fixed_decode_kill_reasons,
+        .kill_reason_counts = state.d_fixed_decode_kill_counts,
+        .kill_ports = state.d_fixed_decode_kill_ports,
         .dummy_page = buffers.dummy_page,
         .page_size = staged.fixed_decode_page_size,
         .device_pages = staged.fixed_decode_device_pages,
@@ -6523,6 +6679,24 @@ bool Dispatch::enqueue_fixed_decode(
     CUDA_CHECK(cudaMemcpyAsync(
         state.h_fixed_decode_kills,
         state.d_fixed_decode_kills,
+        sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost,
+        staged.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        state.h_fixed_decode_kill_reasons,
+        state.d_fixed_decode_kill_reasons,
+        sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost,
+        staged.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        state.h_fixed_decode_kill_counts,
+        state.d_fixed_decode_kill_counts,
+        8 * sizeof(std::uint32_t),
+        cudaMemcpyDeviceToHost,
+        staged.stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        state.h_fixed_decode_kill_ports,
+        state.d_fixed_decode_kill_ports,
         sizeof(std::uint32_t),
         cudaMemcpyDeviceToHost,
         staged.stream));

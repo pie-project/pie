@@ -8,6 +8,8 @@
 
 #include <cuda_bf16.h>
 
+#include <flashinfer/attention/cascade.cuh>
+
 #include <flashinfer/attention/hopper/default_params.cuh>
 #include <flashinfer/attention/hopper/prefill_sm90.cuh>
 #include <flashinfer/attention/scheduler.cuh>
@@ -284,7 +286,8 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
     cudaStream_t stream,
     float logits_soft_cap,
     float sm_scale,
-    float* lse_out) {
+    float* lse_out,
+    bool broadcast_q) {
     if (!plan.valid) {
         throw std::runtime_error("flashinfer sm90 prefill: empty plan");
     }
@@ -320,11 +323,13 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
 
     params.q_stride_n =
         static_cast<std::int64_t>(plan.num_q_heads) * plan.head_dim;
+    const std::int64_t o_stride_n = params.q_stride_n;
+    if (broadcast_q) params.q_stride_n = 0;
     params.k_stride_n =
         static_cast<std::int64_t>(plan.num_kv_heads) * plan.head_dim;
     params.v_stride_n =
         static_cast<std::int64_t>(plan.num_kv_heads) * plan.head_dim;
-    params.o_stride_n = params.q_stride_n;
+    params.o_stride_n = o_stride_n;
     params.q_stride_h = plan.head_dim;
     params.k_stride_h = plan.head_dim;
     params.v_stride_h = plan.head_dim;
@@ -354,6 +359,26 @@ void dispatch_attention_flashinfer_prefill_sm90_bf16(
             /*enable_pdl=*/current_device_major() >= 9, stream);
     }
     CUDA_CHECK(status);
+}
+
+}  // namespace pie_cuda_driver::ops
+
+namespace pie_cuda_driver::ops {
+
+void merge_attention_states_bf16(
+    const void* v, const float* s,
+    void* v_merged, float* s_merged,
+    int num_index_sets, int seq_len, int num_heads, int head_dim,
+    cudaStream_t stream) {
+    if (num_index_sets <= 1 || seq_len <= 0 || num_heads <= 0) return;
+    CUDA_CHECK((::flashinfer::MergeStates<__nv_bfloat16, __nv_bfloat16>(
+        const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(v)),
+        const_cast<float*>(s),
+        static_cast<__nv_bfloat16*>(v_merged), s_merged,
+        static_cast<std::uint32_t>(num_index_sets),
+        static_cast<std::uint32_t>(seq_len),
+        static_cast<std::uint32_t>(num_heads),
+        static_cast<std::uint32_t>(head_dim), stream)));
 }
 
 }  // namespace pie_cuda_driver::ops

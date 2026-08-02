@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -290,6 +291,10 @@ Runner& get_runner() {
 ck::ActivationType to_cutlass_activation(MoeActivation a) {
     switch (a) {
         case MoeActivation::Swiglu: return ck::ActivationType::Swiglu;
+        // Upstream's `Geglu` dispatches to `EpilogueOpDefaultFtGelu` and is
+        // accepted by `supportsFusedGatedActivation`; `GegluTanh` is neither,
+        // so it would drop to the unfused gate for the same math.
+        case MoeActivation::Geglu:  return ck::ActivationType::Geglu;
         case MoeActivation::Relu2:
         default:                    return ck::ActivationType::Relu2;
     }
@@ -664,9 +669,49 @@ void install_tactics(RunnerState& s, Runner& runner, const MoeProblem& p,
 
 bool flashinfer_cutlass_moe_enabled() { return true; }
 
-int flashinfer_cutlass_moe_max_rows() { return 1024; }
+namespace {
 
-int flashinfer_cutlass_moe_min_rows() { return 0; }
+// `PIE_MOE_FUSED_MAX_ROWS` / `PIE_MOE_FUSED_MIN_ROWS` are documented in the
+// header as the overrides for the fused path's row window, but both accessors
+// returned a constant and never read the environment -- so the documented
+// knobs did nothing and the window could not be swept against a measurement.
+int env_int(const char* name, int fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') return fallback;
+    char* end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end == v || parsed < 0 || parsed > std::numeric_limits<int>::max()) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
+}
+
+}  // namespace
+
+int flashinfer_cutlass_moe_max_rows() {
+    static const int v = env_int("PIE_MOE_FUSED_MAX_ROWS", 1024);
+    return v;
+}
+
+namespace {
+
+// Only an explicit override may narrow the window inside the runner. The
+// callers already carry their own row caps (qwen3.5 sizes its workspace for
+// `kFusedMoeMaxRows`, kimi and glm5 consult `min_rows` directly), so enforcing
+// the default here would silently re-route their prefill batches to a
+// different kernel -- a behaviour change dressed up as a fix.
+bool fused_window_overridden() {
+    static const bool on = std::getenv("PIE_MOE_FUSED_MAX_ROWS") != nullptr ||
+                           std::getenv("PIE_MOE_FUSED_MIN_ROWS") != nullptr;
+    return on;
+}
+
+}  // namespace
+
+int flashinfer_cutlass_moe_min_rows() {
+    static const int v = env_int("PIE_MOE_FUSED_MIN_ROWS", 0);
+    return v;
+}
 
 int moe_gemv_max_tokens(int fallback) { return fallback; }
 
@@ -751,6 +796,13 @@ bool flashinfer_cutlass_moe_bf16(
         fc2_expert_weights == nullptr || output == nullptr ||
         workspace == nullptr || unpermuted_row_to_permuted_row == nullptr) {
         return false;
+    }
+    // The row window is policy, not capacity, and it belongs here: a caller
+    // that decided for itself would diverge from the others the moment the
+    // window moved. Declining sends the caller to its own fallback path.
+    if (fused_window_overridden()) {
+        if (num_rows > flashinfer_cutlass_moe_max_rows()) return false;
+        if (num_rows < flashinfer_cutlass_moe_min_rows()) return false;
     }
     const std::size_t needed = flashinfer_cutlass_moe_workspace_bytes(
         activation, num_rows, hidden_size, inter_size, num_experts,

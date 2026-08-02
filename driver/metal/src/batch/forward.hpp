@@ -766,6 +766,11 @@ class MetalExecutor {
     // recurrent state per GDN layer (heap_layout.hpp `plan_heap`); caps
     // reports exactly this value, never a larger, unsupported one.
     std::uint32_t rs_slots() const;
+    /// The widest fire this setup will accept.  A caller with a longer prompt
+    /// must split it, the way the scheduler does: the paged families cap a
+    /// forward at `kPagedMaxForwardTokensCeiling` regardless of what the
+    /// config asked for, and hitting that cap is a refusal, not a queue.
+    std::uint32_t max_forward_tokens() const;
     std::uint64_t rs_slot_bytes() const;
     std::uint64_t elastic_page_bytes() const;
     std::uint64_t elastic_budget_pages() const;

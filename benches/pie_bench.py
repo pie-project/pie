@@ -84,6 +84,14 @@ def reconstruct_token_arrivals(
 
 PIE_BENCH_DEFAULT_DEVICE = "cuda:0"
 
+# Metal's driver takes these two unconditionally: its planner has no lattice
+# to collapse, so a value is always wanted. The CUDA driver documents the
+# opposite -- "Omit to let the memory planner choose ... A guess here is worse
+# than absence" (`worker/src/config.rs`) -- so cuda_native forwards them only
+# when the caller moved them off these defaults.
+PIE_MAX_FORWARD_TOKENS_DEFAULT = 10240
+PIE_MAX_FORWARD_REQUESTS_DEFAULT = 512
+
 
 def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
     if not inferlet_dir:
@@ -246,6 +254,15 @@ def build_config(args: argparse.Namespace):
         # from `gpu_mem_utilization` (worker/src/config.rs).
         if getattr(args, "total_pages", 0):
             driver_options["max_total_pages"] = args.total_pages
+        # Pin the forward layout only on explicit request: an unasked-for pin
+        # collapses the planner's lattice to a guess. Needed when the planner
+        # reports "no viable forward/KV layout fits budget", which a large
+        # dense checkpoint can provoke by leaving too little room for the
+        # prefill width the planner would otherwise pick.
+        if args.max_forward_tokens != PIE_MAX_FORWARD_TOKENS_DEFAULT:
+            driver_options["max_forward_tokens"] = args.max_forward_tokens
+        if args.max_forward_requests != PIE_MAX_FORWARD_REQUESTS_DEFAULT:
+            driver_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "swap_pool_size", 0):
             driver_options["swap_pool_size"] = args.swap_pool_size
     elif args.driver == "metal":
@@ -379,6 +396,10 @@ def build_config(args: argparse.Namespace):
         "frame_size": args.frame_size,
         "frame_submit_depth": args.frame_submit_depth,
         "frame_dispatch_depth": args.frame_dispatch_depth,
+        "submit_deadline": args.submit_deadline,
+    }
+    requested_scheduler_kwargs = {
+        k: v for k, v in requested_scheduler_kwargs.items() if v is not None
     }
     scheduler_parameters = inspect.signature(SchedulerConfig).parameters
     scheduler_kwargs = {
@@ -1304,6 +1325,29 @@ def build_parser() -> argparse.ArgumentParser:
                  ">0 to arm the suspend/restore rung; 0 leaves the residency "
                  "planner with pool-only reclaim.",
         )
+        sp.add_argument(
+            "--frame-size", type=int, default=None,
+            help="Waves per frame (pie scheduler `frame_size`). Omit for the "
+                 "engine default (2).",
+        )
+        sp.add_argument(
+            "--frame-submit-depth", type=int, default=None,
+            help="Frames a guest keeps queued in the engine. Omit for the "
+                 "engine default (3). This is the guest running ahead of the "
+                 "engine; too few collapses the pipeline to lockstep.",
+        )
+        sp.add_argument(
+            "--frame-dispatch-depth", type=int, default=None,
+            help="Frames the engine keeps posted to the driver. Omit for the "
+                 "engine default (2). The worker's config notes this is a "
+                 "two-sided trade-off that a fully batched fleet can lose.",
+        )
+        sp.add_argument(
+            "--submit-deadline", default=None,
+            help="How long a wave waits on a straggler lane before sealing "
+                 "without it, with unit (e.g. '50ms'). Omit for the engine "
+                 "default.",
+        )
         sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
         sp.add_argument(
             "--stream-routed-experts",
@@ -1324,8 +1368,10 @@ def build_parser() -> argparse.ArgumentParser:
                  "runs a checkpoint that does not fit; it is not a faster "
                  "--stream-routed-experts.",
         )
-        sp.add_argument("--max-forward-tokens", type=int, default=10240)
-        sp.add_argument("--max-forward-requests", type=int, default=512)
+        sp.add_argument("--max-forward-tokens", type=int,
+                        default=PIE_MAX_FORWARD_TOKENS_DEFAULT)
+        sp.add_argument("--max-forward-requests", type=int,
+                        default=PIE_MAX_FORWARD_REQUESTS_DEFAULT)
         sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
         sp.add_argument(
             "--mxfp4-moe",

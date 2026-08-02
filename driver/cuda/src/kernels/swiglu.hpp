@@ -40,6 +40,23 @@ void launch_geglu_tanh_bf16(
 //         y   = (up' + 1) * glu
 //
 // Matches `transformers/models/gpt_oss/modeling_gpt_oss.py::_apply_gate`.
+// Strided variant: `gate`/`up` are read at `in_stride` (Marlin's padded
+// intermediate width) and `y` is written densely at `cols`.
+void launch_gpt_oss_glu_strided_bf16(
+    const void* gate,
+    const void* up,
+    void* y,
+    int rows,
+    int cols,
+    int in_stride,
+    int out_stride,
+    cudaStream_t stream,
+    float limit,
+    float alpha = 1.702f);
+
+// `y_fp16`, when non-null, receives the same activation in fp16 -- what the
+// MXFP4 decode GEMV consumes -- so the separate cast kernel that used to
+// follow this one disappears.
 void launch_gpt_oss_glu_bf16(
     const void* gate,
     const void* up,
@@ -47,7 +64,8 @@ void launch_gpt_oss_glu_bf16(
     int num_elements,
     cudaStream_t stream,
     float limit,
-    float alpha = 1.702f);
+    float alpha = 1.702f,
+    void* y_fp16 = nullptr);
 
 // DeepSeek-V4 expert / shared-expert activation — vLLM's
 // `SiluAndMulWithClamp(swiglu_limit, alpha=1.0, beta=0.0)`:
@@ -143,11 +161,15 @@ void launch_chunked_swiglu_strided_bf16(
 // split, but emits `gelu_tanh(gate) * up` instead of `silu(gate) * up`.
 // Used by Gemma-4 26B-A4B's routed-expert block (its dense MLP also
 // uses GeGLU-tanh, see `launch_geglu_tanh_bf16`).
+//
+// `gate_second` selects the [linear|gate] order flashinfer's CUTLASS MoE
+// requires; the default is HuggingFace's [gate|up].
 void launch_chunked_geglu_tanh_bf16(
     const void* packed,  // [N, 2*I] bf16 (gate first, up second)
     void*       y,       // [N, I]   bf16
     int N, int I,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool gate_second = false);
 
 // ReLU-squared activation used by Nemotron-H MLP experts:
 //     y = relu(x) ** 2

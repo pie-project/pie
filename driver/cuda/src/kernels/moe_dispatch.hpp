@@ -275,6 +275,9 @@ void launch_moe_align_decode(
     int num_experts,
     int block_size,
     int max_blocks,
+    // Optional: total padded row count, i.e. how many M-blocks are real. A
+    // grouped GEMM that iterates past it reads the `-1` expert padding.
+    std::int32_t* num_tokens_past_padded,
     cudaStream_t stream);
 
 // `launch_moe_bucket_exact` is the same expert-bucketing setup as
@@ -282,6 +285,37 @@ void launch_moe_align_decode(
 // It writes sorted route ids, the inverse route->sorted-row map, and exact
 // per-expert counts. The host may copy only `counts_out[num_experts]` to build
 // cuBLAS grouped shapes while route metadata stays on device.
+// Add a per-expert bias row to route-major output.
+//
+// Marlin's own bias epilogue indexes `[num_experts, prob_n]`, but GPT-OSS
+// publishes its expert biases at the UNPADDED intermediate width while the
+// packed weights are padded to a 128 multiple, so the two strides disagree and
+// the epilogue cannot be used. This applies the bias afterwards, reading the
+// route's expert from `topk_idx` and the bias row at its own stride.
+void launch_add_moe_route_bias_bf16(
+    void* out,                        // [num_routes, out_stride] bf16
+    const void* bias,                 // [num_experts, bias_stride] bf16
+    const std::int32_t* topk_idx,     // [num_routes]
+    int num_routes,
+    int cols,                         // columns to add (= bias_stride)
+    int out_stride,
+    cudaStream_t stream);
+
+// Transpose per-expert group scales from the checkpoint's `[E, n, k/32]` to
+// the `[E, k/32, n]` Marlin reads.
+//
+// Marlin walks scales with `s_gl_stride = prob_n / 16` int4 units, i.e. one
+// step along K advances a whole row of N: the layout is K-major. GPT-OSS
+// publishes `[E, I_native, H/32]`, which is the transpose of that, so feeding
+// it straight through produces plausible-looking garbage rather than an error.
+void launch_transpose_expert_scales_u8(
+    const void* src,
+    void* dst,
+    int num_experts,
+    int n,
+    int k_groups,
+    cudaStream_t stream);
+
 void launch_moe_bucket_exact(
     const std::int32_t* topk_idx,
     std::int32_t* sorted_route_ids,

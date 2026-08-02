@@ -206,6 +206,26 @@ int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
     return want_token ? argmax_of(out, 0) : 0;
 }
 
+/// Fire a prompt, splitting it into fires the setup will actually accept.
+/// A paged family caps a forward at 1024 rows however wide the config asked,
+/// so a Tier 2 prompt is a refusal rather than a slow answer unless the caller
+/// chunks it -- which is what the scheduler does with a long prompt too, so
+/// chunking here measures the same thing the server would.  Returns the greedy
+/// token of the LAST chunk, or -1 on failure.
+int fire_prompt(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
+                std::uint32_t& next_free_page, bool want_token = false) {
+    const std::uint32_t cap = exec.max_forward_tokens();
+    const std::uint32_t step = (cap > 0 && cap < n) ? cap : n;
+    int last = 0;
+    for (std::uint32_t done = 0; done < n; done += step) {
+        const std::uint32_t take = std::min(step, n - done);
+        last = fire(exec, s, take, page_size, next_free_page,
+                    want_token && done + take >= n);
+        if (last < 0) return -1;
+    }
+    return last;
+}
+
 /// "The capital of France is Paris. The capital of Italy is".
 ///
 /// One prompt, used three ways: the greedy gate continues it, the golden-tap
@@ -426,6 +446,46 @@ int main(int argc, char** argv) {
                     too_big.c_str());
     }
 
+    // The device ceiling is not the bound that killed this machine. Six kernel
+    // panics on the 48 GiB M4 Pro all had free memory under 200 MiB, and the
+    // run that caused the last one had passed every check above: an 18.16 GiB
+    // checkpoint, a device that would hold far more, and a process that peaked
+    // at 40.5 GiB. A weight copied into the heap is resident TWICE while the
+    // copy runs -- once in the heap and once in the mapping it is read from --
+    // and nothing checked the second one.
+    //
+    // So this probe gives the driver room for the checkpoint and the whole
+    // margin, and nothing for the second copy.
+    //
+    // The assertion is on the MESSAGE and not merely on the refusal, and that
+    // is what makes this a regression gate rather than a coincidence: the
+    // clause named below is emitted only when the copy is actually counted, so
+    // deleting that term fails this test whether the driver then refuses for
+    // some other reason or admits the model outright.
+    {
+        const std::size_t kMargin = 2ull << 30;
+        const std::size_t left = std::size_t(weight_bytes) + kMargin;
+        RawMetalContext::set_host_reclaimable_bytes_for_test(left);
+        MetalExecutor probe;
+        std::string why;
+        const bool set_up = probe.setup(cfg, &why);
+        RawMetalContext::set_host_reclaimable_bytes_for_test(0);
+        if (set_up) {
+            std::printf("  FAIL  setup succeeded on a machine with only %.2f GiB left, "
+                        "against %.2f GiB of weights that are resident twice while they "
+                        "load\n",
+                        double(left) / (1 << 30), double(weight_bytes) / (1 << 30));
+            return 1;
+        }
+        if (why.find("does not fit the memory this machine has left") == std::string::npos ||
+            why.find("resident twice") == std::string::npos) {
+            std::printf("  FAIL  refused, but not for the load-time peak: %s\n", why.c_str());
+            return 1;
+        }
+        std::printf("  PASS  refused a model whose load-time peak the machine could not "
+                    "hold: %s\n", why.c_str());
+    }
+
     MetalExecutor exec;
     std::string err;
     const double t_load0 = now_s();
@@ -434,7 +494,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     const double load_s = now_s() - t_load0;
-    std::printf("  loaded in %.2f s, vocab %u\n", load_s, exec.vocab());
+    // `rs_slots` is the concurrency ceiling for a recurrent family, and it is a
+    // budget rather than a request count -- Qwen3.6-27B's linear-attention
+    // state is 170 MiB a slot, so a small enough working set hands back fewer
+    // than the fire declared. Printed because a throughput run that exceeds it
+    // is not a slow run, it is a different experiment; and because on this
+    // family the fleet check starts failing at fifteen members for a reason
+    // that is NOT this one, and ruling it out took a build.
+    std::printf("  loaded in %.2f s, vocab %u, %u recurrent slot(s)\n", load_s, exec.vocab(),
+                exec.rs_slots());
 
     const std::uint32_t page_size = exec.kv_pool_page_size();
 
@@ -634,21 +702,49 @@ int main(int argc, char** argv) {
             // affine g64. The key is what the config says, not what any one
             // tensor is, which is the same thing every other row's group means.
             //
-            // These answers are NOT mlx-lm's, whatever the Gemma-4-26B comment's
-            // "every other row" says. Fed the same twelve ids, mlx-lm greedy
-            // answers 13 279 410 12038 142760 1328 -- the same four tokens and
-            // then a different fifth. So this row is pinned to an arithmetic
-            // like the 26B's is, and the same care applies to moving it.
+            // On `kQwen36Prompt`, and for the reason the `want_prompt` field
+            // exists. gpt-oss is the only o200k vocabulary here, and it reads
+            // `kGatePrompt` as `िstenidikanل cloud.ultstenid oppل` -- not a
+            // sentence in any language, so the model has nothing to be
+            // confident about and the gate was measuring a coin flip. It was
+            // caught the way the gemma-4-31b row was, by a chip: this row is
+            // the only one of the five that failed on an M4 Pro, and mlx-lm's
+            // own top-2 margins on that prompt say why.
             //
-            // That is what stops the dense projections from taking the FP16
-            // GEMM the other families take. It is worth ~4.5% here, and the
-            // objection is measured rather than assumed: activation taps say
-            // FP16 costs about one bf16 ulp per projection, which is ordinary,
-            // but under it this checkpoint tracks mlx-lm for TWO tokens where
-            // BF16 tracks it for four. A ulp that halves the agreement with the
-            // only outside reference there is has not earned the 4.5%.
-            {"gpt-oss-20b", 24, 32, 4, 2880, 32, {13, 279, 410, 12038, 410, 25},
-             {785, 6722, 315, 9625, 1455, 12095}},
+            //     step        1     2     3     4      5      6
+            //     margin    0.50  1.25  0.25  0.00   2.88   1.75
+            //
+            // Step four is an EXACT tie, and step three is a quarter of a
+            // logit. Both engines duly disagree with themselves across
+            // machines: mlx-lm answered 13 279 410 12038 142760 1328 on the
+            // M1 Max and 13 279 410 16 13 410 on the M4, and this driver
+            // answered 13 279 410 12038 410 25 on the one and
+            // 13 279 3206 7890 484 290 on the other -- three tokens, four
+            // answers. Nothing about the arithmetic was wrong: the long gate
+            // below, which is 192 rows through the batched mixture, passes
+            // 6/6 on both machines unchanged.
+            //
+            // `kQwen36Prompt` reads as `1, 2, 3, 4, 5, 6, 7, 8,` in o200k as
+            // well -- the digit and space ids coincide -- so the row costs no
+            // new constant, and its margins are the ones a gate can stand on:
+            //
+            //     step        1     2     3     4      5      6
+            //     margin    3.81  5.19  2.81  3.00   3.00   2.81
+            //
+            // 2.81 is the floor, against 2.0 on Qwen3.6-35B-A3B, which is the
+            // tightest of the four rows that were passing already. The answer
+            // is mlx-lm's on this prompt, and this driver reproduces it on the
+            // M4; the continuation spells ` 9, 10,` and diverges from the
+            // Qwen3.6 rows at step five only because `10` is one token there
+            // and two here.
+            //
+            // The FP16 note this comment used to carry is now recorded where
+            // the switch is, in `device_tuning.hpp`: the dense projections do
+            // not take the FP16 GEMM here, and `PIE_METAL_FP16_QMM=0` and `=1`
+            // produce bit-identical continuations on this checkpoint, so it
+            // was never this row's evidence for anything.
+            {"gpt-oss-20b", 24, 32, 4, 2880, 32, {220, 24, 11, 220, 702, 11},
+             {785, 6722, 315, 9625, 1455, 12095}, kQwen36Prompt},
             // The same Llama-3.2-1B at 8 bits. It is here because it is the
             // only row that exercises a width other than 4 across a WHOLE
             // model -- the embedding gather, every projection, the batched
@@ -994,7 +1090,7 @@ int main(int argc, char** argv) {
     s.tokens = prompt;
     s.tokens.resize(std::size_t(n_prompt + n_decode), 1u);
     const double t0 = now_s();
-    if (fire(exec, s, std::uint32_t(n_prompt), page_size, next_page) < 0) return 1;
+    if (fire_prompt(exec, s, std::uint32_t(n_prompt), page_size, next_page) < 0) return 1;
     const double prefill_s = now_s() - t0;
 
     // ── decode ──
@@ -1035,7 +1131,7 @@ int main(int argc, char** argv) {
     s2.id = 5;
     s2.tokens = s.tokens;
     std::uint32_t next_page2 = 0;
-    if (fire(exec, s2, std::uint32_t(n_prompt), page_size, next_page2) < 0) return 1;
+    if (fire_prompt(exec, s2, std::uint32_t(n_prompt), page_size, next_page2) < 0) return 1;
     const double t2 = now_s();
     for (int i = 0; i < n_decode; ++i) {
         if (fire(exec, s2, 1, page_size, next_page2) < 0) return 1;
@@ -1058,6 +1154,32 @@ int main(int argc, char** argv) {
     double tput_tps = 0.0;
     if (n_seqs > 1) {
         const std::size_t nf = std::size_t(n_seqs);
+        // A recurrent family cannot run a fleet wider than the slots the device
+        // affords, and `rs_slots()` is a BUDGET rather than the request count:
+        // Qwen3.6-27B's linear-attention state is 170 MiB a slot, so a device
+        // with a small enough working set will hand back fewer than were asked
+        // for however many requests the fire declares.
+        //
+        // Gated on `rs_slot_bytes()`, not on `rs_slots()`. A checkpoint with no
+        // GDN layers still reports a slot count -- gpt-oss reports one -- and
+        // reading that as a concurrency ceiling refuses an eight-wide fleet on
+        // a model that has no state to collide. The bytes are the question:
+        // zero of them means no member can overwrite another's history and the
+        // slot id is decoration.
+        //
+        // The assignment below used to be `i % exec.rs_slots()`, which keeps
+        // the id in range and quietly breaks the invariant three lines above --
+        // the wrapped members would share a slot with the low ones and compute
+        // each other's history, which is a wrong answer dressed as a throughput
+        // number. Saying the limit is worth more than producing a number under
+        // it.
+        if (exec.rs_slot_bytes() > 0 && exec.rs_slots() > 0 &&
+            nf > std::size_t(exec.rs_slots())) {
+            std::printf("  ....  throughput: %d sequences need %d recurrent slots and this "
+                        "device affords %u; re-run at PIE_BENCH_TPUT=%u or lower\n",
+                        n_seqs, n_seqs, exec.rs_slots(), exec.rs_slots());
+            return 0;
+        }
         std::vector<Seq> fleet(nf);
         std::uint32_t fpage = 0;
         bool bad = false;
@@ -1065,7 +1187,8 @@ int main(int argc, char** argv) {
             fleet[std::size_t(i)].id = std::uint32_t(100 + i);
             fleet[std::size_t(i)].tokens = prompt;
             fleet[std::size_t(i)].tokens.resize(std::size_t(n_prompt + n_decode), 1u);
-            fleet[std::size_t(i)].rs_slot = exec.rs_slots() > 0 ? i % exec.rs_slots() : 0;
+            fleet[std::size_t(i)].rs_slot =
+                exec.rs_slots() > 0 ? std::uint32_t(i) % exec.rs_slots() : 0u;
             // Prefilled one at a time and UNTIMED. What is being measured is
             // the decode fleet; folding a prefill into it would report one
             // number for two regimes.
@@ -1075,6 +1198,13 @@ int main(int argc, char** argv) {
         }
         if (!bad) {
             std::vector<int> fleet_diverged(nf, -1);
+            // The argmax check above answers "do the members agree", which is
+            // the question a wrong number is asked. It cannot say WHEN they
+            // stopped being the same arithmetic: two rows can differ in the low
+            // bits for twenty steps and pick the same token every time. The
+            // first step whose bf16 rows are not byte-identical is the step the
+            // divergence was CREATED, and that is the one a bisect needs.
+            std::vector<int> first_bitdiff(nf, -1);
             const double t3 = now_s();
             for (int step = 0; step < n_decode && !bad; ++step) {
                 std::vector<MemberForwardDesc> descs;
@@ -1104,11 +1234,21 @@ int main(int argc, char** argv) {
                     if (i == 0) {
                         first_tok = t;
                     } else if (t != first_tok) {
+                        const std::size_t r = std::size_t(n_prompt + 1 + step);
                         std::printf("  FAIL  members of one fire disagree at step %d: "
-                                    "member %d says %d, member 0 says %d\n",
-                                    step, i, t, first_tok);
+                                    "member %d says %d, member 0 says %d"
+                                    " (the same prompt alone said %d)\n",
+                                    step, i, t, first_tok,
+                                    r < s.tokens.size() ? int(s.tokens[r]) : -1);
                         bad = true;
                         break;
+                    }
+                    if (i > 0 && outs[0].device_contents != nullptr &&
+                        outs[std::size_t(i)].device_contents != nullptr &&
+                        std::memcmp(bf16_row(outs[0], 0), bf16_row(outs[std::size_t(i)], 0),
+                                    std::size_t(outs[0].vocab) * 2) != 0 &&
+                        first_bitdiff[std::size_t(i)] < 0) {
+                        first_bitdiff[std::size_t(i)] = step;
                     }
                     // Every member was given the SAME prompt, so the fleet is n
                     // copies of the sequence the latency loop above already
@@ -1127,6 +1267,22 @@ int main(int argc, char** argv) {
                     }
                     m.next_position += 1;
                     if (m.next_position < m.tokens.size()) m.tokens[m.next_position] = std::uint32_t(t);
+                }
+            }
+            {
+                int earliest = -1;
+                int earliest_member = -1;
+                int diverged_members = 0;
+                for (int i = 1; i < n_seqs; ++i) {
+                    const int d = first_bitdiff[std::size_t(i)];
+                    if (d < 0) continue;
+                    ++diverged_members;
+                    if (earliest < 0 || d < earliest) { earliest = d; earliest_member = i; }
+                }
+                if (earliest >= 0) {
+                    std::printf("  ....  %d of %d members leave member 0's arithmetic; the "
+                                "first is member %d at step %d\n",
+                                diverged_members, n_seqs - 1, earliest_member, earliest);
                 }
             }
             if (!bad) {

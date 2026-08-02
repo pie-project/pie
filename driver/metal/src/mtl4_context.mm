@@ -527,13 +527,33 @@ size_t RawMetalContext::host_reclaimable_bytes() {
                           &count) != KERN_SUCCESS) {
         return 0;
     }
-    // `external_page_count` is the file-backed set and is already a subset of
-    // active+inactive, so counting inactive and external both would double-
-    // count the clean file pages that make up most of a freshly-loaded model's
-    // footprint. Take inactive plus purgeable plus free, and add only the
-    // file-backed pages the kernel has parked as speculative.
-    const uint64_t pages = uint64_t(vm.free_count) + vm.inactive_count +
-                           vm.purgeable_count + vm.speculative_count;
+    // What the kernel can hand back without swapping. The queues -- active,
+    // inactive, speculative, wired -- partition non-free memory and are
+    // disjoint; `external_page_count` (file-backed) and `purgeable_count` are
+    // ATTRIBUTES cutting across them, not queues of their own.
+    //
+    // So `inactive` and `external` overlap and cannot simply be added. This
+    // used to resolve that by dropping `external` entirely and keeping only
+    // the file pages parked as speculative -- which throws away every clean
+    // file page the kernel has parked as ACTIVE, and a clean file page is the
+    // cheapest memory on the machine to reclaim: it is dropped, not written.
+    // On a box that has just read sixty gigabytes of checkpoints, which is any
+    // box that has loaded one model and is about to load another, that is
+    // gigabytes of real headroom made invisible. Measured on a 32 GiB M1 Max
+    // with 15.73 GiB free: 6.89 GiB inactive against 8.30 GiB file-backed, so
+    // 1.4 GiB of it was hidden, and the fit check refused a 10.9 GiB model.
+    //
+    // `max` rather than a sum, because that is the union bound that cannot
+    // over-count: both sets live inside active+inactive+speculative, so their
+    // union is at least the larger and at most the total, and only the larger
+    // is safe to claim without knowing the split -- which Mach does not
+    // report. `speculative` is file-backed read-ahead and therefore already
+    // inside `external`; it is added to the inactive arm alone, where it is
+    // disjoint and would otherwise be lost.
+    const uint64_t evictable =
+        std::max<uint64_t>(uint64_t(vm.inactive_count) + vm.speculative_count,
+                           vm.external_page_count);
+    const uint64_t pages = uint64_t(vm.free_count) + vm.purgeable_count + evictable;
     return size_t(pages * uint64_t(page));
 }
 

@@ -6,3 +6,16 @@ This product includes software derived from XGrammar
 
 XGrammar
 Copyright (c) 2024 by XGrammar Contributors
+
+This product includes software derived from Marlin
+(https://github.com/IST-DASLab/marlin), as modified by Neural Magic and
+distributed with vLLM (https://github.com/vllm-project/vllm):
+
+Marlin
+Copyright (C) Marlin.2024 Elias Frantar
+Modified by Neural Magic
+Copyright contributors to the vLLM project
+
+Vendored under driver/cuda/third_party/marlin (single-problem W4A16/MXFP4
+GEMM) and driver/cuda/third_party/marlin_moe (the expert-indexed MoE variant,
+from vLLM's csrc/libtorch_stable/moe/marlin_moe_wna16).

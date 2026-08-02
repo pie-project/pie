@@ -185,6 +185,32 @@ struct Gemma4MoeMlpWorkspace {
     // fire beside the decode plans; `valid == false` means fall back.
     ops::HopperPrefillPlan hopper_decode_plan_sliding;
     std::vector<std::uint32_t> hopper_qo_indptr_h;
+    // The KV split, expressed as a batch: `kGemma4HopperSplits`
+    // pseudo-requests, one token of Q each (broadcast, not copied) over
+    // disjoint page ranges. One request times num_kv_heads is eight CTAs on an
+    // H100, which leaves the decode kernel idle; the split fills it and
+    // `merge_attention_states_bf16` folds the partials back.
+    int hopper_splits = 0;
+    // The layer window this plan was built FOR. The split rewrites
+    // `window_left` into a per-chunk value, so the plan's own field no longer
+    // identifies the layer it serves.
+    int hopper_plan_layer_window = -2;
+    // Same split for the full-attention layers, which cannot use FA3
+    // (head_dim 512) but underfill the device even harder: two KV heads is
+    // two CTAs. These ride FlashInfer's own decode plan, built for
+    // `full_splits` pseudo-requests.
+    ops::DecodePlanCachePtr full_split_plan;
+    int full_splits = 0;
+    std::vector<std::uint32_t> full_split_kv_indptr_h;
+    std::vector<std::uint32_t> full_split_last_h;
+    DeviceBuffer<std::uint32_t> full_split_kv_indptr_d;
+    DeviceBuffer<std::uint32_t> full_split_last_d;
+    std::vector<std::uint32_t> hopper_split_qo_h;
+    std::vector<std::uint32_t> hopper_split_kv_indptr_h;
+    std::vector<std::uint32_t> hopper_split_last_h;
+    DeviceBuffer<std::uint16_t> hopper_split_partial;
+    DeviceBuffer<float> hopper_split_lse;
+    DeviceBuffer<float> hopper_split_lse_merged;
     bool row_decode_prepared = false;
     int row_decode_prepared_tokens = 0;
     int row_decode_prepared_requests = 0;
@@ -197,6 +223,14 @@ struct Gemma4MoeMlpWorkspace {
     DeviceBuffer<const std::uint16_t*> b_dn_ptrs;
     DeviceBuffer<std::uint16_t*>       c_dn_ptrs;
     DeviceBuffer<float>                batch_weights;
+
+    // FlashInfer CUTLASS grouped-MoE runner state. When `cutlass_ws` is
+    // allocated and the batch fits `cutlass_max_rows`, the routed experts run
+    // as one fused device-side call instead of the host-routed per-expert
+    // walk -- which is also what makes the layer graph-capturable.
+    DeviceBuffer<std::uint8_t>  cutlass_ws;       // opaque runner workspace
+    DeviceBuffer<std::int32_t>  cutlass_row_map;  // [rows*K] i32
+    int cutlass_max_rows = 0;                     // rows the ws is sized for
 
     static Gemma4MoeMlpWorkspace allocate(
         int max_tokens, int hidden, int num_experts, int top_k,
@@ -227,6 +261,21 @@ struct Gemma4ForwardCfg {
 // dimensions + KV-source mapping from `HfConfig::layer_types` and
 // `num_kv_shared_layers`. Throws on missing tensors.
 Gemma4Weights bind_gemma4(const LoadedModel& engine);
+
+/// Whether the routed experts' fused `gate_up` tensor is stacked `[up|gate]`
+/// rather than the checkpoint's `[gate|up]`.
+///
+/// flashinfer's CUTLASS grouped MoE reads fc1's output as `[linear|gate]`, so
+/// the fused decode path needs the swapped order. The Rust contract
+/// (`model/gemma_4/src/contract.rs`, `fused_moe_gate_up_tp_slices`) publishes
+/// in whichever order this returns, and the two constants have to agree --
+/// flipping one alone silently swaps gate and up inside every expert.
+bool gemma4_moe_gate_up_swapped();
+
+/// Force the host-routed per-expert MoE walk (`PIE_GEMMA4_MOE_FORCE_GENERAL`).
+/// The comparison switch for the fused CUTLASS path: same weights, other
+/// kernel.
+bool gemma4_moe_force_general_path();
 
 // ── Gemma-4 vision tower (`gemma4_vision`) ──────────────────────────────────
 // A Gemma-style ViT (sandwich RMSNorms, encoder RoPE, gated gelu-tanh MLP),
