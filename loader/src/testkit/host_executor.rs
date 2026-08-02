@@ -71,7 +71,36 @@ enum Root {
 /// difference visible.
 const POISON: u8 = 0xAB;
 
+/// One retired instruction of an executing plan, for a caller rendering
+/// progress.
+///
+/// The smooth axis is bytes, not instructions: one tensor can be half the
+/// model, so an instruction count jerks where the checkpoint bytes consumed
+/// so far advance evenly. The total is the plan's own statement
+/// ([`crate::plan::MemoryPlan::checkpoint_read_bytes`]), known before the
+/// first instruction runs — which is what makes a percentage possible at all.
+pub struct Progress<'a> {
+    /// Checkpoint bytes consumed so far.
+    pub read_bytes: u64,
+    /// What `read_bytes` counts toward.
+    pub total_read_bytes: u64,
+    /// The runtime tensor this instruction published, when it published one.
+    pub finalized: Option<&'a str>,
+}
+
 pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage, Error> {
+    execute_plan_with_progress(plan, snapshot_dir, &mut |_| {})
+}
+
+/// [`execute_plan`], reporting a [`Progress`] after every retired instruction.
+///
+/// The callback is for rendering, so it can do no harm: it sees each state
+/// once, after the work is done, and returns nothing.
+pub fn execute_plan_with_progress(
+    plan: &LoadPlan,
+    snapshot_dir: &Path,
+    progress: &mut dyn FnMut(Progress<'_>),
+) -> Result<HostStorage, Error> {
     // The gate is what this executor *implements* — the convert mask — not
     // `HOST_TILE_MAP_MASK`, which is what a host-lowered plan may *advertise*.
     // A CUDA plan that carries an `Encode` is executable here too; what stays
@@ -105,6 +134,8 @@ pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage,
         buffers: HashMap::new(),
         tensors: HashMap::new(),
         max_tile_write_bytes: 0,
+        progress,
+        read_bytes: 0,
     };
     executor.execute()?;
     Ok(HostStorage {
@@ -114,7 +145,7 @@ pub fn execute_plan(plan: &LoadPlan, snapshot_dir: &Path) -> Result<HostStorage,
     })
 }
 
-struct HostExecutor<'a> {
+struct HostExecutor<'a, 'p> {
     plan: &'a LoadPlan,
     /// The sparse half of plan lookup. Buffers and instructions are dense, so
     /// they go through [`LoadPlan::buffer`] and [`instr_by_id`] directly; tensor
@@ -125,12 +156,28 @@ struct HostExecutor<'a> {
     buffers: HashMap<BufferId, BufferLoc>,
     tensors: HashMap<String, Vec<u8>>,
     max_tile_write_bytes: usize,
+    progress: &'p mut dyn FnMut(Progress<'_>),
+    read_bytes: u64,
 }
 
-impl HostExecutor<'_> {
+impl HostExecutor<'_, '_> {
     fn execute(&mut self) -> Result<(), Error> {
         for id in &self.plan.schedule {
             let instr = instr_by_id(&self.plan.instrs, *id)?.clone();
+            // Accounted before the match consumes the instruction, reported
+            // after its work is done.
+            let consumed = match &instr {
+                StorageInstr::ExtentWrite { source, .. }
+                | StorageInstr::BulkExtentWrite { source, .. } => source.span_bytes,
+                StorageInstr::TileMap { source, .. } => {
+                    source.as_ref().map_or(0, |source| source.span_bytes)
+                }
+                _ => 0,
+            };
+            let finalized = match &instr {
+                StorageInstr::Finalize { name, .. } => Some(name.clone()),
+                _ => None,
+            };
             match instr {
                 StorageInstr::Allocate { buffer, .. } => self.allocate(buffer)?,
                 StorageInstr::Fill { buffer, .. } => self.fill(buffer)?,
@@ -168,6 +215,12 @@ impl HostExecutor<'_> {
                     }
                 }
             }
+            self.read_bytes += consumed;
+            (self.progress)(Progress {
+                read_bytes: self.read_bytes,
+                total_read_bytes: self.plan.memory.checkpoint_read_bytes,
+                finalized: finalized.as_deref(),
+            });
         }
         Ok(())
     }
@@ -2244,6 +2297,75 @@ mod tests {
         assert_eq!(exp2_e8m0(128), 2.0);
         assert_eq!(exp2_e8m0(0), f32::from_bits(1 << 22));
         assert_eq!(exp2_e8m0(254), f32::from_bits(254 << 23));
+    }
+
+    /// Progress reports bytes monotonically against the plan's own total and
+    /// names each tensor as it is published.
+    #[test]
+    fn progress_counts_bytes_and_names_finalized_tensors() {
+        use crate::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use crate::contract::{Expr, ModelContract, TensorContract};
+
+        let dir = std::env::temp_dir().join(format!("pie_host_progress_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = r#"{"raw":{"dtype":"U8","shape":[16],"data_offsets":[0,16]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        file.extend_from_slice(&[7u8; 16]);
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: "raw".to_string(),
+                file_id: FileId(0),
+                file_offset: data_offset,
+                span_bytes: 16,
+                shape: vec![16],
+                encoding: Encoding::Raw(DType::U8),
+            }],
+        };
+        let contract = ModelContract {
+            alignment: 1,
+            tensors: vec![TensorContract::new(
+                "w",
+                Expr::src("raw"),
+                vec![16],
+                Encoding::Raw(DType::U8),
+            )],
+            groups: Vec::new(),
+        };
+        let plan = crate::plan::compile(&metadata, &contract, StorageTarget::default()).unwrap();
+
+        let mut seen = Vec::new();
+        let storage = execute_plan_with_progress(&plan, &dir, &mut |progress| {
+            seen.push((
+                progress.read_bytes,
+                progress.total_read_bytes,
+                progress.finalized.map(str::to_string),
+            ));
+        })
+        .unwrap();
+        assert_eq!(storage.tensors["w"], vec![7u8; 16]);
+
+        assert_eq!(seen.len(), plan.schedule.len());
+        assert!(seen.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        let last = seen.last().unwrap();
+        assert_eq!(last.0, plan.memory.checkpoint_read_bytes);
+        assert_eq!(last.1, plan.memory.checkpoint_read_bytes);
+        assert!(
+            seen.iter().any(|(.., name)| name.as_deref() == Some("w")),
+            "no event named the published tensor: {seen:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// The parallel row driver against a plain sequential loop of the same

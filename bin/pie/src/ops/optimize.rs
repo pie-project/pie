@@ -84,8 +84,14 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
     let plan = pie_loader::plan::compile(&metadata, &normalization.contract, target)
         .map_err(|err| anyhow!("cannot compile the normalization: {err}"))?;
     let started = std::time::Instant::now();
-    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, &snapshot)
-        .map_err(|err| anyhow!("normalization failed: {err}"))?;
+    let mut bar = ProgressLine::new();
+    let storage = pie_loader::testkit::host_executor::execute_plan_with_progress(
+        &plan,
+        &snapshot,
+        &mut |progress| bar.render(&progress),
+    )
+    .map_err(|err| anyhow!("normalization failed: {err}"))?;
+    bar.finish();
 
     let mut tensors = Vec::new();
     for decl in &plan.tensors {
@@ -118,6 +124,66 @@ pub fn run(args: OptimizeArgs) -> Result<()> {
         out_file.display()
     );
     Ok(())
+}
+
+/// A single-line, byte-weighted progress bar over the executing plan.
+///
+/// Renders to stderr only when stderr is a terminal, throttled so the redraw
+/// never becomes the work. The name shown is the last tensor the plan
+/// published, which is the executor's own notion of "where it is".
+struct ProgressLine {
+    terminal: bool,
+    last_draw: std::time::Instant,
+    current: String,
+    drew: bool,
+}
+
+impl ProgressLine {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            terminal: std::io::stderr().is_terminal(),
+            last_draw: std::time::Instant::now(),
+            current: String::new(),
+            drew: false,
+        }
+    }
+
+    fn render(&mut self, progress: &pie_loader::testkit::host_executor::Progress<'_>) {
+        if !self.terminal {
+            return;
+        }
+        if let Some(name) = progress.finalized {
+            self.current = name.to_string();
+        }
+        let done = progress.read_bytes >= progress.total_read_bytes;
+        if !done && self.last_draw.elapsed() < std::time::Duration::from_millis(100) {
+            return;
+        }
+        self.last_draw = std::time::Instant::now();
+        self.drew = true;
+        let percent = if progress.total_read_bytes == 0 {
+            100
+        } else {
+            (progress.read_bytes * 100 / progress.total_read_bytes).min(100)
+        };
+        let filled = (percent / 5) as usize;
+        let gb = |bytes: u64| bytes as f64 / 1e9;
+        eprint!(
+            "\r  [{}{}] {percent:3}%  {:.2}/{:.2} GB  {:<48.48}",
+            "#".repeat(filled),
+            "-".repeat(20 - filled),
+            gb(progress.read_bytes),
+            gb(progress.total_read_bytes),
+            self.current
+        );
+    }
+
+    fn finish(&mut self) {
+        if self.drew {
+            eprintln!();
+        }
+    }
 }
 
 /// The snapshot directory of a downloaded repo: `models--org--name/snapshots/`
