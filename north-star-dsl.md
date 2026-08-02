@@ -199,6 +199,32 @@ peepholes, eligibility predicates, thresholds.
    item-A harnesses (naive-masked, attention-sink, sliding-window) are
    the ready-made parity gates. llama_like first, qwen3_5 after.
 
+   **The hook axis (design set in review, 2026-08-02).** The PTIR stage
+   programs (Prologue / OnAttnProj / OnAttn / Epilogue) also vary per
+   forward pass — and they are NEITHER classes NOR guards. They are the
+   third mechanism, the one plan.md's sketch carried from the start:
+   `forward(tok, h: dyn Hooks)`. Three reasons, each disqualifying an
+   axis: they are PER-LANE (a fire mixes hooked and hook-free lanes —
+   done criterion #2 — and a class is per-fire); WHICH program attaches
+   is `dyn` (user PTIR, runtime-compiled — unenumerable by a trace,
+   the expert axis's peer); and the lowering is the PLANNER's
+   (`Prefix{fast_rows}`, derived per fire — criterion #4's territory).
+   What the declaration states is the SITES: `h.*` calls become
+   `HookSite{stage, layer}` ops whose content is the site's contract
+   (what it observes, what it may intervene on — the sideband types).
+   What it does not state: the program (sideband data) and `fast_rows`
+   (a runtime parameter of the generated code — plan.md Part 3
+   verbatim: "its fast-path conditions take a row count where they used
+   to take a boolean"; the fused decode-QKV arm's `fast_rows == R` gate
+   term becomes that row count). A site with no program attached is a
+   no-op by argument, not by branch — write_state's peer — which is
+   exactly the condition under which the fused kernel survives on the
+   hook-free prefix. Hooked fires stay on the hand-written path (where
+   stages 1/6 built all of this by hand) until the HookSite slice, which
+   follows rung 5 — it is the largest remaining expansion of the
+   declared gate, and it is where the declared world and the
+   polymorphic-batching machinery finally meet in one text.
+
    **The frozen-verify amendment (decided while 4c-iv landed).** The 4b
    geometry called `verify_frozen` a kernel parameter — true for
    `write_state`, but the frozen service ALSO stash-writes (the memcpy
