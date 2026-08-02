@@ -736,7 +736,11 @@ void llama_like_forward_declared(
         // is the logit-lens head). Union fire: tail-layer ops run over
         // the full-depth prefix rows.
         if (depth_k >= 0) {
-            const bool tail_op = op.layer >= 0 && op.layer >= depth_k;
+            // PROMOTED: membership comes from the op's STATED role
+            // (depth_role != 0), not a re-derived layer-tag rule — the
+            // one function all walkers share is now the trace itself.
+            const bool tail_op = op.depth_role != 0 &&
+                op.layer >= depth_k;
             if (tail_op && !depth_union) continue;
             depth_tail_active = depth_union && tail_op;
             N = depth_tail_active ? depth_split : N_fire;
@@ -1181,7 +1185,7 @@ void llama_like_forward_declared(
                 // STRUCTURAL S-4: tail-layer attention on a union fire
                 // pairs with the PREFIX plan and its dedicated
                 // workspace (the plan/workspace pairing rule).
-                if (depth_tail_active) {
+                if (depth_tail_active && op.depth_role == 2) {
                     const int layer_window_left_d =
                         (!fwd_cfg.per_layer_window_left.empty() &&
                          L < static_cast<int>(
@@ -1373,7 +1377,10 @@ void llama_like_forward_declared(
                         kv_page_indptr + split,
                         kv_last_page_lens + split,
                         custom_mask_d, custom_mask_indptr_d + split,
-                        is_pure_decode ? attn_ws : spatial_suffix_attn_ws(),
+                        // Both classes now PLAN the suffix into the
+                        // dedicated workspace (the pure-decode split
+                        // overlaps on the side stream too).
+                        spatial_suffix_attn_ws(),
                         stream);
                     break;
                 }
@@ -1551,6 +1558,33 @@ void llama_like_forward_declared(
                     kv_last_page_lens,
                     attn_ws, stream, /*logits_soft_cap=*/0.f,
                     sm_scale_override);
+                // NO-DEMOTION (3-way, interpreter leg): when prepare
+                // armed the middle decode plan, the causal above was
+                // RE-PLANNED to the prefill lanes [0, P) — the
+                // plain-decode middle [P, split_req) takes the decode
+                // kernel here, exactly the hand-written pairing.
+                if (mask_region == MaskRegion::Prefix &&
+                    plan_state.mixed_mid_decode_plan &&
+                    plan_state.mixed_mid_start >= 0) {
+                    const int P = plan_state.mixed_mid_start;
+                    const int mid_row =
+                        static_cast<int>(qo_indptr_h[P]);
+                    const int layer_window_left_m =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan_state.mixed_mid_decode_plan,
+                        bf16_row(attn_q, mid_row, Hq), kv_view,
+                        bf16_row(attn_out_buf, mid_row, Hq),
+                        kv_page_indices,
+                        kv_page_indptr + P,
+                        kv_last_page_lens + P,
+                        attn_ws, stream, layer_window_left_m,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                }
                 break;
             }
             }

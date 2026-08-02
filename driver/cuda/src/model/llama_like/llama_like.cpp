@@ -49,6 +49,12 @@ struct SpatialSideStream {
     cudaStream_t stream = nullptr;
     cudaEvent_t fork = nullptr;
     cudaEvent_t join = nullptr;
+    // The THIRD lane (no-demotion 3-way): the plain-decode middle's
+    // stream, forked/joined alongside the custom's — causal(main) ∥
+    // decode(stream2) ∥ custom(stream).
+    cudaStream_t stream2 = nullptr;
+    cudaEvent_t fork2 = nullptr;
+    cudaEvent_t join2 = nullptr;
     SpatialSideStream() {
         CUDA_CHECK(cudaStreamCreateWithFlags(
             &stream, cudaStreamNonBlocking));
@@ -56,6 +62,12 @@ struct SpatialSideStream {
             &fork, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventCreateWithFlags(
             &join, cudaEventDisableTiming));
+        CUDA_CHECK(cudaStreamCreateWithFlags(
+            &stream2, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &fork2, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(
+            &join2, cudaEventDisableTiming));
     }
 };
 
@@ -71,6 +83,19 @@ struct SpatialSideStream {
 inline AttentionWorkspace& spatial_suffix_ws() {
     static AttentionWorkspace ws = AttentionWorkspace::allocate();
     return ws;
+}
+
+// ④ Act 1 (banded depth): one dedicated workspace per band slot — the
+// same same-family-planner isolation the suffix workspace exists for,
+// per band. Lazy per slot; band count is capped at 3 (frame gate).
+inline AttentionWorkspace& depth_band_ws(int i) {
+    static std::array<std::unique_ptr<AttentionWorkspace>, 3> pool;
+    auto& slot = pool[static_cast<std::size_t>(i)];
+    if (!slot) {
+        slot = std::make_unique<AttentionWorkspace>(
+            AttentionWorkspace::allocate());
+    }
+    return *slot;
 }
 
 inline bool spatial_stream_enabled() {
@@ -790,7 +815,10 @@ void prepare_llama_like_decode_plan(
     std::uint32_t unmasked_prefix_rows,
     const std::uint32_t* mask_suffix_page_counts_h,
     const std::uint32_t* mask_suffix_last_lens_h,
-    std::uint32_t full_depth_rows)
+    std::uint32_t full_depth_rows,
+    const std::uint32_t* depth_band_k,
+    const std::uint32_t* depth_band_rows,
+    std::uint32_t depth_band_count)
 {
     // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
     // pinned/device buffers in `attn_ws` that the captured body reads via
@@ -869,6 +897,18 @@ void prepare_llama_like_decode_plan(
         if (!state.mask_decode_plan) {
             state.mask_decode_plan = ops::make_prefill_plan();
         }
+        if (std::getenv("PIE_KVPP_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[kvpp-sfx] R=%d split=%d rs=%d counts=%d sfx=[",
+                         num_requests, split, rs,
+                         mask_suffix_page_counts_h != nullptr ? 1 : 0);
+            for (int i = 0; i <= rs; ++i)
+                std::fprintf(stderr, "%u,", kvpp_suffix[i]);
+            std::fprintf(stderr, "] host_tail=[");
+            for (int i = split; i <= num_requests; ++i)
+                std::fprintf(stderr, "%u,", kv_page_indptr_h[i]);
+            std::fprintf(stderr, "]\n");
+        }
         const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         ops::plan_attention_flashinfer_prefill_bf16(
             *state.mask_decode_plan,
@@ -883,7 +923,11 @@ void prepare_llama_like_decode_plan(
             cfg.num_key_value_heads / T,
             cfg.head_dim_kernel,
             cache.page_size(),
-            attn_ws,
+            // The dedicated suffix workspace (the two-plans lesson) —
+            // ALSO the concurrency precondition: the suffix custom
+            // dispatch now overlaps the prefix decode on the side
+            // stream, so their scratch must be disjoint.
+            spatial_suffix_ws(),
             /*stream=*/nullptr,
             fwd_cfg.decode_plan_cuda_graph,
             /*window_left=*/-1,
@@ -930,6 +974,16 @@ void prepare_llama_like_decode_plan(
             }
         }
         if (suffix_decode) {
+            if (std::getenv("PIE_KVPP_TRACE") != nullptr) {
+                std::fprintf(stderr, "[kvpp] R=%d split_req=%d qo=[", 
+                             num_requests, split_req);
+                for (int r = 0; r <= num_requests; ++r)
+                    std::fprintf(stderr, "%u,", qo_indptr_h[r]);
+                std::fprintf(stderr, "] kvpp=[");
+                for (int r = 0; r <= num_requests; ++r)
+                    std::fprintf(stderr, "%u,", kv_page_indptr_h[r]);
+                std::fprintf(stderr, "]\n");
+            }
             const int rs = num_requests - split_req;
             const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
             const int num_q_heads_local = cfg.num_attention_heads / T;
@@ -960,6 +1014,83 @@ void prepare_llama_like_decode_plan(
                 /*causal_mask=*/true,
                 /*custom_mask=*/false);
             state.use_prefill_plan = true;
+            // NO-DEMOTION: split the prefix again — prefill lanes
+            // first (the seriation's multi_token term), then the
+            // plain-decode middle [P, split_req), which gets the
+            // DECODE kernel instead of demoting to the causal prefill.
+            // P derives from the host qo (first width-1 request).
+            state.mixed_mid_decode_plan.reset();
+            state.mixed_mid_start = -1;
+            {
+                int P = split_req;
+                for (int r = 0; r < split_req; ++r) {
+                    if (qo_indptr_h[r + 1] - qo_indptr_h[r] == 1) {
+                        P = r;
+                        break;
+                    }
+                }
+                const int mid = split_req - P;
+                // PIE_MIXED_MID=0 disarms (the demotion-vs-decode A/B
+                // instrument; default ON).
+                static const bool mid_armed = [] {
+                    const char* v = std::getenv("PIE_MIXED_MID");
+                    return v == nullptr || v[0] != '0';
+                }();
+                if (mid_armed && mid > 0 && P > 0 &&
+                    !fwd_cfg.force_prefill_path &&
+                    !fwd_cfg.use_prefill_decode_plan) {
+                    // Middle decode plan over requests [P, split_req):
+                    // kvpp rebased to the middle's page base (the
+                    // suffix-plan pattern, third application). Decode
+                    // and prefill plan REGIONS are disjoint within one
+                    // workspace (the NS-2 precedent), so attn_ws holds
+                    // the prefix-causal + this decode plan together.
+                    std::vector<std::uint32_t> kvpp_mid(
+                        static_cast<std::size_t>(mid) + 1);
+                    const std::uint32_t mid_base = kv_page_indptr_h[P];
+                    for (int i = 0; i <= mid; ++i) {
+                        kvpp_mid[static_cast<std::size_t>(i)] =
+                            kv_page_indptr_h[P + i] - mid_base;
+                    }
+                    if (!state.mixed_mid_decode_plan) {
+                        state.mixed_mid_decode_plan =
+                            ops::make_decode_plan();
+                    }
+                    ops::plan_attention_flashinfer_decode(
+                        *state.mixed_mid_decode_plan, kvpp_mid.data(),
+                        mid, num_q_heads_local, num_kv_heads_local,
+                        cfg.head_dim_kernel, cache.page_size(), attn_ws,
+                        /*stream=*/nullptr,
+                        fwd_cfg.decode_plan_cuda_graph,
+                        decode_full_attention_variant_enabled() &&
+                            fwd_cfg.sliding_window < 0 &&
+                            fwd_cfg.per_layer_window_left.empty(),
+                        cache.hnd_layout());
+                    state.mixed_mid_start = P;
+                    // Re-plan the prefix CAUSAL to the prefill lanes
+                    // only (requests [0, P), tokens qo[P]) — the middle
+                    // now belongs to the decode kernel.
+                    ops::plan_attention_flashinfer_prefill_bf16(
+                        *state.prefill_plan,
+                        qo_indptr_h,
+                        kv_page_indptr_h,
+                        kv_last_page_lens_h,
+                        static_cast<int>(qo_indptr_h[P]),
+                        P,
+                        num_q_heads_local,
+                        num_kv_heads_local,
+                        cfg.head_dim_kernel,
+                        cache.page_size(),
+                        attn_ws,
+                        /*stream=*/nullptr,
+                        fwd_cfg.decode_plan_cuda_graph,
+                        fwd_cfg.sliding_window,
+                        /*full_attention_variant=*/false,
+                        cache.hnd_layout(),
+                        /*causal_mask=*/true,
+                        /*custom_mask=*/false);
+                }
+            }
             // The suffix mask plan: identity qo over the 1-token rows,
             // page geometry from the resolver counts when threaded
             // (composed envelopes) or the host CSR slice (wire lanes) —
@@ -1203,6 +1334,35 @@ void prepare_llama_like_decode_plan(
                 fwd_cfg.sliding_window < 0 &&
                 fwd_cfg.per_layer_window_left.empty(),
             cache.hnd_layout());
+    }
+    // V2 rung ④ Act 1 (banded depth): one prefix decode plan per band
+    // boundary, deepest-first, each against its own workspace. A band
+    // whose start row is 0 needs no plan — nothing lives past it and
+    // the body stops walking layers there.
+    state.depth_band_count = 0;
+    if (depth_band_count >= 2 && depth_band_count <= 3 &&
+        is_pure_decode && !have_custom_mask) {
+        for (std::uint32_t j = 0; j < depth_band_count; ++j) {
+            const std::uint32_t rows = depth_band_rows[j];
+            state.depth_band_k[j] = depth_band_k[j];
+            state.depth_band_rows[j] = rows;
+            if (rows == 0) continue;
+            if (!state.depth_band_plans[j]) {
+                state.depth_band_plans[j] = ops::make_decode_plan();
+            }
+            ops::plan_attention_flashinfer_decode(
+                *state.depth_band_plans[j], kv_page_indptr_h,
+                static_cast<int>(rows),
+                num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
+                cache.page_size(), depth_band_ws(static_cast<int>(j)),
+                /*stream=*/nullptr,
+                fwd_cfg.decode_plan_cuda_graph,
+                decode_full_attention_variant_enabled() &&
+                    fwd_cfg.sliding_window < 0 &&
+                    fwd_cfg.per_layer_window_left.empty(),
+                cache.hnd_layout());
+        }
+        state.depth_band_count = depth_band_count;
     }
 }
 
@@ -2018,6 +2178,26 @@ void llama_like_forward_paged(
                         "spatial mask: the planned split and the prepared "
                         "split drifted");
                 }
+                // NO-DEMOTION (the user's directive): the two kernels of
+                // this split have disjoint outputs and read-only-shared
+                // inputs, so the SUFFIX custom dispatch overlaps the
+                // prefix on the side stream (fork here, join before the
+                // shared tail). Its plan lives in the dedicated
+                // workspace, so the concurrent scratch is disjoint.
+                // Stream-capture safe: the fork/join events become
+                // graph dependencies, exactly the cross-stream capture
+                // pattern, so the split-keyed execs replay the overlap.
+                const bool side_on2 =
+                    spatial_stream_enabled() && split > 0;
+                cudaStream_t suffix_stream2 = stream;
+                SpatialSideStream* ss2 = nullptr;
+                if (side_on2) {
+                    ss2 = &spatial_side_stream();
+                    suffix_stream2 = ss2->stream;
+                    CUDA_CHECK(cudaEventRecord(ss2->fork, stream));
+                    CUDA_CHECK(cudaStreamWaitEvent(
+                        ss2->stream, ss2->fork, 0));
+                }
                 if (split > 0) {
                     if (fwd_cfg.force_prefill_path) {
                         // The deployment's decode form is the plan-free
@@ -2075,7 +2255,11 @@ void llama_like_forward_paged(
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_ws(), suffix_stream2);
+                if (side_on2) {
+                    CUDA_CHECK(cudaEventRecord(ss2->join, ss2->stream));
+                    CUDA_CHECK(cudaStreamWaitEvent(stream, ss2->join, 0));
+                }
             } else if (!is_pure_decode &&
                        plan_state.spatial_mask_split >= 0 &&
                        plan_state.spatial_mask_row_split >= 0 &&
@@ -2165,6 +2349,46 @@ void llama_like_forward_paged(
                     kv_last_page_lens,
                     attn_ws, stream, /*logits_soft_cap=*/0.f,
                     sm_scale_override);
+                // NO-DEMOTION: the plain-decode middle takes the DECODE
+                // kernel (its own plan over requests [P, split_req),
+                // kvpp-rebased; q/out at row qo[P] — pure-decode middle
+                // so row == request there). Same-stream after the
+                // causal launch (both read-only on q/KV; outputs
+                // disjoint) — the async launches already overlap on
+                // the device; the side stream stays the custom's.
+                if (plan_state.mixed_mid_decode_plan &&
+                    plan_state.mixed_mid_start >= 0) {
+                    const int P = plan_state.mixed_mid_start;
+                    const int mid_row =
+                        static_cast<int>(qo_indptr_h[P]);
+                    // The third lane: the middle's decode overlaps the
+                    // causal on its OWN stream (its plan region in
+                    // attn_ws is the decode family's — disjoint from
+                    // the causal's prefill region; outputs disjoint by
+                    // rows).
+                    cudaStream_t mid_stream = stream;
+                    if (side_on && ss != nullptr) {
+                        mid_stream = ss->stream2;
+                        CUDA_CHECK(cudaEventRecord(ss->fork2, stream));
+                        CUDA_CHECK(cudaStreamWaitEvent(
+                            ss->stream2, ss->fork2, 0));
+                    }
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan_state.mixed_mid_decode_plan,
+                        bf16_row(attn_q, mid_row, Hq), kv_view,
+                        bf16_row(attn_out_buf, mid_row, Hq),
+                        kv_page_indices,
+                        kv_page_indptr + P,
+                        kv_last_page_lens + P,
+                        attn_ws, mid_stream, layer_window_left,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    if (side_on && ss != nullptr) {
+                        CUDA_CHECK(cudaEventRecord(
+                            ss->join2, ss->stream2));
+                        CUDA_CHECK(cudaStreamWaitEvent(
+                            stream, ss->join2, 0));
+                    }
+                }
                 if (side_on) {
                     CUDA_CHECK(cudaEventRecord(ss->join, ss->stream));
                     CUDA_CHECK(cudaStreamWaitEvent(stream, ss->join, 0));
@@ -2390,8 +2614,70 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
-    if (full_depth_rows != 0xffffffffu &&
-        (has_custom_mask || hooks != nullptr)) {
+    if (plan_state.depth_band_count >= 2) {
+        // ④ Act 1 (banded depth): distinct-k bands, deepest-first. At
+        // any layer the live rows are the prefix [0, band_rows[j]) of
+        // the interval containing it (the seriation's deepest-first
+        // invariant); frozen rows ride to the one tail exactly as the
+        // S-2 union's suffix does. band_rows[j] == 0 ends the walk —
+        // nothing lives past that band (the all-truncated fire's
+        // bonus: layers past the deepest k never launch).
+        const int m = static_cast<int>(plan_state.depth_band_count);
+        if (!is_pure_decode || has_custom_mask || hooks != nullptr ||
+            !use_decode_path || use_prefill_decode_path ||
+            use_xqa_decode_path ||
+            layer_bound != cfg.num_hidden_layers) {
+            throw std::runtime_error(
+                "depth bands: prepared bands reached an unsupported "
+                "fire shape (frame/driver gate drift)");
+        }
+        if (std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
+            std::fprintf(stderr, "[depth-bands] R=%d m=%d", R, m);
+            for (int j = 0; j < m; ++j) {
+                std::fprintf(
+                    stderr, " (k=%u rows=%u)",
+                    plan_state.depth_band_k[static_cast<std::size_t>(j)],
+                    plan_state
+                        .depth_band_rows[static_cast<std::size_t>(j)]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        const int k_min = static_cast<int>(
+            plan_state.depth_band_k[static_cast<std::size_t>(m - 1)]);
+        for (int L = 0; L < k_min; ++L) {
+            run_layer(L, N, R, decode_plan, attn_ws);
+        }
+        for (int j = m - 1; j >= 0; --j) {
+            const int live = static_cast<int>(
+                plan_state.depth_band_rows[static_cast<std::size_t>(j)]);
+            if (live == 0) break;
+            const int from = static_cast<int>(
+                plan_state.depth_band_k[static_cast<std::size_t>(j)]);
+            const int to =
+                j == 0 ? cfg.num_hidden_layers
+                       : static_cast<int>(plan_state.depth_band_k
+                             [static_cast<std::size_t>(j - 1)]);
+            const ops::DecodePlanCache* band_plan =
+                plan_state.depth_band_plans[static_cast<std::size_t>(j)]
+                    .get();
+            if (band_plan == nullptr) {
+                throw std::runtime_error(
+                    "depth bands: band active but prepare built no "
+                    "plan for it");
+            }
+            for (int L = from; L < to; ++L) {
+                run_layer(L, live, live, band_plan, depth_band_ws(j));
+            }
+        }
+    } else if (full_depth_rows != 0xffffffffu &&
+        (has_custom_mask || hooks != nullptr ||
+         // Deployments without the decode kernel (force_prefill /
+         // prefill_decode_plan) cannot run the WINDOWED range-2 (its
+         // prefix dispatch is the decode plan) — the stash form serves
+         // them instead, with m_start = R (no full-depth suffix: the
+         // stash covers [t_start, R), layers [k, L) run full-N, and
+         // the discarded middle is the whole truncated tail).
+         !use_decode_path || use_prefill_decode_path)) {
         // AC-1 (mask x depth), the stash/restore form: order is
         // [plain | truncated | masked], so the full-depth rows are
         // non-contiguous {[0, t_start) ∪ [m_start, N)}. Rather than
@@ -2419,7 +2705,8 @@ void llama_like_forward_paged(
                       has_custom_mask
                           ? plan_state.spatial_mask_split
                           : R)
-                : plan_state.spatial_mask_split;
+                : (has_custom_mask ? plan_state.spatial_mask_split
+                                   : R);
         // t_start == 0 is legal: no plain block, the truncated middle
         // starts at row 0 ([truncated | masked]).
         if (layer_bound >= cfg.num_hidden_layers || t_start < 0 ||

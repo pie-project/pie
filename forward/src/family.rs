@@ -17,7 +17,7 @@ use crate::dsl::{
     Trace, Val,
 };
 use crate::trace::{
-    DType, Dim, FireClass, ForwardPlan, GuardPred, HookStage, NormVariant, RopeKind, Shape,
+    DType, Dim, FireClass, ForwardPlan, GuardPred, NormVariant, RopeKind, Shape,
 };
 
 /// The lowering a qwen3_5 body traces under, threaded by value: the CUDA
@@ -57,14 +57,7 @@ pub fn llama_like_cuda(
     cuda: &LlamaLikeCudaFacts,
     class: FireClass,
 ) -> ForwardPlan {
-    let mut plan = llama_like_text(facts, Some((cuda, class)));
-    // STRUCTURAL S-3: the lowered Decode class states the depth axis
-    // (see [`ForwardPlan::depth_window`]) exactly where its body can
-    // honour it — the same deployment gate as the mask peel's.
-    plan.depth_window = class == FireClass::Decode
-        && !cuda.xqa_decode
-        && !cuda.head_dim_padded;
-    plan
+    llama_like_text(facts, Some((cuda, class)))
 }
 
 /// THE one llama_like text (north-star-dsl.md): computation and kernel
@@ -89,6 +82,17 @@ fn llama_like_text(
                 .filter(|(_, class)| *class == class_want)
                 .map(|(c, _)| c)
         };
+
+        // STRUCTURAL S-3, stated IN THE BODY (V2 rung ②; formerly the
+        // post-trace paint-over the review named): the lowered Decode
+        // class declares the depth axis exactly where its body can
+        // honour it — the same deployment gate as the mask peel's.
+        // Recording assigns each layer-tagged op's role from here on.
+        if cuda_of(FireClass::Decode)
+            .is_some_and(|c| !c.xqa_decode && !c.head_dim_padded)
+        {
+            m.depth_window();
+        }
 
         // The fused decode-QKV arm's predicate: the model-fact terms
         // here, the load-time backend terms on the facts struct — term
@@ -137,20 +141,15 @@ fn llama_like_text(
                     )
                 };
                 if m.lowering().is_some() {
-                    // The §5.1 lora correction: the adapter delta lands
-                    // on the just-materialized RAW q/v projections,
-                    // BEFORE anything consumes them — bias, norms, rope,
-                    // the KV append (the hand-written apply's position;
+                    // The adapter value seam (§5.1): attachments land on
+                    // the just-materialized RAW q/v projections, BEFORE
+                    // anything consumes them — bias, norms, rope, the KV
+                    // append (the hand-written apply's position;
                     // correcting after rope is different arithmetic, the
-                    // bug the first live A/B caught). A guard with an
-                    // EMPTY else: a fire with no usable lanes launches
-                    // nothing.
-                    dsl::guard(
-                        m,
-                        GuardPred::HasLora,
-                        || cuda::lora_qkv_correction(&q, &v, l),
-                        || {},
-                    );
+                    // bug the first live A/B caught). Rung-① lowering is
+                    // the HasLora guard with an EMPTY else: a fire with
+                    // no usable lanes launches nothing.
+                    dsl::seam_adapter_qv(m, &q, &v, l);
                 }
                 // Qwen-2 family qkv biases: on the raw projections, after
                 // the lora correction and before norms/rope — the
@@ -231,36 +230,49 @@ fn llama_like_text(
                 // under XQA fails loudly PTIR-side (the hand-written
                 // contract). Masked+hooked stays hand-written (the mask
                 // arm carries no sites); the caller's gate encodes it.
-                Some((c, FireClass::Decode)) => {
+                // V2 rung ②b: ONE dispatch statement for both shape
+                // classes. The divergence keys on the WINDOW OPERAND'S
+                // CLASS — `window_one` (every row a 1-token qo window:
+                // today's Decode instantiation) vs ragged (Prefill) —
+                // stated as trace-time predicates the way the fact arms
+                // are. The two per-class arm bodies this replaces were
+                // structurally one body already (the goldens pin the
+                // collapse is byte-identical); rung ③ makes the window
+                // class a PER-ROW operand and this match a region table.
+                Some((c, class @ (FireClass::Decode | FireClass::Prefill))) => {
+                    let window_one = class == FireClass::Decode;
                     // ORDER IS LOAD-BEARING: `guarded_value` OPENS the
                     // chain, and every op recorded after it counts into
-                    // the first arm's region. The non-fused deployment's
+                    // the first arm's region. The non-fused deployments'
                     // general QKV must therefore trace BEFORE the guard
                     // opens (the hoisted `q` below) — tracing it after
                     // put the whole QKV sequence inside the mask arm,
                     // and every unmasked fire skipped it (the phi3/
                     // mistral live-garbage regression, caught 2026-08-03
                     // by the three-model battery; the mistral lowered
-                    // goldens now pin this structure).
+                    // goldens now pin this structure). The fused-post
+                    // deployment (window-one only by its predicate) is
+                    // the one QKV-inside-the-arms shape.
                     let hoisted_q =
                         (!fused_post).then(|| general_qkv());
                     let (g, a) =
                         dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
                     // The masked attention states its SPATIAL SPLIT as
                     // vocabulary (NS-4 landed in the IR): a Peel on the
-                    // unmasked-prefix axis — the deployment's decode
-                    // dispatch serves the plain prefix rows, the custom
-                    // dispatch the masked suffix, the split a runtime
-                    // input, UNPLANNED collapsing to tail-only full-N
-                    // (the fire-level dispatch as the peel's endpoint).
-                    // Padded head dims keep the fire-level word (the
-                    // split's row offsets are logical-width, the padded
-                    // staging is not), and XQA deployments too (the XQA
-                    // fire-wide prepare is R-shaped) — both mirror the
-                    // prepare gate exactly, so the trace never states a
-                    // split prepare refuses to plan.
+                    // unmasked-prefix axis — the deployment's CAUSAL
+                    // dispatch for this window class serves the plain
+                    // prefix rows, the custom dispatch the masked
+                    // suffix, the split a runtime input, UNPLANNED
+                    // collapsing to tail-only full-N (the fire-level
+                    // dispatch as the peel's endpoint). Padded head dims
+                    // keep the fire-level word (the split's row offsets
+                    // are logical-width, the padded staging is not), and
+                    // XQA deployments too (the XQA fire-wide prepare is
+                    // R-shaped) — both mirror the prepare gate exactly,
+                    // so the trace never states a split prepare refuses
+                    // to plan.
                     let masked_attention = |q: &Val| {
-                        if c.xqa_decode || c.head_dim_padded {
+                        if c.head_dim_padded || (window_one && c.xqa_decode) {
                             cuda::attention_flashinfer_prefill_custom_region(q, &w.kv);
                         } else {
                             dsl::peel_masked(
@@ -268,23 +280,23 @@ fn llama_like_text(
                                 Some(l),
                                 || {
                                     // The prefix states THE DEPLOYMENT'S
-                                    // decode form, windowed to the plain
-                                    // rows: the force_prefill fallback
-                                    // (GQA ratio outside the decode
-                                    // kernel's set) is the plan-free
-                                    // prefill dispatch behind its
-                                    // dequant staging, everyone else
-                                    // the planned decode dispatch —
-                                    // `attn_with_sites`' choice, minus
-                                    // the sites (a planned split never
-                                    // carries hooks).
-                                    if c.force_prefill_path {
-                                        cuda::dequant_only(&w.kv);
-                                        cuda::attention_flashinfer_prefill_region(
+                                    // causal form: the planned decode
+                                    // dispatch on window-one fires —
+                                    // force_prefill (GQA ratio outside
+                                    // the decode kernel's set) falling
+                                    // back to the plan-free prefill
+                                    // dispatch behind its dequant
+                                    // staging — and the causal prefill
+                                    // dispatch (same staging) on ragged
+                                    // fires: any mix of prefill and
+                                    // plain-decode requests, ragged qo.
+                                    if window_one && !c.force_prefill_path {
+                                        cuda::attention_flashinfer_decode_region(
                                             q, &w.kv,
                                         );
                                     } else {
-                                        cuda::attention_flashinfer_decode_region(
+                                        cuda::dequant_only(&w.kv);
+                                        cuda::attention_flashinfer_prefill_region(
                                             q, &w.kv,
                                         );
                                     }
@@ -298,8 +310,19 @@ fn llama_like_text(
                         }
                     };
                     let attn_with_sites = |q: &Val| {
-                        dsl::hook_site(HookStage::OnAttnProj, q, l);
-                        if c.xqa_decode {
+                        dsl::seam_observe(&dsl::seam::ATTN_Q, q, l);
+                        if !window_one {
+                            // Ragged fires are row-uniform: dequant,
+                            // then the score-guarded causal dispatch.
+                            cuda::dequant_only(&w.kv);
+                            dsl::guarded(m)
+                                .arm(GuardPred::WantsAttnScore, || {
+                                    cuda::attention_flashinfer_prefill_capture(q, &w.kv)
+                                })
+                                .otherwise(|| {
+                                    cuda::attention_flashinfer_prefill_region(q, &w.kv)
+                                });
+                        } else if c.xqa_decode {
                             cuda::attention_xqa_decode_region(q, &w.kv);
                         } else if c.force_prefill_path {
                             cuda::dequant_only(&w.kv);
@@ -313,7 +336,7 @@ fn llama_like_text(
                                     cuda::attention_flashinfer_decode_region(q, &w.kv)
                                 });
                         }
-                        dsl::hook_site(HookStage::OnAttn, q, l);
+                        dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
                     };
                     if fused_post {
                         g.arm(GuardPred::HasCustomMask, || {
@@ -326,18 +349,18 @@ fn llama_like_text(
                             // the programs a null scores pointer (the
                             // publish-gated contract).
                             let q = general_qkv();
-                            dsl::hook_site(HookStage::OnAttnProj, &q, l);
+                            dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
                             masked_attention(&q);
-                            dsl::hook_site(HookStage::OnAttn, &q, l);
+                            dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
                         })
                         // The lora arm: the fused epilogue writes V
                         // straight to the paged cache — nothing exists to
                         // correct into — so a lora fire runs the whole
-                        // general sequence (whose internal HasLora guard
+                        // general sequence (whose internal adapter seam
                         // lands the correction), full-N: the hand-written
                         // `!has_lora` predicate term, stated as an arm.
                         // Mask+lora composes in the mask arm above (its
-                        // general body carries the same internal guard).
+                        // general body carries the same internal seam).
                         .arm(GuardPred::HasLora, || {
                             let q = general_qkv();
                             attn_with_sites(&q);
@@ -379,78 +402,15 @@ fn llama_like_text(
                             attn_with_sites(&q);
                         });
                     } else {
-                        let q = hoisted_q.as_ref().expect("hoisted for the non-fused arm");
+                        let q = hoisted_q.as_ref().expect("hoisted for the non-fused arms");
                         g.arm(GuardPred::HasCustomMask, || {
                             // Masked+hooked (the fused arm's comment).
-                            dsl::hook_site(HookStage::OnAttnProj, q, l);
+                            dsl::seam_observe(&dsl::seam::ATTN_Q, q, l);
                             masked_attention(q);
-                            dsl::hook_site(HookStage::OnAttn, q, l);
+                            dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
                         })
                         .otherwise(|| attn_with_sites(q));
                     }
-                    a
-                }
-                Some((c, FireClass::Prefill)) => {
-                    let q = general_qkv();
-                    let (g, a) =
-                        dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
-                    g.arm(GuardPred::HasCustomMask, || {
-                        // The custom dispatch takes the layer view whole —
-                        // no dequant staging (the hand-written custom-mask
-                        // branch's contract). Masked+hooked composes: the
-                        // sites bracket the dispatch (null scores at
-                        // OnAttn — no capture variant publishes).
-                        dsl::hook_site(HookStage::OnAttnProj, &q, l);
-                        // The MIXED FIRE: the prefill-class mask arm
-                        // states the same UnmaskedPrefix peel as the
-                        // decode class — prefix region = the causal
-                        // dispatch behind its dequant staging (any mix
-                        // of prefill and plain-decode requests, ragged
-                        // qo), tail = the custom dispatch over the
-                        // masked 1-token suffix. UNPLANNED (prepare
-                        // declined the shape, hooks/lora, disarmed
-                        // gate) collapses to tail-only full-N — the
-                        // fire-level custom dispatch as the peel's
-                        // endpoint. Padded head dims keep the
-                        // fire-level word (prepare's gate mirror).
-                        if c.head_dim_padded {
-                            cuda::attention_flashinfer_prefill_custom_region(
-                                &q, &w.kv,
-                            );
-                        } else {
-                            dsl::peel_masked(
-                                m.trace(),
-                                Some(l),
-                                || {
-                                    cuda::dequant_only(&w.kv);
-                                    cuda::attention_flashinfer_prefill_region(
-                                        &q, &w.kv,
-                                    );
-                                },
-                                || {
-                                    cuda::attention_flashinfer_prefill_custom_region(
-                                        &q, &w.kv,
-                                    )
-                                },
-                            );
-                        }
-                        dsl::hook_site(HookStage::OnAttn, &q, l);
-                    })
-                    .otherwise(|| {
-                        // Prefill has no fused post, so no Peel: the body
-                        // is row-uniform — sites (argument no-ops when
-                        // unhooked), dequant, the score-guarded dispatch.
-                        dsl::hook_site(HookStage::OnAttnProj, &q, l);
-                        cuda::dequant_only(&w.kv);
-                        dsl::guarded(m)
-                            .arm(GuardPred::WantsAttnScore, || {
-                                cuda::attention_flashinfer_prefill_capture(&q, &w.kv)
-                            })
-                            .otherwise(|| {
-                                cuda::attention_flashinfer_prefill_region(&q, &w.kv)
-                            });
-                        dsl::hook_site(HookStage::OnAttn, &q, l);
-                    });
                     a
                 }
                 Some((
@@ -817,7 +777,7 @@ fn gdn_attn_body(
     // repeats; the repeats read q_pre and never write it, so observing
     // before the recurrence guard sees the same bytes.)
     if lower.is_some() {
-        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
     }
     // GQA (value heads sharing fewer key heads) picks the `_gqa` decode
     // step; the prefill kernels state their own layout handling.
@@ -875,7 +835,7 @@ fn gdn_attn_body(
     // The OnAttn site: after the recurrence core, before the gated norm
     // — the hand-written invoke's position (observing q_pre again).
     if lower.is_some() {
-        dsl::hook_site(HookStage::OnAttn, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
     }
 
     // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
@@ -1044,7 +1004,7 @@ fn full_attn_body(
     // hand-written full-attn invoke's position, observing the roped q
     // (bf16). Observation-only, like the GDN sites.
     if lower.is_some() {
-        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
     }
 
     // KV write. Lowered: the mechanism is a per-fire runtime input
@@ -1084,7 +1044,7 @@ fn full_attn_body(
     // The OnAttn site: after the output gate, before the o_proj — the
     // hand-written invoke's position (observing q).
     if lower.is_some() {
-        dsl::hook_site(HookStage::OnAttn, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
     }
     y += matmul(&gated, &w.o_proj);
     y
@@ -1315,9 +1275,9 @@ fn commit_advance_body(t: &Trace, facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFa
         // invokes (they precede its early return), so the commit trace
         // mirrors them (A4) — argument no-ops on every commit fire
         // today, stated because the contract is the body's.
-        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
         cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, cuda.state_bf16);
-        dsl::hook_site(HookStage::OnAttn, &q, l);
+        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
     }
     // Nothing after the loop: no final norm, no lm_head — the pass ends
     // with the last linear layer's recurrence.

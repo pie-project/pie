@@ -377,6 +377,9 @@ struct PieForwardOp {
   /// the field's contract). Empty for every other kind.
   PieForwardIdRange aux_names;
   /// Values consumed, in operand order.
+  /// The op's role under the DEPTH axis (0 none, 1 windowed,
+  /// 2 prefix-plan-swap). Appended per the ABI discipline.
+  uint32_t depth_role;
   PieForwardIdRange inputs;
   /// Values produced (`SplitQkv` produces three, `KvAppend` none).
   PieForwardIdRange outputs;

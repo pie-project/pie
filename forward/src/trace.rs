@@ -617,6 +617,29 @@ pub struct Op {
     pub outputs: Vec<ValueId>,
     /// The layer this op belongs to, or `None` for prologue/epilogue.
     pub layer: Option<u32>,
+    /// STRUCTURAL S-3, promoted (the review's depth-IR gap): this op's
+    /// role under the DEPTH axis, stated as VOCABULARY the goldens pin
+    /// rather than a membership rule three walkers re-derive from the
+    /// layer tag. `None` = outside the axis (prologue/epilogue — the
+    /// unchanged tail is the logit-lens head by construction).
+    /// The split point `k` remains a runtime input; the role says WHAT
+    /// this op does when its layer falls in the truncated range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_role: Option<DepthRole>,
+}
+
+/// An op's behavior under the depth axis ([`Op::depth_role`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepthRole {
+    /// Skipped on a uniform truncated fire when `layer >= k`; runs over
+    /// the full-depth prefix rows on a union fire.
+    Windowed,
+    /// `Windowed`, and additionally the attention dispatch pairs the
+    /// depth PREFIX plan with the dedicated workspace on union tail
+    /// layers (the plan/workspace pairing rule) instead of the fire's
+    /// decode plan.
+    PrefixPlanSwap,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -680,6 +703,13 @@ pub struct TraceBuilder {
     /// region lengths count it and its regions, the aux wire encoding
     /// is unchanged, the walk keeps a skip stack, the emitter recurses.
     guard_depth: u32,
+    /// V2 rung ②: the depth axis, DECLARED BY THE BODY
+    /// ([`Self::declare_depth_window`]) instead of painted on after the
+    /// trace (the review's smell — family.rs:64-91). While set, every
+    /// layer-tagged op records its [`DepthRole`] at push time: the
+    /// flashinfer decode dispatch swaps to the depth prefix plan on
+    /// union tail layers, everything else windows.
+    depth_axis: bool,
 }
 
 impl TraceBuilder {
@@ -690,7 +720,21 @@ impl TraceBuilder {
             ops: Vec::new(),
             layer: None,
             guard_depth: 0,
+            depth_axis: false,
         }
+    }
+
+    /// V2 rung ②: the body states the depth axis (the deployment gate
+    /// lives with the statement, in the declaration text). Must precede
+    /// the first layer-tagged op; the plan serializes with
+    /// `depth_window` set and roles assigned exactly as the retired
+    /// post-trace paint-over assigned them (the goldens pin it).
+    pub fn declare_depth_window(&mut self) {
+        debug_assert!(
+            self.ops.iter().all(|op| op.layer.is_none()),
+            "depth axis declared after layer-tagged ops were recorded"
+        );
+        self.depth_axis = true;
     }
 
     /// Bracket ops that belong to layer `l`.
@@ -850,11 +894,24 @@ impl TraceBuilder {
             .into_iter()
             .map(|(shape, dtype)| self.value(shape, dtype))
             .collect();
+        let depth_role = if self.depth_axis && self.layer.is_some() {
+            Some(match &kind {
+                OpKind::Launch { kernel, .. }
+                    if kernel == "dispatch_attention_flashinfer_decode" =>
+                {
+                    DepthRole::PrefixPlanSwap
+                }
+                _ => DepthRole::Windowed,
+            })
+        } else {
+            None
+        };
         self.ops.push(Op {
             kind,
             inputs,
             outputs: outputs.clone(),
             layer: self.layer,
+            depth_role,
         });
         outputs
     }
@@ -1347,7 +1404,7 @@ impl TraceBuilder {
             family: self.family,
             values: self.values,
             ops: self.ops,
-            depth_window: false,
+            depth_window: self.depth_axis,
         }
     }
 }

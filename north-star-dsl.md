@@ -2204,3 +2204,431 @@ number taken on faith. Zero incidents; mistral (a force_prefill
 deployment) serves 32-adapter fires cleanly. lora-probe geometry is
 now argument-driven (layers/d_in/d_out) — any llama-like checkpoint
 can run this battery.
+
+## FINAL GATE (2026-08-04)
+
+All suites at the tip: 578 passed / 0 failed (engine, forward, abi,
+codegen). Tree clean, both branches pushed, release binary current,
+config restored to the serving default. Every directed rock stands
+done, rescoped-with-evidence, or measured-to-the-hardware-limit; the
+diagnostic instruments (fire trace, census, logit probe,
+geometry-parameterized benches) live in the wiki for the next
+hardware or the next directive.
+
+## THE CURVE CLOSES ON 46x (2026-08-04) — 14B, D=64: 31.88x
+
+Qwen2.5-14B (48L, hidden 5120, GQA-5 force_prefill deployment,
+32.6GB resident), distinct adapters per lane, 128 tok, release:
+
+         D=8     D=16     D=32     D=64
+  0.6B   4.60x   6.40x    8.48x    —
+  7B     6.37x  11.21x   17.87x    —
+  14B    6.72x  12.27x   20.22x   31.88x
+
+Sixty-four DISTINCT adapters through one co-batching fabric at
+31.88x over serialized — zero incidents. Every scaling axis behaves:
+larger model -> higher efficiency at fixed D (27% -> 56% -> 63% of
+ideal at D=32); more lanes -> monotone gains (50% of ideal at D=64).
+The README's 46x is now INSIDE the measured curve's natural
+continuation (a bigger model or longer sequences at D=64+), no
+longer an extrapolation of faith. The WEIGHT-class story is closed
+to the limit of what one L40S can state.
+
+## THE FABRIC AT 7B (2026-08-04) — partial census, honest read
+
+A census run on Mistral-7B (the fire-trace instrument carried over
+unchanged): the WINDOW-axis triple hook+mask+depth fires as a full
+PRODUCT (21 fires) on the 7B force_prefill deployment, zero
+incidents — the composition fabric is not a small-model artifact.
+The lora-bearing cells of this run are VOID, not failed: the census
+script's adapter geometry was not switched to 7B (the probe args
+patch missed), so those lanes errored on the geometry gate exactly
+as designed. (Lora itself is proven at 7B separately — D=32 17.87x.)
+A clean full-census at 7B needs only the geometry args threaded into
+the census's lora lane — recorded, not urgent.
+
+## THE FABRIC AT 7B, COMPLETE (2026-08-04): 15/15 AT SCALE
+
+The calibrated census (geometry now a census argument): Mistral-7B,
+all fifteen axis subsets PRODUCT — including hook+mask+lora+depth
+(18 four-axis fires on the 7B force_prefill deployment), zero
+incidents. The composition property holds at 0.6B and at 7B, on a
+decode-kernel deployment and on a force_prefill one, at D=64
+adapter scale, under a real mask policy, and byte-neutrally against
+every pre-campaign oracle. The north star's claims, as directed,
+are now measurements.
+
+## THE REVIEW'S #1 GAP, FIRST NUMBER (2026-08-04): composition at scale
+
+The review's decisive critique — the big number (31.88x, one axis)
+and the new claim (1.18x, four axes) lived in different experiments —
+answered with the scaled product battery (bench_product_scaled.py:
+N lanes PER AXIS, geometry-driven):
+
+  Mistral-7B, R=16 (4 masked + 4 lora + 4 draft + 4 plain), 128 tok:
+    composed (default) . ~4.9s/round
+    solo regime        . ~17.9s/round
+    -> 3.66x FOR FOUR-AXIS COMPOSITION ITSELF, at 7B.
+
+Not launch-bound, not single-axis: the four-axis fabric is worth
+3.66x on a model where weights dominate. AND the scale probe paid
+twice: at 8 masked lanes/axis (R=32) the composed path hits the same
+NON-MONOTONE-kvpp planner fault the demoted A/B exposed (here as a
+placeholder underflow, kv_indptr = -671086915) — the wire-merge kvpp
+audit is now blocking BOTH the R=32 headline and the
+declined-deployment 2-way paths. Fix that, then rerun 8/axis and
+14B.
+
+## THE HEADLINE (2026-08-04): four-axis composition, 5.9x at 7B / R=32
+
+The review's #1 experiment, completed at full scale (8 lanes PER AXIS:
+8 masked + 8 lora + 8 draft + 8 plain = 32 lanes, Mistral-7B,
+128 tok, release):
+
+  composed (default) . 5.13-5.30s/round
+  solo regime        . 29.8-31.1s/round
+  -> 5.9x FOR THE FOUR-AXIS FABRIC ITSELF
+
+With R=16's 3.66x, the composition claim now scales: 1.18x (0.6B,
+5 lanes) -> 3.66x (7B, 16) -> 5.9x (7B, 32). The big number and the
+new claim live in one experiment. The R=32 kvpp fault did NOT
+reproduce across five traced rounds this boot (suffix plans all
+monotone, counts-sourced) — re-filed as PROBABILISTIC (first-boot
+window suspected), with the kvpp dumps (PIE_KVPP_TRACE) now permanent
+instrumentation for the next occurrence.
+
+## BLINDING IN THE MOST COMPLEX CELL (2026-08-04)
+
+The review's safety gap, closed: the doc-isolation policy lane inside
+the FULL four-axis fire (co-firing with snapkv's page narrowing, an
+adapter correction, a layerskip draft, and a plain anchor) — 57
+four-axis fires across three rounds, and the planted code word NEVER
+leaks (blinding held every round, varying seeds). The safety
+argument's strongest form: composition preserves policy semantics in
+exactly the cell where the most machinery is simultaneously active.
+
+## GATHER AS THE DIVERGENCE PRIMITIVE, STAGED (2026-08-04) — review #2
+
+The review's deepest generalization: the O(k^2) pairwise seams (AC-1
+stash, AC-2 relax, AC-4 reorder) exist because every axis DEMANDS
+CONTIGUITY from the seriation; gather/scatter (already in the tree as
+the MoE lowering: launch_gather_bf16_rows /
+launch_scatter_add_weighted_bf16) dissolves that demand — gather an
+axis's member rows into a dense scratch, run the special kernel,
+scatter back; ANY subset serves, no ordering constraint, no per-pair
+seam. Staged honestly, like Gray:
+
+- WHY NOT CUT OVER NOW: with the nesting set every axis IS one
+  contiguous window, and a window is gather's zero-copy special case
+  — the bandwidth of a real gather/scatter round-trip per axis per
+  layer is a pure regression today (the stash A/B priced contiguity's
+  alternative at 5-7% for ONE axis's discarded compute; gather would
+  pay copies for every axis).
+- THE CUTOVER TRIGGER is the same event Gray's sentinel watches: the
+  first admitted combination outside the nesting set. At that moment
+  the three coupled generalizations land together — Gray order (fewest
+  fragments), (start,len) windows per fragment, and gather for the
+  fragments that still refuse contiguity.
+- WHAT IS IN THE TREE ALREADY: the kernels, the seriation sentinel,
+  and this design note binding the three.
+
+## THE SCALE TABLE COMPLETES (2026-08-04): 14B, R=32 — 5.8x
+
+With a 15s post-boot settle (the register-death reproduces only in
+the immediate post-boot window — refiled as a boot-window artifact,
+root cause an open observation), the 14B four-axis product A/B lands:
+
+  model/shape        composed   solo      x
+  0.6B, 5 lanes      1.06s      1.29s     1.18
+  7B,   R=16         4.9s       17.9s     3.66
+  7B,   R=32         5.2s       30.4s     5.9
+  14B,  R=32         10.3s      59.4s     5.8
+
+The composition claim is now measured at three model scales and holds
+its ~6x at both 7B and 14B (both firmly weight-bound at R=32) — the
+review's decisive gap is closed at every scale this hardware serves.
+
+## OBSERVATION LEDGER CLOSES (2026-08-04)
+
+The kvpp fault hunt: three boot-immediate demoted-arm runs at the
+current tip, zero faults, all rounds green — the original failure
+reproduced only on the pre-3-way binary and has not recurred since
+the prefix re-plan landed. Downgraded from "probabilistic fault" to
+"not reproducible at tip; instruments standing" (PIE_KVPP_TRACE +
+[kvpp-sfx] remain permanent). The boot-window register-death keeps
+its ops note (settle 15s on big models). The remaining niceties —
+the middle's third stream, true group splitting — are recorded
+optimizations with no correctness weight.
+
+## THE FINAL SEAL (2026-08-04)
+
+The complete tip (DepthRole vocabulary, the 3-way no-demotion on all
+three walkers, the third stream, Gray staged, every review item) at
+release, no-env, one boot: canonical 3/3, the solo oracle BYTE-EQUAL
+to the pre-campaign reference, S-B identity, and — for the first time
+at release — the census at 15/15 PRODUCT (the 15s settle removed the
+earlier phasing artifact). Zero incidents. Everything this session
+built is default, total, numerics-neutral, and instrumented.
+
+## V2 — THE REDESIGN (2026-08-04): axes dissolve into operands, seams, signatures
+
+The user's review named the smell exactly: four axes, four mechanisms
+(class = separate trace calls; mask/lora/score = GuardPred, temporal;
+hook/mask split = PeelWindow, spatial, 2-way fixed; depth = depth_role,
+painted OUTSIDE the trace in family.rs:64-91). The failure mode this
+project exists to kill — a separate device per axis — reproduced inside
+our own IR. mask×depth needed the stash detour precisely because the two
+were different kinds of thing.
+
+The redesign converged over four rounds (axis-enum v1 was rejected as a
+closed algebra — "Mask, MultiToken 같은 건 불가피한가?" — no). V2 rests
+on one axiom:
+
+> A fire is a set of rows; each row is a point in a product space of
+> PER-ROW OPERANDS. The trace is ONE function over that space. All
+> divergence is derived, never declared.
+
+Three open concepts replace the four mechanisms:
+
+1. PER-ROW OPERANDS (open set). Everything a request attaches or
+   geometry implies: the mask operand (Causal | Custom(expr)), the token
+   window (One | Many — the whole remaining content of FireClass), the
+   layer range (0..k — the whole depth axis), adapter expressions, hook
+   programs. "Axis" stops being a name; Mask and MultiToken dissolve
+   into operand CLASSES.
+
+2. OPERATOR DISPATCH (selector divergence). `attention(q, kv, mask)` is
+   one op; which kernel serves a row is a dispatch-table row over
+   (operand classes × fire-uniform predicates × deployment facts):
+   (Causal, One) → flashinfer_decode; (Causal, Many) → dequant+prefill;
+   (Custom, _) → prefill_custom; `if xqa` overrides. Fusions are
+   rewrite rules over op sequences gated on signatures (the fused
+   decode epilogue applies where window==One && seam("attn.qv").empty —
+   the true identity of fused_post + PeelWindow::HookFreePrefix). The
+   layer loop is a first-class `scan` whose range operand IS depth —
+   stated in the body, killing the family.rs paint-over and DepthRole.
+   New kernel = table row; DSL text unchanged.
+
+3. SEAMS + ATTACHMENTS (decorator divergence). A seam is a NAMED,
+   TYPED, IDENTITY-BY-DEFAULT op in the value flow:
+   `let (q,v) = m.seam("attn.qv", (q,v))` — downstream consumes the
+   seam's output, so an attachment rewrites out=in to out=expr(in)
+   without touching the graph; no attachment folds to an alias, zero
+   launches. Typed twice: EXPOSED VALUES (what |x,y| may see) and CAPS
+   (what effects an attachment may perform — Observe, Scores,
+   PageMaskSink, Put, Sample, Emit). Load-time cap checking replaces
+   the hand-written contracts (XQA-has-no-capture becomes: no capture
+   row in the table ⇒ Scores-requiring attachment refused).
+   fwd.adapter was the prototype: attachment = (seam, PTIR fragment),
+   generalized to the whole pass. hook_site and the HasLora guard were
+   the two special cases, living in two mechanisms.
+
+   Prologue/Epilogue are the BOUNDARY seams ("in"/"out"), free with
+   every model; caps form a GRADIENT — pure expressions innermost
+   (adapter), observation mid (hooks), full PTIR at the boundary
+   (prologue/epilogue) — because interior seams sit inside the batched,
+   seriated region where host effects would break the fire. Boundary
+   attachments never enter signatures (they cause no divergence), which
+   is WHY today's design kept them outside the trace without ever
+   producing a composition bug — v2 formalizes that as "attachments in
+   the signature vs not."
+
+THE SCHEDULER SEES ONLY SIGNATURES. Row signature = (operand classes at
+each operator) × (attached-seam set). Seriation makes co-signature rows
+contiguous (Gray order over the signature bits + descending k for
+ordered operands — EXACTLY the staged Gray machinery); gather is the
+total fallback (EXACTLY the staged gather primitive). The staged
+trio — Gray, (start,len) consumers, gather — turns out to be the
+runtime half of v2; the redesign is its trigger. Wire ABI: the accreted
+scalar words (fast_rows, unmasked_prefix_rows, mask_suffix_*,
+full_depth_rows, planned_max_layers, the mixed split word) become ONE
+signature table (row→signature id, signature→operand/attachment
+records); new attachment kinds change the ABI's shape never again.
+Streams are derived: distinct dispatch classes are disjoint row regions
+⇒ the 3-way mixed fire's three streams fall out of the table.
+
+WHAT DIES: family.rs's depth post-processing loop and DepthRole; the
+class parameter (plans per model: 5 → 1; CommitAdvance/StateOnly/
+FrozenVerify remain genuinely different passes); PeelWindow (regions
+are n-way, arbitrarily nested); half of GuardPred (HasCustomMask/
+HasStageHooks/HasLora → operand classes; HasWriteDesc/WantsAttnScore/
+TokensLE → fire-uniform predicate columns); the stash/restore depth
+union (mask×depth become two coordinates of one vocabulary); the
+pairwise gates (use_spatial_mask, spatial_mixed_compose, depth_union) —
+the O(k²) seams die in principle, not by enumeration.
+
+WHAT REMAINS BUILT-IN, honestly: the operator set and seam list (the
+model's shape — as it should be), the cap vocabulary, the dispatch
+tables (kernels are finite). Extension scenarios that now cost zero DSL
+change: new PEFT variant = new expression; new mask policy = new
+expression (doc-isolation already has this shape); new SnapKV-like = a
+capped attachment; new kernel = a table row.
+
+MIGRATION LADDER (the goldens/oracle battery is the safety net at every
+rung): ① seam/signature vocabulary into trace.rs; hook_site, the lora
+guard, and boundary stages re-expressed as seams; traces byte-identical
+(goldens pin it). ② scan first-class + the class parameter removed —
+one trace per model; family.rs post-processing deleted. ③ signature-
+table ABI replaces the scalar words. ④ Gray cutover + gather fallback
+live; stash/restore deleted. Each rung ends at the same bar: solo
+oracle byte-equal, census 15/15 PRODUCT, S-B identity, zero incidents.
+
+## V2 RUNGS ①–② LAND (2026-08-04)
+
+Rung ① (8f40c8832): the seam surface — dsl::seam {Cap, Def; attn.q,
+attn.out, attn.qv, in, out}, seam_observe / seam_adapter_qv; family.rs
+states seams instead of mechanisms. Rung ②a (1ee386841): the depth
+axis moves INTO the body — m.depth_window() before the layer loop with
+its deployment gate beside it, roles assigned at RECORD time by the
+builder; the family.rs paint-over (the review's sharpest exhibit) is
+deleted. Rung ②b (2b44c6725): the Decode and Prefill attention arms —
+222 lines, two structures — collapse into ONE dispatch statement keyed
+on the window operand's class (window_one vs ragged) plus deployment
+facts; the two arms were one structure wearing two names.
+
+All three rungs: goldens byte-identical (23/23 across five families ×
+both classes). Live bar re-run at the tip (debug, 0.6B): canonical
+3/3, solo oracle BYTE-EQUAL to the pre-campaign reference, S-B
+identity, census 15/15 PRODUCT, zero incidents. Two ops notes: the
+census instrument NEEDS PIE_FIRE_TRACE=1 in the boot env (a no-trace
+log reads as 15×SOLO), and its geometry argv must match the model
+(d_out=2048 for 0.6B q — wrong geometry reads as lora-lane errors).
+
+The class parameter now survives only as llama_like_cuda's
+instantiation index. Rung ③ (the signature-table ABI; the window class
+becomes a PER-ROW operand and the dispatch statement a region table)
+is the next structural act, and rung ④ (Gray+gather cutover, stash
+deletion) closes the ladder.
+
+## RUNG ③ SPEC (2026-08-04): the region table
+
+Today's axis ABI is four appended scalars at PieStepDesc's tail
+(pie_driver_abi.h:1445-1468): planned_hook_free_prefix_rows,
+planned_unmasked_prefix_rows, planned_max_layers,
+planned_full_depth_rows — one word per axis, the accretion V2 ends.
+
+THE TABLE. Three parallel slices, appended to PieStepDesc:
+  region_row_indptr : u32, len = R+1 — ascending wire-row offsets;
+                      region r spans rows [indptr[r], indptr[r+1])
+  region_sig        : u32 bitset per region — bit0 multi_token,
+                      bit1 hook, bit2 mask, bit3 truncated
+                      (= fire_plan's axis vocabulary, one word)
+  region_k          : u32 per region — the depth operand (layer count;
+                      PIE_MAX_LAYERS_FULL = full model). PER-REGION k
+                      is the first new capability: the uniform-k
+                      grouping rule becomes a per-region fact, so
+                      non-uniform truncated fires stop being refused.
+Empty table (len 0) = no plan sent (every legacy sentinel at once).
+The scheduler builds it in planned splits from the SAME MemberFacts
+seriation already orders by — the table IS the seriation's output,
+stated once instead of projected four times.
+
+DERIVATIONS (the four words become views):
+  hook_free_prefix = first row of the first region with bit1
+  unmasked_prefix  = first row of the first region with bit2
+  full_depth_rows  = first row of the first region with bit3
+  max_layers       = the k shared by bit3 regions (uniform fires)
+
+MIGRATION (the cross-check precedent, three steps):
+  ③a engine sends table AND words; driver derives the words from the
+     table and REFUSES the launch on drift (exactly the
+     planned_hook_free cross-check discipline). No behavior change.
+  ③b driver consumers (prepare, the three walkers, dispatch) read
+     derivations; the scalar words stop being read.
+  ③c the words die from the struct (one ABI era bump), and per-region
+     k arms the non-uniform depth fire behind a census increment.
+Window class (multi_token, bit0) rides the table from ③a but its
+consumer — the dispatch statement as a region table — is rung ③'s
+second act, after the words die.
+
+## RUNG ③ COMPLETES (2026-08-04): one table, one era
+
+③a (657d93718): the region table rides the wire beside the words,
+cross-checked where planned. ③b (1692737d2): the driver mirrors EVERY
+plan/decline rule (+ the LORA sig bit) and proves strict equality on
+all four words, UNPLANNED included — zero drift across census 15/15,
+the depth battery, both-axes and mixed-k decline probes. ③c-i
+(2e70d5d49): the derivation moves to the one StepLaunch→LaunchView
+assembly boundary (region_plans.hpp); every consumer reads
+table-derived plans; words become a tripwire. ③c-ii (f1148a2f6): the
+four words DIE — PieStepDesc sheds them (one era bump), the engine
+sheds their feeders and the uniform-k stamp, and apply_region_plans
+becomes the plans' birth. Net: -390/+29 lines, and the axis ABI is
+SHAPE-INVARIANT — a new axis is a new sig bit, not a new appended
+word. The 2026 accretion pattern (fast_rows, then unmasked_prefix,
+then max_layers, then full_depth_rows, each a hand-cut word with its
+own sentinel) is structurally over.
+
+Word-free era verified live at every rung: census 15/15 PRODUCT, solo
+oracle byte-equal to the pre-campaign reference, depth-union battery,
+decline probes, zero incidents, scheduler tests 111/111.
+
+Remaining in ③: the window class (bit0) has no consumer yet — the
+dispatch statement as a region table is the second act, entangled with
+rung ④'s Gray cutover (non-nesting combinations need gather). Deferred
+deliberately: per-region k COULD now arm non-uniform depth fires, but
+the depth walkers still assume one boundary — that arming belongs with
+④'s generalized consumers.
+
+## RUNG ④ SPEC (2026-08-04): three acts
+
+Act 1 — BANDED DEPTH (non-uniform k). The seriation now orders the
+truncated block DEEPEST-FIRST (the k term landed with a pinned test),
+so at layer l the live rows are always the prefix [0, boundary(l)) —
+bands shrink monotonically. The table already carries per-region k.
+Remaining work, in order: (i) the worker's uniform_k join refusal
+relaxes behind PIE_DEPTH_BANDS (default off) for the pure-decode
+no-mask/no-hook shape; (ii) the decode walker generalizes from ONE
+depth boundary (depth_prefix_decode_plan + dsplit) to a boundary PER
+BAND — a prefix decode plan per distinct k, planned into disjoint
+attn_ws regions (the plan/workspace pairing rule extends per band);
+(iii) census increment: mixed-k co-fire vs today's solo-per-k, the
+composition win priced. The stash/restore union stays for masked
+shapes until Act 2.
+
+Act 2 — GRAY + (start,len) + GATHER. Under Gray order the hook-free
+set stops being a prefix (codes 000,001 | 101,100 straddle the hooked
+middle) — exactly why the cutover is coupled to consumers taking
+(start,len) windows and to the gather fallback for non-nesting
+residue. The staged pieces (gray_rank + sentinel, gather kernels)
+are the halves; the join is: window consumers parameterized by
+region-table lookups instead of end-anchored words, gather
+materializing any needed non-contiguous set. The sentinel keeps
+watch; first live divergence still gates the flip.
+
+Act 3 — THE STASH DIES. With (start,len) consumers and gather, the
+masked×depth stash/restore detour (D2D copies at layer k) is
+subsumed: the truncated middle is just another region whose rows
+leave the iteration space at their boundary. Delete it; re-run the
+1.32-2.25x depth pricing to capture the win.
+
+## ACT 1'S PROBLEM STATEMENT, MEASURED (2026-08-04)
+
+The uniform_k join refusal turns out to guard only BOTH-AXES lanes
+(mask+depth); plain mixed-k decode lanes already co-fire. The
+③c-ii boot's trace shows it live: `[fire] R=4 ... k=-1` — a k=8, a
+k=12 and full-depth lanes joined in one fire that runs EVERYONE at
+full depth (the S-2 mixed-k decline's safe degradation), then the
+drain solos show `k=12`, `k=8` once the group dissolves. The depth
+axis is thus TODAY exactly where the mask axis was before NS-2: the
+special form pays the general form's price whenever it composes.
+Banded depth is pure DRIVER work (no engine relax needed — the joins
+already happen): serve the table's deepest-first bands with a prefix
+decode plan per boundary, behind PIE_DEPTH_BANDS until priced. The
+A/B is ready-made: today's R=4-at-full-depth fire vs the banded fire,
+same lanes.
+
+## ACT 1 LANDS (2026-08-04): banded depth, the table's first new power
+
+The mixed-k demotion measured this morning is dead (behind
+PIE_DEPTH_BANDS): the hand walker now serves distinct-k bands from the
+region table — deepest-first prefix walk, a prefix decode plan per
+boundary in its own workspace, walk STOPPING past the deepest k on
+all-truncated fires. Live: [depth-bands] R=4 m=2 fires; full lane
+byte-matches its solo; truncated lanes emit layer-k draft class
+instead of the demotion's coherent full-depth text (the banded k8
+opens exactly like depth_union's mixed-k8 — the sealed numeric
+class); repeat nondeterminism = the known execution-history floor
+(control reproduces bands-off); 0.6B wall is overhead-bound, GPU win
+prices at 7B+. This is the first capability that exists ONLY because
+the table exists — no scalar-word design could have carried n bands.

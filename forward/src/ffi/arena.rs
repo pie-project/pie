@@ -415,6 +415,11 @@ fn flatten_op(arena: &mut PlanArena, interner: &mut Interner, op: &Op) -> PieFor
         param1: parts.param1,
         selector: parts.selector,
         aux_names: parts.aux_names,
+        depth_role: match op.depth_role {
+            None => 0,
+            Some(crate::trace::DepthRole::Windowed) => 1,
+            Some(crate::trace::DepthRole::PrefixPlanSwap) => 2,
+        },
         inputs,
         outputs,
     }
