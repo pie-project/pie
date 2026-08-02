@@ -87,8 +87,8 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         // Padded to a whole row tile: `qmm_mb_rows` explains why, and why the
         // padding is asked for the GEMM's three questions (does a tile exist,
         // which rung, what grid) and for nothing else in this dispatch.
-        const int qn = qmm_mb_rows(n, g.max_tokens, qmm_min_batch(g.is_moe()));
-        d.qmm_bn = qmm_bn_unsplit(out, qn, qmm_min_batch(g.is_moe()));
+        const int qn = qmm_mb_rows(n, g.max_tokens, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
+        d.qmm_bn = qmm_bn_unsplit(out, qn, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
         d.qmm_bm = qmm_bm(qn);
         // The second quantized set has a matvec and no GEMM: a checkpoint that
         // spares its two routing projections at 8 bits gets one extra pipeline
@@ -201,7 +201,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
             const int sorted = moe_sorted_rows(g, n);
             // Routed, so the routed crossover.
-            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true));
+            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
                 bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
                 d.qmm_bn = bn;
                 d.qmm_bm = shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);
@@ -293,7 +293,7 @@ bool routed_group_shape(const Dispatch& d, const DecodeGeometry& g, int rows,
         case Kernel::LlExpertDown: {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
             const int pairs = rows * g.experts_per_token;
-            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true));
+            if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
                 bn > 0 && shared_kernels::moe_should_batch(pairs, g.n_experts)) {
                 const int bm = shared_kernels::moe_tile_rows(pairs, g.n_experts);
                 const Pso& gemm = mb.qmm_routed[shared_kernels::moe_bm_slot(bm)]
@@ -321,7 +321,8 @@ bool barrier_after_mb(const std::vector<Dispatch>& dag, size_t i,
     return run_ends[i] == int(i);
 }
 
-Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb) {
+Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
+           bool fp16_ok = true) {
     switch (d.kind) {
         case Kernel::EmbedUntied:
         case Kernel::EmbedGather: return mb.embed_mb;
@@ -354,6 +355,14 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
                 const int wide = wide_;
+                // FP16 first, where the tables exist. Storage and every
+                // neighbouring kernel stay BF16; what changes is that the MMA
+                // is an instruction on this device rather than a sequence the
+                // compiler writes to stand in for one.
+                const Pso& fp16 = d.fuse_residual
+                                      ? mb.qmm_t_residual_fp16_precast[wide][slot]
+                                      : mb.qmm_t_fp16_precast[wide][slot];
+                if (fp16_ok && fp16.valid() && mb.qmm_cast_bf16_f16.valid()) return fp16;
                 const Pso& gemm = d.fuse_residual ? mb.qmm_t_residual[wide][slot]
                                                   : mb.qmm_t[wide][slot];
                 if (gemm.valid()) return gemm;
@@ -361,6 +370,29 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             return d.fuse_residual ? base.qmv_residual : base[d.kind];
         }
     }
+}
+
+/// The number of elements this dispatch's staging cast has to write, or 0
+/// where it has none.
+///
+/// The one predicate: `mb_pso` is told FP16 is available exactly when this
+/// answers nonzero, so the kernel that reads the staged copy cannot be
+/// selected in a fire that did not write one.
+int mb_fp16_cast_elems(const Dispatch& d, const MultiBatchPsos& mb,
+                       const DecodeGeometry* g, int n_tokens) {
+    if (g == nullptr || d.qmm_bn <= 0 || d.qmm_split > 1) return 0;
+    if (!mb.qmm_cast_bf16_f16.valid()) return 0;
+    if (is_routed_group(d.kind)) return 0;
+    const int wide = qmm_bm_slot(d.qmm_bm);
+    const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
+    const Pso& fp16 = d.fuse_residual ? mb.qmm_t_residual_fp16_precast[wide][slot]
+                                      : mb.qmm_t_fp16_precast[wide][slot];
+    if (!fp16.valid()) return 0;
+    const int K = int(qmv_kn(d.kind, *g).K);
+    if (K <= 0) return 0;
+    // The padded row count, matching what the host bound at buffer 13 and what
+    // the GEMM's row tiles actually read.
+    return qmm_mb_rows(n_tokens, g->max_tokens, qmm_min_batch(g->is_moe(), qwen35_fp16_format(*g))) * K;
 }
 
 inline void bind_slot(RawMetalContext& ctx, int ord, uint8_t idx, const SlotHandle& slot) {
@@ -653,7 +685,28 @@ void encode_prefill_dags_mb(StepEncoder& se,
             d0.kind != Kernel::LmHeadUntied &&
             !qwen35_uses_alt_quant(d0.kind, *geometry)) {
             const int out = qmv_out_size(d0.kind, *geometry);
-            if (out == 16 && !d0.fuse_residual && mb_psos.qmv_wide_strided.valid()) {
+            // The GEMM below tiles the output 32 columns at a time, so it can
+            // only take a projection whose width is a whole number of tiles.
+            // Everything else needs a batched primitive of its own, and the
+            // wide matvec IS that primitive: it is parametric in N, guards its
+            // last partial row group, and reads each decoded weight chunk once
+            // for four token vectors instead of once per token.
+            //
+            // This used to ask `out == 16`, which is the value Qwen3-Next's
+            // `linear_num_value_heads` has, and every projection of any other
+            // width that the GEMM also declined fell through to ONE MATVEC PER
+            // TOKEN. Qwen3.6-27B has 48 value heads, so its two per-head decay
+            // projections did exactly that: 2 kinds x 48 GDN layers x N tokens,
+            // 3072 dispatches in a 32-token prefill, each moving a 123 KB
+            // weight -- and a 32-token prefill encoded 8435 dispatches where it
+            // now encodes 5459. Prefill tok/s: 67.4 -> 84.2 at 32 tokens, 81.1
+            // -> 90.0 at 64, 94.2 -> 94.0 at 128. It is a per-token cost, so it
+            // is the SHORT prompts it was taxing, and by 128 tokens the GEMMs
+            // have grown past it. The width the GEMM cannot take is the width
+            // that needs this path most, so the question to ask is the GEMM's,
+            // negated.
+            if (out != 0 && out % 32 != 0 && !d0.fuse_residual &&
+                mb_psos.qmv_wide_strided.valid()) {
                 constexpr int vecs = 4;
                 constexpr int lanes = 8;
                 se.set_pso(mb_psos.qmv_wide_strided);
@@ -666,31 +719,37 @@ void encode_prefill_dags_mb(StepEncoder& se,
                 se.barrier();
                 continue;
             }
-            // N=16 GDN projections deliberately stay matvecs. A BN16 strided
-            // GEMM replaced 768 dispatches with six, but end-to-end prefill fell
-            // from 1408 to 1396 tok/s. The wide matvec above is the intermediate
-            // primitive: five vectors reuse each decoded weight chunk without
-            // paying a matrix tile's setup.
+            // A GDN projection narrow enough to fit one tile stays a matvec
+            // even where the GEMM could take it. A BN16 strided GEMM replaced
+            // 768 dispatches with six and end-to-end prefill fell from 1408 to
+            // 1396 tok/s: at that width a matrix tile's setup costs more than
+            // the four-vector reuse above saves.
             if (out != 0 && out % 32 == 0) {
-                const bool wide = qmm_strided_bm(strided_rows) > kQmmBM &&
-                                  mb_psos.qmm_t_strided_wide.valid();
+                static_assert(kQmmBMCount == 3,
+                              "the strided PSO arrays in DecodeStepPsos are sized 3 "
+                              "and indexed by qmm_bm_slot; a fourth rung has to widen "
+                              "them in the same commit");
                 const bool fp16 = mb_psos.qmm_t_strided_cast.valid() &&
-                                  mb_psos.qmm_t_strided_fp16_precast.valid();
-                const Pso& gemm = fp16
-                    ? (wide ? (d0.fuse_residual
-                                   ? mb_psos.qmm_t_strided_fp16_precast_wide_residual
-                                   : mb_psos.qmm_t_strided_fp16_precast_wide)
-                            : (d0.fuse_residual
-                                   ? mb_psos.qmm_t_strided_fp16_precast_residual
-                                   : mb_psos.qmm_t_strided_fp16_precast))
-                    : (wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
-                                                : mb_psos.qmm_t_strided_wide)
-                            : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
-                                                : mb_psos.qmm_t_strided));
+                                  mb_psos.qmm_t_strided_fp16_precast[0].valid();
+                const Pso* rungs = fp16
+                    ? (d0.fuse_residual ? mb_psos.qmm_t_strided_fp16_precast_residual
+                                        : mb_psos.qmm_t_strided_fp16_precast)
+                    : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                        : mb_psos.qmm_t_strided);
+                // The rung the row count earns, narrowed to one that actually
+                // loaded. Narrowing has to move the GRID with it -- the kernel
+                // takes no M and reaches its row count through grid.y alone, so
+                // a BM=64 pipeline dispatched on a BM=32 grid writes sixty-four
+                // rows into a thirty-two-row tile. A 32-row prefill did exactly
+                // that and fell from 84.2 tok/s to 51.7 while still answering
+                // correctly, because the rows it trampled were the padding.
+                int bm = qmm_strided_bm(strided_rows);
+                while (bm > kQmmBM && !rungs[qmm_bm_slot(bm)].valid()) bm /= 2;
+                const Pso& gemm = rungs[qmm_bm_slot(bm)];
                 if (gemm.valid()) {
                     Grid grid;
                     Threadgroup tg;
-                    qmm_t_strided_dispatch(out, strided_rows, grid, tg);
+                    qmm_t_strided_dispatch(out, strided_rows, bm, grid, tg);
                     if (fp16) {
                         se.set_pso(mb_psos.qmm_t_strided_cast);
                         se.set_argtable(d0.kind, d0.ordinal);
@@ -757,6 +816,29 @@ void encode_prefill_dags_mb(StepEncoder& se,
                         grid.x = d0.grid.x * uint32_t(n);
                     }
                     break;
+                case Kernel::QNorm:
+                case Kernel::KNorm:
+                    // `rms_mb_dispatch` lays the heads along x as
+                    // (axis_threads * n_rows); the strided form wants them as
+                    // their own dimension so the threadgroup's position carries
+                    // the (head, token) pair. tg.x IS the axis thread count, so
+                    // the head count divides out.
+                    if (d0.grid.y == 1 && d0.grid.z == 1 && d0.tg.x > 0 &&
+                        d0.grid.x % d0.tg.x == 0) {
+                        strided = mb_psos.rms_strided_head;
+                        grid = Grid{d0.tg.x, d0.grid.x / d0.tg.x, uint32_t(n)};
+                    }
+                    break;
+                case Kernel::Rope:
+                case Kernel::RopeK:
+                    // Already (half, n_heads, 1) per token, and the kernel reads
+                    // `position[m]` from the same array dag[0] points at, so the
+                    // token row is the only thing the launch has to add.
+                    if (d0.grid.z == 1) {
+                        strided = mb_psos.rope_strided;
+                        grid.z = uint32_t(n);
+                    }
+                    break;
                 case Kernel::SiluMul:
                     if (d0.grid.y == 1 && d0.grid.z == 1) {
                         strided = mb_psos.silu_mul_strided;
@@ -806,11 +888,14 @@ void encode_prefill_dags_mb(StepEncoder& se,
                     if (d.kind == Kernel::GdnPrepSlotted) {
                         grid.z = d.grid.z * uint32_t(seg.rows);
                     } else {
-                        // The scan puts two dv rows in one simdgroup so its two
-                        // per-token reductions run 16 lanes wide instead of 32.
-                        // Its x extent therefore covers two rows, not one; an
-                        // odd Dv rounds up and the kernel masks the spare row.
-                        grid.y = (grid.y + 1) / 2;
+                        // The scan puts 32/`gdn_scan_lanes` dv rows in one
+                        // simdgroup so each token's two reductions run that
+                        // many lanes wide instead of 32. Its x extent therefore
+                        // covers that many rows, not one; a Dv the rows do not
+                        // divide rounds up and the kernel masks the spares.
+                        const uint32_t rows_per_simd =
+                            uint32_t(32 / gdn_scan_lanes()) * uint32_t(gdn_scan_rows());
+                        grid.y = (grid.y + rows_per_simd - 1) / rows_per_simd;
                     }
                     se.set_argtable(d.kind, d.ordinal);
                     se.dispatch(grid, d.tg);
@@ -846,11 +931,28 @@ void encode_prefill_dags_mb(StepEncoder& se,
 
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
-                           bool force_barriers) {
+                           bool force_barriers, const DecodeGeometry* g, int n_tokens) {
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
-        se.set_pso(mb_pso(d, base_psos, mb_psos));
+        const int cast_elems = mb_fp16_cast_elems(d, mb_psos, g, n_tokens);
+        // The staging cast, ahead of the GEMM that reads it. It rides the
+        // GEMM's own argument table -- the source is already bound at buffer 3
+        // -- so it needs no DAG entry, and the barrier after it is what makes
+        // the cast visible to the tile loader.
+        //
+        // Per projection rather than grouped: a batched decode produces each
+        // value in the dispatch immediately before its consumer, so there is no
+        // window in which several are simultaneously final and nothing to
+        // group. It touches n*K elements against a GEMM that reads them N/BN
+        // times over.
+        if (cast_elems > 0) {
+            se.set_pso(mb_psos.qmm_cast_bf16_f16);
+            se.set_argtable(d.kind, d.ordinal);
+            se.dispatch(Grid{std::uint32_t(cast_elems), 1, 1}, Threadgroup{256, 1, 1});
+            se.barrier();
+        }
+        se.set_pso(mb_pso(d, base_psos, mb_psos, cast_elems > 0));
         se.set_argtable(d.kind, d.ordinal);
         se.dispatch(d.grid, d.tg);
         // Arm B of the interleaved A/B is a CONTROL by default: identical to

@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "../device_tuning.hpp"
 #include "../model/qwen3_5/decode_dispatch_mb.hpp"
 
 namespace pie::metal {
@@ -212,9 +213,19 @@ bool load_multibatch_psos(RawMetalContext& ctx,
             if (features.residual)
                 want(qmm, "affine_qmm_t_residual" + suffix,
                      &out.qmm_t_residual[w][i]);
+            if (features.residual && features.fp16_precast &&
+                quant.group == 64 && quant.bits == 4) {
+                want(qmm, "affine_qmm_t_residual_fp16_precast" + suffix,
+                     &out.qmm_t_residual_fp16_precast[w][i]);
+            }
             if (features.bias)
                 want(qmm, "affine_qmm_t_bias" + suffix,
                      &out.qmm_t_bias[w][i]);
+            if (features.bias && features.fp16_precast && quant.group == 64 &&
+                quant.bits == 4) {
+                want(qmm, "affine_qmm_t_bias_fp16_precast" + suffix,
+                     &out.qmm_t_bias_fp16_precast[w][i]);
+            }
         }
         if (features.splitk) {
             want(qmm,
@@ -248,10 +259,19 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         // number the sort padded every expert's run to, and a tile that
         // disagreed with the padding would read one expert's weights for
         // another's rows.
+        //
+        // FP16 is a NAME choice: both forms take the same buffers, grid and
+        // `tile_expert` contract, so nothing downstream of here can tell. The
+        // one family that must NOT take it is llama, whose routed top-k moved
+        // under FP16 in `llama_numerics_test` -- and llama builds its own
+        // routed table in `model/llama/kernels.cpp`, so it never reaches this.
+        const bool fp16 = fp16_qmm() && quant.bits == 4 && quant.group == 64;
+        const std::string routed =
+            fp16 ? "affine_qmm_t_routed_fp16" + q : "affine_qmm_t_routed" + q;
         for (int t = 0; t < 3; ++t) {
             for (int i = 0; i < 3; ++i) {
                 want(qmm,
-                     "affine_qmm_t_routed" + q + "_bm_" +
+                     routed + "_bm_" +
                          std::to_string(shared_kernels::kMoeTileWidths[t]) + "_bn_" +
                          std::to_string(16 << i),
                      &out.qmm_routed[t][i]);
@@ -263,29 +283,28 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         want(qmm, "qmm_splitk_reduce_f32_bfloat16",
              &out.qmm_splitk_reduce_f32);
     }
+    // The three row-block rungs, in `kQmmBMs` order. A rung the checkpoint's
+    // quantization has no instantiation for stays invalid and the encoder falls
+    // back to the widest one that loaded.
+    static constexpr const char* kStridedBm[3] = {"_bm_16_bn_32", "_bm_32_bn_32",
+                                                  "_bm_64_bn_32"};
     if (features.strided) {
-        want(qmm, "affine_qmm_t_strided" + q + "_bm_16_bn_32",
-             &out.qmm_t_strided);
-        want(qmm, "affine_qmm_t_strided" + q + "_bm_32_bn_32",
-             &out.qmm_t_strided_wide);
-        if (features.residual) {
-            want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_16_bn_32",
-                 &out.qmm_t_strided_residual);
-            want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_32_bn_32",
-                 &out.qmm_t_strided_wide_residual);
+        for (int r = 0; r < 3; ++r) {
+            want(qmm, "affine_qmm_t_strided" + q + kStridedBm[r],
+                 &out.qmm_t_strided[r]);
+            if (features.residual) {
+                want(qmm, "affine_qmm_t_strided_residual" + q + kStridedBm[r],
+                     &out.qmm_t_strided_residual[r]);
+            }
         }
     }
     if (features.fp16_strided && quant.group == 64 && quant.bits == 4) {
-        want(qmm, "affine_qmm_t_strided_fp16_precast" + q + "_bm_16_bn_32",
-             &out.qmm_t_strided_fp16_precast);
-        want(qmm, "affine_qmm_t_strided_fp16_precast" + q + "_bm_32_bn_32",
-             &out.qmm_t_strided_fp16_precast_wide);
-        want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q +
-                     "_bm_16_bn_32",
-             &out.qmm_t_strided_fp16_precast_residual);
-        want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q +
-                     "_bm_32_bn_32",
-             &out.qmm_t_strided_fp16_precast_wide_residual);
+        for (int r = 0; r < 3; ++r) {
+            want(qmm, "affine_qmm_t_strided_fp16_precast" + q + kStridedBm[r],
+                 &out.qmm_t_strided_fp16_precast[r]);
+            want(qmm, "affine_qmm_t_strided_fp16_precast_residual" + q + kStridedBm[r],
+                 &out.qmm_t_strided_fp16_precast_residual[r]);
+        }
         want(qmm, "cast_qmm_input_strided_bfloat16_to_float16",
              &out.qmm_t_strided_cast);
         want(qmm, "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
@@ -314,7 +333,10 @@ bool load_multibatch_psos(RawMetalContext& ctx,
              &out.gdn_recurrent_slotted);
         want("gdn_prep.metal", "gdn_prep_prefill_bfloat16",
              &out.gdn_prep_prefill);
-        want("gdn_prep.metal", "gdn_core_recurrent_prefill_bfloat16",
+        want("gdn_prep.metal",
+             "gdn_core_recurrent_prefill_bfloat16_l_" +
+                 std::to_string(gdn_scan_lanes()) + "_v_" +
+                 std::to_string(gdn_scan_rows()),
              &out.gdn_core_prefill);
         want("gated_rms.metal", "gated_rms_strided_bfloat16",
              &out.gated_rms_strided);
@@ -322,6 +344,9 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     if (features.strided) {
         want("rms_norm.metal", "rms_strided_row_bfloat16",
              &out.rms_strided);
+        want("rms_norm.metal", "rms_strided_head_row_bfloat16",
+             &out.rms_strided_head);
+        want("rope.metal", "rope_neox_strided_bfloat16", &out.rope_strided);
         want("silu_mul.metal", "silu_mul_strided_bfloat16",
              &out.silu_mul_strided);
     }

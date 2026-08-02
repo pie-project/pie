@@ -88,10 +88,19 @@ struct MultiBatchPsos {
     // native and BF16 MMA is markedly slower.
     Pso qmm_t_fp16_precast[3][3]{};
     Pso qmm_t_residual[3][3]{};
+    /// The residual counterpart of `qmm_t_fp16_precast`. A family whose
+    /// projections fuse the residual add had half its batched GEMM on the
+    /// emulated matrix path until this existed.
+    Pso qmm_t_residual_fp16_precast[3][3]{};
     /// The same GEMM with a Linear's additive bias broadcast down the tile.
     /// gpt-oss biases every projection, so without it the batched path is a
     /// GEMM plus a dispatch that rewrites the whole output to add one vector.
     Pso qmm_t_bias[3][3]{};
+    /// Both at once, which is the shape gpt-oss's dense projections are: a
+    /// bias to fold into the store and an FP16 tile to feed the MMA. Neither
+    /// of the two tables above can serve it, so it is a third rather than a
+    /// flag on either.
+    Pso qmm_t_bias_fp16_precast[3][3]{};
     // affine_qmm_t_strided: the same GEMM with an explicit row pitch, for the
     // prefill, whose scratch rows are laid at a uniform `scratch_widest_elems`
     // rather than packed at `K`.
@@ -111,14 +120,20 @@ struct MultiBatchPsos {
     Pso qmm_cast_bf16_f16{};
     Pso qmm_splitk_reduce{};
     Pso qmm_splitk_reduce_f32{};
-    Pso qmm_t_strided{};
-    Pso qmm_t_strided_wide{};
-    Pso qmm_t_strided_wide_residual{};
-    Pso qmm_t_strided_residual{};
-    Pso qmm_t_strided_fp16_precast{};
-    Pso qmm_t_strided_fp16_precast_wide{};
-    Pso qmm_t_strided_fp16_precast_residual{};
-    Pso qmm_t_strided_fp16_precast_wide_residual{};
+    /// The prefill's batched projection, one entry per `kQmmBMs` rung
+    /// (16 / 32 / 64 rows a tile), indexed by `qmm_bm_slot`.
+    ///
+    /// This was a narrow/wide PAIR, and the pair was the reason a 128-row
+    /// prompt ran at BM=32: `qmm_strided_bm` capped itself at 32 because that
+    /// was the widest thing there was a slot for, while the decode GEMM beside
+    /// it had had a third rung since `kQmmBMs` became a list. The dimension is
+    /// 3 rather than `kQmmBMCount` for the reason `qmm_t_fp16_precast[3][3]`
+    /// is: this header must not depend on a model's dispatch header, so
+    /// `decode_step_mb.cpp` static_asserts the two agree.
+    Pso qmm_t_strided[3]{};
+    Pso qmm_t_strided_residual[3]{};
+    Pso qmm_t_strided_fp16_precast[3]{};
+    Pso qmm_t_strided_fp16_precast_residual[3]{};
     Pso qmm_t_strided_cast{};
     Pso qmv_wide_strided{};
     // Row-independent prefill kernels with an explicit row pitch, so a whole
@@ -126,6 +141,11 @@ struct MultiBatchPsos {
     // the M=1 kernels beside them -- only the row's base address is computed
     // from the prefill layout's uniform pitch.
     Pso rms_strided{};
+    /// The per-head q/k norms, which `rms_strided` cannot take: they are
+    /// `n_heads` rows packed inside one token's row and the launch carries the
+    /// pair. See `rms_strided_head_row`.
+    Pso rms_strided_head{};
+    Pso rope_strided{};
     Pso silu_mul_strided{};
     Pso gated_rms_strided{};
     // GDN over a whole prompt in one dispatch (prep is token-parallel, the

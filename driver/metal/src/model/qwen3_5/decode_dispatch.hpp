@@ -29,6 +29,8 @@ inline void qmv_dispatch(int N, Grid& g, Threadgroup& tg) {
     // hidden -> ONE logit a token: its grid was {32, 0, 1}, no threads ran,
     // its buffer kept the zeros it was allocated with, and every routed token
     // was combined under `sigmoid(0) = 0.5` instead of its own gate.
+    // The 4 is `results_per_simdgroup` in `quantized_qmv.metal`, which was swept
+    // and is at a peak in both directions -- see the table there before moving it.
     g  = Grid{32, (uint32_t(N) + 3u) / 4u, 1};
     tg = Threadgroup{32, 2, 1};
 }

@@ -31,6 +31,7 @@ namespace pie::metal {
 
 class RawMetalContext;
 struct Dispatch;  // beta: decode_step.hpp
+struct SlotHandle;
 
 // A projection's in/out vector lengths, from geometry (matches the staged
 // weight shapes).  The split-K rule needs K, not just the output width.
@@ -61,6 +62,17 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 // are cached by (ordinal, index) and overwritten in place).
 int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                       const DecodeGeometry& g, int n_tokens, int row_pitch = 0);
+
+// The FP16 staging buffer and its element count, for the batched decode's
+// GEMM. The kernel that fills it reads the projection's own input at buffer 3
+// and writes buffer 12, so the only thing the host owes it is where to write
+// and how far -- and `how far` is the fire's row count times the projection's
+// K, which is why this is not part of the setup bind.
+//
+// Returns how many dispatches were given a staging pair.
+int bind_mb_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                     const DecodeGeometry& g, int n_tokens,
+                     const SlotHandle& staging, std::vector<SlotHandle>& keep);
 
 // Heap headroom (bytes) the const region needs on top of plan_heap().total. Conservative
 // upper bound (one 256-aligned slot per possible const buffer across the whole DAG).

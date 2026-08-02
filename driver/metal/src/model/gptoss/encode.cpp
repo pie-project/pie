@@ -15,6 +15,15 @@
 
 namespace pie::metal::gptoss {
 
+/// Whether this checkpoint's GEMM reaches the FP16 matrix path. The GEMM
+/// crossover moves with it -- see `qmm_min_batch`.
+///
+/// Unconditional here, unlike the other three families: gpt-oss is MXFP4 in
+/// every checkpoint there is, and the routed MXFP4 GEMM stages its tile as
+/// half on the way into the MMA whatever the projections are quantized at.
+/// There is no gpt-oss that runs the emulated kernel.
+inline bool gptoss_fp16_format() { return fp16_qmm(); }
+
 namespace {
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -233,7 +242,7 @@ int gptoss_qmm_rows(int rows) {
     // Inherited from qwen3.5 and measured here on the M1 Max: lowering it to 4
     // cost gpt-oss 1% (8 lanes, 55.5 -> 54.9 tok/s), and on an M2 Max the GEMV
     // still wins or ties at every batch the dense number would have switched.
-    if (n < qmm_min_batch(true)) return n;
+    if (n < qmm_min_batch(true, gptoss_fp16_format())) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -293,8 +302,37 @@ int gptoss_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
     if (!gptoss_is_dense_proj(k)) return 0;
     const KN kn = qmv_kn(k, g);
     if (kn.N == 0) return 0;
-    return qmm_bn_unsplit(int(kn.N), gptoss_qmm_rows(rows), qmm_min_batch(true));
+    return qmm_bn_unsplit(int(kn.N), gptoss_qmm_rows(rows), qmm_min_batch(true, gptoss_fp16_format()));
 }
+
+/// Whether a dense projection feeds its tile to the MMA as FP16.
+///
+/// M1 and M2 have no native BF16 matrix instruction and emulate it; the FP16
+/// one is real, and casting the tile on the way in is worth about 40% of the
+/// GEMM. The mechanism was already here for llama and gemma-4 and gpt-oss had
+/// never been wired to it -- its dense projections are a fifth of a prefill.
+///
+/// The LM head is excluded rather than special-cased: it is the one dense
+/// projection with no bias, and at `head_rows` rows it is a matvec anyway, so
+/// it would have wanted a fourth PSO table to buy nothing.
+///
+/// `proj_bits` and not a literal: a mixed checkpoint leaves the projections at
+/// 8 bits, and only the g64/b4 entrypoints are compiled with an FP16 tile.
+bool gptoss_fp16_qmm(const GptOssGeometry& g, Kind k, int m) {
+    if (!fp16_qmm() || g.proj_bits != 4) return false;
+    if (k != Kind::QmvQ && k != Kind::QmvK && k != Kind::QmvV && k != Kind::QmvO) {
+        return false;
+    }
+    return gptoss_qmm_bn(k, g, m) > 0;
+}
+
+/// Which dispatches stage, as opposed to reading what an earlier one staged.
+///
+/// One staging buffer serves the whole step, so a projection casts only when
+/// its input is not already there. `build_gptoss_scratch` has q, k and v all
+/// reading `AttnNorm`'s row and o reading the attention's, so those are the
+/// two groups and their firsts are the two that cast.
+bool gptoss_fp16_cast_before(Kind k) { return k == Kind::QmvQ || k == Kind::QmvO; }
 
 Pso pso_for_mb(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb,
                const GptOssPsos& go) {
@@ -340,6 +378,10 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
         const int wide = qmm_bm_slot(qmm_bm(m));
         const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
         // The LM head has no bias; every other projection here does.
+        if (gptoss_fp16_qmm(g, d.kind, m) &&
+            mb.qmm_t_bias_fp16_precast[wide][slot].valid()) {
+            return mb.qmm_t_bias_fp16_precast[wide][slot];
+        }
         const auto& table = d.kind == Kind::LmHead ? mb.qmm_t : mb.qmm_t_bias;
         if (table[wide][slot].valid()) return table[wide][slot];
     }
@@ -451,6 +493,23 @@ void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
     if (end == 0 || end > dag.size()) end = dag.size();
     for (std::size_t i = begin; i < end; ++i) {
         const Dispatch& d = dag[i];
+        const int m = d.kind == Kind::LmHead
+                          ? (head_rows < 1 ? (rows < 1 ? 1 : rows)
+                                           : std::min(head_rows, rows < 1 ? 1 : rows))
+                          : (rows < 1 ? 1 : rows);
+        // The staging pass, ahead of the group that reads it. It rides the
+        // GEMM's own argument table -- the source is already bound at
+        // `GoQmv::In` -- so it needs no DAG entry, and the barrier after it is
+        // what makes the cast visible to the tile loader.
+        if (gptoss_fp16_qmm(g, d.kind, m) && gptoss_fp16_cast_before(d.kind) &&
+            mb.qmm_cast_bf16_f16.valid()) {
+            se.set_pso(mb.qmm_cast_bf16_f16);
+            se.set_argtable_ordinal(ordinal_base + d.ordinal);
+            const std::uint32_t count = std::uint32_t(gptoss_qmm_rows(m)) *
+                                        std::uint32_t(qmv_kn(d.kind, g).K);
+            se.dispatch(Grid{count, 1, 1}, Threadgroup{256, 1, 1});
+            se.barrier();
+        }
         Grid grid;
         Threadgroup tg;
         launch_shape_mb(d, g, rows, grid, tg, head_rows, requests);

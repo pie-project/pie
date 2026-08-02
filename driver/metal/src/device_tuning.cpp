@@ -37,43 +37,41 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
             // settings actually diverge -- same binary via
             // PIE_METAL_QMM_MIN_BATCH, arms alternated, quiet host:
             // 138.90 tok/s at 12 against 144.04 at 8, +3.7%. See
-            // `device_tuning.hpp` for the individual runs. Applied by FAMILY
-            // and not by core count -- the
-            // crossover is set by per-core matrix throughput, which the
-            // family names and the core count does not.
-            t.qmm_min_batch = 8;
+            // `device_tuning.hpp` for the individual runs. That is where both
+            // crossovers came from on this family; the M1 has since measured
+            // its way to the same pair, so they are the struct's defaults now
+            // and this entry no longer restates them. Applied by FAMILY and
+            // not by core count -- the crossover is set by per-core matrix
+            // throughput, which the family names and the core count does not.
+            //
             // Same machine, same reasoning, a different constant: with 20
             // cores rather than 32 the wide tile's smaller grid fills the
             // machine sooner, so the tile crossover moves down. Measured with
             // `roofline_probe`; the table is in `device_tuning.hpp`.
             t.qmm_bn_crossover_tg = 96;
-            // Both crossovers, because 8 is what this device measured and
-            // shipped with while there was one of them, and a mixture ran it
-            // too. Splitting the constant may not move a device that was
-            // measured before the split existed: the M4's routed half is
-            // unmeasured, and leaving it at 12 here would be a change dressed
-            // as a default.
-            t.qmm_min_batch_moe = 8;
             break;
         case 8:
-            // M2 generation. Measured on an M2 Max (38 cores), one binary via
-            // the env overrides, arms alternated within each batch, three
-            // reps: eight is the first batch where the GEMM beats the GEMV on
-            // all four dense checkpoints (Llama-1B +17.6%, Llama-3B +19.2%,
-            // Qwen3-1.7B +14.4%, gemma-4-E2B +4.6%) and the first with no
-            // regression on any of them.
+            // M2 generation. The DENSE crossover here is eight, which is now
+            // the default and is not restated -- measured on an M2 Max (38
+            // cores), one binary via the env overrides, arms alternated within
+            // each batch, three reps: eight is the first batch where the GEMM
+            // beats the GEMV on all four dense checkpoints (Llama-1B +17.6%,
+            // Llama-3B +19.2%, Qwen3-1.7B +14.4%, gemma-4-E2B +4.6%) and the
+            // first with no regression on any of them.
             //
-            // The ROUTED crossover stays at the M1 number, and that is the
+            // The ROUTED crossover is twelve on this family, and that is the
             // finding rather than an omission: at the same batches the GEMV
-            // still wins on every mixture measured -- Qwen3-30B by 8%,
+            // still won on every mixture measured -- Qwen3-30B by 8%,
             // gemma-4-26B by 12%, gpt-oss-20B by nothing either way. See
             // `DeviceTuning::qmm_min_batch_moe` for the runs.
             //
-            // Only this one constant. The rest of the table is still the M1's
-            // on this machine because nothing here has measured them, and a
-            // family entry that guessed at the others would be worse than the
-            // default it replaced.
-            t.qmm_min_batch = 8;
+            // It is named HERE rather than inherited because the default moved
+            // under it. The M1 reversed its own routed number once the expert
+            // GEMM stopped emulating a bfloat matrix unit; this machine has
+            // not been re-measured since, and inheriting a default that
+            // changed for a reason this device was never tested against would
+            // be a guess wearing a measurement's clothes.
+            t.qmm_min_batch_moe = 12;
             break;
         default:
             break;
@@ -89,6 +87,12 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
     t.qmm_min_batch_moe =
         env_int("PIE_METAL_QMM_MIN_BATCH_MOE",
                 env_int("PIE_METAL_QMM_MIN_BATCH", t.qmm_min_batch_moe));
+    // And the emulated one, for the same reason again: a sweep run on a
+    // group-128 checkpoint that moved only the two above would measure a model
+    // that never changed path.
+    t.qmm_min_batch_emulated =
+        env_int("PIE_METAL_QMM_MIN_BATCH_EMULATED",
+                env_int("PIE_METAL_QMM_MIN_BATCH", t.qmm_min_batch_emulated));
     t.qmm_bn_crossover_tg =
         env_int("PIE_METAL_QMM_BN_CROSSOVER_TG", t.qmm_bn_crossover_tg);
     t.moe_tile_mid_per = env_int("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
@@ -98,6 +102,8 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
         env_int("PIE_METAL_SDPA_TILE_MIN_ROWS", t.sdpa_tile_min_rows_per_request);
     t.moe_batch_min_per_expert =
         env_int("PIE_METAL_MOE_BATCH_MIN_PER_EXPERT", t.moe_batch_min_per_expert);
+    t.gdn_scan_lanes = env_int("PIE_METAL_GDN_SCAN_LANES", t.gdn_scan_lanes);
+    t.gdn_scan_rows = env_int("PIE_METAL_GDN_SCAN_ROWS", t.gdn_scan_rows);
     return t;
 }
 
@@ -119,11 +125,18 @@ const DeviceTuning& device_tuning() {
     return t;
 }
 
-int qmm_min_batch(bool is_moe) {
+int qmm_min_batch(bool is_moe, bool fp16_gemm) {
     const DeviceTuning& t = device_tuning();
+    if (!fp16_gemm) return t.qmm_min_batch_emulated;
     return is_moe ? t.qmm_min_batch_moe : t.qmm_min_batch;
 }
+
+bool fp16_gemm_format(int bits, int group) {
+    return fp16_qmm() && bits == 4 && group == 64;
+}
 int qmm_bn_crossover_tg() { return device_tuning().qmm_bn_crossover_tg; }
+int gdn_scan_lanes() { return device_tuning().gdn_scan_lanes; }
+int gdn_scan_rows() { return device_tuning().gdn_scan_rows; }
 int moe_tile_mid_per() { return device_tuning().moe_tile_mid_per; }
 int moe_tile_wide_per() { return device_tuning().moe_tile_wide_per; }
 bool fp16_qmm() { return device_tuning().fp16_qmm; }

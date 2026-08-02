@@ -31,6 +31,8 @@ namespace pie::metal {
 // exactly qmv_dispatch (the sealed M=1 fast path). out%8==0 holds for every qwen3.6 projection.
 inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
     // Rounded UP, for the reason `qmv_dispatch` gives.
+    // The 4 is `results_per_simdgroup` in `quantized_qmv.metal`, which was swept
+    // and is at a peak in both directions -- see the table there before moving it.
     g  = Grid{32u * uint32_t(N), (uint32_t(out_vec) + 3u) / 4u, 1};
     tg = Threadgroup{32, 2, 1};
 }
@@ -293,9 +295,15 @@ inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup&
 // weight thirty-two times.
 inline int qmm_strided_bm(int padded_rows) {
     static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
-    // The strided form is instantiated as a narrow/wide PAIR, not over
-    // `kQmmBMs`, so it stops at 32 whatever the aligned table grew to.
-    return (!off && padded_rows >= 32) ? 32 : kQmmBM;
+    // 128 was instantiated and measured and is not here: Qwen3.6-27B prefill
+    // gives 103.0 tok/s at 128 rows against 64's 104.5, and 106.5 against 106.7
+    // at 512. A 128-row block is 12.8 KiB of threadgroup memory against 64's
+    // 7.7, which takes a core from four resident threadgroups to two -- and
+    // overlapping one threadgroup's weight read with another's MMA is the only
+    // thing hiding either, per the note in `qmm_t_loaded_impl`. Halving the
+    // dequantizations does not pay for it. The rung stops here.
+    if (off) return kQmmBM;
+    return padded_rows >= 64 ? 64 : (padded_rows >= 32 ? 32 : kQmmBM);
 }
 
 inline int qmm_strided_rows(int N, int max_rows) {
@@ -304,10 +312,13 @@ inline int qmm_strided_rows(int N, int max_rows) {
     return padded <= max_rows ? padded : 0;
 }
 
-inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, Grid& g,
+/// `bm` is passed rather than recomputed: the encoder may have had to narrow it
+/// to a rung whose pipeline exists, and the grid is the ONLY thing that tells
+/// this kernel how many rows it has.
+inline void qmm_t_strided_dispatch(int out_vec, int padded_rows, int bm, Grid& g,
                                    Threadgroup& tg) {
     g  = Grid{32u * (uint32_t(out_vec) / 32u),
-              2u * (uint32_t(padded_rows) / uint32_t(qmm_strided_bm(padded_rows))), 2};
+              2u * (uint32_t(padded_rows) / uint32_t(bm > 0 ? bm : kQmmBM)), 2};
     tg = Threadgroup{32, 2, 2};
 }
 

@@ -250,7 +250,8 @@ void check_padding_fits(const LlamaGeometry& g) {
     // Read, not restated: the minimum batch became a property of the device
     // rather than a constant, so the test has to ask the same question the
     // dispatch does.
-    const int min_batch = pie::metal::qmm_min_batch(g.is_moe());
+    const int min_batch = pie::metal::qmm_min_batch(
+        g.is_moe(), pie::metal::fp16_gemm_format(g.quant.bits, g.quant.group));
     expect_eq(llama_qmm_rows(g, min_batch - 1), min_batch - 1,
               "nothing below the GEMM's minimum batch is padded");
     expect(llama_qmm_rows(g, min_batch) >= min_batch,

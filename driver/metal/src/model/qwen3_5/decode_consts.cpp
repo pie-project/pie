@@ -9,6 +9,7 @@
 #include <stdexcept>
 
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg}
+#include "decode_dispatch_mb.hpp"
 #include "mtl4_context.hpp"
 #include "../../kernels/gdn_params.h"
 #include "../shared_kernels.hpp"
@@ -378,6 +379,43 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 size_t decode_consts_budget(const std::vector<Dispatch>& dag) {
     // Worst case 6 const slots/dispatch (sdpa), each ≤ 256-aligned. Be generous.
     return (dag.size() * 6 + 64) * 256;
+}
+
+int bind_mb_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                     const DecodeGeometry& g, int n_tokens,
+                     const SlotHandle& staging, std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!staging.valid()) return 0;
+    // The padded row count, not the fire's: the GEMM reads whole row tiles and
+    // the tail of the last one has to hold a defined half of something. It is
+    // the same bound the BF16 GEMM already reads through buffer 3.
+    const int rows = qmm_mb_rows(n_tokens, g.max_tokens, qmm_min_batch(g.is_moe(), qwen35_fp16_format(g)));
+    std::vector<std::pair<std::int32_t, SlotHandle>> counts;
+    int bound = 0;
+    for (const Dispatch& d : dag) {
+        if (d.qmm_bn <= 0) continue;
+        const int K = int(qmv_kn(d.kind, g).K);
+        if (K <= 0) continue;
+        const std::int32_t elems = std::int32_t(rows) * std::int32_t(K);
+        SlotHandle count;
+        for (const auto& entry : counts) {
+            if (entry.first == elems) {
+                count = entry.second;
+                break;
+            }
+        }
+        if (!count.valid()) {
+            count = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!count.valid()) continue;
+            *static_cast<std::int32_t*>(count.contents()) = elems;
+            counts.push_back({elems, count});
+            keep.push_back(count);
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 12, staging);
+        ctx.arg_bind_ordinal(d.ordinal, 13, count);
+        ++bound;
+    }
+    return bound;
 }
 
 }  // namespace pie::metal

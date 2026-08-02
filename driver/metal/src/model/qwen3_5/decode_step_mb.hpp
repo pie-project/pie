@@ -141,8 +141,13 @@ bool ab_all_barriers();
 bool ab_arm();
 void ab_set_arm(bool b);
 
+// `g` and `n_tokens` are what the FP16 staging cast needs to size itself, and
+// passing them is what enables it: a caller that leaves them out gets the BF16
+// GEMM, which is correct at any width and merely slower where a matrix unit
+// would have applied.
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
-                           bool force_barriers = false);
+                           bool force_barriers = false,
+                           const DecodeGeometry* g = nullptr, int n_tokens = 0);
 
 }  // namespace pie::metal

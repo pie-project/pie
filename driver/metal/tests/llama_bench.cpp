@@ -449,22 +449,26 @@ int main(int argc, char** argv) {
     // The device ceiling is not the bound that killed this machine. Six kernel
     // panics on the 48 GiB M4 Pro all had free memory under 200 MiB, and the
     // run that caused the last one had passed every check above: an 18.16 GiB
-    // checkpoint, a device that would hold far more, and a process that peaked
-    // at 40.5 GiB. A weight copied into the heap is resident TWICE while the
-    // copy runs -- once in the heap and once in the mapping it is read from --
-    // and nothing checked the second one.
+    // checkpoint and a device that would hold far more. What nothing checked
+    // was the heap against what the machine would actually give back --
+    // `make_resident` wires the heap, and a wired page is not reclaimable at
+    // any price.
     //
-    // So this probe gives the driver room for the checkpoint and the whole
-    // margin, and nothing for the second copy.
+    // So this probe leaves the machine exactly the checkpoint and not one byte
+    // of the margin the driver insists on. It must refuse, and it must refuse
+    // for the host and not for the device: the device ceiling here is untouched
+    // and would admit the model happily, which is what makes the clause named
+    // below the assertion and not the refusal itself.
     //
-    // The assertion is on the MESSAGE and not merely on the refusal, and that
-    // is what makes this a regression gate rather than a coincidence: the
-    // clause named below is emitted only when the copy is actually counted, so
-    // deleting that term fails this test whether the driver then refuses for
-    // some other reason or admits the model outright.
+    // The load window is deliberately NOT what this gates. It used to be -- the
+    // term was the whole checkpoint on the theory that a copied weight is
+    // resident twice -- and that theory was measuring RSS. `time -l` on a
+    // 10.41 GiB gpt-oss load reports 20.84 GiB of resident set and 10.84 GiB of
+    // peak footprint, with zero swaps, because `copy_storage_bytes` hands each
+    // tile back to the kernel before it takes the next. Gating the discredited
+    // number here is how it survived being wrong.
     {
-        const std::size_t kMargin = 2ull << 30;
-        const std::size_t left = std::size_t(weight_bytes) + kMargin;
+        const std::size_t left = std::size_t(weight_bytes);
         RawMetalContext::set_host_reclaimable_bytes_for_test(left);
         MetalExecutor probe;
         std::string why;
@@ -472,18 +476,15 @@ int main(int argc, char** argv) {
         RawMetalContext::set_host_reclaimable_bytes_for_test(0);
         if (set_up) {
             std::printf("  FAIL  setup succeeded on a machine with only %.2f GiB left, "
-                        "against %.2f GiB of weights that are resident twice while they "
-                        "load\n",
+                        "against %.2f GiB of weights it has to wire\n",
                         double(left) / (1 << 30), double(weight_bytes) / (1 << 30));
             return 1;
         }
-        if (why.find("does not fit the memory this machine has left") == std::string::npos ||
-            why.find("resident twice") == std::string::npos) {
-            std::printf("  FAIL  refused, but not for the load-time peak: %s\n", why.c_str());
+        if (why.find("does not fit the memory this machine has left") == std::string::npos) {
+            std::printf("  FAIL  refused, but not for the host: %s\n", why.c_str());
             return 1;
         }
-        std::printf("  PASS  refused a model whose load-time peak the machine could not "
-                    "hold: %s\n", why.c_str());
+        std::printf("  PASS  refused a model the machine could not hold: %s\n", why.c_str());
     }
 
     MetalExecutor exec;
@@ -519,6 +520,14 @@ int main(int argc, char** argv) {
     while (int(prompt.size()) < n_prompt)
         prompt.insert(prompt.end(), kGatePrompt.begin(), kGatePrompt.end());
     prompt.resize(std::size_t(n_prompt));
+
+    // The prompt whose mlx-lm continuation is recorded, and that continuation.
+    // Hoisted out of the block below because the FLEET check far down this file
+    // needs them: comparing a fleet to this driver's own one-row decode only
+    // ever says the two took different kernels, which they did. Comparing it to
+    // mlx-lm says whether the fleet is RIGHT.
+    std::vector<std::uint32_t> gate_prompt;
+    std::vector<int> gate_want;
 
     // ── does it compute the right thing at all? ──
     //
@@ -804,6 +813,8 @@ int main(int argc, char** argv) {
         // A row may bring its own prompt; see `Known::prompt`.
         const std::vector<std::uint32_t>& p =
             (ref != nullptr && !ref->prompt.empty()) ? ref->prompt : kGatePrompt;
+        gate_prompt = p;
+        gate_want = want;
         std::uint32_t page = 0;
         std::uint32_t next_id = 1;
 
@@ -907,7 +918,22 @@ int main(int argc, char** argv) {
         // when taps are asked for, this is the whole run -- and the dump then
         // corresponds to exactly the token list printed here, rather than to
         // whichever synthetic fire happened to go last.
-        if (dumping) {
+        //
+        // ONE EXCEPTION, and it is the whole reason the fleet bugs stayed
+        // unbisectable. `PIE_BENCH_TPUT=n` is the only thing in this harness
+        // that fires n rows of DECODE, and two open wrong-answer bugs live
+        // exactly there and nowhere else -- both reproduce only when the fire
+        // is a fleet, and both are invisible to a dump of a prefill or of a
+        // one-row step. Returning here made the taps and the only reproduction
+        // mutually exclusive. So when a fleet was asked for, fall through: the
+        // executor already publishes whatever fire it just ran at that fire's
+        // row count (`fire_simple` passes `csr.token_ids.size()`, not 1), so
+        // the fleet's per-row activations land with no plumbing at all. Each
+        // step overwrites the last, so point `PIE_BENCH_DECODE` at 1 to keep
+        // step 0 -- which is where a from-the-first-step divergence is made --
+        // and diff it against a second run with `PIE_BENCH_TPUT` unset into a
+        // different directory.
+        if (dumping && n_seqs <= 1) {
             // One more prefill, on its own pages, so what lands in the dump is
             // the PROMPT's fire rather than the last of the gate's one-row
             // decodes. The gate above has already run; this only re-publishes.
@@ -1088,7 +1114,17 @@ int main(int argc, char** argv) {
     Seq s;
     s.id = 4;
     s.tokens = prompt;
-    s.tokens.resize(std::size_t(n_prompt + n_decode), 1u);
+    // n_decode + 1, not n_decode. Step i's SAMPLED token lands at index
+    // `n_prompt + 1 + i` -- the loop advances the position before it stores --
+    // so the last step wants index `n_prompt + n_decode`, one past a buffer
+    // sized `n_prompt + n_decode`. Both the store below and the fleet's
+    // reference lookup are bounds-guarded, so the short buffer did not crash;
+    // it silently dropped the reference the fleet gate needs, and AT
+    // `n_decode == 1` IT DROPPED EVERY ONE OF THEM -- `ref < size` is
+    // `n_prompt + 1 < n_prompt + 1`, false at the only step there is. The gate
+    // then compared nothing and printed PASS, which is how a single-step run
+    // came to look like evidence that a fleet was correct.
+    s.tokens.resize(std::size_t(n_prompt + n_decode + 1), 1u);
     const double t0 = now_s();
     if (fire_prompt(exec, s, std::uint32_t(n_prompt), page_size, next_page) < 0) return 1;
     const double prefill_s = now_s() - t0;
@@ -1152,6 +1188,7 @@ int main(int argc, char** argv) {
     // live in the KV pages and two members sharing a slot compute each other's
     // history.
     double tput_tps = 0.0;
+    const bool taps_dump = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
     if (n_seqs > 1) {
         const std::size_t nf = std::size_t(n_seqs);
         // A recurrent family cannot run a fleet wider than the slots the device
@@ -1180,13 +1217,111 @@ int main(int argc, char** argv) {
                         n_seqs, n_seqs, exec.rs_slots(), exec.rs_slots());
             return 0;
         }
+        // ── is the fleet RIGHT? ──
+        //
+        // The check further down compares the fleet to this file's own
+        // single-sequence decode. That comparison is worth having -- it is the
+        // only one available for a checkpoint nobody has transcribed -- but it
+        // cannot answer the question it looks like it answers. A one-row decode
+        // and an n-row decode take DIFFERENT KERNELS all the way down (`qmv`
+        // against `qmv_mb` or a GEMM, `rms` against `rms_mb`, the sliding
+        // attention against the tiled one), so the two are not the same
+        // arithmetic and are not expected to be bit-identical. Which step their
+        // greedy argmaxes first part company on is then a fact about how sharp
+        // the logits are at that step, not about whether either is correct --
+        // and on an ambiguous continuation they part company almost at once.
+        // That is the same trap the prompt above documents, where a flat-logit
+        // token stream read "1 of 64 steps" on a driver that was perfectly
+        // correct.
+        //
+        // So ask mlx-lm instead. Fire the recorded prompt as an n-wide fleet
+        // and compare the tokens to the recorded answer: that is ground truth,
+        // it is the same bar the single-sequence gate above clears, and a fleet
+        // meeting it is correct no matter which step it leaves our own decode.
+        //
+        // Untimed, on its own pages and its own sequence ids, and run before
+        // the measured fleet so it cannot perturb the number.
+        const bool have_ground_truth = !gate_want.empty() && !gate_prompt.empty();
+        if (have_ground_truth) {
+            const std::size_t steps = gate_want.size();
+            std::vector<Seq> gf(nf);
+            std::uint32_t gpage = 0;
+            bool gbad = false;
+            std::vector<int> got;
+            // The FIRST token comes from the prefill, exactly as the
+            // single-sequence gate above takes it -- `fire(..., want_token)`
+            // samples the prompt's own last position. Decoding a filler token
+            // instead would be continuing a different sequence, and the answer
+            // would rightly not be mlx-lm's.
+            for (int i = 0; i < n_seqs && !gbad; ++i) {
+                gf[std::size_t(i)].id = std::uint32_t(200 + i);
+                gf[std::size_t(i)].tokens = gate_prompt;
+                gf[std::size_t(i)].tokens.resize(gate_prompt.size() + steps + 1, 1u);
+                gf[std::size_t(i)].rs_slot =
+                    exec.rs_slots() > 0 ? std::uint32_t(i) % exec.rs_slots() : 0u;
+                const int t = fire(exec, gf[std::size_t(i)], std::uint32_t(gate_prompt.size()),
+                                   page_size, gpage, /*want_token=*/true, /*staged=*/nullptr,
+                                   /*greedy_token_only=*/true);
+                if (t < 0) {
+                    gbad = true;
+                    break;
+                }
+                if (i == 0) got.push_back(t);
+                Seq& m = gf[std::size_t(i)];
+                if (m.next_position < m.tokens.size())
+                    m.tokens[m.next_position] = std::uint32_t(t);
+            }
+            // One fewer fleet step than there are tokens: the prefill supplied
+            // the first.
+            for (std::size_t step = 1; step < steps && !gbad; ++step) {
+                std::vector<MemberForwardDesc> descs;
+                descs.reserve(nf);
+                for (int i = 0; i < n_seqs; ++i) {
+                    descs.push_back(desc_for(gf[std::size_t(i)], 1, page_size, gpage,
+                                             exec.rs_slots(), /*greedy_token_only=*/true));
+                }
+                std::vector<LogitsOut> outs(nf);
+                std::vector<std::uint8_t> ok(nf, 0);
+                std::vector<std::string> errs(nf);
+                exec.forward_batch(descs, outs, ok, errs);
+                for (int i = 0; i < n_seqs && !gbad; ++i) {
+                    if (ok[std::size_t(i)] == 0) {
+                        std::printf("  FAIL  fleet reference fire: %s\n",
+                                    errs[std::size_t(i)].c_str());
+                        gbad = true;
+                        break;
+                    }
+                    const int t = argmax_of(outs[std::size_t(i)], 0);
+                    if (i == 0) got.push_back(t);
+                    Seq& m = gf[std::size_t(i)];
+                    m.next_position += 1;
+                    if (m.next_position < m.tokens.size())
+                        m.tokens[m.next_position] = std::uint32_t(t);
+                }
+            }
+            if (gbad) return 1;
+            const bool good = got == gate_want;
+            std::printf("  %s  a %d-wide fleet reproduces mlx-lm's continuation:",
+                        good ? "PASS" : "FAIL", n_seqs);
+            for (const int v : got) std::printf(" %d", v);
+            if (!good) {
+                std::printf("\n        mlx-lm says:");
+                for (const int v : gate_want) std::printf(" %d", v);
+            }
+            std::printf("\n");
+            if (!good) return 1;
+        }
+
         std::vector<Seq> fleet(nf);
         std::uint32_t fpage = 0;
         bool bad = false;
         for (int i = 0; i < n_seqs && !bad; ++i) {
             fleet[std::size_t(i)].id = std::uint32_t(100 + i);
             fleet[std::size_t(i)].tokens = prompt;
-            fleet[std::size_t(i)].tokens.resize(std::size_t(n_prompt + n_decode), 1u);
+            // Same +1 as the reference sequence above, for the same reason:
+            // the member stores its own sampled token at the ADVANCED
+            // position.
+            fleet[std::size_t(i)].tokens.resize(std::size_t(n_prompt + n_decode + 1), 1u);
             fleet[std::size_t(i)].rs_slot =
                 exec.rs_slots() > 0 ? std::uint32_t(i) % exec.rs_slots() : 0u;
             // Prefilled one at a time and UNTIMED. What is being measured is
@@ -1205,6 +1340,11 @@ int main(int argc, char** argv) {
             // first step whose bf16 rows are not byte-identical is the step the
             // divergence was CREATED, and that is the one a bisect needs.
             std::vector<int> first_bitdiff(nf, -1);
+            // How many steps were actually COMPARED to the reference. A gate
+            // that silently skips its comparison and reports the skip as a
+            // pass is worse than no gate, because the pass is quoted as
+            // evidence later; see the resize above.
+            int ref_checked = 0;
             const double t3 = now_s();
             for (int step = 0; step < n_decode && !bad; ++step) {
                 std::vector<MemberForwardDesc> descs;
@@ -1261,12 +1401,33 @@ int main(int argc, char** argv) {
                     // member that leaves the reference in the first few steps
                     // is not.
                     const std::size_t ref = std::size_t(n_prompt + 1 + step);
-                    if (ref < s.tokens.size() && fleet_diverged[std::size_t(i)] < 0 &&
-                        std::uint32_t(t) != s.tokens[ref]) {
-                        fleet_diverged[std::size_t(i)] = step;
+                    if (ref < s.tokens.size()) {
+                        if (i == 0) ++ref_checked;
+                        if (fleet_diverged[std::size_t(i)] < 0 &&
+                            std::uint32_t(t) != s.tokens[ref]) {
+                            fleet_diverged[std::size_t(i)] = step;
+                        }
                     }
                     m.next_position += 1;
                     if (m.next_position < m.tokens.size()) m.tokens[m.next_position] = std::uint32_t(t);
+                }
+                // Under a dump, STOP at the fire that first went wrong. Each
+                // step republishes over the last, so running to the end would
+                // leave the taps holding step n-1 -- a fire whose inputs are
+                // already the wrong tokens, which is the contamination and not
+                // the cause. Breaking here makes the dump the offending fire
+                // itself, and it is what turns "the fleet is wrong" into a
+                // per-layer bisect.
+                if (taps_dump) {
+                    bool diverged_now = false;
+                    for (int i = 0; i < n_seqs; ++i) {
+                        if (fleet_diverged[std::size_t(i)] == step) diverged_now = true;
+                    }
+                    if (diverged_now) {
+                        std::printf("  ....  taps hold the fleet fire at step %d, the first "
+                                    "that left the reference\n", step);
+                        break;
+                    }
                 }
             }
             {
@@ -1294,14 +1455,27 @@ int main(int argc, char** argv) {
                     if (d >= 0 && d < worst) worst = d;
                 }
                 // A fleet member that never matches the reference is a broken
-                // forward, not a rounding difference.
-                if (worst == 0) {
+                // forward, not a rounding difference -- UNLESS the fleet has
+                // already reproduced mlx-lm's continuation above, in which case
+                // it is demonstrably not broken and this only says the two
+                // kernel paths round differently on an ambiguous token. Ground
+                // truth outranks self-comparison; where there is none, this is
+                // the only signal there is and it still fails the run.
+                if (worst == 0 && !have_ground_truth) {
                     std::printf("  FAIL  the fleet decodes a different token than the "
-                                "same prompt does alone, from its very first step\n");
+                                "same prompt does alone, from its very first step, and "
+                                "no recorded answer exists to say which is right\n");
+                    bad = true;
+                } else if (ref_checked == 0) {
+                    // Never reachable with the sizing above, and said out loud
+                    // anyway: the whole point of the resize is that this gate
+                    // must not be able to pass by not running.
+                    std::printf("  FAIL  the fleet gate compared 0 of %d steps against the "
+                                "single-sequence reference and so proved nothing\n", n_decode);
                     bad = true;
                 } else {
-                    std::printf("  PASS  fleet agrees with the single-sequence decode for "
-                                "%d of %d steps\n", worst, n_decode);
+                    std::printf("  ....  fleet agrees with the single-sequence decode for "
+                                "%d of %d steps\n", std::min(worst, ref_checked), ref_checked);
                 }
             }
         }
@@ -1317,9 +1491,15 @@ int main(int argc, char** argv) {
                 "scheduler's ceiling, NOT comparable]\n",
                 n_decode, pipelined_s, double(n_decode) / pipelined_s,
                 1000.0 * pipelined_s / double(n_decode));
-    if (tput_tps > 0.0) {
+    if (tput_tps > 0.0 && std::getenv("PIE_METAL_GOLDEN_DIR") == nullptr) {
         std::printf("  tput   : %d seqs x %d tok  =  %.1f tok/s  (%.1f tok/s per seq)\n", n_seqs,
                     n_decode, tput_tps, tput_tps / double(n_seqs));
+    } else if (tput_tps > 0.0) {
+        // Deliberately not printed as a measurement. Taps turn pool recycling
+        // off, so the fleet above ran against a different allocation than the
+        // shipped one; the fire is the right ARITHMETIC to dump and the wrong
+        // program to time.
+        std::printf("  tput   : not reported -- golden taps disable pool recycling\n");
     }
 
     // Decode at batch one reads (almost) every weight once per token, so

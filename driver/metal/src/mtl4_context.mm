@@ -101,9 +101,36 @@ struct StepState {
     void* trace_heap = nullptr;
     std::uint32_t trace_slots = 0;
     std::uint32_t trace_n = 0;
+    // Dispatches this fire could not be timed because the timestamp heap ran
+    // out of slots. Counted rather than ignored: a table that silently covers
+    // the first n dispatches of a fire and is read as covering the fire is a
+    // profile that points at the wrong kernel, and the driver caps the heap at
+    // 8192 slots -- 4096 dispatches -- which a 1024-row prefill of a 40-layer
+    // model passes inside its first layer.
+    std::uint64_t trace_dropped = 0;
+    /// Dispatches seen this fire, timed or not. A fire wider than the heap is
+    /// timed by STRIDE rather than by prefix -- see `dispatch`.
+    std::uint64_t trace_seen = 0;
     std::vector<std::string> trace_labels;
     std::string trace_pso;
 };
+
+// `PIE_METAL_TRACE_STRIDE=<k>` times one dispatch in every k rather than every
+// one. The heap is 4096 dispatches and the driver will not grow it, so a fire
+// wider than that used to be profiled by its PREFIX -- which for a batched
+// prefill is the first few layers and none of the wide GEMMs the later ones
+// reach. A stride samples the whole fire instead. Shares stay comparable
+// because every kernel is sampled at the same rate; absolute ms are 1/k of the
+// truth and the table says so.
+int dispatch_trace_stride() {
+    static const int n = [] {
+        const char* e = getenv("PIE_METAL_TRACE_STRIDE");
+        if (e == nullptr || *e == '\0') return 1;
+        const int v = atoi(e);
+        return v > 0 ? v : 1;
+    }();
+    return n;
+}
 
 // `PIE_METAL_DISPATCH_TRACE=<n>` prints the accumulated table every n fires.
 int dispatch_trace_every() {
@@ -192,6 +219,9 @@ struct RawMetalContext::Impl {
         void* buffer = nullptr;
         size_t virtual_bytes = 0;
         size_t committed_bytes = 0;
+        /// The part of `committed_bytes` the buffer cannot exist without, and
+        /// which a pressure signal is therefore not allowed to take back.
+        size_t mandatory_bytes = 0;
         std::vector<ElasticChunk> chunks;
     };
     struct PendingElasticRelease {
@@ -202,6 +232,7 @@ struct RawMetalContext::Impl {
     std::vector<PendingElasticRelease> pending_elastic_releases;
     size_t elastic_budget_bytes = 0;
     size_t elastic_pressure_floor_bytes = 0;
+    size_t elastic_mandatory_bytes = 0;
     size_t elastic_reserved_bytes = 0;
     size_t elastic_committed_bytes = 0;
     std::shared_ptr<std::atomic<std::uint32_t>> memory_pressure_level =
@@ -244,6 +275,24 @@ struct RawMetalContext::Impl {
     size_t effective_elastic_budget_bytes() const;
 };
 
+// Back off elastic growth when the OS says memory is tight -- but never below
+// what the pools already had to have.
+//
+// `elastic_pressure_floor_bytes` defaults to zero, and a floor of zero under
+// `DISPATCH_MEMORYPRESSURE_CRITICAL` is not a floor, it is an off switch: every
+// `ensure_elastic_buffer` fails, including the 2 MiB-per-layer commitment that
+// makes a KV pool exist at all. Qwen3.6-35B-A3B found this by loading. The
+// load's own mapping is what raises the pressure -- 18.16 GiB of clean file
+// cache takes free memory to 50 MiB on the way in -- so the signal arrives
+// while the pool is still being built, and the model is refused by the state
+// its own admission created.
+//
+// Refusing there also buys nothing. `fits_on_this_gpu` counted the whole
+// elastic budget before a byte was allocated, so the machine was already
+// checked against it; declining the mandatory part does not hand a page back,
+// it only turns an admitted model into an unusable one. What pressure should
+// throttle is GROWTH past that point -- KV pages for sequences that have not
+// arrived yet -- and that is still clamped.
 size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
     const std::uint32_t level =
         memory_pressure_level->load(std::memory_order_acquire);
@@ -252,7 +301,8 @@ size_t RawMetalContext::Impl::effective_elastic_budget_bytes() const {
         level >= 2
             ? elastic_pressure_floor_bytes
             : std::max(elastic_pressure_floor_bytes, elastic_budget_bytes / 2);
-    return std::min(elastic_budget_bytes, pressure_limit);
+    return std::min(elastic_budget_bytes,
+                    std::max(elastic_mandatory_bytes, pressure_limit));
 }
 
 void RawMetalContext::Impl::collect_elastic_releases() {
@@ -413,8 +463,11 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
     // Relaxed granularity, so the pair costs no encoder split; the cost of the
     // marks themselves is charged to whichever dispatch they bracket, which is
     // the same for all of them and so does not move the shares.
-    const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr &&
+    const bool sampled = (s->trace_seen % std::uint64_t(dispatch_trace_stride())) == 0;
+    ++s->trace_seen;
+    const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr && sampled &&
                        2 * (s->trace_n + 1) <= s->trace_slots;
+    if (dispatch_trace_every() > 0 && !trace) ++s->trace_dropped;
     if (trace) mark_timestamp(s->trace_heap, 2 * s->trace_n, /*precise=*/true);
     // A threadgroup wider than the pipeline allows is not an error Metal
     // raises; the dispatch is simply not performed. Say it once per pipeline,
@@ -812,10 +865,19 @@ SlotHandle RawMetalContext::create_elastic_buffer(
     h.gpu_address = buffer.gpuAddress;
     h.size = size;
     h.elastic = true;
-    if (initial_commit_bytes != 0 &&
-        !ensure_elastic_buffer(h, initial_commit_bytes)) {
-        release_elastic_buffer(h);
-        return {};
+    if (initial_commit_bytes != 0) {
+        // Declared mandatory BEFORE the ask, because the ask is what consults
+        // the pressure clamp: this is the commitment without which the buffer
+        // is not a buffer, and `fits_on_this_gpu` has already paid for it.
+        const size_t mandatory = align_up(
+            std::min(initial_commit_bytes, virtual_bytes),
+            Impl::kSparseTileBytes);
+        I.elastic_allocations[h.buffer].mandatory_bytes = mandatory;
+        I.elastic_mandatory_bytes += mandatory;
+        if (!ensure_elastic_buffer(h, initial_commit_bytes)) {
+            release_elastic_buffer(h);
+            return {};
+        }
     }
     return h;
 }
@@ -1010,6 +1072,8 @@ void RawMetalContext::release_elastic_buffer(const SlotHandle& h) {
     trim_elastic_buffer(h, 0);
     auto found = I.elastic_allocations.find(h.buffer);
     if (found == I.elastic_allocations.end()) return;
+    I.elastic_mandatory_bytes -=
+        std::min(I.elastic_mandatory_bytes, found->second.mandatory_bytes);
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)h.buffer;
     [I.rs removeAllocation:buffer];
     [I.rs commit];
@@ -1113,6 +1177,10 @@ size_t RawMetalContext::elastic_page_bytes() const {
 size_t RawMetalContext::elastic_budget_pages() const {
     return pie::elastic::pages_for_bytes(
         impl_->effective_elastic_budget_bytes());
+}
+
+std::uint32_t RawMetalContext::memory_pressure_level() const {
+    return impl_->memory_pressure_level->load(std::memory_order_acquire);
 }
 
 size_t RawMetalContext::elastic_committed_pages() const {
@@ -2045,6 +2113,8 @@ void* encode_one_command_buffer(void* ctx_impl, int ab,
         }
     }
     I.step.trace_n = 0;
+    I.step.trace_dropped = 0;
+    I.step.trace_seen = 0;
     I.step.trace_labels.clear();
     StepEncoder se(&I.step);
     encode_fn(se);
@@ -2079,9 +2149,15 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
         for (std::size_t i = 0; i < ticks.size() && i < got; ++i) ticks[i] = e[i].timestamp;
     }
     static std::map<std::string, std::pair<double, long>> table;
+    static std::map<std::string, double> wall_table;
     static double total_ticks = 0.0;
+    static double total_wall_ticks = 0.0;
     static double total_gpu_ms = 0.0;
     static long fires = 0;
+    static std::uint64_t dropped = 0;
+    static std::uint32_t slots = 0;
+    dropped += I.step.trace_dropped;
+    slots = I.step.trace_slots;
     for (std::uint32_t i = 0; i < n; ++i) {
         const std::uint64_t a = ticks[2 * i], b = ticks[2 * i + 1];
         // A relaxed timestamp is not ordered against the dispatch it brackets,
@@ -2093,21 +2169,110 @@ void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
         slot.second += 1;
         total_ticks += double(b - a);
     }
+    // The column above is a SUM of [start, end] intervals, so if dispatches
+    // overlap it double-counts and its shares are occupancy rather than time.
+    // Sweep the intervals to find out: at every instant divide that instant
+    // among the dispatches running in it, and the result sums to their UNION.
+    //
+    // It always comes back 1.0x -- the union equals the sum, nothing overlaps
+    // anything. That is not what the GPU does; it is what the trace does to
+    // it. See the note the report prints.
+    {
+        struct Ev {
+            std::uint64_t t;
+            int delta;
+            std::uint32_t idx;
+        };
+        std::vector<Ev> ev;
+        ev.reserve(std::size_t(2) * n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const std::uint64_t a = ticks[2 * i], b = ticks[2 * i + 1];
+            if (b <= a) continue;
+            ev.push_back({a, +1, i});
+            ev.push_back({b, -1, i});
+        }
+        std::sort(ev.begin(), ev.end(), [](const Ev& x, const Ev& y) {
+            return x.t != y.t ? x.t < y.t : x.delta > y.delta;
+        });
+        std::map<std::string, int> live;
+        int live_n = 0;
+        std::uint64_t prev = ev.empty() ? 0 : ev.front().t;
+        for (const Ev& e : ev) {
+            if (live_n > 0 && e.t > prev) {
+                const double span = double(e.t - prev);
+                const double each = span / double(live_n);
+                for (const auto& [name, c] : live)
+                    if (c > 0) wall_table[name] += each * double(c);
+                total_wall_ticks += span;
+            }
+            prev = e.t;
+            const std::string& name = I.step.trace_labels[e.idx];
+            live[name] += e.delta;
+            live_n += e.delta;
+        }
+    }
     total_gpu_ms += gpu_ms;
     if (++fires % every != 0) return;
     std::vector<std::pair<std::string, std::pair<double, long>>> rows(table.begin(), table.end());
-    std::sort(rows.begin(), rows.end(),
-              [](const auto& x, const auto& y) { return x.second.first > y.second.first; });
+    std::sort(rows.begin(), rows.end(), [&](const auto& x, const auto& y) {
+        (void)wall_table;
+        return x.second.first > y.second.first;
+    });
     fprintf(stderr, "[trace] %ld fires, %.2f ms of GPU, %zu kernels\n", fires, total_gpu_ms,
             rows.size());
+    // Said before the table, because it invalidates it. The shares below are
+    // over the dispatches that FIT, so a truncated fire reports the kernels at
+    // the head of its DAG and none of the ones after -- which reads as "the
+    // embedding gather is 15% of a prefill" when the embedding gather is
+    // simply what the first 2048 slots happened to cover.
+    if (dropped > 0 && dispatch_trace_stride() <= 1) {
+        fprintf(stderr,
+                "[trace] TRUNCATED: %llu dispatches went untimed (the timestamp heap holds "
+                "%u slots = %u dispatches). The shares below cover only the dispatches that "
+                "fit, which are the FIRST ones each fire encoded -- do not read them as the "
+                "fire's profile. Set PIE_METAL_TRACE_STRIDE=<k> to sample the whole fire "
+                "instead of its head.\n",
+                (unsigned long long)dropped, slots, slots / 2);
+    } else if (dispatch_trace_stride() > 1) {
+        fprintf(stderr,
+                "[trace] SAMPLED 1 dispatch in %d: shares are the fire's, n and ms are 1/%d "
+                "of it.\n",
+                dispatch_trace_stride(), dispatch_trace_stride());
+    }
+    // THE SHARES BELOW ARE OF A FIRE THE TRACE SERIALIZED. Every dispatch is
+    // bracketed by two timestamps, and the pair is a scheduling boundary: the
+    // intervals come back non-overlapping (%.2fx below is the sum over the
+    // union, and it is 1.00) because with the marks in, nothing overlaps.
+    //
+    // Untraced they do. Qwen3.6-27B, 128-token prefill, same binary: 1.226 s
+    // with no trace, 1.332 s at stride 1, 1.487 s at stride 4 -- the stride is
+    // SLOWER because a stride-1 trace stops marking once the heap fills and
+    // lets the rest of the fire run free, while a stride spreads the marks
+    // over all of it. Twenty-one percent of that fire is concurrency, and this
+    // table cannot see any of it.
+    //
+    // What that costs the reader: a small kernel dispatched per token reads
+    // far larger here than it is worth, because untraced it runs under its
+    // neighbours. Batching 3696 dispatches of q/k-norm and rope away -- 33% of
+    // this table -- was worth 0.2% of the fire. Use the table to find WHICH
+    // kernel to look at, never to decide what a change will be worth. Only an
+    // A/B of the real thing decides that.
+    fprintf(stderr,
+            "[trace] SERIALIZED BY THE MARKS: intervals sum to %.2fx their union, i.e. "
+            "the trace let nothing overlap. Untraced this fire overlaps ~21%%. Shares "
+            "point at kernels; they do not price changes -- A/B does.\n",
+            total_wall_ticks > 0 ? total_ticks / total_wall_ticks : 0.0);
     for (const auto& [name, v] : rows) {
         const double share = total_ticks > 0 ? v.first / total_ticks : 0.0;
         fprintf(stderr, "[trace]  %6.2f%%  %8.3f ms  n=%-6ld %s\n", 100.0 * share,
                 share * total_gpu_ms, v.second, name.c_str());
     }
     table.clear();
+    wall_table.clear();
     total_ticks = 0.0;
+    total_wall_ticks = 0.0;
     total_gpu_ms = 0.0;
+    dropped = 0;
 }
 
 StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,

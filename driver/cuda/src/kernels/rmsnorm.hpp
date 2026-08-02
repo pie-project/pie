@@ -23,6 +23,12 @@ void launch_rmsnorm_bf16(
 // they are normalized. Kimi's fused `q_a + kv_a` projection lands both halves
 // in one row-major buffer, and the q half is normalized in place from there
 // rather than compacted first.
+// As above, plus an fp16 copy of the result for a consumer that wants fp16.
+// `y_fp16` may be null, in which case this is exactly `launch_rmsnorm_bf16`.
+void launch_rmsnorm_bf16_with_fp16(
+    const void* x, const void* weight, void* y, void* y_fp16,
+    int num_rows, int hidden, float eps, cudaStream_t stream);
+
 void launch_rmsnorm_strided_bf16(
     const void* x,        // [num_rows, x_row_stride], reads [:, :hidden]
     const void* weight,   // [hidden]

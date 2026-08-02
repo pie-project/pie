@@ -24,6 +24,12 @@
 
 namespace pie::metal::gemma4 {
 
+/// Whether this checkpoint's GEMM reaches the FP16 matrix path. The GEMM
+/// crossover moves with it -- see `qmm_min_batch`.
+inline bool gemma4_fp16_format(const Gemma4Geometry& g) {
+    return fp16_gemm_format(g.quant.bits, g.quant.group);
+}
+
 int gemma4_qmm_rows(const Gemma4Geometry& g, int rows) {
     const int n = rows < 1 ? 1 : rows;
     // The GEMV/GEMM crossover, which `device_tuning.hpp` owns and which this
@@ -34,7 +40,7 @@ int gemma4_qmm_rows(const Gemma4Geometry& g, int rows) {
     // Max first, where lowering the single number to 4 (so the GEMM engaged at
     // 8 rows instead of 12) cost 17% on 8 lanes, 128.5 -> 106.5 tok/s; that
     // checkpoint was routed, which is the half of the split that kept 12.
-    if (n < qmm_min_batch(g.is_moe())) return n;
+    if (n < qmm_min_batch(g.is_moe(), gemma4_fp16_format(g))) return n;
     const int bm = qmm_bm(n);
     return ((n + bm - 1) / bm) * bm;
 }
@@ -63,54 +69,50 @@ bool is_routed(Kind k) {
 
 /// The routed matmul's column tile, or 0 when the batch stays a matvec.
 ///
-/// OPEN BUG, and it is reachable on shipped defaults. When this returns
-/// non-zero on a DECODE fleet, gemma-4-26b-a4b answers wrongly from the very
-/// first step. `moe_should_batch` admits the routed GEMM at
-/// `n_pairs >= n_experts * moe_batch_min_per_expert`, which for this
-/// checkpoint's 128 experts at top-8 is first true at SIXTY-FOUR lanes -- so
-/// nothing in the bench protocol's 8 and 16 ever reached it. Two reproductions,
-/// both `llama_bench` on mlx-community/gemma-4-26b-a4b-it-4bit:
+/// CLOSED BUG, recorded because the diagnosis that stood here for three
+/// sessions was wrong in a way worth not repeating. This GEMM was believed to
+/// answer wrongly on a decode fleet -- `PIE_BENCH_TPUT=64`, or 16 lanes with
+/// the crossover forced to 1, both "FAILED" -- and that belief is what kept
+/// `moe_batch_min_per_expert` pinned at 4 and cost up to 114% of gpt-oss's
+/// fleet throughput.
 ///
-///     PIE_BENCH_TPUT=64                                      -> FAIL
-///     PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=1 PIE_BENCH_TPUT=16 -> FAIL
+/// There was no defect. The evidence was an artefact of the harness, twice
+/// over:
 ///
-/// What is known, so the next reader does not re-measure it:
+///   * `llama_bench`'s fleet gate compared the fleet to THIS DRIVER'S OWN
+///     one-row decode. A one-row decode and an n-row decode take different
+///     kernels the whole way down -- `qmv` against `qmv_mb` or a GEMM, `rms`
+///     against `rms_mb`, sliding attention against tiled -- so they are not the
+///     same arithmetic and were never going to be bit-identical. Which step
+///     their greedy argmaxes first differ on is a fact about how sharp the
+///     logits are there, and the bench's own prompt is `kGatePrompt` repeated
+///     and then TRUNCATED, so at the default 128 it ends mid-sentence and the
+///     next token is close to a coin flip. The file already warned about
+///     exactly this trap one screen above the prompt it builds.
+///   * The reference token buffer was one element short, so at `n_decode == 1`
+///     the comparison never ran and the gate printed PASS having checked
+///     nothing. That produced a four-cell table in which 1-step runs "passed"
+///     and 64-step runs "failed", from which this comment concluded that the
+///     variable was the decode length of the run before -- a dirty scratch
+///     pool. Both halves of that table were measurement error.
 ///
-///   * The fleet members AGREE WITH EACH OTHER and disagree with the same
-///     prompt decoded alone. One consistently wrong batch, not row aliasing --
-///     which is what separates this from the qwen3.5 mixture's failure, where
-///     the members disagree among themselves.
-///   * The matvec arm is bit-perfect on the identical fleet:
-///     `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=99999` gives 32 of 32 steps at 16
-///     lanes. So the router, the sort, the attention and the paging are all
-///     fine; only this GEMM is not.
-///   * THE SAME GEMM AT THE SAME SHAPE IS CORRECT IN A PREFILL. A 16-token
-///     prompt with the crossover forced to 1 batches the routed GEMM at the
-///     same tile (16) and the same sorted count (2048) and returns tokens
-///     identical to the matvec's. The kernel, the tiling, the PSO choice and
-///     the grid therefore all agree with each other; something the DECODE
-///     supplies does not.
-///   * Eliminated: the tile width (`PIE_METAL_MOE_TILE_MID_PER` -- 16 and 32
-///     both fail), the FP16 input staging (`PIE_METAL_FP16_QMM=0` still
-///     fails), and a missing pipeline (all nine `qmm_routed[tile][bn]` are
-///     compiled, and `kernels.cpp` refuses to load if any is not).
+/// What settles it, and what the gate now asks: force this GEMM onto EVERY
+/// fire with `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=0` -- so even a one-row decode
+/// takes the batched path -- and gemma-4-26b-a4b still reproduces mlx-lm's
+/// recorded continuation token for token. An n-wide fleet reproduces it too, at
+/// 4, 8, 16 and 32 lanes, with and without the routed GEMM engaged. The kernel
+/// is correct; it was the ruler that was bent.
 ///
-/// The lead: `rows` is 16 in BOTH the passing prefill and the failing decode,
-/// so the constants are bound with the same row count. What differs is
-/// `head_rows`, `requests` -- and THE DATA. A fleet of n copies of one prompt
-/// routes every row to the same 8 experts, so a few experts hold long runs and
-/// 120 are untouched, where a prefill of distinct tokens spreads thinly over
-/// many. `gemma4_moe_sorted_rows` is a worst-case bound
-/// (`n_pairs + touched * (tile - 1)`) and the tiles past the routing are meant
-/// to decline at `tile_expert < 0`. That decline, under a routing that touches
-/// far fewer experts than the bound assumes, is the next thing to test.
+/// The general lesson, which is why this is here and not in a commit message:
+/// a correctness gate must compare against something OUTSIDE the driver. Two
+/// of our own kernels disagreeing is the expected state of the world.
 int gemma4_moe_qmm_bn(Kind k, const Gemma4Geometry& g, int rows, int layer) {
     if (!is_routed(k) || gemma4_moe_tile_rows(g, rows) <= 1) return 0;
     const KN kn = qmv_kn(k, g, layer);
     if (kn.N == 0) return 0;
     // Routed, so the routed crossover; `moe_should_batch` has already admitted
     // this batch and the sorted count clears either number regardless.
-    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows), qmm_min_batch(true));
+    return qmm_bn(kn.N, gemma4_moe_sorted_rows(g, rows), qmm_min_batch(true, gemma4_fp16_format(g)));
 }
 
 /// Dispatches that may run together: same layer, mutually independent, all
@@ -302,7 +304,7 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
         // `qmm_bn_unsplit`, not `qmm_bn`: the widest-tile rule is correct only
         // where split-K supplies the threadgroups the wide tile gives up, and
         // this family dispatches no split (see `launch_shape_mb`).
-        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe(), gemma4_fp16_format(g)));
         const int wide = qmm_bm_slot(bm);
         // No split-K here either; see `launch_shape_mb`.
         const int split = 0;
@@ -462,7 +464,7 @@ void launch_shape_mb(const Dispatch& d, const Gemma4Geometry& g, int rows, Grid&
         // Same chooser as `pso_for_mb`, for the same reason -- and it has to be
         // the same one: the grid and the pipeline disagreeing about BN is a
         // dispatch that computes the wrong thing rather than one that refuses.
-        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe()));
+        const int bn = qmm_bn_unsplit(kn.N, M, qmm_min_batch(g.is_moe(), gemma4_fp16_format(g)));
         // NO split-K. The split GEMM accumulates partial sums into a split
         // buffer and needs a reduce pass to fold them; qwen3.5 has both, this
         // family has neither -- so a split dispatch here wrote partials nobody
@@ -810,15 +812,25 @@ void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
 ///     448  6144  1536      4163     5794
 ///
 /// Storage and every surrounding kernel stay BF16; only the GEMM's input is
-/// staged to half, once per input rather than once per output tile. Routed
-/// models are excluded on purpose -- llama measured FP16 flipping expert top-k
-/// -- and so is the second quantized set, where a checkpoint ships one: those
-/// tables are 8-bit and have no FP16 pipeline.
+/// staged to half, once per input rather than once per output tile. The ROUTED
+/// projections are excluded -- their weight stack is indexed on the GPU and
+/// the precast kernel has no routed form -- and so is the second quantized
+/// set, where a checkpoint ships one: those tables are 8-bit and have no FP16
+/// pipeline. A mixture's DENSE projections are not excluded; they were, once,
+/// and that cost gemma-4-26b-a4b 37% of its prefill.
 bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
-    // `is_moe` covers the routed kinds too: the DAG emits them under the same
-    // condition, so a dense checkpoint has none to reach.
+    // `is_routed`, not `is_moe`. This used to refuse the whole checkpoint on
+    // the strength of a comment that read "`is_moe` covers the routed kinds
+    // too" -- true, and far too much: a mixture's q/k/v/o are ordinary dense
+    // projections and were being sent down the emulated BF16 MMA with them.
+    // On gemma-4-26b-a4b those are 37% of a 512-row prefill.
+    //
+    // What the routed kinds are actually kept away from is not rounding but
+    // the tile: their weight stack is indexed on the GPU and the precast
+    // kernel has no routed form to select. The router's own GEMV is 8-bit and
+    // excluded by the width test below, so no top-k decision changes here.
     if (!fp16_qmm()) return false;
-    if (g.is_moe() || g.quant.bits != 4 || g.quant.group != 64) return false;
+    if (is_routed(d.kind) || g.quant.bits != 4 || g.quant.group != 64) return false;
     // Only a checkpoint that really ships two formats has an 8-bit set to keep
     // away from, and only the tensors it actually spared. Reading the kind
     // alone would have excluded gate, up and down from every checkpoint, which
@@ -827,7 +839,7 @@ bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m) {
     const KN kn = qmv_kn(d.kind, g, d.layer);
     if (kn.N == 0) return false;
     return qmm_bn_unsplit(int(kn.N), gemma4_qmm_rows(g, m),
-                          qmm_min_batch(g.is_moe())) > 0;
+                          qmm_min_batch(g.is_moe(), gemma4_fp16_format(g))) > 0;
 }
 
 /// Which dispatches stage, as opposed to reading what an earlier one staged.
