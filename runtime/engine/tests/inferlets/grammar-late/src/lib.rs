@@ -6,8 +6,8 @@
 //! coalesced into the fire) IS the production device-alias supply path — the
 //! single channel mechanism now serves both the `grammar` (`MASK_OP_OK`) and
 //! this `grammar-late` (`LATE_MASK_OK`) verify. Kept as its own inferlet (own
-//! JSON knobs + result field names) so the R=2 barrier (`cuda_grammar_r2`)
-//! keeps its two DISJOINT-alphabet, distinguishable-token proof.
+//! JSON knobs + result field names) so it keeps its two DISJOINT-alphabet,
+//! distinguishable-token proof.
 //!
 //! Two non-degenerate asserts (the cut #1 discipline — an all-allowed no-op
 //! mask cannot pass):
@@ -26,7 +26,7 @@
 //! JSON input: `{"alphabet":[..],"max_tokens":N}` (defaults `[10,11,12,13]`, 8).
 
 use inferlet::mask::{all_allowed, apply_mask_argmax, bit_allowed, pack_allowed};
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 /// Default constraint alphabet: the only token ids the grammar ever allows.
@@ -89,8 +89,7 @@ async fn main(input: String) -> Result<String> {
 
     let ws = WorkingSet::new();
     let max_pages = (max_tokens as u32 + 1).div_ceil(PAGE_T).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // Channels: tok_in and KvLen are device loop-carried (seeded; each fire's
     // epilogue advances the post-write readable extent by one), so each fire
@@ -98,14 +97,14 @@ async fn main(input: String) -> Result<String> {
     // KV, not a fixed one-token window. gmask is the per-step host-writer allowed
     // mask (the production channel supply path); tok_out/raw are host-reader
     // outputs (constrained token + RAW logits).
-    let tok_in = Channel::from(vec![seed_tok]).named("tok_in");
-    let kv_len = Channel::from(vec![1u32]).named("kv_len");
-    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-    let positions = Channel::from(vec![0u32]).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
-    let w_slot = Channel::from(vec![0u32]).named("w_slot");
-    let w_off = Channel::from(vec![0u32]).named("w_off");
+    let tok_in = Channel::from([seed_tok]).named("tok_in");
+    let kv_len = Channel::from([1u32]).named("kv_len");
+    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+    let positions = Channel::from([0u32]).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from([0u32]).named("w_slot");
+    let w_off = Channel::from([0u32]).named("w_off");
     let gmask = Channel::new([vocab], dtype::bool).named("gmask");
     let tok_out = Channel::new([1], dtype::i32).named("tok_out");
     let raw = Channel::new([vocab], dtype::f32).named("raw");
@@ -114,32 +113,33 @@ async fn main(input: String) -> Result<String> {
     fwd.embed(&tok_in, &embed_indptr)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         // Takes + compute first, PUTS last (value-id discipline).
         let m = gmask.take(); // [V] bool, host-fed per step
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
         let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
-        let next_length = add(&length, 1u32);
-        let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+        let next_length = &length + 1u32;
+        let page_count = next_length.div_ceil(PAGE_T);
 
         tok_in.put(&tok);
         kv_len.put(&next_length);
         positions.put(&length);
-        w_slot.put(div(&length, PAGE_T));
-        w_off.put(rem(&length, PAGE_T));
-        page_indptr.take();
-        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        w_slot.put(&length / PAGE_T);
+        w_off.put(&length % PAGE_T);
+        page_indptr.put(indptr(1, &page_count));
         tok_out.put(&tok);
         raw.put(&lg);
     });
@@ -161,17 +161,15 @@ async fn main(input: String) -> Result<String> {
 
         gmask.put(mask_bool);
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
         let token = tok_out
-            .take()
-            .get::<i32>()
+            .take_host::<i32>()
             .await
-            .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
+            .with_context(|| format!("@{step}"))? as u32;
         let logits = raw
-            .take()
-            .get::<f32>()
+            .take_host::<Vec<f32>>()
             .await
-            .map_err(|e| format!("raw.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
 
         // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).
         let host_token = apply_mask_argmax(&logits, &packed);

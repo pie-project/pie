@@ -76,6 +76,13 @@ PersistentInputs PersistentInputs::allocate(
     p.rs_buffer_slot_indptr =
         DeviceBuffer<std::uint32_t>::alloc(
             static_cast<std::size_t>(max_requests) + 1);
+    p.rs_buffer_read_slot_ids =
+        DeviceBuffer<std::uint32_t>::alloc(rs_buffer_refs);
+    p.rs_buffer_read_indptr =
+        DeviceBuffer<std::uint32_t>::alloc(
+            static_cast<std::size_t>(max_requests) + 1);
+    p.rs_buffer_read_lens = DeviceBuffer<std::uint32_t>::alloc(max_requests);
+    p.rs_buffer_heads     = DeviceBuffer<std::uint32_t>::alloc(max_requests);
     p.rs_slot_flags_host =
         PinnedHostBuffer<std::uint8_t>::alloc(max_requests);
     p.rs_fold_lens_host =
@@ -85,6 +92,15 @@ PersistentInputs PersistentInputs::allocate(
     p.rs_buffer_slot_indptr_host =
         PinnedHostBuffer<std::uint32_t>::alloc(
             static_cast<std::size_t>(max_requests) + 1);
+    p.rs_buffer_read_slot_ids_host =
+        PinnedHostBuffer<std::uint32_t>::alloc(rs_buffer_refs);
+    p.rs_buffer_read_indptr_host =
+        PinnedHostBuffer<std::uint32_t>::alloc(
+            static_cast<std::size_t>(max_requests) + 1);
+    p.rs_buffer_read_lens_host =
+        PinnedHostBuffer<std::uint32_t>::alloc(max_requests);
+    p.rs_buffer_heads_host =
+        PinnedHostBuffer<std::uint32_t>::alloc(max_requests);
     p.mtp_request_ids    = DeviceBuffer<std::int32_t >::alloc(max_requests);
     const std::size_t mtp_rows =
         static_cast<std::size_t>(std::max(0, max_mtp_draft_rows));

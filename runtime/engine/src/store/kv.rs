@@ -124,6 +124,30 @@ impl Default for FlatEntry {
     }
 }
 
+/// A fresh working set's heap state, built *outside* the global KV lock.
+///
+/// `FlatEntry::default()` allocates. Doing that while holding the store mutex
+/// means one slow `malloc` -- e.g. a direct-reclaim stall when the host is
+/// under memory pressure -- blocks every lane that needs the KV store, which
+/// has been measured at over a second. Allocate first, then take the lock.
+pub struct PreparedWorkingSet {
+    entry: FlatEntry,
+}
+
+impl PreparedWorkingSet {
+    pub fn new() -> Self {
+        Self {
+            entry: FlatEntry::default(),
+        }
+    }
+}
+
+impl Default for PreparedWorkingSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 struct WriteClassification {
     mapped: u64,
@@ -308,8 +332,14 @@ impl KvStore {
     // ------------------------------------------------------------------
 
     pub fn create_working_set(&mut self) -> WorkingSetId {
+        self.install_working_set(PreparedWorkingSet::new())
+    }
+
+    /// Admit a working set whose heap state was built by the caller before it
+    /// took the lock. See [`PreparedWorkingSet`].
+    pub fn install_working_set(&mut self, prepared: PreparedWorkingSet) -> WorkingSetId {
         let ws = self.table.create_working_set();
-        self.flat.insert(ws, FlatEntry::default());
+        self.flat.insert(ws, prepared.entry);
         ws
     }
 
@@ -356,13 +386,17 @@ impl KvStore {
 
     /// Exact lookup of an opaque index key. The returned WorkingSet owns its
     /// own terminal anchor and remains valid after index replacement/removal.
-    pub fn from_index(&mut self, key: &[u8]) -> Result<Option<WorkingSetId>, KvStoreError> {
+    pub fn from_index(
+        &mut self,
+        key: &[u8],
+        prepared: PreparedWorkingSet,
+    ) -> Result<Option<WorkingSetId>, KvStoreError> {
         Self::validate_index_key(key)?;
         let Some(entry) = self.indexes.get(key).copied() else {
             return Ok(None);
         };
         let ws = self.table.from_index_snapshot(entry.snapshot);
-        self.flat.insert(ws, FlatEntry::default());
+        self.flat.insert(ws, prepared.entry);
         self.refresh_flat(ws);
         Ok(Some(ws))
     }
@@ -378,9 +412,13 @@ impl KvStore {
         Ok((true, freed))
     }
 
-    pub fn fork(&mut self, ws: WorkingSetId) -> Result<WorkingSetId, KvStoreError> {
+    pub fn fork(
+        &mut self,
+        ws: WorkingSetId,
+        prepared: PreparedWorkingSet,
+    ) -> Result<WorkingSetId, KvStoreError> {
         let child = self.table.fork(ws)?;
-        self.flat.insert(child, FlatEntry::default());
+        self.flat.insert(child, prepared.entry);
         self.refresh_flat(child);
         Ok(child)
     }
@@ -389,6 +427,7 @@ impl KvStore {
         &mut self,
         ws: WorkingSetId,
         range: Range<u64>,
+        prepared: PreparedWorkingSet,
     ) -> Result<WorkingSetId, KvStoreError> {
         let parent_mapped = self.table.mapped_len(ws)?;
         let parent_chain = self.table.chain_state(ws)?;
@@ -399,7 +438,7 @@ impl KvStore {
         } else {
             self.refresh_chain_after_surgery(child, range.start == 0)?;
         }
-        self.flat.insert(child, FlatEntry::default());
+        self.flat.insert(child, prepared.entry);
         self.refresh_flat(child);
         Ok(child)
     }

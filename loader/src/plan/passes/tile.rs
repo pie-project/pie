@@ -21,8 +21,8 @@
 use crate::plan::index::PlanIndex;
 use crate::plan::{
     FUSION_FP8_TO_MXFP4, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_CAST,
-    TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TILE_MAP_SCALE, TileMapKind,
-    TransformFusion,
+    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TILE_MAP_SCALE,
+    TileMapKind, TransformFusion,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDecl};
 
@@ -32,15 +32,37 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDe
 pub const CUDA_TILE_MAP_MASK: u32 =
     TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_REBLOCK | TILE_MAP_REPACK | TILE_MAP_SCALE;
 
-/// Metal's load executor binds tensors into a heap and runs no tile-map
-/// transforms at all. The loader will therefore not emit a transform this
-/// backend could not run: every `TileMap` that reaches Metal lowering is a
-/// contradiction `validate-target-support` has already rejected.
-pub const METAL_TILE_MAP_MASK: u32 = 0;
+/// The transforms `driver/metal`'s load-time kernels implement. Mirrored in C++
+/// as `kMetalTileMapMask`, which is defined in terms of the generated bits
+/// rather than restated, so the two cannot drift.
+///
+/// `SCALE` decodes a block-scaled scheme to values and `CAST` re-encodes them as
+/// the affine-U4 that driver's matvecs read, which is what lets it load the
+/// published MXFP4 gpt-oss checkpoint directly. It has no repacking or
+/// reblocking kernels, so those bits stay clear.
+pub const METAL_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
 
 /// The transforms `host_executor` implements. Not a device capability, so it is
 /// not part of the C surface.
 pub const HOST_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_REBLOCK | TILE_MAP_SCALE;
+
+/// The mask offline conversion compiles against: everything `replay` runs plus
+/// `Encode` and `Decode`, which the host executor implements for exactly that
+/// command.
+///
+/// A separate constant rather than a wider [`HOST_TILE_MAP_MASK`] because the
+/// two answer different questions. HOST is the verification surface — what a
+/// `replay` of a *device* plan may be asked to reproduce — and widening it
+/// would quietly change which plans `replay` accepts. Conversion is its own
+/// target: a plan compiled against this mask is meant to be executed on the
+/// host and its output written back to a checkpoint, not compared against a
+/// device.
+///
+/// `Decode` is here and in no device mask: the schemes it covers carry their
+/// scales inside the payload (GGUF blocks), which no device kernel reads —
+/// decoding them offline into a checkpoint the device *can* read is the whole
+/// point of conversion.
+pub const CONVERT_TILE_MAP_MASK: u32 = HOST_TILE_MAP_MASK | TILE_MAP_ENCODE | TILE_MAP_DECODE;
 
 /// The loader's own model of what a backend's kernels do.
 ///

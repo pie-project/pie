@@ -67,7 +67,7 @@ fn arithmetic() -> Traced {
 
     let mut builder = Builder::new(32_000, 16);
     builder.stage(Stage::Epilogue, || {
-        let x = logits.take().tensor();
+        let x = logits.take();
         let row = gather_row(&x, idx.take());
 
         // unary
@@ -136,7 +136,7 @@ fn masking() -> Traced {
         let jitter = gumbel(state.read(), [4, 8]);
         let scores = add(noise, jitter);
 
-        let pos = positions.take().tensor();
+        let pos = positions.take();
         let causal = causal_mask(&pos, 8);
         let sliding = sliding_window_mask(&pos, 8, 4);
         let sunk = sink_window_mask(&pos, 8, 1, 4);

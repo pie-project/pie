@@ -28,14 +28,40 @@ unless the ABI changed on purpose; `driver/{cuda,metal}` compile against it.
 
 ## The tool
 
-Compile, inspect, check and replay a plan without a GPU, a runtime, or a driver:
+Compile, inspect, check, replay and convert without a GPU, a runtime, or a
+driver:
 
 ```sh
-pie-loader dump   SNAPSHOT CONTRACT          # the plan, as JSON
-pie-loader verify SNAPSHOT CONTRACT          # check the plan against its contract
-pie-loader diff   SNAPSHOT CONTRACT GOLDEN   # compare against a stored dump
-pie-loader replay SNAPSHOT CONTRACT          # execute on the CPU, against real bytes
+pie-loader dump    SNAPSHOT CONTRACT          # the plan, as JSON
+pie-loader verify  SNAPSHOT CONTRACT          # check the plan against its contract
+pie-loader diff    SNAPSHOT CONTRACT GOLDEN   # compare against a stored dump
+pie-loader replay  SNAPSHOT CONTRACT          # execute on the CPU, against real bytes
+pie-loader convert SNAPSHOT CONTRACT OUT      # execute on the CPU, write a checkpoint
 ```
+
+`convert` is offline weight conversion: the contract declares the output
+tensors (a `Cast` into a quantized encoding is how "quantize this" is
+spelled), the host executor runs the plan, and the result is written as a new
+`.zt` checkpoint — every tensor on a page, every payload digested, and the
+quantization scheme named by the file rather than guessed from a dtype tag. Loading it afterwards is a cheaper
+contract against the converted names. Every encode the plan language admits
+runs on the host: MXFP4 (`F4_E2M1` payload + `U8` block scales), per-channel
+FP8 (`F8_E4M3` + `F32` scales) and per-channel INT8 (`I8` + `F32` scales),
+from a BF16/F16/F32 operand or from an FP8 block-scaled checkpoint whose
+`_scale_inv` factors are applied first — each the bit-for-bit port of the
+corresponding CUDA kernel, encoded row-parallel across cores (AVX2 where the
+CPU has it). The decode direction runs too: a GGUF Q4_0 checkpoint casts to
+`BF16` — the one scheme whose scales live inside the block, which no device
+kernel reads — so `convert` doubles as a GGUF-to-safetensors converter. Build
+with `--release` for real checkpoints. See
+`tests/golden/contracts/convert_bf16_to_mxfp4.json` for the smallest example.
+
+What `convert` still refuses, deliberately: `Repack` (a device kernel layout
+has no on-disk representation; it stays a load-time step), group contracts
+(instances share their template's names, so a checkpoint cannot hold them —
+declare the members as plain tensors and load the result with the group
+contract), and quantized *output* encodings outside {MXFP4, FP8, INT8}
+(safetensors has no tag for a GGUF or AWQ payload).
 
 Four optional positional arguments follow, in order: `BACKEND` (`cuda`|`metal`|
 `host`), `FUSION` (`fused`|`unfused`), `TP` (`RANK/SIZE`), and a JSON

@@ -86,10 +86,13 @@ int main() {
     MultiBatchPsos psos;
     std::string err;
     DecodeStepPsos base;
-    expect(load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/false, &err,
+    // This test checks the M>1 row ABI, not the quantization axis, so it names
+    // the pair the assertions below spell: gs_64/b_4.
+    const pie::metal::AffineFormat q{/*bits=*/4, /*group=*/64};
+    expect(load_decode_psos(*ctx, kernels_dir, base, q, /*with_argmax=*/false, &err,
                             /*fuse_residual=*/false, /*gdn_prep=*/true),
            "load_decode_psos compiles base kernels after MB row ABI additions (" + err + ")");
-    const bool ok = load_multibatch_psos(*ctx, kernels_dir, psos, /*with_d512=*/true, &err);
+    const bool ok = load_multibatch_psos(*ctx, kernels_dir, psos, q, /*with_d512=*/true, &err);
     expect(ok, "load_multibatch_psos compiles successfully (" + err + ")");
     expect(psos.embed_mb.valid(), "embed_gather_mb_4bit_bfloat16_gs_64_b_4 compiled");
     expect(psos.rope_mb.valid(), "rope_neox_mb_bfloat16 compiled");

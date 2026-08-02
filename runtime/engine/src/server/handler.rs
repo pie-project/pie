@@ -205,18 +205,6 @@ impl Session {
                         serde_json::Value::from(inf.fire.quorum.submit_ahead_fires),
                     );
                     stats.insert(
-                        format!("{}.fire.quorum.cold_hold_us", model_name),
-                        serde_json::Value::from(inf.fire.quorum.avg_cold_hold_us),
-                    );
-                    stats.insert(
-                        format!("{}.fire.quorum.cold_hold_fires", model_name),
-                        serde_json::Value::from(inf.fire.quorum.cold_hold_fires),
-                    );
-                    stats.insert(
-                        format!("{}.fire.quorum.cold_hold_us_sum", model_name),
-                        serde_json::Value::from(inf.fire.quorum.cold_hold_us_sum),
-                    );
-                    stats.insert(
                         format!("{}.fire.quorum.straggler_fires", model_name),
                         serde_json::Value::from(inf.fire.quorum.straggler_fires),
                     );
@@ -480,7 +468,10 @@ impl Session {
             return;
         }
 
-        if let Err(err) = inbox::send(process_id.to_string(), message) {
+        // A restarted request keeps its original id on the client side; the
+        // inbox belongs to whichever process is currently running that work.
+        let target = crate::inferlet::process::resolve(process_id);
+        if let Err(err) = inbox::send(target.to_string(), message) {
             tracing::error!(
                 process_id = %process_id,
                 error = %err,

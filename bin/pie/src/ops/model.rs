@@ -18,9 +18,9 @@ use crate::ops::hf::runtime_snapshot_allow_patterns;
 
 #[derive(Subcommand, Debug)]
 pub enum ModelCmd {
-    /// List repo IDs already in the local HF cache.
+    /// List the artifacts pie can serve, and any raw snapshots beside them.
     List,
-    /// Download a model snapshot by HuggingFace repo ID.
+    /// Fetch a model by HuggingFace repo ID and convert it to a `.zt` artifact.
     Download {
         repo_id: String,
         /// Download the complete HF snapshot, including alternate weight
@@ -28,21 +28,49 @@ pub enum ModelCmd {
         /// artifacts: config/tokenizer files and model*.safetensors.
         #[arg(long)]
         all: bool,
+        /// Fetch only. Leaves the HF snapshot as-is and writes no artifact —
+        /// for debugging, or for feeding the files to something other than pie.
+        #[arg(long)]
+        raw: bool,
+        /// Delete the HF snapshot once the artifact is written and verified.
+        /// Off by default: keeping it means a re-convert costs no download.
+        #[arg(long)]
+        clean: bool,
+        /// Convert even if an up-to-date artifact is already in the store.
+        #[arg(long)]
+        force: bool,
+        /// Split the artifact into shards of about this size (e.g. `16GiB`).
+        #[arg(long, value_name = "SIZE", value_parser = crate::ops::convert::parse_size)]
+        max_shard_size: Option<u64>,
     },
-    /// Remove a cached model by HuggingFace repo ID. Prompts for
-    /// confirmation; `--yes` skips the prompt.
+    /// Remove a stored artifact by name. Prompts for confirmation;
+    /// `--yes` skips the prompt.
     Remove {
-        repo_id: String,
+        /// The store name, as `pie model list` prints it.
+        name: String,
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Also delete the HF snapshot the artifact was converted from.
+        #[arg(long)]
+        staging: bool,
     },
+    /// Rewrite a checkpoint as pie's canonical `.zt` artifact.
+    Convert(crate::ops::convert::ConvertArgs),
 }
 
 pub fn run(cmd: ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::List => list(),
-        ModelCmd::Download { repo_id, all } => download(repo_id, all),
-        ModelCmd::Remove { repo_id, yes } => remove(repo_id, yes),
+        ModelCmd::Download {
+            repo_id,
+            all,
+            raw,
+            clean,
+            force,
+            max_shard_size,
+        } => download(repo_id, all, raw, clean, force, max_shard_size),
+        ModelCmd::Remove { name, yes, staging } => remove(name, yes, staging),
+        ModelCmd::Convert(args) => crate::ops::convert::run(args),
     }
 }
 
@@ -60,10 +88,6 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
         2 => Some(format!("{}/{}", parts[0], parts[1])),
         _ => None,
     }
-}
-
-fn repo_id_to_dirname(repo_id: &str) -> String {
-    format!("models--{}", repo_id.replace('/', "--"))
 }
 
 // -----------------------------------------------------------------------------
@@ -95,6 +119,7 @@ const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
     ("gptoss", "gptoss"),
     ("gpt_oss", "gptoss"),
     ("nemotron_h", "nemotron_h"),
+    ("kimi_k3", "kimi_k3"),
 ];
 
 /// Read `<repo_dir>/snapshots/<latest>/config.json` and look up its
@@ -144,45 +169,78 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
 // -----------------------------------------------------------------------------
 
 fn list() -> Result<()> {
-    let hub = hub_dir();
-    if !hub.exists() {
-        println!("(no HuggingFace cache at {})", hub.display());
-        return Ok(());
-    }
-
-    let mut entries: Vec<(String, bool, String)> = std::fs::read_dir(&hub)
-        .map_err(|e| anyhow!("read {hub:?}: {e}"))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let repo_id = dirname_to_repo_id(&name)?;
-            let (ok, info) = check_pie_compatibility(&e.path());
-            Some((repo_id, ok, info))
-        })
-        .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    if entries.is_empty() {
-        println!("(no models in cache)");
-        println!("\n{}", hub.display());
-        return Ok(());
-    }
-
     let colorize = std::io::stdout().is_terminal();
     let (green, dim, reset) = if colorize {
         ("\x1b[32m", "\x1b[2m", "\x1b[0m")
     } else {
         ("", "", "")
     };
-    for (repo_id, ok, info) in &entries {
-        if *ok {
-            println!("  {green}✓{reset} {repo_id} {dim}({info}){reset}");
-        } else {
-            println!("  {dim}○ {repo_id} ({info}){reset}");
+
+    // What pie can serve. This is the store, and it comes first because it is
+    // the answer to "what models do I have" — the HF cache below it is where
+    // these came *from*.
+    let artifacts = crate::ops::store::entries()?;
+    println!("Artifacts ({}):", crate::ops::store::dir().display());
+    if artifacts.is_empty() {
+        println!("  {dim}(none — `pie model download <org>/<name>`){reset}");
+    }
+    for entry in &artifacts {
+        let shards = match entry.shards() {
+            0 => String::new(),
+            n => format!(", {n} shards"),
+        };
+        let from = entry
+            .source
+            .as_deref()
+            .map(|s| format!(" ← {s}"))
+            .unwrap_or_default();
+        let by = entry
+            .written_by
+            .as_deref()
+            .map(|v| format!(" pie {v}"))
+            .unwrap_or_else(|| " provenance missing".to_string());
+        println!(
+            "  {green}●{reset} {} {dim}({}, {} tensors{shards}){reset}{dim}{from},{by}{reset}",
+            entry.name,
+            crate::ops::store::format_bytes(entry.bytes),
+            entry.tensors,
+        );
+    }
+
+    // Raw snapshots, marked as what they now are: staging for conversion,
+    // and disk that `--clean` or `pie model remove --staging` reclaims.
+    let hub = hub_dir();
+    let mut staged: Vec<(String, bool, String, u64)> = match std::fs::read_dir(&hub) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let repo_id = dirname_to_repo_id(&name)?;
+                let (ok, info) = check_pie_compatibility(&e.path());
+                let bytes = crate::ops::store::staging_bytes(&e.path());
+                Some((repo_id, ok, info, bytes))
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    staged.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if !staged.is_empty() {
+        let total: u64 = staged.iter().map(|(_, _, _, b)| b).sum();
+        println!(
+            "\nRaw snapshots ({}, {}):",
+            hub.display(),
+            crate::ops::store::format_bytes(total)
+        );
+        for (repo_id, ok, info, bytes) in &staged {
+            let mark = if *ok { "○" } else { "×" };
+            println!(
+                "  {dim}{mark} {repo_id} ({}, {info}){reset}",
+                crate::ops::store::format_bytes(*bytes)
+            );
         }
     }
-    println!("\n{dim}{}{reset}", hub.display());
     Ok(())
 }
 
@@ -190,7 +248,14 @@ fn list() -> Result<()> {
 // download
 // -----------------------------------------------------------------------------
 
-fn download(repo_id: String, all: bool) -> Result<()> {
+fn download(
+    repo_id: String,
+    all: bool,
+    raw: bool,
+    clean: bool,
+    force: bool,
+    max_shard_size: Option<u64>,
+) -> Result<()> {
     let (owner, name) = parse_repo_id(&repo_id)?;
 
     if all {
@@ -224,28 +289,58 @@ fn download(repo_id: String, all: bool) -> Result<()> {
     })?;
     println!("✓ Downloaded to {}", snapshot_path.display());
 
-    // Post-download compatibility check. The cache layout puts
-    // `snapshots/<commit>/` two levels below the repo dir we want to
-    // probe — walk back up to that root.
-    let repo_dir = snapshot_path
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf());
-    if let Some(repo_dir) = repo_dir {
-        let (ok, info) = check_pie_compatibility(&repo_dir);
-        let colorize = std::io::stdout().is_terminal();
-        let (green, yellow, dim, reset) = if colorize {
-            ("\x1b[32m", "\x1b[33m", "\x1b[2m", "\x1b[0m")
-        } else {
-            ("", "", "", "")
-        };
-        println!();
-        if ok {
-            println!("{green}✓{reset} Pie compatible (arch: {info})");
-            println!("Add to config.toml:");
-            println!("  {dim}hf_repo = \"{repo_id}\"{reset}");
-        } else {
-            println!("{yellow}!{reset} Not Pie compatible ({info})");
+    if raw {
+        println!("\n(--raw: no artifact written; `pie model convert {repo_id}` when you want one)");
+        return Ok(());
+    }
+
+    // Download is fetch *and* convert: what the runtime serves is the
+    // artifact, so a download that stopped at the snapshot would leave the
+    // user one undiscoverable step short of a usable model.
+    println!();
+    crate::ops::convert::run(crate::ops::convert::ConvertArgs {
+        source: repo_id.clone(),
+        out: None,
+        dry_run: false,
+        force,
+        delete_source: false,
+        max_shard_size,
+    })?;
+
+    let staging = crate::ops::store::staging_dir(&repo_id);
+    if clean {
+        if let Some(dir) = &staging {
+            // Only after `convert` returned Ok, which means the artifact is
+            // written; the snapshot is reconstructible by re-downloading, so
+            // this is the reversible half of the two.
+            let bytes = crate::ops::store::staging_bytes(dir);
+            std::fs::remove_dir_all(dir)
+                .map_err(|err| anyhow!("cannot delete {}: {err}", dir.display()))?;
+            println!(
+                "✓ Removed the HF snapshot ({} reclaimed)",
+                crate::ops::store::format_bytes(bytes)
+            );
+        }
+        return Ok(());
+    }
+
+    // The snapshot stays by default, so say what it costs. Keeping it means a
+    // re-convert needs no network; not saying so means the user discovers
+    // twice the disk usage on their own.
+    if let Some(dir) = &staging {
+        let bytes = crate::ops::store::staging_bytes(dir);
+        if bytes > 0 {
+            let colorize = std::io::stdout().is_terminal();
+            let (dim, reset) = if colorize {
+                ("\x1b[2m", "\x1b[0m")
+            } else {
+                ("", "")
+            };
+            println!(
+                "{dim}The HF snapshot is kept ({}), so a re-convert needs no download.\n\
+                 Add --clean, or `pie model remove {repo_id} --staging`, to reclaim it.{reset}",
+                crate::ops::store::format_bytes(bytes)
+            );
         }
     }
     Ok(())
@@ -432,84 +527,77 @@ fn format_bytes(n: u64) -> String {
 // remove
 // -----------------------------------------------------------------------------
 
-fn remove(repo_id: String, skip_confirm: bool) -> Result<()> {
-    let hub = hub_dir();
-    let model_dir = hub.join(repo_id_to_dirname(&repo_id));
-    if !model_dir.exists() {
+fn remove(name: String, skip_confirm: bool, staging: bool) -> Result<()> {
+    let entry = crate::ops::store::find(&name)?;
+    // A store name and a repo ID are different spellings of the same model
+    // (`Qwen/Qwen3-0.6B` ↔ `Qwen--Qwen3-0.6B`), and users will type either.
+    let repo_id = name.replace("--", "/");
+    let staging_dir =
+        crate::ops::store::staging_dir(&repo_id).or_else(|| crate::ops::store::staging_dir(&name));
+
+    if entry.is_none() && !(staging && staging_dir.is_some()) {
         bail!(
-            "model {repo_id:?} not found in cache ({})",
-            model_dir.display()
+            "no artifact named {name:?} in {}",
+            crate::ops::store::dir().display()
         );
     }
 
-    // Use hf-hub's scanner so the size we report dedups blobs shared
-    // between revisions of the same repo — matches `pie model remove`'s
-    // Python behavior (`huggingface_hub.scan_cache_dir`).
-    let size = scanned_repo_size(&repo_id).unwrap_or_else(|| dir_size(&model_dir).unwrap_or(0));
-    let mb = size as f64 / (1024.0 * 1024.0);
+    let mut what = Vec::new();
+    let mut bytes = 0u64;
+    if let Some(entry) = &entry {
+        let files = entry.files.len();
+        what.push(format!(
+            "artifact {name} ({}, {files} file(s))",
+            crate::ops::store::format_bytes(entry.bytes)
+        ));
+        bytes += entry.bytes;
+    }
+    if staging {
+        if let Some(dir) = &staging_dir {
+            let staged = crate::ops::store::staging_bytes(dir);
+            what.push(format!(
+                "its HF snapshot ({})",
+                crate::ops::store::format_bytes(staged)
+            ));
+            bytes += staged;
+        }
+    }
 
     if !skip_confirm {
         if !std::io::stdin().is_terminal() {
-            bail!("remove requires confirmation; rerun with `pie model remove {repo_id} --yes`");
+            bail!("remove requires confirmation; rerun with `pie model remove {name} --yes`");
         }
-        eprint!("Remove {repo_id} ({mb:.1} MiB)? [y/N] ");
+        eprint!(
+            "Remove {} ({} total)? [y/N] ",
+            what.join(" and "),
+            crate::ops::store::format_bytes(bytes)
+        );
         let _ = std::io::stderr().flush();
         let mut answer = String::new();
         std::io::stdin()
             .read_line(&mut answer)
             .map_err(|e| anyhow!("read stdin: {e}"))?;
-        let yes = matches!(answer.trim(), "y" | "Y" | "yes" | "YES");
-        if !yes {
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
             println!("(aborted)");
             return Ok(());
         }
     }
 
-    println!("Removing {repo_id} ({mb:.1} MiB)…");
-    // HF v1 stores blobs under each repo's own `blobs/` dir, not in a
-    // global pool — so removing the repo dir reclaims every blob it
-    // referenced. The Python CLI uses
-    // `huggingface_hub.scan_cache_dir.delete_revisions`; that API is
-    // moot here because the cross-repo blob sharing it accounts for
-    // doesn't exist in the on-disk layout.
-    std::fs::remove_dir_all(&model_dir).map_err(|e| anyhow!("remove {model_dir:?}: {e}"))?;
-    println!("✓ Removed");
-    Ok(())
-}
-
-/// Scan the HF cache and return the deduped repo size. Returns `None`
-/// if the scanner errors, the repo can't be found, or `tokio` fails to
-/// boot — callers fall back to a raw `dir_size` walk.
-fn scanned_repo_size(repo_id: &str) -> Option<u64> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
-    runtime.block_on(async move {
-        let client = hf_hub::HFClient::new().ok()?;
-        let info = client.scan_cache().send().await.ok()?;
-        info.repos
-            .into_iter()
-            .find(|r| r.repo_id == repo_id)
-            .map(|r| r.size_on_disk)
-    })
-}
-
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let mut total = 0;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            total += dir_size(&entry.path())?;
-        } else if metadata.is_file() {
-            total += metadata.len();
-        }
-        // Symlinks (HF cache uses them for snapshot/blob deduplication)
-        // are intentionally skipped — counting through them would
-        // double-count the blobs they point at.
+    if let Some(entry) = &entry {
+        crate::ops::store::remove(entry)?;
     }
-    Ok(total)
+    if staging {
+        if let Some(dir) = &staging_dir {
+            std::fs::remove_dir_all(dir)
+                .map_err(|e| anyhow!("cannot delete {}: {e}", dir.display()))?;
+        }
+    }
+    println!(
+        "✓ Removed {} ({} reclaimed)",
+        what.join(" and "),
+        crate::ops::store::format_bytes(bytes)
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -517,7 +605,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dirname_round_trips() {
+    fn a_cache_dirname_reads_back_as_a_repo_id() {
         assert_eq!(
             dirname_to_repo_id("models--Qwen--Qwen3-0.6B").as_deref(),
             Some("Qwen/Qwen3-0.6B"),
@@ -528,15 +616,6 @@ mod tests {
         );
         assert_eq!(dirname_to_repo_id("not-a-model"), None);
         assert_eq!(dirname_to_repo_id("models--a--b--c"), None);
-
-        assert_eq!(
-            repo_id_to_dirname("Qwen/Qwen3-0.6B"),
-            "models--Qwen--Qwen3-0.6B"
-        );
-        assert_eq!(
-            repo_id_to_dirname("bert-base-uncased"),
-            "models--bert-base-uncased"
-        );
     }
 
     #[test]

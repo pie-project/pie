@@ -95,24 +95,32 @@ void the_dag_skips_what_a_shared_layer_does_not_have() {
     }
     // Everything on the query side, and the whole FFN, runs on every layer.
     for (Kind k : {Kind::AttnNorm, Kind::QmvQ, Kind::QNorm, Kind::RopeQ, Kind::Sdpa,
-                   Kind::QmvO, Kind::PostAttnNorm, Kind::AttnResidual, Kind::FfnNorm,
+                   Kind::QmvO, Kind::PostAttnResidual, Kind::FfnNorm,
                    Kind::QmvGate, Kind::QmvUp, Kind::GegluTanh, Kind::QmvDown,
-                   Kind::PostFfnNorm, Kind::FfnResidual, Kind::LayerScalar}) {
+                   Kind::PostFfnResidual}) {
         expect_eq(count(dag, k), 35, "one per layer");
     }
-    // PLE: five layer-less precompute dispatches, five more per layer.
+    // PLE: four layer-less precompute dispatches, four more per layer -- the
+    // per-layer norm, its residual add and the learned scalar are one dispatch.
     expect_eq(count(dag, Kind::PleCombine), 1, "PLE precompute runs once");
-    expect_eq(count(dag, Kind::PleResidual), 35, "PLE residual runs per layer");
+    expect_eq(count(dag, Kind::PleResidualScaled), 35,
+              "the PLE residual, its norm and the layer scalar are one dispatch");
+    expect_eq(count(dag, Kind::LayerScalar), 0,
+              "so the standalone scalar does not run when there is a PLE to ride on");
 
     // The tail.
+    expect_eq(count(dag, Kind::RowGather), 1,
+              "the sampled rows are compacted once, before the tail");
     expect_eq(count(dag, Kind::FinalRms), 1, "one final norm");
     expect_eq(count(dag, Kind::LmHead), 1, "one logits matvec");
     expect_eq(count(dag, Kind::FinalSoftcap), 1, "gemma4 softcaps its logits");
 
-    // 1 embed + 4 PLE precompute + 35*(21 shared-safe) + owning extras + tail.
-    const int per_layer_always = 16 + 5;  // attention/FFN/scalar + per-layer PLE
+    // 1 embed + 4 PLE precompute + 35*(17 shared-safe) + owning extras + tail.
+    const int per_layer_always = 13 + 4;  // attention/FFN + per-layer PLE
     const int owning_extra = 6;           // k/v proj, k/v norm, rope_k, append
-    const int want = 1 + 4 + g.n_layers * per_layer_always + 15 * owning_extra + 4;
+    // Tail: row gather, final norm, LM head, softcap, and the argmax this DAG
+    // was built with.
+    const int want = 1 + 4 + g.n_layers * per_layer_always + 15 * owning_extra + 5;
     expect_eq(s.total, want, "the whole step is exactly this many dispatches");
 
     // Ordinals are dense and in order — they are the argument-table keys.
@@ -138,7 +146,9 @@ void a_family_without_ple_or_softcap_drops_those_dispatches() {
     g.num_kv_shared_layers = 0;
     const std::vector<Dispatch> dag = build_gemma4_dag(g, /*with_argmax=*/false);
     expect_eq(count(dag, Kind::PleCombine), 0, "no PLE precompute without a PLE table");
-    expect_eq(count(dag, Kind::PleResidual), 0, "and no per-layer PLE");
+    expect_eq(count(dag, Kind::PleResidualScaled), 0, "and no per-layer PLE");
+    expect_eq(count(dag, Kind::LayerScalar), 35,
+              "the layer scalar then runs on its own, with no PLE residual to ride on");
     expect_eq(count(dag, Kind::FinalSoftcap), 0, "no softcap when the config has none");
     expect_eq(count(dag, Kind::QmvK), 35, "every layer owns its KV when none is shared");
     expect_eq(count(dag, Kind::Argmax), 0, "argmax is opt-in");
@@ -188,11 +198,11 @@ void the_dataflow_never_reads_an_unwritten_value() {
     // read-before-write.
     std::vector<bool> written(std::size_t(plan.value_count), false);
     int read_before_write = 0;
-    int last_ordinal = -1;
+    int last_index = -1;
     bool ordered = true;
     for (const Use& u : plan.uses) {
-        ordered = ordered && u.ordinal >= last_ordinal;
-        last_ordinal = u.ordinal;
+        ordered = ordered && u.index >= last_index;
+        last_index = u.index;
         if (u.is_write) {
             written[std::size_t(u.value)] = true;
         } else if (!written[std::size_t(u.value)]) {
@@ -217,17 +227,19 @@ void the_dataflow_never_reads_an_unwritten_value() {
 
     // The residual stream has to be threaded, not reset: the last layer's
     // scalar output must reach the final norm.
-    int final_rms_ord = -1;
-    for (const Dispatch& d : dag) {
-        if (d.kind == Kind::FinalRms) final_rms_ord = d.ordinal;
+    // Positions, not ordinals: `Use::index` is the DAG position, which is what
+    // the dataflow's time axis means.
+    int final_rms_at = -1;
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        if (dag[i].kind == Kind::FinalRms) final_rms_at = int(i);
     }
     int final_rms_input = -2;
     for (const Use& u : plan.uses) {
-        if (u.ordinal == final_rms_ord && !u.is_write) final_rms_input = u.value;
+        if (u.index == final_rms_at && !u.is_write) final_rms_input = u.value;
     }
     int last_scalar_out = -3;
     for (const Use& u : plan.uses) {
-        if (u.ordinal < final_rms_ord && u.is_write) last_scalar_out = u.value;
+        if (u.index < final_rms_at && u.is_write) last_scalar_out = u.value;
     }
     expect_eq(final_rms_input, last_scalar_out,
               "the final norm reads what the last layer wrote");
@@ -289,6 +301,10 @@ struct Facts {
     bool double_wide_mlp = true;
     float final_softcap = 30.0f;
     float rope_theta_full = 1.0e6f, rope_theta_sliding = 1.0e4f, full_partial_rotary = 0.25f;
+    bool enable_moe = false;
+    int n_experts = 0, experts_per_token = 0, moe_intermediate = 0;
+    bool attention_k_eq_v = false;
+    int n_global_kv_heads = 0;
     bool present() const { return n_layers > 0 && hidden > 0; }
 };
 
@@ -365,6 +381,34 @@ void the_kv_region_is_sized_per_owning_layer() {
     expect(gdn_rule != want, "the full-attn-count rule would size this wrongly");
 }
 
+// The prefill DAG must describe the same model as the decode DAG.
+//
+// It is the same dispatch list with argument-table ordinals shifted clear, so
+// the two paths cannot come to describe different models -- which is the failure
+// that produces an engine whose prefill and decode disagree.
+void the_prefill_dag_is_the_decode_dag_with_room_for_its_own_binds() {
+    std::printf("[prefill DAG]\n");
+    Gemma4Geometry g;
+    const auto decode = build_gemma4_dag(g);
+    const int base = 100000;
+    const auto prefill = build_gemma4_dag_mb(g, base);
+
+    expect_eq(static_cast<long long>(prefill.size()),
+              static_cast<long long>(decode.size()), "same dispatch count");
+    int wrong_kind = 0, wrong_ordinal = 0, collides = 0;
+    for (std::size_t i = 0; i < decode.size(); ++i) {
+        if (prefill[i].kind != decode[i].kind || prefill[i].layer != decode[i].layer ||
+            prefill[i].sliding != decode[i].sliding) {
+            ++wrong_kind;
+        }
+        if (prefill[i].ordinal != decode[i].ordinal + base) ++wrong_ordinal;
+        if (prefill[i].ordinal <= decode.back().ordinal) ++collides;
+    }
+    expect(wrong_kind == 0, "every dispatch is the same kind, layer and attention type");
+    expect(wrong_ordinal == 0, "every ordinal is shifted by exactly the base");
+    expect(collides == 0, "and no prefill ordinal lands on a decode one");
+}
+
 }  // namespace
 
 int main() {
@@ -380,6 +424,7 @@ int main() {
     kv_redirect_stays_within_an_attention_type();
     a_config_either_describes_a_schedulable_shape_or_is_refused();
     the_kv_region_is_sized_per_owning_layer();
+    the_prefill_dag_is_the_decode_dag_with_room_for_its_own_binds();
     std::printf("\n==== gemma4_decode_step_test: %s ====\n",
                 g_failures == 0 ? "all passed" : "FAILURES");
     return g_failures == 0 ? 0 : 1;

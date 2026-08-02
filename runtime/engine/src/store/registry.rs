@@ -38,6 +38,10 @@ struct KvLockTraceRecord {
     wait_ns: u64,
     hold_ns: u64,
     tag: &'static str,
+    /// Exact call site. The `tag` groups sites by subsystem, but a convoy is
+    /// always ONE line -- typically one that allocates while holding the
+    /// lock -- so the group alone is not enough to act on.
+    caller: &'static std::panic::Location<'static>,
 }
 
 struct KvLockTrace {
@@ -90,12 +94,17 @@ impl KvLockTrace {
         }
         records.sort_unstable_by_key(|record| record.t_acquire_us);
         let mut output = BufWriter::new(File::create(&self.output)?);
-        writeln!(output, "t_acquire_us,wait_ns,hold_ns,tag")?;
+        writeln!(output, "t_acquire_us,wait_ns,hold_ns,tag,caller")?;
         for record in records {
             writeln!(
                 output,
-                "{},{},{},{}",
-                record.t_acquire_us, record.wait_ns, record.hold_ns, record.tag
+                "{},{},{},{},{}:{}",
+                record.t_acquire_us,
+                record.wait_ns,
+                record.hold_ns,
+                record.tag,
+                record.caller.file(),
+                record.caller.line()
             )?;
         }
         output.flush()?;
@@ -148,6 +157,7 @@ impl Drop for KvTaintOnPanic {
 }
 
 #[inline(always)]
+#[track_caller]
 pub fn with_kv_lock<T>(
     store: &parking_lot::Mutex<KvStore>,
     tag: &'static str,
@@ -158,6 +168,7 @@ pub fn with_kv_lock<T>(
         "KV store tainted by an earlier panic mid-mutation ({tag})"
     );
     let taint = KvTaintOnPanic;
+    let caller = std::panic::Location::caller();
     if !kv_lock_trace_enabled() {
         let mut guard = store.lock();
         let result = operation(&mut guard);
@@ -179,6 +190,7 @@ pub fn with_kv_lock<T>(
         wait_ns,
         hold_ns,
         tag,
+        caller,
     });
     result
 }

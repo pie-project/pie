@@ -35,6 +35,35 @@
 #define PIE_DEVICE_PORT_ATTN_MASK (1 << 7)
 
 /**
+ * Recurrent-state buffered-slot family. The driver resolves the buffered
+ * slab CSR (`rs_buffer_pages` / `rs_buffer_indptr`), the per-row live
+ * buffered length, and the buffered write descriptor from device channel
+ * cells pre-forward — the RS mirror of the KV `pages` / `page-indptr` /
+ * `kv-len` / `w-slot` / `w-off` set.
+ *
+ * Orthogonal to the geometry-class port sets below: those describe how a
+ * pass resolves its ATTENTION geometry, and a recurrent-only pass has none.
+ * A backend advertises these bits independently.
+ */
+#define PIE_DEVICE_PORT_RS_BUFFER_PAGES (1 << 8)
+
+#define PIE_DEVICE_PORT_RS_BUFFER_INDPTR (1 << 9)
+
+#define PIE_DEVICE_PORT_RS_BUFFER_LEN (1 << 10)
+
+#define PIE_DEVICE_PORT_RS_W_SLOT (1 << 11)
+
+#define PIE_DEVICE_PORT_RS_W_OFF (1 << 12)
+
+/**
+ * Full device-resolved port mask of the recurrent-state buffered-slot
+ * family. A guest may bind `rs-geometry`'s channel fields only on a backend
+ * advertising every one of these bits; otherwise the host rejects the
+ * binding rather than silently ignoring it.
+ */
+#define PIE_DEVICE_RS_BUFFER_PORTS ((((PIE_DEVICE_PORT_RS_BUFFER_PAGES | PIE_DEVICE_PORT_RS_BUFFER_INDPTR) | PIE_DEVICE_PORT_RS_BUFFER_LEN) | PIE_DEVICE_PORT_RS_W_SLOT) | PIE_DEVICE_PORT_RS_W_OFF)
+
+/**
  * Full device-resolved port mask of the `DecodeEnvelope` geometry class.
  * Driver-neutral: any backend that executes the class resolves exactly these
  * ports on device.
@@ -68,8 +97,38 @@
  * verdicts and intrinsic side-table analysis the CUDA driver derives for
  * itself in `region_support.hpp`. Additive, and empty means "not supplied",
  * but the struct grew, so drivers and workers ship together.
+ * v21: `PieLaunchDesc::rs_buffer_read_*` — the buffered prefix a fire must
+ * REPLAY before its own tokens, so a recurrence can start from
+ * `folded ⊕ replay(buffer)` instead of only from the folded boundary.
+ * Separate from the write CSR because a write may allocate a slab and a read
+ * must not. Additive, and an empty read side means "nothing to replay", but
+ * the struct grew, so drivers and workers ship together.
+ * v22: `PieLaunchDesc::rs_buffer_heads` — where each row's logical buffer
+ * token 0 physically sits. A fold absorbs tokens off the front of the buffer
+ * but can only release WHOLE covered pages, and `fold_granularity` is 1 while
+ * a buffer page is the KV page size, so a fold routinely lands mid-page and
+ * the survivors keep their offsets. Every buffer span the driver walks is
+ * therefore `head + logical`. Zero for a buffer that was never partially
+ * folded, which is why this was invisible until the replay path landed.
+ * v23: `PIE_RS_FLAG_BUFFER_WRITE` — a new bit in `rs_slot_flags` marking a
+ * row whose buffer span is a WRITE. Orthogonal to `PIE_RS_FLAG_FOLD`: a pass
+ * may scatter its own tokens into the buffer AND fold a prefix of the result
+ * in one go, and the two flags together are what tell a write-and-fold (run
+ * the extended `[buffered | new]` layout, snapshot the state at
+ * `rs_fold_lens[r]`) apart from a pure commit (whose rows ARE the replay).
+ * No struct grew, but an older driver rejects the unknown bit, so drivers and
+ * workers ship together.
+ * v24: `PIE_RS_FLAG_FOLD_LEN_DEVICE` — a new bit in `rs_slot_flags` marking a
+ * row whose fold length the WORKER DOES NOT KNOW. The value lives in the
+ * `rs_fold_len` descriptor port, which the driver resolves at compose time,
+ * so a speculative decode's accepted count never has to round-trip through
+ * the host between the fire that computes it and the fire that folds it.
+ * `rs_fold_lens[r]` is a placeholder for such a row and MUST be ignored; the
+ * driver clamps the resolved value to the row's replay length. No struct
+ * grew, but an older driver rejects the unknown bit, so drivers and workers
+ * ship together.
  */
-#define PIE_DRIVER_ABI_VERSION 19
+#define PIE_DRIVER_ABI_VERSION 24
 
 #define PIE_MODEL_COMPONENT_FULL 0
 
@@ -150,6 +209,24 @@
  * Fold buffered recurrent-state data into the slot after the pass.
  */
 #define PIE_RS_FLAG_FOLD 2
+
+/**
+ * The pass SCATTERS its own tokens into the buffer. Orthogonal to `FOLD`: a
+ * pass may write the buffer and fold a prefix of the result in one go, and
+ * the two together are what distinguishes a write-and-fold (which runs the
+ * extended `[buffered | new]` layout and snapshots the state at
+ * `rs_fold_lens[r]`) from a pure commit (whose rows ARE the replay, gathered
+ * straight from the slabs).
+ */
+#define PIE_RS_FLAG_BUFFER_WRITE 4
+
+/**
+ * This row's fold length is NOT host-known. `rs_fold_lens[r]` is a
+ * placeholder and must be ignored; the real value comes from the
+ * `rs_fold_len` descriptor port, which the driver resolves once the fire that
+ * computes it has completed, and clamps to the row's replay length.
+ */
+#define PIE_RS_FLAG_FOLD_LEN_DEVICE 8
 
 /**
  * Concrete F32 channel element type.
@@ -401,6 +478,14 @@
 #define RS_FLAG_RESET 1
 
 #define RS_FLAG_FOLD 2
+
+#define RS_FLAG_BUFFER_WRITE 4
+
+/**
+ * This row's fold length is not host-known; it comes from the `rs_fold_len`
+ * descriptor port and `rs_fold_lens[r]` is a placeholder.
+ */
+#define RS_FLAG_FOLD_LEN_DEVICE 8
 
 #define REMOTE_WIRE_VERSION 8
 
@@ -1401,6 +1486,29 @@ typedef struct PieStepDesc {
   struct PieU32Slice rs_fold_lens;
   struct PieU32Slice rs_buffer_slot_ids;
   struct PieU32Slice rs_buffer_slot_indptr;
+  /**
+   * Buffered slabs the fire REPLAYS, with the row CSR (`rows + 1`), and the
+   * token count to replay from each row's slabs (`rows` entries).
+   *
+   * Distinct from `rs_buffer_slot_ids`, which is what the fire WRITES: a
+   * write may materialize or privatize a slab, a read must not, and a read
+   * of a merely reserved page would gather uninitialized activations
+   * straight into the recurrent state. All three are empty when no row has
+   * anything buffered, which is the common case.
+   */
+  struct PieU32Slice rs_buffer_read_slot_ids;
+  struct PieU32Slice rs_buffer_read_indptr;
+  struct PieU32Slice rs_buffer_read_lens;
+  struct PieU32Slice rs_buffer_heads;
+  /**
+   * WorkingSet-relative buffer page -> physical slot for channel-resolved
+   * `rs-geometry`, concatenated over request rows. `rs_translation_indptr`
+   * is the row CSR (`rows + 1`). Per ROW, unlike `kv_translation`, because
+   * a pass binds one RS working set per request rather than one per pass.
+   * `0xFFFF_FFFF` marks a reserved-but-unmaterialized page.
+   */
+  struct PieU32Slice rs_translation;
+  struct PieU32Slice rs_translation_indptr;
   struct PieMaskWordsDesc masks;
   /**
    * Model readout rows, flattened across the batch.

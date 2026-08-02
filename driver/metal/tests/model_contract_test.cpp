@@ -34,6 +34,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "model_facts.hpp"
 #include "pie_loader.h"
 #include "pie_loader/model_contract.hpp"
 #include "pie_loader/plan.hpp"
@@ -97,7 +98,7 @@ void test_affine_u4_authors_the_quant_spec_the_kernels_need() {
                                   pie_loader::raw(pie_loader::PieLoaderDType::BF16));
 
     pie_loader::ModelContract c;
-    pie::metal::model::contract_detail::push_mlx_affine_u4(c, raw, scales, biases, "layers.0.w");
+    pie::metal::model::contract_detail::push_mlx_affine_declared(c, raw, scales, biases, 4, 0, "layers.0.w");
     const auto v = c.view();
 
     check(v.tensors.len == 1, "the triplet is one declaration");
@@ -166,7 +167,7 @@ void test_the_derived_group_size_is_what_heap_bind_demands() {
         const auto biases = tensor_of("w.biases", group_shape,
                                       pie_loader::raw(pie_loader::PieLoaderDType::BF16));
         pie_loader::ModelContract contract;
-        pie::metal::model::contract_detail::push_mlx_affine_u4(contract, raw, scales, biases, "w");
+        pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales, biases, 4, 0, "w");
         const auto v = contract.view();
         check(v.tensors.len == 1 && v.tensors.ptr[0].encoding.quant.group_size == c.expected,
               "group size " + std::to_string(c.expected) + " derived from " +
@@ -175,11 +176,69 @@ void test_the_derived_group_size_is_what_heap_bind_demands() {
     }
 }
 
+// The one thing the tensors cannot say.
+//
+// A weight quantized 8-bit in groups of 64 and one quantized 4-bit in groups of
+// 128 have identical shapes: the same u32 count against the same number of
+// scales. So a schema that assumes the width and solves for the group cannot be
+// wrong in a way the shapes reveal -- it just names a group nobody used, and
+// mlx-community's 8-bit Llama-3.2-1B was refused as "g128/b4", a quantization
+// that does not exist. The width has to come from `config.json`, and this is
+// what says the two are then cross-checked rather than one being trusted.
+void test_the_declared_width_is_checked_against_the_shapes() {
+    // 4096 logical columns at 8 bits is 1024 u32 words; at 4 bits it is 512.
+    const std::vector<std::int64_t> packed8{8, 1024};
+    const std::vector<std::int64_t> groups64{8, 64};
+    const auto bf16 = pie_loader::raw(pie_loader::PieLoaderDType::BF16);
+    const auto raw = tensor_of("w.weight", packed8, pie_loader::raw(pie_loader::PieLoaderDType::U32));
+    const auto scales = tensor_of("w.scales", groups64, bf16);
+    const auto biases = tensor_of("w.biases", groups64, bf16);
+
+    {
+        pie_loader::ModelContract contract;
+        pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales, biases,
+                                                                     8, 64, "w");
+        const auto v = contract.view();
+        check(v.tensors.len == 1 && v.tensors.ptr[0].encoding.quant.group_size == 64 &&
+                  v.tensors.ptr[0].encoding.quant.bits_per_element == 8,
+              "an 8-bit g64 triplet is described as 8-bit g64 when the config says 8 bits");
+    }
+    {
+        // The same bytes with the config's width set to 4 -- which is what a
+        // file-wide `quantization` block says about a checkpoint whose per
+        // tensor overrides push a few projections to 8. The GROUP is the
+        // number that holds for the whole file, so it wins, and the width is
+        // read back out of the shapes as 8 rather than believed as 4.
+        pie_loader::ModelContract contract;
+        pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales, biases,
+                                                                     4, 64, "w");
+        const auto v = contract.view();
+        check(v.tensors.len == 1 && v.tensors.ptr[0].encoding.quant.group_size == 64 &&
+                  v.tensors.ptr[0].encoding.quant.bits_per_element == 8,
+              "a file-wide 4-bit declaration does not override an 8-bit tensor's own shapes");
+    }
+    {
+        // The group is now the one told number, so a wrong one is the one way
+        // left to mis-describe these bytes -- and it has to fail rather than
+        // resolve, because g32 over these shapes implies a 16-bit width that
+        // no affine kernel here reads.
+        pie_loader::ModelContract contract;
+        bool threw = false;
+        try {
+            pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales,
+                                                                         biases, 8, 32, "w");
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        check(threw, "a declared group the shapes contradict is refused, not silently widened");
+    }
+}
+
 bool authoring_throws(const pie_loader::SourceTensor& raw, const pie_loader::SourceTensor& scales,
                       const pie_loader::SourceTensor& biases) {
     pie_loader::ModelContract contract;
     try {
-        pie::metal::model::contract_detail::push_mlx_affine_u4(contract, raw, scales, biases, "w");
+        pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales, biases, 4, 0, "w");
     } catch (const std::exception&) {
         return true;
     }
@@ -228,6 +287,31 @@ void test_every_name_is_mapped_or_refused() {
               std::string(from) + " -> " + std::string(to));
     };
     mapped("lm_head.weight", "shared_embedding.weight");
+    // The untied member of the same family, spelled by the repack. 0.8B ships
+    // tied and has no `lm_head`; 35B-A3B ships untied and has one, under the
+    // wrapper. Authoring stopped on this name.
+    mapped("language_model.lm_head.weight", "shared_embedding.weight");
+    mapped("language_model.lm_head.biases", "shared_embedding.biases");
+    // ── and the same two names when the head is NOT the table ──
+    // A tied checkpoint has one tensor and one slot, so both ends land on
+    // `shared_embedding`. An untied one has two, and mapping them both onto
+    // that slot declares it twice -- which is how this was found: every routed
+    // member of the family is untied, and the load stopped with a duplicate.
+    // `LmHeadUntied` and `EmbedUntied` bind these names.
+    {
+        const detail::HeadTying untied{false};
+        const auto mapped_untied = [&untied](std::string_view from, std::string_view to) {
+            const auto got = detail::runtime_name(from, untied);
+            check(got.has_value() && *got == to,
+                  std::string("untied: ") + std::string(from) + " -> " + std::string(to));
+        };
+        mapped_untied("lm_head.weight", "lm_head.weight");
+        mapped_untied("language_model.lm_head.scales", "lm_head.scales");
+        mapped_untied("model.language_model.embed_tokens.weight", "embed_tokens.weight");
+        mapped_untied("language_model.model.embed_tokens.biases", "embed_tokens.biases");
+        // Everything else is indifferent to tying, and must stay so.
+        mapped_untied("model.language_model.norm.weight", "final_norm.weight");
+    }
     // The tied half: this family ships tied, so its checkpoint has an
     // `embed_tokens` and no `lm_head`, and both land in the one shared slot
     // `EmbedGather` and `QmvLmHead` bind.
@@ -243,6 +327,24 @@ void test_every_name_is_mapped_or_refused() {
     check(!detail::runtime_name("mtp.layers.0.weight").has_value(),
           "the MTP head is skipped");
 
+    // The same checkpoint, spelled by mlx_lm's repack rather than by the HF
+    // release: the wrapper and the language tower swap places. Both are real
+    // and both are this family, and the driver read only the first -- so
+    // authoring against an actual mlx Qwen3.5 stopped on its first tensor.
+    // These are the same six names as above with the prefix swapped, which is
+    // the point: only the prefix may differ.
+    mapped("language_model.model.embed_tokens.weight", "shared_embedding.weight");
+    mapped("language_model.model.embed_tokens.scales", "shared_embedding.scales");
+    mapped("language_model.model.norm.weight", "final_norm.weight");
+    mapped("language_model.model.layers.31.self_attn.q_proj.weight",
+           "layers.31.self_attn.q_proj.weight");
+    mapped("language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+           "layers.0.linear_attn.in_proj_qkv.weight");
+    mapped("language_model.model.layers.3.mlp.switch_mlp.up_proj.weight",
+           "layers.3.mlp.experts.up_proj.weight");
+    check(!detail::runtime_name("vision_tower.blocks.0.attn.qkv.weight").has_value(),
+          "and its vision tower is skipped under that spelling too");
+
     const auto refused = [](std::string_view name) {
         try {
             (void)detail::runtime_name(name);
@@ -251,9 +353,50 @@ void test_every_name_is_mapped_or_refused() {
         }
         return false;
     };
+    // The mixture. `mlx_lm` wraps a routed FFN in a `SwitchGLU`, so a
+    // Qwen3-Next MoE checkpoint spells its stacked banks `mlp.switch_mlp.*`;
+    // the driver's dispatches read `mlp.experts.*`. Until the family learned
+    // this, the pass-through mapped `switch_mlp` onto itself: every expert was
+    // declared, loaded into the heap, and read by nothing, and the router --
+    // whose `mlp.gate` DID map -- routed tokens to weights the driver never
+    // bound. Note that `mlp.gate` is asserted above and `mlp.gate_proj` is a
+    // different tensor; the two differ by a suffix and one is a router.
+    mapped("model.language_model.layers.3.mlp.switch_mlp.gate_proj.weight",
+           "layers.3.mlp.experts.gate_proj.weight");
+    mapped("model.language_model.layers.3.mlp.switch_mlp.down_proj.scales",
+           "layers.3.mlp.experts.down_proj.scales");
+    // And the fused export's spelling is already the driver's, so it passes
+    // through unchanged rather than being rewritten twice.
+    mapped("model.language_model.layers.3.mlp.experts.up_proj.weight",
+           "layers.3.mlp.experts.up_proj.weight");
+
     check(refused("model.embed_tokens.weight"), "an unmapped name is an error, not a pass-through");
     check(refused("model.language_model.layers.x.weight"), "a non-numeric layer index is an error");
     check(refused("model.language_model.layers.7"), "a layer tensor with no suffix is an error");
+    // A mixture this driver cannot run, refused at load with the tensor's name
+    // on it rather than loaded and ignored: a stock HF checkpoint ships the
+    // experts unstacked, and binding those would need a load-time gather this
+    // driver does not do -- guessing gives every token expert 0, which is
+    // fluent.
+    check(refused("model.language_model.layers.3.mlp.experts.0.gate_proj.weight"),
+          "an unstacked expert bank is refused, not silently bound to expert 0");
+    // The shared expert, which this driver now DISPATCHES. Its four tensors
+    // pass through under their own names -- `weights_for_kind` asks for exactly
+    // these -- and the assertion is that they are mapped and not merely
+    // tolerated, because a name that reaches the heap under a spelling no
+    // dispatch reads is the failure the refusal used to prevent.
+    for (const char* n : {"mlp.shared_expert.gate_proj.weight",
+                          "mlp.shared_expert.up_proj.scales",
+                          "mlp.shared_expert.down_proj.biases",
+                          "mlp.shared_expert_gate.weight"}) {
+        mapped(std::string("model.language_model.layers.3.") + n,
+               std::string("layers.3.") + n);
+    }
+    // The PLURAL spelling is still refused. `mlp.shared_experts.` is DeepSeek's,
+    // where several shared experts are stacked on an axis this block has no
+    // index for; taking the first would be one expert of several, silently.
+    check(refused("model.language_model.layers.3.mlp.shared_experts.gate_proj.weight"),
+          "a STACK of shared experts is still refused");
 }
 
 void test_the_schema_owns_its_model_types() {
@@ -262,9 +405,18 @@ void test_the_schema_owns_its_model_types() {
                                  "qwen3_6"}) {
         check(model::is_supported_model_type(yes), std::string(yes) + " is this schema's");
     }
-    for (std::string_view no : {"llama", "qwen3", "qwen3_5_vision", ""}) {
-        check(!model::is_supported_model_type(no), std::string(no) + " is not this schema's");
+    for (std::string_view no : {"qwen3_5_vision", ""}) {
+        check(!model::is_supported_model_type(no), std::string(no) + " is nobody's");
     }
+    // `llama` and `qwen3` ARE supported -- by the llama schema, not this one.
+    // Which is the point of asking: one table answers "whose", so a name that
+    // two schemas both claimed would be a routing bug rather than a coin toss.
+    for (std::string_view ll : {"llama", "llama3", "mistral", "qwen2", "qwen3", "qwen3_moe"}) {
+        check(model::model_family_of(ll) == model::ModelFamily::Llama,
+              std::string(ll) + " routes to the llama schema");
+    }
+    check(model::model_family_of("qwen3_5") == model::ModelFamily::Qwen35,
+          "qwen3_5 still routes to this one");
 
     // The refusal has to happen before anything is authored, or a caller gets a
     // half-built contract and a message about a missing tensor.
@@ -272,7 +424,7 @@ void test_the_schema_owns_its_model_types() {
     pie_loader::ModelContract contract;
     bool threw = false;
     try {
-        model::author_model_contract(empty, "llama", pie::metal::metal_device_target(), contract);
+        model::author_model_contract(empty, "gpt2", pie::metal::metal_device_target(), contract);
     } catch (const std::exception&) {
         threw = true;
     }
@@ -313,12 +465,14 @@ void check_well_formed(const pie_loader::Checkpoint& checkpoint,
                   std::string("Src '") + std::string(view_of(n.name)) +
                       "' names a tensor the checkpoint has");
         }
-        // This driver renames and reinterprets; it shards nothing and packs
-        // nothing. Anything else appearing here is a schema that grew a
-        // transform the Metal binder has no kernel for.
+        // This driver renames, reinterprets, and narrows a float that is not
+        // already BF16; it shards nothing and packs nothing. Anything else
+        // appearing here is a schema that grew a transform the Metal binder has
+        // no kernel for.
         check(kind_of(n) == pie_loader::PieLoaderExprKind::Src ||
-                  kind_of(n) == pie_loader::PieLoaderExprKind::Transmute,
-              "the Metal schema authors only Src and Transmute");
+                  kind_of(n) == pie_loader::PieLoaderExprKind::Transmute ||
+                  kind_of(n) == pie_loader::PieLoaderExprKind::Cast,
+              "the Metal schema authors only Src, Transmute and Cast");
     }
     check(sources > 0, "the contract reads the checkpoint");
 }
@@ -360,14 +514,27 @@ void author_real_contract(const std::string& snapshot, const std::string& model_
 int main() {
     test_affine_u4_authors_the_quant_spec_the_kernels_need();
     test_the_derived_group_size_is_what_heap_bind_demands();
+    test_the_declared_width_is_checked_against_the_shapes();
     test_a_malformed_triplet_is_refused();
     test_every_name_is_mapped_or_refused();
     test_the_schema_owns_its_model_types();
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");
     if (snapshot != nullptr && *snapshot != '\0') {
-        const char* model_type = std::getenv("PIE_TEST_MODEL_TYPE");
-        author_real_contract(snapshot, model_type != nullptr ? model_type : "qwen3_5");
+        // Read from the checkpoint, not defaulted. This used to fall back to
+        // "qwen3_5", so pointing it at a Llama snapshot ran the WRONG schema and
+        // reported "Qwen3.5 schema has no mapping for model.embed_tokens.biases"
+        // -- a true sentence about a question nobody asked. `PIE_TEST_MODEL_TYPE`
+        // still overrides, for the case where the point is to run a schema
+        // against a checkpoint it does not claim.
+        const char* forced = std::getenv("PIE_TEST_MODEL_TYPE");
+        std::string model_type = forced != nullptr ? forced
+                                                   : pie::metal::read_model_facts(snapshot).model_type;
+        if (model_type.empty()) {
+            check(false, "the snapshot's config.json names no model_type");
+        } else {
+            author_real_contract(snapshot, model_type);
+        }
     }
 
     if (failures != 0) {

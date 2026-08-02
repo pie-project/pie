@@ -51,9 +51,10 @@
 //! silently corrupt the constraint instead of failing, so it is checked here
 //! rather than assumed.
 
-use inferlet::mask::bit_allowed;
-use inferlet::ptir::prelude::*;
-use inferlet::{Constrain, JsonSchema, Result, Schema, chat, model as wit_model};
+use inferlet::chat;
+use inferlet::grammar::{Grammar, Matcher};
+use inferlet::mask::unpack_mask;
+use inferlet::ptir::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -131,15 +132,6 @@ struct Output {
     rollback_checks: usize,
 }
 
-fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
-    if packed.is_empty() {
-        return vec![true; vocab as usize];
-    }
-    (0..vocab as usize)
-        .map(|token| bit_allowed(packed, token))
-        .collect()
-}
-
 /// Longest-suffix prompt lookup over the committed history (CacheBack-style).
 fn draft_from_cache(tokens: &[u32], draft_length: usize, max_ngram: usize) -> Vec<u32> {
     if draft_length == 0 || tokens.len() < 2 {
@@ -194,17 +186,15 @@ async fn verify(
 
     let ws = WorkingSet::new();
     let max_pages = total.div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve verification KV: {e}"))?;
-    let tokens = Channel::from(input.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let embed_indptr = Channel::from(vec![0u32, total]).named("embed_indptr");
-    let positions = Channel::from((0..total).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
-    let w_slot =
-        Channel::from((0..total).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot");
-    let w_off = Channel::from((0..total).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off");
-    let kv_len = Channel::from(vec![total]).named("kv_len");
+    ws.reserve(max_pages).context("reserve verification KV")?;
+    let tokens = Channel::from_iter(input.iter().map(|&token| token as i32));
+    let embed_indptr = Channel::from([0u32, total]).named("embed_indptr");
+    let positions = Channel::from_iter(0..total).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((0..total).map(|p| p / page_size)).named("w_slot");
+    let w_off = Channel::from_iter((0..total).map(|p| p % page_size)).named("w_off");
+    let kv_len = Channel::from([total]).named("kv_len");
     let readout = Channel::from(readout).named("readout");
     // One row of the allowed-token mask per readout row. The SDK reshapes a
     // single-row `logits` to `[vocab]`, so the mask has to follow suit or the
@@ -222,15 +212,17 @@ async fn verify(
     fwd.readout(&readout)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         target_out.put(masked_argmax(intrinsics::logits(), allowed.take()));
@@ -238,13 +230,10 @@ async fn verify(
 
     allowed.put(masks.concat());
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline)
-        .map_err(|e| format!("verify constrained draft: {e}"))?;
+    fwd.submit(&pipeline).context("verify constrained draft")?;
     let target = target_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read verification result: {e}"))?
+        .take_host::<Vec<i32>>()
+        .await?
         .into_iter()
         .map(|token| token as u32)
         .collect();
@@ -258,9 +247,9 @@ async fn main(input: Input) -> Result<Output> {
         return Err("max_tokens must be at least 1".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
-    let page_size = WorkingSet::new().page_size();
-    let mut constraint = JsonSchema(&input.schema).build_constraint()?;
+    let vocab = model::output_vocab_size();
+    let page_size = kv_page_size();
+    let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
     let mut committed = chat::system_user(
         "Generate only the requested JSON value, with no markdown or explanation.",
@@ -296,8 +285,8 @@ async fn main(input: Input) -> Result<Output> {
                 break;
             }
             constraint
-                .advance(&[token])
-                .map_err(|e| format!("grammar rejected a drafted token: {e}"))?;
+                .accept_tokens(&[token])
+                .context("grammar rejected a drafted token")?;
             draft.push(token);
             if constraint.is_terminated() {
                 // Nothing follows a completed document; the bonus row would
@@ -359,8 +348,8 @@ async fn main(input: Input) -> Result<Output> {
 
         for token in accepted {
             constraint
-                .advance(&[token])
-                .map_err(|e| format!("accepted token violates the grammar: {e}"))?;
+                .accept_tokens(&[token])
+                .context("accepted token violates the grammar")?;
             committed.push(token);
             generated.push(token);
             if constraint.is_terminated() || generated.len() == input.max_tokens {
@@ -376,7 +365,7 @@ async fn main(input: Input) -> Result<Output> {
         ));
     }
 
-    let text = wit_model::decode(&generated)?;
+    let text = model::decode(&generated)?;
     serde_json::from_str::<Value>(&text)
         .map_err(|e| format!("constraint terminated with invalid JSON: {e}; output={text:?}"))?;
     let acceptance_rate = if total_drafted == 0 {

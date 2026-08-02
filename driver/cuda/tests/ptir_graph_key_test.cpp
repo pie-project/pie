@@ -109,8 +109,8 @@ int main() {
         pie_cuda_driver::model::workspace_mtp_draft_row_base(1024) == 1024 &&
             pie_cuda_driver::model::workspace_logits_rows(1024, 40) == 1064,
         "workspace reserves every target token row before MTP drafts");
-    const pie_native::launch::StructuredMaskDescriptor sliding_masks[] = {
-        {pie_native::launch::StructuredMaskKind::SlidingWindow, 8, 0, 4},
+    const pie::driver::fire::StructuredMaskDescriptor sliding_masks[] = {
+        {pie::driver::fire::StructuredMaskKind::SlidingWindow, 8, 0, 4},
     };
     const std::uint32_t tail_positions[] = {6, 7};
     const std::uint32_t arbitrary_positions[] = {1, 7};
@@ -133,7 +133,7 @@ int main() {
         static_cast<std::uint32_t>(std::numeric_limits<int>::max()) + 2u;
     expect(
         !pie_cuda_driver::pipeline::runtime_window_for_tail_aligned(
-             std::span<const pie_native::launch::StructuredMaskDescriptor>(
+             std::span<const pie::driver::fire::StructuredMaskDescriptor>(
                  &oversized_window, 1),
              tail_positions, tail_qo, tail_pages, tail_last, 16)
              .has_value(),
@@ -156,36 +156,36 @@ int main() {
     const std::uint8_t folded_rs_flags[] = {PIE_RS_FLAG_RESET, 0};
     const std::uint32_t buffered_rs_slots[] = {900, 901};
     const std::uint32_t buffered_rs_indptr[] = {0, 1, 2};
-    pie_native::LaunchView mixed_view{};
+    pie::driver::fire::LaunchView mixed_view{};
     mixed_view.ptir_program_hashes =
-        pie_native::slice_from_u64(program_hashes, 2);
+        pie::driver::slice_from_u64(program_hashes, 2);
     mixed_view.ptir_program_row_indptr =
-        pie_native::slice_from_u32(program_rows, 3);
+        pie::driver::slice_from_u32(program_rows, 3);
     mixed_view.token_ids =
-        pie_native::slice_from_u32(wire_tokens, 1);
+        pie::driver::slice_from_u32(wire_tokens, 1);
     mixed_view.position_ids =
-        pie_native::slice_from_u32(wire_positions, 1);
+        pie::driver::slice_from_u32(wire_positions, 1);
     mixed_view.qo_indptr =
-        pie_native::slice_from_u32(wire_qo, 2);
+        pie::driver::slice_from_u32(wire_qo, 2);
     mixed_view.kv_page_indices =
-        pie_native::slice_from_u32(wire_pages, 1);
+        pie::driver::slice_from_u32(wire_pages, 1);
     mixed_view.kv_page_indptr =
-        pie_native::slice_from_u32(wire_page_ptr, 2);
+        pie::driver::slice_from_u32(wire_page_ptr, 2);
     mixed_view.kv_last_page_lens =
-        pie_native::slice_from_u32(wire_last, 1);
+        pie::driver::slice_from_u32(wire_last, 1);
     mixed_view.sampling_indices =
-        pie_native::slice_from_u32(wire_samples, 1);
+        pie::driver::slice_from_u32(wire_samples, 1);
     mixed_view.sampling_indptr =
-        pie_native::slice_from_u32(wire_sample_ptr, 2);
+        pie::driver::slice_from_u32(wire_sample_ptr, 2);
     mixed_view.rs_slot_ids =
-        pie_native::slice_from_u32(folded_rs_slots, 2);
+        pie::driver::slice_from_u32(folded_rs_slots, 2);
     mixed_view.rs_slot_flags =
-        pie_native::slice_from_u8(folded_rs_flags, 2);
+        pie::driver::slice_from_u8(folded_rs_flags, 2);
     mixed_view.rs_buffer_slot_ids =
-        pie_native::slice_from_u32(buffered_rs_slots, 2);
+        pie::driver::slice_from_u32(buffered_rs_slots, 2);
     mixed_view.rs_buffer_slot_indptr =
-        pie_native::slice_from_u32(buffered_rs_indptr, 3);
-    pie_native::launch::ResolvedPrograms resolved;
+        pie::driver::slice_from_u32(buffered_rs_indptr, 3);
+    pie::driver::fire::ResolvedPrograms resolved;
     resolved.per_program.resize(2);
     resolved.is_device_geometry = {1, 0};
     resolved.device_count = 1;
@@ -200,7 +200,7 @@ int main() {
     device.sampling_indptr = {0, 1};
     device.has_kv_family = true;
     device.structured_mask.kind =
-        pie_native::launch::StructuredMaskKind::SlidingWindow;
+        pie::driver::fire::StructuredMaskKind::SlidingWindow;
     device.structured_mask.key_len = 16;
     device.structured_mask.window = 4;
     pie_cuda_driver::pipeline::ComposedBatch mixed;
@@ -222,15 +222,15 @@ int main() {
             mixed.rs_slot_ids != mixed.rs_buffer_slot_ids &&
             mixed.structured_masks.size() == 2 &&
             mixed.structured_masks[0].kind ==
-                pie_native::launch::StructuredMaskKind::None &&
+                pie::driver::fire::StructuredMaskKind::None &&
             mixed.structured_masks[1].kind ==
-                pie_native::launch::StructuredMaskKind::SlidingWindow,
+                pie::driver::fire::StructuredMaskKind::SlidingWindow,
         "B=2 device/wire composition preserves native wire masking and "
         "request-order folded RS");
-    const pie_native::launch::StructuredMaskDescriptor no_masks[2]{};
-    const pie_native::launch::StructuredMaskDescriptor explicit_masks[2] = {
+    const pie::driver::fire::StructuredMaskDescriptor no_masks[2]{};
+    const pie::driver::fire::StructuredMaskDescriptor explicit_masks[2] = {
         sliding_masks[0], sliding_masks[0]};
-    const pie_native::launch::StructuredMaskDescriptor mixed_masks[2] = {
+    const pie::driver::fire::StructuredMaskDescriptor mixed_masks[2] = {
         {}, sliding_masks[0]};
     expect(
         pie_cuda_driver::pipeline::structured_mask_coverage(no_masks) ==
@@ -255,7 +255,7 @@ int main() {
     const std::uint32_t short_buffered_indptr[] = {0, 2};
     auto bad_buffer_view = mixed_view;
     bad_buffer_view.rs_buffer_slot_indptr =
-        pie_native::slice_from_u32(short_buffered_indptr, 2);
+        pie::driver::slice_from_u32(short_buffered_indptr, 2);
     pie_cuda_driver::pipeline::ComposedBatch bad_buffered;
     expect(
         !pie_cuda_driver::pipeline::compose_forward_batch(

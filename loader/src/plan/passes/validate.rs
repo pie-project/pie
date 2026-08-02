@@ -148,8 +148,16 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                         QuantScheme::Fp8E4M3
                             | QuantScheme::Int8Symmetric
                             | QuantScheme::Mxfp4E2M1E8M0
+                            | QuantScheme::MlxAffineU4
                     )
                 ))
+                // Decode is implemented for the schemes whose scales live
+                // *inside* the payload — a GGUF block is self-contained, so
+                // decoding needs no factor operand. A separate-scale scheme
+                // spells its dequant as a per-block `Scale` instead, and a
+                // `Decode` of one has no meaning any executor could give it.
+                || (*kind == TileMapKind::Decode
+                    && matches!(transform.from, Some(QuantScheme::GgufQ4_0)))
                 || (*kind == TileMapKind::Repack
                     && program.target.native_mxfp4_moe
                     && transform.repack.is_some_and(|repack| {
@@ -187,7 +195,7 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
         else {
             continue;
         };
-        if *kind != TileMapKind::Scale || transform.scale_group == 0 {
+        if *kind != TileMapKind::Scale || transform.scale_blocks.is_empty() {
             continue;
         }
         // One operand carries the payload unless it arrives as a source
@@ -195,7 +203,8 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
         let wanted = 1 + usize::from(source.is_none());
         if inputs.len() != wanted {
             return Err(Error::Contract(format!(
-                "per-group Scale has {} input operands, expected {wanted}                  (payload then factors)",
+                "per-group Scale has {} input operands, expected {wanted} \
+                 (payload then factors)",
                 inputs.len()
             )));
         }

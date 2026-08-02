@@ -1,15 +1,9 @@
 //! Strict loader for modern Hugging Face `tokenizer.json` BPE pipelines.
 //!
-//! Pie supports four structural profiles:
+//! Pie supports two structural profiles:
 //! - Byte-level BPE with optional NFC and one or more isolated regex splitters
 //!   (Qwen 3+, DeepSeek V4, GLM 5.2, Nemotron 3).
 //! - String replacement plus byte-fallback BPE (Gemma 4).
-//! - Legacy Llama-2-style sentencepiece BPE: no pre-tokenizer, a
-//!   `Prepend` + `Replace` normalizer (dummy prefix), and a decoder that
-//!   ends in `Strip` (Phi-3 and other Llama-2 relatives).
-//! - Metaspace sentencepiece BPE: no normalizer, a `Metaspace` pre-tokenizer
-//!   with `prepend_scheme: "first"` and `split: false`, and the same
-//!   `Strip`-terminated decoder (Mistral 7B v0.3 and relatives).
 //!
 //! Other component combinations are rejected instead of being partially
 //! interpreted.
@@ -21,7 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 use crate::bpe::BpeTable;
-use crate::{AddedToken, BpeMode, DummyPrefix, Pipeline, Tokenizer};
+use crate::{AddedToken, BpeMode, Pipeline, Tokenizer};
 
 #[derive(Deserialize)]
 struct HfTokenizerJson {
@@ -140,8 +134,8 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
             token.content
         );
         ensure!(
-            !token.single_word,
-            "unsupported added-token single_word flag for {:?}",
+            !token.single_word && !token.lstrip && !token.rstrip,
+            "unsupported added-token boundary flags for {:?}",
             token.content
         );
         ensure!(
@@ -154,8 +148,6 @@ fn from_hf(hf: HfTokenizerJson) -> Result<Tokenizer> {
             id: token.id,
             content: token.content,
             special: token.special,
-            lstrip: token.lstrip,
-            rstrip: token.rstrip,
         });
     }
 
@@ -188,15 +180,11 @@ fn validate_model_basics(model: &HfModel) -> Result<()> {
 }
 
 fn compile_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
-    let Some(pre_tokenizer) = hf.pre_tokenizer.as_ref() else {
-        return compile_sentencepiece_profile(hf);
-    };
+    let pre_tokenizer = hf.pre_tokenizer.as_ref().context("missing pre_tokenizer")?;
     if is_byte_level_sequence(pre_tokenizer) {
         compile_byte_level_profile(hf)
     } else if node_type(pre_tokenizer) == "Split" {
         compile_byte_fallback_profile(hf)
-    } else if node_type(pre_tokenizer) == "Metaspace" {
-        compile_metaspace_profile(hf)
     } else {
         bail!(
             "unsupported pre_tokenizer profile: {}",
@@ -262,29 +250,19 @@ fn compile_byte_level_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
             "unsupported pre-tokenizer: {}",
             node_type(node)
         );
-        // Two encodings of a match-driven split ship in the wild:
-        //   * `Isolated` + `invert: false` (qwen/llama-3): pattern matches
-        //     become pieces AND the text between them survives;
-        //   * `Removed` + `invert: true` (GPT-2 lineage, OLMo-2): the
-        //     pattern matches the pieces THEMSELVES and the gaps are
-        //     dropped. The classic exhaustive patterns leave no gaps, but
-        //     the drop is honored exactly rather than assumed away.
-        let behavior = node.get("behavior").and_then(serde_json::Value::as_str);
-        let invert =
-            node.get("invert").and_then(serde_json::Value::as_bool) == Some(true);
-        let keep_gaps = match (behavior, invert) {
-            (Some("Isolated"), false) => true,
-            (Some("Removed"), true) => false,
-            _ => bail!(
-                "unsupported Split profile: behavior={behavior:?} invert={invert}"
-            ),
-        };
+        ensure!(
+            node.get("behavior").and_then(serde_json::Value::as_str) == Some("Isolated"),
+            "only isolated regex splits are supported"
+        );
+        ensure!(
+            node.get("invert").and_then(serde_json::Value::as_bool) == Some(false),
+            "inverted regex splits are unsupported"
+        );
         let pattern = regex_pattern(node).context("Split must contain a Regex pattern")?;
-        splitters.push(crate::Splitter {
-            regex: fancy_regex::Regex::new(pattern)
+        splitters.push(
+            fancy_regex::Regex::new(pattern)
                 .with_context(|| format!("compiling Split regex: {pattern}"))?,
-            keep_gaps,
-        });
+        );
     }
 
     let decoder = hf.decoder.as_ref().context("missing byte-level decoder")?;
@@ -370,219 +348,17 @@ fn compile_byte_fallback_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile
         decoders.len() == 3,
         "Gemma decoder must contain Replace, ByteFallback, Fuse"
     );
-    validate_fallback_decoder_head(&decoders, normalizer_from, normalizer_to)?;
-
-    let unk_token_id = resolve_unk_token_id(&hf.model)?;
-
-    Ok(CompiledProfile {
-        pipeline: Pipeline::ByteFallbackReplace {
-            normalizer_from: normalizer_from.to_string(),
-            normalizer_to: normalizer_to.to_string(),
-            unk_token_id: Some(unk_token_id),
-            dummy_prefix: DummyPrefix::None,
-            strip_decoder_marker: false,
-        },
-        raw_byte_keys: false,
-        normalizes_text: true,
-    })
-}
-
-/// Legacy Llama-2-style sentencepiece BPE (Phi-3 and relatives): no
-/// pre-tokenizer, a `Prepend` + `Replace` normalizer injecting the dummy
-/// prefix, and a `Replace` + `ByteFallback` + `Fuse` + `Strip` decoder that
-/// removes it again.
-fn compile_sentencepiece_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
-    ensure!(
-        hf.model.byte_fallback,
-        "sentencepiece profile requires byte_fallback=true"
-    );
-    ensure!(
-        hf.model.fuse_unk,
-        "sentencepiece profile requires fuse_unk=true"
-    );
-    ensure!(
-        !hf.model.ignore_merges,
-        "sentencepiece profile cannot ignore merges"
-    );
-
-    let normalizer = hf
-        .normalizer
-        .as_ref()
-        .context("missing Prepend + Replace normalizer")?;
-    let normalizers = sequence_children(normalizer, "normalizers")?;
-    ensure!(
-        normalizers.len() == 2,
-        "sentencepiece normalizer must be Prepend + Replace"
-    );
-    ensure!(
-        node_type(normalizers[0]) == "Prepend",
-        "first sentencepiece normalizer must be Prepend"
-    );
-    let prepend = normalizers[0]
-        .get("prepend")
-        .and_then(serde_json::Value::as_str)
-        .context("Prepend normalizer requires a prepend string")?;
-    ensure!(
-        node_type(normalizers[1]) == "Replace",
-        "second sentencepiece normalizer must be Replace"
-    );
-    let normalizer_from =
-        string_pattern(normalizers[1]).context("Replace normalizer requires a String pattern")?;
-    let normalizer_to = normalizers[1]
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .context("Replace normalizer requires content")?;
-    ensure!(
-        normalizer_from == " " && normalizer_from != normalizer_to,
-        "sentencepiece Replace normalizer must map a space to a marker"
-    );
-    ensure!(
-        prepend == normalizer_to,
-        "Prepend must inject the Replace marker"
-    );
-
-    validate_sentencepiece_decoder(hf, normalizer_from, normalizer_to)?;
-
-    let unk_token_id = resolve_unk_token_id(&hf.model)?;
-
-    Ok(CompiledProfile {
-        pipeline: Pipeline::ByteFallbackReplace {
-            normalizer_from: normalizer_from.to_string(),
-            normalizer_to: normalizer_to.to_string(),
-            unk_token_id: Some(unk_token_id),
-            dummy_prefix: DummyPrefix::EverySegment,
-            strip_decoder_marker: true,
-        },
-        raw_byte_keys: false,
-        normalizes_text: true,
-    })
-}
-
-/// Mistral-style Metaspace BPE: no normalizer, a `Metaspace` pre-tokenizer
-/// with `prepend_scheme: "first"` and `split: false` (space→marker mapping
-/// plus a dummy prefix only at the very start of the input), and the same
-/// `Replace` + `ByteFallback` + `Fuse` + `Strip` decoder as the legacy
-/// sentencepiece profile.
-///
-/// Other Metaspace parameterizations (`split: true`, `prepend_scheme:
-/// "always"` / `"never"`) have different segmentation semantics and are
-/// rejected instead of approximated.
-fn compile_metaspace_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
-    ensure!(
-        hf.model.byte_fallback,
-        "metaspace profile requires byte_fallback=true"
-    );
-    ensure!(
-        hf.model.fuse_unk,
-        "metaspace profile requires fuse_unk=true"
-    );
-    ensure!(
-        !hf.model.ignore_merges,
-        "metaspace profile cannot ignore merges"
-    );
-
-    match hf.normalizer.as_ref() {
-        None => {}
-        Some(value) if value.is_null() => {}
-        Some(value) => bail!("unsupported metaspace normalizer: {}", node_type(value)),
-    }
-
-    let pre_tokenizer = hf.pre_tokenizer.as_ref().context("missing pre_tokenizer")?;
-    let replacement = pre_tokenizer
-        .get("replacement")
-        .and_then(serde_json::Value::as_str)
-        .context("Metaspace requires a replacement string")?;
-    ensure!(
-        replacement.chars().count() == 1 && replacement != " ",
-        "Metaspace replacement must be a single non-space character"
-    );
-    let prepend_scheme = pre_tokenizer
-        .get("prepend_scheme")
-        .and_then(serde_json::Value::as_str)
-        .context("Metaspace requires prepend_scheme")?;
-    ensure!(
-        prepend_scheme == "first",
-        "unsupported Metaspace prepend_scheme: {prepend_scheme}"
-    );
-    ensure!(
-        pre_tokenizer.get("split").and_then(serde_json::Value::as_bool) == Some(false),
-        "Metaspace.split must be false"
-    );
-    ensure!(
-        pre_tokenizer.get("add_prefix_space").is_none(),
-        "legacy Metaspace add_prefix_space is unsupported"
-    );
-
-    validate_sentencepiece_decoder(hf, " ", replacement)?;
-
-    let unk_token_id = resolve_unk_token_id(&hf.model)?;
-
-    Ok(CompiledProfile {
-        pipeline: Pipeline::ByteFallbackReplace {
-            normalizer_from: " ".to_string(),
-            normalizer_to: replacement.to_string(),
-            unk_token_id: Some(unk_token_id),
-            dummy_prefix: DummyPrefix::FirstSegment,
-            strip_decoder_marker: true,
-        },
-        raw_byte_keys: false,
-        normalizes_text: true,
-    })
-}
-
-/// Validate the `Replace` + `ByteFallback` + `Fuse` + `Strip` decoder shared
-/// by the legacy sentencepiece and Metaspace profiles: the head reverses the
-/// space→marker mapping and `Strip` removes the dummy prefix again.
-fn validate_sentencepiece_decoder(
-    hf: &HfTokenizerJson,
-    normalizer_from: &str,
-    normalizer_to: &str,
-) -> Result<()> {
-    let decoder = hf
-        .decoder
-        .as_ref()
-        .context("missing sentencepiece decoder")?;
-    let decoders = sequence_children(decoder, "decoders")?;
-    ensure!(
-        decoders.len() == 4,
-        "sentencepiece decoder must contain Replace, ByteFallback, Fuse, Strip"
-    );
-    validate_fallback_decoder_head(&decoders, normalizer_from, normalizer_to)?;
-    let strip = decoders[3];
-    ensure!(
-        node_type(strip) == "Strip",
-        "fourth sentencepiece decoder must be Strip"
-    );
-    ensure!(
-        strip.get("content").and_then(serde_json::Value::as_str) == Some(normalizer_from),
-        "decoder Strip must remove the replaced source string"
-    );
-    ensure!(
-        strip.get("start").and_then(serde_json::Value::as_u64) == Some(1)
-            && strip.get("stop").and_then(serde_json::Value::as_u64) == Some(0),
-        "decoder Strip must remove exactly one leading occurrence"
-    );
-    Ok(())
-}
-
-/// Validate the shared `Replace` + `ByteFallback` + `Fuse` head of a
-/// byte-fallback decoder sequence.
-fn validate_fallback_decoder_head(
-    decoders: &[&serde_json::Value],
-    normalizer_from: &str,
-    normalizer_to: &str,
-) -> Result<()> {
     ensure!(
         node_type(decoders[0]) == "Replace",
-        "first byte-fallback decoder must be Replace"
+        "first Gemma decoder must be Replace"
     );
     ensure!(
         node_type(decoders[1]) == "ByteFallback",
-        "second byte-fallback decoder must be ByteFallback"
+        "second Gemma decoder must be ByteFallback"
     );
     ensure!(
         node_type(decoders[2]) == "Fuse",
-        "third byte-fallback decoder must be Fuse"
+        "third Gemma decoder must be Fuse"
     );
     let decoder_pattern =
         string_pattern(decoders[0]).context("decoder Replace requires a String pattern")?;
@@ -594,21 +370,29 @@ fn validate_fallback_decoder_head(
         decoder_pattern == normalizer_to && decoder_content == normalizer_from,
         "decoder Replace must reverse the normalizer"
     );
-    Ok(())
-}
 
-fn resolve_unk_token_id(model: &HfModel) -> Result<u32> {
-    model
+    let unk_token_id = hf
+        .model
         .unk_token
         .as_ref()
         .context("byte-fallback profile requires unk_token")
         .and_then(|token| {
-            model
+            hf.model
                 .vocab
                 .get(token)
                 .copied()
                 .with_context(|| format!("unknown unk_token {token:?}"))
-        })
+        })?;
+
+    Ok(CompiledProfile {
+        pipeline: Pipeline::ByteFallbackReplace {
+            normalizer_from: normalizer_from.to_string(),
+            normalizer_to: normalizer_to.to_string(),
+            unk_token_id: Some(unk_token_id),
+        },
+        raw_byte_keys: false,
+        normalizes_text: true,
+    })
 }
 
 fn is_byte_level_sequence(value: &serde_json::Value) -> bool {

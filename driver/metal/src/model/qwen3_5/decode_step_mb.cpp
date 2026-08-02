@@ -29,15 +29,31 @@ int qmv_out_size(Kernel k, const DecodeGeometry& g) {
     switch (k) {
         case Kernel::QmvIn: return g.gdn_conv_dim;
         case Kernel::QmvInZ: return g.gdn_v_total;
+        case Kernel::GdnInA:
+        case Kernel::GdnInB: return g.gdn_v_heads;
         case Kernel::QmvOut:
         case Kernel::QmvO:
-        case Kernel::QmvDown: return g.hidden;
+        case Kernel::QmvDown:
+        case Kernel::LlSharedDown: return g.hidden;
         case Kernel::QmvQ: return 2 * g.n_q_heads * g.head_dim;
         case Kernel::QmvK:
         case Kernel::QmvV: return g.n_kv_heads * g.head_dim;
         case Kernel::QmvGate:
         case Kernel::QmvUp: return g.intermediate;
-        case Kernel::QmvLmHead: return g.vocab;
+        case Kernel::QmvLmHead:
+        case Kernel::LmHeadUntied: return g.vocab;
+        // The router is a DENSE matvec into one logit per expert: it runs over
+        // the tokens like any other projection, and only what follows it is
+        // routed. The three expert projections are deliberately absent -- they
+        // run over the SORTED rows, and answering here would launch them over
+        // the token count instead, computing the first `n` sorted rows and
+        // leaving the rest of the stack holding the previous layer's output.
+        case Kernel::LlRouter: return g.n_experts;
+        // The shared expert is dense in every sense -- it runs over the tokens,
+        // one row each, so it answers here like any other projection.
+        case Kernel::LlSharedGate:
+        case Kernel::LlSharedUp: return g.shared_intermediate;
+        case Kernel::LlSharedGateProj: return 1;
         default: return 0;
     }
 }
@@ -65,10 +81,29 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     if (const int out = qmv_out_size(d.kind, g); out != 0) {
         d.qmm_bn = qmm_bn(out, n);
         d.qmm_bm = qmm_bm(n);
-        static const bool split_off = std::getenv("PIE_METAL_NO_SPLITK") != nullptr;
-        d.qmm_split = (d.qmm_bn > 0 && !split_off)
-                          ? qmm_split_k(out, n, qmv_kn(d.kind, g).K, d.qmm_bm)
-                          : 1;
+        // NO split-K, for exactly the reason gemma4's `launch_shape_mb` gives:
+        // the split GEMM writes `split_k` partial [M, N] slices into a side
+        // buffer and needs a reduce pass to sum them, and NOTHING IN THIS
+        // DRIVER EVER DISPATCHES THAT PASS. `qmm_splitk_reduce` is compiled and
+        // has no caller; `affine_qmm_t_splitk` writes its result to buffer 8,
+        // the partials, and buffer 4 -- the projection's real output -- keeps
+        // whatever the last fire left in it.
+        //
+        // It survived because the split only engages at `qmm_bn != 0`, which
+        // needs a batch of at least `kQmmMinBatch`, and nothing fired one until
+        // the throughput harness did. With the harness's fleet check it is a
+        // one-line reproduction: sixteen copies of one prompt in one fire
+        // answer 74088 and 1125 at step 0 with the split on, and agree with the
+        // single-sequence decode for all 64 steps with it off.
+        //
+        // The measured cost of turning it off is the honest version of a number
+        // that was never real: 717 tok/s becomes 520 at sixteen lanes, and 717
+        // was the speed of computing the wrong answer.
+        //
+        // The fix is to emit the reduce, which this family cannot do here --
+        // `mb_geometry` decides the split while walking a DAG that is already
+        // built, so it has no way to insert a dispatch after itself.
+        d.qmm_split = 1;
         if (d.qmm_split > 1)
             qmm_t_splitk_dispatch(out, n, d.qmm_bm, d.qmm_split, d.grid, d.tg);
         else if (d.qmm_bn > 0)
@@ -78,6 +113,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         return;
     }
     switch (d.kind) {
+        case Kernel::EmbedUntied:
         case Kernel::EmbedGather:
             embed_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
         case Kernel::Rms:
@@ -88,11 +124,6 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             rms(g.head_dim, g.n_q_heads); break;
         case Kernel::KNorm:
             rms(g.head_dim, g.n_kv_heads); break;
-        case Kernel::GdnInA:
-        case Kernel::GdnInB:
-            d.grid = Grid{32u, uint32_t(g.gdn_v_heads), uint32_t(n)};
-            d.tg = Threadgroup{32, 1, 1};
-            break;
         case Kernel::GdnPrepSlotted:
             d.grid = Grid{32u, 1u, uint32_t(n * g.gdn_v_heads)};
             d.tg = Threadgroup{32, 1, 1};
@@ -123,7 +154,56 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LayerOut:
             elementwise_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
         case Kernel::SiluMul:
-            elementwise_mb_dispatch(g.intermediate, n, d.grid, d.tg); break;
+            // Routed, the dense SwiGLU that remains is the SHARED expert's --
+            // one row a token, at its own width. The mixture's own SwiGLU is
+            // `LlExpertSiluMul` below, over the sorted stack, and the two were
+            // split precisely because this line cannot say both.
+            elementwise_mb_dispatch(g.is_moe() ? g.shared_intermediate : g.intermediate,
+                                    n, d.grid, d.tg);
+            break;
+        case Kernel::LlExpertSiluMul:
+            // The slot axis is gone -- a sorted row IS a slot -- so this is the
+            // same elementwise shape over a taller batch.
+            elementwise_mb_dispatch(g.moe_intermediate, moe_sorted_rows(g, n), d.grid, d.tg);
+            break;
+
+        // ── the mixture ──
+        // The three expert projections first, because `qmv_out_size` does not
+        // answer for them: they run over the sorted rows, which is neither `n`
+        // nor `n * k`, because the sort pads every expert's run to a whole
+        // tile. Once the batch fills a tile they become matmuls, and the tile
+        // is `kMoeTileRows` -- the same number the sort padded to, spelled from
+        // the constant rather than restated.
+        case Kernel::LlExpertGate:
+        case Kernel::LlExpertUp:
+        case Kernel::LlExpertDown: {
+            const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
+            const int sorted = moe_sorted_rows(g, n);
+            if (const int bn = qmm_bn(N, sorted);
+                bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
+                d.qmm_bn = bn;
+                d.qmm_bm = shared_kernels::kMoeTileRows;
+                d.qmm_split = 1;
+                qmm_t_dispatch(N, sorted, bn, shared_kernels::kMoeTileRows, d.grid, d.tg);
+            } else {
+                // One sorted row per (token, slot) pair and no expert axis: the
+                // pair's expert is `row_expert[p]`, not `tid.z`.
+                shared_kernels::routed_qmv_dispatch(N, 1, d.grid, d.tg, sorted);
+            }
+            break;
+        }
+        case Kernel::GoRouterTopK:
+            shared_kernels::router_topk_dispatch(g.n_experts, d.grid, d.tg, n); break;
+        case Kernel::LlMoeSort:
+            shared_kernels::moe_route_sort_dispatch(g.n_experts, d.grid, d.tg); break;
+        case Kernel::LlMoeGather:
+            shared_kernels::moe_route_rows_dispatch(g.hidden, moe_sorted_rows(g, n),
+                                                    d.grid, d.tg); break;
+        case Kernel::LlMoeCombine:
+            shared_kernels::expert_combine_dispatch(g.hidden, d.grid, d.tg, n); break;
+        case Kernel::LlSharedCombine:
+            elementwise_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
+
         default:
             throw std::runtime_error("missing multi-batch launch geometry");
     }
@@ -137,6 +217,7 @@ bool barrier_after_mb(const std::vector<Dispatch>& dag, size_t i,
 
 Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb) {
     switch (d.kind) {
+        case Kernel::EmbedUntied:
         case Kernel::EmbedGather: return mb.embed_mb;
         case Kernel::Rope:
         case Kernel::RopeK: return mb.rope_mb;
@@ -144,8 +225,23 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::GdnCoreSlotted: return mb.gdn_recurrent_slotted;
         case Kernel::KvAppendPaged: return mb.kv_append_paged;
         case Kernel::SdpaPaged: return mb.sdpa_paged;
+        // The mixture's projections, asked BEFORE the shared GEMM below and
+        // for the same reason `qmv_out_size` declines to answer for them: they
+        // carry a `qmm_bn` like any batched projection, so the default arm
+        // would hand them the DENSE GEMM -- which indexes one weight for the
+        // whole dispatch and would run every expert's rows through expert 0's
+        // slice. Fluent, and wrong.
+        case Kernel::LlExpertGate:
+        case Kernel::LlExpertUp:
+        case Kernel::LlExpertDown: {
+            if (d.qmm_bn > 0) {
+                const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
+                if (mb.qmm_routed[slot].valid()) return mb.qmm_routed[slot];
+            }
+            return base[d.kind];
+        }
         default: {
-            const int wide_ = d.qmm_bm == kQmmBMWide ? 1 : 0;
+            const int wide_ = qmm_bm_slot(d.qmm_bm);
             if (d.qmm_split > 1 && mb.qmm_t_splitk[wide_].valid())
                 return mb.qmm_t_splitk[wide_];
             if (d.qmm_bn > 0) {
@@ -235,6 +331,7 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
             bind_slot(ctx, ord, wb.bind_index, it->second);
         }
         switch (d.kind) {
+            case Kernel::EmbedUntied:
             case Kernel::EmbedGather:
                 ctx.arg_bind_ordinal(ord, uint8_t(bind::Embed::TokenId), io(IoSlot::TokenId),
                                      offsets.token_row * sizeof(uint32_t));
@@ -311,6 +408,7 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
                 ctx.arg_bind_ordinal(ord, uint8_t(bind::Rope::Position), io(IoSlot::Position),
                                      offsets.token_row * sizeof(uint32_t));
                 break;
+            case Kernel::LmHeadUntied:
             case Kernel::QmvLmHead:
                 ctx.arg_bind_ordinal(ord, uint8_t(bind::Qmv::Out), io(IoSlot::Logits),
                                      offsets.logits_bytes);
@@ -362,7 +460,8 @@ namespace {
 // group.
 // The tail that exists only to produce a row's logits.
 bool produces_logits(Kernel kind) {
-    return kind == Kernel::QmvLmHead || kind == Kernel::Argmax;
+    return kind == Kernel::QmvLmHead || kind == Kernel::LmHeadUntied ||
+           kind == Kernel::Argmax;
 }
 
 bool carries_cross_token_state(Kernel kind) {
@@ -429,10 +528,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
         geometry != nullptr ? qmm_strided_rows(int(n), max_rows) : 0;
     for (size_t i = 0; i < length; ++i) {
         const Dispatch& d0 = dags[0][i];
-        if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead) {
+        if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead &&
+            d0.kind != Kernel::LmHeadUntied) {
             const int out = qmv_out_size(d0.kind, *geometry);
             if (out != 0 && out % 32 == 0) {
-                const bool wide = qmm_strided_bm(strided_rows) == kQmmBMWide &&
+                const bool wide = qmm_strided_bm(strided_rows) > kQmmBM &&
                                   mb_psos.qmm_t_strided_wide.valid();
                 const Pso& gemm =
                     wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
@@ -478,16 +578,6 @@ void encode_prefill_dags_mb(StepEncoder& se,
                 case Kernel::GatedRms:
                     if (d0.grid.z == 1) {
                         strided = mb_psos.gated_rms_strided;
-                        grid.z = uint32_t(n);
-                    }
-                    break;
-                case Kernel::GdnInA:
-                case Kernel::GdnInB:
-                    // grid is (32, N_out, 1): the simdgroup lane, the output row,
-                    // and -- once strided -- the prompt row.  Worth 1.4% of the
-                    // fire: 18 GDN layers x 2 is 42% of its per-row dispatches.
-                    if (d0.grid.z == 1) {
-                        strided = mb_psos.dense_gemv_strided;
                         grid.z = uint32_t(n);
                     }
                     break;

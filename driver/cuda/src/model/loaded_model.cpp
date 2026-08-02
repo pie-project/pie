@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
@@ -15,6 +16,7 @@
 #include "ops/gemm.hpp"
 #include "loader/load_plan_bridge.hpp"
 #include "loader/load_plan_executor.hpp"
+#include "model/descriptor.hpp"
 #include "model/registry.hpp"
 #include "model/weight_artifact_cache.hpp"
 #include "tensor.hpp"
@@ -70,6 +72,50 @@ private:
     bool enabled_ = false;
 };
 
+/// How much device memory the group slab may take.
+///
+/// A configured `expert_cache_gb` is taken at its word -- someone who names a
+/// number is answering a question about their card that this cannot. The
+/// interesting case is zero, and the rule there is: ask for the whole group,
+/// but never take more than half of what is free.
+///
+/// The first half of that is what makes streaming safe to leave on. If the
+/// group fits, the slab holds all of it, no page-in ever misses after the
+/// first sweep, and the run is exactly the resident run that the stacked
+/// contract would have produced -- so turning streaming on costs nothing on a
+/// card that did not need it. The second half is the fallback that makes it
+/// useful on a card that did: the experts and the KV cache are the two things
+/// competing for what is left after the resident weights, and with no way to
+/// know how long the sequences will be, splitting it is the honest default.
+std::uint64_t group_cache_budget(
+    double configured_gb,
+    pie_loader::PieLoaderGroupSlice groups,
+    bool verbose)
+{
+    std::uint64_t wanted = 0;
+    for (std::size_t i = 0; i < groups.len; ++i) {
+        const auto& g = groups.ptr[i];
+        if (g.plan == nullptr) continue;
+        wanted += g.plan->memory.persistent_bytes *
+                  static_cast<std::uint64_t>(g.arity);
+    }
+    if (configured_gb > 0.0) {
+        return static_cast<std::uint64_t>(configured_gb * 1024.0 * 1024.0 * 1024.0);
+    }
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const std::uint64_t half_free = static_cast<std::uint64_t>(free_bytes) / 2;
+    const std::uint64_t budget = std::min(wanted, half_free);
+    if (verbose) {
+        std::cerr << "[pie-driver-cuda] group slab: want "
+                  << (wanted / (1024ull * 1024ull)) << " MiB, "
+                  << (free_bytes / (1024ull * 1024ull)) << " MiB free, taking "
+                  << (budget / (1024ull * 1024ull)) << " MiB\n";
+    }
+    return budget;
+}
+
 }  // namespace
 
 LoadedModel LoadedModel::load(
@@ -101,9 +147,27 @@ LoadedModel LoadedModel::load(
     };
 
     const std::filesystem::path snapshot{boot_cfg.model.snapshot_dir};
-    log_stage("parse hf config begin");
-    e.hf_ = parse_hf_config(snapshot / "config.json");
-    log_stage("parse hf config done");
+    if (!boot_cfg.model.descriptor.empty()) {
+        // The artifact carried its model config already normalized, so there
+        // is nothing to derive here. See model/descriptor.hpp.
+        log_stage("read model descriptor begin");
+        std::ifstream in(boot_cfg.model.descriptor);
+        if (!in) {
+            throw std::runtime_error("cannot open model descriptor: " +
+                                     boot_cfg.model.descriptor);
+        }
+        std::ostringstream buffer;
+        buffer << in.rdbuf();
+        e.hf_ = parse_pie_model_descriptor(buffer.str());
+        log_stage("read model descriptor done");
+    } else {
+        // A snapshot that predates the artifact format. The whole of
+        // `parse_hf_config` exists for this branch, and it goes when the
+        // descriptor has been proven on real hardware.
+        log_stage("parse hf config begin");
+        e.hf_ = parse_hf_config(snapshot / "config.json");
+        log_stage("parse hf config done");
+    }
 
     // Bind to the requested CUDA device before we allocate anything.
     int dev_id = 0;
@@ -182,7 +246,8 @@ LoadedModel LoadedModel::load(
         model::ContractBuilder builder(
             checkpoint, facts, device_target,
             model::resolve_runtime_quant(runtime_quant, fp8_native),
-            mxfp4_moe, component, contract);
+            mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
+            contract);
         arch->author_contract(builder);
         builder.finish();
         mxfp4_moe_policy = builder.mxfp4_moe();
@@ -198,9 +263,14 @@ LoadedModel LoadedModel::load(
     LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
     log_stage("compile LoadPlan done");
 
-    log_stage("open safetensors begin");
-    pie_loader::CheckpointSource loader(planned_load.plan.view());
-    log_stage("open safetensors done");
+    log_stage("open checkpoint source begin");
+    // On the heap because streaming outlives this function: a group is paged
+    // in by reading the same files the resident load read, so the handles have
+    // to survive it, and the cache holds a reference to them.
+    auto source = std::make_unique<pie_loader::CheckpointSource>(
+        planned_load.plan.view());
+    pie_loader::CheckpointSource& loader = *source;
+    log_stage("open checkpoint source done");
 
     // What used to sit here: `supports_tp()` — a list of twenty-odd model_type
     // strings — followed by eighty lines of per-family divisibility rules read
@@ -405,6 +475,37 @@ LoadedModel LoadedModel::load(
                   << static_cast<int>(materialized.phase_pinned_alloc_ms)
                   << "ms) transform="
                   << static_cast<int>(materialized.phase_transform_ms) << "ms\n";
+    }
+
+    // The groups, if the contract declared any.
+    //
+    // This happens here, after the resident weights are on the device and
+    // before anything else measures the card, and that ordering is what makes
+    // the slab cost nothing to account for: the KV pool sizes itself from
+    // `cudaMemGetInfo` at context construction, so a slab taken now is already
+    // subtracted from what it sees. There is no second budget to keep in step.
+    if (boot_cfg.model.stream_routed_experts && load_view.groups.len > 0) {
+        const std::uint64_t budget = group_cache_budget(
+            boot_cfg.model.expert_cache_gb, load_view.groups, verbose);
+        e.group_cache_ = std::make_unique<GroupStreamCache>(
+            loader, load_view.groups, budget,
+            static_cast<std::uint64_t>(
+                boot_cfg.model.expert_host_cache_gb * 1024.0 * 1024.0 * 1024.0),
+            verbose);
+        e.stream_source_ = std::move(source);
+        e.stream_plan_ = std::make_unique<pie_loader::LoadPlan>(
+            std::move(planned_load.plan));
+        if (verbose) {
+            const auto& cache = *e.group_cache_;
+            std::cerr << "[pie-driver-cuda] streaming " << load_view.groups.len
+                      << " group(s), " << cache.total_instances()
+                      << " instances of "
+                      << (cache.slot_bytes() / (1024ull * 1024ull))
+                      << " MiB in " << cache.num_slots() << " slots ("
+                      << (cache.slab_bytes() / (1024ull * 1024ull)) << " MiB)"
+                      << (cache.fully_resident() ? " -- fully resident\n"
+                                                 : "\n");
+        }
     }
 
     e.weights_.validate_quant_metadata();

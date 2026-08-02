@@ -45,6 +45,10 @@ Qwen35Model::Qwen35Model(
     // `declared_` empty with the reason logged once and body() keeps the
     // hand-written path; a validated plan is consumed by body()'s
     // eligibility gate below.
+    // (0.3 re-port 2026-08-05: the gate helpers moved into
+    // declared_facts.cpp during the split, so the merge-era dormancy —
+    // "helpers live in the tart qwen3_5_forward.cpp" — no longer holds;
+    // the walker is live again.)
     if (qwen35_declared_forward_enabled()) {
         declared_ = build_qwen3_5_declared_plan(hf_config_, weights_, tp_size);
     }
@@ -149,6 +153,7 @@ void Qwen35Model::body(Workspace& ws,
                          in.is_pure_decode ? 1 : 0, fallback_reason);
         }
     }
+
     qwen3_5_forward_paged(
         weights_, hf_config_, fwd_cfg_, plan_state_,
         ws, la_ws_, kv, state_cache_,
@@ -165,8 +170,10 @@ void Qwen35Model::body(Workspace& ws,
         in.commit_advance_gather_d,
         in.rs_buffer_slot_ids_h, in.rs_buffer_slot_indptr_h,
         in.rs_fold_lens_d,
+        in.rs_fold_lens_h,
         in.rs_buffer_write, in.rs_buffer_fold,
-        in.stage_hooks);
+        in.rs_buffer_read_slot_ids_h, in.rs_buffer_read_indptr_h,
+        in.rs_buffer_read_lens_h, in.rs_buffer_heads_h);
 }
 
 std::uint32_t Qwen35Model::graph_layout() {

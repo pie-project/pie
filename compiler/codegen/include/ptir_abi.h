@@ -223,6 +223,12 @@ enum PtirPort : uint8_t {
   PTIR_PORT_W_OFF = 7,
   PTIR_PORT_READOUT = 8,
   PTIR_PORT_ATTN_MASK = 9,
+  PTIR_PORT_RS_BUFFER_PAGES = 10,
+  PTIR_PORT_RS_BUFFER_INDPTR = 11,
+  PTIR_PORT_RS_BUFFER_LEN = 12,
+  PTIR_PORT_RS_W_SLOT = 13,
+  PTIR_PORT_RS_W_OFF = 14,
+  PTIR_PORT_RS_FOLD_LEN = 15,
 };
 
 // ── first-party value intrinsics (op 0xA0 payload) ──
@@ -258,8 +264,8 @@ enum PtirChannelClass : uint8_t { PTIR_CHAN_FULL_RING = 0, PTIR_CHAN_IN_PLACE = 
 // silently reuse a stale cubin/metallib. They are emitted here rather than
 // retyped in the drivers precisely because the two copies cannot be compared at
 // runtime -- the mismatch shows up as a wrong answer, not as an error.
-#define PTIR_CUDA_EMITTER_VERSION 19
-#define PTIR_METAL_M1_EMITTER_VERSION 35
+#define PTIR_CUDA_EMITTER_VERSION 21
+#define PTIR_METAL_M1_EMITTER_VERSION 36
 #define PTIR_METAL_M1_MAX_CHANNELS 29
 #define PTIR_METAL_M2_MAX_FUSED_CHANNELS 12
 // Threads a grouped generated region is launched with. The emitted MSL sizes

@@ -1,4 +1,4 @@
-package pie:inferlet@0.2.0;
+package pie:inferlet@0.3.0;
 
 world inferlet {
     import types;
@@ -6,7 +6,10 @@ world inferlet {
     import tokenizer;
     import pipeline;
     import working-set;
-    import forward;
+    import channel;
+    import forward;             // attention-only
+    import forward-recurrent;
+    import forward-hybrid;
     import grammar;
     import chat;
     import tools;

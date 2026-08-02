@@ -30,6 +30,7 @@
 #include "../model/deepseek_v4/deepseek_v4_forward.hpp"
 #include "dsv4_compress_cache.hpp"
 #include "../model/glm5/glm5_forward.hpp"
+#include "../model/kimi_k3/kimi_k3_forward.hpp"
 #include "../model/kimi/kimi_forward.hpp"
 #include "../model/loaded_model.hpp"
 #include "../model/nemotron_h/nemotron_h_forward.hpp"
@@ -296,6 +297,7 @@ CudaMemoryPlan plan_cuda_memory(
     bool deepseek_v4_selected,
     bool kimi_selected,
     bool glm5_selected,
+    bool kimi_k3_selected,
     const pie_cuda_driver::KvCacheFormat& kv_format,
     const pie_cuda_driver::ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose)
@@ -345,7 +347,7 @@ CudaMemoryPlan plan_cuda_memory(
                   pie_cuda_driver::kv_cache_device_bytes_per_page(
                       kv_format, 1, 1, hf.head_dim) +
                   pie_cuda_driver::dsv4_compress_bytes_per_token(hf)
-            : (kimi_selected || glm5_selected)
+            : (kimi_selected || glm5_selected || kimi_k3_selected)
             ? static_cast<std::size_t>(hf.num_hidden_layers) *
                   (static_cast<std::size_t>(hf.kv_lora_rank) +
                    static_cast<std::size_t>(hf.qk_rope_head_dim)) *
@@ -410,8 +412,14 @@ CudaMemoryPlan plan_cuda_memory(
                          prefill_cap,
                          2 * profile_prefill_target("throughput", cfg, prop)));
 
+    // Kimi-K3 keeps the same kind of per-request linear-attention state, and
+    // its widths coincide: KDA is not grouped, so `linear_num_key_heads ==
+    // linear_num_value_heads` and the two head dims are equal, which makes the
+    // `2*K + V` conv width below exactly K3's three short-convolution bands.
+    // Leaving K3 out reserves **zero** bytes for its state slots, and the
+    // planner then hands out a `max_requests` the cache cannot back.
     const bool has_qwen_linear_state =
-        qwen3_5_selected || qwen3_5_moe_selected;
+        qwen3_5_selected || qwen3_5_moe_selected || kimi_k3_selected;
     const std::size_t K_dim =
         static_cast<std::size_t>(
             std::max(0, hf.linear_num_key_heads / tp_size)) *
@@ -534,12 +542,10 @@ CudaMemoryPlan plan_cuda_memory(
             const int output_rows = R0;
             int mtp_drafts_per_program = 0;
             if (qwen3_5_selected || qwen3_5_moe_selected) {
-                mtp_drafts_per_program = cfg.model.mtp_num_drafts;
-                if (const char* value =
-                        std::getenv("PIE_MTP_DRAFT_TOKENS")) {
-                    mtp_drafts_per_program =
-                        std::clamp(std::atoi(value), 0, 32);
-                }
+                // Same clamp as `configured_mtp_num_drafts` in context.cpp;
+                // the arena must be sized for exactly the K that will run.
+                mtp_drafts_per_program =
+                    std::clamp(cfg.model.mtp_num_drafts, 0, 32);
             }
             std::size_t arena = 0;
             arena += pie_cuda_driver::model::workspace_bytes(
@@ -572,6 +578,10 @@ CudaMemoryPlan plan_cuda_memory(
             if (glm5_selected) {
                 arena += pie_cuda_driver::model::glm5_workspace_bytes(
                     hf, N, output_rows, hf.max_position_embeddings, tp_size);
+            }
+            if (kimi_k3_selected) {
+                arena += pie_cuda_driver::model::kimi_k3_workspace_bytes(
+                    hf, N, output_rows, tp_size);
             }
             const std::size_t attn_float_bytes =
                 pie_cuda_driver::attention_float_workspace_bytes(

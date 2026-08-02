@@ -39,10 +39,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         Ok(self.ctx().table.push(ws)?)
     }
 
-    async fn state_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u64> {
-        crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.get(&this)?.geom.state_size)
-    }
 
     async fn buffer_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
         crate::inferlet::process::gate::residency_gate(self).await?;
@@ -52,10 +48,6 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         Ok(size.map_err(anyhow::Error::from)?)
     }
 
-    async fn buffer_page_size(&mut self, this: Resource<RsWorkingSet>) -> Result<u32> {
-        crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.get(&this)?.geom.buffer_page_tokens)
-    }
 
     async fn alloc_buffer(
         &mut self,
@@ -90,6 +82,23 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
             .free_buffer(ws.id, &indices, epoch)
             .map_err(|e| e.to_string());
         rs.retire_idle();
+        Ok(out)
+    }
+
+    async fn discard_buffered(
+        &mut self,
+        this: Resource<RsWorkingSet>,
+        count: u32,
+    ) -> Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let ws = self.ctx().table.get(&this)?.clone();
+        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let out = stores
+            .rs
+            .lock()
+            .unwrap()
+            .discard_buffered(ws.id, count)
+            .map_err(|e| e.to_string());
         Ok(out)
     }
 

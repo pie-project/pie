@@ -7,7 +7,7 @@
 #include <limits>
 
 #include <pie_driver_abi.h>
-#include <pie_native/step_launch.hpp>
+#include <pie/driver/fire/step.hpp>
 
 namespace pie_cuda_driver::abi {
 
@@ -257,20 +257,49 @@ inline int validate_launch_resources(const LaunchT& launch,
         }
     }
 
+    // These four said only "invalid argument", which is the least useful thing
+    // they could say: the capacity they check against is a *driver* decision
+    // (which cache the executor was handed), so a family that wires the wrong
+    // one reads as a well-formed launch that the runtime keeps retrying. The
+    // numbers are what identify it, and the rest of this function already
+    // prints them.
     if (launch.rs_slot_ids.len != 0) {
-        if (rs_slots <= 0) return PIE_STATUS_INVALID_ARGUMENT;
+        if (rs_slots <= 0) {
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] launch validation: %zu rs slot "
+                         "id(s) but the executor has no state cache\n",
+                         launch.rs_slot_ids.len);
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
         for (std::size_t i = 0; i < launch.rs_slot_ids.len; ++i) {
             if (launch.rs_slot_ids.ptr[i] >=
                 static_cast<std::uint32_t>(rs_slots)) {
+                std::fprintf(stderr,
+                             "[pie-driver-cuda] launch validation: rs slot id "
+                             "%u at %zu of %zu exceeds the cache's %d slot(s)\n",
+                             launch.rs_slot_ids.ptr[i], i,
+                             launch.rs_slot_ids.len, rs_slots);
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
         }
     }
     if (launch.rs_buffer_slot_ids.len != 0) {
-        if (rs_buffer_slots <= 0) return PIE_STATUS_INVALID_ARGUMENT;
+        if (rs_buffer_slots <= 0) {
+            std::fprintf(stderr,
+                         "[pie-driver-cuda] launch validation: %zu rs buffer "
+                         "slot id(s) but no rs buffer pool is configured\n",
+                         launch.rs_buffer_slot_ids.len);
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
         for (std::size_t i = 0; i < launch.rs_buffer_slot_ids.len; ++i) {
             if (launch.rs_buffer_slot_ids.ptr[i] >=
                 static_cast<std::uint32_t>(rs_buffer_slots)) {
+                std::fprintf(stderr,
+                             "[pie-driver-cuda] launch validation: rs buffer "
+                             "slot id %u at %zu of %zu exceeds the pool's %d "
+                             "slot(s)\n",
+                             launch.rs_buffer_slot_ids.ptr[i], i,
+                             launch.rs_buffer_slot_ids.len, rs_buffer_slots);
                 return PIE_STATUS_INVALID_ARGUMENT;
             }
         }

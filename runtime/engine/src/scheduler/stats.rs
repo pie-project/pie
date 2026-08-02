@@ -213,7 +213,7 @@ pub struct FireStats {
 }
 
 /// Quorum-rule probe averages/counters (overview §7.2; thrust-2 §3 F1–F6).
-/// The wave counters (`wave_*`, `cold_hold_fires`) populate in every build.
+/// The wave counters (`wave_*`) populate in every build.
 /// Legacy straggler counters remain zero under strict wait-all.
 /// The latency probes (bubble/quorum-latency sums, escape/submit-ahead)
 /// still require `profile-fire`. Populated by the quorum core (thrust-2
@@ -231,11 +231,6 @@ pub struct QuorumStats {
     /// Depth-2 submit-ahead (G3 bubble) fire count; divide by `total_batches`
     /// for the submit-ahead rate (steady-state decode-fleet bubble-filler).
     pub submit_ahead_fires: u64,
-    /// Mean cold-hold window per cold-hold fire (F3 occupancy).
-    pub avg_cold_hold_us: u64,
-    pub cold_hold_us_sum: u64,
-    /// Count of fires through the cold-hold path (F3).
-    pub cold_hold_fires: u64,
     /// Legacy field: strict wait-all never fires narrow.
     pub straggler_fires: u64,
     /// Legacy field: strict wait-all never demotes pipelines.
@@ -316,8 +311,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
     let mut q_quorum_latency = 0u64;
     let mut q_escape_fires = 0u64;
     let mut q_submit_ahead_fires = 0u64;
-    let mut q_cold_hold = 0u64;
-    let mut q_cold_hold_fires = 0u64;
     let mut q_straggler_fires = 0u64;
     let mut q_straggler_demotions = 0u64;
     let mut q_readiness_miss = 0u64;
@@ -350,8 +343,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
         q_quorum_latency += f.quorum.quorum_latency_us.load(Relaxed);
         q_escape_fires += f.quorum.escape_fires.load(Relaxed);
         q_submit_ahead_fires += f.quorum.submit_ahead_fires.load(Relaxed);
-        q_cold_hold += f.quorum.cold_hold_us.load(Relaxed);
-        q_cold_hold_fires += f.quorum.cold_hold_fires.load(Relaxed);
         q_straggler_fires += f.quorum.straggler_fires.load(Relaxed);
         q_straggler_demotions += f.quorum.straggler_demotions.load(Relaxed);
         q_readiness_miss += f.quorum.readiness_miss.load(Relaxed);
@@ -425,13 +416,6 @@ pub(crate) fn aggregate(scheduler_stats: &[Arc<SchedulerStats>]) -> AggregateSta
                 quorum_latency_us_sum: q_quorum_latency,
                 escape_fires: q_escape_fires,
                 submit_ahead_fires: q_submit_ahead_fires,
-                avg_cold_hold_us: if q_cold_hold_fires > 0 {
-                    q_cold_hold / q_cold_hold_fires
-                } else {
-                    0
-                },
-                cold_hold_us_sum: q_cold_hold,
-                cold_hold_fires: q_cold_hold_fires,
                 straggler_fires: q_straggler_fires,
                 straggler_demotions: q_straggler_demotions,
                 readiness_miss: q_readiness_miss,

@@ -27,7 +27,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
-#include "pie_native/launch/op_table.hpp"
+#include "pie/driver/launch/op_table.hpp"
 #include <rng_contract.generated.h>
 
 namespace pie_cuda_driver::pipeline {

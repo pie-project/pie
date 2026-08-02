@@ -12,11 +12,31 @@ import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
 from componentize_py_async_support.futures import FutureReader, FutureWriter
 
+class ForwardKind(Enum):
+    """
+    Which forward-pass kind the bound model requires. A guest may only
+    construct the `forward-pass` of the matching interface; the other
+    interfaces' constructors error immediately.
+    
+    Do NOT derive this by parsing `architecture()` — that is an open set and
+    every new model family would break guests. This enum is closed over
+    STATE SEMANTICS, so it does not grow with the model zoo.
+    
+    Relationship to `is-linear`: `is-linear()` == (`pass-kind()` !=
+    attention). `is-linear` remains as the commit-policy hint (irreversible
+    fold ⇒ FOLD-COMMIT); `pass-kind` is what selects the binding surface.
+    """
+    ATTENTION = 0
+    RECURRENT = 1
+    HYBRID = 2
+
 
 def name() -> str:
     """
     The engine serves exactly one model; these are global functions over
-    that single bound model (no `model`/`tokenizer` resource handles).
+    that single bound model (no `model` resource handle). Identity + memory-
+    shaping capabilities only — the tokenizer surface (encode/decode/vocabs/
+    special-tokens/split-regex) lives in the sibling `tokenizer` interface.
     Returns the name of the bound model
     """
     raise NotImplementedError
@@ -30,31 +50,70 @@ def default_system_speculation() -> bool:
     Whether the bound model enables system speculation by default
     """
     raise NotImplementedError
-def encode(text: str) -> List[int]:
+def is_linear() -> bool:
     """
-    Converts input text into a list of token IDs
+    Whether the bound model is linear/recurrent — i.e. it carries a fused
+    recurrent state that folds tokens IRREVERSIBLY (linear-attention / SSM:
+    Qwen3.5 GDN, Nemotron-H Mamba2), as opposed to pure attention whose KV is
+    per-token and reversibly discardable. TRUE iff the model has recurrent
+    state (equivalently `rs-state-size() > 0`). The runtime uses this to pick
+    the speculative-commit strategy — FOLD-COMMIT (fold only the accepted
+    prefix, holding the uncertain tail in the RS buffer; folding is
+    runtime-managed in-forward) for linear models vs KV-SLOT DISCARD for
+    attention — so the inferlet's spec-decode loop can stay model-agnostic.
+    Prefer this over
+    reading `rs-state-size()` as a class flag: this pins the commit CONTRACT
+    (irreversible fold ⇒ fold-commit), not a byte-accounting accident.
     """
     raise NotImplementedError
-def decode(tokens: List[int]) -> str:
+def pass_kind() -> ForwardKind:
+    raise NotImplementedError
+def output_vocab_size() -> int:
     """
-    Converts token IDs back into a decoded string
+    Logits/output dimension (= hf_config.vocab_size). May EXCEED the
+    tokenizer's vocabs() token count due to padding. Use THIS for
+    sampler-program lowering and any logits-shaped op; use vocabs() only for
+    token-space work. Sourced from the model (not hardcoded) so the
+    inferlet's lowering vocab == the driver's logits / recognizer-table vocab.
+    """
+    raise NotImplementedError
+def kv_page_size() -> int:
+    """
+    Tokens per KV page for the bound model/driver.
+    """
+    raise NotImplementedError
+def frame_size() -> int:
+    """
+    Waves per frame (k) for this deployment — a static constant fixed at
+    engine start, exactly like kv-page-size. `forward.submit` takes exactly
+    this many ordered slots; slot i executes in wave i. Guests must be
+    output-correct for any k: it decides submission granularity and
+    resource sizing, never token-level behavior. Never renegotiated per
+    frame and never adapted from runtime timing.
+    """
+    raise NotImplementedError
+def channel_capacity() -> int:
+    """
+    Host-reader channel capacity, in cells, that lets one lane sustain the
+    engine's run-ahead without the ring becoming the bottleneck. Size every
+    host-reader channel to at least this; the staging margin is already
+    included, so guests need no arithmetic.
     
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    Under-sizing does not fail loudly. At k = 1 there is no frame to
+    validate, so an undersized ring simply serialises the lane with no
+    diagnostic — and because the scheduler waits for ALL lanes, a serialised
+    lane holds up every co-resident tenant, not just itself.
+    
+    UNLIKE frame-size this is not promised to be static: it derives from the
+    host resubmit turnaround, which the runtime may later adapt. Read it,
+    don't cache it across a run.
     """
     raise NotImplementedError
-def vocabs() -> Tuple[List[int], List[bytes]]:
+def max_embed_length() -> int:
     """
-    Returns the model's vocabulary as a list of byte sequences (tokens)
-    """
-    raise NotImplementedError
-def split_regex() -> str:
-    """
-    Returns the split regular expression used by the tokenizer
-    """
-    raise NotImplementedError
-def special_tokens() -> Tuple[List[int], List[bytes]]:
-    """
-    Returns the special tokens recognized by the model
+    Max embed tokens in a single pass (C) — the prefill chunk budget.
+    Guests split a prompt of L tokens into ceil(L / C) chunk passes;
+    chunking is guest-side, against this static constant.
     """
     raise NotImplementedError
 def rs_state_size() -> int:
@@ -73,8 +132,8 @@ def rs_buffer_page_size() -> int:
     raise NotImplementedError
 def rs_fold_granularity() -> int:
     """
-    Fold granularity in tokens: `forward-pass.fold-buffered(n)` requires `n`
-    to be a positive multiple of this value. 1 (or 0) means unconstrained;
+    Fold granularity in tokens: an RS fold of `n` tokens requires `n` to
+    be a positive multiple of this value. 1 (or 0) means unconstrained;
     0 also implies the model has no recurrent state. (Token-causal RS models
     — Qwen3.5 GDN, Nemotron-H Mamba2 — report 1.)
     """

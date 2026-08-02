@@ -98,6 +98,4 @@ template <typename T>
       const device itype*, device uint*, constant ArgmaxParams&,           \
       device uint*, uint3, uint3, uint3, uint, uint);
 
-instantiate_argmax(float32, float)
-instantiate_argmax(float16, half)
 instantiate_argmax(bfloat16, bfloat)

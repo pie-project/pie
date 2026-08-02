@@ -1,21 +1,5 @@
-/** @module Interface wasi:filesystem/types@0.2.4 **/
-/**
- * Attempts to extract a filesystem-related `error-code` from the stream
- * `error` provided.
- * 
- * Stream operations which return `stream-error::last-operation-failed`
- * have a payload with more information about the operation that failed.
- * This payload can be passed through to this function to see if there's
- * filesystem-related information about the error to return.
- * 
- * Note that this function is fallible because not all stream-related
- * errors are filesystem-related errors.
- */
-export function filesystemErrorCode(err: Error): ErrorCode | undefined;
-export type InputStream = import('./wasi-io-streams.js').InputStream;
-export type OutputStream = import('./wasi-io-streams.js').OutputStream;
-export type Error = import('./wasi-io-streams.js').Error;
-export type Datetime = import('./wasi-clocks-wall-clock.js').Datetime;
+/** @module Interface wasi:filesystem/types@0.3.0 **/
+export type Instant = import('./wasi-clocks-system-clock.js').Instant;
 /**
  * File size or length of a region within a file.
  */
@@ -24,35 +8,58 @@ export type Filesize = bigint;
  * The type of a filesystem object referenced by a descriptor.
  * 
  * Note: This was called `filetype` in earlier versions of WASI.
- * # Variants
- * 
- * ## `"unknown"`
- * 
- * The type of the descriptor or file is unknown or is different from
- * any of the other types specified.
- * ## `"block-device"`
- * 
+ */
+export type DescriptorType = DescriptorTypeBlockDevice | DescriptorTypeCharacterDevice | DescriptorTypeDirectory | DescriptorTypeFifo | DescriptorTypeSymbolicLink | DescriptorTypeRegularFile | DescriptorTypeSocket | DescriptorTypeOther;
+/**
  * The descriptor refers to a block device inode.
- * ## `"character-device"`
- * 
+ */
+export interface DescriptorTypeBlockDevice {
+  tag: 'block-device',
+}
+/**
  * The descriptor refers to a character device inode.
- * ## `"directory"`
- * 
+ */
+export interface DescriptorTypeCharacterDevice {
+  tag: 'character-device',
+}
+/**
  * The descriptor refers to a directory inode.
- * ## `"fifo"`
- * 
+ */
+export interface DescriptorTypeDirectory {
+  tag: 'directory',
+}
+/**
  * The descriptor refers to a named pipe.
- * ## `"symbolic-link"`
- * 
+ */
+export interface DescriptorTypeFifo {
+  tag: 'fifo',
+}
+/**
  * The file refers to a symbolic link inode.
- * ## `"regular-file"`
- * 
+ */
+export interface DescriptorTypeSymbolicLink {
+  tag: 'symbolic-link',
+}
+/**
  * The descriptor refers to a regular file inode.
- * ## `"socket"`
- * 
+ */
+export interface DescriptorTypeRegularFile {
+  tag: 'regular-file',
+}
+/**
  * The descriptor refers to a socket.
  */
-export type DescriptorType = 'unknown' | 'block-device' | 'character-device' | 'directory' | 'fifo' | 'symbolic-link' | 'regular-file' | 'socket';
+export interface DescriptorTypeSocket {
+  tag: 'socket',
+}
+/**
+ * The type of the descriptor or file is different from any of the
+ * other types specified.
+ */
+export interface DescriptorTypeOther {
+  tag: 'other',
+  val: string | undefined,
+}
 /**
  * Descriptor flags.
  * 
@@ -169,21 +176,21 @@ export interface DescriptorStat {
    * If the `option` is none, the platform doesn't maintain an access
    * timestamp for this file.
    */
-  dataAccessTimestamp?: Datetime,
+  dataAccessTimestamp?: Instant,
   /**
    * Last data modification timestamp.
    * 
    * If the `option` is none, the platform doesn't maintain a
    * modification timestamp for this file.
    */
-  dataModificationTimestamp?: Datetime,
+  dataModificationTimestamp?: Instant,
   /**
    * Last file status-change timestamp.
    * 
    * If the `option` is none, the platform doesn't maintain a
    * status-change timestamp for this file.
    */
-  statusChangeTimestamp?: Datetime,
+  statusChangeTimestamp?: Instant,
 }
 /**
  * When setting a timestamp, this gives the value to set it to.
@@ -207,7 +214,7 @@ export interface NewTimestampNow {
  */
 export interface NewTimestampTimestamp {
   tag: 'timestamp',
-  val: Datetime,
+  val: Instant,
 }
 /**
  * A directory entry.
@@ -227,121 +234,233 @@ export interface DirectoryEntry {
  * Not all of these error codes are returned by the functions provided by this
  * API; some are used in higher-level library layers, and others are provided
  * merely for alignment with POSIX.
- * # Variants
- * 
- * ## `"access"`
- * 
+ */
+export type ErrorCode = ErrorCodeAccess | ErrorCodeAlready | ErrorCodeBadDescriptor | ErrorCodeBusy | ErrorCodeDeadlock | ErrorCodeQuota | ErrorCodeExist | ErrorCodeFileTooLarge | ErrorCodeIllegalByteSequence | ErrorCodeInProgress | ErrorCodeInterrupted | ErrorCodeInvalid | ErrorCodeIo | ErrorCodeIsDirectory | ErrorCodeLoop | ErrorCodeTooManyLinks | ErrorCodeMessageSize | ErrorCodeNameTooLong | ErrorCodeNoDevice | ErrorCodeNoEntry | ErrorCodeNoLock | ErrorCodeInsufficientMemory | ErrorCodeInsufficientSpace | ErrorCodeNotDirectory | ErrorCodeNotEmpty | ErrorCodeNotRecoverable | ErrorCodeUnsupported | ErrorCodeNoTty | ErrorCodeNoSuchDevice | ErrorCodeOverflow | ErrorCodeNotPermitted | ErrorCodePipe | ErrorCodeReadOnly | ErrorCodeInvalidSeek | ErrorCodeTextFileBusy | ErrorCodeCrossDevice | ErrorCodeOther;
+/**
  * Permission denied, similar to `EACCES` in POSIX.
- * ## `"would-block"`
- * 
- * Resource unavailable, or operation would block, similar to `EAGAIN` and `EWOULDBLOCK` in POSIX.
- * ## `"already"`
- * 
+ */
+export interface ErrorCodeAccess {
+  tag: 'access',
+}
+/**
  * Connection already in progress, similar to `EALREADY` in POSIX.
- * ## `"bad-descriptor"`
- * 
+ */
+export interface ErrorCodeAlready {
+  tag: 'already',
+}
+/**
  * Bad descriptor, similar to `EBADF` in POSIX.
- * ## `"busy"`
- * 
+ */
+export interface ErrorCodeBadDescriptor {
+  tag: 'bad-descriptor',
+}
+/**
  * Device or resource busy, similar to `EBUSY` in POSIX.
- * ## `"deadlock"`
- * 
+ */
+export interface ErrorCodeBusy {
+  tag: 'busy',
+}
+/**
  * Resource deadlock would occur, similar to `EDEADLK` in POSIX.
- * ## `"quota"`
- * 
+ */
+export interface ErrorCodeDeadlock {
+  tag: 'deadlock',
+}
+/**
  * Storage quota exceeded, similar to `EDQUOT` in POSIX.
- * ## `"exist"`
- * 
+ */
+export interface ErrorCodeQuota {
+  tag: 'quota',
+}
+/**
  * File exists, similar to `EEXIST` in POSIX.
- * ## `"file-too-large"`
- * 
+ */
+export interface ErrorCodeExist {
+  tag: 'exist',
+}
+/**
  * File too large, similar to `EFBIG` in POSIX.
- * ## `"illegal-byte-sequence"`
- * 
+ */
+export interface ErrorCodeFileTooLarge {
+  tag: 'file-too-large',
+}
+/**
  * Illegal byte sequence, similar to `EILSEQ` in POSIX.
- * ## `"in-progress"`
- * 
+ */
+export interface ErrorCodeIllegalByteSequence {
+  tag: 'illegal-byte-sequence',
+}
+/**
  * Operation in progress, similar to `EINPROGRESS` in POSIX.
- * ## `"interrupted"`
- * 
+ */
+export interface ErrorCodeInProgress {
+  tag: 'in-progress',
+}
+/**
  * Interrupted function, similar to `EINTR` in POSIX.
- * ## `"invalid"`
- * 
+ */
+export interface ErrorCodeInterrupted {
+  tag: 'interrupted',
+}
+/**
  * Invalid argument, similar to `EINVAL` in POSIX.
- * ## `"io"`
- * 
+ */
+export interface ErrorCodeInvalid {
+  tag: 'invalid',
+}
+/**
  * I/O error, similar to `EIO` in POSIX.
- * ## `"is-directory"`
- * 
+ */
+export interface ErrorCodeIo {
+  tag: 'io',
+}
+/**
  * Is a directory, similar to `EISDIR` in POSIX.
- * ## `"loop"`
- * 
+ */
+export interface ErrorCodeIsDirectory {
+  tag: 'is-directory',
+}
+/**
  * Too many levels of symbolic links, similar to `ELOOP` in POSIX.
- * ## `"too-many-links"`
- * 
+ */
+export interface ErrorCodeLoop {
+  tag: 'loop',
+}
+/**
  * Too many links, similar to `EMLINK` in POSIX.
- * ## `"message-size"`
- * 
+ */
+export interface ErrorCodeTooManyLinks {
+  tag: 'too-many-links',
+}
+/**
  * Message too large, similar to `EMSGSIZE` in POSIX.
- * ## `"name-too-long"`
- * 
+ */
+export interface ErrorCodeMessageSize {
+  tag: 'message-size',
+}
+/**
  * Filename too long, similar to `ENAMETOOLONG` in POSIX.
- * ## `"no-device"`
- * 
+ */
+export interface ErrorCodeNameTooLong {
+  tag: 'name-too-long',
+}
+/**
  * No such device, similar to `ENODEV` in POSIX.
- * ## `"no-entry"`
- * 
+ */
+export interface ErrorCodeNoDevice {
+  tag: 'no-device',
+}
+/**
  * No such file or directory, similar to `ENOENT` in POSIX.
- * ## `"no-lock"`
- * 
+ */
+export interface ErrorCodeNoEntry {
+  tag: 'no-entry',
+}
+/**
  * No locks available, similar to `ENOLCK` in POSIX.
- * ## `"insufficient-memory"`
- * 
+ */
+export interface ErrorCodeNoLock {
+  tag: 'no-lock',
+}
+/**
  * Not enough space, similar to `ENOMEM` in POSIX.
- * ## `"insufficient-space"`
- * 
+ */
+export interface ErrorCodeInsufficientMemory {
+  tag: 'insufficient-memory',
+}
+/**
  * No space left on device, similar to `ENOSPC` in POSIX.
- * ## `"not-directory"`
- * 
+ */
+export interface ErrorCodeInsufficientSpace {
+  tag: 'insufficient-space',
+}
+/**
  * Not a directory or a symbolic link to a directory, similar to `ENOTDIR` in POSIX.
- * ## `"not-empty"`
- * 
+ */
+export interface ErrorCodeNotDirectory {
+  tag: 'not-directory',
+}
+/**
  * Directory not empty, similar to `ENOTEMPTY` in POSIX.
- * ## `"not-recoverable"`
- * 
+ */
+export interface ErrorCodeNotEmpty {
+  tag: 'not-empty',
+}
+/**
  * State not recoverable, similar to `ENOTRECOVERABLE` in POSIX.
- * ## `"unsupported"`
- * 
+ */
+export interface ErrorCodeNotRecoverable {
+  tag: 'not-recoverable',
+}
+/**
  * Not supported, similar to `ENOTSUP` and `ENOSYS` in POSIX.
- * ## `"no-tty"`
- * 
+ */
+export interface ErrorCodeUnsupported {
+  tag: 'unsupported',
+}
+/**
  * Inappropriate I/O control operation, similar to `ENOTTY` in POSIX.
- * ## `"no-such-device"`
- * 
+ */
+export interface ErrorCodeNoTty {
+  tag: 'no-tty',
+}
+/**
  * No such device or address, similar to `ENXIO` in POSIX.
- * ## `"overflow"`
- * 
+ */
+export interface ErrorCodeNoSuchDevice {
+  tag: 'no-such-device',
+}
+/**
  * Value too large to be stored in data type, similar to `EOVERFLOW` in POSIX.
- * ## `"not-permitted"`
- * 
+ */
+export interface ErrorCodeOverflow {
+  tag: 'overflow',
+}
+/**
  * Operation not permitted, similar to `EPERM` in POSIX.
- * ## `"pipe"`
- * 
+ */
+export interface ErrorCodeNotPermitted {
+  tag: 'not-permitted',
+}
+/**
  * Broken pipe, similar to `EPIPE` in POSIX.
- * ## `"read-only"`
- * 
+ */
+export interface ErrorCodePipe {
+  tag: 'pipe',
+}
+/**
  * Read-only file system, similar to `EROFS` in POSIX.
- * ## `"invalid-seek"`
- * 
+ */
+export interface ErrorCodeReadOnly {
+  tag: 'read-only',
+}
+/**
  * Invalid seek, similar to `ESPIPE` in POSIX.
- * ## `"text-file-busy"`
- * 
+ */
+export interface ErrorCodeInvalidSeek {
+  tag: 'invalid-seek',
+}
+/**
  * Text file busy, similar to `ETXTBSY` in POSIX.
- * ## `"cross-device"`
- * 
+ */
+export interface ErrorCodeTextFileBusy {
+  tag: 'text-file-busy',
+}
+/**
  * Cross-device link, similar to `EXDEV` in POSIX.
  */
-export type ErrorCode = 'access' | 'would-block' | 'already' | 'bad-descriptor' | 'busy' | 'deadlock' | 'quota' | 'exist' | 'file-too-large' | 'illegal-byte-sequence' | 'in-progress' | 'interrupted' | 'invalid' | 'io' | 'is-directory' | 'loop' | 'too-many-links' | 'message-size' | 'name-too-long' | 'no-device' | 'no-entry' | 'no-lock' | 'insufficient-memory' | 'insufficient-space' | 'not-directory' | 'not-empty' | 'not-recoverable' | 'unsupported' | 'no-tty' | 'no-such-device' | 'overflow' | 'not-permitted' | 'pipe' | 'read-only' | 'invalid-seek' | 'text-file-busy' | 'cross-device';
+export interface ErrorCodeCrossDevice {
+  tag: 'cross-device',
+}
+/**
+ * A catch-all for errors not captured by the existing variants.
+ * Implementations can use this to extend the error type without
+ * breaking existing code.
+ */
+export interface ErrorCodeOther {
+  tag: 'other',
+  val: string | undefined,
+}
 /**
  * File or memory access pattern advisory information.
  * # Variants
@@ -386,6 +505,7 @@ export interface MetadataHashValue {
    */
   upper: bigint,
 }
+export type Result<T, E> = { tag: 'ok', val: T } | { tag: 'err', val: E };
 
 export class Descriptor {
   /**
@@ -393,40 +513,56 @@ export class Descriptor {
    */
   private constructor();
   /**
-  * Return a stream for reading from a file, if available.
-  * 
-  * May fail with an error-code describing why the file cannot be read.
+  * Return a stream for reading from a file.
   * 
   * Multiple read, write, and append streams may be active on the same open
   * file and they do not interfere with each other.
   * 
-  * Note: This allows using `read-stream`, which is similar to `read` in POSIX.
+  * This function returns a `stream` which provides the data received from the
+  * file, and a `future` providing additional error information in case an
+  * error is encountered.
+  * 
+  * If no error is encountered, `stream.read` on the `stream` will return
+  * `read-status::closed` with no `error-context` and the future resolves to
+  * the value `ok`. If an error is encountered, `stream.read` on the
+  * `stream` returns `read-status::closed` with an `error-context` and the future
+  * resolves to `err` with an `error-code`.
+  * 
+  * Note: This is similar to `pread` in POSIX.
   */
-  readViaStream(offset: Filesize): InputStream;
+  readViaStream(offset: Filesize): [ReadableStream<number>, Promise<Result<void, ErrorCode>>];
   /**
   * Return a stream for writing to a file, if available.
   * 
   * May fail with an error-code describing why the file cannot be written.
   * 
-  * Note: This allows using `write-stream`, which is similar to `write` in
-  * POSIX.
+  * It is valid to write past the end of a file; the file is extended to the
+  * extent of the write, with bytes between the previous end and the start of
+  * the write set to zero.
+  * 
+  * This function returns once either full contents of the stream are
+  * written or an error is encountered.
+  * 
+  * Note: This is similar to `pwrite` in POSIX.
   */
-  writeViaStream(offset: Filesize): OutputStream;
+  writeViaStream(data: ReadableStream<number>, offset: Filesize): Promise<Result<void, ErrorCode>>;
   /**
   * Return a stream for appending to a file, if available.
   * 
   * May fail with an error-code describing why the file cannot be appended.
   * 
-  * Note: This allows using `write-stream`, which is similar to `write` with
-  * `O_APPEND` in POSIX.
+  * This function returns once either full contents of the stream are
+  * written or an error is encountered.
+  * 
+  * Note: This is similar to `write` with `O_APPEND` in POSIX.
   */
-  appendViaStream(): OutputStream;
+  appendViaStream(data: ReadableStream<number>): Promise<Result<void, ErrorCode>>;
   /**
   * Provide file advisory information on a descriptor.
   * 
   * This is similar to `posix_fadvise` in POSIX.
   */
-  advise(offset: Filesize, length: Filesize, advice: Advice): void;
+  advise(offset: Filesize, length: Filesize, advice: Advice): Promise<void>;
   /**
   * Synchronize the data of a file to disk.
   * 
@@ -435,7 +571,7 @@ export class Descriptor {
   * 
   * Note: This is similar to `fdatasync` in POSIX.
   */
-  syncData(): void;
+  syncData(): Promise<void>;
   /**
   * Get flags associated with a descriptor.
   * 
@@ -444,7 +580,7 @@ export class Descriptor {
   * Note: This returns the value that was the `fs_flags` value returned
   * from `fdstat_get` in earlier versions of WASI.
   */
-  getFlags(): DescriptorFlags;
+  getFlags(): Promise<DescriptorFlags>;
   /**
   * Get the dynamic type of a descriptor.
   * 
@@ -457,14 +593,14 @@ export class Descriptor {
   * Note: This returns the value that was the `fs_filetype` value returned
   * from `fdstat_get` in earlier versions of WASI.
   */
-  getType(): DescriptorType;
+  getType(): Promise<DescriptorType>;
   /**
   * Adjust the size of an open file. If this increases the file's size, the
   * extra bytes are filled with zeros.
   * 
   * Note: This was called `fd_filestat_set_size` in earlier versions of WASI.
   */
-  setSize(size: Filesize): void;
+  setSize(size: Filesize): Promise<void>;
   /**
   * Adjust the timestamps of an open file or directory.
   * 
@@ -472,33 +608,7 @@ export class Descriptor {
   * 
   * Note: This was called `fd_filestat_set_times` in earlier versions of WASI.
   */
-  setTimes(dataAccessTimestamp: NewTimestamp, dataModificationTimestamp: NewTimestamp): void;
-  /**
-  * Read from a descriptor, without using and updating the descriptor's offset.
-  * 
-  * This function returns a list of bytes containing the data that was
-  * read, along with a bool which, when true, indicates that the end of the
-  * file was reached. The returned list will contain up to `length` bytes; it
-  * may return fewer than requested, if the end of the file is reached or
-  * if the I/O operation is interrupted.
-  * 
-  * In the future, this may change to return a `stream<u8, error-code>`.
-  * 
-  * Note: This is similar to `pread` in POSIX.
-  */
-  read(length: Filesize, offset: Filesize): [Uint8Array, boolean];
-  /**
-  * Write to a descriptor, without using and updating the descriptor's offset.
-  * 
-  * It is valid to write past the end of a file; the file is extended to the
-  * extent of the write, with bytes between the previous end and the start of
-  * the write set to zero.
-  * 
-  * In the future, this may change to take a `stream<u8, error-code>`.
-  * 
-  * Note: This is similar to `pwrite` in POSIX.
-  */
-  write(buffer: Uint8Array, offset: Filesize): Filesize;
+  setTimes(dataAccessTimestamp: NewTimestamp, dataModificationTimestamp: NewTimestamp): Promise<void>;
   /**
   * Read directory entries from a directory.
   * 
@@ -509,8 +619,11 @@ export class Descriptor {
   * This always returns a new stream which starts at the beginning of the
   * directory. Multiple streams may be active on the same directory, and they
   * do not interfere with each other.
+  * 
+  * This function returns a future, which will resolve to an error code if
+  * reading full contents of the directory fails.
   */
-  readDirectory(): DirectoryEntryStream;
+  readDirectory(): [ReadableStream<DirectoryEntry>, Promise<Result<void, ErrorCode>>];
   /**
   * Synchronize the data and metadata of a file to disk.
   * 
@@ -519,13 +632,13 @@ export class Descriptor {
   * 
   * Note: This is similar to `fsync` in POSIX.
   */
-  sync(): void;
+  sync(): Promise<void>;
   /**
   * Create a directory.
   * 
   * Note: This is similar to `mkdirat` in POSIX.
   */
-  createDirectoryAt(path: string): void;
+  createDirectoryAt(path: string): Promise<void>;
   /**
   * Return the attributes of an open file or directory.
   * 
@@ -537,7 +650,7 @@ export class Descriptor {
   * 
   * Note: This was called `fd_filestat_get` in earlier versions of WASI.
   */
-  stat(): DescriptorStat;
+  stat(): Promise<DescriptorStat>;
   /**
   * Return the attributes of a file or directory.
   * 
@@ -547,7 +660,7 @@ export class Descriptor {
   * 
   * Note: This was called `path_filestat_get` in earlier versions of WASI.
   */
-  statAt(pathFlags: PathFlags, path: string): DescriptorStat;
+  statAt(pathFlags: PathFlags, path: string): Promise<DescriptorStat>;
   /**
   * Adjust the timestamps of a file or directory.
   * 
@@ -556,7 +669,7 @@ export class Descriptor {
   * Note: This was called `path_filestat_set_times` in earlier versions of
   * WASI.
   */
-  setTimesAt(pathFlags: PathFlags, path: string, dataAccessTimestamp: NewTimestamp, dataModificationTimestamp: NewTimestamp): void;
+  setTimesAt(pathFlags: PathFlags, path: string, dataAccessTimestamp: NewTimestamp, dataModificationTimestamp: NewTimestamp): Promise<void>;
   /**
   * Create a hard link.
   * 
@@ -566,7 +679,7 @@ export class Descriptor {
   * 
   * Note: This is similar to `linkat` in POSIX.
   */
-  linkAt(oldPathFlags: PathFlags, oldPath: string, newDescriptor: Descriptor, newPath: string): void;
+  linkAt(oldPathFlags: PathFlags, oldPath: string, newDescriptor: Descriptor, newPath: string): Promise<void>;
   /**
   * Open a file or directory.
   * 
@@ -581,7 +694,7 @@ export class Descriptor {
   * 
   * Note: This is similar to `openat` in POSIX.
   */
-  openAt(pathFlags: PathFlags, path: string, openFlags: OpenFlags, flags: DescriptorFlags): Descriptor;
+  openAt(pathFlags: PathFlags, path: string, openFlags: OpenFlags, flags: DescriptorFlags): Promise<Descriptor>;
   /**
   * Read the contents of a symbolic link.
   * 
@@ -590,7 +703,7 @@ export class Descriptor {
   * 
   * Note: This is similar to `readlinkat` in POSIX.
   */
-  readlinkAt(path: string): string;
+  readlinkAt(path: string): Promise<string>;
   /**
   * Remove a directory.
   * 
@@ -598,13 +711,13 @@ export class Descriptor {
   * 
   * Note: This is similar to `unlinkat(fd, path, AT_REMOVEDIR)` in POSIX.
   */
-  removeDirectoryAt(path: string): void;
+  removeDirectoryAt(path: string): Promise<void>;
   /**
   * Rename a filesystem object.
   * 
   * Note: This is similar to `renameat` in POSIX.
   */
-  renameAt(oldPath: string, newDescriptor: Descriptor, newPath: string): void;
+  renameAt(oldPath: string, newDescriptor: Descriptor, newPath: string): Promise<void>;
   /**
   * Create a symbolic link (also known as a "symlink").
   * 
@@ -613,14 +726,19 @@ export class Descriptor {
   * 
   * Note: This is similar to `symlinkat` in POSIX.
   */
-  symlinkAt(oldPath: string, newPath: string): void;
+  symlinkAt(oldPath: string, newPath: string): Promise<void>;
   /**
   * Unlink a filesystem object that is not a directory.
   * 
-  * Return `error-code::is-directory` if the path refers to a directory.
-  * Note: This is similar to `unlinkat(fd, path, 0)` in POSIX.
+  * This is similar to `unlinkat(fd, path, 0)` in POSIX.
+  * 
+  * Error returns are as specified by POSIX.
+  * 
+  * If the filesystem object is a directory, `error-code::access` or
+  * `error-code::is-directory` may be returned instead of the
+  * POSIX-specified `error-code::not-permitted`.
   */
-  unlinkFileAt(path: string): void;
+  unlinkFileAt(path: string): Promise<void>;
   /**
   * Test whether two descriptors refer to the same filesystem object.
   * 
@@ -629,7 +747,7 @@ export class Descriptor {
   * wasi-filesystem does not expose device and inode numbers, so this function
   * may be used instead.
   */
-  isSameObject(other: Descriptor): boolean;
+  isSameObject(other: Descriptor): Promise<boolean>;
   /**
   * Return a hash of the metadata associated with a filesystem object referred
   * to by a descriptor.
@@ -651,23 +769,12 @@ export class Descriptor {
   * 
   * However, none of these is required.
   */
-  metadataHash(): MetadataHashValue;
+  metadataHash(): Promise<MetadataHashValue>;
   /**
   * Return a hash of the metadata associated with a filesystem object referred
   * to by a directory descriptor and a relative path.
   * 
   * This performs the same hash computation as `metadata-hash`.
   */
-  metadataHashAt(pathFlags: PathFlags, path: string): MetadataHashValue;
-}
-
-export class DirectoryEntryStream {
-  /**
-   * This type does not have a public constructor.
-   */
-  private constructor();
-  /**
-  * Read a single directory entry from a `directory-entry-stream`.
-  */
-  readDirectoryEntry(): DirectoryEntry | undefined;
+  metadataHashAt(pathFlags: PathFlags, path: string): Promise<MetadataHashValue>;
 }

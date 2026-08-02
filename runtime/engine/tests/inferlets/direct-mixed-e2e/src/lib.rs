@@ -1,14 +1,13 @@
 use inferlet::Result;
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 
 /// One-page working set + a single seeded token.
 const MAX_PAGES: u32 = 1;
 
 fn geometry() -> Result<(WorkingSet, Channel)> {
     let ws = WorkingSet::new();
-    ws.reserve(MAX_PAGES)
-        .map_err(|error| format!("ws.reserve: {error}"))?;
-    Ok((ws, Channel::from(vec![1i32]).named("token")))
+    ws.reserve(MAX_PAGES).context("ws.reserve")?;
+    Ok((ws, Channel::from([1i32]).named("token")))
 }
 
 fn bind_geometry(
@@ -17,31 +16,33 @@ fn bind_geometry(
     token: &Channel,
     kv_len: &Channel,
 ) -> Result<()> {
-    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-    let positions = Channel::from(vec![0u32]).named("positions");
-    let pages = Channel::from(vec![0u32]).named("pages");
-    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
-    let w_slot = Channel::from(vec![0u32]).named("w_slot");
-    let w_off = Channel::from(vec![0u32]).named("w_off");
+    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+    let positions = Channel::from([0u32]).named("positions");
+    let pages = Channel::from([0u32]).named("pages");
+    let page_indptr = Channel::from([0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from([0u32]).named("w_slot");
+    let w_off = Channel::from([0u32]).named("w_off");
     pass.embed(token, &embed_indptr)?;
     pass.attention(
         ws,
-        ..,
-        ..,
-        kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )
 }
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
     let (ws, token) = geometry()?;
-    let mixed_kv_len = Channel::from(vec![1u32]).named("mixed_kv_len");
+    let mixed_kv_len = Channel::from([1u32]).named("mixed_kv_len");
     let mixed_token = Channel::new([1], dtype::u32).named("mixed_token");
     let mixed_scalar = Channel::new([1], dtype::f32).named("mixed_scalar");
     let vector = Channel::new([4], dtype::u32).named("vector");
@@ -50,26 +51,26 @@ async fn main(_input: String) -> Result<String> {
     let sampler_b = Channel::new([1], dtype::u32).named("sampler_b");
     let sampler_c = Channel::new([1], dtype::u32).named("sampler_c");
     let sampler_d = Channel::new([1], dtype::u32).named("sampler_d");
-    let mixed_token_source = Channel::from(vec![7u32]).named("mixed_token_source");
-    let mixed_scalar_source = Channel::from(vec![1.25f32]).named("mixed_scalar_source");
-    let vector_source = Channel::from(vec![3u32, 5, 8, 13]).named("vector_source");
-    let prefix_source = Channel::from(vec![0u32]).named("prefix_source");
-    let sampler_a_source = Channel::from(vec![11u32]).named("sampler_a_source");
-    let sampler_b_source = Channel::from(vec![12u32]).named("sampler_b_source");
-    let sampler_c_source = Channel::from(vec![13u32]).named("sampler_c_source");
-    let sampler_d_source = Channel::from(vec![14u32]).named("sampler_d_source");
+    let mixed_token_source = Channel::from([7u32]).named("mixed_token_source");
+    let mixed_scalar_source = Channel::from([1.25f32]).named("mixed_scalar_source");
+    let vector_source = Channel::from([3u32, 5, 8, 13]).named("vector_source");
+    let prefix_source = Channel::from([0u32]).named("prefix_source");
+    let sampler_a_source = Channel::from([11u32]).named("sampler_a_source");
+    let sampler_b_source = Channel::from([12u32]).named("sampler_b_source");
+    let sampler_c_source = Channel::from([13u32]).named("sampler_c_source");
+    let sampler_d_source = Channel::from([14u32]).named("sampler_d_source");
 
     let mixed = ForwardPass::new();
     bind_geometry(&mixed, &ws, &token, &mixed_kv_len)?;
     mixed.epilogue(move || {
-        let mixed_token_value = mixed_token_source.take().tensor();
-        let mixed_scalar_value = mixed_scalar_source.take().tensor();
-        let vector_value = vector_source.take().tensor();
-        let prefix_value = prefix_source.take().tensor();
-        let sampler_a_value = sampler_a_source.take().tensor();
-        let sampler_b_value = sampler_b_source.take().tensor();
-        let sampler_c_value = sampler_c_source.take().tensor();
-        let sampler_d_value = sampler_d_source.take().tensor();
+        let mixed_token_value = mixed_token_source.take();
+        let mixed_scalar_value = mixed_scalar_source.take();
+        let vector_value = vector_source.take();
+        let prefix_value = prefix_source.take();
+        let sampler_a_value = sampler_a_source.take();
+        let sampler_b_value = sampler_b_source.take();
+        let sampler_c_value = sampler_c_source.take();
+        let sampler_d_value = sampler_d_source.take();
 
         mixed_token_source.put(&mixed_token_value);
         mixed_scalar_source.put(&mixed_scalar_value);
@@ -91,73 +92,35 @@ async fn main(_input: String) -> Result<String> {
     });
 
     let pipeline = Pipeline::new();
-    mixed
-        .submit(&pipeline)
-        .map_err(|error| format!("mixed submit: {error}"))?;
-    let token_value = mixed_token
-        .take()
-        .get::<u32>()
-        .await
-        .map_err(|error| format!("mixed token: {error}"))?[0];
-    let scalar_value = mixed_scalar
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|error| format!("mixed scalar: {error}"))?[0];
-    let vector_value = vector
-        .take()
-        .get::<u32>()
-        .await
-        .map_err(|error| format!("vector: {error}"))?;
-    let empty_prefix = prefix_len
-        .take()
-        .get::<u32>()
-        .await
-        .map_err(|error| format!("prefix: {error}"))?[0] as usize;
+    mixed.submit(&pipeline).context("mixed submit")?;
+    let token_value = mixed_token.take_host::<u32>().await?;
+    let scalar_value = mixed_scalar.take_host::<f32>().await?;
+    let vector_value = vector.take_host::<Vec<u32>>().await?;
+    let empty_prefix = prefix_len.take_host::<u32>().await? as usize;
     let samplers = [
-        sampler_a
-            .take()
-            .get::<u32>()
-            .await
-            .map_err(|error| error.to_string())?[0],
-        sampler_b
-            .take()
-            .get::<u32>()
-            .await
-            .map_err(|error| error.to_string())?[0],
-        sampler_c
-            .take()
-            .get::<u32>()
-            .await
-            .map_err(|error| error.to_string())?[0],
-        sampler_d
-            .take()
-            .get::<u32>()
-            .await
-            .map_err(|error| error.to_string())?[0],
+        sampler_a.take_host::<u32>().await?,
+        sampler_b.take_host::<u32>().await?,
+        sampler_c.take_host::<u32>().await?,
+        sampler_d.take_host::<u32>().await?,
     ];
     pipeline.close();
 
     let (entropy_ws, entropy_token) = geometry()?;
-    let entropy_kv_len = Channel::from(vec![1u32]).named("entropy_kv_len");
+    let entropy_kv_len = Channel::from([1u32]).named("entropy_kv_len");
     let entropy = Channel::new([1], dtype::f32).named("entropy");
-    let entropy_source = Channel::from(vec![0.5f32]).named("entropy_source");
+    let entropy_source = Channel::from([0.5f32]).named("entropy_source");
     let entropy_pass = ForwardPass::new();
     bind_geometry(&entropy_pass, &entropy_ws, &entropy_token, &entropy_kv_len)?;
     entropy_pass.epilogue(move || {
-        let entropy_value = entropy_source.take().tensor();
+        let entropy_value = entropy_source.take();
         entropy_source.put(&entropy_value);
         entropy.put(&entropy_value);
     });
     let entropy_pipeline = Pipeline::new();
     entropy_pass
         .submit(&entropy_pipeline)
-        .map_err(|error| format!("entropy submit: {error}"))?;
-    let entropy_value = entropy
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|error| format!("entropy: {error}"))?[0];
+        .context("entropy submit")?;
+    let entropy_value = entropy.take_host::<f32>().await?;
     entropy_pipeline.close();
 
     let mixed_ok = token_value == 7 && (scalar_value - 1.25).abs() < f32::EPSILON;

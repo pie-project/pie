@@ -60,9 +60,10 @@
 //! different storage. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::mask::bit_allowed;
-use inferlet::ptir::prelude::*;
-use inferlet::{Constrain, JsonSchema, Result, Schema, chat, model as wit_model};
+use inferlet::chat;
+use inferlet::grammar::{Grammar, Matcher};
+use inferlet::mask::unpack_mask;
+use inferlet::ptir::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -143,15 +144,6 @@ fn default_seed() -> u32 {
     0x51D0
 }
 
-fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
-    if packed.is_empty() {
-        return vec![true; vocab as usize];
-    }
-    (0..vocab as usize)
-        .map(|t| bit_allowed(packed, t))
-        .collect()
-}
-
 /// The explored prefix trie. `alpha[node]` is the current over-approximation of
 /// that node's expected future grammaticality.
 struct Trie {
@@ -220,7 +212,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err("rounds must satisfy 1 <= rounds <= 16".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     // Exact, not truncated: a node gains at most one explored child per round.
     let pairs = input.rounds;
 
@@ -242,32 +234,28 @@ async fn main(input: Input) -> Result<Output> {
 
     for round in 0..input.rounds {
         let root_alpha_before = trie.alpha[0];
-        let mut constraint = JsonSchema(&input.schema).build_constraint()?;
+        let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
         // A fresh KV state per round: ASAp resamples the whole string, and a
         // WorkingSet permanently claims the first pipeline it fires on, so all
         // rounds share this inferlet's single pipeline.
         let ws = WorkingSet::new();
-        let page_size = ws.page_size();
+        let page_size = kv_page_size();
         let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-        ws.reserve(max_pages)
-            .map_err(|e| format!("reserve KV: {e}"))?;
+        ws.reserve(max_pages).context("reserve KV")?;
 
-        let prompt_tokens = Channel::from(prompt.iter().map(|&t| t as i32).collect::<Vec<_>>());
-        let pre_indptr = Channel::from(vec![0u32, n]).named("pre_indptr");
-        let pre_positions = Channel::from((0..n).collect::<Vec<_>>()).named("pre_positions");
-        let pre_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pre_pages");
-        let pre_page_indptr =
-            Channel::from(vec![0u32, n.div_ceil(page_size)]).named("pre_page_indptr");
-        let pre_w_slot =
-            Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("pre_w_slot");
-        let pre_w_off =
-            Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("pre_w_off");
-        let pre_kv_len = Channel::from(vec![n]).named("pre_kv_len");
+        let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
+        let pre_indptr = Channel::from([0u32, n]).named("pre_indptr");
+        let pre_positions = Channel::from_iter(0..n).named("pre_positions");
+        let pre_pages = Channel::from_iter(0..max_pages).named("pre_pages");
+        let pre_page_indptr = Channel::from([0u32, n.div_ceil(page_size)]).named("pre_page_indptr");
+        let pre_w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("pre_w_slot");
+        let pre_w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("pre_w_off");
+        let pre_kv_len = Channel::from([n]).named("pre_kv_len");
         let pre_mask = Channel::new([vocab], dtype::bool).named("pre_mask");
         let pre_alpha_idx = Channel::new([pairs as u32], dtype::u32).named("pre_alpha_idx");
         let pre_alpha_val = Channel::new([pairs as u32], dtype::f32).named("pre_alpha_val");
-        let pre_rng = Channel::from(vec![input.seed ^ (round as u32 * 0x9E37), 0]).named("pre_rng");
+        let pre_rng = Channel::from([input.seed ^ (round as u32 * 0x9E37), 0]).named("pre_rng");
         let pre_token = Channel::new([1], dtype::i32).named("pre_token");
         let pre_mass = Channel::new([1], dtype::f32).named("pre_mass");
         let pre_prob = Channel::new([1], dtype::f32).named("pre_prob");
@@ -277,20 +265,22 @@ async fn main(input: Input) -> Result<Output> {
         prefill.embed(&prompt_tokens, &pre_indptr)?;
         prefill.attention(
             &ws,
-            ..,
-            ..,
-            &pre_kv_len,
-            &pre_pages,
-            &pre_page_indptr,
-            &pre_w_slot,
-            &pre_w_off,
-            &pre_positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &pre_kv_len,
+                pages: &pre_pages,
+                page_indptr: &pre_page_indptr,
+                w_slot: &pre_w_slot,
+                w_off: &pre_w_off,
+                positions: &pre_positions,
+                mask: None,
+            },
         )?;
         prefill.epilogue(move || {
-            let allowed = pre_mask.take().tensor();
-            let idx = pre_alpha_idx.take().tensor();
-            let val = pre_alpha_val.take().tensor();
+            let allowed = pre_mask.take();
+            let idx = pre_alpha_idx.take();
+            let val = pre_alpha_val.take();
             let r = pre_rng.take();
             let (token, mass, prob, wmass) =
                 asap_step(intrinsics::logits(), vocab, &allowed, &idx, &val, &r);
@@ -304,40 +294,38 @@ async fn main(input: Input) -> Result<Output> {
         pre_mask.put(unpack_mask(&constraint.mask(), vocab));
         pre_alpha_idx.put(idx0);
         pre_alpha_val.put(val0);
-        prefill
-            .submit(&pipeline)
-            .map_err(|e| format!("ASAp prefill: {e}"))?;
+        prefill.submit(&pipeline).context("ASAp prefill")?;
 
-        let first = read_i32(&pre_token).await?;
+        let first = pre_token.take_host::<i32>().await?;
         let mut path_nodes = vec![0usize];
-        let mut masses = vec![read_f32(&pre_mass).await?];
-        let mut probs = vec![read_f32(&pre_prob).await?];
-        let mut weighted_masses = vec![read_f32(&pre_wmass).await?];
+        let mut masses = vec![pre_mass.take_host::<f32>().await?];
+        let mut probs = vec![pre_prob.take_host::<f32>().await?];
+        let mut weighted_masses = vec![pre_wmass.take_host::<f32>().await?];
         // The α the step actually used for the token it took.
         let mut used_alpha = vec![alpha_of(&trie, 0, first as u32)];
 
         let mut generated = vec![first as u32];
         constraint
-            .advance(&[first as u32])
-            .map_err(|e| format!("grammar rejected the prefill token: {e}"))?;
+            .accept_tokens(&[first as u32])
+            .context("grammar rejected the prefill token")?;
         let mut node = trie.child(0, first as u32);
         path_nodes.push(node);
 
         if !constraint.is_terminated() && generated.len() < input.max_tokens {
-            let token_in = Channel::from(vec![first]).named("token_in");
-            let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-            let positions = Channel::from(vec![n]).named("positions");
-            let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+            let token_in = Channel::from([first]).named("token_in");
+            let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+            let positions = Channel::from([n]).named("positions");
+            let pages = Channel::from_iter(0..max_pages).named("pages");
             let page_indptr =
-                Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-            let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-            let w_off = Channel::from(vec![n % page_size]).named("w_off");
-            let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+                Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+            let w_slot = Channel::from([n / page_size]).named("w_slot");
+            let w_off = Channel::from([n % page_size]).named("w_off");
+            let kv_len = Channel::from([n + 1]).named("kv_len");
             let mask_ch = Channel::new([vocab], dtype::bool).named("mask");
             let alpha_idx = Channel::new([pairs as u32], dtype::u32).named("alpha_idx");
             let alpha_val = Channel::new([pairs as u32], dtype::f32).named("alpha_val");
             let rng =
-                Channel::from(vec![input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0]).named("rng");
+                Channel::from([input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0]).named("rng");
             let token_out = Channel::new([1], dtype::i32).named("token_out");
             let mass_out = Channel::new([1], dtype::f32).named("mass_out");
             let prob_out = Channel::new([1], dtype::f32).named("prob_out");
@@ -347,35 +335,36 @@ async fn main(input: Input) -> Result<Output> {
             decode.embed(&token_in, &embed_indptr)?;
             decode.attention(
                 &ws,
-                ..,
-                (n / page_size)..,
-                &kv_len,
-                &pages,
-                &page_indptr,
-                &w_slot,
-                &w_off,
-                &positions,
-                None,
+                KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (n / page_size)..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
             )?;
             decode.epilogue(move || {
-                let length = kv_len.take().tensor();
-                let allowed = mask_ch.take().tensor();
-                let idx = alpha_idx.take().tensor();
-                let val = alpha_val.take().tensor();
+                let length = kv_len.take();
+                let allowed = mask_ch.take();
+                let idx = alpha_idx.take();
+                let val = alpha_val.take();
                 let r = rng.take();
                 let (token, mass, prob, wmass) =
                     asap_step(intrinsics::logits(), vocab, &allowed, &idx, &val, &r);
 
-                let next_length = add(&length, 1u32);
-                let page_count = div(add(&next_length, page_size - 1), page_size);
+                let next_length = &length + 1u32;
+                let page_count = next_length.div_ceil(page_size);
                 token_in.put(&token);
                 kv_len.put(&next_length);
                 positions.put(&length);
-                w_slot.put(div(&length, page_size));
-                w_off.put(rem(&length, page_size));
-                page_indptr.take();
-                page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
-                rng.put(add(&r, iota(2)));
+                w_slot.put(&length / page_size);
+                w_off.put(&length % page_size);
+                page_indptr.put(indptr(1, &page_count));
+                rng.put(&r + iota(2));
                 token_out.put(&token);
                 mass_out.put(&mass);
                 prob_out.put(&prob);
@@ -389,17 +378,15 @@ async fn main(input: Input) -> Result<Output> {
                 mask_ch.put(unpack_mask(&constraint.mask(), vocab));
                 alpha_idx.put(idx);
                 alpha_val.put(val);
-                decode
-                    .submit(&pipeline)
-                    .map_err(|e| format!("ASAp decode: {e}"))?;
+                decode.submit(&pipeline).context("ASAp decode")?;
 
-                let token = read_i32(&token_out).await? as u32;
-                masses.push(read_f32(&mass_out).await?);
-                probs.push(read_f32(&prob_out).await?);
-                weighted_masses.push(read_f32(&wmass_out).await?);
+                let token = token_out.take_host::<i32>().await? as u32;
+                masses.push(mass_out.take_host::<f32>().await?);
+                probs.push(prob_out.take_host::<f32>().await?);
+                weighted_masses.push(wmass_out.take_host::<f32>().await?);
                 used_alpha.push(alpha_of(&trie, node, token));
                 generated.push(token);
-                constraint.advance(&[token]).map_err(|e| {
+                constraint.accept_tokens(&[token]).map_err(|e| {
                     format!(
                         "round {round} step {}: grammar rejected token {token}: {e}",
                         generated.len() - 1
@@ -440,7 +427,7 @@ async fn main(input: Input) -> Result<Output> {
             })
             .sum::<f32>();
 
-        let text = wit_model::decode(&generated)?;
+        let text = model::decode(&generated)?;
         if !distinct.contains(&text) {
             distinct.push(text.clone());
         }
@@ -509,20 +496,20 @@ fn asap_step(
     allowed: &Tensor,
     alpha_idx: &Tensor,
     alpha_val: &Tensor,
-    state: impl AsTensor + Copy,
+    state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor) {
     let probabilities = softmax(logits);
-    let zero = broadcast(Tensor::constant(0.0f32), [vocab]);
+    let zero = broadcast(0.0f32, [vocab]);
     let masked = select(allowed, &probabilities, &zero);
     let mass = reduce_sum(&masked);
 
     // `α` is scattered into a `[vocab + 1]` base so the padding index `vocab`
     // has somewhere to land; duplicate padding writes are all 1.0, so their
     // undefined ordering does not matter.
-    let base = broadcast(Tensor::constant(1.0f32), [vocab + 1]);
+    let base = broadcast(1.0f32, [vocab + 1]);
     let alpha = gather(scatter_set(&base, alpha_idx, alpha_val), iota(vocab));
 
-    let weighted = mul(&masked, &alpha);
+    let weighted = &masked * &alpha;
     let weighted_mass = reduce_sum(&weighted);
 
     // Gumbel-max, but spelled out rather than taken from `gumbel_max`, so that
@@ -532,8 +519,8 @@ fn asap_step(
     // chosen_score = -1e9 against best_score = -0.06). `masked_argmax` applies
     // a true -inf after the noise is already in place, which is the same
     // primitive the grammar-constrained-decoding inferlet relies on.
-    let floored = log(max_elem(&weighted, Tensor::constant(1e-30f32)));
-    let scores = add(&floored, gumbel(state, [vocab]));
+    let floored = log(max_elem(&weighted, 1e-30f32));
+    let scores = &floored + gumbel(state, [vocab]);
     let token = masked_argmax(&scores, allowed);
 
     let probability = scalar_gather(&masked, &token);
@@ -543,26 +530,4 @@ fn asap_step(
         reshape(probability, [1]),
         reshape(weighted_mass, [1]),
     )
-}
-
-async fn read_i32(channel: &Channel) -> Result<i32> {
-    channel
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read i32 channel: {e}"))?
-        .first()
-        .copied()
-        .ok_or_else(|| "empty i32 channel".into())
-}
-
-async fn read_f32(channel: &Channel) -> Result<f32> {
-    channel
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("read f32 channel: {e}"))?
-        .first()
-        .copied()
-        .ok_or_else(|| "empty f32 channel".into())
 }

@@ -19,7 +19,7 @@
 //! ~9 near-tie flips). The composite (charlie's Phase-2 finding):
 //!   (a) the surviving `cuda_concurrent` single-lane reference — SEAL + carrier transparency with the
 //!       co-batch confound REMOVED (a single long-decode lane forced to preempt
-//!       via PIE_KV_PAGE_CAP, byte-identical to its sync reference);
+//!       via `[batching].total_pages`, byte-identical to its sync reference);
 //!   (b) engaged multi-lane `restore_attributable == 0` HERE — a divergence first
 //!       appearing at KV position >= page_size (a SEALED + restored page) is real
 //!       suspend/restore corruption, hard-gated (assertion 3);
@@ -562,7 +562,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // near-tie flip). The exact-MATCH thus cannot be a hard gate here; the clean,
     // un-confounded suspend/restore transparency proof is the single-lane
     // `cuda_concurrent` reference
-    // (a single long-decode lane forced to preempt via PIE_KV_PAGE_CAP,
+    // (a single long-decode lane forced to preempt via `[batching].total_pages`,
     // byte-identical to its sync reference). What this harness CAN hard-gate is
     // genuine KV corruption, by the FIRST-DIVERGENCE POSITION of each mismatch
     // (guru's `restore_attributable == 0` refinement — unconfounded even where

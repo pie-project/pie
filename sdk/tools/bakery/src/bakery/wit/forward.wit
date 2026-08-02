@@ -1,109 +1,80 @@
-// The forward-pass guest↔host surface (submits PTIR container bytes). The WIT
-// surface is named `forward`; PTIR remains the name of the container byte
-// format it ships. Gated behind the runtime `ptir` cargo feature: the interface
-// is in the world unconditionally (additive, no-op for legacy guests); when the
-// feature is off, `forward-pass.program` / `forward-pass.submit` return a "ptir
-// disabled" error.
+// The forward-pass guest<->host surface (submits PTIR container bytes). The WIT
+// surface family is named `forward*`; PTIR remains the name of the container
+// byte format it ships.
 //
 // Layering: the guest traces a pass -> canonical PTIR container bytes
 // (pie_sampling_ir::ptir). WIT cannot carry closures, so the container bytes
-// stay the wire artifact — but everything the author manipulates (channels,
+// stay the wire artifact -- but everything the author manipulates (channels,
 // working sets, the pass, the pipeline) crosses the boundary as a first-class
-// resource, mirroring the ptir tracing DSL:
+// resource, mirroring the ptir tracing DSL.
 //
-//   Channel::new([1], i32)       ->  channel constructor
-//   tok.put([BOS])               ->  channel.put        (seeds ride the channel)
-//   WorkingSet::new()/reserve(n) ->  kv-working-set     (working-set.wit)
-//   ForwardPass + epilogue       ->  empty builder + typed attachments + program
-//   Pipeline::new(); fwd.submit(p) -> pipeline (pipeline.wit) + forward-pass.submit
+// THREE INTERFACES, ONE PER STATE SEMANTICS (forward_refactor.md D1):
 //
-// The old registry surface (register-program / program-id / instantiate /
-// channel-seed / pipeline.channel(index)) is deleted: identity dedup (the
-// FNV-1a container hash) and bind (against the backend ModelProfile — the guest
-// cannot bind) happen inside `forward-pass.program`, invisible to the guest.
-// Malformed traces fail there with the validator's message. Seeds are
-// per-instance data (never identity): a `put` staged on a `seeded` channel
-// before the first submit is that channel's seed value.
+//   `forward`            paged, per-token, reversibly discardable KV only
+//   `forward-recurrent`  irreversibly folded recurrent state only
+//   `forward-hybrid`     both, in the same forward
+//
+// The split is over STATE SEMANTICS, not model family: `architecture()` is an
+// open, fast-growing string set, while this taxonomy is closed. `model.pass-kind()`
+// selects the interface; constructing the wrong one errors immediately.
+//
+// The split is also a CORRECTNESS GATE. Attention-only algorithms (H2O, SnapKV,
+// TOVA, Quest) are semantically wrong on a folded recurrent state -- evicting KV
+// does not undo the fold -- and until now nothing caught it. They can no longer
+// name a hybrid model's pass type.
+//
+// All three deliberately DUPLICATE `embed` / `readout` / `program` / `submit`
+// and their geometry records rather than sharing a `pass-body` (D3): WIT
+// duplication does not force implementation duplication (the host keeps one
+// private `PassCore`), and full separation makes cross-kind states
+// unrepresentable instead of runtime-guarded. Adding a field to one interface's
+// record must never move another's ABI.
+
+// THIS FILE: pure attention. llama_like, gemma*, mixtral, kimi, deepseek_v4,
+// glm5, qwen3_vl, csm. Valid only when `model.pass-kind()` == attention.
+//
+// Legal stages: prologue, on_attn_proj, on_attn, epilogue.
+//
+// The resource name `forward-pass` is shared by all three interfaces: WIT
+// scopes resource names to their interface, so this is legal and the generated
+// bindings differ only by module path. That is what collapses guest migration
+// to a single changed `use` line.
 
 interface forward {
-    use types.{error};
-    use types.{shape, dtype, data};
-    use working-set.{kv-working-set, rs-working-set, page-span};
+    use types.{error, data};
+    use channel.{channel};
+    use working-set.{kv-working-set, page-span};
     use pipeline.{pipeline};
 
-    /// How a forward pass treats the recurrent state of the working sets
-    /// bound by `set-rs-working-sets`. Linear/SSM models only; a
-    /// pure-attention model must leave this at the default.
-    variant rs-mode {
-        /// Fold every token of this fire into the folded state, in-forward
-        /// and IRREVERSIBLY. The plain prefill/decode path, and the default,
-        /// so a guest that never calls `set-rs-mode` is unaffected.
-        fold,
-        /// Write each token's pre-recurrence activations into the working
-        /// set's buffered slots and leave the folded state UNTOUCHED. This
-        /// is what makes a linear model speculatable: an uncertain tail that
-        /// is never folded costs nothing to abandon (`model.is-linear`'s
-        /// FOLD-COMMIT contract). The payload is the buffer-relative token
-        /// offset of this fire's first row; the driver fills slots
-        /// page-major from that offset, so it must be a multiple of
-        /// `rs-buffer-page-size`. Requires an already-materialized folded
-        /// state — run the folding prefill first.
-        buffer(u32),
-        /// Replay buffered tokens into the folded state: one length per
-        /// bound working set, in request order. Runs ONLY the recurrent
-        /// layers (no embed, no attention/MLP, no logits) and advances the
-        /// folded boundary, dropping the fully covered head slots. Each
-        /// length must be a positive multiple of `rs-fold-granularity`.
-        fold-buffered(list<u32>),
-    }
-
-    /// A GPU-resident bounded queue of cells with full/empty bits. Guest-
-    /// constructed and first-class: the SAME handle is bound into a forward pass
-    /// (by dense declaration index, via `forward-pass.program`) and used for host
-    /// `put`/`set`/`take`/`read`. `Channel::from(v)` in the DSL is constructor +
-    /// `put(v)`.
+    /// Attention geometry. Every input is an individual channel; the record
+    /// exists so the whole group can be handled as a unit (and, in
+    /// `forward-hybrid`, made optional as a unit). `none` on `mask` omits the
+    /// PTIR AttnMask port; `some(mask)` binds that channel to it.
     ///
-    /// The shape/dtype/capacity must match the container's declaration for the
-    /// index the handle is bound at — `forward-pass.program` validates this.
-    /// Direction comes from the container (`host-role`): a host-writer channel
-    /// takes `put`; a host-reader channel yields `take`/`read`. Before binding,
-    /// `put` stages freely (a seed or an early Writer cell); staged puts
-    /// coalesce into the next submit. A poisoned channel surfaces an
-    /// `error` instead of hanging (the `?` in `out.take().get::<T>().await?`).
-    resource channel {
-        constructor(shape: shape, dtype: dtype, capacity: u32);
-
-        /// Hand a value to the device. On a `seeded` channel before the first
-        /// fire this is the seed; on a host-writer channel it is the next
-        /// staged cell (empty -> fill; full -> back-pressure). `bool` payloads
-        /// are dtype-native (1 byte per bool); the wire packs to bits.
-        put:  func(value: data) -> result<_, error>;
-
-        /// Atomically replace the committed front cell without changing queue
-        /// occupancy. This is a fused take+put: it never exposes an empty slot,
-        /// never enqueues, and leaves any later put queued for the next fire
-        /// untouched. Errors when the channel is empty, poisoned/closed, or
-        /// its front is currently claimed by an in-flight fire.
-        set:  func(value: data) -> result<_, error>;
-
-        /// Move a committed value out to the host (host-reader channels). Full
-        /// -> value + empty the cell. Empty -> BLOCKS by awaiting the pass's
-        /// in-flight fires (submit order) until the cell fills; errors when no
-        /// in-flight fire remains (nothing will ever fill it) or the channel
-        /// is poisoned — a fire that feeds it failed, and the error carries
-        /// that fire's failure (under run-ahead, poison IS the error channel).
-        take: async func() -> result<data, error>;
-
-        /// Copy a committed value to the host, leaving the cell full. Same
-        /// await/poison discipline as `take`.
-        read: async func() -> result<data, error>;
+    /// Declared separately per interface ON PURPOSE (D8/D3).
+    record kv-geometry {
+        readable-pages: page-span,
+        writable-pages: page-span,
+        kv-len:      borrow<channel>,
+        pages:       borrow<channel>,
+        page-indptr: borrow<channel>,
+        w-slot:      borrow<channel>,
+        w-off:       borrow<channel>,
+        positions:   borrow<channel>,
+        mask:        option<borrow<channel>>,
     }
 
     /// A forward-pass builder. Construction is empty; descriptor resources are
     /// attached explicitly, then `program` supplies the traced container.
-    /// Native program validation/binding happens when `program` is attached.
     resource forward-pass {
         constructor();
+
+        /// State binding. REQUIRED -- a pass with no attention binding is not
+        /// submittable.
+        attention: func(
+            kv:   borrow<kv-working-set>,
+            geom: kv-geometry,
+        ) -> result<_, error>;
 
         /// Bind embedding token ids and CSR row indptr. Both are channels.
         embed: func(
@@ -111,43 +82,17 @@ interface forward {
             indptr: borrow<channel>,
         ) -> result<_, error>;
 
-        /// The only attention binding surface. Every geometry input is an
-        /// individual channel. `none` omits the existing PTIR AttnMask port;
-        /// `some(mask)` binds that channel to it.
-        attention: func(
-            kv-working-set: borrow<kv-working-set>,
-            readable-pages: page-span,
-            writable-pages: page-span,
-            kv-len: borrow<channel>,
-            pages: borrow<channel>,
-            page-indptr: borrow<channel>,
-            w-slot: borrow<channel>,
-            w-off: borrow<channel>,
-            positions: borrow<channel>,
-            mask: option<borrow<channel>>,
-        ) -> result<_, error>;
-
         /// Bind an optional readout-index channel separately from embedding.
         readout: func(indices: borrow<channel>) -> result<_, error>;
 
-        /// Bind recurrent-state working sets in resolved request order.
-        set-rs-working-sets: func(
-            rs-working-sets: list<borrow<rs-working-set>>,
-        ) -> result<_, error>;
-
-        /// Select how this pass treats recurrent state. Defaults to `fold`.
-        /// Rejected on a pure-attention model, and when a `fold-buffered`
-        /// length list does not match the bound recurrent-state working
-        /// sets.
-        set-rs-mode: func(mode: rs-mode) -> result<_, error>;
-
         /// Attach canonical PTIR bytes and channel handles in dense declaration
-        /// order. Validation uses the engine-owned ModelProfile.
+        /// order. Validation uses the engine-owned ModelProfile, and now also
+        /// rejects any stage this interface does not admit -- see the per-file
+        /// note on which stages are legal.
         program: func(
             container-bytes: data,
             channels: list<borrow<channel>>,
         ) -> result<_, error>;
-
     }
 
     /// Submit ONE FRAME on `on`: exactly `model.frame-size()` ordered slots.
@@ -188,4 +133,34 @@ interface forward {
         on: borrow<pipeline>,
         slots: list<option<borrow<forward-pass>>>,
     ) -> result<_, error>;
+
+    /// Leave the frame's wait-set on `on` until this pipeline submits again.
+    ///
+    /// A frame batches one slot per participating pipeline and does not
+    /// dispatch until every member has submitted, so membership is a promise
+    /// to keep submitting. A pipeline that stops — it is blocked on a user
+    /// turn, waiting on a peer, or simply idle — would otherwise hold the
+    /// frame. `model.submit-deadline-us` bounds that promise: hold the
+    /// wait-set that long with nothing owed to you and the engine stops
+    /// waiting for you — the slot is dropped from the frame, work you already
+    /// submitted still runs, and your next submit rejoins. That costs you a
+    /// boundary, not your instance. Staying silent much longer than that
+    /// WITHOUT parking is a different matter: it reads as an abandoned
+    /// pipeline and the instance is terminated. `park` is how a pipeline
+    /// stops without breaking the promise — it states the intent the engine
+    /// cannot infer, leaves the wait-set, and stops that clock entirely, for
+    /// as long as you like.
+    ///
+    /// Ordered against this pipeline's own submits, not against the call: it
+    /// takes effect once every frame submitted before it has sealed, so it is
+    /// legal — and expected — to park with fires still outstanding. Their
+    /// results are delivered as usual; the exit simply follows them. There is
+    /// no rejoin call, because a member that had joined but not yet submitted
+    /// would reopen exactly the gap this closes: the next `submit` rejoins
+    /// the wait-set atomically with the slot it contributes.
+    ///
+    /// Parking twice with no submit in between is a no-op, as is parking a
+    /// pipeline that never fired. Outside frame mode there is no wait-set and
+    /// this does nothing.
+    park: func(on: borrow<pipeline>);
 }

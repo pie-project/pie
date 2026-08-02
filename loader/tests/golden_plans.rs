@@ -273,8 +273,10 @@ fn gpt_oss_checkpoint() -> CheckpointMetadata {
 
 /// GPT-OSS at the ABI where the driver repacks into Marlin's layout.
 ///
-/// The only fixture that reaches [`Expr::Repack`], and the biases are the only
-/// thing that reaches `RepackLayout::DenseRowGather`. Kept separate from
+/// The only fixture that reaches [`Expr::Repack`]. The biases used to reach it
+/// too, through a gather layout that existed because the algebra could not say
+/// "every other row of this rank's band"; [`Expr::Stride`] says it, so they are
+/// ordinary copies and the layout is gone. Kept separate from
 /// [`gpt_oss_checkpoint`] because that one carries the decoder around the
 /// experts and none of the repack path.
 ///
@@ -691,8 +693,8 @@ fn gpt_oss_mxfp4_cuda_native_gemm() {
     );
 }
 
-/// The repack path, which no other golden reaches: `MarlinMxfp4Weight`,
-/// `MarlinMxfp4Scale` and `DenseRowGather` all appear in this contract.
+/// The repack path, which no other golden reaches: both layouts the plan can
+/// carry, `MarlinMxfp4Weight` and `MarlinMxfp4Scale`, appear in this contract.
 #[test]
 fn gpt_oss_native_mxfp4() {
     let mut target = target(BackendKind::Cuda, 0, 1);

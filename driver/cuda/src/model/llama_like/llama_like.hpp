@@ -100,6 +100,14 @@ struct LlamaLikeForwardCfg {
     // all-reduce there are no more collectives, so they can skip rank-0 logits.
     bool emit_logits = true;
 
+    // Per-fire, from `ForwardInputs::logits_argmax_chunk_tokens`. When
+    // non-zero the lm_head is computed one vocabulary slab at a time and each
+    // slab is reduced to a running greedy argmax as it lands, so `ws.logits`
+    // is never filled and `ws.sampled_tokens` carries the result (§20.37).
+    // Only the driver sets it, and only once it has proven every epilogue is a
+    // bare argmax over the logits.
+    int logits_argmax_chunk_tokens = 0;
+
     // ── Qwen3-VL M-RoPE ──────────────────────────────────────────────
     // mrope_section partitions head_dim/2 across the (t,h,w) axes. Consumed
     // only when `rope_kind == MRopeInterleaved`. The 3-axis positions are
@@ -154,6 +162,10 @@ struct LlamaLikePlanState {
     // workspace (the two-plans-one-workspace lesson, per band).
     // count == 0 = unbanded fire.
     std::array<ops::DecodePlanCachePtr, 3> depth_band_plans;
+    // Prefill-family band plans (force_prefill / prefill-decode
+    // deployments — their per-band prefix dispatch is the planned
+    // causal prefill, not the decode kernel).
+    std::array<ops::PrefillPlanCachePtr, 3> depth_band_prefill_plans;
     std::array<std::uint32_t, 3> depth_band_k{};
     std::array<std::uint32_t, 3> depth_band_rows{};
     std::uint32_t depth_band_count = 0;
@@ -200,6 +212,11 @@ struct LlamaLikePlanState {
 // buffers. Prepare plans the suffix against this; the mixed dispatch
 // sites pair with it.
 AttentionWorkspace& spatial_suffix_attn_ws();
+
+// ④ Act 1 (banded depth): band slot `i`'s dedicated workspace — the
+// prepare plans each band's prefix plan into it, and both walkers'
+// banded tail dispatches pair against it.
+AttentionWorkspace& depth_band_attn_ws_public(int i);
 
 // Refresh the decode plan for the current fire. Caller invokes this
 // BEFORE either a direct forward call OR a graph replay, outside any

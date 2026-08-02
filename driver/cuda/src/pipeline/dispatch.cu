@@ -157,16 +157,18 @@ private:
 }  // namespace
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
-// scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
+// fire-geometry) now lives under pie::driver (driver/common); bring both the
+// fire and launch namespaces into scope so the CUDA-side tier-0/1 code below
+// can use them unqualified.
+using namespace pie::driver::launch;
+using namespace pie::driver::fire;
 
 // `store/kv_cache.hpp` (pulled in for the `envelope_dot` KV geometry) declares
 // its own `pie_cuda_driver::DType`, which sits closer in the lookup chain than
 // the using-directive above and would silently retarget every unqualified
 // `DType` in this file. Pin the PTIR one explicitly; the cache's own dtype is
 // spelled `pie_cuda_driver::DType` where it is needed.
-using DType = pie_native::launch::DType;
+using DType = pie::driver::launch::DType;
 
 struct CallbackFence {
     std::atomic<std::uint32_t> pending{0};
@@ -593,23 +595,31 @@ __global__ void compose_fixed_decode(
     const FixedDecodeLane* descriptor =
         valid ? &lanes[lane] : nullptr;
 
+    std::uint32_t entry_kill_reason = 0;
     if (valid) {
         const auto* commit =
             fixed_decode_pointer<std::uint32_t>(
             descriptor->pass_commit);
-        valid = commit != nullptr && *commit != 0;
+        if (commit == nullptr || *commit == 0) {
+            valid = false;
+            entry_kill_reason = 8;
+        }
         for (std::size_t port = 0;
              port < kFixedDecodePortCount;
              ++port) {
             const auto* ready =
                 fixed_decode_pointer<std::uint8_t>(
                     descriptor->ready[port]);
-            if (ready != nullptr && *ready == 0) valid = false;
+            if (ready != nullptr && *ready == 0) {
+                valid = false;
+                if (entry_kill_reason == 0) entry_kill_reason = 9;
+            }
         }
         const auto* token_source =
             fixed_decode_pointer<std::uint32_t>(descriptor->token);
         if (token_source == nullptr) {
             valid = false;
+            if (entry_kill_reason == 0) entry_kill_reason = 10;
         } else {
             token = *token_source;
             sentinel =
@@ -621,6 +631,7 @@ __global__ void compose_fixed_decode(
     std::uint32_t kv_len = 1;
     std::uint32_t write_page = output.dummy_page;
     std::uint32_t write_offset = 0;
+    std::uint32_t kill_reason = entry_kill_reason;
     if (valid && !sentinel) {
         const auto* page_indptr =
             fixed_decode_pointer<std::uint32_t>(
@@ -645,6 +656,7 @@ __global__ void compose_fixed_decode(
             w_slot == nullptr || w_off == nullptr ||
             page_indptr[0] != 0) {
             valid = false;
+            kill_reason = 1;
         } else {
             page_count = page_indptr[1];
             kv_len = *kv_len_source;
@@ -661,24 +673,36 @@ __global__ void compose_fixed_decode(
                           output.page_size;
             if (page_count == 0 ||
                 page_count > descriptor->pages_capacity ||
-                page_count > descriptor->translation_len ||
-                page_count != expected_pages ||
-                logical_write_page >= descriptor->translation_len ||
-                write_offset >= output.page_size ||
-                logical_write_position < descriptor->write_lower_bound ||
-                logical_write_position >=
-                    descriptor->write_upper_bound) {
+                page_count > descriptor->translation_len) {
                 valid = false;
+                kill_reason = 2;
+            } else if (page_count != expected_pages) {
+                valid = false;
+                kill_reason = 3;
+            } else if (logical_write_page >= descriptor->translation_len ||
+                       write_offset >= output.page_size) {
+                valid = false;
+                kill_reason = 4;
+            } else if (logical_write_position <
+                           descriptor->write_lower_bound ||
+                       logical_write_position >=
+                           descriptor->write_upper_bound) {
+                valid = false;
+                kill_reason = 5;
             } else {
                 write_page = translation[logical_write_page];
-                if (write_page >= output.device_pages) valid = false;
+                if (write_page >= output.device_pages) {
+                    valid = false;
+                    kill_reason = 6;
+                }
                 for (std::uint32_t page = 0;
-                     page < page_count;
+                     valid && page < page_count;
                      ++page) {
                     const std::uint32_t logical_page = pages[page];
                     if (logical_page >= descriptor->translation_len ||
                         translation[logical_page] >= output.device_pages) {
                         valid = false;
+                        kill_reason = 7;
                         break;
                     }
                 }
@@ -699,6 +723,9 @@ __global__ void compose_fixed_decode(
         }
         if (output.chain_kills != nullptr) {
             atomicAdd(output.chain_kills, 1u);
+            if (kill_reason >= 1 && kill_reason <= 10) {
+                atomicAdd(output.chain_kills + kill_reason, 1u);
+            }
         }
         page_count = 1;
         kv_len = 1;
@@ -1418,6 +1445,7 @@ struct Dispatch::Impl {
     // each batch and reported loudly when it grows.
     std::uint32_t* d_fixed_decode_kills = nullptr;
     std::uint32_t* h_fixed_decode_kills = nullptr;
+    std::uint32_t fixed_decode_kill_reasons_reported[16] = {};
     std::uint32_t fixed_decode_kills_reported = 0;
     // Same diagnostic for the decode-envelope compose path (RV-16).
     std::uint32_t* d_envelope_kills = nullptr;
@@ -1489,6 +1517,7 @@ struct StagedLane {
     std::uint32_t logical_vocab = 0;
     std::vector<std::uint64_t> logits_bf16_rows;
     std::vector<std::uint64_t> mtp_logits_bf16_rows;
+    std::vector<std::uint64_t> presampled_token_rows;
     const std::uint8_t* row_valid = nullptr;
     std::uint32_t row_valid_offset = 0;
 };
@@ -1546,7 +1575,7 @@ struct HookPreparedInvocation {
 
 struct StagedLaunch::State {
     Dispatch::Impl* owner = nullptr;
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     cudaStream_t stream = nullptr;
     std::vector<std::unique_ptr<StagedLane>> lanes;
     std::vector<std::uint64_t> touched_instances;
@@ -1606,6 +1635,7 @@ struct StagedLaunch::State {
     // against the exact (phase, layer) order the prepare pass recorded.
     // `prepared_attn[phase - PTIR_STAGE_ON_ATTN_PROJ]`.
     bool hook_graph_prepared = false;
+    std::uint32_t prepared_planned_layers = 0xffffffffu;
     std::array<std::vector<HookPreparedInvocation>, 2> prepared_attn;
     std::array<std::size_t, 2> prepared_cursor{};
     // Host CSR of folded score offsets, uploaded to the arena's score-rows
@@ -2279,7 +2309,7 @@ class NotifyContextLease {
 // members could both pass on the last available entry/slot and the second
 // would die as a device-side poison instead of a synchronous rejection.
 std::vector<DeviceHostChannelTicket> build_channel_tickets(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::size_t program,
     BoundInstance& bound,
     DeviceChannelRegistry& channels) {
@@ -2365,7 +2395,7 @@ std::vector<DeviceHostChannelTicket> build_channel_tickets(
 // host head/tail to the wire-assigned sequence. Serial, in lane order —
 // byte-for-byte the order the fused builder produced (W6).
 void apply_lane_sequence_tickets(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::size_t program,
     BoundInstance& bound,
     DeviceChannelRegistry& channels) {
@@ -2676,7 +2706,7 @@ DispatchStats Dispatch::stats() const {
 }
 
 std::vector<std::uint32_t> Dispatch::mtp_draft_rows(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     std::vector<std::uint32_t> rows(view.ptir_program_hashes.size(), 0);
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
@@ -3614,7 +3644,7 @@ int Dispatch::close_channel(std::uint64_t channel_id, std::string* err) {
 }
 
 int Dispatch::validate_launch(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::string* err) {
     if (err) err->clear();
     const std::size_t count = view.ptir_program_hashes.size();
@@ -3676,7 +3706,7 @@ void Dispatch::set_attention_hook_coverage(
 }
 
 bool Dispatch::launch_has_attention_stages(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
          ++program) {
@@ -3696,7 +3726,7 @@ bool Dispatch::launch_has_attention_stages(
 }
 
 std::uint32_t Dispatch::launch_hook_free_prefix_rows(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     const std::uint32_t derived = derive_hook_free_prefix_rows(view);
     // B (the fire planner's first consumed lowering): when the scheduler
     // sent its planned prefix — fire_plan's qkv_postprocess site,
@@ -3729,7 +3759,7 @@ std::uint32_t Dispatch::launch_hook_free_prefix_rows(
 }
 
 std::uint32_t Dispatch::derive_hook_free_prefix_rows(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     const std::size_t n_prog = view.ptir_program_hashes.size();
     // Per-program row attribution is the only way to LOCATE a hook, so its
     // absence means "no fast prefix", not "no hooks".
@@ -3770,7 +3800,7 @@ std::uint32_t Dispatch::derive_hook_free_prefix_rows(
 }
 
 bool Dispatch::launch_wants_attn_score(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
          ++program) {
@@ -3787,8 +3817,69 @@ bool Dispatch::launch_wants_attn_score(
     return false;
 }
 
+bool Dispatch::launch_epilogue_is_greedy_argmax(
+    const pie::driver::fire::LaunchView& view,
+    std::uint32_t vocab) const {
+    bool saw_epilogue = false;
+    // The verdict is a property of the program, and a launch is overwhelmingly
+    // the same guest replicated across every lane, so the same hash would
+    // otherwise be re-analysed once per lane -- op scans plus two vector
+    // allocations each, hundreds of times per fire.
+    std::vector<std::uint64_t> analysed;
+    for (std::size_t program = 0;
+         program < view.ptir_program_hashes.size();
+         ++program) {
+        const std::uint64_t hash = view.ptir_program_hashes.data()[program];
+        if (std::find(analysed.begin(), analysed.end(), hash) !=
+            analysed.end()) {
+            continue;
+        }
+        analysed.push_back(hash);
+        const auto* plans = impl_->cache.plans(hash);
+        if (plans == nullptr) return false;
+        const auto generated = impl_->fused_modules.program(hash);
+        if (generated == nullptr ||
+            generated->stages.size() != plans->size()) {
+            return false;
+        }
+        for (std::size_t index = 0; index < plans->size(); ++index) {
+            const plan::StagePlan& stage = (*plans)[index];
+            if (stage.stage != PTIR_STAGE_EPILOGUE) continue;
+            // A program may declare a vocabulary narrower than the weight's,
+            // and the materialising path honours it by scanning only that many
+            // columns. The fused reduction runs over the whole weight, so it
+            // could return a token the narrowed program can never emit.
+            //
+            // `stage_logits_vocab` throws on a malformed program. Declining is
+            // the right answer here rather than propagating: this is a
+            // question about an optimisation, and `finish` still rejects the
+            // same program at the same place it always did.
+            std::uint32_t logical_vocab = 0;
+            try {
+                logical_vocab = stage_logits_vocab(&stage, vocab);
+            } catch (const std::exception&) {
+                return false;
+            }
+            if (logical_vocab != vocab) return false;
+            const auto& executable = generated->stages[index];
+            if (executable == nullptr) return false;
+            std::string unused;
+            if (!generated::generated_stage_supported(
+                    *executable, stage, &unused)) {
+                return false;
+            }
+            if (!generated::generated_stage_is_compact_argmax(
+                    stage, *executable)) {
+                return false;
+            }
+            saw_epilogue = true;
+        }
+    }
+    return saw_epilogue;
+}
+
 bool Dispatch::launch_wants_page_mask(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
          ++program) {
@@ -3811,7 +3902,7 @@ bool Dispatch::launch_wants_page_mask(
 }
 
 bool Dispatch::launch_wants_lora(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
          ++program) {
@@ -3834,7 +3925,7 @@ bool Dispatch::launch_wants_lora(
 }
 
 bool Dispatch::has_decode_envelopes(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     if (view.ptir_program_instances.size() !=
         view.ptir_program_hashes.size()) {
         return false;
@@ -3857,7 +3948,7 @@ bool Dispatch::has_decode_envelopes(
 }
 
 bool Dispatch::envelope_plan_page_bounds(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::span<const std::uint32_t> program_request_starts,
     std::span<const std::uint32_t> wire_kv_page_indptr,
     std::vector<std::uint32_t>& per_request_pages) const {
@@ -4526,6 +4617,9 @@ GroupedLaneBinding make_staged_binding(
         .mtp_logits_bf16_rows = lane.mtp_logits_bf16_rows.empty()
             ? nullptr
             : &lane.mtp_logits_bf16_rows,
+        .presampled_token_rows = lane.presampled_token_rows.empty()
+            ? nullptr
+            : &lane.presampled_token_rows,
         .sample_output_channel_mask =
             sample_output_channel_mask(lane, stage),
         .row_valid = lane.row_valid,
@@ -5043,7 +5137,7 @@ void execute_declared_phase(
 }  // namespace
 
 std::unique_ptr<StagedLaunch> Dispatch::begin_host(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     cudaStream_t stream) {
     drain_reaped_instances(*impl_);
     const bool prologue_timing = fire_timing::full();
@@ -5245,6 +5339,92 @@ std::unique_ptr<StagedLaunch> Dispatch::begin_host(
     return launch;
 }
 
+namespace {
+
+// The churn fix (driver-only; north-star "CONSTRAINT, STATED" — the
+// runtime is untouchable): absorb transient guest lag at the LAST host
+// point before a wave commits. The engine's run-ahead expectations
+// assume consumes and ring space a guest a few ms behind has not yet
+// provided; since v14 deleted the RETRY outcome, one unready lane
+// fails its whole frame step and the failed fire's committed
+// reservations poison the instance (the churn fault, root-caused
+// 2026-08-04: 63-90% lane death under 9-lane 35ms churn). Readiness
+// is MONOTONE toward the expectations (heads advance only by prior
+// waves already on the stream and by guest takes; ring space only
+// grows), so a bounded host poll is sound: wait up to
+// PIE_CHANNEL_READY_WAIT_MS (default 25; 0 disables) for every gate
+// to hold, then proceed either way — an exhausted budget keeps
+// today's loud failure semantics.
+bool lane_tickets_ready(const std::vector<DeviceHostChannelTicket>& tickets) {
+    for (const DeviceHostChannelTicket& ticket : tickets) {
+        if (ticket.words == nullptr) continue;
+        const std::uint64_t head =
+            std::atomic_ref<const std::uint64_t>(ticket.words[0])
+                .load(std::memory_order_acquire);
+        const std::uint64_t tail =
+            std::atomic_ref<const std::uint64_t>(ticket.words[1])
+                .load(std::memory_order_acquire);
+        if ((ticket.flags & kTicketConsume) != 0 &&
+            head != ticket.expected_head) {
+            return false;
+        }
+        if ((ticket.flags & kTicketRequireInput) != 0 && !(tail > head)) {
+            return false;
+        }
+        if ((ticket.flags & kTicketPublish) != 0) {
+            const std::uint64_t same_fire_consume =
+                (ticket.flags & kTicketConsume) != 0 ? 1u : 0u;
+            if (tail != ticket.expected_tail) return false;
+            if (!(tail - head <
+                  static_cast<std::uint64_t>(ticket.cap1 - 1) +
+                      same_fire_consume)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void wait_for_wave_readiness(
+    const std::vector<std::unique_ptr<StagedLane>>& lanes) {
+    // DEFAULT OFF after measurement: a 2-minute churn soak with the
+    // wait armed (25 ms) still failed 88% of lanes across 12k waits —
+    // the dominant failure is NOT front-loaded enqueue-time lag, so
+    // the wait only added stall. Kept as an env-armed experiment
+    // (PIE_CHANNEL_READY_WAIT_MS=<ms>); the real fix is the upstream
+    // dev integration (its scheduler keeps channel-bound lanes out of
+    // shared steps — the blast-radius half of the fault).
+    static const int budget_ms = [] {
+        const char* v = std::getenv("PIE_CHANNEL_READY_WAIT_MS");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    if (budget_ms <= 0) return;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(budget_ms);
+    bool waited = false;
+    for (const auto& lane : lanes) {
+        while (!lane_tickets_ready(lane->tickets)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                if (std::getenv("PIE_READY_WAIT_TRACE") != nullptr) {
+                    std::fprintf(stderr,
+                                 "[ready-wait] budget exhausted "
+                                 "(%d ms) — proceeding to the loud "
+                                 "gate\n",
+                                 budget_ms);
+                }
+                return;
+            }
+            waited = true;
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
+    if (waited && std::getenv("PIE_READY_WAIT_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ready-wait] wave absorbed guest lag\n");
+    }
+}
+
+}  // namespace
+
 void Dispatch::begin_enqueue(StagedLaunch& launch) {
     StagedLaunch::State& state = *launch.state_;
     if (!state.active || state.device_layer != nullptr) {
@@ -5252,10 +5432,13 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
             "staged PTIR launch enqueued twice or after abort");
     }
     cudaStream_t stream = state.stream;
-    const pie_native::LaunchView& view = state.view;
+    const pie::driver::fire::LaunchView& view = state.view;
     const bool begin_timing = fire_timing::full();
     auto begin_mark = begin_timing ? fire_timing::Clock::now()
                                    : fire_timing::Clock::time_point{};
+    // The churn fix: bounded readiness absorption before this wave's
+    // expectations harden into the frame (see wait_for_wave_readiness).
+    wait_for_wave_readiness(state.lanes);
     // Registry sequence applies, in lane order, at the wave's ENQUEUE
     // position: every execution-time mirror reader (stage-metadata
     // builders, settlement prep) was written against the pre-frame-split
@@ -5352,7 +5535,7 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
 }
 
 std::unique_ptr<StagedLaunch> Dispatch::begin(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     cudaStream_t stream) {
     auto launch = begin_host(view, stream);
     begin_enqueue(*launch);
@@ -5361,7 +5544,7 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
 
 void Dispatch::update_launch_geometry(
     StagedLaunch& launch,
-    const pie_native::LaunchView& resolved_view,
+    const pie::driver::fire::LaunchView& resolved_view,
     std::span<const std::uint32_t> program_token_starts) {
     StagedLaunch::State& state = *launch.state_;
     if (!state.active ||
@@ -5371,7 +5554,7 @@ void Dispatch::update_launch_geometry(
     }
     state.view = resolved_view;
     const std::size_t count = state.lanes.size();
-    auto extent = [&](const pie_native::Slice<std::uint32_t>& values,
+    auto extent = [&](const pie::driver::Slice<std::uint32_t>& values,
                       std::size_t program) {
         return values.size() == count
             ? values.data()[program]
@@ -5576,7 +5759,9 @@ std::uint64_t Dispatch::prepare_attention_phases(
     if (in.observation == nullptr || !in.observation->usable()) {
         return veto("no usable observation");
     }
-    const std::uint32_t layers = impl_->model_layers;
+    const std::uint32_t layers = in.planned_layers == 0xffffffffu
+        ? impl_->model_layers
+        : std::min(impl_->model_layers, in.planned_layers);
     if (layers == 0 || !impl_->attention_hook_coverage) {
         return veto("no attention hook coverage");
     }
@@ -6174,6 +6359,7 @@ std::uint64_t Dispatch::prepare_attention_phases(
     // asserted by this pass's construction instead.
     state.phase_invocations[PTIR_STAGE_ON_ATTN_PROJ] = layers;
     state.phase_invocations[PTIR_STAGE_ON_ATTN] = layers;
+    state.prepared_planned_layers = in.planned_layers;
     state.hook_graph_prepared = true;
     return fingerprint == 0 ? 1 : fingerprint;
 }
@@ -6235,7 +6421,9 @@ void Dispatch::execute_attention_phase(
                 std::to_string(static_cast<int>(phase)) + " layer " +
                 std::to_string(layer) + " does not match prepared entry " +
                 std::to_string(at) + " of " +
-                std::to_string(invocations.size()));
+                std::to_string(invocations.size()) +
+                " (prep planned_layers=" +
+                std::to_string(state.prepared_planned_layers) + ")");
         }
         ++state.prepared_cursor[phase_index];
         HookPreparedInvocation& invocation = invocations[at];
@@ -6351,7 +6539,7 @@ void Dispatch::execute_attention_phase(
 
 bool Dispatch::finish(
     StagedLaunch& launch,
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     const void* logits,
     std::uint32_t vocab,
     cudaStream_t stream,
@@ -6364,6 +6552,7 @@ bool Dispatch::finish(
     std::uint32_t direct_bf16_row_capacity,
     const std::uint8_t* row_valid,
     std::span<const std::uint32_t> row_valid_offsets,
+    const std::int32_t* presampled_tokens,
     FinishBreakdown* breakdown) {
     const bool trace_fire_timing = fire_timing::enabled();
     if (trace_fire_timing) {
@@ -6385,6 +6574,15 @@ bool Dispatch::finish(
         throw std::runtime_error(
             "PTIR row-valid offsets do not match launched programs");
     }
+    // A depth-truncated launch (region-table uniform k) legitimately runs
+    // its attention phases at only the planned layers. A DEPTH-SPLIT
+    // launch (full-depth rows present, truncated suffix) still walks the
+    // full model — the split narrows rows, not the layer walk.
+    const std::uint32_t expected_layers =
+        view.planned_max_layers == 0xffffffffu ||
+                view.planned_full_depth_rows != 0xffffffffu
+            ? impl_->model_layers
+            : std::min(impl_->model_layers, view.planned_max_layers);
     for (std::uint8_t phase :
          {std::uint8_t{PTIR_STAGE_ON_ATTN_PROJ},
           std::uint8_t{PTIR_STAGE_ON_ATTN}}) {
@@ -6394,7 +6592,7 @@ bool Dispatch::finish(
                 return !(*lane->phase_plans)[phase].empty();
             });
         if (declared &&
-            state.phase_invocations[phase] != impl_->model_layers) {
+            state.phase_invocations[phase] != expected_layers) {
             throw std::runtime_error(
                 "PTIR attention phase did not execute at every model layer");
         }
@@ -6442,12 +6640,17 @@ bool Dispatch::finish(
         lane.logical_vocab = logical_vocab == 0 ? vocab : logical_vocab;
         lane.logits_bf16_rows.clear();
         lane.mtp_logits_bf16_rows.clear();
+        lane.presampled_token_rows.clear();
         lane.row_valid = row_valid;
         lane.row_valid_offset =
             row_valid == nullptr ? 0 : row_valid_offsets[program];
         if (direct_bf16_logits != nullptr &&
             direct_row_indices != nullptr) {
-            lane.logits_bf16_rows.reserve(lane.sampled_rows);
+            if (presampled_tokens != nullptr) {
+                lane.presampled_token_rows.reserve(lane.sampled_rows);
+            } else {
+                lane.logits_bf16_rows.reserve(lane.sampled_rows);
+            }
             for (std::uint32_t row = 0; row < lane.sampled_rows; ++row) {
                 const std::uint32_t source =
                     direct_row_indices[lane.row_offset + row];
@@ -6456,10 +6659,21 @@ bool Dispatch::finish(
                     throw std::runtime_error(
                         "direct BF16 sampled row exceeds the logits layout");
                 }
-                lane.logits_bf16_rows.push_back(
-                    reinterpret_cast<std::uint64_t>(
-                        direct_bf16_logits +
-                        static_cast<std::size_t>(source) * vocab));
+                if (presampled_tokens != nullptr) {
+                    // Same `source` row, one token wide instead of a
+                    // vocabulary. Exclusive with the BF16 table rather than
+                    // alongside it: on this path `direct_bf16_logits` holds
+                    // slab scratch, so a row table into it would be a live
+                    // pointer to something nobody wrote.
+                    lane.presampled_token_rows.push_back(
+                        reinterpret_cast<std::uint64_t>(
+                            presampled_tokens + source));
+                } else {
+                    lane.logits_bf16_rows.push_back(
+                        reinterpret_cast<std::uint64_t>(
+                            direct_bf16_logits +
+                            static_cast<std::size_t>(source) * vocab));
+                }
             }
         }
         if (drafts != 0) {
@@ -6835,7 +7049,7 @@ void Dispatch::abort(
 }
 
 bool Dispatch::run(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     const void* logits,
     std::uint32_t vocab,
     cudaStream_t stream,
@@ -6897,7 +7111,7 @@ bool Dispatch::run(
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>>
 Dispatch::settle_failed_launch(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     cudaStream_t execution_stream) {
     const cudaError_t execution_status =
         cudaStreamSynchronize(execution_stream);
@@ -6944,7 +7158,7 @@ Dispatch::settle_failed_launch(
 }
 
 bool Dispatch::stage_decode_envelopes(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::span<const std::uint32_t> program_token_starts,
     std::span<const std::uint32_t> program_request_starts,
     std::span<const std::uint32_t> template_kv_page_indptr,
@@ -7231,7 +7445,7 @@ bool Dispatch::enqueue_decode_envelopes(
 }
 
 bool Dispatch::stage_fixed_decode(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::uint32_t page_size,
     std::uint32_t device_pages,
     const FixedDecodeDeviceBuffers& buffers,
@@ -7624,10 +7838,10 @@ bool Dispatch::enqueue_fixed_decode(
     // (the mirror copy below is async on the launch stream), then arm this
     // batch's counter.
     if (state.d_fixed_decode_kills == nullptr) {
-        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kills, sizeof(std::uint32_t)));
-        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kills, 0, sizeof(std::uint32_t)));
-        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kills, sizeof(std::uint32_t)));
-        *state.h_fixed_decode_kills = 0;
+        CUDA_CHECK(cudaMalloc(&state.d_fixed_decode_kills, 16 * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMemset(state.d_fixed_decode_kills, 0, 16 * sizeof(std::uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&state.h_fixed_decode_kills, 16 * sizeof(std::uint32_t)));
+        std::memset(state.h_fixed_decode_kills, 0, 16 * sizeof(std::uint32_t));
     }
     if (const std::uint32_t seen = *state.h_fixed_decode_kills;
         seen > state.fixed_decode_kills_reported) {
@@ -7637,7 +7851,17 @@ bool Dispatch::enqueue_fixed_decode(
         state.stats.fixed_decode_chain_kills += fresh;
         std::cerr << "[pie-driver-cuda] fixed-decode compose FAIL-STOPPED "
                   << fresh << " lane(s): geometry/containment inconsistency; "
-                  << "the affected chains are killed (successors dummy-run)\n";
+                  << "the affected chains are killed (successors dummy-run)"
+                  << " reasons[null,cap,pages!=expected,wbounds,lease,"
+                  << "wxlate,pxlate,commit,ready,token]+=";
+        for (int reason = 1; reason <= 10; ++reason) {
+            const std::uint32_t now = state.h_fixed_decode_kills[reason];
+            std::cerr << (reason == 1 ? "" : ",")
+                      << now - state.fixed_decode_kill_reasons_reported
+                                   [reason];
+            state.fixed_decode_kill_reasons_reported[reason] = now;
+        }
+        std::cerr << "\n";
     }
 
     const FixedDecodeLane* device_lanes =
@@ -7679,7 +7903,7 @@ bool Dispatch::enqueue_fixed_decode(
     CUDA_CHECK(cudaMemcpyAsync(
         state.h_fixed_decode_kills,
         state.d_fixed_decode_kills,
-        sizeof(std::uint32_t),
+        16 * sizeof(std::uint32_t),
         cudaMemcpyDeviceToHost,
         staged.stream));
     state.fixed_decode_upload.mark_used(staged.stream);
@@ -7687,6 +7911,27 @@ bool Dispatch::enqueue_fixed_decode(
         std::lock_guard<std::mutex> lock(state.stats_mutex);
         ++state.stats.fixed_decode_batches;
         state.stats.fixed_decode_lanes += programs;
+    }
+    // One line per process, on the first templated batch: whether this build's
+    // decode template is carrying recurrent state. There is no cheaper way to
+    // observe it -- `DispatchStats` is wired only into fire-timing debug, and
+    // the whole effect of admitting an RS fire here is that a slower path is
+    // NOT taken, which no assertion downstream can see. If the RS guard above
+    // is ever re-tightened, this is what says so.
+    //
+    // The env read is a function-local static, not a per-batch `getenv`: this
+    // runs once per decode step on the latency path, and reading the
+    // environment there measurably costs (~1.5% of single-request tok/s).
+    static const bool trace_template =
+        std::getenv("PIE_FIXED_DECODE_TRACE") != nullptr;
+    if (trace_template) {
+        static std::once_flag once;
+        std::call_once(once, [&] {
+            std::cerr << "[pie-driver-cuda] fixed-decode template active: "
+                      << "programs=" << programs << " recurrent_state="
+                      << (buffers.rs_slot_ids != nullptr ? "yes" : "no")
+                      << "\n";
+        });
     }
     return true;
 }
@@ -7784,7 +8029,7 @@ std::string describe_uncommitted_lane(
     return message;
 }
 
-int Dispatch::dense_mask_scope_violation(const pie_native::LaunchView& view,
+int Dispatch::dense_mask_scope_violation(const pie::driver::fire::LaunchView& view,
                                          bool allow_structured_masks) const {
     const std::size_t n_prog = view.ptir_program_hashes.size();
     if (n_prog <= 1 || view.ptir_program_instances.size() != n_prog) {
@@ -7838,7 +8083,7 @@ int Dispatch::dense_mask_scope_violation(const pie_native::LaunchView& view,
     return -1;
 }
 
-bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
+bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
                                    std::uint32_t page_size,
                                    std::uint32_t device_pages,
                                    ResolvedPrograms& out,
@@ -7888,19 +8133,84 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         // (frame.cpp) takes the composed batch from R to its request
         // bucket with device-side pad rows, so the template no longer
         // requires R to sit exactly on the lattice.
-        if (staged == nullptr ||
-            page_size == 0 || device_pages == 0 ||
-            !view.rs_slot_ids.empty() ||
-            !view.rs_fold_lens.empty() ||
-            !view.rs_buffer_slot_ids.empty() ||
-            view.kv_translation_indptr.size() != n_prog + 1 ||
-            view.kv_translation_indptr.data()[0] != 0 ||
-            view.kv_translation_indptr.data()[n_prog] !=
-                view.kv_translation.size() ||
-            view.ptir_kv_write_lower_bounds.size() != n_prog ||
-            view.ptir_kv_write_upper_bounds.size() != n_prog) {
+        // Plain per-request RS slots ride through untouched: this template
+        // resolves *geometry* (tokens, positions, pages), and the slot->request
+        // attribution is host data that `compose_forward_batch` copies and that
+        // graph padding extends with `graph_pad_slot`. A fold or a buffered
+        // working set is different -- both change the batch's shape -- so those
+        // two still refuse.
+        //
+        // Refusing on `rs_slot_ids` too is what shut every recurrent-state
+        // family out of device composition, which is the only path that can
+        // resolve a chained descriptor: the host readback fallback cannot see a
+        // value the producing fire has not committed yet, so a decode step that
+        // reads the prefill's sampled token never became ready.
+        const bool trace_compose = [] {
+            const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        auto refuse = [&](const std::string& why) {
+            if (trace_compose) {
+                std::fprintf(stderr, "[compose] refused: %s\n", why.c_str());
+                std::fflush(stderr);
+            }
             return false;
+        };
+        if (staged == nullptr) return refuse("no staged launch");
+        if (page_size == 0 || device_pages == 0) return refuse("no kv pages");
+        // A *bound* fold-length array is not a fold. The runtime carries one
+        // entry per request for every recurrent-state family, and on an
+        // ordinary decode step every entry is zero -- the state advances by
+        // the step's own token, with nothing to replay. Only a non-zero
+        // length reshapes the batch, and only that has to refuse.
+        {
+            const auto folds = view.rs_fold_lens.as<std::uint32_t>();
+            std::size_t nonzero = 0;
+            for (std::size_t i = 0; i < folds.size(); ++i) {
+                if (folds[i] != 0) ++nonzero;
+            }
+            if (nonzero != 0) {
+                if (trace_compose) {
+                    std::fprintf(stderr,
+                                 "[compose] refused: rs fold (%zu/%zu non-zero)\n",
+                                 nonzero, folds.size());
+                    std::fflush(stderr);
+                }
+                return false;
+            }
         }
+        if (!view.rs_buffer_slot_ids.empty()) return refuse("rs buffer");
+        // A DEVICE-RESIDENT fold length (`PIE_RS_FLAG_FOLD_LEN_DEVICE`). Its
+        // value is substituted during descriptor resolution and clamped
+        // against a host bound; this template resolves nothing, so the wire
+        // array would still hold that bound -- folding more than the accepted
+        // prefix, and tokens absorbed into the recurrence are unrecoverable.
+        // frame.cpp refuses the combination outright, so it must refuse here
+        // rather than later.
+        //
+        // The non-zero fold check above happens to catch this today, but only
+        // because the host's bound is non-zero. The flag is what actually
+        // carries the rule, so the flag is what is tested.
+        if (std::any_of(view.rs_slot_flags.data(),
+                        view.rs_slot_flags.data() + view.rs_slot_flags.size(),
+                        [](std::uint8_t f) {
+                            return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+                        })) {
+            return refuse("rs device-resident fold length");
+        }
+        if (view.kv_translation_indptr.size() != n_prog + 1)
+            return refuse("kv_translation_indptr size");
+        if (view.kv_translation_indptr.data()[0] != 0)
+            return refuse("kv_translation_indptr[0]");
+        if (view.kv_translation_indptr.data()[n_prog] !=
+            view.kv_translation.size())
+            return refuse("kv_translation_indptr tail");
+        if (view.ptir_kv_write_lower_bounds.size() != n_prog)
+            return refuse("kv_write_lower_bounds size " +
+                          std::to_string(view.ptir_kv_write_lower_bounds.size()) +
+                          " != n_prog " + std::to_string(n_prog));
+        if (view.ptir_kv_write_upper_bounds.size() != n_prog)
+            return refuse("kv_write_upper_bounds size");
         ResolvedPrograms candidate;
         candidate.per_program.resize(n_prog);
         candidate.is_device_geometry.assign(n_prog, 0);
@@ -7930,7 +8240,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             if (instance.geometry_class !=
                     PIE_GEOMETRY_CLASS_DECODE_ENVELOPE ||
                 instance.trace == nullptr) {
-                return false;
+                return refuse("geometry class not decode-envelope");
             }
             const Trace& trace = *instance.trace;
             std::array<const PortBinding*, 10> dynamic{};
@@ -8090,6 +8400,17 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
     out.is_device_geometry.assign(n_prog, 0);
     const bool resolve_device_mask =
         view.has_user_mask && view.flattened_masks.empty();
+    // The fold length is the one RS quantity the host may never have seen, so
+    // a program that is otherwise ORDINARY -- host geometry, wire-composed --
+    // still has one port that must be read off the device. Resolve just that
+    // port for such a program, exactly as a device mask is resolved for an
+    // otherwise host-geometry attention pass.
+    const bool resolve_device_fold_len = std::any_of(
+        view.rs_slot_flags.data(),
+        view.rs_slot_flags.data() + view.rs_slot_flags.size(),
+        [](std::uint8_t f) {
+            return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+        });
     bool resolved_mask = false;
     std::vector<detail::PortCellCache> cached_cells(n_prog);
     // Pull host-writer rings on the descriptor stream: the readback pack
@@ -8167,11 +8488,12 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        const bool mask_only =
-            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            resolve_device_mask;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            !mask_only) {
+        const bool host_class =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST;
+        const bool mask_only = host_class && resolve_device_mask;
+        const bool fold_len_only =
+            host_class && !mask_only && resolve_device_fold_len;
+        if (host_class && !mask_only && !fold_len_only) {
             continue;
         }
         const std::unordered_set<std::uint32_t>* pending_slots =
@@ -8181,6 +8503,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         for (const PortBinding& binding : trace->ports) {
             if (binding.is_const) continue;
             if (mask_only && binding.port != kPortAttnMask) continue;
+            if (fold_len_only && binding.port != kPortRsFoldLen) continue;
             ChannelView& channel_view = it->second.instance->view();
             const std::uint32_t slot =
                 channel_view.slot(binding.channel);
@@ -8280,7 +8603,7 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             const auto& instance =
                 s.instances.at(view.ptir_program_instances.data()[p]);
             if (instance.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-                !resolve_device_mask) {
+                !resolve_device_mask && !resolve_device_fold_len) {
                 continue;
             }
             if (snapshot_offsets[p] ==
@@ -8336,11 +8659,12 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
         const std::uint64_t iid = view.ptir_program_instances.data()[p];
         auto it = s.instances.find(iid);
         const Trace* trace = it->second.trace;
-        const bool mask_only =
-            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            resolve_device_mask;
-        if (it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST &&
-            !mask_only) {
+        const bool host_class =
+            it->second.geometry_class == PIE_GEOMETRY_CLASS_HOST;
+        const bool mask_only = host_class && resolve_device_mask;
+        const bool fold_len_only =
+            host_class && !mask_only && resolve_device_fold_len;
+        if (host_class && !mask_only && !fold_len_only) {
             continue;
         }
 
@@ -8363,6 +8687,19 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
                 return false;
             }
             resolved_mask = true;
+            continue;
+        }
+        if (fold_len_only) {
+            // ONE port, and nothing else: this program's geometry is host
+            // composed and correct already. `is_device_geometry` stays 0 so
+            // composition keeps taking the wire arrays for everything except
+            // the fold length, which it substitutes per flagged row.
+            if (!resolve_rs_fold_len(
+                    *trace, it->second.instance->view(), fg, err,
+                    pending_slots, &cached_cells[p])) {
+                return false;
+            }
+            if (fg.has_rs_fold_len) resolved_mask = true;
             continue;
         }
         if (!resolve_fire_geometry(

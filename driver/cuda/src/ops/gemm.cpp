@@ -20,6 +20,7 @@
 #include "kernels/dequant_fp4.hpp"
 #include "kernels/dequant_fp8.hpp"
 #include "kernels/add_bias.hpp"
+#include "kernels/argmax.hpp"
 #include "kernels/gemv.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/residual_add.hpp"
@@ -38,15 +39,19 @@ constexpr std::size_t kDefaultLtWorkspaceBytes = 32ull * 1024ull * 1024ull;
 struct LtCtx;
 thread_local LtCtx* g_runtime_quant_context = nullptr;
 
-cublasComputeType_t bf16_compute_type() {
-    static const cublasComputeType_t ct = [] {
-        const char* v = std::getenv("PIE_CUBLAS_PRECISE");
-        if (v != nullptr && v[0] != '\0' && v[0] != '0')
-            return CUBLAS_COMPUTE_32F;
-        return CUBLAS_COMPUTE_32F_FAST_16BF;
-    }();
-    return ct;
-}
+// CUBLAS_COMPUTE_32F_FAST_16BF exists to let a matmul over *fp32* operands
+// round them to bf16 for the tensor cores. Operands that are already bf16 gain
+// nothing from it, and cuBLASLt has no algorithm at all for many bf16 shapes
+// under it -- the MLA absorb batches and the MoE expert batch among them. Its
+// heuristic query then fails on every call, and cuBLAS silently retries the
+// matmul in CUBLAS_COMPUTE_32F. That internal retry is not reliable when eight
+// rank threads take it at the same instant: when it loses the race the call
+// returns NOT_SUPPORTED or INTERNAL_ERROR, and if it happened inside a graph
+// capture the failure also invalidates the capture, so the next GEMM dies far
+// from the cause. That is what killed roughly one boot in ten at tp > 1.
+// CUBLAS_COMPUTE_32F is what bf16 operands should have been asking for all
+// along: same tensor cores, same fp32 accumulate, no fallback to race.
+cublasComputeType_t bf16_compute_type() { return CUBLAS_COMPUTE_32F; }
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* what) {
     if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
@@ -1287,6 +1292,39 @@ void gemm_bf16_cublas_impl(
     }
 }
 
+// Whether `cublasGemmGroupedBatchedEx` can serve a given shape is only
+// discoverable by calling it and looking at the status. That is fine on a plain
+// stream, but a failed cuBLAS call inside a stream capture INVALIDATES the
+// capture, and the next GEMM then dies with an unrelated INTERNAL_ERROR far from
+// the cause -- intermittently, because which shapes reach a capture first
+// depends on rank timing. So speculate only outside capture, remember the answer
+// per shape, and while capturing an untried shape go straight to the batched
+// path.
+struct GroupedBatchedSupport {
+    // -1 unknown, 0 unsupported, 1 supported.
+    int lookup(std::uint64_t key) {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto it = known.find(key);
+        return it == known.end() ? -1 : (it->second ? 1 : 0);
+    }
+
+    void store(std::uint64_t key, bool supported) {
+        std::lock_guard<std::mutex> lock(mu);
+        known.emplace(key, supported);
+    }
+
+    std::mutex mu;
+    std::unordered_map<std::uint64_t, bool> known;
+};
+
+bool stream_is_capturing(cublasHandle_t handle) {
+    cudaStream_t stream = nullptr;
+    if (cublasGetStream(handle, &stream) != CUBLAS_STATUS_SUCCESS) return true;
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) return true;
+    return status != cudaStreamCaptureStatusNone;
+}
+
 void gemm_batched_bf16_impl(
     cublasHandle_t handle,
     const void* const* act_ptrs_dev,
@@ -1298,7 +1336,16 @@ void gemm_batched_bf16_impl(
 {
     if (batch_count <= 0) return;
     const float alpha = 1.f;
-    if (use_cublas_grouped_batched_bf16()) {
+    const std::uint64_t grouped_key =
+        dense_key(M, N, K, beta) ^
+        (static_cast<std::uint64_t>(batch_count) * 0x9E3779B97F4A7C15ull);
+    auto& grouped_support = per_device_singleton<GroupedBatchedSupport>();
+    const int grouped_known = grouped_support.lookup(grouped_key);
+    const bool try_grouped =
+        use_cublas_grouped_batched_bf16() &&
+        (grouped_known == 1 ||
+         (grouped_known < 0 && !stream_is_capturing(handle)));
+    if (try_grouped) {
         const cublasOperation_t transa_array[1] = {CUBLAS_OP_T};
         const cublasOperation_t transb_array[1] = {CUBLAS_OP_N};
         const int m_array[1] = {N};
@@ -1319,6 +1366,10 @@ void gemm_batched_bf16_impl(
             y_ptrs_dev, CUDA_R_16BF, ldc_array,
             /*group_count=*/1, group_size,
             bf16_compute_type());
+        if (grouped_known < 0) {
+            grouped_support.store(grouped_key,
+                                  status == CUBLAS_STATUS_SUCCESS);
+        }
         if (status == CUBLAS_STATUS_SUCCESS) {
             return;
         }
@@ -1415,10 +1466,9 @@ void gemm_grouped_bf16_impl(
             group_size.data(),
             compute);
     };
-    cublasStatus_t status = run(CUBLAS_COMPUTE_32F_FAST_16BF);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        status = run(CUBLAS_COMPUTE_32F);
-    }
+    // No FAST_16BF attempt first: it has no algorithm for these shapes, and a
+    // failed call inside a graph capture invalidates the capture.
+    const cublasStatus_t status = run(bf16_compute_type());
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -1801,9 +1851,15 @@ namespace {
 // device memory the cache may hold (0 disables it).
 class DequantWeightCache {
  public:
+    // Per device, not per process. Every rank of a TP group runs in this one
+    // process with its own current device, and the entries here own device
+    // memory: a shared cache lets one rank's insert evict and `cudaFree` a
+    // pointer belonging to another rank's device, which poisons the context
+    // and surfaces as an illegal access in whatever runs next. The same
+    // reasoning already governs `Bf16LtCtx`, `Bf16LtPlanCache` and
+    // `DenseGemmTuner` a few hundred lines up.
     static DequantWeightCache& instance() {
-        static DequantWeightCache c;
-        return c;
+        return per_device_singleton<DequantWeightCache>();
     }
 
     // The expansion depends on the weight AND on how it is read, so the key
@@ -1876,7 +1932,8 @@ class DequantWeightCache {
         used_ = 0;
     }
 
- private:
+    // Public only so `per_device_singleton` can build one per device; the
+    // instance is still reached exclusively through `instance()`.
     DequantWeightCache() {
         const char* v = std::getenv("PIE_FP8_DEQUANT_CACHE_GB");
         if (v != nullptr && v[0] != '\0') {
@@ -2472,6 +2529,59 @@ void gemm_act_x_w(
     unsupported("gemm_act_x_w", act_dtype, w.dtype, y_dtype);
 }
 
+bool lm_head_argmax_supported(WeightView w) {
+    return w.data != nullptr && w.dtype == DType::BF16 &&
+        w.scale_data == nullptr;
+}
+
+std::size_t lm_head_argmax_slab_bytes(int M, int N, int chunk) {
+    if (M <= 0 || N <= 0 || chunk <= 0) return 0;
+    const std::size_t width = static_cast<std::size_t>(std::min(chunk, N));
+    return static_cast<std::size_t>(M) * width * sizeof(__nv_bfloat16);
+}
+
+bool lm_head_argmax_chunked(
+    cublasHandle_t handle,
+    const void* act,
+    WeightView w,
+    std::int32_t* token_ids,
+    void* slab,
+    float* acc_val,
+    std::int32_t* acc_idx,
+    int M, int N, int K,
+    int chunk)
+{
+    if (!lm_head_argmax_supported(w)) return false;
+    if (M <= 0 || N <= 0 || K <= 0 || chunk <= 0) return false;
+    if (act == nullptr || slab == nullptr ||
+        token_ids == nullptr || acc_val == nullptr || acc_idx == nullptr) {
+        return false;
+    }
+
+    cudaStream_t stream = nullptr;
+    cublasGetStream(handle, &stream);
+    const auto* weight_rows = static_cast<const std::uint8_t*>(w.data);
+
+    for (int base = 0; base < N; base += chunk) {
+        const int width = std::min(chunk, N - base);
+        // A slab is rows [base, base+width) of W, which are contiguous, and
+        // lands in `slab` as a tightly packed [M, width] -- so the slab's row
+        // stride is `width`, not `chunk`, on the ragged final iteration.
+        gemm_act_x_w(
+            handle, act,
+            WeightView::raw(
+                weight_rows + static_cast<std::size_t>(base) *
+                                  static_cast<std::size_t>(K) * sizeof(__nv_bfloat16),
+                DType::BF16),
+            slab, M, width, K);
+        kernels::launch_argmax_accumulate_bf16(
+            slab, M, width, width, base, acc_val, acc_idx,
+            /*init=*/base == 0, stream);
+    }
+    kernels::launch_argmax_finalize_bf16(acc_val, acc_idx, token_ids, M, stream);
+    return true;
+}
+
 void gemm_act_x_wt_bf16_out_fp32(
     cublasHandle_t handle,
     const void* act,
@@ -2572,9 +2682,7 @@ void mla_absorb_q_to_latent_bf16(
         /*strideC=*/kv_lora_rank,
         /*batchCount=*/heads,
         bf16_compute_type(), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error("mla_absorb_q_to_latent_bf16: cuBLAS failed");
-    }
+    check(status, "mla_absorb_q_to_latent_bf16");
 }
 
 void mla_absorb_latent_to_v_bf16(
@@ -2585,7 +2693,7 @@ void mla_absorb_latent_to_v_bf16(
     if (tokens <= 0 || heads <= 0) return;
     const float alpha = 1.f, beta = 0.f;
     const auto* wv = static_cast<const __nv_bfloat16*>(kv_b_proj) +
-                     static_cast<long long>(qk_nope_dim) * kv_lora_rank;
+                 static_cast<long long>(qk_nope_dim) * kv_lora_rank;
     // Row-major C[T, v_dim] = A[T, kv_lora] @ W[v_dim, kv_lora]^T per head.
     const auto status = cublasGemmStridedBatchedEx(
         handle, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -2600,9 +2708,7 @@ void mla_absorb_latent_to_v_bf16(
         /*strideC=*/v_head_dim,
         /*batchCount=*/heads,
         bf16_compute_type(), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error("mla_absorb_latent_to_v_bf16: cuBLAS failed");
-    }
+    check(status, "mla_absorb_latent_to_v_bf16");
 }
 
 }  // namespace pie_cuda_driver::ops

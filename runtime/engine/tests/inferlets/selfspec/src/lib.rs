@@ -25,7 +25,7 @@
 //!    nonzero, `≠ g[j]`) ⇒ `V == [g0..g_{j-1}, g_j, 0..]` — the accepted
 //!    prefix, the correction `t_j == g[j]` spliced at `j`, then 0s.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model, serde_json};
 
 const PAGE_T: u32 = 16;
@@ -55,34 +55,34 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     let ws = WorkingSet::new();
     let n = prompt.len() as u32;
     let max_pages = (n + k + 1).div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("greedy ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("greedy ws.reserve")?;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
 
     let toks_p = Channel::from(prompt_i32).named("g_toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("g_embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("g_positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("g_pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("g_page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("g_w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("g_w_off_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("g_embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("g_positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("g_pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(PAGE_T)]).named("g_page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / PAGE_T)).named("g_w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % PAGE_T)).named("g_w_off_p");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
@@ -91,64 +91,57 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     // ONE pipeline for the whole greedy stream (R4-4): prefill then decode
     // are one sequential stream. The g0 handoff still rides the host.
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("greedy prefill: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p.submit(&pipe).context("greedy prefill")?;
+    let g0 = g0_ch.take_host::<i32>().await?;
 
     let mut g: Vec<u32> = vec![g0 as u32];
     if k > 1 {
-        let tok_in = Channel::from(vec![g0; 1]).named("g_tok_in");
+        let tok_in = Channel::from([g0]).named("g_tok_in");
         let out = Channel::new([1], dtype::i32).named("g_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("g_embed_indptr");
-        let positions = Channel::from(vec![n]).named("g_positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("g_pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("g_page_indptr");
-        let w_slot = Channel::from(vec![n / PAGE_T]).named("g_w_slot");
-        let w_off = Channel::from(vec![n % PAGE_T]).named("g_w_off");
+        let lane1 = Channel::from([0u32, 1u32]).named("g_embed_indptr");
+        let positions = Channel::from([n]).named("g_positions");
+        let pages = Channel::from_iter(0..max_pages).named("g_pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]).named("g_page_indptr");
+        let w_slot = Channel::from([n / PAGE_T]).named("g_w_slot");
+        let w_off = Channel::from([n % PAGE_T]).named("g_w_off");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
         fwd.attention(
             &ws,
-            ..,
-            (n / PAGE_T)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / PAGE_T)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let t = reduce_argmax(intrinsics::logits());
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, PAGE_T - 1), PAGE_T);
+            let next_length = &length + 1u32;
+            let page_count = next_length.div_ceil(PAGE_T);
             tok_in.put(&t);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, PAGE_T));
-            w_off.put(rem(&length, PAGE_T));
-            page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            w_slot.put(&length / PAGE_T);
+            w_off.put(&length % PAGE_T);
+            page_indptr.put(indptr(1, &page_count));
             out.put(&t);
         });
         for step in 1..k {
             fwd.submit(&pipe)
-                .map_err(|e| format!("greedy decode @{step}: {e}"))?;
+                .with_context(|| format!("greedy decode @{step}"))?;
             let t = out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("greedy out @{step}: {e}"))?[0];
+                .with_context(|| format!("greedy out @{step}"))?;
             g.push(t as u32);
         }
     }
@@ -167,15 +160,14 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
 
     let ws = WorkingSet::new();
     let max_pages = n.div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("verify ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("verify ws.reserve")?;
     let toks = Channel::from(inp).named("v_toks");
-    let embed_indptr = Channel::from(vec![0u32, n]).named("v_embed_indptr");
-    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("v_positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("v_pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("v_page_indptr");
-    let w_slot = Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("v_w_slot");
-    let w_off = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("v_w_off");
+    let embed_indptr = Channel::from([0u32, n]).named("v_embed_indptr");
+    let positions = Channel::from_iter(0..n).named("v_positions");
+    let pages = Channel::from_iter(0..max_pages).named("v_pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("v_page_indptr");
+    let w_slot = Channel::from_iter((0..n).map(|p| p / PAGE_T)).named("v_w_slot");
+    let w_off = Channel::from_iter((0..n).map(|p| p % PAGE_T)).named("v_w_off");
     let verify_out = Channel::new([k], dtype::i32).named("v_out");
 
     // k read-out rows (the last k positions, prompt-tail .. prompt-tail+k-1)
@@ -187,44 +179,41 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
-    let kv_len = Channel::from(vec![n]).named("kv_len");
+    let kv_len = Channel::from([n]).named("kv_len");
     fwd.readout(&readout)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded input tokens (NOT a separate
         // submitted draft channel) and gather the k draft positions out of it.
-        let toks_val = toks.read().tensor(); // [n] i32
+        let toks_val = toks.read(); // [n] i32
         let draft = gather(&toks_val, Tensor::constant(draft_positions.clone())); // [k] i32
         let target = reduce_argmax(intrinsics::logits()); // [k] i32
         let hit = eq(&target, &draft); // [k] bool
-        let ones = broadcast(Tensor::constant(1.0f32), [k]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
-        let n_acc = cast(reduce_sum(cumprod(select(&hit, &ones, &zeros))), DType::U32);
+        let ones = broadcast(1.0f32, [k]);
+        let zeros = broadcast(0.0f32, [k]);
+        let n_acc = cast(reduce_sum(cumprod(select(&hit, &ones, &zeros))), dtype::u32);
         let keep = ge(broadcast(&n_acc, [k]), iota(k)); // [k] bool: i <= n_acc
-        let zeros_i32 = broadcast(Tensor::constant(0i32), [k]);
+        let zeros_i32 = broadcast(0i32, [k]);
         let verify = select(&keep, &target, &zeros_i32); // accepted prefix + correction + 0s
         verify_out.put(&verify);
     });
 
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline)
-        .map_err(|e| format!("verify submit: {e}"))?;
-    let v = verify_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("verify take: {e}"))?;
+    fwd.submit(&pipeline).context("verify submit")?;
+    let v = verify_out.take_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok(v.iter().map(|&x| x as u32).collect())
 }

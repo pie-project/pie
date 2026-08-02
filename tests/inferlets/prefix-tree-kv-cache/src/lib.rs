@@ -4,8 +4,8 @@
 //! working set, append distinct text, and are each forked again into two leaves.
 //! Generation then continues independently from all four shared-prefix leaves.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
+use inferlet::chat;
+use inferlet::ptir::attention::prelude::*;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -32,57 +32,42 @@ async fn append_tokens(
     let total = start + n;
     // The generated geometry spans `max_pages`; extend the (purely logical)
     // lease so it covers the appended extent by fire time.
-    let max_pages = total.div_ceil(ws.page_size()).max(1);
+    let max_pages = total.div_ceil(kv_page_size()).max(1);
     let have = ws.page_len();
     if max_pages > have {
-        ws.reserve(max_pages - have)
-            .map_err(|e| format!("reserve append KV: {e}"))?;
+        ws.reserve(max_pages - have).context("reserve append KV")?;
     }
-    let token_input = Channel::from(tokens.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((start..total).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..ws.page_len()).collect::<Vec<_>>()).named("pages");
-    let page_indptr =
-        Channel::from(vec![0u32, total.div_ceil(ws.page_size())]).named("page_indptr");
-    let w_slot = Channel::from(
-        (start..total)
-            .map(|p| p / ws.page_size())
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot");
-    let w_off = Channel::from(
-        (start..total)
-            .map(|p| p % ws.page_size())
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off");
+    let token_input = Channel::from_iter(tokens.iter().map(|&token| token as i32));
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(start..total).named("positions");
+    let pages = Channel::from_iter(0..ws.page_len()).named("pages");
+    let page_indptr = Channel::from([0u32, total.div_ceil(kv_page_size())]).named("page_indptr");
+    let w_slot = Channel::from_iter((start..total).map(|p| p / kv_page_size())).named("w_slot");
+    let w_off = Channel::from_iter((start..total).map(|p| p % kv_page_size())).named("w_off");
     let next_token = Channel::new([1], dtype::i32).named("next_token");
 
     let fwd = ForwardPass::new();
     fwd.embed(&token_input, &embed_indptr)?;
-    let kv_len = Channel::from(vec![total]).named("kv_len");
+    let kv_len = Channel::from([total]).named("kv_len");
     fwd.attention(
         ws,
-        ..,
-        (start / ws.page_size())..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (start / kv_page_size())..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         next_token.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
-    fwd.submit(pipeline)
-        .map_err(|e| format!("append shared prefix: {e}"))?;
-    Ok(next_token
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read branch token: {e}"))?[0])
+    fwd.submit(pipeline).context("append shared prefix")?;
+    Ok(next_token.take_host::<i32>().await?)
 }
 
 async fn generate(
@@ -108,64 +93,59 @@ async fn generate(
     // The generated geometry spans `max_pages`; extend the (purely logical)
     // lease so it covers the whole decode by fire time.
     let max_pages = (seq_len + max_tokens as u32 + 1)
-        .div_ceil(ws.page_size())
+        .div_ceil(kv_page_size())
         .max(1);
     let have = ws.page_len();
     if max_pages > have {
-        ws.reserve(max_pages - have)
-            .map_err(|e| format!("reserve leaf KV: {e}"))?;
+        ws.reserve(max_pages - have).context("reserve leaf KV")?;
     }
-    let token_in = Channel::from(vec![first_token]).named("token_in");
-    let page_size = ws.page_size();
-    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-    let positions = Channel::from(vec![seq_len]).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr =
-        Channel::from(vec![0u32, (seq_len + 1).div_ceil(page_size)]).named("page_indptr");
-    let w_slot = Channel::from(vec![seq_len / page_size]).named("w_slot");
-    let w_off = Channel::from(vec![seq_len % page_size]).named("w_off");
+    let token_in = Channel::from([first_token]).named("token_in");
+    let page_size = kv_page_size();
+    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+    let positions = Channel::from([seq_len]).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, (seq_len + 1).div_ceil(page_size)]).named("page_indptr");
+    let w_slot = Channel::from([seq_len / page_size]).named("w_slot");
+    let w_off = Channel::from([seq_len % page_size]).named("w_off");
     let token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("token_out");
 
     let fwd = ForwardPass::new();
     fwd.embed(&token_in, &embed_indptr)?;
-    let kv_len = Channel::from(vec![seq_len + 1]).named("kv_len");
+    let kv_len = Channel::from([seq_len + 1]).named("kv_len");
     fwd.attention(
         ws,
-        ..,
-        (seq_len / page_size)..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (seq_len / page_size)..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
-        let next_length = add(&length, 1u32);
-        let page_count = div(add(&next_length, page_size - 1), page_size);
+        let next_length = &length + 1u32;
+        let page_count = next_length.div_ceil(page_size);
 
         token_in.put(&token);
         kv_len.put(&next_length);
         positions.put(&length);
-        w_slot.put(div(&length, page_size));
-        w_off.put(rem(&length, page_size));
-        page_indptr.take();
-        page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+        w_slot.put(&length / page_size);
+        w_off.put(&length % page_size);
+        page_indptr.put(indptr(1, &page_count));
         token_out.put(&token);
     });
 
     let budget = max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &fwd, budget as usize, async || {
-        let token = token_out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("read leaf token: {e}"))?[0] as u32;
+        let token = token_out.take_host::<i32>().await? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }
@@ -186,7 +166,7 @@ struct Branch {
 async fn main(input: Input) -> Result<String> {
     let root = WorkingSet::new();
 
-    let root_tokens = wit_model::encode("Write a short scene set");
+    let root_tokens = model::encode("Write a short scene set");
     if root_tokens.is_empty() {
         return Err("tokenizer produced an empty root prompt".into());
     }
@@ -198,7 +178,7 @@ async fn main(input: Input) -> Result<String> {
     let mut first_level = Vec::new();
     for suffix in [" in a city", " in a forest"] {
         let child = root.fork(&tree_pipeline)?;
-        let tokens = wit_model::encode(suffix);
+        let tokens = model::encode(suffix);
         append_tokens(&child, &tree_pipeline, root_len, &tokens, false).await?;
         first_level.push(Branch {
             label: suffix.trim().into(),
@@ -213,7 +193,7 @@ async fn main(input: Input) -> Result<String> {
     for (pi, parent) in first_level.into_iter().enumerate() {
         for (si, suffix) in leaf_suffixes.into_iter().enumerate() {
             let leaf = parent.ws.fork(&tree_pipeline)?;
-            let tokens = wit_model::encode(suffix);
+            let tokens = model::encode(suffix);
             // The last leaf's append is the build stream's final submission.
             let last = pi + 1 == num_parents && si + 1 == leaf_suffixes.len();
             let first = append_tokens(&leaf, &tree_pipeline, parent.seq_len, &tokens, last).await?;
@@ -231,7 +211,7 @@ async fn main(input: Input) -> Result<String> {
     let mut outputs = Vec::with_capacity(leaves.len());
     for (label, ws, seq_len, first) in leaves {
         let generated = generate(&ws, &tree_pipeline, seq_len, first, input.num_tokens).await?;
-        outputs.push(format!("{label}: {}", wit_model::decode(&generated)?));
+        outputs.push(format!("{label}: {}", model::decode(&generated)?));
     }
     tree_pipeline.close();
     Ok(outputs.join("\n"))

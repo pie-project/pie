@@ -3105,15 +3105,15 @@ fn single_step_frame(
             }],
             terminal_cells,
             program_row_indptr,
-            // No fire plan on this path (a harness/legacy single-step
-            // submission): no region table — the driver derives alone.
-            region_row_indptr: Vec::new(),
-            region_sig: Vec::new(),
-            region_k: Vec::new(),
             logical_fire_ids,
             channel_expected_head,
             channel_expected_tail,
             channel_ticket_indptr,
+            // tart: no region table on the harness/legacy path — the
+            // driver derives alone (legacy discipline).
+            region_row_indptr: Vec::new(),
+            region_sig: Vec::new(),
+            region_k: Vec::new(),
         }],
     }
 }

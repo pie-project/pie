@@ -24,6 +24,7 @@ struct RmsParams {
   uint axis_size;   // feature dim (hidden), e.g. 1024
   uint w_stride;    // weight stride along axis (1 for contiguous)
   uint plus_one;    // 1 => effective gain is (1.0f + weight) [Gemma/qwen3.5]
+  float gain;       // constant multiplier on the weight; 1.0 unless stated
 };
 
 template <typename T, int N_READS>
@@ -79,13 +80,15 @@ template <typename T, int N_READS>
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
       out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
         out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
       }
     }
@@ -151,13 +154,15 @@ template <typename T, int N_READS>
   out += row_base + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+      T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
       out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        T wv = p.plus_one ? T(1.0f + float(w[w_stride * i])) : w[w_stride * i];
+        T wv = T(p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                    : float(w[w_stride * i])));
         out[i] = wv * static_cast<T>(x[i] * local_inv_mean[0]);
       }
     }
@@ -170,8 +175,6 @@ template <typename T, int N_READS>
       const device itype*, const device itype*, device itype*,          \
       constant RmsParams&, constant int&, uint, uint, uint, uint);
 
-instantiate_rms_strided_row(float32, float, 4)
-instantiate_rms_strided_row(float16, half, 4)
 instantiate_rms_strided_row(bfloat16, bfloat, 4)
 
 #define instantiate_rms_single_row(name, itype, n_reads)               \
@@ -180,6 +183,140 @@ instantiate_rms_strided_row(bfloat16, bfloat, 4)
       const device itype*, const device itype*, device itype*,          \
       constant RmsParams&, uint, uint, uint, uint);
 
-instantiate_rms_single_row(float32, float, 4)
-instantiate_rms_single_row(float16, half, 4)
 instantiate_rms_single_row(bfloat16, bfloat, 4)
+
+// ── Fused norm + residual (+ optional layer scalar) — gemma4 ─────────────────
+//
+// gemma4 wraps each sublayer in a norm sandwich: the BLOCK's output is
+// normalised before it rejoins the residual stream. So `rms_single_row` is
+// immediately followed by `residual_add` three times a layer, and the per-layer
+// embedding path adds a learned scalar after its own add. Each of those is a
+// separate dispatch, and a dispatch that is barrier-separated costs ~5.8 us on
+// this machine against a step of 8.46 ms -- measured, by running the same DAG
+// with 723, 833 and 1 barriers.
+//
+// The pair fuses for free: the threadgroup that computes the row's inverse RMS
+// already holds every element of the row, so adding the residual in its
+// write-back costs one extra load and no synchronisation at all.
+//
+//   out = rms_norm(x) * w + r            (`rms_residual`)
+//   out = (rms_norm(x) * w + r) * s[0]   (`rms_residual_scaled`)
+//
+// Arithmetic is otherwise identical to `rms_single_row` followed by
+// `residual_add`: the same float accumulate, the same `precise::rsqrt`, and the
+// same single bf16 round on the way out. It is NOT bit-identical to the
+// two-dispatch form, which rounds the norm to bf16 before the add reads it back;
+// this keeps that intermediate in float, so it is strictly closer to the
+// reference. The parity walk is what says so.
+template <typename T, int N_READS, bool SCALED>
+METAL_FUNC void rms_residual_impl(
+    const device T* x,
+    const device T* w,
+    const device T* r,
+    const device T* s,
+    device T* out,
+    constant RmsParams& p,
+    threadgroup float* local_inv_mean,
+    threadgroup float* local_sums,
+    uint gid,
+    uint lid,
+    uint simd_lane_id,
+    uint simd_group_id) {
+  const uint axis_size = p.axis_size;
+  const uint w_stride = p.w_stride;
+
+  float acc = 0;
+  const size_t row = size_t(gid) * size_t(axis_size);
+  x += row + lid * N_READS;
+  w += w_stride * lid * N_READS;
+  if (lid * N_READS + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      float xi = x[i];
+      acc += xi * xi;
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if ((lid * N_READS + i) < axis_size) {
+        float xi = x[i];
+        acc += xi * xi;
+      }
+    }
+  }
+  acc = simd_sum(acc);
+  if (simd_group_id == 0) {
+    local_sums[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lane_id == 0) {
+    local_sums[simd_group_id] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    acc = simd_sum(local_sums[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_inv_mean[0] = precise::rsqrt(acc / axis_size + p.eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float scale = SCALED ? float(s[0]) : 1.0f;
+  r += row + lid * N_READS;
+  out += row + lid * N_READS;
+  for (int i = 0; i < N_READS; i++) {
+    if (lid * N_READS + N_READS <= axis_size || (lid * N_READS + i) < axis_size) {
+      const float wv = p.gain * (p.plus_one ? (1.0f + float(w[w_stride * i]))
+                                         : float(w[w_stride * i]));
+      const float normed = wv * (float(x[i]) * local_inv_mean[0]);
+      out[i] = static_cast<T>((normed + float(r[i])) * scale);
+    }
+  }
+}
+
+template <typename T, int N_READS>
+[[kernel]] void rms_residual(
+    const device T* x          [[buffer(0)]],
+    const device T* w          [[buffer(1)]],
+    device T* out              [[buffer(2)]],
+    constant RmsParams& p      [[buffer(3)]],
+    const device T* r          [[buffer(4)]],
+    uint gid                   [[threadgroup_position_in_grid]],
+    uint lid                   [[thread_position_in_threadgroup]],
+    uint simd_lane_id          [[thread_index_in_simdgroup]],
+    uint simd_group_id         [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[32];
+  rms_residual_impl<T, N_READS, false>(x, w, r, nullptr, out, p, local_inv_mean, local_sums,
+                                       gid, lid, simd_lane_id, simd_group_id);
+}
+
+template <typename T, int N_READS>
+[[kernel]] void rms_residual_scaled(
+    const device T* x          [[buffer(0)]],
+    const device T* w          [[buffer(1)]],
+    device T* out              [[buffer(2)]],
+    constant RmsParams& p      [[buffer(3)]],
+    const device T* r          [[buffer(4)]],
+    const device T* s          [[buffer(5)]],
+    uint gid                   [[threadgroup_position_in_grid]],
+    uint lid                   [[thread_position_in_threadgroup]],
+    uint simd_lane_id          [[thread_index_in_simdgroup]],
+    uint simd_group_id         [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[32];
+  rms_residual_impl<T, N_READS, true>(x, w, r, s, out, p, local_inv_mean, local_sums,
+                                      gid, lid, simd_lane_id, simd_group_id);
+}
+
+#define instantiate_rms_residual(name, itype, nreads)                    \
+  template [[host_name("rms_residual_" #name)]]                          \
+  [[kernel]] void rms_residual<itype, nreads>(                           \
+      const device itype*, const device itype*, device itype*,           \
+      constant RmsParams&, const device itype*,                          \
+      uint, uint, uint, uint);                                           \
+  template [[host_name("rms_residual_scaled_" #name)]]                   \
+  [[kernel]] void rms_residual_scaled<itype, nreads>(                    \
+      const device itype*, const device itype*, device itype*,           \
+      constant RmsParams&, const device itype*, const device itype*,     \
+      uint, uint, uint, uint);
+
+instantiate_rms_residual(bfloat16, bfloat, 4)

@@ -6,11 +6,11 @@
 #include <vector>
 
 #include <pie_driver_abi.h>
-#include <pie_native/step_launch.hpp>
+#include <pie/driver/fire/step.hpp>
 
 #include "batch/forward.hpp"
-#include "pie_native/launch_view.hpp"
-#include "pie_native/fire/fire_geometry.hpp"
+#include "pie/driver/fire/view.hpp"
+#include "pie/driver/fire/geometry.hpp"
 
 namespace pie::metal::batch {
 
@@ -48,6 +48,8 @@ struct OwnedLaunchView {
     // fallback for resolved request rows.
     std::vector<std::uint32_t> rs_buffer_slot_ids;
     std::vector<std::uint32_t> rs_buffer_slot_indptr;
+    std::vector<std::uint32_t> rs_translation;
+    std::vector<std::uint32_t> rs_translation_indptr;
     std::vector<std::uint32_t> sampling_indices;
     std::vector<std::uint32_t> sampling_indptr;
     std::vector<std::uint32_t> kv_translation;
@@ -58,8 +60,8 @@ struct OwnedLaunchView {
     std::uint32_t required_kv_pages = 0;
     bool has_user_mask = false;
 
-    static OwnedLaunchView capture(const pie_native::StepLaunch& launch);
-    pie_native::LaunchView view() const;
+    static OwnedLaunchView capture(const pie::driver::fire::StepLaunch& launch);
+    pie::driver::fire::LaunchView view() const;
 };
 
 struct LaunchJobData {
@@ -70,15 +72,15 @@ struct LaunchJobData {
     std::uint64_t lease_id = 0;
 };
 
-pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch);
+pie::driver::fire::LaunchView build_launch_view(const pie::driver::fire::StepLaunch& launch);
 
 bool build_member_forward_desc(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::size_t member,
     std::size_t member_count,
     bool has_linear_attn,
     std::uint32_t page_size,
-    const pie_native::launch::FireGeometry* resolved,
+    const pie::driver::fire::FireGeometry* resolved,
     MemberForwardDesc& desc,
     std::string& error);
 

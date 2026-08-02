@@ -1,6 +1,7 @@
 #include "model/llama_like/llama_like_model.hpp"
 
 #include "model/stage_hooks.hpp"
+#include "ops/gemm.hpp"
 
 #include <cstdlib>
 #include <utility>
@@ -67,6 +68,14 @@ LlamaLikeModel::LlamaLikeModel(
     caps_.supports_supergraph =
         static_cast<bool>(declared_) &&
         llama_like_supergraph_supported(declared_);
+    // `body()` below forwards the slab width, and `llama_like_forward_paged`
+    // acts on it -- but only a dense BF16 head can be reduced slab by slab, so
+    // the weight decides too. Asked once here rather than inside the forward:
+    // by then the graph key and the epilogue's token source are committed.
+    // MERGE NOTE: upstream's fused LM-head argmax is NOT taken into the
+    // tart llama_like body (its epilogue would read tokens the body never
+    // wrote); the capability stays off until that port.
+    caps_.supports_fused_lm_head_argmax = false;
 }
 
 void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
@@ -133,7 +142,23 @@ void LlamaLikeModel::body(Workspace& ws,
         // The trace committed to the fused QKV binding; a workspace without
         // the packed buffer cannot honour it (same availability check the
         // hand-written `use_fused_qkv` makes).
-        (!declared_.fused_qkv || !ws.qkv_fused.empty());
+        (!declared_.fused_qkv || !ws.qkv_fused.empty()) &&
+        // ④ Act 1 (banded depth): the interpreter serves banded fires
+        // when the DECODE-family band plans exist (every live band has
+        // its prefix plan); prefill-family banded deployments keep the
+        // hand-written body. Without any term here the declared leg
+        // silently demoted mixed-k fires to full depth (caught live at
+        // 14B: R=8 co-fires, no [depth-bands], no DECLINE).
+        (plan_.depth_band_count < 2 ||
+         (in.is_pure_decode && [&] {
+             for (std::uint32_t j = 0; j < plan_.depth_band_count; ++j) {
+                 if (plan_.depth_band_rows[j] > 0 &&
+                     !plan_.depth_band_plans[j]) {
+                     return false;
+                 }
+             }
+             return true;
+         }()));
     if (declared_eligible) {
         llama_like_forward_declared(
             declared_, weights_, hf_config_, fwd_cfg_, plan_,
@@ -158,8 +183,11 @@ void LlamaLikeModel::body(Workspace& ws,
             in.full_depth_rows);
         return;
     }
+    LlamaLikeForwardCfg fwd = fwd_cfg_;
+    fwd.logits_argmax_chunk_tokens = in.logits_argmax_chunk_tokens;
+
     llama_like_forward_paged(
-        weights_, hf_config_, fwd_cfg_, plan_,
+        weights_, hf_config_, fwd, plan_,
         ws, kv, attn_ws, cublas,
         in.token_ids, in.positions,
         in.qo_indptr_d, in.kv_page_indices_d, in.kv_page_indptr_d,

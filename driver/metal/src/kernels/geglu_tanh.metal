@@ -40,6 +40,49 @@ template <typename T>
       const device itype*, const device itype*, device itype*,         \
       constant GegluParams&, uint);
 
-instantiate_geglu_tanh(float32, float)
-instantiate_geglu_tanh(float16, half)
 instantiate_geglu_tanh(bfloat16, bfloat)
+
+// ── Strided variant: the operands are rows of DIFFERENT pitches ──────────────
+//
+// gemma4's per-layer-embedding GeGLU gates the residual stream by one layer's
+// slice of the PLE table. At M=1 that slice is a byte offset and the flat kernel
+// above serves. At M>1 it is not: the table is `[rows, n_layers*ple_dim]` row
+// major, so layer L's slice is `ple_dim` wide with a stride of `n_layers*ple_dim`
+// between rows, while the gate and the output are densely `[rows, ple_dim]`.
+//
+// A byte offset cannot express that, and the flat kernel reading it walks into
+// the NEXT layers' slices after the first row -- which is not a crash and not
+// even implausible numbers, since those slices are the same table.
+//
+// So the pitches are stated. At rows==1 every pitch is unused and this is the
+// flat kernel with an offset, which is what the M=1 path keeps doing.
+struct GegluStridedParams {
+  uint width;       // elements per row (ple_dim)
+  uint rows;        // token rows
+  uint gate_pitch;  // elements between rows of `gate`
+  uint up_pitch;    // ... of `up` -- the wide one
+  uint out_pitch;   // ... of `out`
+};
+
+template <typename T>
+[[kernel]] void geglu_tanh_strided(
+    const device T* gate            [[buffer(0)]],
+    const device T* up              [[buffer(1)]],
+    device T* out                   [[buffer(2)]],
+    constant GegluStridedParams& p  [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const uint k = gid.x;
+  const uint m = gid.y;
+  if (k >= p.width || m >= p.rows) return;
+  const float g = float(gate[size_t(m) * size_t(p.gate_pitch) + k]);
+  const float u = float(up[size_t(m) * size_t(p.up_pitch) + k]);
+  out[size_t(m) * size_t(p.out_pitch) + k] = static_cast<T>(gelu_tanh(g) * u);
+}
+
+#define instantiate_geglu_strided(name, itype)                     \
+  template [[host_name("geglu_tanh_strided_" #name)]]              \
+  [[kernel]] void geglu_tanh_strided<itype>(                       \
+      const device itype*, const device itype*, device itype*,     \
+      constant GegluStridedParams&, uint2);
+
+instantiate_geglu_strided(bfloat16, bfloat)

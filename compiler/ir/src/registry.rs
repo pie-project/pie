@@ -95,7 +95,7 @@ crate::declare_tagged_enum! {
         /// The token ids to embed, one flat run per request. Taken.
         EmbedTokens = 0, "embed_tokens";
         /// Row offsets splitting `embed_tokens` into per-request runs; one
-        /// entry more than there are requests. Taken.
+        /// entry more than there are requests. Read.
         EmbedIndptr = 1, "embed_indptr";
         /// Each token's position in its sequence, driving both RoPE and the
         /// causal masks. Taken.
@@ -117,6 +117,41 @@ crate::declare_tagged_enum! {
         /// An explicit attention mask replacing the derived causal one.
         /// Read.
         AttnMask = 9, "attn_mask";
+        // ── Recurrent-state buffered-slot family. Wire-additive: tags 0-9 are
+        // unmoved, so a pure-attention guest's container is byte-identical.
+        //
+        // NO GUEST BINDS THESE ANY MORE. `rs-geometry` used to carry the
+        // buffer's addressing, and the runtime derived the same values from
+        // the `RsStore` it is authoritative for and refused any fire whose
+        // guest copy disagreed — five channels of page arithmetic with one
+        // satisfying assignment. The tags are RESERVED rather than reclaimed:
+        // renumbering would silently change the meaning of already-compiled
+        // containers, which is a far worse trade than five unused names.
+        //
+        // `RsBufferLen` is the exception, and its direction is INVERTING. The
+        // live buffered token count is exactly the quantity t15 makes
+        // device-resident, so it comes back not as something the guest states
+        // but as something the device writes and the host reads as an upper
+        // bound. `FireGeometry::rs_buffer_lens` is already staged for it.
+        /// RESERVED. The buffer's page pool. Derived by the runtime.
+        RsBufferPages = 10, "rs_buffer_pages";
+        /// RESERVED. Row offsets splitting `rs_buffer_pages` per request.
+        /// Derived by the runtime.
+        RsBufferIndptr = 11, "rs_buffer_indptr";
+        /// RESERVED, and inverting: the live buffered token count, which t15
+        /// makes device-resident. Staged as `FireGeometry::rs_buffer_lens`.
+        RsBufferLen = 12, "rs_buffer_len";
+        /// RESERVED. Each buffered token's slab. Derived by the runtime.
+        RsWSlot = 13, "rs_w_slot";
+        /// RESERVED. Each buffered token's offset within its slab. Derived by
+        /// the runtime.
+        RsWOff = 14, "rs_w_off";
+        /// How far the folded boundary advances, per request. Unlike 10-14
+        /// this is a real guest decision, and the only RS port whose value the
+        /// host is allowed not to know: a device-computed accepted count
+        /// reaches the recurrence through here instead of round-tripping
+        /// through the host. Read.
+        RsFoldLen = 15, "rs_fold_len";
     }
 }
 
@@ -128,7 +163,8 @@ impl Port {
     pub fn consumes(self) -> bool {
         matches!(
             self,
-            Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff
+            Port::EmbedTokens | Port::Positions | Port::WSlot | Port::WOff | Port::RsWSlot
+                | Port::RsWOff
         )
     }
 }

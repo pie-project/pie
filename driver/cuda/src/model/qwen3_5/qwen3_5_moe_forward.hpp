@@ -17,7 +17,10 @@
 
 namespace pie_cuda_driver::model {
 
-struct StageHooks;
+/// True when `PIE_QWEN35_MOE_FORCE_GENERAL=1`: take the per-expert dispatch for
+/// every shape. That path syncs the stream, so the model must also declare
+/// itself un-capturable -- same reason streaming does.
+bool qwen35_moe_force_general_path();
 
 // MoE-side workspace. Reuses Qwen3.5's la_ws for the linear-attn
 // staging tensors.
@@ -120,11 +123,21 @@ void qwen3_5_moe_forward_paged(
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     const std::int32_t* rs_fold_lens_d = nullptr,
+    // Host mirror. A buffered pass emits one length per row even when
+    // it folds nothing, so only the HOST copy can answer "does this
+    // write also fold?".
+    const std::uint32_t* rs_fold_lens_h = nullptr,
     bool rs_buffer_write = false,
     bool rs_buffer_fold = false,
-    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
-    // program attached.
-    const StageHooks* hooks = nullptr);
+    // Buffer READ: the tokens already buffered past the fold boundary that
+    // each request must replay before its own. See qwen3_5_forward.hpp.
+    const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_read_indptr_h = nullptr,
+    const std::uint32_t* rs_buffer_read_lens_h = nullptr,
+    // Physical offset of each row's logical buffer token 0. A fold that lands
+    // mid-page cannot release the page it half-consumed, so the survivors keep
+    // their offsets and every buffer span is `head + logical`.
+    const std::uint32_t* rs_buffer_heads_h = nullptr);
 
 void qwen3_5_moe_mtp_process_cache(
     const Qwen3_5MoeWeights& w,

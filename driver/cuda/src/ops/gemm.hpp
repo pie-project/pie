@@ -187,6 +187,72 @@ void gemm_act_x_w(
     DType act_dtype = DType::BF16,
     DType y_dtype = DType::BF16);
 
+// Streams the LM head GEMM one vocabulary slab at a time, reducing each slab
+// to a running argmax before the next overwrites it, so the [M, N] logits
+// tensor is never materialised.
+//
+// The logits round-trip that this removes is pure HBM traffic: at M=512 and a
+// 151936 vocabulary the sampler's input is 156 MB written and 156 MB read back
+// solely because the reduction was a separate kernel. Slabs stay resident in
+// L2, so both ends of that round-trip disappear (§20.36 measured 185 us/step;
+// the weight read is untouched and still dominates).
+//
+// `W` is [N, K] row-major, so a vocabulary slab is a contiguous row range and
+// no gather is needed. Results are bit-identical to a full GEMM followed by
+// `launch_argmax_bf16`: the tie-break is a total order on (value, -index), so
+// where the vocabulary is cut cannot change the answer.
+//
+//   act      : [M, K] bf16
+//   w        : [N, K] bf16 (dense only)
+//   token_ids: [M] i32, the output
+//   slab     : [M, chunk] bf16 scratch, overwritten every iteration
+//   acc_val / acc_idx : [M, kernels::kArgmaxAccumSlots] scratch
+//
+// Returns false without launching anything when the weight is not dense BF16.
+// Callers must not treat that as a fallback: by the time the forward runs, the
+// graph key and the epilogue's token source are already committed to the fused
+// shape, so the only correct response is to fail loudly. Ask
+// `lm_head_argmax_supported` beforehand instead -- this return is the
+// belt-and-braces half of the same predicate.
+// `chunk` is a device+model property and belongs to the planner's calibration,
+// not to a constant in here.
+bool lm_head_argmax_chunked(
+    cublasHandle_t handle,
+    const void* act,
+    WeightView w,
+    std::int32_t* token_ids,
+    void* slab,
+    float* acc_val,
+    std::int32_t* acc_idx,
+    int M, int N, int K,
+    int chunk);
+
+// Scratch for `lm_head_argmax_chunked`.
+//
+// Only the slab is carved from the caller's block, and it is carved from
+// `ws.logits` -- by construction the buffer this path is not filling. The size
+// is `M * min(chunk, N)` bf16 elements with no padding, and `ws.logits` holds
+// `workspace_logits_rows * N` of them, so with `M <= workspace_logits_rows` it
+// fits by construction rather than by a runtime test that could quietly fail.
+//
+// The running accumulators do NOT live here: they are `[rows, kArgmaxAccumSlots]`
+// and would push the total past `ws.logits` exactly when every row samples.
+// They get their own (tiny) workspace tensors so that "does it fit" is never a
+// question the forward has to answer.
+std::size_t lm_head_argmax_slab_bytes(int M, int N, int chunk);
+
+// Whether `lm_head_argmax_chunked` can run against this weight. Split out so
+// the driver can decide to fuse BEFORE the forward runs -- by then the graph
+// key and the epilogue's token source are already committed, and a fallback
+// discovered inside the forward would be a silent miscompute.
+//
+// Note that today's callers all reach this through the implicit
+// `WeightView(const DeviceTensor&)`, which hard-codes `scale_data = nullptr`,
+// so in practice only the dtype discriminates. The scale check is here because
+// the chunked path slices `w.data` by row and has nowhere to carry a scale, so
+// a future quantised LM head must not silently qualify.
+bool lm_head_argmax_supported(WeightView w);
+
 // Batched variant: per-batch act / W / y pointers, all sharing the same
 // (M, N, K). Used by the Qwen3.6-MoE decode path to fuse the per-expert
 // `gate_up_proj` GEMM (and the `down_proj` GEMM) of all top-K active

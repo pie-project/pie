@@ -436,6 +436,15 @@ namespace {
 //
 // Shared memory layout: q[K_d] + k[K_d] fp32. Caller passes shmem of
 // size 2*K_d*sizeof(float).
+// Per-row refinement of the pass-level `write_state`. A mixed fire folds some
+// rows and leaves others buffered, and the two differ ONLY in whether the
+// recurrence persists -- same initial state, same outputs. A null mask means
+// the pass is uniform, which is the overwhelmingly common case.
+__device__ __forceinline__ bool row_persists(
+    const std::uint8_t* __restrict__ mask, int r) {
+    return mask == nullptr || mask[r] != 0;
+}
+
 template <typename StateT, bool KLast>
 __global__ void recurrent_step_kernel(
     const float* __restrict__ q_norm,
@@ -592,7 +601,8 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
     long long slot_stride_elems,
     float*       __restrict__ out,
     int V_h, int K_d, int V_d,
-    bool write_state)
+    bool write_state,
+    const std::uint8_t* __restrict__ write_state_mask)
 {
     const int r = blockIdx.x;
     const int h = blockIdx.y;
@@ -648,7 +658,7 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
     // Frozen verify (write_state=false): produce outputs but persist nothing,
     // leaving the committed slot at its pre-verify value (advanced later by the
     // repair forward).
-    if (write_state) {
+    if (write_state && row_persists(write_state_mask, r)) {
         __syncthreads();
         for (int i = threadIdx.x; i < state_elems; i += blockDim.x) {
             state_store(state + i, s_state[i]);
@@ -669,7 +679,8 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
     long long slot_stride_elems,
     float*       __restrict__ out,
     int V_h, int K_d, int V_d,
-    bool write_state)
+    bool write_state,
+    const std::uint8_t* __restrict__ write_state_mask)
 {
     constexpr int WARPS = 4;
     constexpr int MAX_K_PER_LANE = 8;  // supports K_d <= 256 with 32 lanes
@@ -739,7 +750,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
     }
 
     // Frozen verify (write_state=false): persist nothing.
-    if (write_state) {
+    if (write_state && row_persists(write_state_mask, r)) {
         #pragma unroll
         for (int i = 0; i < MAX_K_PER_LANE; ++i) {
             if (i < n_k) {
@@ -765,7 +776,8 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
     long long slot_stride_elems,
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
-    bool write_state)
+    bool write_state,
+    const std::uint8_t* __restrict__ write_state_mask)
 {
     constexpr int WARPS = 4;
     constexpr int MAX_K_PER_LANE = 8;  // supports K_d <= 256 with 32 lanes
@@ -841,7 +853,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
     // correct draft outputs but persist nothing, leaving the committed slot at
     // its pre-verify value (the implicit speculative snapshot). The repair
     // forward over [input|accepted] advances it afterward.
-    if (write_state) {
+    if (write_state && row_persists(write_state_mask, r)) {
         #pragma unroll
         for (int i = 0; i < MAX_K_PER_LANE; ++i) {
             if (i < n_k) {
@@ -867,7 +879,8 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel(
     long long slot_stride_elems,
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
-    bool write_state)
+    bool write_state,
+    const std::uint8_t* __restrict__ write_state_mask)
 {
     constexpr int WARPS = 4;
     constexpr int ILP_V = 2;
@@ -967,7 +980,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel(
 
     // Frozen verify (write_state=false): persist nothing — see the non-ILP2
     // GQA kernel above.
-    if (write_state) {
+    if (write_state && row_persists(write_state_mask, r)) {
         #pragma unroll
         for (int i = 0; i < MAX_K_PER_LANE; ++i) {
             if (i < n_k) {
@@ -1664,10 +1677,23 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
 
     // Phase 2: recompute s = state*g + sk*delta; accumulate out_v;
     // write the updated state straight to HBM (skips SMEM writeback).
+    //
+    // `state*g` is rounded to bf16 before delta is added, which looks
+    // gratuitous when the value is already in a register — but it is what
+    // makes this kernel a drop-in for the legacy one. The legacy kernel
+    // STORES state*g to HBM in its first phase and RELOADS it in its second,
+    // so its phase-2 base is bf16-rounded; carrying full fp32 through here
+    // instead is more accurate per step and still changes the greedy
+    // trajectory, because argmax turns any perturbation into a different
+    // token the moment two logits are close. Qwen3.5-0.8B diverged from the
+    // HF reference trajectory at the SECOND decoded token that way. Kernel
+    // selection is an implementation detail and must not be observable in
+    // the output, so match the legacy rounding exactly.
     float out_v = 0.f;
     for (int k = 0; k < K_d; ++k) {
-        float s = __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h
-                + sk[k] * delta;
+        const float sg = __bfloat162float(__float2bfloat16(
+            __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h));
+        float s = sg + sk[k] * delta;
         out_v += s * sq[k];
         // Each thread owns column `threadIdx.x` for every k, so rewriting
         // its own SMEM slot races with nothing. Costing a SMEM round trip
@@ -1730,7 +1756,8 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
     float*       __restrict__ out,
     int K_h, int V_h, int K_d, int V_d,
     bool write_state,
-    const int* __restrict__ commit_len)
+    const int* __restrict__ commit_len,
+    const std::uint8_t* __restrict__ write_state_mask)
 {
     // GQA: q/k are stored compact in K_h heads; g/beta/v/out are V_h heads.
     // Block head h (0..V_h) maps to its K-head h_k = h / (V_h/K_h). When
@@ -1878,7 +1905,7 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
     // over just the accepted prefix (write_state=true) — lossless, cheap. This is
     // the SoTA (Snakes-and-Ladders / STree) and the right design for the low-
     // concurrency regime MTP targets.
-    if (!write_state) return;
+    if (!write_state || !row_persists(write_state_mask, r)) return;
     #pragma unroll
     for (int j = 0; j < BK_MAX / 2; ++j) {
         const int k0 = 2 * j;
@@ -2341,7 +2368,8 @@ void launch_chunk_gated_delta_prefill_batched(
     long long slot_stride_elems,
     float* out,
     int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state, const int* commit_len)
+    cudaStream_t stream, bool write_state, const int* commit_len,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
     // FLA-style chunked prefill: keeps state in registers across the
@@ -2363,7 +2391,8 @@ void launch_chunk_gated_delta_prefill_batched(
             grid_fla, block_fla, shmem_bytes_fla, stream>>>(
             q_norm, k_norm, v, g_log, beta, state_base,
             slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state, commit_len);
+            out, K_h, V_h, K_d, V_d, write_state, commit_len,
+            write_state_mask);
         return;
     }
     constexpr int BLOCK = 128;
@@ -2394,7 +2423,8 @@ void launch_chunk_gated_delta_prefill_batched_state_bf16(
     long long slot_stride_elems,
     float* out,
     int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state, const int* commit_len)
+    cudaStream_t stream, bool write_state, const int* commit_len,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
     constexpr int BK_MAX_FLA = 128;
@@ -2411,7 +2441,8 @@ void launch_chunk_gated_delta_prefill_batched_state_bf16(
             q_norm, k_norm, v, g_log, beta,
             static_cast<__nv_bfloat16*>(state_base),
             slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state, commit_len);
+            out, K_h, V_h, K_d, V_d, write_state, commit_len,
+            write_state_mask);
         return;
     }
     constexpr int BLOCK = 128;
@@ -2444,7 +2475,8 @@ void launch_chunk_gated_delta_prefill_batched_cached(
     long long slot_stride_elems,
     float* out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state)
+    cudaStream_t stream, bool write_state,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
     constexpr int BLOCK = 128;
@@ -2463,13 +2495,13 @@ void launch_chunk_gated_delta_prefill_batched_cached(
             grid, block, shmem_bytes, stream>>>(
             q_norm, k_norm, v, g_log, beta, state_base,
             slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state);
+            out, V_h, K_d, V_d, write_state, write_state_mask);
     } else {
         chunk_gated_delta_prefill_batched_cached_kernel<float, false><<<
             grid, block, shmem_bytes, stream>>>(
             q_norm, k_norm, v, g_log, beta, state_base,
             slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state);
+            out, V_h, K_d, V_d, write_state, write_state_mask);
     }
 }
 
@@ -2482,7 +2514,8 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     long long slot_stride_elems,
     float* out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state)
+    cudaStream_t stream, bool write_state,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
     constexpr int BLOCK = 128;
@@ -2502,14 +2535,14 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
             q_norm, k_norm, v, g_log, beta,
             static_cast<__nv_bfloat16*>(state_base),
             slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state);
+            out, V_h, K_d, V_d, write_state, write_state_mask);
     } else {
         chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false><<<
             grid, block, shmem_bytes, stream>>>(
             q_norm, k_norm, v, g_log, beta,
             static_cast<__nv_bfloat16*>(state_base),
             slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state);
+            out, V_h, K_d, V_d, write_state, write_state_mask);
     }
 }
 
@@ -2522,7 +2555,8 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled(
     long long slot_stride_elems,
     float* out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state)
+    cudaStream_t stream, bool write_state,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
     if (K_d > 256) {
@@ -2541,13 +2575,13 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled(
             grid, block, 0, stream>>>(
             q_norm, k_norm, v, g_log, beta, state_base,
             slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state);
+            out, V_h, K_d, V_d, write_state, write_state_mask);
     } else {
         chunk_gated_delta_prefill_batched_warp_tiled_kernel<float, false><<<
             grid, block, 0, stream>>>(
             q_norm, k_norm, v, g_log, beta, state_base,
             slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state);
+            out, V_h, K_d, V_d, write_state, write_state_mask);
     }
 }
 
@@ -2560,7 +2594,8 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
     long long slot_stride_elems,
     float* out,
     int R, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state)
+    cudaStream_t stream, bool write_state,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
     if (K_d > 256) {
@@ -2580,14 +2615,14 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
             q_norm, k_norm, v, g_log, beta,
             static_cast<__nv_bfloat16*>(state_base),
             slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state);
+            out, V_h, K_d, V_d, write_state, write_state_mask);
     } else {
         chunk_gated_delta_prefill_batched_warp_tiled_kernel<__nv_bfloat16, false><<<
             grid, block, 0, stream>>>(
             q_norm, k_norm, v, g_log, beta,
             static_cast<__nv_bfloat16*>(state_base),
             slot_ids, qo_indptr, slot_stride_elems,
-            out, V_h, K_d, V_d, write_state);
+            out, V_h, K_d, V_d, write_state, write_state_mask);
     }
 }
 
@@ -2600,7 +2635,8 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
     long long slot_stride_elems,
     float* out,
     int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state)
+    cudaStream_t stream, bool write_state,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || K_h <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
     if (K_d > 256 || V_h % K_h != 0) {
@@ -2620,13 +2656,13 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
                 grid, block, 0, stream>>>(
                 q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
                 slot_ids, qo_indptr, slot_stride_elems,
-                out, K_h, V_h, K_d, V_d, write_state);
+                out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
         } else {
             chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<float, false><<<
                 grid, block, 0, stream>>>(
                 q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
                 slot_ids, qo_indptr, slot_stride_elems,
-                out, K_h, V_h, K_d, V_d, write_state);
+                out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
         }
         return;
     }
@@ -2637,13 +2673,13 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
             grid, block, 0, stream>>>(
             q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
             slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state);
+            out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
     } else {
         chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<float, false><<<
             grid, block, 0, stream>>>(
             q_norm_kh, k_norm_kh, v, g_log, beta, state_base,
             slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state);
+            out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
     }
 }
 
@@ -2656,7 +2692,8 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
     long long slot_stride_elems,
     float* out,
     int R, int K_h, int V_h, int K_d, int V_d,
-    cudaStream_t stream, bool write_state)
+    cudaStream_t stream, bool write_state,
+    const std::uint8_t* write_state_mask)
 {
     if (R <= 0 || K_h <= 0 || V_h <= 0 || K_d <= 0 || V_d <= 0) return;
     if (K_d > 256 || V_h % K_h != 0) {
@@ -2677,14 +2714,14 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
                 q_norm_kh, k_norm_kh, v, g_log, beta,
                 static_cast<__nv_bfloat16*>(state_base),
                 slot_ids, qo_indptr, slot_stride_elems,
-                out, K_h, V_h, K_d, V_d, write_state);
+                out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
         } else {
             chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel<__nv_bfloat16, false><<<
                 grid, block, 0, stream>>>(
                 q_norm_kh, k_norm_kh, v, g_log, beta,
                 static_cast<__nv_bfloat16*>(state_base),
                 slot_ids, qo_indptr, slot_stride_elems,
-                out, K_h, V_h, K_d, V_d, write_state);
+                out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
         }
         return;
     }
@@ -2696,14 +2733,14 @@ void launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
             q_norm_kh, k_norm_kh, v, g_log, beta,
             static_cast<__nv_bfloat16*>(state_base),
             slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state);
+            out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
     } else {
         chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel<__nv_bfloat16, false><<<
             grid, block, 0, stream>>>(
             q_norm_kh, k_norm_kh, v, g_log, beta,
             static_cast<__nv_bfloat16*>(state_base),
             slot_ids, qo_indptr, slot_stride_elems,
-            out, K_h, V_h, K_d, V_d, write_state);
+            out, K_h, V_h, K_d, V_d, write_state, write_state_mask);
     }
 }
 

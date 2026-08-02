@@ -112,6 +112,12 @@ inline bool spatial_stream_enabled() {
 // dedicated workspace the mixed prepare planned into.
 AttentionWorkspace& spatial_suffix_attn_ws() { return spatial_suffix_ws(); }
 
+// ④ Act 1: the interpreter's banded tail dispatch pairs against the
+// same per-band workspaces the prepare planned into.
+AttentionWorkspace& depth_band_attn_ws_public(int i) {
+    return depth_band_ws(i);
+}
+
 namespace {
 
 inline SpatialSideStream& spatial_side_stream() {
@@ -795,6 +801,46 @@ bool decode_fused_post_enabled() {
     return enabled;
 }
 
+// The kvpp SENTRY (the probabilistic composed-R=32 fault, 2026-08-04:
+// flashinfer's PrefillSplitQOKVIndptr asserting on kv_indptr garbage —
+// e.g. -1160232626 at entry 13 — in the first-boot window, twice
+// sighted, never under trace). Host plan inputs are validated HERE,
+// before any planner consumes them, and a violation dumps the arrays
+// UNCONDITIONALLY and refuses the fire cleanly — the heisenbug becomes
+// a self-documenting event at its next occurrence instead of a deep
+// planner assert. Cost: one R-length scan per prepare.
+static void kvpp_sentry(
+    const char* what,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int num_requests)
+{
+    for (int r = 0; r < num_requests; ++r) {
+        const bool qo_bad =
+            qo_indptr_h != nullptr && qo_indptr_h[r + 1] < qo_indptr_h[r];
+        const bool kv_bad = kv_page_indptr_h != nullptr &&
+                            kv_page_indptr_h[r + 1] < kv_page_indptr_h[r];
+        if (!qo_bad && !kv_bad) continue;
+        std::fprintf(stderr,
+                     "[kvpp-sentry] %s: NON-MONOTONE host plan input at "
+                     "lane %d of %d\n",
+                     what, r, num_requests);
+        for (int i = 0; i <= num_requests; ++i) {
+            std::fprintf(
+                stderr, "[kvpp-sentry]   [%d] qo=%d kvpp=%d\n", i,
+                qo_indptr_h != nullptr
+                    ? static_cast<std::int32_t>(qo_indptr_h[i])
+                    : -1,
+                kv_page_indptr_h != nullptr
+                    ? static_cast<std::int32_t>(kv_page_indptr_h[i])
+                    : -1);
+        }
+        throw std::runtime_error(
+            std::string("kvpp sentry: non-monotone host plan input (") +
+            what + ") — the composed-placeholder fault; arrays dumped");
+    }
+}
+
 void prepare_llama_like_decode_plan(
     LlamaLikePlanState& state,
     AttentionWorkspace& attn_ws,
@@ -1252,6 +1298,10 @@ void prepare_llama_like_decode_plan(
     }
     const int min_prefill_decode_pages =
         std::max(0, fwd_cfg.prefill_decode_min_kv_pages);
+    kvpp_sentry("prepare", qo_indptr_h, kv_page_indptr_h, num_requests);
+    // ④ Act 1: bands are re-stamped per fire; a deployment branch that
+    // returns early must not leave a previous fire's bands armed.
+    state.depth_band_count = 0;
     std::uint64_t total_kv_pages = 0;
     for (int r = 0; r < num_requests; ++r) {
         total_kv_pages += static_cast<std::uint64_t>(
@@ -1294,6 +1344,42 @@ void prepare_llama_like_decode_plan(
             fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
             full_attention_variant, cache.hnd_layout(),
             /*causal_mask=*/false);
+        // ④ Act 1 (banded depth, prefill family): a band's prefix
+        // dispatch on this deployment is the planned causal prefill —
+        // one plan per boundary, identity-qo prefix restriction, each
+        // in its OWN workspace (the per-band isolation rule).
+        if (depth_band_count >= 2 && depth_band_count <= 3 &&
+            is_pure_decode && !have_custom_mask) {
+            for (std::uint32_t j = 0; j < depth_band_count; ++j) {
+                const std::uint32_t rows = depth_band_rows[j];
+                state.depth_band_k[j] = depth_band_k[j];
+                state.depth_band_rows[j] = rows;
+                if (rows == 0) continue;
+                if (!state.depth_band_prefill_plans[j]) {
+                    state.depth_band_prefill_plans[j] =
+                        ops::make_prefill_plan();
+                }
+                ops::plan_attention_flashinfer_prefill_bf16(
+                    *state.depth_band_prefill_plans[j],
+                    qo_indptr_h.data(), kv_page_indptr_h,
+                    kv_last_page_lens_h,
+                    /*total_tokens=*/static_cast<int>(rows),
+                    static_cast<int>(rows),
+                    num_q_heads_local, num_kv_heads_local,
+                    cfg.head_dim_kernel, cache.page_size(),
+                    depth_band_ws(static_cast<int>(j)),
+                    /*stream=*/nullptr,
+                    fwd_cfg.decode_plan_cuda_graph, fwd_cfg.sliding_window,
+                    full_attention_variant, cache.hnd_layout(),
+                    /*causal_mask=*/false);
+            }
+            state.depth_band_count = depth_band_count;
+        }
+        if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[band-prep] prefill-branch in=%u stamped=%u\n",
+                         depth_band_count, state.depth_band_count);
+        }
         return;
     }
     if (!state.decode_plan) {
@@ -1363,6 +1449,11 @@ void prepare_llama_like_decode_plan(
                 cache.hnd_layout());
         }
         state.depth_band_count = depth_band_count;
+    }
+    if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[band-prep] decode-branch in=%u stamped=%u\n",
+                     depth_band_count, state.depth_band_count);
     }
 }
 
@@ -1656,7 +1747,9 @@ void llama_like_forward_paged(
     // the full-depth prefix is rows [0, split) of every base array.
     const auto run_layer = [&](const int L, const int N, const int R,
                                const ops::DecodePlanCache* decode_plan,
-                               AttentionWorkspace& attn_ws) {
+                               AttentionWorkspace& attn_ws,
+                               const ops::PrefillPlanCache*
+                                   prefill_plan_override = nullptr) {
         const auto& layer = w.layers[L];
 
         // Pre-norm: norm(y) → norm_x; QKV reads from norm_x.
@@ -2128,7 +2221,8 @@ void llama_like_forward_paged(
             kernels::launch_dequant_kv_cache_layer_to_bf16_active(
                 kv_view, kv_page_indices, num_pages_in_batch, stream);
             ops::dispatch_attention_flashinfer_prefill_bf16(
-                *prefill_decode_plan,
+                *(prefill_plan_override != nullptr ? prefill_plan_override
+                                                   : prefill_decode_plan),
                 attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 attn_ws, stream, /*logits_soft_cap=*/0.f, sm_scale_override);
@@ -2227,13 +2321,35 @@ void llama_like_forward_paged(
                         // AC-4: the ATTN page views (hook-narrowed when
                         // sites ran, aliases of the raw CSRs otherwise)
                         // — hooked prefix lanes keep their page masks.
-                        ops::dispatch_attention_flashinfer_decode(
-                            *decode_plan,
-                            attn_q, kv_view, attn_out_buf,
-                            attn_page_indices, attn_page_indptr,
-                            attn_last_page_lens,
-                            attn_ws, stream, layer_window_left,
-                            /*logits_soft_cap=*/0.f, sm_scale_override);
+                        // hook×mask: the prefix decode IS the paged decode
+                        // path, and the hook rows live in it (seriation
+                        // puts masked rows in the suffix), so the score
+                        // capture rides here exactly as in the unsplit
+                        // decode arm — request ordinals start at row 0,
+                        // identical indexing.
+                        if (score_capture.active()) {
+                            ops::dispatch_attention_flashinfer_decode_capture(
+                                *decode_plan,
+                                attn_q, kv_view, attn_out_buf,
+                                attn_page_indices, attn_page_indptr,
+                                attn_last_page_lens,
+                                attn_ws, stream,
+                                score_capture.raw(),
+                                score_capture.indptr_d(),
+                                layer_window_left,
+                                /*logits_soft_cap=*/0.f, sm_scale_override);
+                            score_capture.publish(
+                                attn_page_indptr, attn_last_page_lens,
+                                cache.page_size());
+                        } else {
+                            ops::dispatch_attention_flashinfer_decode(
+                                *decode_plan,
+                                attn_q, kv_view, attn_out_buf,
+                                attn_page_indices, attn_page_indptr,
+                                attn_last_page_lens,
+                                attn_ws, stream, layer_window_left,
+                                /*logits_soft_cap=*/0.f, sm_scale_override);
+                        }
                     }
                 }
                 // BASE buffers + ABSOLUTE device CSR values at +split —
@@ -2614,7 +2730,20 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
-    if (plan_state.depth_band_count >= 2) {
+    const bool bands_runnable =
+        plan_state.depth_band_count >= 2 && is_pure_decode &&
+        !has_custom_mask && hooks == nullptr && !use_xqa_decode_path &&
+        (use_decode_path || use_prefill_decode_path) &&
+        layer_bound == cfg.num_hidden_layers;
+    if (plan_state.depth_band_count >= 2 && !bands_runnable &&
+        std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
+        // Degrade loudly-quietly: the fire runs full depth (today's
+        // demotion) rather than dying — deployments the banded walk
+        // does not serve yet (XQA) or shapes the frame gate should
+        // have declined.
+        std::fprintf(stderr, "[depth-bands] DECLINE R=%d\n", R);
+    }
+    if (bands_runnable) {
         // ④ Act 1 (banded depth): distinct-k bands, deepest-first. At
         // any layer the live rows are the prefix [0, band_rows[j]) of
         // the interval containing it (the seriation's deepest-first
@@ -2623,14 +2752,6 @@ void llama_like_forward_paged(
         // nothing lives past that band (the all-truncated fire's
         // bonus: layers past the deepest k never launch).
         const int m = static_cast<int>(plan_state.depth_band_count);
-        if (!is_pure_decode || has_custom_mask || hooks != nullptr ||
-            !use_decode_path || use_prefill_decode_path ||
-            use_xqa_decode_path ||
-            layer_bound != cfg.num_hidden_layers) {
-            throw std::runtime_error(
-                "depth bands: prepared bands reached an unsupported "
-                "fire shape (frame/driver gate drift)");
-        }
         if (std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
             std::fprintf(stderr, "[depth-bands] R=%d m=%d", R, m);
             for (int j = 0; j < m; ++j) {
@@ -2660,13 +2781,19 @@ void llama_like_forward_paged(
             const ops::DecodePlanCache* band_plan =
                 plan_state.depth_band_plans[static_cast<std::size_t>(j)]
                     .get();
-            if (band_plan == nullptr) {
+            const ops::PrefillPlanCache* band_prefill =
+                plan_state
+                    .depth_band_prefill_plans[static_cast<std::size_t>(j)]
+                    .get();
+            if (use_prefill_decode_path ? band_prefill == nullptr
+                                        : band_plan == nullptr) {
                 throw std::runtime_error(
                     "depth bands: band active but prepare built no "
                     "plan for it");
             }
             for (int L = from; L < to; ++L) {
-                run_layer(L, live, live, band_plan, depth_band_ws(j));
+                run_layer(L, live, live, band_plan, depth_band_ws(j),
+                          band_prefill);
             }
         }
     } else if (full_depth_rows != 0xffffffffu &&
@@ -2693,20 +2820,28 @@ void llama_like_forward_paged(
         // the hook-free-prefix word via fast_rows... the mask split is
         // the v0 anchor; hooked+depth composition keeps m_start = the
         // mask word since hooked lanes sort between).
-        // AC-5 anchor refinement: the middle ends at the HOOKED block
-        // when hooks are present (hook_free_prefix_rows — pure decode,
-        // row == lane), else at the MASKED block; with both, the
-        // earlier (order [plain | truncated | hooked | masked]).
-        const int m_start =
-            hooks != nullptr
-                ? std::min<int>(
-                      static_cast<int>(
-                          hooks->hook_free_prefix_rows),
-                      has_custom_mask
-                          ? plan_state.spatial_mask_split
-                          : R)
-                : (has_custom_mask ? plan_state.spatial_mask_split
-                                   : R);
+        // AC-5 anchor refinement: the middle ends at the first
+        // mask/hook block AFTER the truncated rows — the TRAILING
+        // tail. The seriation may place hook (or masked) FULL-DEPTH
+        // rows in the prefix, before the truncated block; those rows
+        // are part of [0, t_start) and must not drag m_start below it
+        // (the derivation already counted them into the split — see
+        // region_plans.hpp block_ok). A marker at or before t_start
+        // is a prefix block, not the tail.
+        int m_start = R;
+        if (has_custom_mask && plan_state.spatial_mask_split >= 0 &&
+            plan_state.spatial_mask_split > t_start) {
+            m_start =
+                std::min<int>(m_start, plan_state.spatial_mask_split);
+        }
+        if (hooks != nullptr) {
+            const int hook_start =
+                static_cast<int>(hooks->hook_free_prefix_rows);
+            if (hook_start >= 0 && hook_start <= R &&
+                hook_start > t_start) {
+                m_start = std::min<int>(m_start, hook_start);
+            }
+        }
         // t_start == 0 is legal: no plain block, the truncated middle
         // starts at row 0 ([truncated | masked]).
         if (layer_bound >= cfg.num_hidden_layers || t_start < 0 ||

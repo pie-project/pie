@@ -6,16 +6,61 @@
 /// Result type for inferlet operations (compatible with WIT bindings).
 pub type Result<T> = std::result::Result<T, String>;
 
+/// Add context to a failure on its way up.
+///
+/// `pie:inferlet` declares `type error = string`, so every fallible call
+/// across the ABI already fails with a message and there is no error type to
+/// introduce. What is missing is the standard way of saying WHERE the message
+/// came from, which is why the inferlets were writing
+/// `map_err(|e| format!("reserve KV: {e}"))` by hand.
+///
+/// ```ignore
+/// ws.reserve(pages).context("reserve KV")?;
+/// tok_out
+///     .take()
+///     .to_host::<i32>()
+///     .await
+///     .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+/// ```
+pub trait Context<T> {
+    /// Prefix the error with `what`, as `"{what}: {error}"`.
+    fn context(self, what: &str) -> Result<T>;
+
+    /// Same, but the prefix is only built if there is an error to prefix.
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, what: F) -> Result<T>;
+}
+
+impl<T, E: std::fmt::Display> Context<T> for std::result::Result<T, E> {
+    fn context(self, what: &str) -> Result<T> {
+        self.map_err(|error| format!("{what}: {error}"))
+    }
+
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, what: F) -> Result<T> {
+        self.map_err(|error| format!("{}: {error}", what()))
+    }
+}
+
+/// The same, for an absent value: `Option` has no error to prefix, so `what`
+/// becomes the whole message.
+impl<T> Context<T> for Option<T> {
+    fn context(self, what: &str) -> Result<T> {
+        self.ok_or_else(|| what.to_string())
+    }
+
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, what: F) -> Result<T> {
+        self.ok_or_else(|| what().to_string())
+    }
+}
+
 // Re-export wit_bindgen so the macro-generated inline WIT can reference it
 pub use wit_bindgen;
 
 // Re-export serde and serde_json so the macro-generated JSON bridge can use them
-pub use schemars;
 pub use serde;
 pub use serde_json;
 
-// Re-export the attribute macros
-pub use inferlet_macros::{main, tool};
+// Re-export the attribute macro
+pub use inferlet_macros::main;
 
 // Generate WIT bindings directly in lib.rs. With no `async:` option, the
 // WIT's own `async func` annotations drive async generation: only
@@ -37,55 +82,28 @@ pub use pie::inferlet::types;
 // Context
 // =============================================================================
 
-mod constraint;
-
-pub use constraint::{AnyJson, Constrain, Ebnf, GrammarConstraint, JsonSchema, Regex, Schema};
-
 /// The runtime working-set resources (KV page-slot array + recurrent state).
-/// Most inferlets use the [`Context`] facade; reach here for direct control.
+/// The generated WIT resources, unwrapped; [`ptir::WorkingSet`] is the
+/// pass-facing handle built over them.
 pub mod working_set {
     pub use crate::pie::inferlet::working_set::*;
 }
 
 // =============================================================================
-// Sampler / Probe + Forward primitive
+// Forward primitive
 // =============================================================================
 
-pub mod audio;
-pub mod http;
 pub mod mask;
 /// The author-facing PTIR bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
 /// `WorkingSet`/`Channel` over the WIT `ptir` resources, driving the `pie-dsl`
 /// trace `Builder`. The single home of the PTIR authoring surface.
 pub mod ptir;
 
-/// Snapshot manifests (keep-core): the thin `SnapshotData` + serde +
-/// wasi:filesystem I/O (`save`/`open`/`snapshot`/`take`/`delete`). The token-log
-/// REPLAY factors out to the inferlet's carrier prefill; the `Context::save/open`
-/// facade is the sugar that gets deleted. See `ptir-snapshot-keepcore-spec`.
-pub mod snapshot;
-
-/// Device tensor + tensor-program substrate (the WIT `tensor` interface).
-///
-/// Exposes the generated `tensor::{Tensor, Program, Op, OpKind, Value, Input,
-/// Dtype, Literal, Predicate, RngKind}` bindings — the **front door** the guest
-/// emit (`SamplingProgram` → `op-kind`) and program-authoring inferlets build
-/// against. A [`Program`](tensor::Program) is binding-free and reusable;
-/// attach it (with attach-time input bindings) via
-/// [`Forward::sampler`](crate::forward::Forward::sampler).
-pub mod tensor {
-    pub use crate::pie::inferlet::types::*;
-}
-
 // =============================================================================
-// Generation state machine + decoders + speculation
+// Generation state machine + decoders
 // =============================================================================
 
 pub mod chat;
-pub mod reasoning;
-pub mod tools;
-
-pub use tools::Tool;
 
 // =============================================================================
 // Model
@@ -96,14 +114,14 @@ pub use tools::Tool;
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        architecture, arena_block_size, channel_capacity, default_system_speculation, frame_size,
-        is_linear, kv_page_size, max_embed_length, name, output_vocab_size, rs_buffer_page_size,
-        rs_fold_granularity, rs_state_size,
+        ForwardKind, architecture, arena_block_size, channel_capacity, default_system_speculation,
+        frame_size, kv_page_size, max_embed_length, name, output_vocab_size, pass_kind,
+        rs_buffer_page_size, rs_fold_granularity, rs_state_size, submit_deadline_us,
     };
     // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported
     // here so `model::encode`/`model::decode`/… keep working for inferlet source.
     pub use crate::pie::inferlet::tokenizer::{
-        decode, encode, special_tokens, split_regex, vocabs,
+        Token, decode, encode, special_tokens, split_regex, vocabs,
     };
 }
 
@@ -137,7 +155,12 @@ pub mod session {
     pub use crate::pie::inferlet::session::*;
 }
 
-pub mod inference {
+/// Grammar compilation + incremental matching (the WIT `grammar` interface).
+/// [`Grammar`](grammar::Grammar) compiles a JSON Schema / regex / EBNF source
+/// once for the bound model's vocabulary; [`Matcher`](grammar::Matcher) walks
+/// one generation against it, exposing the packed allowed-token bitmask that
+/// [`mask`] interprets.
+pub mod grammar {
     pub use crate::pie::inferlet::grammar::*;
 }
 
@@ -151,39 +174,8 @@ pub mod media {
     pub use crate::pie::inferlet::media::{Audio, Image, Video};
 }
 
-/// Grammar matcher — re-export for callers that build their own
-/// constraints around it. Most users should reach for [`Schema`] or
-/// [`GrammarConstraint`] instead.
-pub use crate::pie::inferlet::grammar::Matcher;
-
 // Under component-model-async, the WIT `async func`s are generated as native
 // `async fn`s directly on the bindings — `forward-pass.execute().await`,
 // `session::receive().await` — so no SDK-side pollable/future polling shim
 // is needed (the old `ForwardPassExt`, `FutureStringExt`, `FutureBlobExt` and the `wstd`
 // executor have been removed); the host event loop drives all of it.
-
-// =============================================================================
-// Argument Parsing (re-exported from pico_args)
-// =============================================================================
-
-/// Re-export of `pico_args::Arguments` for ergonomic CLI argument parsing.
-pub use pico_args::Arguments;
-
-/// Parses a `Vec<String>` (as received from the WIT entry point) into
-/// a `pico_args::Arguments` for flag/option extraction.
-pub fn parse_args(args: Vec<String>) -> Arguments {
-    Arguments::from_vec(args.into_iter().map(std::ffi::OsString::from).collect())
-}
-
-/// Prelude module for convenient imports.
-///
-/// `use inferlet::prelude::*;` covers the common case so inferlets don't
-/// have to maintain a hand-rolled import grocery list.
-pub mod prelude {
-    pub use crate::model;
-    pub use crate::runtime;
-    pub use crate::tensor;
-    pub use crate::{Result, Schema, Tool};
-    pub use crate::{chat, reasoning, tools};
-    pub use crate::{main, tool};
-}

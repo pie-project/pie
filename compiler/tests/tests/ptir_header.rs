@@ -58,12 +58,12 @@ fn drivers_do_not_retype_generated_tags() {
     // (file, constant-name fragment, the generated prefix it must derive from)
     let guarded = [
         (
-            "driver/abi/include/pie_native/fire/descriptor.hpp",
+            "driver/common/include/pie/driver/fire/descriptor.hpp",
             "kPort",
             "PTIR_PORT_",
         ),
         (
-            "driver/abi/include/pie_native/launch/program.hpp",
+            "driver/common/include/pie/driver/launch/program.hpp",
             "StageKind",
             "PTIR_STAGE_",
         ),

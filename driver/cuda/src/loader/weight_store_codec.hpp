@@ -1,35 +1,49 @@
 #pragma once
 
-// Weight-store codec (PIEWSTOR format): serialize a materialized WeightStore to a
-// byte stream, and restore one from a byte buffer. A general conversion/load
-// primitive for finished device weights — it owns the on-disk byte format and the
-// integrity checksum but knows nothing about caches, directories, keys, or
-// eviction. The artifact cache (model/weight_artifact_cache.hpp) is one consumer:
-// it owns that policy and uses serialize/restore as opaque byte conversion.
+// Weight-store codec: write a materialized WeightStore to an artifact file, and
+// restore one from it. A general conversion/load primitive for finished device
+// weights — it knows nothing about caches, directories, keys, or eviction. The
+// artifact cache (model/weight_artifact_cache.hpp) is one consumer: it owns
+// that policy and uses serialize/restore as opaque file conversion.
+//
+// The byte format is not here. It used to be — PIEWSTOR, a hand-rolled binary
+// layout with its own checksum, its own alignment arithmetic and its own
+// truncation checks. An artifact is a file format, and pie has one: the loader
+// writes these as `.zt` (loader/src/weight_store.rs), so placement, digests and
+// a validating reader all come from the same place the checkpoints do. What is
+// left here is the part only the driver can do, which is the device copies.
 //
 // Memory model: the WeightStore is a set of *owned* DeviceTensors (the storage
 // arena + any separately-owned buffers) and *view* DeviceTensors that point into
-// one of those owned buffers. We store each owned buffer's bytes once and record
-// each view as (owning-root index, byte offset). The full TensorDecl spec and
-// the quant_meta map are serialized so the rebuilt store passes finalize()
+// one of those owned buffers. Each owned buffer's bytes are stored once, and
+// each view is recorded as its owning root and a byte offset — restoring a view
+// as a copy would double the memory the views exist to save. The full TensorDecl
+// and the quant_meta map travel too, so the rebuilt store passes finalize()
 // validation unchanged.
 //
-// restore() streams the owned blobs to the device through the shared pinned
-// staged-H2D engine (loader/staged_h2d.hpp) — the same path the cold materialize
-// uses — and verifies each blob's checksum concurrently with the copy.
+// serialize() copies each root off the device in chunks and hands them over as
+// they arrive: the host never holds more than one chunk of a store that is tens
+// of gigabytes. restore() streams the artifact's mapped bytes to the device
+// through the shared pinned staged-H2D engine (loader/staged_h2d.hpp) — the same
+// path the cold materialize uses — and verifies each payload's digest
+// concurrently with the copy.
 
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <istream>
-#include <ostream>
-#include <streambuf>
+#include <filesystem>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
-#include "model/weight_store.hpp"
+#include "pie_loader/plan.hpp"
+#include "pie_loader/request.hpp"
+
+#include "loader/dtype_map.hpp"
 #include "loader/tensor_spec.hpp"
+#include "model/weight_store.hpp"
 #include "tensor.hpp"
 
 #if __has_include(<cuda_runtime.h>)
@@ -42,181 +56,124 @@
 
 namespace pie_cuda_driver::weight_codec {
 
-inline constexpr char kMagic[8] = {'P', 'I', 'E', 'W', 'S', 'T', 'O', 'R'};
-inline constexpr std::uint32_t kFormatVersion = 4;
-// Blob checksum fold granularity. Boundary-DEPENDENT (see blob_hash_update), so
-// serialize and restore MUST fold in identical chunks; both use this constant.
+// This whole file is one ABI's caller, and every name it reaches for is from
+// that ABI. The directive is scoped to this namespace, so it pulls nothing into
+// anyone else's.
+using namespace pie_loader;
+
+// How much of a root is copied back from the device at a time. Sized to amortize
+// the per-copy latency without pinning a large host buffer; nothing in the file
+// depends on it, so it can change freely.
 inline constexpr std::uint64_t kChunkBytes = 64ull * 1024ull * 1024ull;
-inline constexpr std::uint64_t kBlobHashSeed = 0xcbf29ce484222325ull;
-
-// Streaming integrity hash over blob bytes — folds 32 bytes/step across 4 lanes
-// (breaks the multiply dependency chain) with an 8-byte then 1-byte tail.
-// Host-endian, non-cryptographic: a same-machine corruption check, not security.
-inline std::uint64_t blob_hash_update(std::uint64_t seed, const void* data, std::size_t len)
-{
-    constexpr std::uint64_t prime = 0x100000001b3ull;
-    const auto* p = static_cast<const std::uint8_t*>(data);
-    std::uint64_t h0 = seed;
-    std::uint64_t h1 = seed ^ 0x9e3779b97f4a7c15ull;
-    std::uint64_t h2 = seed ^ 0xff51afd7ed558ccdull;
-    std::uint64_t h3 = seed ^ 0xc4ceb9fe1a85ec53ull;
-    std::size_t i = 0;
-    for (; i + 32 <= len; i += 32) {
-        std::uint64_t w0, w1, w2, w3;
-        std::memcpy(&w0, p + i, 8);
-        std::memcpy(&w1, p + i + 8, 8);
-        std::memcpy(&w2, p + i + 16, 8);
-        std::memcpy(&w3, p + i + 24, 8);
-        h0 = (h0 ^ w0) * prime;
-        h1 = (h1 ^ w1) * prime;
-        h2 = (h2 ^ w2) * prime;
-        h3 = (h3 ^ w3) * prime;
-    }
-    std::uint64_t h = h0 ^ h1 ^ h2 ^ h3;
-    for (; i + 8 <= len; i += 8) {
-        std::uint64_t w;
-        std::memcpy(&w, p + i, 8);
-        h = (h ^ w) * prime;
-    }
-    for (; i < len; ++i) {
-        h = (h ^ p[i]) * prime;
-    }
-    return h;
-}
-
-// Fold a whole owned blob into its checksum using the canonical chunking.
-inline std::uint64_t blob_checksum(const std::uint8_t* data, std::uint64_t nbytes)
-{
-    std::uint64_t sum = kBlobHashSeed;
-    std::uint64_t done = 0;
-    while (done < nbytes) {
-        const std::size_t n =
-            static_cast<std::size_t>(std::min<std::uint64_t>(kChunkBytes, nbytes - done));
-        sum = blob_hash_update(sum, data + done, n);
-        done += n;
-    }
-    return sum;
-}
 
 namespace detail {
 
-// --- little binary writers over std::ostream -------------------------------
-template <typename T>
-inline void put_scalar(std::ostream& os, const T& v)
-{
-    os.write(reinterpret_cast<const char*>(&v), sizeof(T));
-}
-inline void put_str(std::ostream& os, const std::string& s)
-{
-    put_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(s.size()));
-    os.write(s.data(), static_cast<std::streamsize>(s.size()));
-}
-inline void put_shape(std::ostream& os, const std::vector<std::int64_t>& shape)
-{
-    put_scalar<std::uint32_t>(os, static_cast<std::uint32_t>(shape.size()));
-    for (const auto d : shape) {
-        put_scalar<std::int64_t>(os, d);
-    }
-}
-inline void put_spec(std::ostream& os, const TensorDecl& s)
-{
-    put_str(os, s.name);
-    put_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(s.dtype));
-    put_shape(os, s.shape);
-    put_scalar<std::uint8_t>(os, static_cast<std::uint8_t>(s.ownership));
-    put_str(os, s.backing_tensor);
-}
+// The artifact writer, freed exactly once however the function leaves.
+class Writer {
+  public:
+    Writer() = default;
+    Writer(const Writer&) = delete;
+    Writer& operator=(const Writer&) = delete;
+    ~Writer() { pie_loader_weight_store_discard(raw_); }
 
-// --- seekable read-only stream over an in-memory buffer (the mmap'd file) ---
-// Lets restore parse the (small) manifest with the same readers the writer used,
-// while the (huge) blob section is accessed directly through the buffer pointer.
-struct membuf : std::streambuf {
-    membuf(const char* base, std::size_t n)
+    bool open(const std::filesystem::path& path, const std::string& key)
     {
-        char* p = const_cast<char*>(base);
-        setg(p, p, p + n);
-    }
-    pos_type seekoff(off_type off, std::ios_base::seekdir dir,
-                     std::ios_base::openmode) override
-    {
-        char* target = (dir == std::ios_base::beg)   ? eback() + off
-                       : (dir == std::ios_base::cur) ? gptr() + off
-                                                     : egptr() + off;
-        if (target < eback() || target > egptr()) {
-            return pos_type(off_type(-1));
+        pie_loader::LoadPlanDiagnostics diags;
+        const auto status = pie_loader_weight_store_create(
+            pie_loader::borrow(path.string()), pie_loader::borrow(key), &raw_,
+            diags.slot());
+        if (status != pie_loader::PieLoaderStatus::Ok) {
+            std::fprintf(stderr, "[pie-driver-cuda] weight codec: %s\n",
+                         diags.text().c_str());
+            return false;
         }
-        setg(eback(), target, egptr());
-        return pos_type(target - eback());
+        return true;
     }
-    pos_type seekpos(pos_type pos, std::ios_base::openmode which) override
+
+    // Publish the artifact. The handle is consumed either way.
+    bool publish()
     {
-        return seekoff(off_type(pos), std::ios_base::beg, which);
+        pie_loader::LoadPlanDiagnostics diags;
+        const auto status =
+            pie_loader_weight_store_publish(std::exchange(raw_, nullptr), diags.slot());
+        if (status != pie_loader::PieLoaderStatus::Ok) {
+            std::fprintf(stderr, "[pie-driver-cuda] weight codec: %s\n",
+                         diags.text().c_str());
+            return false;
+        }
+        return true;
     }
-};
-struct imemstream : virtual membuf, std::istream {
-    imemstream(const char* base, std::size_t n)
-        : membuf(base, n), std::istream(static_cast<std::streambuf*>(this)) {}
+
+    // Report and swallow a failed call: every one of them is a reason to skip
+    // persisting, never a reason to fail the load that produced the store.
+    bool ok(pie_loader::PieLoaderStatus status, const char* what)
+    {
+        if (status == pie_loader::PieLoaderStatus::Ok) {
+            return true;
+        }
+        std::fprintf(stderr, "[pie-driver-cuda] weight codec: %s: %s\n", what,
+                     pie_loader::bytes_to_string(pie_loader_weight_store_error(raw_))
+                         .c_str());
+        return false;
+    }
+
+    PieLoaderWeightWriter* raw() { return raw_; }
+
+  private:
+    PieLoaderWeightWriter* raw_ = nullptr;
 };
 
-template <typename T>
-inline T get_scalar(std::istream& is)
-{
-    T v{};
-    is.read(reinterpret_cast<char*>(&v), sizeof(T));
-    return v;
-}
-inline std::string get_str(std::istream& is)
-{
-    const auto len = get_scalar<std::uint32_t>(is);
-    std::string s(len, '\0');
-    is.read(s.data(), static_cast<std::streamsize>(len));
-    return s;
-}
-inline std::vector<std::int64_t> get_shape(std::istream& is)
-{
-    const auto rank = get_scalar<std::uint32_t>(is);
-    std::vector<std::int64_t> shape(rank);
-    for (std::uint32_t i = 0; i < rank; ++i) {
-        shape[i] = get_scalar<std::int64_t>(is);
+// An opened artifact, closed exactly once however the function leaves.
+class Store {
+  public:
+    Store() = default;
+    Store(const Store&) = delete;
+    Store& operator=(const Store&) = delete;
+    ~Store() { pie_loader_weight_store_close(raw_); }
+
+    bool open(const std::filesystem::path& path, const std::string& key)
+    {
+        pie_loader::LoadPlanDiagnostics diags;
+        const auto status = pie_loader_weight_store_open(
+            pie_loader::borrow(path.string()), pie_loader::borrow(key), &raw_,
+            diags.slot());
+        if (status != pie_loader::PieLoaderStatus::Ok) {
+            // A miss, not a fault: a stale key, another schema and a file that
+            // is not an artifact all mean the same thing to the caller.
+            return false;
+        }
+        return true;
     }
-    return shape;
-}
-inline TensorDecl get_spec(std::istream& is)
-{
-    TensorDecl s;
-    s.name = get_str(is);
-    s.dtype = static_cast<DType>(get_scalar<std::uint8_t>(is));
-    s.shape = get_shape(is);
-    s.ownership = static_cast<TensorOwnershipKind>(get_scalar<std::uint8_t>(is));
-    s.backing_tensor = get_str(is);
-    return s;
-}
+
+    const PieLoaderWeightStore& get() const { return *raw_; }
+    const PieLoaderWeightStore* raw() const { return raw_; }
+
+  private:
+    PieLoaderWeightStore* raw_ = nullptr;
+};
 
 }  // namespace detail
 
-// Serialize `store` (keyed by `key`) to `out`. Best-effort: returns false
-// (without throwing for recoverable cases) if the store doesn't fit the
-// owned-buffer + views model, so the caller can simply skip persisting. `out`
-// must be seekable (the per-blob checksums are back-patched after the D2H pass).
+// Serialize `store` (keyed by `key`) to `path`, which is created and renamed
+// into place. Best-effort: returns false (without throwing for recoverable
+// cases) if the store doesn't fit the owned-buffer + views model or a call
+// fails, so the caller can simply skip persisting.
 inline bool serialize_weight_store(const WeightStore& store,
                                    const std::string& key,
-                                   std::ostream& out)
+                                   const std::filesystem::path& path)
 {
 #if !PIE_CUDA_WEIGHT_CODEC_HAS_CUDA
-    (void)store; (void)key; (void)out;
+    (void)store; (void)key; (void)path;
     return false;
 #else
-    using namespace detail;
-
     struct OwnedRoot {
         const TensorRecord* rec;
         std::uintptr_t base;
         std::uint64_t nbytes;
-        std::uint64_t blob_offset;
     };
     struct ViewEntry {
         const TensorRecord* rec;
-        std::uint64_t root_index;
+        const OwnedRoot* root;  // null for a view with no bytes at all
         std::uint64_t byte_offset;
     };
 
@@ -233,7 +190,7 @@ inline bool serialize_weight_store(const WeightStore& store,
         if (t.owns_memory() && t.data() != nullptr) {
             owned.push_back(OwnedRoot{
                 &rec, reinterpret_cast<std::uintptr_t>(t.data()),
-                static_cast<std::uint64_t>(t.nbytes()), 0});
+                static_cast<std::uint64_t>(t.nbytes())});
         }
     }
 
@@ -244,206 +201,183 @@ inline bool serialize_weight_store(const WeightStore& store,
         if (t.owns_memory() && t.data() != nullptr) {
             continue;  // already an owned root
         }
-        const auto vbase = reinterpret_cast<std::uintptr_t>(t.data());
-        const auto vbytes = static_cast<std::uint64_t>(t.nbytes());
-        std::uint64_t root_index = UINT64_MAX;
+        const OwnedRoot* root = nullptr;
         std::uint64_t byte_offset = 0;
         if (t.data() != nullptr) {
-            for (std::uint64_t i = 0; i < owned.size(); ++i) {
-                const auto& r = owned[i];
-                if (vbase >= r.base && vbase + vbytes <= r.base + r.nbytes) {
-                    root_index = i;
-                    byte_offset = vbase - r.base;
+            const auto vbase = reinterpret_cast<std::uintptr_t>(t.data());
+            const auto vbytes = static_cast<std::uint64_t>(t.nbytes());
+            for (const auto& candidate : owned) {
+                if (vbase >= candidate.base &&
+                    vbase + vbytes <= candidate.base + candidate.nbytes) {
+                    root = &candidate;
+                    byte_offset = vbase - candidate.base;
                     break;
                 }
             }
-            if (root_index == UINT64_MAX) {
+            if (root == nullptr) {
                 std::fprintf(stderr,
                     "[pie-driver-cuda] weight codec: declining — view '%s' has "
                     "no owned backing buffer in the store\n", it->first.c_str());
                 return false;
             }
         }
-        views.push_back(ViewEntry{&rec, root_index, byte_offset});
+        views.push_back(ViewEntry{&rec, root, byte_offset});
     }
 
-    std::uint64_t blob_cursor = 0;
-    for (auto& r : owned) {
-        r.blob_offset = blob_cursor;
-        blob_cursor += r.nbytes;
-    }
-    const std::uint64_t blob_section_bytes = blob_cursor;
-
-    out.write(kMagic, sizeof(kMagic));
-    put_scalar<std::uint32_t>(out, kFormatVersion);
-    put_str(out, key);
-    put_scalar<std::uint64_t>(out, owned.size());
-    put_scalar<std::uint64_t>(out, views.size());
-    const auto& qmap = store.quant_meta_map();
-    put_scalar<std::uint64_t>(out, qmap.size());
-    put_scalar<std::uint64_t>(out, blob_section_bytes);
-
-    std::vector<std::streampos> checksum_pos(owned.size());
-    for (std::uint64_t i = 0; i < owned.size(); ++i) {
-        const auto& r = owned[i];
-        put_spec(out, r.rec->spec);
-        put_scalar<std::uint64_t>(out, r.nbytes);
-        put_scalar<std::uint64_t>(out, r.blob_offset);
-        checksum_pos[i] = out.tellp();
-        put_scalar<std::uint64_t>(out, std::uint64_t{0});  // checksum placeholder
-    }
-    for (const auto& v : views) {
-        put_spec(out, v.rec->spec);
-        put_scalar<std::uint64_t>(out, v.root_index);
-        put_scalar<std::uint64_t>(out, v.byte_offset);
-    }
-    for (const auto& kv : qmap) {
-        const QuantMeta& m = kv.second;
-        put_str(out, kv.first);
-        put_scalar<std::uint8_t>(out, static_cast<std::uint8_t>(m.kind));
-        put_str(out, m.scale_name);
-        put_str(out, m.zero_point_name);
-        put_scalar<std::int32_t>(out, static_cast<std::int32_t>(m.group_size));
-        put_scalar<std::int32_t>(out, static_cast<std::int32_t>(m.channel_axis));
+    detail::Writer writer;
+    if (!writer.open(path, key)) {
+        return false;
     }
 
-    // Blob section: D2H each owned buffer in chunks, write + checksum.
-    std::vector<std::uint64_t> checksums(owned.size());
-    std::vector<char> host(static_cast<std::size_t>(
-        std::min<std::uint64_t>(kChunkBytes, std::max<std::uint64_t>(blob_section_bytes, 1))));
-    for (std::uint64_t i = 0; i < owned.size(); ++i) {
-        std::uint64_t sum = kBlobHashSeed;
+    std::vector<char> host(static_cast<std::size_t>(kChunkBytes));
+    for (const auto& root : owned) {
+        const TensorDecl& spec = root.rec->spec;
+        const auto shape = spec.shape;
+        const PieLoaderWeightTensor decl{
+            .name = pie_loader::borrow(spec.name),
+            .dtype = dtype_to_rust(spec.dtype),
+            .runtime_dtype = pie_loader::borrow(dtype_name(spec.dtype)),
+            .shape = PieLoaderI64Slice{shape.data(), shape.size()},
+        };
+        if (!writer.ok(pie_loader_weight_store_begin_tensor(writer.raw(), &decl),
+                       spec.name.c_str())) {
+            return false;
+        }
+        const auto* src = static_cast<const std::uint8_t*>(root.rec->tensor.data());
         std::uint64_t done = 0;
-        const auto* src = static_cast<const std::uint8_t*>(owned[i].rec->tensor.data());
-        while (done < owned[i].nbytes) {
+        while (done < root.nbytes) {
             const std::size_t n = static_cast<std::size_t>(
-                std::min<std::uint64_t>(host.size(), owned[i].nbytes - done));
+                std::min<std::uint64_t>(host.size(), root.nbytes - done));
             const cudaError_t e = cudaMemcpy(host.data(), src + done, n,
                                              cudaMemcpyDeviceToHost);
             if (e != cudaSuccess) {
                 std::fprintf(stderr,
                     "[pie-driver-cuda] weight codec: D2H failed for '%s': %s\n",
-                    owned[i].rec->spec.name.c_str(), cudaGetErrorString(e));
+                    spec.name.c_str(), cudaGetErrorString(e));
                 return false;
             }
-            sum = blob_hash_update(sum, host.data(), n);
-            out.write(host.data(), static_cast<std::streamsize>(n));
+            if (!writer.ok(pie_loader_weight_store_write(
+                               writer.raw(),
+                               reinterpret_cast<const std::uint8_t*>(host.data()), n),
+                           spec.name.c_str())) {
+                return false;
+            }
             done += n;
         }
-        checksums[i] = sum;
+        if (!writer.ok(pie_loader_weight_store_end_tensor(writer.raw()),
+                       spec.name.c_str())) {
+            return false;
+        }
     }
-    for (std::uint64_t i = 0; i < owned.size(); ++i) {
-        out.seekp(checksum_pos[i]);
-        put_scalar<std::uint64_t>(out, checksums[i]);
+
+    for (const auto& view : views) {
+        const TensorDecl& spec = view.rec->spec;
+        const auto shape = spec.shape;
+        const PieLoaderWeightView decl{
+            .name = pie_loader::borrow(spec.name),
+            .root = view.root != nullptr
+                        ? pie_loader::borrow(view.root->rec->spec.name)
+                        : PieLoaderBytes{nullptr, 0},
+            .byte_offset = view.byte_offset,
+            .dtype = dtype_to_rust(spec.dtype),
+            .runtime_dtype = pie_loader::borrow(dtype_name(spec.dtype)),
+            .shape = PieLoaderI64Slice{shape.data(), shape.size()},
+            .backing = pie_loader::borrow(spec.backing_tensor),
+        };
+        if (!writer.ok(pie_loader_weight_store_add_view(writer.raw(), &decl),
+                       spec.name.c_str())) {
+            return false;
+        }
     }
-    out.seekp(0, std::ios::end);
-    return static_cast<bool>(out);
+
+    for (const auto& kv : store.quant_meta_map()) {
+        const QuantMeta& meta = kv.second;
+        const PieLoaderWeightQuant decl{
+            .name = pie_loader::borrow(kv.first),
+            .kind = pie_loader::borrow(quant_kind_name(meta.kind)),
+            .scale = pie_loader::borrow(meta.scale_name),
+            .zero_point = pie_loader::borrow(meta.zero_point_name),
+            .group_size = static_cast<std::int32_t>(meta.group_size),
+            .channel_axis = static_cast<std::int32_t>(meta.channel_axis),
+        };
+        if (!writer.ok(pie_loader_weight_store_add_quant(writer.raw(), &decl),
+                       kv.first.c_str())) {
+            return false;
+        }
+    }
+
+    return writer.publish();
 #endif
 }
 
-// Restore a store from a contiguous byte buffer `data` (e.g. a mmap'd file),
-// which must remain valid for the duration of the call. Returns
-// false on magic/version/key mismatch or corruption (a "miss" the caller falls
-// back from); the blobs are streamed to device through `pool` and each blob's
-// checksum is verified concurrently with the copy when `verify` is set.
-inline bool restore_weight_store(const std::uint8_t* data, std::size_t size,
+// Restore a store from the artifact at `path`. Returns false on a key or format
+// mismatch or on corruption (a "miss" the caller falls back from); the payloads
+// are streamed to the device through `pool` straight from the mapped file, and
+// each one's digest is verified concurrently with the copy when `verify` is set.
+inline bool restore_weight_store(const std::filesystem::path& path,
                                  const std::string& expected_key, bool verify,
                                  WeightStoreBuilder& builder,
                                  PinnedLanePool& pool)
 {
 #if !PIE_CUDA_WEIGHT_CODEC_HAS_CUDA
-    (void)data; (void)size; (void)expected_key; (void)verify; (void)builder; (void)pool;
+    (void)path; (void)expected_key; (void)verify; (void)builder; (void)pool;
     return false;
 #else
-    using namespace detail;
-
-    imemstream is(reinterpret_cast<const char*>(data), size);
-    char magic[8];
-    is.read(magic, sizeof(magic));
-    if (!is || std::memcmp(magic, kMagic, sizeof(magic)) != 0) {
+    detail::Store store;
+    if (!store.open(path, expected_key)) {
         return false;
     }
-    if (get_scalar<std::uint32_t>(is) != kFormatVersion) {
-        return false;
-    }
-    if (get_str(is) != expected_key) {
-        return false;  // key mismatch — stale/foreign store
-    }
-    const auto num_owned = get_scalar<std::uint64_t>(is);
-    const auto num_views = get_scalar<std::uint64_t>(is);
-    const auto num_quant = get_scalar<std::uint64_t>(is);
-    const auto blob_section_bytes = get_scalar<std::uint64_t>(is);
+    const PieLoaderWeightStore& artifact = store.get();
 
-    struct OwnedHdr { TensorDecl spec; std::uint64_t nbytes, blob_offset, checksum; };
-    std::vector<OwnedHdr> owned(num_owned);
-    for (auto& o : owned) {
-        o.spec = get_spec(is);
-        o.nbytes = get_scalar<std::uint64_t>(is);
-        o.blob_offset = get_scalar<std::uint64_t>(is);
-        o.checksum = get_scalar<std::uint64_t>(is);
-    }
-    struct ViewHdr { TensorDecl spec; std::uint64_t root_index, byte_offset; };
-    std::vector<ViewHdr> views(num_views);
-    for (auto& v : views) {
-        v.spec = get_spec(is);
-        v.root_index = get_scalar<std::uint64_t>(is);
-        v.byte_offset = get_scalar<std::uint64_t>(is);
-    }
-    struct QuantHdr {
-        std::string name; std::uint8_t kind; std::string scale_name;
-        std::string zero_point_name; std::int32_t group_size, channel_axis;
-    };
-    std::vector<QuantHdr> quants(num_quant);
-    for (auto& q : quants) {
-        q.name = get_str(is);
-        q.kind = get_scalar<std::uint8_t>(is);
-        q.scale_name = get_str(is);
-        q.zero_point_name = get_str(is);
-        q.group_size = get_scalar<std::int32_t>(is);
-        q.channel_axis = get_scalar<std::int32_t>(is);
-    }
-    if (!is) {
-        return false;  // truncated metadata
-    }
-    const std::uint64_t blob_section_pos =
-        static_cast<std::uint64_t>(is.tellg());
-    if (blob_section_pos + blob_section_bytes > size) {
-        return false;  // truncated blob section
-    }
-    const std::uint8_t* blobs = data + blob_section_pos;
-
-    // Allocate owned roots and queue one staged copy each, sourced straight from
-    // the (mmap'd) blob section. The shared engine pins + pipelines the H2D.
-    std::vector<void*> root_base(num_owned, nullptr);
+    // Allocate the roots and queue one staged copy each, sourced straight from
+    // the mapped file. The shared engine pins + pipelines the H2D.
+    std::unordered_map<std::string, void*> root_base;
     std::vector<StagedCopy> copies;
-    copies.reserve(num_owned);
-    for (std::uint64_t i = 0; i < num_owned; ++i) {
-        const auto& o = owned[i];
-        if (o.blob_offset + o.nbytes > blob_section_bytes) {
+    copies.reserve(artifact.tensors.len);
+    root_base.reserve(artifact.tensors.len);
+    for (std::size_t i = 0; i < artifact.tensors.len; ++i) {
+        const PieLoaderWeightTensorView& raw = artifact.tensors.ptr[i];
+        const std::string name = pie_loader::bytes_to_string(raw.name);
+        TensorDecl spec;
+        spec.name = name;
+        if (!dtype_by_name(
+                std::string_view(reinterpret_cast<const char*>(raw.runtime_dtype.ptr),
+                                 raw.runtime_dtype.len),
+                spec.dtype)) {
+            std::fprintf(stderr,
+                "[pie-driver-cuda] weight codec: '%s' names a type this build "
+                "does not have — discarding restore\n", name.c_str());
             return false;
         }
-        DeviceTensor t = DeviceTensor::allocate(o.spec.dtype, o.spec.shape);
-        if (t.nbytes() != o.nbytes) {
+        spec.shape = pie_loader::i64_slice_to_vector(raw.shape);
+        spec.ownership = TensorOwnershipKind::Owned;
+
+        DeviceTensor t = DeviceTensor::allocate(spec.dtype, spec.shape);
+        if (t.nbytes() != raw.nbytes) {
             std::fprintf(stderr,
                 "[pie-driver-cuda] weight codec: nbytes mismatch for '%s' — "
-                "discarding restore\n", o.spec.name.c_str());
+                "discarding restore\n", name.c_str());
             return false;
         }
-        copies.push_back(StagedCopy{t.data(), blobs + o.blob_offset, o.nbytes});
-        root_base[i] = t.data();
-        builder.insert(o.spec.name, std::move(t), o.spec);
+        copies.push_back(StagedCopy{t.data(), raw.data, raw.nbytes});
+        root_base.emplace(name, t.data());
+        builder.insert(name, std::move(t), spec);
     }
 
-    // Verify checksums on the CPU concurrently with the DMA: the copy is PCIe-
-    // bound while the hash is a memory read, and both touch the same warm pages.
+    // Verify on the CPU concurrently with the DMA: the copy is PCIe-bound while
+    // the digest is a memory read, and both touch the same warm pages.
     std::thread verifier;
-    bool checksum_ok = true;
+    bool digests_ok = true;
     if (verify) {
-        verifier = std::thread([&] {
-            for (std::uint64_t i = 0; i < num_owned && checksum_ok; ++i) {
-                if (blob_checksum(blobs + owned[i].blob_offset, owned[i].nbytes)
-                        != owned[i].checksum) {
-                    checksum_ok = false;
+        const PieLoaderWeightStore* raw = store.raw();
+        const std::size_t count = artifact.tensors.len;
+        verifier = std::thread([raw, count, &digests_ok] {
+            for (std::size_t i = 0; i < count && digests_ok; ++i) {
+                bool ok = false;
+                if (pie_loader_weight_store_verify(raw, i, &ok) !=
+                        pie_loader::PieLoaderStatus::Ok ||
+                    !ok) {
+                    digests_ok = false;
                 }
             }
         });
@@ -459,44 +393,78 @@ inline bool restore_weight_store(const std::uint8_t* data, std::size_t size,
     if (verifier.joinable()) {
         verifier.join();
     }
-    if (verify && !checksum_ok) {
+    if (verify && !digests_ok) {
         std::fprintf(stderr,
-            "[pie-driver-cuda] weight codec: checksum mismatch — discarding restore\n");
+            "[pie-driver-cuda] weight codec: digest mismatch — discarding restore\n");
         return false;
     }
 
-    // Reconstruct views into their owned roots (physical), with their spec.
-    for (const auto& v : views) {
-        void* base = nullptr;
-        if (v.root_index != UINT64_MAX && v.root_index < num_owned) {
-            base = static_cast<std::uint8_t*>(root_base[v.root_index]) + v.byte_offset;
+    // Reconstruct the views as windows into their roots, with their spec.
+    for (std::size_t i = 0; i < artifact.views.len; ++i) {
+        const PieLoaderWeightView& raw = artifact.views.ptr[i];
+        TensorDecl spec;
+        spec.name = pie_loader::bytes_to_string(raw.name);
+        if (!dtype_by_name(
+                std::string_view(reinterpret_cast<const char*>(raw.runtime_dtype.ptr),
+                                 raw.runtime_dtype.len),
+                spec.dtype)) {
+            std::fprintf(stderr,
+                "[pie-driver-cuda] weight codec: view '%s' names a type this "
+                "build does not have — discarding restore\n", spec.name.c_str());
+            return false;
         }
-        builder.insert(v.spec.name,
-                       DeviceTensor::view(base, v.spec.dtype, v.spec.shape),
-                       v.spec);
+        spec.shape = pie_loader::i64_slice_to_vector(raw.shape);
+        spec.ownership = TensorOwnershipKind::BorrowedView;
+        spec.backing_tensor = pie_loader::bytes_to_string(raw.backing);
+
+        void* base = nullptr;
+        const std::string root = pie_loader::bytes_to_string(raw.root);
+        if (!root.empty()) {
+            const auto it = root_base.find(root);
+            if (it == root_base.end()) {
+                std::fprintf(stderr,
+                    "[pie-driver-cuda] weight codec: view '%s' names root '%s', "
+                    "which the artifact does not hold — discarding restore\n",
+                    spec.name.c_str(), root.c_str());
+                return false;
+            }
+            base = static_cast<std::uint8_t*>(it->second) + raw.byte_offset;
+        }
+        builder.insert(spec.name,
+                       DeviceTensor::view(base, spec.dtype, spec.shape),
+                       spec);
     }
 
     // Rebuild quant metadata (pointers resolved by name from the populated store).
-    for (const auto& q : quants) {
+    for (std::size_t i = 0; i < artifact.quants.len; ++i) {
+        const PieLoaderWeightQuant& raw = artifact.quants.ptr[i];
         QuantMeta meta;
-        meta.kind = static_cast<QuantMeta::Kind>(q.kind);
-        meta.scale_name = q.scale_name;
-        meta.zero_point_name = q.zero_point_name;
-        meta.group_size = q.group_size;
-        meta.channel_axis = q.channel_axis;
-        if (!q.scale_name.empty()) {
-            auto it = builder.find(q.scale_name);
+        if (!quant_kind_by_name(
+                std::string_view(reinterpret_cast<const char*>(raw.kind.ptr),
+                                 raw.kind.len),
+                meta.kind)) {
+            std::fprintf(stderr,
+                "[pie-driver-cuda] weight codec: unknown scale kind — "
+                "discarding restore\n");
+            return false;
+        }
+        meta.scale_name = pie_loader::bytes_to_string(raw.scale);
+        meta.zero_point_name = pie_loader::bytes_to_string(raw.zero_point);
+        meta.group_size = raw.group_size;
+        meta.channel_axis = raw.channel_axis;
+        if (!meta.scale_name.empty()) {
+            auto it = builder.find(meta.scale_name);
             if (it != builder.end()) {
                 meta.scale = &it->second.tensor;
             }
         }
-        if (!q.zero_point_name.empty()) {
-            auto it = builder.find(q.zero_point_name);
+        if (!meta.zero_point_name.empty()) {
+            auto it = builder.find(meta.zero_point_name);
             if (it != builder.end()) {
                 meta.zero_point = &it->second.tensor;
             }
         }
-        builder.set_quant_meta(q.name, std::move(meta));
+        builder.set_quant_meta(pie_loader::bytes_to_string(raw.name), std::move(meta));
     }
 
     builder.finalize();

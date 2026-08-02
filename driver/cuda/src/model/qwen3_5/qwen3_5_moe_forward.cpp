@@ -647,6 +647,19 @@ inline void rmsnorm_bf16_dispatch(
 
 }  // namespace
 
+// Force the general (per-expert) dispatch even for shapes the decode fast path
+// would take. Streaming already lands here because it has no fused slab to
+// stride, so this is what makes "same weights, same path" a runnable
+// comparison: without it a resident/streamed diff confounds the residency
+// change with a change of kernel.
+bool qwen35_moe_force_general_path() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_FORCE_GENERAL");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
 Qwen3_5MoeMlpWorkspace Qwen3_5MoeMlpWorkspace::allocate(
     int max_tokens, int hidden, int num_experts, int top_k,
     int moe_intermediate, int shared_intermediate)
@@ -782,20 +795,59 @@ void linear_attn_body(
     Workspace& ws,
     Qwen3_5LinearAttnWorkspace& la,
     RecurrentStateCache& state_cache,
-    int layer_idx, int linear_idx, int N, int R, bool is_pure_decode,
+    int layer_idx, int linear_idx, int N_new, int R, bool is_pure_decode,
     const std::int32_t*  slot_ids_h,
     const std::int32_t*  slot_ids_d,
-    const std::uint32_t* qo_indptr_h,
-    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* qo_new_h,
+    const std::uint32_t* qo_new_d,
     ops::CublasHandle& cublas, cudaStream_t stream,
     Qwen35MoeForwardProfile* profile,
     const std::int32_t* commit_len = nullptr,
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     bool rs_buffer_write = false,
+    // The buffered write folds the WHOLE extended row into the state.
+    bool rs_fold_after_write = false,
     bool rs_buffer_fold = false,
-    const StageHooks* hooks = nullptr)
+    // Buffer READ path -- see qwen3_5_forward.cpp's linear_attn_layer_body for
+    // the full rationale; this body mirrors it against MoE weights.
+    const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_read_indptr_h = nullptr,
+    const std::uint32_t* rs_buffer_read_lens_h = nullptr,
+    const std::uint32_t* rs_buffer_heads_h = nullptr,
+    const std::uint32_t* qo_ext_h = nullptr,
+    const std::uint32_t* qo_ext_d = nullptr,
+    int N_ext = 0,
+    // MIXED pass only: one byte per request, non-zero where this row's
+    // recurrent/conv state must persist. Null means every row agrees and
+    // `write_state` alone decides.
+    const std::uint8_t* rs_write_state_mask = nullptr)
 {
+    // The linear layers run over the EXTENDED token layout `[B_r | T_r]` per
+    // request: a recurrence always resumes from the folded boundary, so any
+    // token buffered past it must be replayed first. `N` / `qo_indptr_*` are
+    // rebound to that space; `N_new` / `qo_new_h` stay in the fire's own.
+    const bool has_buffer_read =
+        rs_buffer_read_lens_h != nullptr && qo_ext_h != nullptr &&
+        qo_ext_d != nullptr && N_ext > 0;
+    const int N = has_buffer_read ? N_ext : N_new;
+    const std::uint32_t* qo_indptr_h = has_buffer_read ? qo_ext_h : qo_new_h;
+    const std::uint32_t* qo_indptr_d = has_buffer_read ? qo_ext_d : qo_new_d;
+    auto read_len_for = [&](int r) -> int {
+        return has_buffer_read
+            ? static_cast<int>(rs_buffer_read_lens_h[r])
+            : 0;
+    };
+    // Logical buffer token L of request r lives at physical `head + L`. A fold
+    // absorbs tokens off the FRONT of the buffer but can only release WHOLE
+    // covered pages, so a fold that lands mid-page leaves the survivors where
+    // they were. Reading or writing at the logical index would then re-scan
+    // tokens that are already inside the folded state, or overwrite live ones.
+    auto head_for = [&](int r) -> int {
+        return rs_buffer_heads_h != nullptr
+            ? static_cast<int>(rs_buffer_heads_h[r])
+            : 0;
+    };
     const int T        = std::max(1, fwd_cfg.tp_size);
     const int H        = cfg.hidden_size;
     const int K_h      = cfg.linear_num_key_heads / T;
@@ -806,15 +858,24 @@ void linear_attn_body(
     const int V_dim    = V_h * V_d;
     const int conv_dim = 2 * K_dim + V_dim;
     const int conv_K   = cfg.linear_conv_kernel_dim;
-    const bool linear_decode = is_pure_decode && !rs_buffer_write;
+    // An extended layout has N != R, so the decode kernels cannot describe it.
+    const bool linear_decode =
+        is_pure_decode && !rs_buffer_write && !has_buffer_read;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
     auto slot_for = [&](int r) -> int {
         return slot_ids_h ? slot_ids_h[r] : 0;
     };
     // Frozen verify: produce outputs but persist no recurrent/conv state (the
     // repair forward advances it through [input|accepted]). See qwen3_5_forward.
+    // A buffered write leaves the folded state alone -- UNLESS it also folds.
+    // The extended `[buffered | new]` layout IS the row's buffer token space,
+    // so when the fold takes the WHOLE of it the boundary is the last extended
+    // token and the ordinary end-of-sequence writeback already lands there.
+    // (A boundary strictly inside is a different problem: `commit_len`
+    // truncates the sequence rather than just moving the snapshot, so the
+    // tokens past it would get no outputs. The planner refuses that.)
     const bool write_state =
-        !state_cache.verify_frozen() && !rs_buffer_write;
+        !state_cache.verify_frozen() && (!rs_buffer_write || rs_fold_after_write);
 
     const void* z_data = la.z.data();
     const void* a_data = la.a.data();
@@ -833,14 +894,24 @@ void linear_attn_body(
                     const int qo0 = static_cast<int>(qo_indptr_h[r]);
                     const int nr =
                         static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                    // The fold replays LOGICAL tokens [0, nr), which live at
+                    // physical [head, head+nr).
+                    const int head = head_for(r);
+                    const int page_first = (head / page) * page;
                     const std::uint32_t s0 =
                         rs_buffer_slot_indptr_h[r];
                     const std::uint32_t s1 =
                         rs_buffer_slot_indptr_h[r + 1];
                     for (std::uint32_t j = 0; s0 + j < s1; ++j) {
-                        const int tok0 = static_cast<int>(j) * page;
-                        const int count = std::min(page, nr - tok0);
+                        const int page_tok0 =
+                            page_first + static_cast<int>(j) * page;
+                        const int phys0 = std::max(page_tok0, head);
+                        const int count =
+                            std::min(page_tok0 + page, head + nr) - phys0;
                         if (count <= 0) break;
+                        const std::size_t in_page =
+                            static_cast<std::size_t>(phys0 - page_tok0);
+                        const int tok0 = phys0 - head;
                         auto* slab = static_cast<std::uint16_t*>(
                             state_cache.rs_buffer_slab(
                                 linear_idx,
@@ -849,21 +920,21 @@ void linear_attn_body(
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.mixed_qkv.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * conv_dim,
-                            slab,
+                            slab + in_page * conv_dim,
                             static_cast<std::size_t>(count) * conv_dim *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.a.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h,
-                            slab + slab_a,
+                            slab + slab_a + in_page * V_h,
                             static_cast<std::size_t>(count) * V_h *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.b.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h,
-                            slab + slab_b,
+                            slab + slab_b + in_page * V_h,
                             static_cast<std::size_t>(count) * V_h *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
@@ -874,34 +945,127 @@ void linear_attn_body(
             // The qkv/z and b/a fusions are independent: b/a is always
             // fused (tiny weights, same per-GEMV floor), qkv/z only when
             // the weight duplication fits.
-            if (Lw.la_in_proj_qkvz != nullptr) {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.la_in_proj_qkvz->data(),
-                    la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
-                kernels::launch_split_bf16_rows(
-                    la.mixed_qkvz.data(), la.mixed_qkv.data(), la.z.data(),
-                    N, conv_dim, V_dim, stream);
+            // `src0` indexes the fire's own tokens (norm_x, z); `dst0` the
+            // extended recurrence layout (mixed_qkv, a, b).
+            auto in_proj_rows = [&](int src0, int dst0, int rows) {
+                if (rows <= 0) return;
+                const auto* x =
+                    static_cast<const std::uint16_t*>(ws.norm_x.data()) +
+                    static_cast<std::size_t>(src0) * H;
+                if (Lw.la_in_proj_qkvz != nullptr) {
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        x, Lw.la_in_proj_qkvz->data(),
+                        la.mixed_qkvz.data(), rows, conv_dim + V_dim, H);
+                    kernels::launch_split_bf16_rows(
+                        la.mixed_qkvz.data(),
+                        la.mixed_qkv.data() +
+                            static_cast<std::size_t>(dst0) * conv_dim,
+                        la.z.data() + static_cast<std::size_t>(src0) * V_dim,
+                        rows, conv_dim, V_dim, stream);
+                } else {
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        x, Lw.la_in_proj_qkv->data(),
+                        la.mixed_qkv.data() +
+                            static_cast<std::size_t>(dst0) * conv_dim,
+                        rows, conv_dim, H);
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        x, Lw.la_in_proj_z->data(),
+                        la.z.data() + static_cast<std::size_t>(src0) * V_dim,
+                        rows, V_dim, H);
+                }
+                if (Lw.la_in_proj_ba != nullptr) {
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        x, Lw.la_in_proj_ba->data(),
+                        la.ba.data(), rows, 2 * V_h, H);
+                    kernels::launch_split_qwen_gdn_ba_bf16(
+                        la.ba.data(),
+                        la.b.data() + static_cast<std::size_t>(dst0) * V_h,
+                        la.a.data() + static_cast<std::size_t>(dst0) * V_h,
+                        rows, V_h, stream);
+                } else {
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        x, Lw.la_in_proj_a->data(),
+                        la.a.data() + static_cast<std::size_t>(dst0) * V_h,
+                        rows, V_h, H);
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        x, Lw.la_in_proj_b->data(),
+                        la.b.data() + static_cast<std::size_t>(dst0) * V_h,
+                        rows, V_h, H);
+                }
+            };
+            if (!has_buffer_read) {
+                in_proj_rows(0, 0, N);
             } else {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.la_in_proj_qkv->data(),
-                    la.mixed_qkv.data(), N, conv_dim, H);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.la_in_proj_z->data(),
-                    la.z.data(), N, V_dim, H);
+                for (int r = 0; r < R; ++r) {
+                    const int src0 = static_cast<int>(qo_new_h[r]);
+                    const int rows =
+                        static_cast<int>(qo_new_h[r + 1]) - src0;
+                    in_proj_rows(
+                        src0,
+                        static_cast<int>(qo_indptr_h[r]) + read_len_for(r),
+                        rows);
+                }
             }
-            if (Lw.la_in_proj_ba != nullptr) {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.la_in_proj_ba->data(),
-                    la.ba.data(), N, 2 * V_h, H);
-                kernels::launch_split_qwen_gdn_ba_bf16(
-                    la.ba.data(), la.b.data(), la.a.data(), N, V_h, stream);
-            } else {
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.la_in_proj_a->data(),
-                    la.a.data(), N, V_h, H);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    ws.norm_x.data(), Lw.la_in_proj_b->data(),
-                    la.b.data(), N, V_h, H);
+            if (has_buffer_read) {
+                // Gather each request's buffered in-proj activations into rows
+                // [qo_ext[r], qo_ext[r] + B_r): the prefix the recurrence must
+                // replay before it reaches this fire's own tokens.
+                const int page = state_cache.rs_buffer_page_tokens();
+                const std::size_t slab_a =
+                    static_cast<std::size_t>(page) * conv_dim;
+                const std::size_t slab_b =
+                    slab_a + static_cast<std::size_t>(page) * V_h;
+                for (int r = 0; r < R; ++r) {
+                    const int qo0 = static_cast<int>(qo_indptr_h[r]);
+                    const int br  = read_len_for(r);
+                    if (br <= 0) continue;
+                    const int head = head_for(r);
+                    const int page_first = (head / page) * page;
+                    const std::uint32_t s0 = rs_buffer_read_indptr_h[r];
+                    const std::uint32_t s1 = rs_buffer_read_indptr_h[r + 1];
+                    for (std::uint32_t j = 0; s0 + j < s1; ++j) {
+                        const int page_tok0 =
+                            page_first + static_cast<int>(j) * page;
+                        const int phys0 = std::max(page_tok0, head);
+                        const int cnt =
+                            std::min(page_tok0 + page, head + br) - phys0;
+                        if (cnt <= 0) break;
+                        const std::size_t in_page =
+                            static_cast<std::size_t>(phys0 - page_tok0);
+                        const int tok0 = phys0 - head;
+                        auto* slab = static_cast<std::uint16_t*>(
+                            state_cache.rs_buffer_slab(
+                                linear_idx,
+                                static_cast<int>(
+                                    rs_buffer_read_slot_ids_h[s0 + j])));
+                        if (slab == nullptr) {
+                            throw std::runtime_error(
+                                "RS buffer read names a slab this layer has "
+                                "not allocated");
+                        }
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.mixed_qkv.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * conv_dim,
+                            slab + in_page * conv_dim,
+                            static_cast<std::size_t>(cnt) * conv_dim *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.a.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            slab + slab_a + in_page * V_h,
+                            static_cast<std::size_t>(cnt) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            la.b.data() +
+                                static_cast<std::size_t>(qo0 + tok0) * V_h,
+                            slab + slab_b + in_page * V_h,
+                            static_cast<std::size_t>(cnt) * V_h *
+                                sizeof(std::uint16_t),
+                            cudaMemcpyDeviceToDevice, stream));
+                    }
+                }
             }
             if (rs_buffer_write) {
                 const int page = state_cache.rs_buffer_page_tokens();
@@ -913,14 +1077,29 @@ void linear_attn_body(
                     const int qo0 = static_cast<int>(qo_indptr_h[r]);
                     const int nr =
                         static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                    // Only rows at or past B_r are this fire's to write; the
+                    // ones below were gathered from the buffer. page_span()
+                    // starts at the page CONTAINING B_r, so the first listed
+                    // page can begin before the appended span.
+                    const int head = head_for(r);
+                    const int w0 = head + read_len_for(r);
+                    const int wn = nr - read_len_for(r);
+                    if (wn <= 0) continue;
+                    const int page_first = (w0 / page) * page;
                     const std::uint32_t s0 =
                         rs_buffer_slot_indptr_h[r];
                     const std::uint32_t s1 =
                         rs_buffer_slot_indptr_h[r + 1];
                     for (std::uint32_t j = 0; s0 + j < s1; ++j) {
-                        const int tok0 = static_cast<int>(j) * page;
-                        const int count = std::min(page, nr - tok0);
+                        const int page_tok0 =
+                            page_first + static_cast<int>(j) * page;
+                        const int phys0 = std::max(page_tok0, w0);
+                        const int count =
+                            std::min(page_tok0 + page, w0 + wn) - phys0;
                         if (count <= 0) break;
+                        const std::size_t in_page =
+                            static_cast<std::size_t>(phys0 - page_tok0);
+                        const int tok0 = phys0 - head;
                         auto* slab = static_cast<std::uint16_t*>(
                             state_cache.rs_buffer_slab(
                                 linear_idx,
@@ -930,7 +1109,8 @@ void linear_attn_body(
                             reinterpret_cast<const std::uint8_t*>(
                                 la.mixed_qkv.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * conv_dim),
-                            reinterpret_cast<std::uint8_t*>(slab),
+                            reinterpret_cast<std::uint8_t*>(
+                                slab + in_page * conv_dim),
                             static_cast<std::size_t>(count) * conv_dim *
                                 sizeof(std::uint16_t),
                             slot_ids_d, r, stream);
@@ -938,7 +1118,8 @@ void linear_attn_body(
                             reinterpret_cast<const std::uint8_t*>(
                                 la.a.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h),
-                            reinterpret_cast<std::uint8_t*>(slab + slab_a),
+                            reinterpret_cast<std::uint8_t*>(
+                                slab + slab_a + in_page * V_h),
                             static_cast<std::size_t>(count) * V_h *
                                 sizeof(std::uint16_t),
                             slot_ids_d, r, stream);
@@ -946,7 +1127,8 @@ void linear_attn_body(
                             reinterpret_cast<const std::uint8_t*>(
                                 la.b.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h),
-                            reinterpret_cast<std::uint8_t*>(slab + slab_b),
+                            reinterpret_cast<std::uint8_t*>(
+                                slab + slab_b + in_page * V_h),
                             static_cast<std::size_t>(count) * V_h *
                                 sizeof(std::uint16_t),
                             slot_ids_d, r, stream);
@@ -989,7 +1171,8 @@ void linear_attn_body(
                     slot_ids_d, qo_indptr_d,
                     static_cast<long long>(state_cache.conv_kernel()) *
                         state_cache.conv_dim(),
-                    R, conv_dim, conv_K, stream, write_state, commit_len);
+                    R, conv_dim, conv_K, stream, write_state, commit_len,
+                    rs_write_state_mask);
             } else {
                 for (int r = 0; r < R; ++r) {
                     const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -1015,10 +1198,16 @@ void linear_attn_body(
         N <= qwen35_gdn_warp_tiled_max_tokens() &&
         K_d <= 256 &&
         commit_len == nullptr;
+    // Same reasoning as the dense forward: V_h == K_h is the repeat=1 case,
+    // not a shape the GQA kernel cannot express, and excluding it only hid
+    // the tuned SMEM step kernel from models with equal linear key/value
+    // head counts. See qwen3_5_forward.cpp for the full argument and
+    // driver/cuda/tests/gdn_recurrent_step_parity.cu for the guard. No
+    // Qwen3.5 MoE checkpoint that fits this box has equal head counts, so
+    // this arm rides on the equivalence proof rather than a local measurement.
     const bool use_decode_gqa_recurrent =
         linear_decode &&
         slot_ids_d != nullptr &&
-        V_h != K_h &&
         V_h % K_h == 0;
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_prep_ms : nullptr,
@@ -1039,7 +1228,6 @@ void linear_attn_body(
         }
     });
     invoke_stage_hook(
-        hooks,
         StageHookPoint::OnAttnProj, la.q_pre.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(K_h * K_d),
@@ -1154,7 +1342,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
                                 la.q_pre.data(),
@@ -1167,7 +1355,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, K_h, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         }
                     } else if (use_warp_tiled_recurrent) {
                         if (state_bf16) {
@@ -1182,7 +1370,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
                                 q_recur_full,
@@ -1195,7 +1383,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         }
                     } else if (
                         commit_len == nullptr &&
@@ -1212,7 +1400,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         } else {
                             kernels::launch_chunk_gated_delta_prefill_batched_cached(
                                 q_recur_full,
@@ -1225,7 +1413,7 @@ void linear_attn_body(
                                 slot_stride,
                                 la.core_out.data(),
                                 R, V_h, K_d, V_d,
-                                stream, write_state);
+                                stream, write_state, rs_write_state_mask);
                         }
                     } else {
                         if (state_bf16) {
@@ -1295,7 +1483,6 @@ void linear_attn_body(
             }
         });
     invoke_stage_hook(
-        hooks,
         StageHookPoint::OnAttn, la.q_pre.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(K_h * K_d),
@@ -1303,28 +1490,50 @@ void linear_attn_body(
         /*query_is_f32=*/true);
     if (commit_len != nullptr) return;
 
+    // Back to the fire's own token space: drop each request's replayed prefix.
+    // The shift is left-overlapping, so it cannot be done in place; `v_fp32`
+    // has the identical shape and is dead once the FLA returns, which makes it
+    // a free landing pad for a path most fires never take.
+    const float* core_rows = la.core_out.data();
+    if (has_buffer_read) {
+        float* packed = la.v_fp32.data();
+        for (int r = 0; r < R; ++r) {
+            const int src0 =
+                static_cast<int>(qo_indptr_h[r]) + read_len_for(r);
+            const int dst0 = static_cast<int>(qo_new_h[r]);
+            const int rows = static_cast<int>(qo_new_h[r + 1]) - dst0;
+            if (rows <= 0) continue;
+            CUDA_CHECK(cudaMemcpyAsync(
+                packed + static_cast<std::size_t>(dst0) * V_dim,
+                la.core_out.data() + static_cast<std::size_t>(src0) * V_dim,
+                static_cast<std::size_t>(rows) * V_dim * sizeof(float),
+                cudaMemcpyDeviceToDevice, stream));
+        }
+        core_rows = packed;
+    }
+
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_post_ms : nullptr,
         stream, [&] {
     kernels::launch_rmsnorm_gated_fp32_in_bf16(
-        la.core_out.data(), z_data, Lw.la_norm_w_fp32,
+        core_rows, z_data, Lw.la_norm_w_fp32,
         la.core_out_bf16.data(),
-        N * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
+        N_new * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
     // out_proj: TP=1 fuses residual via beta=1; TP>1 row-parallel +
     // all-reduce + residual-add.
     if (T == 1) {
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             la.core_out_bf16.data(), Lw.la_out_proj->data(),
-            ws.y.data(), N, H, V_dim, /*beta=*/1.f);
+            ws.y.data(), N_new, H, V_dim, /*beta=*/1.f);
     } else {
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             la.core_out_bf16.data(), Lw.la_out_proj->data(),
-            ws.norm_y.data(), N, H, V_dim, /*beta=*/0.f);
+            ws.norm_y.data(), N_new, H, V_dim, /*beta=*/0.f);
         tp->all_reduce_bf16(ws.norm_y.data(),
-            static_cast<std::size_t>(N) * H, ncclSum, stream);
+            static_cast<std::size_t>(N_new) * H, ncclSum, stream);
         kernels::launch_residual_add_bf16(
             ws.y.data(), ws.norm_y.data(),
-            static_cast<std::size_t>(N) * H, stream);
+            static_cast<std::size_t>(N_new) * H, stream);
     }
     });
 }
@@ -1351,8 +1560,7 @@ void full_attn_body(
     const std::uint32_t* w_off_d,
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
-    ops::CublasHandle& cublas, cudaStream_t stream,
-    const StageHooks* hooks)
+    ops::CublasHandle& cublas, cudaStream_t stream)
 {
     const int T  = std::max(1, fwd_cfg.tp_size);
     const int H  = cfg.hidden_size;
@@ -1406,7 +1614,6 @@ void full_attn_body(
     // observer scoring it against the cached keys -- which are stored
     // post-rope -- compares in the same space.
     invoke_stage_hook(
-        hooks,
         StageHookPoint::OnAttnProj, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -1464,7 +1671,6 @@ void full_attn_body(
             ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     }
     invoke_stage_hook(
-        hooks,
         StageHookPoint::OnAttn, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -1521,9 +1727,15 @@ bool moe_block(
     // has to apply the sigmoid scalar gate.
     bool moe_shared_folded = false;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
+    // Streamed experts have no fused slab, so every device-side path that
+    // builds pointer arrays by striding one is off the table. The general
+    // path already dispatches one expert at a time, which is exactly the
+    // granularity a slot has.
+    const bool streamed = Lw.expert_cache != nullptr;
     const bool use_decode_fast_path =
-        is_pure_decode ||
-        (N > 0 && N <= qwen35_moe_decode_fast_max_tokens());
+        !streamed && !qwen35_moe_force_general_path() &&
+        (is_pure_decode ||
+         (N > 0 && N <= qwen35_moe_decode_fast_max_tokens()));
     if (moe_path_log_enabled()) {
         // One line per distinct (N, pure_decode, path) triple, so a whole
         // run reports which shapes took which path without 40 lines per
@@ -1998,6 +2210,20 @@ bool moe_block(
                 CUDA_CHECK(cudaMemsetAsync(ws.norm_y.data(), 0,
                     (std::size_t)N * H * sizeof(std::uint16_t), stream));
                 const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
+                if (streamed) {
+                    // Routing is known for the whole layer before any of it
+                    // runs, and the experts are paged one at a time, so say up
+                    // front which ones are wanted. The read for expert e+1 then
+                    // overlaps the GEMMs for expert e instead of following
+                    // them. This is the only point in the pass that knows the
+                    // order, and it is why prefetching is worth stating rather
+                    // than leaving to the page cache's readahead.
+                    for (int e = 0; e < E; ++e) {
+                        if (routing.token_idx[e].empty()) continue;
+                        Lw.expert_cache->prefetch(
+                            Lw.expert_group, static_cast<std::uint32_t>(e));
+                    }
+                }
                 for (int e = 0; e < E; ++e) {
                     const auto& tok_idx = routing.token_idx[e];
                     const auto& wts     = routing.weights[e];
@@ -2017,9 +2243,26 @@ bool moe_block(
                         moe_ws.expert_in.data(),
                         Ne, H, stream);
 
-                    const auto* gate_up_w = static_cast<const std::uint16_t*>(
-                                                Lw.moe_gate_up_proj->data())
-                                            + e * expert_stride_gu;
+                    const std::uint16_t* gate_up_w = nullptr;
+                    const std::uint16_t* down_w = nullptr;
+                    if (streamed) {
+                        // Page it in. The slot holds exactly what one stride of
+                        // the stack would have held: the group's plan is the
+                        // stack's expression with the expert axis removed.
+                        const WeightStore& slot = Lw.expert_cache->ensure_resident(
+                            Lw.expert_group, static_cast<std::uint32_t>(e), stream);
+                        gate_up_w = static_cast<const std::uint16_t*>(
+                            slot.get("gate_up_proj").data());
+                        down_w = static_cast<const std::uint16_t*>(
+                            slot.get("down_proj").data());
+                    } else {
+                        gate_up_w = static_cast<const std::uint16_t*>(
+                                        Lw.moe_gate_up_proj->data())
+                                    + e * expert_stride_gu;
+                        down_w = static_cast<const std::uint16_t*>(
+                                     Lw.moe_down_proj->data())
+                                 + e * expert_stride_dn;
+                    }
                     ops::gemm_act_x_wt_bf16(cublas.handle(),
                         moe_ws.expert_in.data(), gate_up_w,
                         moe_ws.expert_gate_up.data(), Ne, 2 * Im, H);
@@ -2030,9 +2273,6 @@ bool moe_block(
                         Ne, Im, stream,
                         /*gate_second=*/moe_gate_up_swapped());
 
-                    const auto* down_w = static_cast<const std::uint16_t*>(
-                                             Lw.moe_down_proj->data())
-                                         + e * expert_stride_dn;
                     ops::gemm_act_x_wt_bf16(cublas.handle(),
                         moe_ws.expert_act.data(), down_w,
                         moe_ws.expert_out.data(), Ne, H, Im);
@@ -2041,6 +2281,16 @@ bool moe_block(
                         ws.norm_y.data(), moe_ws.expert_out.data(),
                         moe_ws.expert_idx.data(), moe_ws.expert_w.data(),
                         Ne, H, stream);
+
+                    if (streamed) {
+                        // Unpin per expert, not per layer: the pin then covers
+                        // exactly the launches that read the slot. Holding a
+                        // whole layer's routed set would make the slab's
+                        // minimum size the number of experts a step happens to
+                        // route to. Nothing races -- a later page-in that wants
+                        // this slot syncs `stream` before overwriting it.
+                        Lw.expert_cache->end_batch();
+                    }
                 }
             });
     }
@@ -2199,9 +2449,13 @@ void qwen3_5_moe_forward_paged(
     const std::uint32_t* rs_buffer_slot_ids_h,
     const std::uint32_t* rs_buffer_slot_indptr_h,
     const std::int32_t* rs_fold_lens,
+    const std::uint32_t* rs_fold_lens_h,
     bool rs_buffer_write,
     bool rs_buffer_fold,
-    const StageHooks* hooks)
+    const std::uint32_t* rs_buffer_read_slot_ids_h,
+    const std::uint32_t* rs_buffer_read_indptr_h,
+    const std::uint32_t* rs_buffer_read_lens_h,
+    const std::uint32_t* rs_buffer_heads_h)
 {
     // Recurrent-only commit-advance (see qwen3_5_forward.cpp): re-run only the
     // linear-attn block over the accepted tokens (gathered from the verify
@@ -2220,6 +2474,7 @@ void qwen3_5_moe_forward_paged(
         throw std::runtime_error(
             "buffered RS fold is missing per-request commit lengths");
     }
+
     // Pure-Qwen3-MoE (Qwen3-30B-A3B, model_type == "qwen3_moe") has no
     // linear-attn layers; the per-slot rs_cache is unused. Qwen3.5 /
     // 3.6-MoE additionally fires the linear-attn body — those layers
@@ -2235,6 +2490,85 @@ void qwen3_5_moe_forward_paged(
     const int R  = num_requests;
     const float eps = cfg.rms_norm_eps;
     cudaStream_t stream = cublas.stream();
+    // A buffered write that ALSO folds: the boundary is a `commit_len` over
+    // the extended layout rather than a separate replay pass, so it rides the
+    // ordinary write path. `rs_fold_lens` is emitted for every row of every
+    // buffered pass, so an all-zero one means "pure append" and must not turn
+    // the pass into a fold.
+    //
+    // A MIXED fire is the same thing per row: one request folds while another
+    // only appends. The rows share an initial state, an extended layout and
+    // their outputs -- they differ ONLY in whether the recurrence persists.
+    // So the pass-level `write_state` becomes "does ANY row persist", refined
+    // by a per-row device mask. A row persists when it folds, or when it has
+    // no buffer of its own at all (an empty write CSR span), which is the
+    // plain in-forward advance riding along in a buffered fire.
+    std::vector<std::uint8_t> rs_write_mask_h;
+    const std::uint8_t* rs_write_state_mask_d = nullptr;
+    bool write_folds = false;
+    if (rs_buffer_write && rs_fold_lens_h != nullptr &&
+        rs_buffer_slot_indptr_h != nullptr) {
+        rs_write_mask_h.resize(static_cast<std::size_t>(R));
+        bool all_persist = true;
+        for (int r = 0; r < R; ++r) {
+            const bool row_buffered =
+                rs_buffer_slot_indptr_h[r + 1] > rs_buffer_slot_indptr_h[r];
+            const bool persists = rs_fold_lens_h[r] != 0 || !row_buffered;
+            rs_write_mask_h[r] = persists ? 1 : 0;
+            write_folds = write_folds || persists;
+            all_persist = all_persist && persists;
+        }
+        if (write_folds && !all_persist) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.rs_write_state_mask.data(), rs_write_mask_h.data(),
+                rs_write_mask_h.size() * sizeof(std::uint8_t),
+                cudaMemcpyHostToDevice, stream));
+            rs_write_state_mask_d = la_ws.rs_write_state_mask.data();
+        }
+    }
+
+    // The extended token layout for the buffer-read path, built once per fire
+    // because every linear layer runs over the same rows.
+    std::vector<std::uint32_t> qo_ext_h;
+    const std::uint32_t* qo_ext_d = nullptr;
+    int n_ext = 0;
+    const bool has_buffer_read =
+        rs_buffer_read_lens_h != nullptr &&
+        rs_buffer_read_indptr_h != nullptr &&
+        rs_buffer_read_slot_ids_h != nullptr &&
+        std::any_of(rs_buffer_read_lens_h, rs_buffer_read_lens_h + R,
+                    [](std::uint32_t len) { return len != 0; });
+    if (has_buffer_read) {
+        if (rs_buffer_fold) {
+            throw std::runtime_error(
+                "an RS fold replays the buffer itself; it cannot also carry a "
+                "buffer read");
+        }
+        if (qo_indptr_h == nullptr) {
+            throw std::runtime_error(
+                "RS buffer read needs the host-side qo_indptr to place each "
+                "request's replayed prefix");
+        }
+        qo_ext_h.resize(static_cast<std::size_t>(R) + 1);
+        qo_ext_h[0] = 0;
+        for (int r = 0; r < R; ++r) {
+            const std::uint32_t rows =
+                (qo_indptr_h[r + 1] - qo_indptr_h[r]) + rs_buffer_read_lens_h[r];
+            qo_ext_h[r + 1] = qo_ext_h[r] + rows;
+        }
+        n_ext = static_cast<int>(qo_ext_h[R]);
+        if (la_ws.max_tokens > 0 && n_ext > la_ws.max_tokens) {
+            throw std::runtime_error(
+                "RS buffer replay plus new tokens (" + std::to_string(n_ext) +
+                ") exceeds the linear-attention workspace capacity (" +
+                std::to_string(la_ws.max_tokens) + ")");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            la_ws.qo_ext.data(), qo_ext_h.data(),
+            qo_ext_h.size() * sizeof(std::uint32_t),
+            cudaMemcpyHostToDevice, stream));
+        qo_ext_d = la_ws.qo_ext.data();
+    }
     if (has_write_desc) {
         const bool has_full_attention = std::any_of(
             w.layers.begin(), w.layers.end(), [](const auto& layer) {
@@ -2316,7 +2650,12 @@ void qwen3_5_moe_forward_paged(
                 cublas, stream, &profile,
                 rs_buffer_fold ? rs_fold_lens : nullptr,
                 rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                /*rs_buffer_write=*/false, rs_buffer_fold, hooks);
+                /*rs_buffer_write=*/false, /*rs_fold_after_write=*/false,
+                rs_buffer_fold,
+                // A fold IS the replay; it never carries a read as well. It
+                // still needs the head: its own gather is physical.
+                nullptr, nullptr, nullptr, rs_buffer_heads_h,
+                nullptr, nullptr, 0);
             ++linear_idx;
             continue;
         }
@@ -2350,7 +2689,14 @@ void qwen3_5_moe_forward_paged(
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                     cublas, stream, &profile, /*commit_len=*/nullptr,
                     rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                    rs_buffer_write, /*rs_buffer_fold=*/false, hooks);
+                    rs_buffer_write, /*rs_fold_after_write=*/write_folds,
+                    /*rs_buffer_fold=*/false,
+                    has_buffer_read ? rs_buffer_read_slot_ids_h : nullptr,
+                    has_buffer_read ? rs_buffer_read_indptr_h : nullptr,
+                    has_buffer_read ? rs_buffer_read_lens_h : nullptr,
+                    rs_buffer_heads_h,
+                    has_buffer_read ? qo_ext_h.data() : nullptr,
+                    qo_ext_d, n_ext, rs_write_state_mask_d);
             });
         } else {
             ++profile.full_layers;
@@ -2363,7 +2709,7 @@ void qwen3_5_moe_forward_paged(
                     positions, qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
                     w_page_d, w_off_d, row_valid_d, has_write_desc,
-                    cublas, stream, hooks);
+                    cublas, stream);
             });
         }
         // (Post-attention residual fused into the body's final GEMM

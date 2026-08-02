@@ -24,6 +24,7 @@
 //   * wire custom (non-causal) BRLE masks co-batched with device geometry
 
 #include <algorithm>
+#include "page_translation.hpp"
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -31,17 +32,17 @@
 #include <string>
 #include <vector>
 
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/fire/view.hpp"
 
 #include "batch/rs_metadata.hpp"
-#include "pie_native/fire/fire_geometry.hpp"
+#include "pie/driver/fire/geometry.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
+// fire-geometry) now lives in pie::driver::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
+using namespace pie::driver::fire;
 
 inline int mtp_global_history_tokens(
     int input_position,
@@ -101,6 +102,15 @@ struct ComposedBatch {
     std::vector<std::uint32_t> rs_fold_lens;
     std::vector<std::uint32_t> rs_buffer_slot_ids;
     std::vector<std::uint32_t> rs_buffer_slot_indptr;
+    // Buffer READ side, in the same composed request order. Unlike the write
+    // CSR this is never channel-resolved: a replay span is a property of the
+    // working set's occupancy, which only the host knows, so it always comes
+    // straight off the wire. It still has to be REORDERED with everything else
+    // -- composition emits wire programs before device-geometry ones.
+    std::vector<std::uint32_t> rs_buffer_read_slot_ids;
+    std::vector<std::uint32_t> rs_buffer_read_indptr;
+    std::vector<std::uint32_t> rs_buffer_read_lens;
+    std::vector<std::uint32_t> rs_buffer_heads;
     std::vector<StructuredMaskDescriptor> structured_masks;
     // Explicit KV-write descriptor covering EVERY composed token row
     // (`has_write_desc` routes the whole forward's KV append through it, so
@@ -219,9 +229,25 @@ inline bool validate_folded_rs_bindings(
     }
     for (std::size_t request = 0; request < slot_flags.size(); ++request) {
         const std::uint8_t flags = slot_flags[request];
-        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD)) != 0) {
+        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD |
+                       PIE_RS_FLAG_BUFFER_WRITE |
+                       PIE_RS_FLAG_FOLD_LEN_DEVICE)) != 0) {
             if (error != nullptr) {
                 *error = "folded RS flags contain unknown bits";
+            }
+            return false;
+        }
+        // This runs on the pre-composition wire row, where the bit is still
+        // an instruction to `append_rs` rather than a property of the row:
+        // once the resolved length is substituted the row is an ordinary
+        // buffered fold and `append_rs` CLEARS the bit. A row that claims a
+        // device-resident length without a fold is malformed.
+        if ((flags & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0 &&
+            (flags & PIE_RS_FLAG_FOLD) == 0) {
+            if (error != nullptr) {
+                *error =
+                    "a folded RS row claims a device-resident fold length but "
+                    "does not fold";
             }
             return false;
         }
@@ -344,21 +370,50 @@ inline bool plan_rs_execution(
         }
     }
 
-    const bool any_fold = std::any_of(
-        slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
-            return (flags & PIE_RS_FLAG_FOLD) != 0;
-        });
-    const bool all_fold = std::all_of(
-        slot_flags.begin(), slot_flags.end(), [](std::uint8_t flags) {
-            return (flags & PIE_RS_FLAG_FOLD) != 0;
-        });
-    if (any_fold != all_fold) {
+    // A pass that scatters its own tokens into the buffer runs the extended
+    // `[buffered | new]` layout; if it ALSO folds, the boundary is expressed
+    // as a `commit_len` over that layout rather than as a separate replay, so
+    // the mode is still a write. Only a pure commit -- a fold with no write --
+    // takes the gather-from-slabs BufferFold path.
+    //
+    // Rows are classified individually, because a fire may MIX them. A row
+    // that owns no buffer in this pass -- empty CSR span, no BUFFER_WRITE --
+    // is the plain in-forward advance, and it composes with buffered rows: the
+    // two shapes run the identical dispatch over the extended layout and
+    // disagree only about whether the recurrence persists, which travels as a
+    // per-row mask. A pure REPLAY row does NOT compose: it gathers activations
+    // out of the slabs instead of computing them.
+    auto row_span = [&](std::size_t r) -> std::uint32_t {
+        return has_buffer_csr
+            ? buffer_slot_indptr[r + 1] - buffer_slot_indptr[r]
+            : 0;
+    };
+    // NOTE `PIE_RS_FLAG_BUFFER_WRITE` marks a row that writes the buffer AND
+    // folds; a pure append carries no flags at all. So the write is read off
+    // the CSR span, and the flags only say whether the row's state persists.
+    bool any_buffer = false;
+    bool any_replay = false;
+    bool all_replay = true;
+    for (std::size_t r = 0; r < requests; ++r) {
+        const std::uint8_t flags = slot_flags[r];
+        const bool buffered_row = row_span(r) > 0;
+        const bool replays = buffered_row &&
+            (flags & PIE_RS_FLAG_FOLD) != 0 &&
+            (flags & PIE_RS_FLAG_BUFFER_WRITE) == 0;
+        any_buffer = any_buffer || buffered_row;
+        any_replay = any_replay || replays;
+        all_replay = all_replay && replays;
+    }
+    if (any_replay && !all_replay) {
         if (error != nullptr) {
-            *error = "mixed folded and forward RS rows are unsupported";
+            *error =
+                "an RS row that only replays buffered tokens cannot share a fire with "
+                "one that computes new ones";
         }
         return false;
     }
-    if (!any_fold && buffer_slot_ids.empty()) {
+    const bool any_fold = all_replay;
+    if (!any_fold && !any_buffer) {
         plan.mode = pie_cuda_driver::RsExecutionMode::Forward;
         return true;
     }
@@ -414,6 +469,9 @@ inline bool plan_rs_execution(
             if (error != nullptr) *error = "resolved RS query CSR is not monotonic";
             return false;
         }
+        // An in-forward row riding along in a mixed fire owns no slabs and
+        // scatters nothing; its tokens are not buffer tokens.
+        if (row_span(request) == 0) continue;
         const std::uint64_t required_slabs =
             (static_cast<std::uint64_t>(end - begin) + buffer_page_tokens - 1) /
             buffer_page_tokens;
@@ -490,7 +548,7 @@ inline std::optional<int> runtime_window_for_tail_aligned(
 // descriptor resolution. Requires `view.ptir_program_row_indptr` (the runtime
 // ships it for every direct launch). Returns false + `*err` on a violated
 // contract; the executor must fail the fire.
-inline bool compose_forward_batch(const pie_native::LaunchView& view,
+inline bool compose_forward_batch(const pie::driver::fire::LaunchView& view,
                                   const ResolvedPrograms& resolved,
                                   std::uint32_t page_size,
                                   ComposedBatch& out,
@@ -569,8 +627,36 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
         view.rs_buffer_slot_ids.as<std::uint32_t>();
     const auto input_rs_buffer_indptr =
         view.rs_buffer_slot_indptr.as<std::uint32_t>();
-    const bool has_rs_buffer = !input_rs_buffer_indptr.empty();
-    if (has_rs_buffer) {
+    const auto input_rs_read_ids =
+        view.rs_buffer_read_slot_ids.as<std::uint32_t>();
+    const auto input_rs_read_indptr =
+        view.rs_buffer_read_indptr.as<std::uint32_t>();
+    const auto input_rs_read_lens =
+        view.rs_buffer_read_lens.as<std::uint32_t>();
+    const auto input_rs_heads = view.rs_buffer_heads.as<std::uint32_t>();
+    const bool has_rs_read =
+        input_rs_read_lens.size() == input_request_count &&
+        input_rs_read_indptr.size() == input_request_count + 1;
+    const bool has_rs_heads = input_rs_heads.size() == input_request_count;
+    if (!input_rs_read_lens.empty() && !has_rs_read) {
+        if (err) *err =
+            "ptir compose: buffered RS read CSR does not cover resolved requests";
+        return false;
+    }
+    const auto input_rs_translation = view.rs_translation.as<std::uint32_t>();
+    const auto input_rs_translation_indptr =
+        view.rs_translation_indptr.as<std::uint32_t>();
+    bool any_resolved_rs_buffer = false;
+    for (std::size_t p = 0; p < n_prog; ++p) {
+        if (resolved.is_device_geometry[p] &&
+            resolved.per_program[p].has_rs_buffer_family) {
+            any_resolved_rs_buffer = true;
+            break;
+        }
+    }
+    const bool has_wire_rs_buffer = !input_rs_buffer_indptr.empty();
+    const bool has_rs_buffer = has_wire_rs_buffer || any_resolved_rs_buffer;
+    if (has_wire_rs_buffer) {
         if (input_rs_buffer_indptr.size() != input_request_count + 1 ||
             input_rs_buffer_indptr.front() != 0 ||
             input_rs_buffer_indptr.back() != input_rs_buffer_ids.size()) {
@@ -597,6 +683,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
     out.kv_page_indptr.push_back(0);
     out.sampling_indptr.push_back(0);
     if (has_rs_buffer) out.rs_buffer_slot_indptr.push_back(0);
+    if (has_rs_read) out.rs_buffer_read_indptr.push_back(0);
     out.prog_sample_offsets.assign(n_prog + 1, 0);
     out.prog_sample_starts.assign(n_prog, 0);
     out.prog_sample_counts.assign(n_prog, 0);
@@ -610,9 +697,10 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
     out.prog_page_counts.assign(n_prog, unavailable);
     out.prog_query_lens.assign(n_prog, unavailable);
     out.prog_key_lens.assign(n_prog, unavailable);
-    auto append_rs = [&](std::size_t program) {
+    auto append_rs = [&](std::size_t program) -> bool {
         const std::uint32_t begin = input_request_starts[program];
         const std::uint32_t count = input_request_counts[program];
+        const FireGeometry& geom = resolved.per_program[program];
         if (has_folded_rs) {
             out.rs_slot_ids.insert(
                 out.rs_slot_ids.end(),
@@ -622,30 +710,182 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
                 out.rs_slot_flags.end(),
                 input_rs_flags.begin() + begin,
                 input_rs_flags.begin() + begin + count);
+            // FOLD_LEN_DEVICE is an instruction to THIS function, not a
+            // property of the row. Once the resolved length has been
+            // substituted below, the row is an ordinary buffered fold and must
+            // be indistinguishable from one -- so the bit is cleared here
+            // rather than travelling on into the frame and the kernels, where
+            // "does this row carry an unresolved length" is no longer true and
+            // nothing downstream should be able to branch on it.
+            for (std::size_t i = out.rs_slot_flags.size() - count;
+                 i < out.rs_slot_flags.size(); ++i) {
+                out.rs_slot_flags[i] &=
+                    static_cast<std::uint8_t>(~PIE_RS_FLAG_FOLD_LEN_DEVICE);
+            }
+            // The fold length is the ONE RS quantity the host is allowed not
+            // to know. A row flagged FOLD_LEN_DEVICE carries, on the wire, the
+            // host's UPPER BOUND on its own buffer occupancy -- not garbage --
+            // and the real length comes from the resolved `rs_fold_len` port.
+            // Clamping the resolved value to that bound is what makes the
+            // whole scheme safe: the device may name a count the host never
+            // saw, but it can never name one the buffer cannot supply.
+            //
+            // This substitution happens BEFORE `plan_rs_execution` and before
+            // `validate_folded_rs_bindings`, so nothing downstream -- the
+            // replay CSR shape, the pure-decode classifier, the model's
+            // `commit_len` -- ever sees the placeholder. The flag does not
+            // need to escape composition.
             if (!input_rs_fold_lens.empty()) {
-                out.rs_fold_lens.insert(
-                    out.rs_fold_lens.end(),
-                    input_rs_fold_lens.begin() + begin,
-                    input_rs_fold_lens.begin() + begin + count);
-            }
-        }
-        if (has_rs_buffer) {
-            for (std::uint32_t request = begin;
-                 request < begin + count;
-                 ++request) {
-                const std::uint32_t lo = input_rs_buffer_indptr[request];
-                const std::uint32_t hi = input_rs_buffer_indptr[request + 1];
-                if (hi != lo) {
-                    out.rs_buffer_slot_ids.insert(
-                        out.rs_buffer_slot_ids.end(),
-                        input_rs_buffer_ids.begin() + lo,
-                        input_rs_buffer_ids.begin() + hi);
+                for (std::uint32_t r = 0; r < count; ++r) {
+                    const std::uint32_t bound = input_rs_fold_lens[begin + r];
+                    const std::uint8_t flags = input_rs_flags[begin + r];
+                    if ((flags & PIE_RS_FLAG_FOLD_LEN_DEVICE) == 0) {
+                        out.rs_fold_lens.push_back(bound);
+                        continue;
+                    }
+                    if (!geom.has_rs_fold_len || geom.rs_fold_lens.size() < count) {
+                        if (err) *err =
+                            "ptir compose: a row claims a device-resident fold "
+                            "length but its program resolved no fold length"
+                            " (program " + std::to_string(program) + ": " +
+                            std::to_string(geom.rs_fold_lens.size()) +
+                            " resolved for " + std::to_string(count) +
+                            " rows)";
+                        return false;
+                    }
+                    const std::uint32_t folded =
+                        std::min(geom.rs_fold_lens[r], bound);
+                    if (folded == 0) {
+                        if (err) *err =
+                            "ptir compose: a device-resident fold length "
+                            "resolved to 0, which is not a dispatchable "
+                            "commit -- a speculative commit must fold at "
+                            "least the bonus token it is guaranteed to accept";
+                        return false;
+                    }
+                    out.rs_fold_lens.push_back(folded);
                 }
-                out.rs_buffer_slot_indptr.push_back(
-                    static_cast<std::uint32_t>(
-                        out.rs_buffer_slot_ids.size()));
             }
         }
+        for (std::uint32_t request = begin; request < begin + count; ++request) {
+            if (has_rs_read) {
+                const std::uint32_t lo = input_rs_read_indptr[request];
+                const std::uint32_t hi = input_rs_read_indptr[request + 1];
+                if (hi < lo || hi > input_rs_read_ids.size()) {
+                    if (err) *err = "ptir compose: buffered RS read CSR malformed";
+                    return false;
+                }
+                out.rs_buffer_read_slot_ids.insert(
+                    out.rs_buffer_read_slot_ids.end(),
+                    input_rs_read_ids.begin() + lo,
+                    input_rs_read_ids.begin() + hi);
+                out.rs_buffer_read_indptr.push_back(
+                    static_cast<std::uint32_t>(out.rs_buffer_read_slot_ids.size()));
+                out.rs_buffer_read_lens.push_back(input_rs_read_lens[request]);
+            }
+            if (has_rs_heads) out.rs_buffer_heads.push_back(input_rs_heads[request]);
+        }
+        if (!has_rs_buffer) return true;
+        // Channel-resolved `rs-geometry` wins over the host-derived CSR when
+        // the program traced it. The values are WorkingSet-RELATIVE buffer
+        // page indexes -- the guest never holds a physical slot id -- so they
+        // must go through this request's translation segment. The segment is
+        // per REQUEST, not per program: a pass binds one RS working set per
+        // request, so there is no single table for the fire the way there is
+        // for KV.
+        // `rs_w_slot`/`rs_w_off` describe where each token's buffered
+        // activations land. The driver's scatter walks a row's listed slabs
+        // page-major and contiguously -- it has no per-token indirection --
+        // so the ONLY descriptor it can honour is the one that says exactly
+        // that. Rather than resolve these ports and silently ignore them,
+        // check that they agree with the layout and refuse if they do not.
+        if (geom.has_rs_write_desc) {
+            if (geom.rs_w_slot.size() != geom.rs_w_off.size()) {
+                if (err) *err =
+                    "ptir compose: rs write descriptor slot/off length mismatch";
+                return false;
+            }
+            for (std::size_t t = 1; t < geom.rs_w_slot.size(); ++t) {
+                const bool same_slab = geom.rs_w_slot[t] == geom.rs_w_slot[t - 1];
+                const bool steps_within =
+                    same_slab && geom.rs_w_off[t] == geom.rs_w_off[t - 1] + 1;
+                const bool steps_across =
+                    geom.rs_w_slot[t] == geom.rs_w_slot[t - 1] + 1 &&
+                    geom.rs_w_off[t] == 0;
+                if (!steps_within && !steps_across) {
+                    if (err) *err =
+                        "ptir compose: rs write descriptor is not the "
+                        "contiguous page-major layout the recurrence scatters "
+                        "into; a per-token buffered-activation target is not "
+                        "implemented";
+                    return false;
+                }
+            }
+        }
+        const bool from_channels =
+            resolved.is_device_geometry[program] && geom.has_rs_buffer_family &&
+            geom.rs_buffer_slot_indptr.size() == count + 1;
+        const bool has_translation =
+            input_rs_translation_indptr.size() > begin + count;
+        if (from_channels && !has_translation) {
+            if (err) *err =
+                "ptir compose: channel-resolved rs-geometry without a "
+                "buffer-page translation";
+            return false;
+        }
+        for (std::uint32_t request = begin; request < begin + count; ++request) {
+            if (!from_channels && !has_wire_rs_buffer) {
+                out.rs_buffer_slot_indptr.push_back(
+                    static_cast<std::uint32_t>(out.rs_buffer_slot_ids.size()));
+                continue;
+            }
+            const std::uint32_t lo = from_channels
+                ? geom.rs_buffer_slot_indptr[request - begin]
+                : input_rs_buffer_indptr[request];
+            const std::uint32_t hi = from_channels
+                ? geom.rs_buffer_slot_indptr[request - begin + 1]
+                : input_rs_buffer_indptr[request + 1];
+            const auto& source = from_channels
+                ? geom.rs_buffer_slot_ids
+                : input_rs_buffer_ids;
+            if (hi > lo) {
+                if (hi > source.size()) {
+                    if (err) *err = "ptir compose: buffered RS CSR overruns its ids";
+                    return false;
+                }
+                const std::size_t appended = out.rs_buffer_slot_ids.size();
+                out.rs_buffer_slot_ids.insert(
+                    out.rs_buffer_slot_ids.end(),
+                    source.begin() + lo,
+                    source.begin() + hi);
+                if (from_channels) {
+                    const std::uint32_t tr_lo =
+                        input_rs_translation_indptr[request];
+                    const std::uint32_t tr_hi =
+                        input_rs_translation_indptr[request + 1];
+                    if (tr_hi < tr_lo || tr_hi > input_rs_translation.size()) {
+                        if (err) *err =
+                            "ptir compose: rs translation CSR malformed";
+                        return false;
+                    }
+                    std::string translate_error;
+                    if (!translate_resolved_rs_slot_ids(
+                            std::span<std::uint32_t>(
+                                out.rs_buffer_slot_ids.data() + appended,
+                                hi - lo),
+                            std::span<const std::uint32_t>(
+                                input_rs_translation.data() + tr_lo,
+                                tr_hi - tr_lo),
+                            &translate_error)) {
+                        if (err) *err = "ptir compose: " + translate_error;
+                        return false;
+                    }
+                }
+            }
+            out.rs_buffer_slot_indptr.push_back(
+                static_cast<std::uint32_t>(out.rs_buffer_slot_ids.size()));
+        }
+        return true;
     };
 
     bool any_write_desc = false;
@@ -806,7 +1046,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
         out.prog_sample_counts[p] =
             static_cast<std::uint32_t>(out.sampling_indices.size()) -
             out.prog_sample_starts[p];
-        append_rs(p);
+        if (!append_rs(p)) return false;
     }
 
     // Pass 2 — device-geometry programs, appended in program order.
@@ -912,7 +1152,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
                 }
             }
         }
-        append_rs(p);
+        if (!append_rs(p)) return false;
     }
     out.prog_sample_offsets[n_prog] =
         static_cast<std::uint32_t>(out.sampling_indices.size());
@@ -930,7 +1170,11 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
           (!input_rs_fold_lens.empty() &&
            out.rs_fold_lens.size() != composed_requests))) ||
         (has_rs_buffer &&
-         out.rs_buffer_slot_indptr.size() != composed_requests + 1)) {
+         out.rs_buffer_slot_indptr.size() != composed_requests + 1) ||
+        (has_rs_read &&
+         (out.rs_buffer_read_lens.size() != composed_requests ||
+          out.rs_buffer_read_indptr.size() != composed_requests + 1)) ||
+        (has_rs_heads && out.rs_buffer_heads.size() != composed_requests)) {
         if (err) *err = "ptir compose: composed RS request attribution mismatch";
         return false;
     }
@@ -940,7 +1184,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
 // Per-program logits row offsets for a PURE-WIRE launch (no device-geometry
 // program resolved): the gathered order is the wire request order, so program
 // `p`'s sampled rows start at `sampling_indptr[row_indptr[p]]`.
-inline bool wire_program_sample_offsets(const pie_native::LaunchView& view,
+inline bool wire_program_sample_offsets(const pie::driver::fire::LaunchView& view,
                                         std::vector<std::uint32_t>& out,
                                         std::string* err) {
     const std::size_t n_prog = view.ptir_program_hashes.size();

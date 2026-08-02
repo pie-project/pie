@@ -11,7 +11,7 @@
 //! the mask binding plus the mask-evolution epilogue ops (iota/le/put) —
 //! the attention-path swap is the measured object.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
@@ -81,11 +81,11 @@ struct Output {
 }
 
 /// One sampling step: temperature, then a Gumbel-max draw over the full vocab.
-fn step(logits: Tensor, temperature: f32, rng_state: impl AsTensor + Copy) -> Tensor {
+fn step(logits: Tensor, temperature: f32, rng_state: &Tensor) -> Tensor {
     let scaled = if temperature == 1.0 {
         logits
     } else {
-        div(&logits, temperature)
+        &logits / temperature
     };
     gumbel_max(scaled, rng_state)
 }
@@ -119,7 +119,7 @@ async fn main(input: Input) -> Result<Output> {
     // composed batch is forced through the wire-mask ASSEMBLY branch.
     let holed = mask_mode == "dense-prefill-hole";
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -197,21 +197,23 @@ async fn main(input: Input) -> Result<Output> {
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
-            ..,
-            ..,
-            &kv_len_p,
-            &pages_p,
-            &page_indptr_p,
-            &w_slot_p,
-            &w_off_p,
-            &positions_p,
-            mask_p.as_ref(),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: mask_p.as_ref(),
+            },
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
-            let r_next = add(&r, iota(2));
+            let r_next = &r + iota(2);
             tok_out_p.put(&token);
             rng_p.put(&r_next);
         });
@@ -221,10 +223,9 @@ async fn main(input: Input) -> Result<Output> {
             .map_err(|e| format!("prefill submit @{base}: {e}"))?;
 
         g0 = tok_out_p
-            .take()
-            .get::<i32>()
+            .take_host::<i32>()
             .await
-            .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
+            .map_err(|e| format!("g0 take @{base}: {e}"))?;
     }
     generated.push(g0 as u32);
 
@@ -267,20 +268,22 @@ async fn main(input: Input) -> Result<Output> {
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &klen,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &pos,
-            if masked { Some(&mask) } else { None },
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: if masked { Some(&mask) } else { None },
+            },
         )?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
-            let base = fill.take().tensor(); // [1] u32 — position this fire writes
-            let pids = pool_ids_ch.take().tensor();
+            let base = fill.take(); // [1] u32 — position this fire writes
+            let pids = pool_ids_ch.take();
             let r = rng.take();
 
             let logits = intrinsics::logits();
@@ -288,17 +291,17 @@ async fn main(input: Input) -> Result<Output> {
                 lg_out.put(&reduce_max(&logits));
             }
             let token = step(logits, temperature, &r);
-            let r_next = add(&r, iota(2));
+            let r_next = &r + iota(2);
 
-            let logical_slot = div(&base, page_size);
+            let logical_slot = &base / page_size;
             let w_slot_v = gather(&pids, &logical_slot);
-            let w_off_v = rem(&base, page_size);
-            let klen_v = add(&base, 1u32);
-            let next_free = add(&base, 1u32);
+            let w_off_v = &base % page_size;
+            let klen_v = &base + 1u32;
+            let next_free = &base + 1u32;
             let pages_v = reshape(&pids, [pool_pages]);
             // Page count tracks the new kv length, never the pool size.
-            let page_count = div(add(&klen_v, page_size - 1), page_size);
-            let pidx_v = mul(iota(2), broadcast(&page_count, [2]));
+            let page_count = klen_v.div_ceil(page_size);
+            let pidx_v = indptr(1, &page_count);
 
             tok_in.take();
             tok_in.put(&token);
@@ -350,16 +353,14 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?;
             if probe {
                 let v = lg_out
-                    .take()
-                    .get::<f32>()
+                    .take_host::<f32>()
                     .await
-                    .map_err(|e| format!("lg_out.take: {e}"))?[0];
+                    .map_err(|e| format!("lg_out.take: {e}"))?;
                 lg.push(v);
             }
             generated.push(t as u32);

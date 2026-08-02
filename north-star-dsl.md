@@ -2632,3 +2632,238 @@ class); repeat nondeterminism = the known execution-history floor
 (control reproduces bands-off); 0.6B wall is overhead-bound, GPU win
 prices at 7B+. This is the first capability that exists ONLY because
 the table exists — no scalar-word design could have carried n bands.
+
+## ACT 1 PRICED (2026-08-04): 1.26x at 7B, and where the win lives
+
+Prefill-family bands land (this hardware's 7B/14B are prefill-decode
+deployments: per-band planned causal prefill, identity-qo prefix,
+own workspace; staleness fix; XQA degrades with a DECLINE trace).
+The 7B numbers teach the shape of the win: mixed full+trunc is a
+WASH — weight-bandwidth-bound decode reads every layer's weights
+regardless of row count — but ALL-TRUNCATED mixed-k prices 1.26x
+(2.25 vs 2.83s, 4×k8+4×k16, 128 tok, debug), because the banded walk
+STOPS past the deepest k and a skipped layer skips its weight pass.
+Corollary for the board: banded depth's headline case is draft/
+speculative fleets (all lanes truncated, mixed k); mixed
+full+truncated fires need the row-narrowing to become compute-bound
+(large R / prefill-shaped members) before it prices. Correctness: at
+both scales the full lane byte-matches its solo run and truncated
+lanes emit layer-k class — the demotion is dead wherever bands arm.
+
+## ACT 1 HARDENED AT 14B (2026-08-04): two real bugs, one honest limit
+
+Taking bands to 14B surfaced what 0.6B/7B could not: (1) the declared
+leg was swallowing banded fires and silently demoting them — the
+per-fire fallback now refuses stamped bands; (2) the frame's band
+computation sat inside the plan-once-per-frame skip, so steady-state
+steps read empty bands and replayed demoted graphs. Both are the same
+lesson the campaign kept teaching: A DEFAULT-ON AXIS MUST BE VISIBLE
+TO EVERY GATE THAT ROUTES AROUND THE WALKER THAT SERVES IT (graphs,
+legs, plan reuse). And one honest limit: the 14B chained-decode
+ENVELOPE rarely runs prepare at all (placeholder host inputs skip the
+plan hook), so banding it requires planning from composed geometry —
+scoped out as a future increment; the envelope degrades to the
+pre-Act-1 demotion, no regression. Diagnosis instruments are
+permanent (PIE_REGION_TRACE: [region] / [band-gate] / [band-prep]).
+
+## THE SECOND LEG WALKS BANDS (2026-08-04)
+
+The declared interpreter now serves banded fires: per-op live-row
+resolution from the band arrays, the PrefixPlanSwap dispatch pairing
+each band's plan with its own workspace; the generated static forms
+stand down; the model gate admits only fires whose decode-family band
+plans exist. Validated opt-in (PIE_DECLARED_FORWARD=1): 22 banded
+fires walk the trace, hand walker zero, full lane byte-equal, zero
+incidents. Record corrected: the declared leg (opt-in, never running)
+was NOT the 14B demoter — the envelope's prepare-skip was the whole
+story. Board: hand ✓ declared ✓ generated (stands down, port later);
+envelope banding and Act 2/3 remain.
+
+## THREE LEGS, ONE WALK (2026-08-04): banded depth completes its leg set
+
+The emitter spells the banded walk into the static forms (per-layer
+band resolution against the plan-state arrays, band plan/ws at the
+swap dispatch); the interpreter's stand-down is gone; five .inc forms
+regenerated. Parity: truncated rows CHARACTER-IDENTICAL across
+interpreter and generated legs; full rows within the sealed
+execution-history equality class (the earlier per-boot byte-matches
+were a deterministic sub-case, not a guarantee — the floor is the
+bar, as sealed in the observation ledger). Default-path bar re-run at
+the tip: census 15/15 PRODUCT, solo oracle byte-equal, zero
+incidents. Banded depth now exists in every walker the driver owns —
+the axis is total across legs, exactly what the v2 thesis demands of
+an axis: one vocabulary, one scheduler output, every consumer serves
+it or loudly declines.
+
+## BANDS COMPOSE (2026-08-04): the census increment lands
+
+The rung-③ spec's promissory note — "per-region k arms the
+non-uniform depth fire behind a census increment" — is paid: bands ×
+LORA is PRODUCT (15-24 fires per run carry lora=1 beside
+[depth-bands] R=4 — the correction lands on the plain row while the
+truncated rows band, one fire; note the fire trace prints k=-1 there
+because mixed-k derives max_layers FULL — banding is proven by the
+adjacent [depth-bands] line, a read-the-trace subtlety that cost one
+false alarm). Bands × MASK and bands × HOOK decline safely (lanes
+complete, zero incidents, the solo drain even exercised the DECLINE
+trace). The battery is formalized as .wiki/tart/bands_comp.py. The
+composition table's depth column now reads: uniform-k unions (S-2),
+mixed-k bands (Act 1), each composing with lora, degrading safely
+against mask/hooks until Act 2's (start,len)/gather admits them.
+
+## THE V2 SEAL (2026-08-04): release at the redesign's tip
+
+One release boot (15s settle) over the ENTIRE V2 arc — seams (①),
+depth-in-the-body (②a), the class collapse (②b), the region table
+and the words' death (③a-c), banded depth total across three legs
+with its composition cells (④ Act 1) — plus every prior campaign
+property: canonical 3/3, solo oracle BYTE-EQUAL to the pre-campaign
+reference, S-B identity + k8 determinism, census 15/15 PRODUCT (one
+first-pass PARTIAL = the documented release phasing artifact,
+resolved on the immediate retry), bands×lora PRODUCT (16 banded
+fires with the correction aboard), bands×mask/hook SAFE decline,
+banded trio full-lane prefix match, 68 banded fires, ZERO incidents.
+
+The redesign holds at release. What the review called four mechanisms
+is now: one attach vocabulary on the surface, one dispatch statement
+in the text, one region table on the wire, one seriation invariant in
+the scheduler, and one walk per leg that serves it — with every
+degradation loud and every axis's plans derived, not declared twice.
+
+## STABILITY EVALUATION (2026-08-04): the churn fault, characterized
+
+A hostile-load evaluation (requested as such) over ~25 minutes and
+~11k lanes. The verdicts, in order of confidence:
+
+ENGINE ROBUSTNESS: EXCELLENT. Zero crashes, zero illegal access, zero
+panics across every phase; RSS flat (~6.7GB) over 1193 max-rate
+rounds; round walls flat; sequential traffic (the canonical battery)
+unaffected even on a heavily-abused engine. The correctness bar holds
+(ORACLE_EQ, census with its known phasing retry, bands batteries).
+
+LANE RELIABILITY UNDER CONCURRENT MULTI-AXIS CHURN: POOR — and
+PRE-EXISTING. The full 4-axis 9-lane concurrent round (2 plain +
+dense + doc-isolation + snapkv + 2 lora + k8 + k12, stagger ≤35ms)
+kills 63-90% of lanes: driver prepare refuses "ptir prologue or
+channel readiness did not commit" (refused=12/13 tickets,
+consume-head behind expectation), retries exhaust, the work item
+publishes Failed, channels poison. The control settles attribution:
+the PRE-V2 binary (28e343569, rebuilt in a worktree) fails the same
+soak at the same magnitude (63%) — nothing this session's arc caused
+or worsened. Bisection: masks+hook alone CLEAN, lora+draft alone
+CLEAN, lora×(mask|hook) in one gather FAILS (the lora lanes
+themselves often survive while poisoning neighbours). The "frame slot
+1" signature points at multi-step frames racing the run-ahead channel
+ticket expectations. Why the census never saw it: its subsets stop at
+5 lanes with wider stagger; the 9-lane union with ≤35ms stagger is
+past the boundary the campaign's batteries ever exercised.
+
+FILED as the third standing observation (with the numeric floor and
+the kvpp heisenbug — now sentry-fenced): the repro is
+.wiki/tart/stability_soak.py (minutes [gap] args) plus the bisect
+recipe above. This is ENGINE machinery (frames/tickets/run-ahead),
+not axis machinery — the fix lives upstream of the composition
+fabric.
+
+## THE CHURN FAULT, ROOT-CAUSED (2026-08-04): a fix blueprint
+
+The mechanism, fully traced through the code:
+
+1. RESERVATIONS ARE OPTIMISTIC AND UNBOUNDED. Every submitted fire
+   reserves channel ticket sequences by incrementing
+   `device_reserved_head/tail` (channel.rs:356
+   `reserve_device_ticket`) with NO bound against ring capacity or
+   actual consumption — run-ahead reserves as deep as it likes.
+2. COMMIT HAPPENS AT SUBMIT, NOT AT TERMINAL. fire.rs:1228 commits
+   the TicketReservation as soon as submission succeeds; a fire that
+   later FAILS leaves its consume-head increments in the cell forever
+   (rollback is Drop-only and LIFO-only — fire.rs:768 — and by then
+   newer fires have reserved on top).
+3. THE DRIVER GATE IS EXACT. dispatch.cu:7735 refuses a lane when the
+   device words disagree with expectations: `consume-head-moved`
+   (head != expected — a prior fire never consumed),
+   `publish-tail-moved` / `publish-ring-full` (run-ahead published
+   deeper than cap1-1 unconsumed entries).
+4. v14 DELETED RETRY. worker.rs:4621: a surviving RETRY terminal is a
+   contract violation — "frame admission bounds every in-frame gate."
+   But no admission bound was ever implemented for the channel gates:
+   v13's RETRY was the backpressure, and its deletion left the gate
+   with only one outcome: FAIL the work item.
+5. THE CASCADE. One transiently-late lane (tight stagger: its guest
+   hasn't consumed / its ring is briefly full) fails its SHARED frame
+   step; every co-framed lane gets a Failed terminal; each failed
+   fire's committed reservations poison that instance's every later
+   expectation (head=63/exp66 = three leaked fires); fresh rounds
+   re-roll the dice each time. 63-90% lane death under 9-lane 35ms
+   churn; zero deaths when the mix or timing keeps every lane ready.
+
+THE FIX (blueprint, for a fresh context): restore the backpressure at
+ADMISSION, where v14 wants it — in fire.rs before
+`TicketReservation::new`, per cell: (a) publish tickets wait until
+`device_reserved_tail - host_consumed < cap1 - 1`
+(`await_channel_progress` exists for exactly this wait); (b) consume
+tickets wait until outstanding == 0 for the cell. With admission
+serialized per cell, rollback-on-failure becomes LIFO-trivial — roll
+reservations back on Failed terminals and the leak dies. Alternative
+smaller patch: reinstate a bounded retry FOR THE READINESS CLASS
+only (the gate already names its reason). Risk note: (a) bounds
+run-ahead depth to the ring capacity per generation channel — the
+measured run-ahead speedups should be re-priced after the fix with
+cap1 sized accordingly.
+
+## CONSTRAINT, STATED (2026-08-04): tart is a DRIVER feature
+
+The user's standing rule, now explicit: RUNTIME SCHEDULING MUST NOT
+CHANGE — tart's machinery belongs driver-side. Consequences:
+
+1. THE CHURN-FAULT BLUEPRINT IS REVISED. The engine-side admission
+   backpressure sketched above is WITHDRAWN. The driver-side fix: a
+   BOUNDED READINESS WAIT at the staging/prepare gate — the pinned
+   ticket words (dispatch.cu's StagedLane tickets) are host-readable,
+   and the driver can poll head/tail against expectations for a small
+   bounded window before declaring the lane uncommitted, absorbing
+   transient guest lag (the tight-stagger spark) with ZERO engine
+   changes. The reservation-leak cascade then never starts for the
+   transient class; genuine failures keep today's per-instance
+   semantics. Engine files stay untouched.
+2. THIS SESSION'S ENGINE TOUCHES, INVENTORIED against the rule:
+   the V2 arc's direction already complies in spirit — rung ③ MOVED
+   plan derivation OUT of the engine INTO the driver (batch.rs net
+   -272 lines; the driver derives, the engine only carries the region
+   table as data). ABI/submission edits are data carriage, not
+   scheduling. ONE genuine scheduling touch stands: the deepest-first
+   k term in the seriation key (fire_plan.rs, +38 lines with
+   MemberFacts.max_layers) — behavior-neutral for every uniform-k
+   fire, ordering-relevant only for mixed-k truncated lanes, and it
+   is what banded depth's prefix invariant rests on. FLAGGED for the
+   user's ruling: keep (small, neutral, load-bearing for bands) or
+   rework bands to tolerate arbitrary order via the region table
+   (the driver already reads per-region k — a driver-side sort of
+   band DISPATCH order is possible; the rows themselves cannot be
+   reordered driver-side).
+
+## THE DEV MERGE LANDS (2026-08-04): WIT 0.3 era opens
+
+github/dev (395+ commits) is merged (f94e97c7e + 8eb4bcef1): engine/
+worker/tokenizer upstream wholesale with data-field regrafts; all 34
+driver conflict hunks resolved with the V2 machinery INTACT — forward
+goldens 23/23, region table / bands / spatial / seams compiled and
+runtime-live; engine tests 403/403; full driver-cuda build green; E2E
+0.3 lanes and 11-lane concurrent probes clean. DORMANT this era,
+awaiting re-port onto the 0.3 container/channel surface: tart's guest
+APIs (set-max-layers, fwd.adapter, the 0.2 test inferlets and their
+batteries), qwen3_5 declared walker + hooks, upstream's fused LM-head
+argmax (deliberately off in tart bodies).
+
+TWO ATTRIBUTION RESULTS worth the whole day:
+1. THE CHURN FAULT IS UPSTREAM-WIDE: the 9-lane mixed 0.3 churn fails
+   98.3% on PURE github/dev vs 99% on the merged tree — e0454c39e
+   (dense-mask channels out of shared steps) is a partial fix; the
+   reservation/no-retry mechanism tart root-caused stands, upstream
+   included. The fix conversation belongs upstream.
+2. THE PHANTOM KILLER WAS A NEIGHBOUR: a co-located agent session
+   (cleanup-bravo) issues `pkill -x pie` on this box — today's
+   mystery SIGTERMs, dead boots and at least part of the historical
+   "boot-window register-death" flakiness were CROSS-AGENT KILLS, not
+   engine bugs. Standing ops rule: run our engine as `pie-tart`
+   (copy the binary; -x match misses it).

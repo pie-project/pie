@@ -41,20 +41,58 @@
 
 namespace pie_cuda_driver {
 
+/// The two things that differ between running a plan as the model's resident
+/// load and running one instance of a group into a slot.
+///
+/// A group plan is a whole plan, compiled at instance 0, which is exactly why
+/// the same executor runs it. What the caller has to say is where its
+/// persistent buffers land -- a slot it owns, not an arena the executor
+/// allocates -- and which instance's bytes to read. Nothing else about
+/// execution changes, and nothing here says whether the group is being
+/// streamed or made resident; that is the caller's business.
+struct LoadPlanExecution {
+    /// Where the plan's persistent buffers go. Null means allocate one, which
+    /// is the resident load and the default.
+    std::uint8_t* persistent_arena = nullptr;
+    std::uint64_t persistent_arena_bytes = 0;
+
+    /// One instance's slice of `PieLoaderGroupView::bindings`. Each entry
+    /// replaces the source extent of the instruction it names; the rest of the
+    /// instruction -- destination, stride, span, dtype -- is index-independent
+    /// by construction, which is what the loader proved when it accepted the
+    /// group. Empty means read what the plan was compiled to read.
+    const pie_loader::PieLoaderSourceBindingView* source_bindings = nullptr;
+    std::size_t source_binding_count = 0;
+};
 
 class LoadPlanExecutor {
 public:
+    /// `lent_copy_engine` is for a caller that runs many short plans -- a
+    /// group cache paging one instance per miss. An engine creates its copy
+    /// streams and pinned pool lazily and tears them down with itself, which
+    /// is free amortised over a whole model load and is the dominant cost of
+    /// a page-in that moves a few megabytes. Lending one hoists that setup out
+    /// of the loop. Null means own one, which is the resident load.
     LoadPlanExecutor(
         pie_loader::CheckpointSource& loader,
         WeightStoreBuilder& weights,
-        std::vector<RustQuantAttachment> quant_attachments)
+        std::vector<RustQuantAttachment> quant_attachments,
+        WeightCopyEngine* lent_copy_engine = nullptr)
         : loader_(loader),
           weights_(weights),
-          quant_attachments_(std::move(quant_attachments))
+          quant_attachments_(std::move(quant_attachments)),
+          copy_engine_(lent_copy_engine != nullptr ? *lent_copy_engine
+                                                   : owned_copy_engine_)
     {}
 
+    LoadExecutionStats execute(const pie_loader::LoadPlanView& plan)
+    {
+        return execute(plan, LoadPlanExecution{});
+    }
+
     LoadExecutionStats execute(
-        const pie_loader::LoadPlanView& plan)
+        const pie_loader::LoadPlanView& plan,
+        const LoadPlanExecution& how)
     {
         LoadExecutionStats stats;
         stats.planned_tensor_count = plan.tensors.len;
@@ -62,7 +100,8 @@ public:
             plan.memory.temporary_peak_bytes;
         stats.planned_storage_temp_bytes = plan.memory.temporary_peak_bytes;
         plan_index_.reset(plan);
-        init_persistent_arena(plan);
+        bind_sources(how);
+        init_persistent_arena(plan, how);
         copy_engine_.set_stats(&stats);
         const bool trace_executor =
             loader_config::env_present("PIE_CUDA_TRACE_STORAGE_EXECUTOR");
@@ -100,10 +139,10 @@ public:
                 fill(instr.op.fill);
                 break;
             case Tag::ExtentWrite:
-                extent_write(instr.op.extent_write, stats);
+                extent_write(instr.id, instr.op.extent_write, stats);
                 break;
             case Tag::BulkExtentWrite:
-                bulk_extent_write(instr.op.bulk_extent_write, stats);
+                bulk_extent_write(instr.id, instr.op.bulk_extent_write, stats);
                 break;
             case Tag::Finalize:
                 {
@@ -115,7 +154,10 @@ public:
                 copy_engine_.flush();
                 {
                     PhaseTimer _pt(&stats.phase_transform_ms);
-                    transcode_.tile_map(instr.op.tile_map, stats);
+                    transcode_.tile_map(
+                        instr.op.tile_map,
+                        resolved_source(instr.id, instr.op.tile_map.source),
+                        stats);
                 }
                 break;
             case Tag::CreateView:
@@ -201,8 +243,26 @@ private:
     }
 
     void init_persistent_arena(
-        const pie_loader::LoadPlanView& plan)
+        const pie_loader::LoadPlanView& plan,
+        const LoadPlanExecution& how)
     {
+        if (how.persistent_arena != nullptr) {
+            // A caller-owned destination. The arena is not this executor's to
+            // allocate, not the weight store's to hold, and not named -- every
+            // buffer that lands in it is a bare view, so tearing down whatever
+            // store collected them frees nothing.
+            if (how.persistent_arena_bytes < plan.memory.persistent_bytes) {
+                throw std::runtime_error(
+                    "rust storage executor: caller arena of " +
+                    std::to_string(how.persistent_arena_bytes) +
+                    " bytes is smaller than the plan's " +
+                    std::to_string(plan.memory.persistent_bytes));
+            }
+            persistent_arena_base_ = how.persistent_arena;
+            persistent_arena_bytes_ = how.persistent_arena_bytes;
+            external_arena_ = true;
+            return;
+        }
         if (loader_config::env_truthy("PIE_CUDA_DISABLE_WEIGHT_ARENA")) {
             return;
         }
@@ -260,7 +320,9 @@ private:
         buffers_.emplace(
             buffer.id,
             DeviceTensor::view(persistent_arena_base_ + aligned, dtype, shape));
-        arena_backing_names_[buffer.id] = persistent_arena_name_;
+        if (!persistent_arena_name_.empty()) {
+            arena_backing_names_[buffer.id] = persistent_arena_name_;
+        }
         return true;
     }
 
@@ -271,64 +333,97 @@ private:
             !buffer.temporary && buffer.bytes != 0;
     }
 
+    /// Index this instance's bindings by the instruction each one rebinds.
+    void bind_sources(const LoadPlanExecution& how)
+    {
+        source_binding_by_instr_.clear();
+        for (std::size_t i = 0; i < how.source_binding_count; ++i) {
+            const auto& binding = how.source_bindings[i];
+            source_binding_by_instr_[binding.instr_id] = &binding;
+        }
+    }
+
+    /// The source `instr_id` reads, after this instance's binding if it has
+    /// one. A binding replaces the three fields that name bytes on disk and
+    /// nothing else, so the returned extent keeps the template's stride, span
+    /// and dtype -- the parts the loader proved index-independent.
+    pie_loader::PieLoaderSourceExtentView resolved_source(
+        std::uint32_t instr_id,
+        const pie_loader::PieLoaderSourceExtentView& source) const
+    {
+        if (source_binding_by_instr_.empty()) return source;
+        const auto it = source_binding_by_instr_.find(instr_id);
+        if (it == source_binding_by_instr_.end()) return source;
+        pie_loader::PieLoaderSourceExtentView bound = source;
+        bound.file_id = it->second->file_id;
+        bound.tensor_id = it->second->tensor_id;
+        bound.file_offset = it->second->file_offset;
+        return bound;
+    }
+
     void extent_write(
-        const pie_loader::PieLoaderStorageOp::ExtentWrite_Body& instr,
+        std::uint32_t instr_id,
+        const pie_loader::PieLoaderStorageOp::ExtentWrite_Body& instr_body,
         LoadExecutionStats& stats)
     {
-        auto dst_it = buffers_.find(instr.dest.buffer_id);
+        const auto& dest = instr_body.dest;
+        const auto source = resolved_source(instr_id, instr_body.source);
+        auto dst_it = buffers_.find(dest.buffer_id);
         if (dst_it == buffers_.end()) {
             throw std::runtime_error(
                 "rust storage executor: destination buffer missing");
         }
         auto* dst = static_cast<std::uint8_t*>(dst_it->second.data()) +
-            instr.dest.offset + instr.dest.stride.base_offset;
-        if (!pie_loader::compact_extent(instr.dest.stride)) {
+            dest.offset + dest.stride.base_offset;
+        if (!pie_loader::compact_extent(dest.stride)) {
             throw std::runtime_error(
                 "rust storage executor: non-compact ExtentWrite destination is not "
                 "implemented");
         }
-        if (!pie_loader::compact_extent(instr.source.stride)) {
+        if (!pie_loader::compact_extent(source.stride)) {
             const std::uint64_t dst_offset =
-                instr.dest.offset + instr.dest.stride.base_offset;
+                dest.offset + dest.stride.base_offset;
             const std::uint64_t dst_total = dst_it->second.nbytes();
             copy_strided_extent_to_device(
-                loader_, instr.source,
+                loader_, source,
                 dst,
                 dst_offset > dst_total ? 0 : dst_total - dst_offset);
             return;
         }
         copy_engine_.queue(
-            instr.source.file_id,
-            instr.source.file_offset + instr.source.stride.base_offset,
-            instr.source.span_bytes,
+            source.file_id,
+            source.file_offset + source.stride.base_offset,
+            source.span_bytes,
             dst);
         ++stats.h2d_copy_count;
-        stats.h2d_copy_bytes += instr.source.span_bytes;
+        stats.h2d_copy_bytes += source.span_bytes;
     }
 
     void bulk_extent_write(
-        const pie_loader::PieLoaderStorageOp::BulkExtentWrite_Body& instr,
+        std::uint32_t instr_id,
+        const pie_loader::PieLoaderStorageOp::BulkExtentWrite_Body& instr_body,
         LoadExecutionStats& stats)
     {
+        const auto source = resolved_source(instr_id, instr_body.source);
         if (persistent_arena_base_ == nullptr) {
             throw std::runtime_error(
                 "rust storage executor: BulkExtentWrite requires persistent arena");
         }
-        const std::uint64_t dst_offset = instr.dest_offset;
+        const std::uint64_t dst_offset = instr_body.dest_offset;
         if (dst_offset > persistent_arena_bytes_ ||
-            instr.source.span_bytes > persistent_arena_bytes_ - dst_offset) {
+            source.span_bytes > persistent_arena_bytes_ - dst_offset) {
             throw std::runtime_error(
                 "rust storage executor: BulkExtentWrite destination out of bounds");
         }
         copy_engine_.queue(
-            instr.source.file_id,
-            instr.source.file_offset + instr.source.stride.base_offset,
-            instr.source.span_bytes,
+            source.file_id,
+            source.file_offset + source.stride.base_offset,
+            source.span_bytes,
             persistent_arena_base_ + dst_offset);
         ++stats.h2d_copy_count;
         ++stats.h2d_bulk_copy_count;
-        stats.h2d_copy_bytes += instr.source.span_bytes;
-        stats.h2d_bulk_copy_bytes += instr.source.span_bytes;
+        stats.h2d_copy_bytes += source.span_bytes;
+        stats.h2d_bulk_copy_bytes += source.span_bytes;
     }
 
     void create_view(
@@ -410,6 +505,10 @@ private:
                    backing != arena_backing_names_.end()) {
             spec.ownership = TensorOwnershipKind::BorrowedView;
             spec.backing_tensor = backing->second;
+        } else if (external_arena_ && !buffer.mapped().owns_memory()) {
+            // Lent arena: nothing in this store owns these bytes, and nothing
+            // in it can, because the arena is the caller's.
+            spec.ownership = TensorOwnershipKind::External;
         }
         stats.loaded_bytes += buffer.mapped().nbytes();
         const std::string runtime_name = pie_loader::bytes_to_string(instr.name);
@@ -512,11 +611,18 @@ private:
     std::unordered_map<std::uint32_t, std::string> finalized_buffer_names_;
     std::unordered_map<std::uint32_t, std::string> view_backing_names_;
     std::unordered_map<std::uint32_t, std::string> arena_backing_names_;
+    // This instance's source rebindings, by the instruction each replaces.
+    // Empty for a resident load, which is every plan that is not a group's.
+    std::unordered_map<std::uint32_t, const pie_loader::PieLoaderSourceBindingView*>
+        source_binding_by_instr_;
     std::string persistent_arena_name_;
+    bool external_arena_ = false;
     std::uint8_t* persistent_arena_base_ = nullptr;
     std::uint64_t persistent_arena_bytes_ = 0;
     // Host->device copy path (streams, pinned staging, reader lanes, batching).
-    WeightCopyEngine copy_engine_{loader_};
+    // Unused, and so never spun up, when the caller lends one.
+    WeightCopyEngine owned_copy_engine_{loader_};
+    WeightCopyEngine& copy_engine_;
     pie_loader::LoadPlanIndex plan_index_{"load plan executor"};
     BufferResolver resolver_{buffers_, finalized_buffer_names_, weights_};
     TranscodeEngine transcode_{loader_, copy_engine_, plan_index_, resolver_};

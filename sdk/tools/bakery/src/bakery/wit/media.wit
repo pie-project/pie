@@ -16,6 +16,13 @@ interface media {
 
     use types.{error};
 
+    // A visual span's extent in merged-token units.
+    record merged-grid {
+        t: u32,
+        h: u32,
+        w: u32,
+    }
+
     // A host-side handle to a preprocessed still image (also used for one
     // decoded video frame). `from-bytes` decodes + resizes + patchifies per the
     // bound model's processor, so the layout queries below are answerable
@@ -37,13 +44,13 @@ interface media {
         // (M-RoPE), where the next text token's three components all begin.
         position-span: func() -> u32;
 
-        // (t, h, w) in merged-token units.
-        grid: func() -> tuple<u32, u32, u32>;
+        // Extent in merged-token units.
+        grid: func() -> merged-grid;
 
         // Model-specific delimiter tokens the context must place immediately
         // before / after this span (e.g. Qwen `<|vision_start|>` /
-        // `<|vision_end|>`); empty for models that need none. The SDK's
-        // `append-image` applies these so the inferlet stays model-agnostic.
+        // `<|vision_end|>`); empty for models that need none. A guest splices
+        // these around the span's tokens so it stays model-agnostic.
         prefix-tokens: func() -> list<u32>;
         suffix-tokens: func() -> list<u32>;
     }

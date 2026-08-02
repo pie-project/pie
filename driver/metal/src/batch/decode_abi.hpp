@@ -57,8 +57,25 @@ enum class Region : uint8_t {
                     // this; the M=1 HND ring above is UNTOUCHED/reinterpreted)
 };
 
-// Scratch ping-pong pool size (beta, from WAR/WAW chain). 6 max-shape buffers.
-inline constexpr int SCRATCH_POOL = 6;
+// Scratch ping-pong pool size (beta, from WAR/WAW chain).
+//
+// This is the CAP, not the allocation: the executor commits `colors_used`
+// slots, which is six for a dense stack, eight for a routed one, and nine for
+// a routed one with a shared expert. The mixture is what set the number -- its
+// router writes two values and its sort writes four, all of them read after
+// three matvecs have allocated freely in between, so six of the eight live at
+// once where a dense FFN has three. The shared expert added the ninth without
+// adding a sixth of its own: it reads the pre-FFN norm, which the mixture used
+// to finish with at the gather, so that ONE value is now live across the
+// mixture's whole peak. Emitting the shared block earlier does not help --
+// then its own two outputs are what span the peak instead, which is worse.
+//
+// A schedule needing more than this has nowhere to spill: `bind_scratch` skips
+// any buffer id past the end of the pool, so the overflow binds to nothing and
+// every dispatch reading it gets whatever was last there. The cap is deliberately
+// the current peak and not a round number above it, so the next value that does
+// not fit says so.
+inline constexpr int SCRATCH_POOL = 9;
 
 // ── IO region slots (I1: all GPU-read buffers, never setBytes) ───────────────
 // M=1: scalars are written at [0] only (the sealed single-stream path is unchanged).
@@ -93,9 +110,13 @@ enum class IoSlot : uint8_t {
     AttnMask       = 15, // u8[N,mask_stride] dense allow mask
     AttnMaskStride = 16, // u32[1] dense mask row stride
     AttnMaskEnabled= 17, // u8[N] 1 iff row consumes AttnMask
+    // Which rows the fire will SAMPLE, in readout order. The tail runs over
+    // these and no others: a prefill computes every row of the body but reads
+    // one per request, and the LM head is the step's most expensive dispatch.
+    SampleRows     = 18, // u32[S] — row indices into the body's [N, hidden]
 };
 inline constexpr int kIoSlotCount =
-    static_cast<int>(IoSlot::AttnMaskEnabled) + 1;
+    static_cast<int>(IoSlot::SampleRows) + 1;
 
 // ── Per-kernel binding indices (arg order the encoder binds into MTL4ArgumentTable) ──
 // Grounded in MLX's host-side dispatch arg order, adjusted for I1 (scalars→buffers).
@@ -138,6 +159,23 @@ enum class SdpaPaged : uint8_t {
     KvPageIndptr = 8,    // IoSlot::KvPageIndptr
     PageSize = 9, NKvHeads = 10, Scale = 11,
     AttnMask = 12, AttnMaskStride = 13, AttnMaskEnabled = 14,
+    // Sliding window, in positions. <=0 is full attention. Full-attention
+    // families must still BIND it -- one kernel serves both, so an unbound slot
+    // is a window read out of uninitialized memory, which is wrong attention
+    // rather than a crash.
+    Window = 15,
+    // gpt-oss's learned per-head scalar, which joins the softmax denominator as
+    // though it were one more key. Bound only by the family that has one; the
+    // `sink` instantiation is a separate pipeline, so the others never read it.
+    Sinks = 16,
+    // N, the fire's row count. Read only by `sdpa_paged_tiled`, whose grid
+    // rounds up to whole query tiles where the per-row kernel's grid was
+    // exactly N threadgroups tall. Bound for both, because which of the two
+    // pipelines runs is a row-count decision made after the bind table for
+    // this Kind is written -- and an ordinal the running kernel does not
+    // declare costs a slot, where an unbound one the kernel DOES declare
+    // costs the attention.
+    Rows = 17,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
@@ -150,10 +188,6 @@ enum class Residual : uint8_t { X = 0, Residual = 1, Out = 2, Width = 3 };
 
 // SwiGLU (golden `swiglu`): Out = silu(Gate) * Up, elementwise over intermediate.
 enum class SiluMul : uint8_t { Gate = 0, Up = 1, Out = 2, Width = 3 };
-
-// dense bf16 GEMV (M=1) for GDN `gdn_in_a`/`gdn_in_b` (in_proj_a/b stored DENSE
-// bf16 [V_h,hidden], NOT 4-bit). Out[N] = sum_k W[N,K]*X[K], float accum.
-enum class Dense : uint8_t { W = 0, X = 1, Out = 2, K = 3, N = 4 };
 
 // q_gate_split: deinterleave 2x-wide q_proj output (qwen3.5 gated attn).
 // qg[n_q,2,head_dim] -> Q[n_q,head_dim] + gate[n_q,head_dim]. Internal (no golden tag).
@@ -170,7 +204,12 @@ enum class Rope : uint8_t { X = 0, Position = 1, Scale = 2, Base = 3, HeadDim = 
 // embedding gather (4-bit dequant of the shared lm_head bundle; tied). TokenId is
 // IO::TokenId (I1). Matches embed_gather.metal: W/Scales/Biases (same 4-bit packing
 // as Qmv) + token id + out + hidden. Bound to the SAME lm_head slots as QmvLmHead.
-enum class Embed : uint8_t { W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5 };
+enum class Embed : uint8_t {
+    W = 0, Scales = 1, Biases = 2, TokenId = 3, Out = 4, Hidden = 5,
+    // gemma4's `embed_gather_scaled_4bit` only. qwen3.5 runs the unscaled
+    // instantiation, which has no buffer 6 to bind.
+    Scale = 6,
+};
 
 // KV append (in-place write at position): Pos is IO::Position (I1). Matches kv_append.metal:
 //   0=k_new, 1=v_new, 2=k_cache, 3=v_cache, 4=pos(IO), 5=head_dim, 6=k_head_stride
@@ -303,6 +342,11 @@ enum class SdpaSliding : uint8_t {
     Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
     KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
     Window = 11,   // attend the last `window` positions; <=0 means all of them
+    // Stated by the caller rather than inferred: decode's Q is one row, a
+    // prefill's is [M, n_heads*D] from a GEMM, and a kernel that guessed wrong
+    // between them would read plausible garbage instead of failing.
+    QRowStride = 12,
+    ORowStride = 13,
 };
 
 // geglu_tanh.metal: out = gelu_tanh(gate) * up. Gemma's FFN nonlinearity, where
@@ -311,6 +355,9 @@ enum class Geglu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
 
 // logit_softcap.metal: out = cap * tanh(logits / cap), over the vocabulary.
 enum class Softcap : uint8_t { Logits = 0, Out = 1, Params = 2 };
+
+// row_gather.metal: out[i,:] = in[rows[i],:] — the fire's sampled rows, dense.
+enum class RowGather : uint8_t { In = 0, Out = 1, Rows = 2, Params = 3 };
 
 // layer_scalar.metal: out = x * scalar[0]. A learned per-layer gain, broadcast.
 enum class LayerScalar : uint8_t { X = 0, Scalar = 1, Out = 2, Params = 3 };
@@ -321,6 +368,96 @@ enum class PleCombine : uint8_t { Proj = 0, Token = 1, Out = 2, Params = 3 };
 // vnorm.metal `vnorm_single_row`: RMS with NO learnable weight, applied to V
 // before the KV write. Distinct from bind::Rms, which always has one.
 enum class VNorm : uint8_t { X = 0, Out = 1, Params = 2 };
+
+// rms_norm.metal `rms_residual` / `rms_residual_scaled` (gemma4): the norm
+// sandwich's second half and the residual add it always precedes, in one
+// dispatch. `bind::Rms`'s four slots verbatim, so the weight bind is shared,
+// plus the residual and (scaled variant only) the learned per-layer gain.
+//
+//   out = rms_norm(x) * w + r            [* s[0]]
+// ── GPT-OSS ────────────────────────────────────────────────────────────────
+// The matvec, plus the two things every projection in this family has that no
+// other one does: an additive bias, and (for the MoE) an expert index the GPU
+// picked. `bind::Qmv`'s seven slots verbatim, so the weight binds are shared.
+enum class GoQmv : uint8_t {
+    W = 0, Scales = 1, Biases = 2, X = 3, Out = 4, K = 5, N = 6,
+    Bias = 7,        // the Linear's additive bias -- NOT `Biases`, the zero point
+    ExpertIds = 8,   // routed projections only: [experts_per_token] from the router
+    // Whether the INPUT is per-expert as well as the weight. `gate` and `up`
+    // read one shared norm output (0); `down` reads the SwiGLU's k-wide stack
+    // (K). Stated rather than inferred from the kind, because a kernel that
+    // guessed would read four copies of the first expert's activation and
+    // produce a plausible wrong token.
+    XSlotStride = 9,
+    // The token row's pitch in `x`. Stated rather than assumed to be K, because
+    // `down` reads the SwiGLU's [rows, k, intermediate] stack, whose row is k
+    // times as wide as its slot.
+    XRowStride = 10,
+    // How many expert slots each row selects, so a routed dispatch can find
+    // ITS row's ids: at M>1 every row routes independently, which is why a
+    // batched MoE is not one wider matmul.
+    SlotsPerRow = 11,
+    // The expert each ROW TILE of the batched form reads, from
+    // `moe_route_sort`. Clear of the matvec's slots because one argument table
+    // ordinal serves both pipelines -- the row count picks which runs, and the
+    // host binds every slot either way.
+    TileExpert = 12,
+};
+
+// moe_route_sort / moe_route_gather / moe_combine_sorted: the expert-major
+// reordering a batched mixture runs on. The sort's outputs and the row-mover
+// share no layout, so they get their own tables.
+//
+// `Inv` sits after `Params` because it was added later and these ordinals are
+// an ABI. It is the sort's own inverse -- the position it gave each pair --
+// which is what lets the combine read the sorted results in place instead of a
+// fourth kernel putting them back first.
+enum class MoeRouteSort : uint8_t {
+    ExpertIds = 0, Perm = 1, RowExpert = 2, TileExpert = 3, Params = 4, Inv = 5
+};
+enum class MoeRouteRows : uint8_t { In = 0, Out = 1, Perm = 2, Params = 3 };
+
+// moe_combine_sorted: `GoExpertCombine` plus the sort's inverse permutation.
+enum class MoeCombineSorted : uint8_t { Y = 0, Weights = 1, Out = 2, Params = 3, Inv = 4 };
+
+// shared_expert_combine: routed + sigmoid(gate) * shared. The gate is one
+// value per ROW, not per column, which is why this is not `AttnGate`.
+enum class SharedCombine : uint8_t {
+    Routed = 0, Shared = 1, Gate = 2, Out = 3, Width = 4
+};
+
+// router_topk: top-k over the router's logits, then a softmax over the k that
+// survive. Emits both halves of the routing decision.
+enum class GoRouterTopK : uint8_t { Logits = 0, Ids = 1, Weights = 2, Params = 3 };
+
+// gptoss_swiglu: gate*sigmoid(alpha*gate) * (up+1), both operands clamped.
+enum class GoSwiGlu : uint8_t { Gate = 0, Up = 1, Out = 2, Params = 3 };
+
+// expert_combine: the weighted sum of the k experts' outputs.
+enum class GoExpertCombine : uint8_t { Y = 0, Weights = 1, Out = 2, Params = 3 };
+
+// sdpa_vector_decode_sink: bind::SdpaSliding verbatim plus the per-head sink.
+enum class SdpaSink : uint8_t {
+    Q = 0, K = 1, V = 2, Out = 3, GqaFactor = 4, N = 5,
+    KHeadStride = 6, KSeqStride = 7, VHeadStride = 8, VSeqStride = 9, Scale = 10,
+    Window = 11, QRowStride = 12, ORowStride = 13,
+    Sinks = 14,
+};
+
+// rope_neox_freqs_decode: the frequencies are a TABLE, not a base. Whatever
+// closed form produced them (YaRN here) is the host's arithmetic, done once.
+enum class RopeFreqs : uint8_t {
+    X = 0, Position = 1, Scale = 2, InvFreq = 3, HeadDim = 4,
+    MScale = 5,  // YaRN's attention-temperature correction on q and k
+    // `rope_neox_freqs_mb` only: the token row's pitch, `n_heads * head_dim`.
+    // Not derivable from the grid -- q and k have different head counts and
+    // share the kernel.
+    RowStride = 6,
+};
+
+enum class RmsResidual : uint8_t {
+    X = 0, W = 1, Out = 2, Params = 3, Residual = 4, Scalar = 5,
+};
 
 }  // namespace bind
 
@@ -372,6 +509,7 @@ enum class Kernel : uint8_t {
     G4Geglu,             // gelu_tanh(gate) * up
     G4LayerScalar,       // learned per-layer gain
     G4Softcap,           // cap * tanh(logits / cap)
+    G4RowGather,         // the sampled rows, compacted before the tail
     G4SdpaSliding,       // sliding-window decode attention
     // Per-Layer Embeddings.
     G4PleTokenGather,    // embed_tokens_per_layer
@@ -383,6 +521,85 @@ enum class Kernel : uint8_t {
     G4PleProjLayerGemv,  // per_layer_projection
     G4PleNorm,           // post_per_layer_input_norm
     G4PleResidual,       // hidden += ple
+    // Fused: the norm sandwich's closing norm and the residual add it always
+    // precedes. Three per layer, so three barriers a layer at ~5.8 us each.
+    G4AttnPostResidual,  // rms(block)*post_attention_layernorm + resid
+    G4FfnPostResidual,   // rms(block)*post_feedforward_layernorm + resid
+    G4PleResidualScaled, // (rms(ple)*post_per_layer_input_norm + resid)*layer_scalar
+    // ── GPT-OSS, and the untied/routed kinds it happened to introduce first.
+    //
+    // Its projections are all biased, so none of the shared kinds' weight maps
+    // fit and the `Go` prefix is right for those. But an untied embedding, an
+    // untied head and the two weightless routing stages are not gpt-oss's --
+    // llama and the Qwen MoEs need exactly the same ones, and a name is free.
+    // Only the numeric VALUES are ABI, so these were renamed in place rather
+    // than duplicated.
+    EmbedUntied,         // model.embed_tokens (quantized, NOT tied to the head)
+    LmHeadUntied,        // lm_head (quantized, its own tensor)
+    GoQmvQ, GoQmvK, GoQmvV, GoQmvO,
+    GoSdpaSink,          // self_attn.sinks
+    GoRouter,            // mlp.router (8-bit affine) + its bias
+    GoExpertGate, GoExpertUp, GoExpertDown,
+    GoRouterTopK, GoSwiGlu, GoExpertCombine,
+    // ── Llama family's routed FFN. APPEND ONLY, same rule as above.
+    //
+    // Separate from the `Go*` expert kinds for one reason: those bind a bias at
+    // slot 7 and Qwen's experts have none. Everything else -- the stacked
+    // weights, the `expert_ids` index, the slot axis -- is shared, which is why
+    // the routed matvec is the same kernel with BIASED off.
+    LlRouter,            // mlp.gate  (the routing logits; no bias)
+    LlExpertGate,        // mlp.experts.gate_proj  (stacked over experts)
+    LlExpertUp,          // mlp.experts.up_proj
+    LlExpertDown,        // mlp.experts.down_proj
+    // The batched mixture's expert-major reordering. Weightless -- they move
+    // rows and indices, not parameters -- but they are still kinds, and giving
+    // them names is what keeps `pso_kind` from having to answer with the
+    // fall-through value and hide a real gap behind it.
+    LlMoeSort,
+    LlMoeGather,
+    LlMoeCombine,
+    // ── The shared expert, which every routed member of the Qwen3.5 family
+    // runs beside the routed bank. APPEND ONLY, same rule as above.
+    //
+    // The three projections and the SwiGLU between them are an ordinary dense
+    // FFN, and they would have reused `QmvGate`/`QmvUp`/`QmvDown` -- except
+    // that a kind IS a weight name here (`weights_for_kind` switches on it and
+    // nothing else), and these are `mlp.shared_expert.*`. So the projections
+    // get names and the ACTIVATION kinds do not: `SiluMul` still means the
+    // dense one, because in a routed layer the only dense SwiGLU there is is
+    // this one.
+    LlSharedGate,        // mlp.shared_expert.gate_proj
+    LlSharedUp,          // mlp.shared_expert.up_proj
+    LlSharedDown,        // mlp.shared_expert.down_proj
+    LlSharedGateProj,    // mlp.shared_expert_gate -- hidden -> ONE logit a token
+    LlSharedCombine,     // routed + sigmoid(gate) * shared
+    // The mixture's own SwiGLU, over the SORTED stack. Split from `SiluMul`
+    // when the shared expert arrived: a routed layer now runs both, at
+    // different widths and over different buffers, and one kind cannot answer
+    // for two extents.
+    LlExpertSiluMul,
+    // ── Gemma 4's mixture (gemma-4-26B-A4B). APPEND ONLY, same rule as above.
+    //
+    // Separate from the `Ll*` set for the reason a kind IS a weight name here:
+    // gemma spells its stacked experts `experts.switch_glu.{gate,up,down}_proj`
+    // and its router `router.proj`, and it carries three tensors no other
+    // family has -- the router's own norm scale, its per-expert gain, and the
+    // two branch norms the mixture layer adds. The KERNELS are the shared ones;
+    // only the weights differ, which is exactly what a kind names.
+    G4Router,            // router.proj (no bias) + router.per_expert_scale
+    G4RouterNorm,        // router.scale, folded with hidden**-0.5 at load
+    G4RouterTopK,        // top-k, softmax over the selected, then the gain
+    G4MoeNorm,           // pre_feedforward_layernorm_2
+    G4DenseBranchNorm,   // post_feedforward_layernorm_1
+    G4MoeBranchNorm,     // post_feedforward_layernorm_2
+    G4ExpertGate,        // experts.switch_glu.gate_proj (stacked)
+    G4ExpertUp,          // experts.switch_glu.up_proj
+    G4ExpertDown,        // experts.switch_glu.down_proj
+    G4ExpertGeglu,       // GeGLU over the sorted stack -- gemma's activation
+    G4MoeSort,
+    G4MoeGather,
+    G4ExpertCombine,
+    G4BranchAdd          // h1 + h2, the two branches meeting
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

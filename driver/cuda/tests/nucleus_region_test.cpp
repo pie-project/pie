@@ -4,22 +4,22 @@
 #include <string>
 #include <vector>
 
-#include "pie_native/launch/image.hpp"
-#include "pie_native/launch/plan.hpp"
+#include "pie/driver/testing/image.hpp"
+#include "pie/driver/launch/plan.hpp"
 #include "pipeline/library_region.hpp"
 
 int main(int argc, char** argv) {
     const std::string path =
         (argc > 1 ? argv[1] : "../fixtures") +
         std::string("/nucleus_sample.launch");
-    pie_native::launch::PackageImage image;
+    pie::driver::testing::PackageImage image;
     std::string error;
     if (!image.load(path, &error) || image.package().plans.len != 1) {
         std::fprintf(stderr, "nucleus_region_test: %s\n", error.c_str());
         return 1;
     }
-    const pie_native::launch::plan::StagePlan plan =
-        pie_native::launch::plan::adopt(0, image.package().plans.ptr[0]);
+    const pie::driver::launch::plan::StagePlan plan =
+        pie::driver::launch::plan::adopt(0, image.package().plans.ptr[0]);
     const auto region = std::find_if(
         plan.fused.regions.begin(),
         plan.fused.regions.end(),

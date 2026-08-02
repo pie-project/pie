@@ -36,8 +36,25 @@ inline const char* act_dump_dir() {
 
 inline bool act_dump_enabled() { return act_dump_dir() != nullptr; }
 
+/// The CUDA device this thread is on, as a filename suffix.
+///
+/// Every rank of a TP group runs in one process and writes to one directory,
+/// so without this they collide: the file that survives is whichever rank
+/// finished last, and a dump that silently mixes ranks is worse than no dump.
+/// It also makes the ranks comparable to each other, which is the question
+/// worth asking about a tensor the model replicates.
+inline int act_dump_device() {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return 0;
+    return device;
+}
+
 inline int& act_dump_step() {
-    static int step = -1;
+    // Per-thread, because the embedded TP launcher runs every rank as a thread
+    // in ONE process. A process-wide counter would be advanced once per rank
+    // per forward, so `PIE_ACT_DUMP_STEPS=1` would stop dumping partway through
+    // the very first prefill at tp=8.
+    static thread_local int step = -1;
     return step;
 }
 
@@ -81,8 +98,8 @@ inline void act_dump_write_npy(
     const std::string& tag, const std::vector<float>& host,
     long rows, long cols) {
     char path[1024];
-    std::snprintf(path, sizeof(path), "%s/s%d_%s.npy",
-                  act_dump_dir(), act_dump_step(), tag.c_str());
+    std::snprintf(path, sizeof(path), "%s/d%d_s%d_%s.npy",
+                  act_dump_dir(), act_dump_device(), act_dump_step(), tag.c_str());
     std::FILE* f = std::fopen(path, "wb");
     if (f == nullptr) {
         std::fprintf(stderr, "[pie-act-dump] cannot open %s\n", path);

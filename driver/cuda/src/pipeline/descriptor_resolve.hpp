@@ -28,18 +28,19 @@
 #include <vector>
 
 #include "pipeline/channel_registry.hpp"
-#include "pie_native/fire/descriptor.hpp"
-#include "pie_native/fire/fire_geometry.hpp"
-#include "pie_native/launch/program.hpp"
-#include "pie_native/launch/trace_query.hpp"
+#include "pie/driver/fire/descriptor.hpp"
+#include "pie/driver/fire/geometry.hpp"
+#include "pie/driver/launch/program.hpp"
+#include "pie/driver/launch/query.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
+// fire-geometry) now lives in pie::driver::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
-using namespace pie_native::launch::descriptor;
+using namespace pie::driver::launch;
+using namespace pie::driver::fire;
+using namespace pie::driver::fire::descriptor;
 
 namespace detail {
 
@@ -112,10 +113,14 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                                   const detail::PortCellCache*
                                       cached_cells = nullptr) {
     // Index the channel-bound ports by tag.
-    ChannelId ch[10];
-    bool has[10] = {false};
+    // Sized by the HIGHEST port tag, not by the port COUNT: tags 10-14 are
+    // reserved holes left by the rs-geometry rebalance, so the two are no
+    // longer the same number.
+    constexpr std::size_t kPortSlots = kPortRsFoldLen + 1;
+    ChannelId ch[kPortSlots];
+    bool has[kPortSlots] = {false};
     for (const PortBinding& pb : trace.ports) {
-        if (pb.is_const || pb.port > kPortAttnMask) continue;
+        if (pb.is_const || pb.port >= kPortSlots) continue;
         ch[pb.port] = pb.channel;
         has[pb.port] = true;
     }
@@ -138,6 +143,21 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                 }
                 break;
             case kPortReadout: out.sampling_indices = values; break;
+            case kPortRsBufferPages:
+                out.rs_buffer_slot_ids = values;
+                out.has_rs_buffer_family = true;
+                break;
+            case kPortRsBufferIndptr: out.rs_buffer_slot_indptr = values; break;
+            case kPortRsBufferLen: out.rs_buffer_lens = values; break;
+            case kPortRsFoldLen:
+                out.rs_fold_lens = values;
+                out.has_rs_fold_len = true;
+                break;
+            case kPortRsWSlot:
+                out.rs_w_slot = values;
+                out.has_rs_write_desc = true;
+                break;
+            case kPortRsWOff: out.rs_w_off = values; break;
             default: break;
         }
     }
@@ -225,6 +245,89 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
             out.kv_last_page_lens.push_back(last_page_len(len, page_size));
     }
 
+    // -- recurrent-state buffered-slot family (same CSR-prefix contract as KV) --
+    if (has[kPortRsBufferIndptr]) {
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, ch[kPortRsBufferIndptr], b, err, pending_slots,
+                cached_cells)) return false;
+        out.rs_buffer_slot_indptr = detail::as_u32(b);
+    }
+    if (has[kPortRsBufferPages]) {
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, ch[kPortRsBufferPages], b, err, pending_slots,
+                cached_cells)) return false;
+        out.rs_buffer_slot_ids = detail::as_u32(b);
+        // CSR-prefix: channels keep a fixed shape, so the indptr's last
+        // element is the live prefix length of the slab-id vector. A [rows,
+        // stride] declaration is densely repacked per row, exactly as the KV
+        // `pages` port is.
+        if (!out.rs_buffer_slot_indptr.empty()) {
+            const auto& dims =
+                trace.channels[ch[kPortRsBufferPages]].type.shape.dims;
+            const std::size_t rows = out.rs_buffer_slot_indptr.size() - 1;
+            if (dims.size() == 2 && dims[0] == rows) {
+                std::vector<std::uint32_t> packed;
+                packed.reserve(out.rs_buffer_slot_indptr.back());
+                for (std::size_t row = 0; row < rows; ++row) {
+                    const std::uint32_t count =
+                        out.rs_buffer_slot_indptr[row + 1] -
+                        out.rs_buffer_slot_indptr[row];
+                    if (count > dims[1]) return false;
+                    const std::size_t begin = row * dims[1];
+                    packed.insert(
+                        packed.end(),
+                        out.rs_buffer_slot_ids.begin() + begin,
+                        out.rs_buffer_slot_ids.begin() + begin + count);
+                }
+                out.rs_buffer_slot_ids = std::move(packed);
+            } else {
+                const std::uint32_t nnz_slabs =
+                    out.rs_buffer_slot_indptr.back();
+                if (nnz_slabs <= out.rs_buffer_slot_ids.size()) {
+                    out.rs_buffer_slot_ids.resize(nnz_slabs);
+                }
+            }
+        }
+        out.has_rs_buffer_family = true;
+    }
+    if (has[kPortRsBufferLen]) {
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, ch[kPortRsBufferLen], b, err, pending_slots,
+                cached_cells)) return false;
+        out.rs_buffer_lens = detail::as_u32(b);
+    }
+    // Read LAST among the RS ports, and unconditionally: this is the one whose
+    // value the host may never have seen, so there is no wire array to fall
+    // back on if the cell is not ready.
+    if (has[kPortRsFoldLen]) {
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, ch[kPortRsFoldLen], b, err, pending_slots,
+                cached_cells)) return false;
+        out.rs_fold_lens = detail::as_u32(b);
+        out.has_rs_fold_len = true;
+    }
+    if (has[kPortRsWSlot]) {
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, ch[kPortRsWSlot], b, err, pending_slots,
+                cached_cells)) return false;
+        out.rs_w_slot = detail::as_u32(b);
+        out.rs_w_slot.resize(nnz);
+        out.has_rs_write_desc = true;
+    }
+    if (has[kPortRsWOff]) {
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, ch[kPortRsWOff], b, err, pending_slots,
+                cached_cells)) return false;
+        out.rs_w_off = detail::as_u32(b);
+        out.rs_w_off.resize(nnz);
+    }
+
     // -- read-out --
     std::vector<std::uint32_t> readout = out.sampling_indices;
     if (has[kPortReadout]) {
@@ -308,6 +411,40 @@ inline bool resolve_fire_geometry(const Trace& trace, ChannelView& view,
                     out.mask.size() / out.token_ids.size());
             }
         }
+    }
+    return true;
+}
+
+/// Resolve ONLY the `rs_fold_len` port, for a program whose geometry is
+/// otherwise host-composed. A commit fire is an ordinary wire program in every
+/// respect except this one number, which the host may never have learned --
+/// so promoting the whole program to device geometry to reach it would be a
+/// far larger claim than the truth.
+///
+/// Absent port is NOT an error: a fire may carry a mix of rows, and only the
+/// flagged ones need this. Composition refuses a flagged row whose program
+/// left `has_rs_fold_len` false, which is where that mistake is caught.
+inline bool resolve_rs_fold_len(
+    const Trace& trace, ChannelView& view, FireGeometry& out,
+    std::string* err,
+    const std::unordered_set<std::uint32_t>* pending_slots = nullptr,
+    const detail::PortCellCache* cached_cells = nullptr) {
+    for (const PortBinding& candidate : trace.ports) {
+        if (candidate.port != kPortRsFoldLen) continue;
+        if (candidate.is_const) {
+            out.rs_fold_lens = detail::as_u32(candidate.const_data);
+            out.has_rs_fold_len = true;
+            return true;
+        }
+        std::vector<std::uint8_t> b;
+        if (!detail::read_port_cell(
+                view, candidate.channel, b, err, pending_slots,
+                cached_cells)) {
+            return false;
+        }
+        out.rs_fold_lens = detail::as_u32(b);
+        out.has_rs_fold_len = true;
+        return true;
     }
     return true;
 }

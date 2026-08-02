@@ -108,10 +108,7 @@ pub fn from_file(path: &Path) -> Result<Tokenizer> {
         bpe,
         Pipeline::ByteLevelRegex {
             nfc: false,
-            splitters: vec![crate::Splitter {
-                regex: split_regex,
-                keep_gaps: true,
-            }],
+            splitters: vec![split_regex],
             bpe_mode: BpeMode::PreferWholeToken,
         },
         added_tokens,
@@ -178,8 +175,6 @@ impl TiktokenTokenizerConfig {
                 id,
                 content,
                 special,
-                lstrip: false,
-                rstrip: false,
             });
         }
         Ok(tokens)

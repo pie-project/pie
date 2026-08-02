@@ -19,6 +19,8 @@
 #include "elastic.hpp"
 
 #include <chrono>
+#include <sys/stat.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +30,8 @@
 #include <atomic>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -42,9 +46,11 @@ MetalStorageFacts query_metal_storage_facts() {
     if (device == nil) {
         throw std::runtime_error("no Metal device");
     }
+    const MTLResourceOptions options =
+        MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
     const MTLSizeAndAlign sa = [device
         heapBufferSizeAndAlignWithLength:1
-        options:MTLResourceStorageModeShared];
+        options:options];
     const long page = ::sysconf(_SC_PAGESIZE);
     return MetalStorageFacts{
         .alignment = static_cast<std::uint32_t>(std::max<NSUInteger>(1, sa.align)),
@@ -62,16 +68,47 @@ inline size_t align_up(size_t v, size_t a) { return (v + (a - 1)) & ~(a - 1); }
 // or -1 for a singleton). Kind is decorative: within one layer Rms/Residual recur,
 // so (kind, layer) collides — the ordinal is the only unique key.
 inline int argkey(int ordinal) { return ordinal; }
+
+// MSL caps `[[buffer(n)]]` at n <= 30, so a kernel can never reference more than
+// 31 buffer bindings and the argument tables are sized to exactly that. Binds
+// past it are a driver bug, not a capacity shortfall -- an argument table
+// silently ignores an out-of-range index, so they are rejected loudly instead.
+inline constexpr std::uint32_t kMaxArgBinds = 31;
 }  // namespace
 
 // ── Per-step encoder state (transient, lives across one run_step) ─────────────
 struct StepState {
     id<MTL4ComputeCommandEncoder> en = nil;
     RawMetalContext::Impl*        ctx = nullptr;
+    // Per-dispatch attribution, off unless PIE_METAL_DISPATCH_TRACE is set.
+    // A fire is a hundred-odd dispatches behind one fence, so "the GPU spent
+    // 81 ms" is not an answer to "which kernel"; this brackets every dispatch
+    // with a timestamp and reports the shares. It lives in the encoder rather
+    // than in a family's encode function so that one implementation covers
+    // every model and every kernel.
+    void* trace_heap = nullptr;
+    std::uint32_t trace_slots = 0;
+    std::uint32_t trace_n = 0;
+    std::vector<std::string> trace_labels;
+    std::string trace_pso;
 };
+
+// `PIE_METAL_DISPATCH_TRACE=<n>` prints the accumulated table every n fires.
+int dispatch_trace_every() {
+    static const int n = [] {
+        const char* e = getenv("PIE_METAL_DISPATCH_TRACE");
+        if (e == nullptr || *e == '\0') return 0;
+        const int v = atoi(e);
+        return v > 0 ? v : 1;
+    }();
+    return n;
+}
 
 // ── RawMetalContext::Impl — owns the Metal-4 device objects ───────────────────
 struct RawMetalContext::Impl {
+    // Heap slots memoized by the argument-table slot they are bound to, so a
+    // constant rebound every fire is allocated once. See `const_slot`.
+    std::unordered_map<std::uint64_t, SlotHandle> const_slots;
     id<MTLDevice>            dev   = nil;
     id<MTL4CommandQueue>     queue = nil;
     id<MTL4CommandQueue>     mapping_queue = nil;
@@ -82,6 +119,28 @@ struct RawMetalContext::Impl {
     id<MTL4PipelineDataSetSerializer> pipeline_serializer = nil;
     id<MTLSharedEvent>       event = nil;
     uint64_t                 ev_val = 0;
+
+    // Most recent Metal 4 commit feedback. Metal delivers it on its own queue,
+    // so every read/write goes through the mutex.
+    // Commit feedback handlers can fire after the context is torn down, so the
+    // state they touch is kept alive by the block itself rather than by Impl.
+    struct FeedbackSlot {
+        std::mutex        mutex;
+        GpuCommitFeedback value;
+    };
+    std::shared_ptr<FeedbackSlot> feedback = std::make_shared<FeedbackSlot>();
+
+    // The one submit primitive. Every path that puts work on `queue` goes
+    // through here: it attaches the commit-feedback handler, submits all `n`
+    // command buffers in a single `commit:count:options:`, and signals the
+    // queue timeline once for the whole batch.
+    //
+    // `wait_value > 0` makes the batch wait on the timeline first (GPU-side
+    // serialization for the autoregressive dependency). Returns the value the
+    // batch signals on completion.
+    uint64_t commit_and_signal(const id<MTL4CommandBuffer> __strong* cbs,
+                               NSUInteger n,
+                               uint64_t wait_value);
 
     size_t heap_size = 0;
     size_t bump      = 0;             // running heap offset
@@ -98,7 +157,10 @@ struct RawMetalContext::Impl {
     std::unordered_map<void*, size_t> external_allocations;
     bool saw_ptir_compile = false;
     bool last_ptir_fast_math_disabled = false;
+    uint64_t surfaced_feedback_error = 0;
     std::atomic<bool> force_wait_timeout_once{false};
+    // Set when a wait was abandoned. Sticky: see run_steps.
+    bool wedged = false;
 
     // Standalone-buffer allocation accounting (all non-heap buffers,
     // including buffers retained by the transient pool).
@@ -159,6 +221,9 @@ struct RawMetalContext::Impl {
 
     id<MTL4ArgumentTable> argtable_for(int ordinal, bool create);
     void collect_elastic_releases();
+    // Wait for the queue to reach `value`, bounded. False means the driver
+    // gave up and the context is finished; see the definition.
+    bool await_event(uint64_t value);
     void drain_mapping_through(uint64_t value);
     uint64_t schedule_mapping(
         id<MTLBuffer> buffer,
@@ -203,10 +268,50 @@ void RawMetalContext::Impl::collect_elastic_releases() {
     pending_elastic_releases.erase(out, pending_elastic_releases.end());
 }
 
+// How long the driver waits for a completion fence before it stops waiting.
+// Split into probes so a step that is merely slow is still counted as slow the
+// moment it passes the first one, while the budget is what decides to stop.
+//
+// A step here is a command buffer for one token or one prefill chunk, and the
+// slowest measured on this machine -- a 192-token prefill through a 30B
+// mixture -- is about 200 ms. Two orders of magnitude past that is not a slow
+// GPU; it is one that is not coming back, and waiting on it produced no
+// diagnostic whatsoever. The symptom that brought this here was twenty-two
+// minutes of silence inside `waitUntilSignaledValue`, with the driver's own
+// "timed out before its completion fence" message sitting unreachable behind
+// a bare retry loop.
+static constexpr int kWaitProbeMs = 5000;
+static constexpr int kWaitProbes  = 12;
+
+bool RawMetalContext::Impl::await_event(uint64_t value) {
+    if (event == nil) return true;
+    for (int probe = 0; probe < kWaitProbes; ++probe) {
+        if (force_wait_timeout_once.exchange(false)) break;
+        if ([event waitUntilSignaledValue:value timeoutMS:kWaitProbeMs]) return true;
+        if (probe == 0) m0_timing_counters().record_forward_wait_timeout();
+    }
+    // Sticky. A command buffer that has not signalled may still be executing,
+    // and both things this driver does after a wait -- resetting the allocator
+    // a buffer was drawn from, and releasing the heaps it reads -- are unsafe
+    // while that is true. There is no way back from here, so say so once and
+    // refuse everything after, rather than waiting forever in silence.
+    if (!wedged) {
+        wedged = true;
+        fprintf(stderr,
+                "[pie-metal] the GPU did not reach event %llu within %d ms; this context is "
+                "abandoned because its command buffers may still be running\n",
+                (unsigned long long)value, kWaitProbes * kWaitProbeMs);
+    }
+    return false;
+}
+
 void RawMetalContext::Impl::drain_mapping_through(uint64_t value) {
-    if (value != 0 && event != nil) {
-        while (![event waitUntilSignaledValue:value timeoutMS:5000]) {
-        }
+    if (value != 0 && !await_event(value)) {
+        // Deliberately NOT collecting: `collect_elastic_releases` hands heaps
+        // back, and the wait that would have proved nothing is still reading
+        // them is the one that just failed. Leaking them is the safe half of a
+        // bad situation; the destructor that used to sit here forever was not.
+        return;
     }
     collect_elastic_releases();
 }
@@ -235,7 +340,7 @@ id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(int ordinal, bool crea
     id<MTL4ArgumentTable> t = argtables[key];
     if (t == nil && create) {
         MTL4ArgumentTableDescriptor* ad = [MTL4ArgumentTableDescriptor new];
-        ad.maxBufferBindCount = 31;  // M1 readiness: status + lane + up to 29 channels
+        ad.maxBufferBindCount = kMaxArgBinds;
         NSError* e = nil;
         t = [dev newArgumentTableWithDescriptor:ad error:&e];
         if (t == nil) {
@@ -251,7 +356,11 @@ id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(int ordinal, bool crea
 // ── StepEncoder bridges ───────────────────────────────────────────────────────
 void StepEncoder::set_pso(Pso pso) {
     auto* s = static_cast<StepState*>(impl_);
-    [s->en setComputePipelineState:(__bridge id<MTLComputePipelineState>)pso.obj];
+    id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)pso.obj;
+    [s->en setComputePipelineState:p];
+    if (dispatch_trace_every() > 0) {
+        s->trace_pso = p.label != nil ? p.label.UTF8String : "<unlabelled>";
+    }
 }
 void StepEncoder::set_argtable(Kernel k, int ordinal) {
     (void)k;  // decorative tag; ordinal is the key
@@ -268,8 +377,19 @@ void StepEncoder::set_argtable_ordinal(int ordinal) {
 }
 void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
     auto* s = static_cast<StepState*>(impl_);
+    // Relaxed granularity, so the pair costs no encoder split; the cost of the
+    // marks themselves is charged to whichever dispatch they bracket, which is
+    // the same for all of them and so does not move the shares.
+    const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr &&
+                       2 * (s->trace_n + 1) <= s->trace_slots;
+    if (trace) mark_timestamp(s->trace_heap, 2 * s->trace_n, /*precise=*/true);
     [s->en dispatchThreads:MTLSizeMake(grid.x, grid.y, grid.z)
         threadsPerThreadgroup:MTLSizeMake(tg.x, tg.y, tg.z)];
+    if (trace) {
+        mark_timestamp(s->trace_heap, 2 * s->trace_n + 1, /*precise=*/true);
+        s->trace_labels.push_back(s->trace_pso);
+        ++s->trace_n;
+    }
 }
 // Map the pure-C++ BarrierVisibility to MTL4VisibilityOptions, honoring a one-shot
 // `PIE_BARRIER_VIS=none|device` global override (delta's visibility sweep): when set it
@@ -324,6 +444,21 @@ RawMetalContext::~RawMetalContext() {
     }
 }
 
+static std::atomic<size_t> g_working_set_override{0};
+
+void RawMetalContext::set_device_working_set_bytes_for_test(size_t bytes) {
+    g_working_set_override.store(bytes, std::memory_order_relaxed);
+}
+
+size_t RawMetalContext::device_working_set_bytes() {
+    if (const size_t forced = g_working_set_override.load(std::memory_order_relaxed);
+        forced != 0) {
+        return forced;
+    }
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    return dev == nil ? 0 : size_t(dev.recommendedMaxWorkingSetSize);
+}
+
 std::unique_ptr<RawMetalContext> RawMetalContext::create(
     size_t heap_bytes,
     size_t elastic_budget_bytes) {
@@ -332,6 +467,13 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(
 
     I.dev = MTLCreateSystemDefaultDevice();
     if (I.dev == nil) { fprintf(stderr, "[pie-metal] no Metal device\n"); return nullptr; }
+    if (![I.dev supportsFamily:MTLGPUFamilyMetal4]) {
+        fprintf(stderr,
+                "[pie-metal] device '%s' does not support MTLGPUFamilyMetal4; "
+                "this driver is Metal 4 only (macOS 26+ / MSL 4.0)\n",
+                I.dev.name.UTF8String);
+        return nullptr;
+    }
 
     I.queue    = [I.dev newMTL4CommandQueue];
     I.mapping_queue = [I.dev newMTL4CommandQueue];
@@ -402,6 +544,7 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(
     MTLHeapDescriptor* hd = [MTLHeapDescriptor new];
     hd.type        = MTLHeapTypePlacement;
     hd.storageMode = MTLStorageModeShared;   // UMA: contents() valid for all slots
+    hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
     hd.size        = heap_bytes;
     I.heap = [I.dev newHeapWithDescriptor:hd];
     if (I.heap == nil) {
@@ -423,12 +566,27 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(
     return ctx;
 }
 
+SlotHandle RawMetalContext::const_slot(int ordinal, std::uint8_t index, size_t bytes) {
+    const std::uint64_t key =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(ordinal)) << 8) | index;
+    auto& cache = impl_->const_slots;
+    const auto it = cache.find(key);
+    // A different SIZE at the same slot would be a different constant, which
+    // this cache cannot serve; allocate afresh rather than hand back a slot too
+    // small to hold it.
+    if (it != cache.end() && it->second.size >= bytes) return it->second;
+    SlotHandle s = heap_alloc(bytes);
+    if (s.valid()) cache[key] = s;
+    return s;
+}
+
 SlotHandle RawMetalContext::heap_alloc(size_t size, size_t align) {
     auto& I = *impl_;
     SlotHandle h;
     if (size == 0) return h;
 
-    MTLResourceOptions opts = MTLResourceStorageModeShared;
+    MTLResourceOptions opts =
+        MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
     MTLSizeAndAlign sa = [I.dev heapBufferSizeAndAlignWithLength:size options:opts];
     size_t a = align > sa.align ? align : sa.align;
     size_t off = align_up(I.bump, a);
@@ -477,47 +635,71 @@ SlotHandle RawMetalContext::create_standalone_buffer(size_t size) {
     return h;
 }
 
+SlotHandle RawMetalContext::wrap_host_memory(void* ptr, size_t size) {
+    auto& I = *impl_;
+    SlotHandle h;
+    if (ptr == nullptr || size == 0) return h;
+    id<MTLBuffer> buf = [I.dev newBufferWithBytesNoCopy:ptr
+                                                 length:size
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+    if (buf == nil) {
+        fprintf(stderr, "[pie-metal] no-copy buffer over host memory failed (%zu bytes)\n",
+                size);
+        return h;
+    }
+    [I.retained addObject:buf];
+    [I.rs addAllocation:buf];
+    [I.rs commit];
+    if (I.resident) [I.rs requestResidency];
+
+    h.buffer       = (__bridge void*)buf;
+    h.contents_ptr = buf.contents;
+    h.gpu_address  = buf.gpuAddress;
+    h.offset       = 0;
+    h.size         = size;
+    return h;
+}
+
 SlotHandle RawMetalContext::create_elastic_buffer(
     size_t size,
     size_t initial_commit_bytes) {
     auto& I = *impl_;
     SlotHandle h;
     if (size == 0) return h;
-    if (@available(macOS 26.0, iOS 26.0, *)) {
-        const size_t virtual_bytes = align_up(
-            size,
-            Impl::kSparseTileBytes);
-        id<MTLBuffer> buffer = [I.dev
-            newBufferWithLength:virtual_bytes
-                       options:MTLResourceStorageModePrivate
-       placementSparsePageSize:MTLSparsePageSize16];
-        if (buffer == nil) {
-            fprintf(
-                stderr,
-                "[pie-metal] placement sparse buffer creation failed (%zu bytes)\n",
-                virtual_bytes);
-            return h;
-        }
-        [I.retained addObject:buffer];
-        [I.rs addAllocation:buffer];
-        [I.rs commit];
-        if (I.resident) [I.rs requestResidency];
-        I.elastic_allocations.emplace(
-            (__bridge void*)buffer,
-            Impl::ElasticAllocation{
-                .buffer = (__bridge void*)buffer,
-                .virtual_bytes = virtual_bytes,
-            });
+    const size_t virtual_bytes = align_up(
+        size,
+        Impl::kSparseTileBytes);
+    id<MTLBuffer> buffer = [I.dev
+        newBufferWithLength:virtual_bytes
+                   options:MTLResourceStorageModePrivate
+   placementSparsePageSize:MTLSparsePageSize16];
+    if (buffer == nil) {
+        fprintf(
+            stderr,
+            "[pie-metal] placement sparse buffer creation failed (%zu bytes)\n",
+            virtual_bytes);
+        return h;
+    }
+    [I.retained addObject:buffer];
+    [I.rs addAllocation:buffer];
+    [I.rs commit];
+    if (I.resident) [I.rs requestResidency];
+    I.elastic_allocations.emplace(
+        (__bridge void*)buffer,
+        Impl::ElasticAllocation{
+            .buffer = (__bridge void*)buffer,
+            .virtual_bytes = virtual_bytes,
+        });
 
-        h.buffer = (__bridge void*)buffer;
-        h.gpu_address = buffer.gpuAddress;
-        h.size = size;
-        h.elastic = true;
-        if (initial_commit_bytes != 0 &&
-            !ensure_elastic_buffer(h, initial_commit_bytes)) {
-            release_elastic_buffer(h);
-            return {};
-        }
+    h.buffer = (__bridge void*)buffer;
+    h.gpu_address = buffer.gpuAddress;
+    h.size = size;
+    h.elastic = true;
+    if (initial_commit_bytes != 0 &&
+        !ensure_elastic_buffer(h, initial_commit_bytes)) {
+        release_elastic_buffer(h);
+        return {};
     }
     return h;
 }
@@ -1058,6 +1240,13 @@ void RawMetalContext::arg_bind(Kernel k, int ordinal, uint8_t bind_index, SlotHa
 void RawMetalContext::arg_bind_ordinal(int ordinal, uint8_t bind_index, SlotHandle slot,
                                        size_t offset) {
     auto& I = *impl_;
+    if (bind_index >= kMaxArgBinds) {
+        fprintf(stderr,
+                "[pie-metal] arg_bind ordinal %d index %u: MSL allows at most %u "
+                "buffer bindings ([[buffer(0..%u)]]); the bind was ignored\n",
+                ordinal, unsigned(bind_index), kMaxArgBinds, kMaxArgBinds - 1);
+        return;
+    }
     id<MTL4ArgumentTable> t = I.argtable_for(ordinal, /*create=*/true);
     if (t == nil) return;
     [t setAddress:(slot.gpu_address + offset) atIndex:bind_index];
@@ -1094,6 +1283,23 @@ void RawMetalContext::release_argtable_ordinal(int ordinal) {
 
 namespace {
 
+/// Whether `lib` really exports `fn`.
+///
+/// Asked BEFORE building a pipeline descriptor, because a
+/// `MTL4LibraryFunctionDescriptor` naming a function the library does not have
+/// is not an error the compiler returns -- Metal asserts inside
+/// `setComputeFunction:` and kills the process. That is the wrong outcome for a
+/// name this driver derives: `sdpa_paged_decode_bfloat16_d_96` is what a
+/// checkpoint with an uninstantiated head width asks for, and the honest answer
+/// is a refusal that names the width, not a crash with no context.
+bool library_has_function(id<MTLLibrary> lib, const std::string& fn) {
+    NSString* want = [NSString stringWithUTF8String:fn.c_str()];
+    for (NSString* have in lib.functionNames) {
+        if ([have isEqualToString:want]) return true;
+    }
+    return false;
+}
+
 Pso compile_pso_impl(
     RawMetalContext::Impl& I,
     const std::string& src,
@@ -1103,6 +1309,14 @@ Pso compile_pso_impl(
     std::string* error) {
     Pso out;
     NSError* e = nil;
+    // Single choke point for the MSL dialect. This driver is Metal 4 only, and
+    // the runtime shader compiler otherwise defaults to an older standard --
+    // which silently hides <metal_tensor> and the MetalPerformancePrimitives
+    // tensor ops from every kernel. Pinning it here (rather than at each of the
+    // four call sites) keeps the dialect a property of the driver, not of the
+    // caller that happened to build the options object.
+    if (options == nil) options = [MTLCompileOptions new];
+    options.languageVersion = MTLLanguageVersion4_0;
     id<MTLLibrary> lib =
         [I.dev newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()]
                             options:options
@@ -1111,11 +1325,19 @@ Pso compile_pso_impl(
         if (error) *error = e.localizedDescription.UTF8String;
         return out;
     }
+    if (!library_has_function(lib, fn)) {
+        if (error) *error = "the library compiled but exports no '" + fn + "'";
+        return out;
+    }
     MTL4LibraryFunctionDescriptor* fd = [MTL4LibraryFunctionDescriptor new];
     fd.name = [NSString stringWithUTF8String:fn.c_str()];
     fd.library = lib;
     MTL4ComputePipelineDescriptor* pd = [MTL4ComputePipelineDescriptor new];
     pd.computeFunctionDescriptor = fd;
+    // The entrypoint's name, carried on the pipeline, is what per-dispatch
+    // tracing has to report -- a `Pso` is an opaque pointer and an ordinal
+    // names a position in a DAG rather than a kernel.
+    pd.label = fd.name;
     id<MTLComputePipelineState> pso =
         [I.compiler newComputePipelineStateWithDescriptor:pd
                                       compilerTaskOptions:task_options
@@ -1130,10 +1352,11 @@ Pso compile_pso_impl(
     return out;
 }
 
-bool read_metal_source(
+bool read_metal_source_at(
     const std::string& path,
     std::string& source,
-    std::string* error) {
+    std::string* error,
+    int depth) {
     NSError* e = nil;
     NSString* src = [NSString
         stringWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]
@@ -1147,52 +1370,64 @@ bool read_metal_source(
         return false;
     }
     source = src.UTF8String;
+
+    // Metal's runtime shader compiler does no filesystem include lookup, so a
+    // `#include "..."` in a kernel source is spliced in here. That is the only
+    // way two `.metal` files can share a definition: each one is handed to
+    // `newLibraryWithSource:` on its own, so anything they both need would
+    // otherwise have to be written twice. The 4-bit codecs are, which is what
+    // made this general -- it used to resolve one hardcoded filename.
+    //
+    // Angle-bracket includes are the system headers and are left alone.
+    if (depth > 8) {
+        if (error) *error = "include nesting too deep at '" + path + "'";
+        return false;
+    }
+    const std::size_t separator = path.find_last_of("/\\");
+    const std::string dir =
+        separator == std::string::npos ? std::string{} : path.substr(0, separator + 1);
+    constexpr std::string_view kDirective = "#include \"";
+    for (std::size_t at = source.find(kDirective); at != std::string::npos;
+         at = source.find(kDirective, at)) {
+        // Only at the start of a line: the same characters inside a string or a
+        // comment are not a directive.
+        if (at != 0 && source[at - 1] != '\n') {
+            at += kDirective.size();
+            continue;
+        }
+        const std::size_t name_at = at + kDirective.size();
+        const std::size_t close = source.find('"', name_at);
+        if (close == std::string::npos) {
+            if (error) *error = "unterminated #include in '" + path + "'";
+            return false;
+        }
+        std::string included;
+        if (!read_metal_source_at(dir + source.substr(name_at, close - name_at), included, error,
+                                  depth + 1)) {
+            return false;
+        }
+        source.replace(at, close + 1 - at, included);
+        at += included.size();
+    }
     return true;
 }
 
 void configure_ptir_math_options(
     MTLCompileOptions* options,
     bool& strict_math) {
-    if (@available(macOS 15.0, *)) {
-        options.mathMode = MTLMathModeSafe;
-        options.mathFloatingPointFunctions =
-            MTLMathFloatingPointFunctionsPrecise;
-        strict_math = options.mathMode == MTLMathModeSafe;
-        return;
-    }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    options.fastMathEnabled = NO;
-    strict_math = options.fastMathEnabled == NO;
-#pragma clang diagnostic pop
+    options.mathMode = MTLMathModeSafe;
+    options.mathFloatingPointFunctions =
+        MTLMathFloatingPointFunctionsPrecise;
+    strict_math = options.mathMode == MTLMathModeSafe;
 }
 
 }  // namespace
 
-bool read_ptir_msl_source(
+bool read_metal_source(
     const std::string& path,
     std::string& source,
     std::string* error) {
-    if (!read_metal_source(path, source, error)) return false;
-    constexpr std::string_view include =
-        "#include \"ptir_rng.generated.metal\"";
-    const std::size_t first = source.find(include);
-    if (first == std::string::npos) return true;
-
-    const std::size_t separator = path.find_last_of("/\\");
-    const std::string preamble_path =
-        (separator == std::string::npos
-             ? std::string{}
-             : path.substr(0, separator + 1)) +
-        "ptir_rng.generated.metal";
-    std::string preamble;
-    if (!read_metal_source(preamble_path, preamble, error)) return false;
-    for (std::size_t position = first;
-         position != std::string::npos;
-         position = source.find(include, position + preamble.size())) {
-        source.replace(position, include.size(), preamble);
-    }
-    return true;
+    return read_metal_source_at(path, source, error, 0);
 }
 
 Pso RawMetalContext::compile_pso(const std::string& src, const std::string& fn,
@@ -1206,6 +1441,216 @@ Pso RawMetalContext::compile_pso_from_file(const std::string& path, const std::s
     return read_metal_source(path, source, error)
                ? compile_pso(source, fn, error)
                : Pso{};
+}
+
+std::string RawMetalContext::pso_archive_dir() {
+    if (const char* override_dir = getenv("PIE_METAL_PSO_CACHE")) return override_dir;
+    const char* home = getenv("HOME");
+    if (home == nullptr || *home == '\0') return std::string();
+    return std::string(home) + "/Library/Caches/pie-metal";
+}
+
+namespace {
+inline void hash_bytes(std::uint64_t& h, const void* p, size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+}
+
+// Names the archive for one batch. Every input that can change the compiled
+// binaries goes into the key: which entrypoints were asked for, out of which
+// files, and the resolved source of each of those files -- so editing a .metal
+// source, or anything it includes, invalidates the archive instead of silently
+// serving a stale pipeline.
+std::string batch_archive_path(
+    const std::vector<RawMetalContext::PsoFileRequest>& requests) {
+    const std::string dir = RawMetalContext::pso_archive_dir();
+    if (dir.empty()) return std::string();
+
+    std::uint64_t h = 1469598103934665603ull;
+    std::string last_path;
+    for (const auto& r : requests) {
+        hash_bytes(h, r.path.data(), r.path.size());
+        hash_bytes(h, r.function.data(), r.function.size());
+        if (r.path == last_path) continue;
+        last_path = r.path;
+        // The RESOLVED source, not the file's size and mtime. A source that
+        // includes another would otherwise keep its key when the included file
+        // changed, and serve a pipeline compiled from the old definition --
+        // which is worse than a slow start, because it looks like it worked.
+        std::string resolved;
+        if (read_metal_source(r.path, resolved, nullptr)) {
+            hash_bytes(h, resolved.data(), resolved.size());
+        }
+    }
+
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:@(dir.c_str())
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:nil]) {
+        return std::string();
+    }
+    char name[64];
+    std::snprintf(name, sizeof(name), "/psos-%016llx.mtl4archive",
+                  (unsigned long long)h);
+    return dir + name;
+}
+
+// Every edit to a kernel source strands the archive keyed to the old one, so
+// without this the cache grows by ~3 MB per edit and never shrinks.
+void prune_stale_archives(const std::string& dir) {
+    static constexpr double kMaxAgeSeconds = 14 * 24 * 60 * 60;
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSArray<NSString*>* entries =
+        [fm contentsOfDirectoryAtPath:@(dir.c_str()) error:nil];
+    NSDate* now = [NSDate date];
+    for (NSString* entry in entries) {
+        if (![entry hasSuffix:@".mtl4archive"]) continue;
+        NSString* full = [@(dir.c_str()) stringByAppendingPathComponent:entry];
+        NSDate* modified = [fm attributesOfItemAtPath:full error:nil][NSFileModificationDate];
+        if (modified != nil && [now timeIntervalSinceDate:modified] > kMaxAgeSeconds) {
+            [fm removeItemAtPath:full error:nil];
+        }
+    }
+}
+}  // namespace
+
+std::vector<Pso> RawMetalContext::compile_psos_from_files(
+    const std::vector<PsoFileRequest>& requests,
+    std::vector<std::string>* errors,
+    bool use_archive_cache) {
+    auto& I = *impl_;
+    std::vector<Pso> out(requests.size());
+    if (errors != nullptr) errors->assign(requests.size(), std::string{});
+    if (requests.empty()) return out;
+
+    // A hit means every pipeline below is fetched from the archive rather than
+    // compiled; a miss means we compile now and write the archive at the end.
+    const std::string archive_path =
+        use_archive_cache ? batch_archive_path(requests) : std::string();
+    MTL4CompilerTaskOptions* task = nil;
+    if (!archive_path.empty()) {
+        NSURL* url = [NSURL fileURLWithPath:@(archive_path.c_str())];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
+            NSError* archive_error = nil;
+            id<MTL4Archive> archive = [I.dev newArchiveWithURL:url error:&archive_error];
+            if (archive != nil) {
+                task = [MTL4CompilerTaskOptions new];
+                task.lookupArchives = @[archive];
+            }
+        }
+    }
+
+    // ── Stage 1: one library per distinct source file ──
+    // The batch asks for many entry points out of a handful of files, so each
+    // file is read and compiled exactly once instead of once per entry point.
+    std::vector<std::string> paths;
+    std::unordered_map<std::string, size_t> path_index;
+    std::vector<size_t> request_library(requests.size(), 0);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto [it, inserted] =
+            path_index.emplace(requests[i].path, paths.size());
+        if (inserted) paths.push_back(requests[i].path);
+        request_library[i] = it->second;
+    }
+
+    std::vector<id<MTLLibrary>> libraries(paths.size(), nil);
+    std::vector<std::string> library_errors(paths.size());
+    // Compilation stays synchronous on purpose. Metal serializes the work in
+    // its own compiler service, so driving it from extra threads measured no
+    // faster, and the completion-handler API overruns the stack of Metal's
+    // scheduler threads on batches this size (EXC_BAD_ACCESS in the stack
+    // guard region under MTLCompilerFunctionRequest::serializedRequest).
+    for (size_t li = 0; li < paths.size(); ++li) {
+        std::string source;
+        std::string read_error;
+        if (!read_metal_source(paths[li], source, &read_error)) {
+            library_errors[li] = read_error;
+            continue;
+        }
+        MTLCompileOptions* options = [MTLCompileOptions new];
+        options.languageVersion = MTLLanguageVersion4_0;
+        NSError* le = nil;
+        id<MTLLibrary> lib =
+            [I.dev newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+                                options:options
+                                  error:&le];
+        if (lib != nil) libraries[li] = lib;
+        else library_errors[li] = le != nil ? le.localizedDescription.UTF8String
+                                            : "library compile failed";
+    }
+
+    // ── Stage 2: every pipeline state off those libraries ──
+    std::vector<id<MTLComputePipelineState>> states(requests.size(), nil);
+    std::vector<std::string> pso_errors(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const size_t li = request_library[i];
+        if (libraries[li] == nil) {
+            pso_errors[i] = library_errors[li];
+            continue;
+        }
+        if (!library_has_function(libraries[li], requests[i].function)) {
+            pso_errors[i] =
+                "the library compiled but exports no '" + requests[i].function + "'";
+            continue;
+        }
+        MTL4LibraryFunctionDescriptor* fd = [MTL4LibraryFunctionDescriptor new];
+        fd.name = [NSString stringWithUTF8String:requests[i].function.c_str()];
+        fd.library = libraries[li];
+        MTL4ComputePipelineDescriptor* pd = [MTL4ComputePipelineDescriptor new];
+        pd.computeFunctionDescriptor = fd;
+        pd.label = fd.name;
+        NSError* pe = nil;
+        id<MTLComputePipelineState> pso =
+            [I.compiler newComputePipelineStateWithDescriptor:pd
+                                          compilerTaskOptions:task
+                                                        error:&pe];
+        if (pso != nil) states[i] = pso;
+        else pso_errors[i] = pe != nil ? pe.localizedDescription.UTF8String
+                                       : "pipeline build failed";
+    }
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (states[i] == nil) {
+            if (errors != nullptr) (*errors)[i] = pso_errors[i];
+            continue;
+        }
+        [I.retained addObject:states[i]];
+        out[i].obj = (__bridge void*)states[i];
+        I.retained_psos.insert(out[i].obj);
+    }
+
+    // Only write on a miss, and only when the whole batch built: a partial
+    // archive would be served back as if it were complete.
+    const bool all_built =
+        std::none_of(states.begin(), states.end(),
+                     [](id<MTLComputePipelineState> p) { return p == nil; });
+    if (task == nil && all_built && !archive_path.empty() &&
+        I.pipeline_serializer != nil) {
+        NSError* serialize_error = nil;
+        NSURL* url = [NSURL fileURLWithPath:@(archive_path.c_str())];
+        if (![I.pipeline_serializer serializeAsArchiveAndFlushToURL:url
+                                                              error:&serialize_error]) {
+            fprintf(stderr, "[pie-metal] pipeline archive write failed: %s\n",
+                    serialize_error.localizedDescription.UTF8String);
+        } else {
+            prune_stale_archives(pso_archive_dir());
+        }
+    }
+    return out;
+}
+
+Pso RawMetalContext::compile_precise_pso_from_file(const std::string& path,
+                                                   const std::string& fn,
+                                                   std::string* error) {
+    std::string source;
+    if (!read_metal_source(path, source, error)) return Pso{};
+    // Load-time transcode has to reproduce MLX's arithmetic bit for bit, and
+    // fast math rewrites `x / s` into `x * (1/s)` -- one ulp there moves a
+    // rounded 4-bit code by a whole step.
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    bool strict = false;
+    configure_ptir_math_options(options, strict);
+    return compile_pso_impl(*impl_, source, fn, options, nil, error);
 }
 
 Pso RawMetalContext::compile_ptir_pso(
@@ -1224,7 +1669,7 @@ Pso RawMetalContext::compile_ptir_pso_from_file(
     const std::string& fn,
     std::string* error) {
     std::string source;
-    return read_ptir_msl_source(path, source, error)
+    return read_metal_source(path, source, error)
                ? compile_ptir_pso(source, fn, error)
                : Pso{};
 }
@@ -1361,14 +1806,95 @@ void RawMetalContext::release_timestamp_heap(void* heap) {
     [impl_->retained removeObject:counter];
 }
 
-StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,
-                                     int ab) {
-    auto& I = *impl_;
-    StepTiming tm;
-    ab &= 1;
+uint64_t RawMetalContext::Impl::commit_and_signal(
+    const id<MTL4CommandBuffer> __strong* cbs,
+    NSUInteger n,
+    uint64_t wait_value) {
+    if (wait_value > 0) [queue waitForEvent:event value:wait_value];
 
-    double t0 = nowms();
-    [I.alloc[ab] reset];
+    // The value this batch will signal, known before the commit so the feedback
+    // handler can tag itself with the timeline point it describes.
+    const uint64_t signal_value = ev_val + 1;
+
+    // A fresh options object per commit: `addFeedbackHandler:` appends, so a
+    // shared instance would accumulate one handler per step forever, and the
+    // class is documented as not thread-safe.
+    MTL4CommitOptions* options = [MTL4CommitOptions new];
+    std::shared_ptr<FeedbackSlot> slot = feedback;
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+        GpuCommitFeedback got;
+        got.event_value = signal_value;
+        got.gpu_start_s = fb.GPUStartTime;
+        got.gpu_end_s   = fb.GPUEndTime;
+        got.gpu_ms      = (fb.GPUEndTime - fb.GPUStartTime) * 1000.0;
+        if (fb.error != nil) {
+            got.had_error = true;
+            got.error = fb.error.localizedDescription.UTF8String;
+            // The localized description of an MTL4 queue error is "the
+            // operation couldn't be completed", which names nothing. The
+            // domain, the code and the underlying error are what say what
+            // actually went wrong -- and a 19 GB model that fails to commit
+            // gives no other clue.
+            fprintf(stderr,
+                    "[pie-metal] GPU commit error (event=%llu): %s [%s code %ld]%s%s\n",
+                    (unsigned long long)signal_value, got.error.c_str(),
+                    fb.error.domain.UTF8String, (long)fb.error.code,
+                    fb.error.userInfo[NSUnderlyingErrorKey] != nil ? " underlying: " : "",
+                    fb.error.userInfo[NSUnderlyingErrorKey] != nil
+                        ? [[fb.error.userInfo[NSUnderlyingErrorKey] description] UTF8String]
+                        : "");
+        }
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        // Feedback blocks can land out of order; keep the newest only.
+        if (got.event_value >= slot->value.event_value) slot->value = got;
+    }];
+
+    [queue commit:cbs count:n options:options];
+    [queue signalEvent:event value:signal_value];
+    ev_val = signal_value;
+    return signal_value;
+}
+
+GpuCommitFeedback RawMetalContext::last_commit_feedback() const {
+    std::lock_guard<std::mutex> lock(impl_->feedback->mutex);
+    return impl_->feedback->value;
+}
+
+// Fold whatever feedback has landed for `event_value` into `tm`. The handler is
+// asynchronous, so a miss here is normal and simply leaves `gpu_ms` at zero.
+static void apply_commit_feedback(const RawMetalContext& ctx,
+                                  uint64_t event_value,
+                                  StepTiming& tm) {
+    // The fence has already been reached, but the feedback block is dispatched
+    // asynchronously. Normal inference does not put that CPU scheduling delay
+    // on every token: the handler logs an error immediately, and run_steps
+    // promotes a late error to a sticky failure before the next submission.
+    // Tracing and the GPU meter do wait because their output specifically asks
+    // for this event's calibrated GPU timestamps.
+    GpuCommitFeedback fb = ctx.last_commit_feedback();
+    const bool synchronous =
+        dispatch_trace_every() > 0 || getenv("PIE_METAL_GPU_METER") != nullptr ||
+        getenv("PIE_METAL_SYNC_FEEDBACK") != nullptr;
+    if (synchronous) {
+        for (int spin = 0; fb.event_value != event_value && spin < 200; ++spin) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            fb = ctx.last_commit_feedback();
+        }
+    }
+    if (fb.event_value != event_value) return;
+    tm.gpu_ms = fb.gpu_ms;
+    tm.gpu_error = fb.had_error;
+    tm.gpu_error_text = fb.error;
+}
+
+/// One command buffer, encoded and closed.
+///
+/// Shared so the ordered and the unordered runner cannot drift on what encoding
+/// a segment means. Not in an anonymous namespace: `StepEncoder`'s constructor
+/// is private, and a name the header cannot see is a name it cannot befriend.
+void* encode_one_command_buffer(void* ctx_impl, int ab,
+                                const std::function<void(StepEncoder&)>& encode_fn) {
+    auto& I = *static_cast<RawMetalContext::Impl*>(ctx_impl);
     id<MTL4CommandBuffer> cb = [I.dev newCommandBuffer];
     [cb beginCommandBufferWithAllocator:I.alloc[ab]];
     [cb useResidencySet:I.rs];
@@ -1376,81 +1902,218 @@ StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& en
 
     I.step.en  = en;
     I.step.ctx = &I;
+    if (dispatch_trace_every() > 0 && I.step.trace_heap == nullptr) {
+        // Sized once and reused: a fire is bounded by its DAG, and a heap
+        // reallocated per fire would be timing the allocator.
+        // The driver caps a timestamp heap and says only "invalid heap size",
+        // so the size is found rather than assumed: the largest power of two
+        // it will hand over, down to a floor below which tracing is pointless.
+        for (std::uint32_t want = 8192; want >= 256; want /= 2) {
+            MTL4CounterHeapDescriptor* hd = [MTL4CounterHeapDescriptor new];
+            hd.type = MTL4CounterHeapTypeTimestamp;
+            hd.count = want;
+            NSError* he = nil;
+            id<MTL4CounterHeap> h = [I.dev newCounterHeapWithDescriptor:hd error:&he];
+            if (h == nil) continue;
+            [I.retained addObject:h];
+            I.step.trace_heap = (__bridge void*)h;
+            I.step.trace_slots = want;
+            break;
+        }
+        if (I.step.trace_heap == nullptr) {
+            fprintf(stderr, "[trace] no timestamp heap: dispatch tracing is off\n");
+        }
+    }
+    I.step.trace_n = 0;
+    I.step.trace_labels.clear();
     StepEncoder se(&I.step);
     encode_fn(se);
 
     [en endEncoding];
     [cb endCommandBuffer];
+    I.step.en = nil;
+    // Hands the caller a reference rather than a borrowed pointer. A plain
+    // `__bridge` here compiles and then crashes in `objc_retain`: ARC releases
+    // `cb` when this function returns, so the caller bridges back a pointer to
+    // a command buffer that is already gone. The call sites balance this with
+    // `__bridge_transfer`.
+    return (__bridge_retained void*)cb;
+}
+
+// Resolve the bracketed timestamps of the fire just waited for and fold them
+// into a running table. Reported as SHARES of the fire's own GPU time, which
+// needs no tick-to-nanosecond calibration: the question a trace answers is
+// which kernel to go and look at, and the absolute figure beside it is the
+// commit feedback's, which is already calibrated.
+void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
+    const int every = dispatch_trace_every();
+    if (every <= 0 || I.step.trace_heap == nullptr || I.step.trace_n == 0) return;
+    const std::uint32_t n = I.step.trace_n;
+    std::vector<std::uint64_t> ticks(std::size_t(2) * n, 0);
+    {
+        id<MTL4CounterHeap> h = (__bridge id<MTL4CounterHeap>)I.step.trace_heap;
+        NSData* d = [h resolveCounterRange:NSMakeRange(0, 2 * n)];
+        if (d == nil) return;
+        const auto* e = static_cast<const MTL4TimestampHeapEntry*>(d.bytes);
+        const std::size_t got = d.length / sizeof(MTL4TimestampHeapEntry);
+        for (std::size_t i = 0; i < ticks.size() && i < got; ++i) ticks[i] = e[i].timestamp;
+    }
+    static std::map<std::string, std::pair<double, long>> table;
+    static double total_ticks = 0.0;
+    static double total_gpu_ms = 0.0;
+    static long fires = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint64_t a = ticks[2 * i], b = ticks[2 * i + 1];
+        // A relaxed timestamp is not ordered against the dispatch it brackets,
+        // so a pair can come back inverted. Dropping those is honest; counting
+        // them as zero would quietly shrink whichever kernel is noisiest.
+        if (b <= a) continue;
+        auto& slot = table[I.step.trace_labels[i]];
+        slot.first += double(b - a);
+        slot.second += 1;
+        total_ticks += double(b - a);
+    }
+    total_gpu_ms += gpu_ms;
+    if (++fires % every != 0) return;
+    std::vector<std::pair<std::string, std::pair<double, long>>> rows(table.begin(), table.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& x, const auto& y) { return x.second.first > y.second.first; });
+    fprintf(stderr, "[trace] %ld fires, %.2f ms of GPU, %zu kernels\n", fires, total_gpu_ms,
+            rows.size());
+    for (const auto& [name, v] : rows) {
+        const double share = total_ticks > 0 ? v.first / total_ticks : 0.0;
+        fprintf(stderr, "[trace]  %6.2f%%  %8.3f ms  n=%-6ld %s\n", 100.0 * share,
+                share * total_gpu_ms, v.second, name.c_str());
+    }
+    table.clear();
+    total_ticks = 0.0;
+    total_gpu_ms = 0.0;
+}
+
+StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,
+                                     int ab) {
+    return run_steps({encode_fn}, ab);
+}
+
+StepTiming RawMetalContext::run_steps(
+    const std::vector<std::function<void(StepEncoder&)>>& encode_fns,
+    int ab) {
+    auto& I = *impl_;
+    StepTiming tm;
+    ab &= 1;
+    const GpuCommitFeedback pending = last_commit_feedback();
+    if (pending.had_error && pending.event_value > I.surfaced_feedback_error) {
+        I.surfaced_feedback_error = pending.event_value;
+        I.wedged = true;
+        tm.gpu_error = true;
+        tm.gpu_error_text = pending.error;
+        return tm;
+    }
+    if (I.wedged) {
+        tm.timed_out = true;
+        return tm;
+    }
+    if (encode_fns.empty()) {
+        tm.completed = true;
+        return tm;
+    }
+
+    double t0 = nowms();
+    [I.alloc[ab] reset];
+    // One allocator can back several command buffers; `reset` only requires
+    // that every buffer drawn from it has completed, which the wait below
+    // guarantees before the next reset.
+    std::vector<id<MTL4CommandBuffer>> cbs;
+    cbs.reserve(encode_fns.size());
+    for (const auto& encode_fn : encode_fns) {
+        cbs.push_back((__bridge_transfer id<MTL4CommandBuffer>)
+            encode_one_command_buffer(&I, ab, encode_fn));
+    }
     double t1 = nowms();
 
-    [I.queue commit:&cb count:1];
-    [I.queue signalEvent:I.event value:++I.ev_val];
+    const uint64_t signalled = I.commit_and_signal(cbs.data(), cbs.size(), 0);
+
     const auto wait_begin = M0TimingCounters::Clock::now();
-    BOOL signaled = I.force_wait_timeout_once.exchange(false)
-                        ? NO
-                        : [I.event waitUntilSignaledValue:I.ev_val
-                                               timeoutMS:5000];
-    tm.timed_out = signaled == NO;
-    if (tm.timed_out) {
-        m0_timing_counters().record_forward_wait_timeout();
+    if (I.await_event(signalled)) {
+        tm.completed = true;
+    } else {
+        tm.timed_out = true;
+        tm.completed = false;
     }
-    while (signaled == NO) {
-        signaled = [I.event waitUntilSignaledValue:I.ev_val
-                                        timeoutMS:5000];
-    }
-    tm.completed = true;
     m0_timing_counters().record_forward_wait(
         M0TimingCounters::Clock::now() - wait_begin);
     double t2 = nowms();
 
-    I.step.en = nil;
     tm.encode_ms   = t1 - t0;
     tm.gpu_exec_ms = t2 - t1;
+    apply_commit_feedback(*this, signalled, tm);
+    report_dispatch_trace(I, tm.gpu_ms > 0.0 ? tm.gpu_ms : tm.gpu_exec_ms);
+    return tm;
+}
+
+StepTiming RawMetalContext::run_segments(
+    const std::vector<std::function<void(StepEncoder&)>>& encode_fns,
+    const std::function<void(std::size_t)>& between,
+    int ab) {
+    auto& I = *impl_;
+    StepTiming tm;
+    ab &= 1;
+    const GpuCommitFeedback pending = last_commit_feedback();
+    if (pending.had_error && pending.event_value > I.surfaced_feedback_error) {
+        I.surfaced_feedback_error = pending.event_value;
+        I.wedged = true;
+        tm.gpu_error = true;
+        tm.gpu_error_text = pending.error;
+        return tm;
+    }
+    if (I.wedged) {
+        tm.timed_out = true;
+        return tm;
+    }
+    if (encode_fns.empty()) {
+        tm.completed = true;
+        return tm;
+    }
+
+    std::uint64_t last_signal = 0;
+    for (std::size_t i = 0; i < encode_fns.size(); ++i) {
+        const double t0 = nowms();
+        // Legal every time round: `reset` needs every buffer drawn from this
+        // allocator to have completed, and the previous iteration waited for
+        // exactly that. Resetting per segment rather than once is what keeps a
+        // long model from growing the allocator by its layer count.
+        [I.alloc[ab] reset];
+        id<MTL4CommandBuffer> cb = (__bridge_transfer id<MTL4CommandBuffer>)
+            encode_one_command_buffer(&I, ab, encode_fns[i]);
+        const double t1 = nowms();
+
+        last_signal = I.commit_and_signal(&cb, 1, 0);
+        const auto wait_begin = M0TimingCounters::Clock::now();
+        const bool ok = I.await_event(last_signal);
+        m0_timing_counters().record_forward_wait(
+            M0TimingCounters::Clock::now() - wait_begin);
+        const double t2 = nowms();
+
+        tm.encode_ms += t1 - t0;
+        tm.gpu_exec_ms += t2 - t1;
+        if (!ok) {
+            // A segment that never finished leaves the host holding results
+            // that were never computed, so `between` is not called and the
+            // remaining segments are not encoded.
+            tm.timed_out = true;
+            tm.completed = false;
+            apply_commit_feedback(*this, last_signal, tm);
+            return tm;
+        }
+        if (between) between(i);
+    }
+    tm.completed = true;
+    apply_commit_feedback(*this, last_signal, tm);
     return tm;
 }
 
 void RawMetalContext::force_next_wait_timeout_for_test() {
     impl_->force_wait_timeout_once.store(true);
-}
-
-uint64_t RawMetalContext::commit_step_async(const std::function<void(StepEncoder&)>& encode_fn,
-                                            int ab) {
-    return commit_step_async_dep(encode_fn, ab, 0);
-}
-
-uint64_t RawMetalContext::commit_step_async_dep(const std::function<void(StepEncoder&)>& encode_fn,
-                                                int ab, uint64_t wait_value) {
-    auto& I = *impl_;
-    ab &= 1;
-    // Caller guarantees the allocator for `ab` is free (its prior step completed) via
-    // sync_event() before reuse — depth-2 pipelining over the two double-buffered allocators.
-    [I.alloc[ab] reset];
-    id<MTL4CommandBuffer> cb = [I.dev newCommandBuffer];
-    [cb beginCommandBufferWithAllocator:I.alloc[ab]];
-    [cb useResidencySet:I.rs];
-    id<MTL4ComputeCommandEncoder> en = [cb computeCommandEncoder];
-    I.step.en  = en;
-    I.step.ctx = &I;
-    StepEncoder se(&I.step);
-    encode_fn(se);
-    [en endEncoding];
-    [cb endCommandBuffer];
-    // GPU-side serialization: make this CB wait for `wait_value` (the prior step's completion)
-    // on the queue timeline before executing. This enforces the autoregressive token dependency
-    // (single-stream steps CANNOT overlap on the GPU) while keeping the HOST non-blocking, so
-    // the host CB-build for step i+1 overlaps GPU(i) and step i+1 starts the instant i finishes
-    // (zero host gap -> holds the clock). Without it the GPU overlaps independent CBs = the
-    // throughput regime, not single-stream.
-    if (wait_value > 0) [I.queue waitForEvent:I.event value:wait_value];
-    [I.queue commit:&cb count:1];
-    [I.queue signalEvent:I.event value:++I.ev_val];
-    I.step.en = nil;
-    return I.ev_val;
-}
-
-void RawMetalContext::sync_event(uint64_t value) {
-    while (![impl_->event waitUntilSignaledValue:value timeoutMS:5000]) {
-    }
 }
 
 uint64_t RawMetalContext::last_event() const { return impl_->ev_val; }

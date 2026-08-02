@@ -35,7 +35,7 @@
 //!
 //! Plain input: an optional draft-window size `k` (default 4, min 2), e.g. `"6"`.
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 
 const PROMPT: &str = "The quick brown fox jumps over";
@@ -88,23 +88,20 @@ async fn verify_window(
 
     let ws = WorkingSet::new();
     let max_pages = n.div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // Seeded inputs (single fire: the host geometry prefill reads seeds) + the
     // terminal [k]-Token reader output.
     let toks = Channel::from(input_toks).named("toks");
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
-    let w_slot =
-        Channel::from((0..n).map(|position| position / PAGE_T).collect::<Vec<_>>()).named("w_slot");
-    let w_off =
-        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>()).named("w_off");
-    let kv_len = Channel::from(vec![n]).named("kv_len");
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(0..n).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((0..n).map(|position| position / PAGE_T)).named("w_slot");
+    let w_off = Channel::from_iter((0..n).map(|position| position % PAGE_T)).named("w_off");
+    let kv_len = Channel::from([n]).named("kv_len");
     let allow = Channel::from_shaped([k, vocab], mask).named("allow");
-    let draft_ch = Channel::from(draft.to_vec()).named("draft");
+    let draft_ch = Channel::from(draft).named("draft");
     let out = Channel::new([k], dtype::i32).named("out");
 
     // k read-out rows ⇒ intrinsics::logits() declares [k, vocab].
@@ -116,41 +113,39 @@ async fn verify_window(
     fwd.readout(&readout)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         // Takes + compute first, PUTS last (value-id discipline).
-        let a = allow.take().tensor(); // [k, vocab] bool per-position mask
-        let d = draft_ch.take().tensor(); // [k] i32 submit draft
+        let a = allow.take(); // [k, vocab] bool per-position mask
+        let d = draft_ch.take(); // [k] i32 submit draft
         let logits = intrinsics::logits(); // [k, vocab] f32 target
-        let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [k, vocab]);
+        let neg_inf = broadcast(f32::NEG_INFINITY, [k, vocab]);
         let masked = select(&a, &logits, &neg_inf); // per-position mask
         let tgt = reduce_argmax(masked); // [k] grammar-constrained per-row argmax
         let hit = eq(&tgt, &d); // [k] bool
-        let ones = broadcast(Tensor::constant(1.0f32), [k]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let ones = broadcast(1.0f32, [k]);
+        let zeros = broadcast(0.0f32, [k]);
         // Cross-row prefix-AND: the first reject zeroes the whole suffix.
         let keep = gt(cumprod(select(&hit, &ones, &zeros)), 0.5f32);
-        let neg1 = broadcast(Tensor::constant(-1i32), [k]);
+        let neg1 = broadcast(-1i32, [k]);
         let ver = select(&keep, &d, &neg1); // accepted prefix, then -1
         out.put(&ver);
     });
 
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
-    let raw = out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("out take: {e}"))?;
+    fwd.submit(&pipeline).context("submit")?;
+    let raw = out.take_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok(accepted_prefix(&raw))
 }

@@ -24,7 +24,7 @@
 
 #include <cuda_runtime.h>
 
-#include "pie_native/launch/image.hpp"
+#include "pie/driver/testing/image.hpp"
 #include "pipeline/program_runtime.hpp"
 #include "pipeline/grouped_runtime.cuh"
 #include "pipeline/tier0/tier0_runner.hpp"
@@ -52,10 +52,10 @@ std::uint64_t program_key(const std::string& name) {
 // register the same program twice.
 const PieLaunchPackage* load_package(
     const std::string& dir, const std::string& name) {
-    static std::map<std::string, pie_native::launch::PackageImage> cache;
+    static std::map<std::string, pie::driver::testing::PackageImage> cache;
     auto found = cache.find(name);
     if (found == cache.end()) {
-        pie_native::launch::PackageImage image;
+        pie::driver::testing::PackageImage image;
         std::string error;
         if (!image.load(dir + "/" + name + ".launch", &error)) {
             expect(false, name + ": load launch package (" + error + ")");
@@ -69,7 +69,7 @@ const PieLaunchPackage* load_package(
 bool build_trace(const std::string& dir, const std::string& name, Trace& out) {
     const PieLaunchPackage* package = load_package(dir, name);
     if (package == nullptr) return false;
-    out = pie_native::launch::adopt(*package);
+    out = pie::driver::launch::adopt(*package);
     return true;
 }
 

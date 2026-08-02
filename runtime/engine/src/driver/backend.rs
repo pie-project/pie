@@ -42,13 +42,6 @@ pub struct DriverSpec {
     pub num_kv_pages: usize,
     pub limits: SchedulerLimits,
     pub device_geometry_port_mask: u32,
-    /// Site summary of the driver's traced + validated declared plan, from
-    /// the capabilities handshake (empty = no model-structural sites
-    /// known). Read by this driver's scheduler at spawn, which maps the
-    /// entries through the fire-plan vocabulary
-    /// (`fire_plan::site_table::summary_sites`) and merges them into every
-    /// fire's plan.
-    pub model_site_summary: pie_driver_abi::ModelSiteSummary,
 }
 
 impl DriverSpec {

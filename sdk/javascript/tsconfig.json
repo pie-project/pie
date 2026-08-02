@@ -16,47 +16,155 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "paths": {
-      "pie:core/model": [
-        "./src/bindings/interfaces/pie-core-model.js"
+      "pie:inferlet/channel": [
+        "./src/bindings/interfaces/pie-inferlet-channel.js"
       ],
-      "pie:core/working-set": [
-        "./src/bindings/interfaces/pie-core-working-set.js"
+      "pie:inferlet/channel@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-channel.js"
       ],
-      "pie:core/inference": [
-        "./src/bindings/interfaces/pie-core-inference.js"
+      "pie:inferlet/chat": [
+        "./src/bindings/interfaces/pie-inferlet-chat.js"
       ],
-      "pie:core/runtime": [
-        "./src/bindings/interfaces/pie-core-runtime.js"
+      "pie:inferlet/chat@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-chat.js"
       ],
-      "pie:core/session": [
-        "./src/bindings/interfaces/pie-core-session.js"
+      "pie:inferlet/forward": [
+        "./src/bindings/interfaces/pie-inferlet-forward.js"
       ],
-      "pie:core/adapter": [
-        "./src/bindings/interfaces/pie-core-adapter.js"
+      "pie:inferlet/forward-hybrid": [
+        "./src/bindings/interfaces/pie-inferlet-forward-hybrid.js"
       ],
-      "pie:core/types": [
-        "./src/bindings/interfaces/pie-core-types.js"
+      "pie:inferlet/forward-hybrid@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-forward-hybrid.js"
       ],
-      "pie:instruct/chat": [
-        "./src/bindings/interfaces/pie-instruct-chat.js"
+      "pie:inferlet/forward-recurrent": [
+        "./src/bindings/interfaces/pie-inferlet-forward-recurrent.js"
       ],
-      "pie:instruct/reasoning": [
-        "./src/bindings/interfaces/pie-instruct-reasoning.js"
+      "pie:inferlet/forward-recurrent@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-forward-recurrent.js"
       ],
-      "pie:instruct/tool-use": [
-        "./src/bindings/interfaces/pie-instruct-tool-use.js"
+      "pie:inferlet/forward@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-forward.js"
       ],
-      "pie:zo/zo": [
-        "./src/bindings/interfaces/pie-zo-zo.js"
+      "pie:inferlet/grammar": [
+        "./src/bindings/interfaces/pie-inferlet-grammar.js"
       ],
-      "wasi:io/poll@0.2.4": [
-        "./src/bindings/interfaces/wasi-io-poll.js"
+      "pie:inferlet/grammar@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-grammar.js"
       ],
-      "wasi:filesystem/preopens@0.2.4": [
+      "pie:inferlet/media": [
+        "./src/bindings/interfaces/pie-inferlet-media.js"
+      ],
+      "pie:inferlet/media@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-media.js"
+      ],
+      "pie:inferlet/model": [
+        "./src/bindings/interfaces/pie-inferlet-model.js"
+      ],
+      "pie:inferlet/model@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-model.js"
+      ],
+      "pie:inferlet/pipeline": [
+        "./src/bindings/interfaces/pie-inferlet-pipeline.js"
+      ],
+      "pie:inferlet/pipeline@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-pipeline.js"
+      ],
+      "pie:inferlet/reasoning": [
+        "./src/bindings/interfaces/pie-inferlet-reasoning.js"
+      ],
+      "pie:inferlet/reasoning@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-reasoning.js"
+      ],
+      "pie:inferlet/run": [
+        "./src/bindings/interfaces/pie-inferlet-run.js"
+      ],
+      "pie:inferlet/run@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-run.js"
+      ],
+      "pie:inferlet/session": [
+        "./src/bindings/interfaces/pie-inferlet-session.js"
+      ],
+      "pie:inferlet/session@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-session.js"
+      ],
+      "pie:inferlet/speech": [
+        "./src/bindings/interfaces/pie-inferlet-speech.js"
+      ],
+      "pie:inferlet/speech@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-speech.js"
+      ],
+      "pie:inferlet/system": [
+        "./src/bindings/interfaces/pie-inferlet-system.js"
+      ],
+      "pie:inferlet/system@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-system.js"
+      ],
+      "pie:inferlet/tokenizer": [
+        "./src/bindings/interfaces/pie-inferlet-tokenizer.js"
+      ],
+      "pie:inferlet/tokenizer@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-tokenizer.js"
+      ],
+      "pie:inferlet/tools": [
+        "./src/bindings/interfaces/pie-inferlet-tools.js"
+      ],
+      "pie:inferlet/tools@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-tools.js"
+      ],
+      "pie:inferlet/types": [
+        "./src/bindings/interfaces/pie-inferlet-types.js"
+      ],
+      "pie:inferlet/types@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-types.js"
+      ],
+      "pie:inferlet/working-set": [
+        "./src/bindings/interfaces/pie-inferlet-working-set.js"
+      ],
+      "pie:inferlet/working-set@0.3.0": [
+        "./src/bindings/interfaces/pie-inferlet-working-set.js"
+      ],
+      "wasi:clocks/monotonic-clock": [
+        "./src/bindings/interfaces/wasi-clocks-monotonic-clock.js"
+      ],
+      "wasi:clocks/monotonic-clock@0.3.0": [
+        "./src/bindings/interfaces/wasi-clocks-monotonic-clock.js"
+      ],
+      "wasi:clocks/system-clock": [
+        "./src/bindings/interfaces/wasi-clocks-system-clock.js"
+      ],
+      "wasi:clocks/system-clock@0.3.0": [
+        "./src/bindings/interfaces/wasi-clocks-system-clock.js"
+      ],
+      "wasi:clocks/types": [
+        "./src/bindings/interfaces/wasi-clocks-types.js"
+      ],
+      "wasi:clocks/types@0.3.0": [
+        "./src/bindings/interfaces/wasi-clocks-types.js"
+      ],
+      "wasi:filesystem/preopens": [
         "./src/bindings/interfaces/wasi-filesystem-preopens.js"
       ],
-      "wasi:filesystem/types@0.2.4": [
+      "wasi:filesystem/preopens@0.3.0": [
+        "./src/bindings/interfaces/wasi-filesystem-preopens.js"
+      ],
+      "wasi:filesystem/types": [
         "./src/bindings/interfaces/wasi-filesystem-types.js"
+      ],
+      "wasi:filesystem/types@0.3.0": [
+        "./src/bindings/interfaces/wasi-filesystem-types.js"
+      ],
+      "wasi:http/client": [
+        "./src/bindings/interfaces/wasi-http-client.js"
+      ],
+      "wasi:http/client@0.3.0": [
+        "./src/bindings/interfaces/wasi-http-client.js"
+      ],
+      "wasi:http/types": [
+        "./src/bindings/interfaces/wasi-http-types.js"
+      ],
+      "wasi:http/types@0.3.0": [
+        "./src/bindings/interfaces/wasi-http-types.js"
       ]
     }
   },
@@ -65,6 +173,7 @@
   ],
   "exclude": [
     "node_modules",
-    "dist"
+    "dist",
+    "src/__tests__"
   ]
 }

@@ -183,6 +183,10 @@ struct TpFireHeader {
     std::int32_t rs_mode;
     std::int32_t rs_fold_lens_count;
     std::int32_t rs_buffer_ids_count;
+    // Length of the buffer READ id array. The other three read-side arrays
+    // are fixed by R (indptr R+1, lens R, heads R), so this is the only one
+    // the follower cannot derive.
+    std::int32_t rs_buffer_read_ids_count;
     // Chosen by rank 0 so both ranks always agree on how this fire's payload
     // travels; the follower never decides for itself.
     std::int32_t transport;
@@ -201,6 +205,7 @@ enum class TpBuf : int {
     kCustomMask, kCustomMaskIndptr,
     kSlotIds, kIsFresh, kRsSlotFlags,
     kRsFoldLens, kRsBufferSlotIndptr, kRsBufferSlotIds,
+    kRsBufferReadIndptr, kRsBufferReadIds, kRsBufferReadLens, kRsBufferHeads,
     kSampleIdx,
     kCount,
 };
@@ -235,6 +240,10 @@ void* tp_buffer_ptr(PersistentInputs& pi, TpBuf id) {
         case TpBuf::kRsFoldLens:         return pi.rs_fold_lens.data();
         case TpBuf::kRsBufferSlotIndptr: return pi.rs_buffer_slot_indptr.data();
         case TpBuf::kRsBufferSlotIds:    return pi.rs_buffer_slot_ids.data();
+        case TpBuf::kRsBufferReadIndptr: return pi.rs_buffer_read_indptr.data();
+        case TpBuf::kRsBufferReadIds:    return pi.rs_buffer_read_slot_ids.data();
+        case TpBuf::kRsBufferReadLens:   return pi.rs_buffer_read_lens.data();
+        case TpBuf::kRsBufferHeads:      return pi.rs_buffer_heads.data();
         case TpBuf::kSampleIdx:          return pi.sample_idx.data();
         case TpBuf::kCount:              break;
     }
@@ -340,18 +349,29 @@ struct TpStallWatchdog {
                 const auto c = consumed.load(std::memory_order_acquire);
                 if (p == last_pub && c == last_con) {
                     const int ph = rank0_phase.load(std::memory_order_acquire);
+                    // Every rank, not just the first two: at tp>2 the whole
+                    // question is *which* rank stopped arriving, and a pair of
+                    // counters cannot name it.
+                    char coll[256];
+                    int off = 0;
+                    for (std::size_t r = 0; r < collectives.size(); ++r) {
+                        const auto n = collectives[r].load();
+                        if (n == 0) continue;
+                        off += std::snprintf(coll + off, sizeof(coll) - off,
+                                             "%sr%zu=%llu", off ? " " : "", r,
+                                             (unsigned long long)n);
+                    }
                     std::fprintf(stderr,
                         "[tp-watchdog] STALLED %ds: published=%llu consumed=%llu "
                         "(delta=%lld) rank0_last_phase=%s seq=%llu "
-                        "follower_forwards=%llu collectives=[r0=%llu r1=%llu]\n",
+                        "follower_forwards=%llu collectives=[%s]\n",
                         (++stuck) * 5,
                         (unsigned long long)p, (unsigned long long)c,
                         (long long)(p - c),
                         (ph >= 0 && ph < 5) ? kPhase[ph] : "none",
                         (unsigned long long)rank0_phase_seq.load(),
                         (unsigned long long)follower_forwards.load(),
-                        (unsigned long long)collectives[0].load(),
-                        (unsigned long long)collectives[1].load());
+                        coll);
                 } else {
                     stuck = 0;
                 }
@@ -472,10 +492,13 @@ void tp_publish_fire(const std::string& cpu_gate_key,
                      int structured_window_left,
                      RsExecutionMode rs_mode,
                      int rs_fold_lens_count,
-                     int rs_buffer_ids_count) {
+                     int rs_buffer_ids_count,
+                     int rs_buffer_read_ids_count) {
     if (cpu_gate_key.empty()) return;
+    // Before anything is written into the mailbox: a fire published to a group
+    // that has lost a rank can never complete.
+    tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
-    TpStallWatchdog::instance().start();
     TpStallWatchdog::instance().start();
     tp_mailbox_reserve_slot(*box, cpu_gate_key);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
@@ -489,6 +512,7 @@ void tp_publish_fire(const std::string& cpu_gate_key,
         static_cast<std::int32_t>(rs_mode),
         rs_fold_lens_count,
         rs_buffer_ids_count,
+        rs_buffer_read_ids_count,
         TP_TRANSPORT_NCCL,
         0,
     };
@@ -532,6 +556,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                          RsExecutionMode rs_mode,
                          int rs_fold_lens_count,
                          int rs_buffer_ids_count,
+                         int rs_buffer_read_ids_count,
                          cudaStream_t stream)
 {
     if (mask_bytes < 0 || mask_indptr_count < 0 ||
@@ -543,6 +568,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
             "TP root custom mask metadata exceeds persistent capacity");
     }
     TpStageTimer root_timer(TpProfile::kRootBroadcast);
+    tp_check_ranks_alive();
     const TpFireHeader header{
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
         kv_indices_count, required_kv_pages, mask_bytes, mask_indptr_count,
@@ -553,6 +579,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
         static_cast<std::int32_t>(rs_mode),
         rs_fold_lens_count,
         rs_buffer_ids_count,
+        rs_buffer_read_ids_count,
     };
     const bool via_mailbox = !cpu_gate_key.empty();
     if (!via_mailbox) {
@@ -671,6 +698,32 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
                     sizeof(std::uint32_t),
                 ncclChar, 0, comm.comm(), stream));
         }
+        // The buffer READ side. A follower that does not get it skips the
+        // replay of the buffered prefix entirely and folds a DIFFERENT
+        // recurrent state than rank 0 -- silently, since the all-reduce
+        // happily mixes the two.
+        NCCL_CHECK(ncclBroadcast(
+            pi.rs_buffer_read_indptr.data(), pi.rs_buffer_read_indptr.data(),
+            static_cast<std::size_t>(R + 1) * sizeof(std::uint32_t),
+            ncclChar, 0, comm.comm(), stream));
+        if (R > 0) {
+            NCCL_CHECK(ncclBroadcast(
+                pi.rs_buffer_read_lens.data(), pi.rs_buffer_read_lens.data(),
+                static_cast<std::size_t>(R) * sizeof(std::uint32_t),
+                ncclChar, 0, comm.comm(), stream));
+            NCCL_CHECK(ncclBroadcast(
+                pi.rs_buffer_heads.data(), pi.rs_buffer_heads.data(),
+                static_cast<std::size_t>(R) * sizeof(std::uint32_t),
+                ncclChar, 0, comm.comm(), stream));
+        }
+        if (rs_buffer_read_ids_count > 0) {
+            NCCL_CHECK(ncclBroadcast(
+                pi.rs_buffer_read_slot_ids.data(),
+                pi.rs_buffer_read_slot_ids.data(),
+                static_cast<std::size_t>(rs_buffer_read_ids_count) *
+                    sizeof(std::uint32_t),
+                ncclChar, 0, comm.comm(), stream));
+        }
     }
     if (!state_only_fold && logit_rows > 0) {
         NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
@@ -691,6 +744,7 @@ void tp_publish_mtp(const std::string& cpu_gate_key,
                     int draft_step,
                     int max_global_tokens) {
     if (cpu_gate_key.empty()) return;
+    tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
     tp_mailbox_reserve_slot(*box, cpu_gate_key);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
@@ -718,6 +772,9 @@ void tp_broadcast_mtp_step(
     int draft_step,
     int max_global_tokens,
     cudaStream_t stream) {
+    // Gate-off configurations never touch the mailbox, so this is their only
+    // liveness check before the collectives below.
+    tp_check_ranks_alive();
     if (cpu_gate_key.empty()) {
         // Gate off: the follower is parked inside the header broadcast.
         auto* device_header = tp_hdr_dev_buf();
@@ -779,6 +836,53 @@ void tp_cpu_gate_request_stop(const std::string& key) {
     gate->request_stop();
 }
 
+namespace detail {
+std::atomic<bool> g_tp_rank_failed{false};
+}  // namespace detail
+
+namespace {
+std::mutex g_tp_rank_failure_mu;
+std::string g_tp_rank_failure_msg;
+}  // namespace
+
+void tp_throw_rank_failure() {
+    std::string msg;
+    {
+        std::lock_guard<std::mutex> lk(g_tp_rank_failure_mu);
+        msg = g_tp_rank_failure_msg;
+    }
+    throw std::runtime_error(
+        msg.empty() ? std::string("tp: a rank left the group") : msg);
+}
+
+void tp_report_rank_failure(const std::string& cpu_gate_key,
+                            int rank,
+                            const std::string& what) {
+    bool first = false;
+    {
+        std::lock_guard<std::mutex> lk(g_tp_rank_failure_mu);
+        if (g_tp_rank_failure_msg.empty()) {
+            g_tp_rank_failure_msg =
+                "tp rank " + std::to_string(rank) +
+                " left the group and every later fire would hang: " + what;
+            first = true;
+        }
+    }
+    // Release: the message above must be visible to whoever observes the flag.
+    detail::g_tp_rank_failed.store(true, std::memory_order_release);
+    if (!first) return;
+    std::cerr << "[pie-driver-cuda] tp rank " << rank
+              << " left the group: " << what
+              << " — failing the TP group\n";
+    // Peers parked on the gate wake and see a stopped gate.
+    tp_cpu_gate_request_stop(cpu_gate_key);
+    // Peers already inside a collective this rank will never join are waiting
+    // on the device, where no flag can reach them. Aborting the communicators
+    // makes those waits return an error, which is the difference between a
+    // reported failure and a hang.
+    nccl_abort_all_comms();
+}
+
 // ============================================================================
 // TP follower service loop
 // ============================================================================
@@ -796,8 +900,7 @@ void tp_cpu_gate_request_stop(const std::string& key) {
 // matching broadcast in `tp_broadcast_inputs`.
 void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
     if (engine.tp_comm == nullptr) {
-        std::cerr << "[pie-driver-cuda] tp_follower_serve: no tp_comm\n";
-        return;
+        throw std::runtime_error("tp_follower_serve: no tp_comm");
     }
     auto& pi      = engine.inputs;
     auto& comm    = *engine.tp_comm;
@@ -879,6 +982,15 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 hdr.logit_rows, hdr.rs_mode,
                 (unsigned long long)fire_slot);
         }
+        {
+            static const std::uint64_t kill_at = [] {
+                const char* v = std::getenv("PIE_TP_TEST_KILL_FOLLOWER_AT_FIRE");
+                return v ? std::strtoull(v, nullptr, 10) : 0ull;
+            }();
+            if (kill_at != 0 && cpu_gate_seq == kill_at) {
+                throw std::runtime_error("injected follower fault");
+            }
+        }
         if (hdr.magic == TP_STOP_MAGIC) break;
         if (hdr.magic == TP_MTP_MAGIC) {
             // Header is already copied out, and an MTP fire carries no planner
@@ -946,7 +1058,8 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             hdr.structured_window_left;
         if (!valid_rs_execution_mode(hdr.rs_mode) ||
             hdr.rs_fold_lens_count < 0 ||
-            hdr.rs_buffer_ids_count < 0) {
+            hdr.rs_buffer_ids_count < 0 ||
+            hdr.rs_buffer_read_ids_count < 0) {
             throw std::runtime_error(
                 "TP follower received invalid RS metadata header");
         }
@@ -956,6 +1069,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             rs_mode == RsExecutionMode::BufferFold;
         const int rs_fold_lens_count = hdr.rs_fold_lens_count;
         const int rs_buffer_ids_count = hdr.rs_buffer_ids_count;
+        const int rs_buffer_read_ids_count = hdr.rs_buffer_read_ids_count;
         const std::size_t rs_rows =
             static_cast<std::size_t>(std::max(R, 0));
         const bool header_has_slots = hdr.has_slot_ids != 0;
@@ -978,7 +1092,9 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             static_cast<std::size_t>(rs_fold_lens_count) >
                 pi.rs_fold_lens.size() ||
             static_cast<std::size_t>(rs_buffer_ids_count) >
-                pi.rs_buffer_slot_ids.size()) {
+                pi.rs_buffer_slot_ids.size() ||
+            static_cast<std::size_t>(rs_buffer_read_ids_count) >
+                pi.rs_buffer_read_slot_ids.size()) {
             throw std::runtime_error(
                 "TP follower RS metadata exceeds persistent capacity");
         }
@@ -1011,6 +1127,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 pi.row_valid.data(), pi.row_valid.data(),
                 static_cast<std::size_t>(N), ncclChar, 0,
                 comm.comm(), stream));
+        }
         if (!state_only_fold && has_write_desc && N > 0) {
             NCCL_CHECK(ncclBroadcast(
                 pi.w_page.data(), pi.w_page.data(),
@@ -1089,6 +1206,30 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                         sizeof(std::uint32_t),
                     ncclChar, 0, comm.comm(), stream));
             }
+            NCCL_CHECK(ncclBroadcast(
+                pi.rs_buffer_read_indptr.data(),
+                pi.rs_buffer_read_indptr.data(),
+                static_cast<std::size_t>(R + 1) * sizeof(std::uint32_t),
+                ncclChar, 0, comm.comm(), stream));
+            if (R > 0) {
+                NCCL_CHECK(ncclBroadcast(
+                    pi.rs_buffer_read_lens.data(),
+                    pi.rs_buffer_read_lens.data(),
+                    static_cast<std::size_t>(R) * sizeof(std::uint32_t),
+                    ncclChar, 0, comm.comm(), stream));
+                NCCL_CHECK(ncclBroadcast(
+                    pi.rs_buffer_heads.data(), pi.rs_buffer_heads.data(),
+                    static_cast<std::size_t>(R) * sizeof(std::uint32_t),
+                    ncclChar, 0, comm.comm(), stream));
+            }
+            if (rs_buffer_read_ids_count > 0) {
+                NCCL_CHECK(ncclBroadcast(
+                    pi.rs_buffer_read_slot_ids.data(),
+                    pi.rs_buffer_read_slot_ids.data(),
+                    static_cast<std::size_t>(rs_buffer_read_ids_count) *
+                        sizeof(std::uint32_t),
+                    ncclChar, 0, comm.comm(), stream));
+            }
         }
         if (!state_only_fold && logit_rows > 0) {
             NCCL_CHECK(ncclBroadcast(pi.sample_idx.data(), pi.sample_idx.data(),
@@ -1097,7 +1238,6 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
         }
         NCCL_CHECK_ASYNC(ncclGroupEnd(), comm.comm());
         payload_timer.stop();
-        }
 
         // 3. Host views of the qo/KV layout for the per-arch attention planner
         // (it runs outside the captured kernel sequence). Rank 0 already holds
@@ -1184,6 +1324,31 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                             sizeof(std::uint32_t),
                         cudaMemcpyDeviceToHost, stream));
                 }
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_buffer_read_indptr_host.data(),
+                    pi.rs_buffer_read_indptr.data(),
+                    static_cast<std::size_t>(R + 1) * sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, stream));
+                if (R > 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_read_lens_host.data(),
+                        pi.rs_buffer_read_lens.data(),
+                        static_cast<std::size_t>(R) * sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_heads_host.data(),
+                        pi.rs_buffer_heads.data(),
+                        static_cast<std::size_t>(R) * sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                }
+                if (rs_buffer_read_ids_count > 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_read_slot_ids_host.data(),
+                        pi.rs_buffer_read_slot_ids.data(),
+                        static_cast<std::size_t>(rs_buffer_read_ids_count) *
+                            sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                }
             }
         } else {
             host_readback = true;
@@ -1240,6 +1405,31 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                         pi.rs_buffer_slot_ids_host.data(),
                         pi.rs_buffer_slot_ids.data(),
                         static_cast<std::size_t>(rs_buffer_ids_count) *
+                            sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                }
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pi.rs_buffer_read_indptr_host.data(),
+                    pi.rs_buffer_read_indptr.data(),
+                    static_cast<std::size_t>(R + 1) * sizeof(std::uint32_t),
+                    cudaMemcpyDeviceToHost, stream));
+                if (R > 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_read_lens_host.data(),
+                        pi.rs_buffer_read_lens.data(),
+                        static_cast<std::size_t>(R) * sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_heads_host.data(),
+                        pi.rs_buffer_heads.data(),
+                        static_cast<std::size_t>(R) * sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, stream));
+                }
+                if (rs_buffer_read_ids_count > 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pi.rs_buffer_read_slot_ids_host.data(),
+                        pi.rs_buffer_read_slot_ids.data(),
+                        static_cast<std::size_t>(rs_buffer_read_ids_count) *
                             sizeof(std::uint32_t),
                         cudaMemcpyDeviceToHost, stream));
                 }
@@ -1364,6 +1554,7 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
             make_graph_variant(/*small_spec=*/false,
                                /*rs_verify=*/false,
                                have_custom_mask,
+                               /*fused_argmax=*/false,
                                graph_layout);
         if (try_graphs) {
             const ForwardGraphKey key{R, N, graph_variant};
@@ -1382,7 +1573,10 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                     pi.w_page.data(),
                     pi.w_off.data(),
                     has_write_desc,
-                    structured_window_left);
+                    structured_window_left,
+                    // The LM head is sharded across ranks and the followers
+                    // never sample, so the fused reduction has no meaning here.
+                    /*logits_argmax_chunk_tokens=*/0);
                 engine.graph_cache->put(key, exec);
             }
             CUDA_CHECK(cudaGraphLaunch(exec, /*stream=*/nullptr));
@@ -1413,6 +1607,33 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 buffered ? pi.rs_buffer_slot_ids_host.data() : nullptr;
             fwd_in.rs_buffer_slot_indptr_h =
                 buffered ? pi.rs_buffer_slot_indptr_host.data() : nullptr;
+            // Rank 0 decides whether a row replays; the follower must reach
+            // the SAME decision or its recurrence starts from a different
+            // state, and the all-reduce hides the disagreement.
+            const bool follower_has_read =
+                buffered && R > 0 &&
+                std::any_of(
+                    pi.rs_buffer_read_lens_host.data(),
+                    pi.rs_buffer_read_lens_host.data() + R,
+                    [](std::uint32_t n) { return n != 0; });
+            if (follower_has_read &&
+                pi.rs_buffer_read_indptr_host[static_cast<std::size_t>(R)] !=
+                    static_cast<std::uint32_t>(rs_buffer_read_ids_count)) {
+                throw std::runtime_error(
+                    "TP follower RS buffer read CSR does not match its id "
+                    "count");
+            }
+            fwd_in.rs_buffer_read_slot_ids_h =
+                follower_has_read ? pi.rs_buffer_read_slot_ids_host.data()
+                                  : nullptr;
+            fwd_in.rs_buffer_read_indptr_h =
+                follower_has_read ? pi.rs_buffer_read_indptr_host.data()
+                                  : nullptr;
+            fwd_in.rs_buffer_read_lens_h =
+                follower_has_read ? pi.rs_buffer_read_lens_host.data()
+                                  : nullptr;
+            fwd_in.rs_buffer_heads_h =
+                buffered && R > 0 ? pi.rs_buffer_heads_host.data() : nullptr;
             fwd_in.rs_fold_lens_h =
                 rs_fold_lens_count > 0
                     ? pi.rs_fold_lens_host.data()

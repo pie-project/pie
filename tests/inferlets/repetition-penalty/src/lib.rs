@@ -52,8 +52,7 @@
 //! Faithfulness: **Exact**. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, model as wit_model};
+use inferlet::ptir::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -133,35 +132,29 @@ fn apply_penalties(
     counts: &Tensor,
     prompt_present: &Tensor,
 ) -> (Tensor, Tensor, Tensor) {
-    let zero = broadcast(Tensor::constant(0.0f32), [vocab]);
+    let zero = broadcast(0.0f32, [vocab]);
     let out_seen = gt(counts, &zero);
     // `prompt_present` is carried as 0.0/1.0 floats so the channel dtype stays
     // uniform with `counts`; 0.5 is the only sensible split point.
-    let prompt_seen = gt(prompt_present, broadcast(Tensor::constant(0.5f32), [vocab]));
+    let prompt_seen = gt(prompt_present, broadcast(0.5f32, [vocab]));
     let seen = or(&out_seen, &prompt_seen);
 
     // CTRL-style repetition penalty. Dividing a positive logit and multiplying
     // a negative one both move it toward -inf, which is the point: a single
     // multiplicative rule would *reward* already-negative logits.
-    let r = broadcast(Tensor::constant(cfg.repetition_penalty), [vocab]);
+    let r = broadcast(cfg.repetition_penalty, [vocab]);
     let positive = gt(logits, &zero);
-    let repenalized = select(&positive, div(logits, &r), mul(logits, &r));
+    let repenalized = select(&positive, logits / &r, logits * &r);
     let l = select(&seen, &repenalized, logits);
 
     // Frequency scales with how often the token was emitted; presence is a flat
     // charge for having been emitted at all.
-    let freq = mul(
-        broadcast(Tensor::constant(cfg.frequency_penalty), [vocab]),
-        counts,
-    );
-    let pres = mul(
-        broadcast(Tensor::constant(cfg.presence_penalty), [vocab]),
-        cast(&out_seen, DType::F32),
-    );
+    let freq = broadcast(cfg.frequency_penalty, [vocab]) * counts;
+    let pres = broadcast(cfg.presence_penalty, [vocab]) * cast(&out_seen, dtype::f32);
 
-    let penalized = reshape(reduce_sum(cast(&seen, DType::F32)), [1]);
+    let penalized = reshape(reduce_sum(cast(&seen, dtype::f32)), [1]);
     let peak = reshape(reduce_max(counts), [1]);
-    (sub(sub(&l, &freq), &pres), penalized, peak)
+    (&l - &freq - &pres, penalized, peak)
 }
 
 /// One sampling step. Returns `(token, counts_next, penalized_count, peak)`.
@@ -171,7 +164,7 @@ fn step(
     cfg: Cfg,
     counts: &Tensor,
     prompt_present: &Tensor,
-    rng_state: impl AsTensor + Copy,
+    rng_state: &Tensor,
 ) -> (Tensor, Tensor, Tensor, Tensor) {
     let (penalized, n_penalized, peak) =
         apply_penalties(&logits, vocab, cfg, counts, prompt_present);
@@ -180,13 +173,13 @@ fn step(
     let scaled = if cfg.temperature == 1.0 {
         penalized
     } else {
-        div(&penalized, cfg.temperature)
+        &penalized / cfg.temperature
     };
     let token = gumbel_max(scaled, rng_state);
     // `gumbel_max` reduces the row away, so the token index is rank-0. The
     // scatter's `vals` must then be rank-0 too — a `[1]` vector would not match
     // `idx.dims ++ base.dims[1..]`, which is empty here.
-    let counts_next = scatter_add(counts, &token, Tensor::constant(1.0f32));
+    let counts_next = scatter_add(counts, &token, 1.0f32);
     (token, counts_next, n_penalized, peak)
 }
 
@@ -203,7 +196,7 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let cfg = Cfg {
         frequency_penalty: input.frequency_penalty,
         presence_penalty: input.presence_penalty,
@@ -211,7 +204,7 @@ async fn main(input: Input) -> Result<Output> {
         temperature: input.temperature,
     };
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -227,14 +220,13 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     // The repetition penalty's scope includes the prompt, so seed the presence
     // vector on the host — one pass over the prompt beats a device scatter that
@@ -253,15 +245,14 @@ async fn main(input: Input) -> Result<Output> {
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
+    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
     let counts_p = Channel::from(vec![0.0f32; vocab as usize]).named("counts_p");
     let present_p = Channel::from(present.clone()).named("present_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -272,23 +263,25 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let counts = counts_p.take().tensor();
-        let present = present_p.take().tensor();
+        let counts = counts_p.take();
+        let present = present_p.take();
         let logits = intrinsics::logits();
         let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         tok_out_p.put(&token);
         pen_out_p.put(&n_pen);
         peak_out_p.put(&peak);
@@ -298,25 +291,11 @@ async fn main(input: Input) -> Result<Output> {
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let p0 = pen_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("pen take: {e}"))?[0];
-    let k0 = peak_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("peak take: {e}"))?[0];
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let p0 = pen_out_p.take_host::<f32>().await?;
+    let k0 = peak_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
     penalized.push(p0);
     peaks.push(k0);
@@ -330,8 +309,8 @@ async fn main(input: Input) -> Result<Output> {
             counts0[g0 as usize] = 1.0;
         }
 
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let tok_in = Channel::from([g0]).named("tok_in");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let counts_c = Channel::from(counts0).named("counts");
         let present_c = Channel::from(present).named("present");
         let tok_out = Channel::new([1], dtype::i32)
@@ -343,49 +322,49 @@ async fn main(input: Input) -> Result<Output> {
         let peak_out = Channel::new([1], dtype::f32)
             .capacity(channel_capacity() as u32)
             .named("peak_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
             // Takes and compute first, puts last (value-id discipline).
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
-            let counts = counts_c.take().tensor();
-            let present = present_c.take().tensor();
+            let counts = counts_c.take();
+            let present = present_c.take();
             let logits = intrinsics::logits();
             let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
 
-            let r_next = add(&r, iota(2));
-            let next_length = add(&length, 1u32);
-            let page_count = div(add(&next_length, page_size - 1), page_size);
+            let r_next = &r + iota(2);
+            let next_length = &length + 1u32;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
-            w_slot.put(div(&length, page_size));
-            w_off.put(rem(&length, page_size));
-            page_indptr.take();
-            page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+            w_slot.put(&length / page_size);
+            w_off.put(&length % page_size);
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             pen_out.put(&n_pen);
             peak_out.put(&peak);
@@ -397,20 +376,17 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             let p = pen_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("pen_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             let k = peak_out
-                .take()
-                .get::<f32>()
+                .take_host::<f32>()
                 .await
-                .map_err(|e| format!("peak_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);
             penalized.push(p);
             peaks.push(k);
@@ -433,7 +409,7 @@ async fn main(input: Input) -> Result<Output> {
     let unique: HashSet<u32> = generated.iter().copied().collect();
     Ok(Output {
         sampler: "repetition-penalty",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         frequency_penalty: cfg.frequency_penalty,
         presence_penalty: cfg.presence_penalty,

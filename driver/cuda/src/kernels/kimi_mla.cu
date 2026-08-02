@@ -118,16 +118,33 @@ __global__ void topk_sigmoid_kernel(
     }
     __syncthreads();
 
+    // `taken` rather than poisoning `scores` with -FLT_MAX: the poison value is
+    // indistinguishable from a genuine score, so a row containing NaN (every
+    // comparison against which is false) or K > E would leave the scan with no
+    // winner. That used to fall out as `best_i == -1`, which then wrote
+    // `scores[-1]` -- an out-of-bounds shared write -- and published expert -1
+    // into `topk_idx`, where the MoE pointer builder turned it into a negative
+    // weight offset and the failure finally surfaced as an illegal address
+    // inside a batched GEMM, far from its cause.
+    __shared__ bool taken[MAX_EXPERTS];
+    for (int e = tid; e < E; e += TOPK_BLOCK) taken[e] = false;
+    __syncthreads();
+
     if (tid == 0) {
         std::int32_t* idx = topk_idx + static_cast<long long>(n) * K;
         float* w = topk_w + static_cast<long long>(n) * K;
         float sum = 0.f;
-        for (int k = 0; k < K; ++k) {
+        const int picks = K < E ? K : E;
+        for (int k = 0; k < picks; ++k) {
             int best_i = -1;
             float best_v = -FLT_MAX;
             for (int e = 0; e < E; ++e) {
+                if (taken[e]) continue;
                 const float v = scores[e];
-                if (v > best_v) {
+                // Seeding from the first untaken expert keeps a winner even
+                // when every remaining score is NaN; for ordinary rows this is
+                // the same first-maximum the strict `>` scan already produced.
+                if (best_i < 0 || v > best_v) {
                     best_v = v;
                     best_i = e;
                 }
@@ -135,7 +152,14 @@ __global__ void topk_sigmoid_kernel(
             idx[k] = best_i;
             w[k] = orig_scores[best_i];
             sum += orig_scores[best_i];
-            scores[best_i] = -FLT_MAX;
+            taken[best_i] = true;
+        }
+        // Only reachable when a checkpoint asks for more routes than it has
+        // experts. Repeating the last expert would double-count it in the
+        // weighted sum, so these slots are parked on expert 0 with zero weight.
+        for (int k = picks; k < K; ++k) {
+            idx[k] = 0;
+            w[k] = 0.f;
         }
         const float scale = renormalize && sum > 0.f
             ? routed_scaling_factor / sum

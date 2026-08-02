@@ -14,8 +14,7 @@
 //! (interp.rs `Predicate::CummassLe`) without depending on float summation
 //! order.
 
-use inferlet::ptir::prelude::*;
-use inferlet::{Result, model as wit_model};
+use inferlet::ptir::attention::prelude::*;
 use serde::Deserialize;
 
 const TOP_P: f32 = 0.9;
@@ -34,27 +33,26 @@ fn argmax(values: &[f32]) -> usize {
 
 #[inferlet::main]
 async fn main(_input: Input) -> Result<String> {
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
-    let mut prompt = wit_model::encode("The capital of France is");
+    let mut prompt = model::encode("The capital of France is");
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
     let max_pages = n.div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
-    let toks = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
-    let w_slot = Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot");
-    let w_off = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off");
-    let kv_len = Channel::from(vec![n]).named("kv_len");
+    let toks = Channel::from_iter(prompt.iter().map(|&token| token as i32));
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(0..n).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot");
+    let w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off");
+    let kv_len = Channel::from([n]).named("kv_len");
     let token_out = Channel::new([1], dtype::i32).named("token");
     let logits_out = Channel::new([vocab], dtype::f32).named("logits");
     let entropy_out = Channel::new([1], dtype::f32).named("entropy");
@@ -66,15 +64,17 @@ async fn main(_input: Input) -> Result<String> {
     fwd.embed(&toks, &embed_indptr)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         let logits = intrinsics::logits();
@@ -97,38 +97,14 @@ async fn main(_input: Input) -> Result<String> {
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline)
-        .map_err(|e| format!("sampling-primitives submit: {e}"))?;
+        .context("sampling-primitives submit")?;
 
-    let token = token_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read token: {e}"))?[0] as usize;
-    let logits = logits_out
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("read logits: {e}"))?;
-    let entropy = entropy_out
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("read entropy: {e}"))?[0];
-    let probabilities = probs_out
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("read probabilities: {e}"))?;
-    let log_probabilities = logprobs_out
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("read log-probabilities: {e}"))?;
-    let keep_mask = keep_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read nucleus keep-mask: {e}"))?;
+    let token = token_out.take_host::<i32>().await? as usize;
+    let logits = logits_out.take_host::<Vec<f32>>().await?;
+    let entropy = entropy_out.take_host::<f32>().await?;
+    let probabilities = probs_out.take_host::<Vec<f32>>().await?;
+    let log_probabilities = logprobs_out.take_host::<Vec<f32>>().await?;
+    let keep_mask = keep_out.take_host::<Vec<i32>>().await?;
     pipeline.close();
 
     if token != argmax(&logits) || token != argmax(&probabilities) {

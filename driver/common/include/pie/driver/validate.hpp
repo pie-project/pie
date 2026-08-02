@@ -1,0 +1,1048 @@
+#pragma once
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+
+#include <pie_driver_abi.h>
+
+namespace pie::driver::validate {
+
+inline int version(std::uint32_t version) noexcept {
+    return version == PIE_DRIVER_ABI_VERSION
+        ? PIE_STATUS_OK
+        : PIE_STATUS_BAD_ABI_VERSION;
+}
+
+template <typename T>
+inline int slice(const T* ptr, std::size_t len) noexcept {
+    if (len == 0) return PIE_STATUS_OK;
+    if (ptr == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    if (len > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+
+    const auto address = reinterpret_cast<std::uintptr_t>(ptr);
+    const std::size_t bytes = len * sizeof(T);
+    if (address % alignof(T) != 0 ||
+        bytes > std::numeric_limits<std::uintptr_t>::max() - address) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int bytes(PieBytes bytes) noexcept {
+    return slice(bytes.ptr, bytes.len);
+}
+
+inline int terminal_cell_ptr(PieTerminalCell* cell) noexcept {
+    if (cell == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    if ((reinterpret_cast<std::uintptr_t>(cell) % alignof(PieTerminalCell)) != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (cell->reserved0 != 0 ||
+        std::atomic_ref<std::uint32_t>(cell->outcome).load(
+            std::memory_order_acquire) != PIE_TERMINAL_OUTCOME_PENDING) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int terminal_cells(PieTerminalCellPtrSlice cells) noexcept {
+    int status = slice(cells.ptr, cells.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < cells.len; ++i) {
+        status = terminal_cell_ptr(cells.ptr[i]);
+        if (status != PIE_STATUS_OK) return status;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (cells.ptr[i] == cells.ptr[j]) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    return PIE_STATUS_OK;
+}
+
+inline bool valid_memory_domain(std::uint32_t domain) noexcept {
+    return domain == PIE_MEMORY_DOMAIN_HOST_PINNED ||
+           domain == PIE_MEMORY_DOMAIN_CUDA_DEVICE ||
+           domain == PIE_MEMORY_DOMAIN_ROCM_DEVICE ||
+           domain == PIE_MEMORY_DOMAIN_METAL_SHARED ||
+           domain == PIE_MEMORY_DOMAIN_METAL_PRIVATE;
+}
+
+inline int channel_values(PieChannelValueDescSlice values) noexcept {
+    int status = slice(values.ptr, values.len);
+    if (status != PIE_STATUS_OK) return status;
+    if (values.len > std::numeric_limits<std::uint32_t>::max()) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 0; i < values.len; ++i) {
+        status = bytes(values.ptr[i].bytes);
+        if (status != PIE_STATUS_OK ||
+            values.ptr[i].bytes.len > std::numeric_limits<std::uint32_t>::max()) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int csr(PieU32Slice indptr,
+                        std::size_t values_len,
+                        std::size_t outer_count) noexcept {
+    int status = slice(indptr.ptr, indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    if (indptr.len == 0) {
+        return values_len == 0 ? PIE_STATUS_OK : PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (outer_count == std::numeric_limits<std::size_t>::max() ||
+        indptr.len != outer_count + 1 ||
+        values_len > std::numeric_limits<std::uint32_t>::max() ||
+        indptr.ptr[0] != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 0; i < outer_count; ++i) {
+        if (indptr.ptr[i] > indptr.ptr[i + 1]) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    return indptr.ptr[outer_count] == values_len
+        ? PIE_STATUS_OK
+        : PIE_STATUS_INVALID_ARGUMENT;
+}
+
+// Validate a CSR whose outer dimension is resolved later by a device
+// descriptor. A direct launch can be descriptor-only or mixed with wire rows,
+// so the outer count is intentionally not checked here; CUDA composition checks
+// it against the exact resolved request count before execution.
+inline int deferred_outer_csr(PieU32Slice indptr,
+                                       std::size_t values_len) noexcept {
+    int status = slice(indptr.ptr, indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    if (indptr.len == 0) {
+        return values_len == 0 ? PIE_STATUS_OK : PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (values_len > std::numeric_limits<std::uint32_t>::max() ||
+        indptr.ptr[0] != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 1; i < indptr.len; ++i) {
+        if (indptr.ptr[i - 1] > indptr.ptr[i]) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    return indptr.ptr[indptr.len - 1] == values_len
+        ? PIE_STATUS_OK
+        : PIE_STATUS_INVALID_ARGUMENT;
+}
+
+inline int optional_rows(std::size_t len,
+                                  std::size_t rows) noexcept {
+    return (len == 0 || len == rows)
+        ? PIE_STATUS_OK
+        : PIE_STATUS_INVALID_ARGUMENT;
+}
+
+inline int create_desc(const PieDriverCreateDesc* desc,
+                                PieDriverCaps* caps) noexcept {
+    if (desc == nullptr || caps == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    status = version(desc->runtime.abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 || desc->runtime.reserved0 != 0 ||
+        desc->runtime.notify == nullptr) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = bytes(desc->config_bytes);
+    if (status != PIE_STATUS_OK || desc->config_bytes.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int model_load_desc(const PieModelLoadDesc* desc,
+                                    PieDriverCaps* caps) noexcept {
+    if (desc == nullptr || caps == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->component > PIE_MODEL_COMPONENT_ENCODE ||
+        desc->mxfp4_moe > PIE_MXFP4_MOE_EAGER_BF16) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = bytes(desc->runtime_quant);
+    if (status != PIE_STATUS_OK) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = bytes(desc->snapshot_dir);
+    if (status != PIE_STATUS_OK || desc->snapshot_dir.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int launch_ops(const PieLaunchOpSlice& ops) noexcept {
+    int status = slice(ops.ptr, ops.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < ops.len; ++i) {
+        status = slice(ops.ptr[i].args.ptr, ops.ptr[i].args.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(ops.ptr[i].shape.ptr,
+                                ops.ptr[i].shape.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int launch_regions(const PieLaunchRegionSlice& regions) noexcept {
+    int status = slice(regions.ptr, regions.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < regions.len; ++i) {
+        const PieLaunchRegion& region = regions.ptr[i];
+        status = slice(region.nodes.ptr, region.nodes.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(region.inputs.ptr, region.inputs.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(region.outputs.ptr, region.outputs.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(region.sinks.ptr, region.sinks.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
+}
+
+// The launch package's tables. A driver walks these directly -- there is no
+// decode step to reject a malformed program first -- so a bad slice here is a
+// segfault rather than an error return. The nested slices are two and three
+// levels down, where a top-level check does not reach.
+inline int launch_package(const PieLaunchPackage& launch) noexcept {
+    int status = slice(launch.values.ptr, launch.values.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.values.len; ++i) {
+        status = slice(launch.values.ptr[i].shape.ptr,
+                                launch.values.ptr[i].shape.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    status = slice(launch.channels.ptr, launch.channels.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.channels.len; ++i) {
+        const PieLaunchChannel& channel = launch.channels.ptr[i];
+        status = slice(channel.shape.ptr, channel.shape.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = bytes(channel.extern_name);
+        if (status != PIE_STATUS_OK) return status;
+        // An out-of-range readiness would read as `Untouched` after the cast
+        // and silently drop the channel's gate, so it is rejected here.
+        if (channel.readiness > PIE_READINESS_NEEDS_EMPTY) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    status = slice(launch.ports.ptr, launch.ports.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.ports.len; ++i) {
+        const PieLaunchPort& port = launch.ports.ptr[i];
+        status = slice(port.const_shape.ptr, port.const_shape.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = bytes(port.const_data);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    status = slice(launch.names.ptr, launch.names.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.names.len; ++i) {
+        status = bytes(launch.names.ptr[i]);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    status = slice(launch.stages.ptr, launch.stages.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.stages.len; ++i) {
+        const PieLaunchStage& stage = launch.stages.ptr[i];
+        status = launch_ops(stage.ops);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(stage.puts.ptr, stage.puts.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(stage.takes.ptr, stage.takes.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(stage.reads.ptr, stage.reads.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    // Plans are parallel to stages: the driver indexes one with the other.
+    if (launch.plans.len != launch.stages.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = slice(launch.plans.ptr, launch.plans.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < launch.plans.len; ++i) {
+        const PieLaunchStagePlan& plan = launch.plans.ptr[i];
+        status = launch_ops(plan.ops);
+        if (status != PIE_STATUS_OK) return status;
+        // `source_op_counts` is parallel to `ops`; `source_ops` is its
+        // concatenation, so a short table would run a walk off the end.
+        if (plan.source_op_counts.len != plan.ops.len) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        status = slice(plan.source_ops.ptr, plan.source_ops.len);
+        if (status != PIE_STATUS_OK) return status;
+        status =
+            slice(plan.source_op_counts.ptr, plan.source_op_counts.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(plan.value_types.ptr, plan.value_types.len);
+        if (status != PIE_STATUS_OK) return status;
+        for (std::size_t v = 0; v < plan.value_types.len; ++v) {
+            const PieLaunchPlanValue& type = plan.value_types.ptr[v];
+            if (type.extents.len != type.dims.len) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+            status = slice(type.extents.ptr, type.extents.len);
+            if (status != PIE_STATUS_OK) return status;
+            status = slice(type.dims.ptr, type.dims.len);
+            if (status != PIE_STATUS_OK) return status;
+        }
+        status = slice(plan.channel_bindings.ptr,
+                                plan.channel_bindings.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(plan.names.ptr, plan.names.len);
+        if (status != PIE_STATUS_OK) return status;
+        for (std::size_t n = 0; n < plan.names.len; ++n) {
+            status = bytes(plan.names.ptr[n]);
+            if (status != PIE_STATUS_OK) return status;
+        }
+        status = launch_regions(plan.singleton);
+        if (status != PIE_STATUS_OK) return status;
+        status = launch_regions(plan.fused);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(plan.used_extents.ptr, plan.used_extents.len);
+        if (status != PIE_STATUS_OK) return status;
+        status =
+            slice(plan.channel_rules.ptr, plan.channel_rules.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = bytes(plan.error);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int program_desc(const PieProgramDesc* desc,
+                                 std::uint64_t* program_id) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 || program_id == nullptr) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = slice(desc->emitted_kernels.ptr, desc->emitted_kernels.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = launch_package(desc->launch);
+    if (status != PIE_STATUS_OK) return status;
+    status =
+        slice(desc->region_analysis.ptr, desc->region_analysis.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < desc->region_analysis.len; ++i) {
+        const PieRegionAnalysis& region = desc->region_analysis.ptr[i];
+        if (region.reserved0 != 0) return PIE_STATUS_INVALID_ARGUMENT;
+        status =
+            slice(region.direct_argmax.ptr, region.direct_argmax.len);
+        if (status != PIE_STATUS_OK) return status;
+        status = slice(region.skipped.ptr, region.skipped.len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int channel_desc(
+    const PieChannelDesc* desc,
+    const PieChannelEndpointBinding* binding) noexcept {
+    if (desc == nullptr || binding == nullptr) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 || desc->reserved1 != 0 ||
+        desc->channel_id == 0 || desc->capacity == 0 ||
+        desc->dtype > PIE_CHANNEL_DTYPE_ACT ||
+        desc->host_role > PIE_CHANNEL_HOST_ROLE_READER ||
+        desc->seeded > 1 ||
+        desc->extern_dir > PIE_CHANNEL_EXTERN_EXPORT ||
+        desc->reader_wait_id == 0 || desc->writer_wait_id == 0 ||
+        desc->reader_wait_id == desc->writer_wait_id) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = slice(desc->shape.ptr, desc->shape.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = bytes(desc->extern_name);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < desc->shape.len; ++i) {
+        if (desc->shape.ptr[i] == 0) return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->extern_dir == PIE_CHANNEL_EXTERN_NONE) {
+        if (desc->extern_name.len != 0) return PIE_STATUS_INVALID_ARGUMENT;
+    } else if (desc->extern_name.len == 0 ||
+               desc->host_role != PIE_CHANNEL_HOST_ROLE_NONE ||
+               desc->seeded != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int completion(
+    PieCompletion completion,
+    bool require_terminal_cell) noexcept {
+    if (completion.wait_id == 0 || completion.target_epoch == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (require_terminal_cell) {
+        return terminal_cell_ptr(completion.terminal_cell);
+    }
+    return completion.terminal_cell == nullptr
+        ? PIE_STATUS_OK
+        : PIE_STATUS_INVALID_ARGUMENT;
+}
+
+inline int instance_desc(const PieInstanceDesc* desc,
+                                  PieInstanceBinding* binding) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 ||
+        desc->reserved1 != 0 ||
+        desc->geometry_class >
+            PIE_GEOMETRY_CLASS_DEVICE_GEOMETRY ||
+        binding == nullptr) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = slice(desc->channel_ids.ptr, desc->channel_ids.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = channel_values(desc->seed_values);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->channel_ids.len > std::numeric_limits<std::uint32_t>::max()) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int masks(const PieMaskWordsDesc& masks,
+                          std::size_t request_count) noexcept {
+    int status = slice(
+        masks.request_indptr.ptr, masks.request_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(masks.word_indptr.ptr, masks.word_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(masks.words.ptr, masks.words.len);
+    if (status != PIE_STATUS_OK) return status;
+
+    if (masks.request_indptr.len == 0) {
+        return masks.word_indptr.len == 0 && masks.words.len == 0
+            ? PIE_STATUS_OK
+            : PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (masks.request_indptr.len == 1 &&
+        masks.request_indptr.ptr[0] == 0 &&
+        masks.word_indptr.len == 1 &&
+        masks.word_indptr.ptr[0] == 0 &&
+        masks.words.len == 0) {
+        return PIE_STATUS_OK;
+    }
+    if (request_count == std::numeric_limits<std::size_t>::max() ||
+        masks.request_indptr.len != request_count + 1 ||
+        masks.request_indptr.ptr[0] != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 0; i < request_count; ++i) {
+        if (masks.request_indptr.ptr[i] > masks.request_indptr.ptr[i + 1]) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    const std::size_t row_count =
+        masks.request_indptr.ptr[request_count];
+    return csr(masks.word_indptr, masks.words.len, row_count);
+}
+
+inline int step_desc(const PieStepDesc* desc,
+                              std::size_t roster_len) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = PIE_STATUS_OK;
+    if (desc->single_token_mode > 1 || desc->has_user_mask > 1) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::uint8_t value : desc->reserved_flags) {
+        if (value != 0) return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->reserved0 != 0) return PIE_STATUS_INVALID_ARGUMENT;
+
+#define PIE_VALIDATE_SLICE(field)                                              \
+    do {                                                                       \
+        status = slice(desc->field.ptr, desc->field.len);             \
+        if (status != PIE_STATUS_OK) return status;                            \
+    } while (false)
+
+    PIE_VALIDATE_SLICE(roster_rows);
+    PIE_VALIDATE_SLICE(sub_batch_indptr);
+    PIE_VALIDATE_SLICE(sub_batch_class);
+    for (std::size_t i = 0; i < desc->roster_rows.len; ++i) {
+        if (static_cast<std::size_t>(desc->roster_rows.ptr[i]) >= roster_len) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    status = terminal_cells(desc->terminal_cells);
+    if (status != PIE_STATUS_OK) return status;
+    PIE_VALIDATE_SLICE(token_ids);
+    PIE_VALIDATE_SLICE(position_ids);
+    PIE_VALIDATE_SLICE(kv_page_indices);
+    PIE_VALIDATE_SLICE(kv_page_indptr);
+    PIE_VALIDATE_SLICE(kv_last_page_lens);
+    PIE_VALIDATE_SLICE(qo_indptr);
+    PIE_VALIDATE_SLICE(rs_slot_ids);
+    PIE_VALIDATE_SLICE(rs_slot_flags);
+    PIE_VALIDATE_SLICE(rs_fold_lens);
+    PIE_VALIDATE_SLICE(rs_buffer_slot_ids);
+    PIE_VALIDATE_SLICE(rs_buffer_slot_indptr);
+    PIE_VALIDATE_SLICE(rs_buffer_read_slot_ids);
+    PIE_VALIDATE_SLICE(rs_buffer_read_indptr);
+    PIE_VALIDATE_SLICE(rs_buffer_read_lens);
+    PIE_VALIDATE_SLICE(rs_buffer_heads);
+    PIE_VALIDATE_SLICE(rs_translation);
+    PIE_VALIDATE_SLICE(rs_translation_indptr);
+    PIE_VALIDATE_SLICE(sampling_indices);
+    PIE_VALIDATE_SLICE(sampling_indptr);
+    PIE_VALIDATE_SLICE(context_ids);
+    PIE_VALIDATE_SLICE(image_indptr);
+    PIE_VALIDATE_SLICE(image_grids);
+    PIE_VALIDATE_SLICE(image_anchor_positions);
+    PIE_VALIDATE_SLICE(image_pixel_indptr);
+    PIE_VALIDATE_SLICE(image_mrope_positions);
+    PIE_VALIDATE_SLICE(image_mrope_indptr);
+    PIE_VALIDATE_SLICE(image_patch_positions);
+    PIE_VALIDATE_SLICE(image_anchor_rows);
+    PIE_VALIDATE_SLICE(audio_feature_indptr);
+    PIE_VALIDATE_SLICE(audio_anchor_rows);
+    PIE_VALIDATE_SLICE(audio_indptr);
+    PIE_VALIDATE_SLICE(embed_indptr);
+    PIE_VALIDATE_SLICE(embed_shapes);
+    PIE_VALIDATE_SLICE(embed_dtypes);
+    PIE_VALIDATE_SLICE(embed_anchor_rows);
+    PIE_VALIDATE_SLICE(embed_block_indptr);
+    PIE_VALIDATE_SLICE(kv_len);
+    PIE_VALIDATE_SLICE(kv_len_device);
+    PIE_VALIDATE_SLICE(ptir_program_row_indptr);
+    PIE_VALIDATE_SLICE(ptir_kv_write_lower_bounds);
+    PIE_VALIDATE_SLICE(ptir_kv_write_upper_bounds);
+    PIE_VALIDATE_SLICE(logical_fire_ids);
+    PIE_VALIDATE_SLICE(channel_expected_head);
+    PIE_VALIDATE_SLICE(channel_expected_tail);
+    PIE_VALIDATE_SLICE(channel_ticket_indptr);
+#undef PIE_VALIDATE_SLICE
+
+    status = bytes(desc->image_pixels);
+    if (status != PIE_STATUS_OK) return status;
+    status = bytes(desc->audio_features);
+    if (status != PIE_STATUS_OK) return status;
+    status = bytes(desc->embed_rows);
+    if (status != PIE_STATUS_OK) return status;
+    const std::size_t instance_count = desc->roster_rows.len;
+    const std::size_t wire_row_count =
+        desc->qo_indptr.len == 0 ? 0 : desc->qo_indptr.len - 1;
+    status = masks(desc->masks, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    const std::size_t max_int =
+        static_cast<std::size_t>(std::numeric_limits<int>::max());
+    for (std::size_t len : {
+             desc->roster_rows.len,
+             desc->token_ids.len,
+             desc->position_ids.len,
+             desc->kv_page_indices.len,
+             desc->kv_page_indptr.len,
+             desc->kv_last_page_lens.len,
+             desc->qo_indptr.len,
+             desc->rs_slot_ids.len,
+             desc->rs_slot_flags.len,
+             desc->rs_fold_lens.len,
+             desc->rs_buffer_slot_ids.len,
+             desc->rs_buffer_slot_indptr.len,
+             desc->rs_translation.len,
+             desc->rs_translation_indptr.len,
+             desc->masks.request_indptr.len,
+             desc->masks.word_indptr.len,
+             desc->masks.words.len,
+             desc->sampling_indices.len,
+             desc->sampling_indptr.len,
+             desc->context_ids.len,
+             desc->image_indptr.len,
+             desc->image_grids.len,
+             desc->image_anchor_positions.len,
+             desc->image_pixels.len,
+             desc->image_pixel_indptr.len,
+             desc->image_mrope_positions.len,
+             desc->image_mrope_indptr.len,
+             desc->image_patch_positions.len,
+             desc->image_anchor_rows.len,
+             desc->audio_features.len,
+             desc->audio_feature_indptr.len,
+             desc->audio_anchor_rows.len,
+             desc->audio_indptr.len,
+             desc->embed_rows.len,
+             desc->embed_indptr.len,
+             desc->embed_shapes.len,
+             desc->embed_dtypes.len,
+             desc->embed_anchor_rows.len,
+             desc->embed_block_indptr.len,
+             desc->kv_len.len,
+             desc->kv_len_device.len,
+            desc->ptir_program_row_indptr.len,
+            desc->ptir_kv_write_lower_bounds.len,
+            desc->ptir_kv_write_upper_bounds.len,
+            desc->logical_fire_ids.len,
+            desc->channel_expected_head.len,
+            desc->channel_expected_tail.len,
+            desc->channel_ticket_indptr.len,
+         }) {
+        if (len > max_int) return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (instance_count > std::numeric_limits<std::uint32_t>::max() ||
+        desc->terminal_cells.len != instance_count ||
+        desc->position_ids.len != desc->token_ids.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if ((desc->logical_fire_ids.len != 0 &&
+         desc->logical_fire_ids.len != instance_count) ||
+        desc->channel_expected_head.len != desc->channel_expected_tail.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->embed_shapes.len != 2 * desc->embed_dtypes.len ||
+        desc->embed_anchor_rows.len != desc->embed_dtypes.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 0; i < desc->embed_dtypes.len; ++i) {
+        if (desc->embed_dtypes.ptr[i] != 2) return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = csr(
+        desc->embed_indptr, desc->embed_rows.len, desc->embed_dtypes.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = csr(
+        desc->embed_block_indptr, desc->embed_dtypes.len, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = csr(
+        desc->channel_ticket_indptr,
+        desc->channel_expected_head.len,
+        instance_count);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->channel_ticket_indptr.len != 0 &&
+        desc->channel_ticket_indptr.ptr[
+            desc->channel_ticket_indptr.len - 1] !=
+            desc->channel_expected_head.len) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (desc->ptir_program_row_indptr.len != 0) {
+        status = csr(
+            desc->ptir_program_row_indptr,
+            wire_row_count,
+            instance_count);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    if (desc->ptir_kv_write_lower_bounds.len !=
+            desc->ptir_kv_write_upper_bounds.len ||
+        (desc->ptir_kv_write_lower_bounds.len != 0 &&
+         desc->ptir_kv_write_lower_bounds.len != instance_count)) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 0;
+         i < desc->ptir_kv_write_lower_bounds.len;
+         ++i) {
+        if (desc->ptir_kv_write_lower_bounds.ptr[i] >
+            desc->ptir_kv_write_upper_bounds.ptr[i]) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    for (std::size_t i = 0; i < instance_count; ++i) {
+        for (std::size_t j = 0; j < i; ++j) {
+            if (desc->roster_rows.ptr[i] == desc->roster_rows.ptr[j]) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    if (desc->rs_slot_ids.len != desc->rs_slot_flags.len ||
+        (desc->rs_fold_lens.len != 0 &&
+         desc->rs_fold_lens.len != desc->rs_slot_ids.len)) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const bool has_rs_fold_lens = desc->rs_fold_lens.len != 0;
+    for (std::size_t i = 0; i < desc->rs_slot_flags.len; ++i) {
+        const std::uint8_t flags = desc->rs_slot_flags.ptr[i];
+        if ((flags & ~(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD |
+                       PIE_RS_FLAG_BUFFER_WRITE |
+                       PIE_RS_FLAG_FOLD_LEN_DEVICE)) != 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        // A device-resident fold length is only meaningful on a folding row,
+        // and its wire slot must carry the host's non-zero upper bound so the
+        // clamp in composition has something to clamp against.
+        if ((flags & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0 &&
+            (flags & PIE_RS_FLAG_FOLD) == 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        const bool folds = (flags & PIE_RS_FLAG_FOLD) != 0;
+        if (folds !=
+            (has_rs_fold_lens && desc->rs_fold_lens.ptr[i] != 0)) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    for (std::size_t i = 0; i < desc->rs_slot_ids.len; ++i) {
+        if (desc->rs_slot_ids.ptr[i] >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    for (std::size_t i = 0; i < desc->rs_buffer_slot_ids.len; ++i) {
+        if (desc->rs_buffer_slot_ids.ptr[i] >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+
+    for (std::size_t len : {
+            desc->kv_last_page_lens.len,
+            desc->context_ids.len,
+            desc->kv_len.len,
+         }) {
+        status = optional_rows(len, wire_row_count);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    for (std::size_t i = 0; i < desc->rs_fold_lens.len; ++i) {
+        if (desc->rs_fold_lens.ptr[i] >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    // A direct PTIR launch may contain device-geometry programs whose
+    // descriptor-resolved row count differs from their wire placeholder span.
+    // Keep the vectors internally valid here, but defer their outer cardinality
+    // until CUDA composition has the exact resolved request count.
+    const bool defer_rs_outer =
+        instance_count != 0 &&
+        (wire_row_count == 0 ||
+         desc->ptir_program_row_indptr.len == instance_count + 1);
+    if (!defer_rs_outer && wire_row_count != 0 &&
+        desc->rs_slot_ids.len != 0 &&
+        desc->rs_slot_ids.len != wire_row_count) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->kv_len_device.len > 1) return PIE_STATUS_INVALID_ARGUMENT;
+
+    status = csr(
+        desc->qo_indptr, desc->token_ids.len, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = csr(
+        desc->kv_page_indptr, desc->kv_page_indices.len, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = defer_rs_outer
+        ? deferred_outer_csr(
+              desc->rs_buffer_slot_indptr,
+              desc->rs_buffer_slot_ids.len)
+        : csr(
+              desc->rs_buffer_slot_indptr,
+              desc->rs_buffer_slot_ids.len,
+              wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = defer_rs_outer
+        ? deferred_outer_csr(
+              desc->rs_translation_indptr, desc->rs_translation.len)
+        : csr(
+              desc->rs_translation_indptr,
+              desc->rs_translation.len,
+              wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = csr(
+        desc->sampling_indptr, desc->sampling_indices.len, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->kv_page_indptr.len != 0 &&
+        desc->kv_last_page_lens.len != wire_row_count) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const bool deferred_ptir_geometry =
+        instance_count != 0 &&
+        desc->ptir_program_row_indptr.len == instance_count + 1;
+    if (desc->token_ids.len != 0 && !deferred_ptir_geometry &&
+        (desc->kv_page_indptr.len == 0 ||
+         desc->kv_last_page_lens.len != wire_row_count ||
+         desc->sampling_indptr.len == 0)) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->sampling_indices.len != 0 && desc->qo_indptr.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->sampling_indices.len != 0) {
+        for (std::size_t request = 0; request < wire_row_count; ++request) {
+            const std::uint32_t query_rows =
+                desc->qo_indptr.ptr[request + 1] -
+                desc->qo_indptr.ptr[request];
+            for (std::uint32_t index =
+                     desc->sampling_indptr.ptr[request];
+                 index < desc->sampling_indptr.ptr[request + 1];
+                 ++index) {
+                if (desc->sampling_indices.ptr[index] >= query_rows) {
+                    return PIE_STATUS_INVALID_ARGUMENT;
+                }
+            }
+        }
+    }
+
+    if (desc->image_grids.len % 3 != 0 ||
+        desc->image_patch_positions.len % 2 != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const std::size_t image_count = desc->image_grids.len / 3;
+    if (desc->image_anchor_positions.len != image_count ||
+        desc->image_anchor_rows.len != image_count) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    for (std::size_t i = 0; i < image_count; ++i) {
+        if (desc->image_anchor_rows.ptr[i] >= desc->token_ids.len) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    status = csr(
+        desc->image_indptr, image_count, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    if (image_count != 0 && desc->image_pixel_indptr.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = csr(
+        desc->image_pixel_indptr, desc->image_pixels.len, image_count);
+    if (status != PIE_STATUS_OK) return status;
+    status = csr(
+        desc->image_mrope_indptr,
+        desc->image_mrope_positions.len,
+        image_count);
+    if (status != PIE_STATUS_OK) return status;
+
+    const std::size_t audio_count = desc->audio_anchor_rows.len;
+    for (std::size_t i = 0; i < audio_count; ++i) {
+        if (desc->audio_anchor_rows.ptr[i] >= desc->token_ids.len) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    status = csr(
+        desc->audio_indptr, audio_count, wire_row_count);
+    if (status != PIE_STATUS_OK) return status;
+    if (audio_count != 0 && desc->audio_feature_indptr.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = csr(
+        desc->audio_feature_indptr,
+        desc->audio_features.len,
+        audio_count);
+    if (status != PIE_STATUS_OK) return status;
+    return PIE_STATUS_OK;
+}
+
+inline int frame_desc(const PieFrameDesc* desc) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 || desc->reserved1 != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = slice(desc->instance_ids.ptr, desc->instance_ids.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(desc->kv_translation.ptr, desc->kv_translation.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(
+        desc->kv_translation_indptr.ptr, desc->kv_translation_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(desc->steps.ptr, desc->steps.len);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->steps.len == 0 || desc->steps.ptr == nullptr) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    const std::size_t roster_len = desc->instance_ids.len;
+    for (std::size_t i = 0; i < roster_len; ++i) {
+        for (std::size_t j = 0; j < i; ++j) {
+            if (desc->instance_ids.ptr[i] == desc->instance_ids.ptr[j]) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    if (desc->kv_translation.len != 0 &&
+        desc->kv_translation_indptr.len == 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = csr(
+        desc->kv_translation_indptr, desc->kv_translation.len, roster_len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < desc->steps.len; ++i) {
+        status = step_desc(&desc->steps.ptr[i], roster_len);
+        if (status != PIE_STATUS_OK) return status;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int encode_desc(const PieEncodeDesc* desc) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0) return PIE_STATUS_INVALID_ARGUMENT;
+    status = slice(desc->image_grids.ptr, desc->image_grids.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = bytes(desc->image_pixels);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(
+        desc->image_pixel_indptr.ptr, desc->image_pixel_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(
+        desc->image_patch_positions.ptr, desc->image_patch_positions.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(
+        desc->image_anchor_rows.ptr, desc->image_anchor_rows.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = bytes(desc->audio_features);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(
+        desc->audio_feature_indptr.ptr, desc->audio_feature_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(
+        desc->audio_anchor_rows.ptr, desc->audio_anchor_rows.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(desc->output_rows.ptr, desc->output_rows.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(
+        desc->output_row_indptr.ptr, desc->output_row_indptr.len);
+    if (status != PIE_STATUS_OK) return status;
+    const std::size_t images = desc->image_anchor_rows.len;
+    const std::size_t clips = desc->audio_anchor_rows.len;
+    if (images + clips == 0 ||
+        desc->output_row_indptr.len != images + clips + 1 ||
+        desc->output_rows.len == 0 ||
+        desc->output_rows.len % sizeof(std::uint16_t) != 0) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    if (images == 0) {
+        if (desc->image_grids.len != 0 || desc->image_pixels.len != 0 ||
+            desc->image_pixel_indptr.len != 0 ||
+            desc->image_patch_positions.len != 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    } else {
+        if (desc->image_grids.len != images * 3 ||
+            desc->image_pixel_indptr.len != images + 1 ||
+            desc->image_pixels.len == 0 ||
+            desc->image_pixels.len % sizeof(float) != 0 ||
+            desc->image_patch_positions.len == 0 ||
+            desc->image_patch_positions.len % 2 != 0 ||
+            desc->image_pixel_indptr.ptr[0] != 0 ||
+            desc->image_pixel_indptr.ptr[images] != desc->image_pixels.len) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        for (std::size_t image = 0; image < images; ++image) {
+            const std::uint32_t begin = desc->image_pixel_indptr.ptr[image];
+            const std::uint32_t end = desc->image_pixel_indptr.ptr[image + 1];
+            if (begin > end || begin % sizeof(float) != 0 ||
+                end % sizeof(float) != 0) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    if (clips == 0) {
+        if (desc->audio_features.len != 0 ||
+            desc->audio_feature_indptr.len != 0) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    } else {
+        if (desc->audio_feature_indptr.len != clips + 1 ||
+            desc->audio_features.len == 0 ||
+            desc->audio_features.len % sizeof(float) != 0 ||
+            desc->audio_feature_indptr.ptr[0] != 0 ||
+            desc->audio_feature_indptr.ptr[clips] !=
+                desc->audio_features.len) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+        for (std::size_t clip = 0; clip < clips; ++clip) {
+            const std::uint32_t begin =
+                desc->audio_feature_indptr.ptr[clip];
+            const std::uint32_t end =
+                desc->audio_feature_indptr.ptr[clip + 1];
+            if (begin >= end || begin % sizeof(float) != 0 ||
+                end % sizeof(float) != 0) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int kv_copy_desc(const PieKvCopyDesc* desc) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 ||
+        !valid_memory_domain(desc->src_domain) ||
+        !valid_memory_domain(desc->dst_domain)) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = slice(desc->src_page_ids.ptr, desc->src_page_ids.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(desc->dst_page_ids.ptr, desc->dst_page_ids.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(desc->cells.ptr, desc->cells.len);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->src_page_ids.len != desc->dst_page_ids.len ||
+        desc->cells.len >
+            static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int state_copy_desc(const PieStateCopyDesc* desc) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0) return PIE_STATUS_INVALID_ARGUMENT;
+    status = slice(desc->slot_ranges.ptr, desc->slot_ranges.len);
+    if (status != PIE_STATUS_OK) return status;
+    for (std::size_t i = 0; i < desc->slot_ranges.len; ++i) {
+        const PieStateCopyRange& range = desc->slot_ranges.ptr[i];
+        if (range.src_slot_id >
+                static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+            range.dst_slot_id >
+                static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+            static_cast<std::uint64_t>(range.src_token_offset) +
+                    range.token_count >
+                std::numeric_limits<std::uint32_t>::max() ||
+            static_cast<std::uint64_t>(range.dst_token_offset) +
+                    range.token_count >
+                std::numeric_limits<std::uint32_t>::max()) {
+            return PIE_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    return PIE_STATUS_OK;
+}
+
+inline int pool_resize_desc(const PiePoolResizeDesc* desc) noexcept {
+    if (desc == nullptr) return PIE_STATUS_INVALID_ARGUMENT;
+    int status = version(desc->abi_version);
+    if (status != PIE_STATUS_OK) return status;
+    if (desc->reserved0 != 0 ||
+        desc->target_pages >
+            static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        return PIE_STATUS_INVALID_ARGUMENT;
+    }
+    status = slice(desc->map_ranges.ptr, desc->map_ranges.len);
+    if (status != PIE_STATUS_OK) return status;
+    status = slice(desc->unmap_ranges.ptr, desc->unmap_ranges.len);
+    if (status != PIE_STATUS_OK) return status;
+
+    for (PiePoolRangeSlice ranges :
+         {desc->map_ranges, desc->unmap_ranges}) {
+        for (std::size_t i = 0; i < ranges.len; ++i) {
+            if (ranges.ptr[i].page_count >
+                std::numeric_limits<std::uint64_t>::max() -
+                    ranges.ptr[i].page_index) {
+                return PIE_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    return PIE_STATUS_OK;
+}
+
+}  // namespace pie::driver::validate

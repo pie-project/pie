@@ -203,7 +203,6 @@ fn register_dummy_driver(
         has_mtp_drafts: true,
         has_value_head: true,
         has_attn_score: true,
-        model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
         callback_delay_ms: 0,
         reject_launches: false,
         reject_launches_remaining: 0,
@@ -227,19 +226,10 @@ fn register_dummy_driver(
             limits,
             device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS
                 | pie_driver_abi::PIE_DEVICE_PORT_ATTN_MASK,
-            model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
         },
         backend,
     );
-    let scheduler = BatchScheduler::new(
-        driver_id,
-        driver_idx,
-        16,
-        limits,
-        30,
-        1,
-        pie_driver_abi::ModelSiteSummary::default(),
-    );
+    let scheduler = BatchScheduler::new(driver_id, driver_idx, 16, limits, 30, 1);
     (driver_id, scheduler)
 }
 

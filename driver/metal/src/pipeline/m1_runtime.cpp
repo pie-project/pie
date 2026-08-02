@@ -260,7 +260,7 @@ std::uint32_t symbolic_extent(
 }
 
 bool describe_value(
-    const pie_native::launch::plan::ValueType& type,
+    const pie::driver::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents,
     DeviceValueDesc& descriptor) {
     descriptor = {};
@@ -319,7 +319,7 @@ std::size_t wire_value_bytes(const DeviceValueDesc& descriptor) {
 }
 
 std::uint64_t combined_signature(
-    const std::vector<pie_native::launch::plan::StagePlan>& plans) {
+    const std::vector<pie::driver::launch::plan::StagePlan>& plans) {
     std::vector<std::uint8_t> bytes;
     bytes.reserve(plans.size() * sizeof(std::uint64_t));
     for (const auto& plan : plans) {
@@ -335,7 +335,7 @@ std::uint64_t combined_signature(
 }  // namespace
 
 M1ResolvedShape resolve_m1_shape_for_test(
-    const pie_native::launch::plan::ValueType& type,
+    const pie::driver::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents) {
     DeviceValueDesc descriptor;
     if (!describe_value(type, extents, descriptor)) return {};
@@ -392,13 +392,13 @@ struct M1RegionExecutable {
 };
 
 struct M2FusedRegionExecutable {
-    pie_native::launch::plan::Region region;
+    pie::driver::launch::plan::Region region;
     Pso pso{};
     int ordinal = -1;
 };
 
 struct M3GroupedRegionExecutable {
-    pie_native::launch::plan::Region region;
+    pie::driver::launch::plan::Region region;
     Pso pso{};
     bool parallel_nucleus = false;
     bool parallel_topk = false;
@@ -419,7 +419,7 @@ struct M1StageExecutable {
 
 struct M1ProgramStage {
     std::shared_ptr<M1StageExecutable> executable;
-    pie_native::launch::plan::StagePlan plan;
+    pie::driver::launch::plan::StagePlan plan;
 };
 
 struct M1ProgramExecutable {
@@ -614,7 +614,7 @@ std::string m3_stage_key(
 }
 
 std::size_t m3_used_channel_slots(
-    const pie_native::launch::plan::StagePlan& stage) {
+    const pie::driver::launch::plan::StagePlan& stage) {
     std::size_t count = 0;
     for (const auto& normalized : stage.ops) {
         if (normalized.op.chan >= 0) {
@@ -850,7 +850,7 @@ std::unique_ptr<M1Runtime> M1Runtime::create(
     // no filesystem include lookup, so we splice it in ourselves later.
     const std::filesystem::path rng_path =
         std::filesystem::path(kernels_dir) / "ptir_rng.generated.metal";
-    if (!read_ptir_msl_source(
+    if (!read_metal_source(
             rng_path.string(), impl->ptir_rng_preamble, &error) ||
         impl->ptir_rng_preamble.empty()) {
         return nullptr;
@@ -1127,8 +1127,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
                     transaction)) {
                 return reject_retryable(
                     "Metal M1 compile failed for " +
-                    std::string(pie_native::launch::op_name(
-                        static_cast<pie_native::launch::OpCode>(
+                    std::string(pie::driver::launch::op_name(
+                        static_cast<pie::driver::launch::OpCode>(
                             operations[region].op.tag))) +
                     ": " + error);
             }

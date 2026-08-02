@@ -460,9 +460,9 @@ void glm5_forward_paged(
             total_tokens, num_requests, stream, row_valid_d);
         }
 
-        // kv_b_proj_bf16 holds a BF16 copy of the (possibly FP8) kv_b
-        // weight that the kimi_mla kernels require.
-        const void* kv_b_bf16 = Lw.kv_b_proj_bf16->data();
+        // The kimi_mla kernels read kv_b in BF16, which is what the contract
+        // publishes it as -- an FP8 checkpoint is dequantized by the loader.
+        const void* kv_b_bf16 = Lw.kv_b_proj->data();
         ops::mla_absorb_q_to_latent_bf16(cublas.handle(),
             ws.q_nope.data(), kv_b_bf16,
             ws.q_nope_latent.data(),

@@ -25,7 +25,7 @@
 //! It is also the workspace's only exercise of `WorkingSet::fork` on the
 //! bridge surface (the fused beam reorders inside one working set instead).
 
-use inferlet::ptir::prelude::*;
+use inferlet::ptir::attention::prelude::*;
 use inferlet::serde_json;
 use inferlet::{Result, model as wit_model};
 
@@ -78,54 +78,47 @@ async fn forward_logits(
 ) -> Result<Vec<f32>> {
     let n = tokens.len() as u32;
     let end = start + n;
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
     let pool_pages = ws.page_len();
     let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let toks = Channel::from(toks_i32).named("toks");
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((start..end).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr");
-    let w_slot = Channel::from(
-        (start..end)
-            .map(|position| position / page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot");
-    let w_off = Channel::from(
-        (start..end)
-            .map(|position| position % page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off");
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(start..end).named("positions");
+    let pages = Channel::from_iter(0..pool_pages).named("pages");
+    let page_indptr = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr");
+    let w_slot =
+        Channel::from_iter((start..end).map(|position| position / page_size)).named("w_slot");
+    let w_off =
+        Channel::from_iter((start..end).map(|position| position % page_size)).named("w_off");
     let logits_out = Channel::new([vocab], dtype::f32).named("logits_out");
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
-    let kv_len = Channel::from(vec![end]).named("kv_len");
+    let kv_len = Channel::from([end]).named("kv_len");
     fwd.attention(
         ws,
-        ..,
-        (start / page_size)..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (start / page_size)..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         // No on-device select: ship the raw logits row to the host.
         logits_out.put(&intrinsics::logits());
     });
 
-    fwd.submit(on).map_err(|e| format!("submit {tag}: {e}"))?;
+    fwd.submit(on).with_context(|| format!("submit {tag}"))?;
     logits_out
-        .take()
-        .get::<f32>()
+        .take_host::<Vec<f32>>()
         .await
-        .map_err(|e| format!("logits take {tag}: {e}"))
+        .with_context(|| format!("{tag}"))
 }
 
 #[inferlet::main]
@@ -153,9 +146,8 @@ async fn main(input: String) -> Result<String> {
     // Root working set: reserve the whole logical envelope BEFORE any fork so
     // every CoW child shares one address space sized for prompt + decode.
     let root = WorkingSet::new();
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(root.page_size());
-    root.reserve(max_pages)
-        .map_err(|e| format!("root reserve: {e}"))?;
+    let max_pages = (n + max_tokens as u32 + 1).div_ceil(kv_page_size());
+    root.reserve(max_pages).context("root reserve")?;
 
     // One run-ahead ordering domain for the whole search: forks and fires
     // linearize on it, so a survivor's fork is ordered after its parent's
@@ -167,7 +159,7 @@ async fn main(input: String) -> Result<String> {
     let mut beams: Vec<Beam> = Vec::with_capacity(beam_width);
     let mut pending: Vec<Vec<u32>> = Vec::with_capacity(beam_width);
     for _ in 0..beam_width {
-        let ws = root.fork(&pipe).map_err(|e| format!("seed fork: {e}"))?;
+        let ws = root.fork(&pipe).context("seed fork")?;
         beams.push(Beam {
             ws,
             seq_len: 0,
@@ -204,10 +196,7 @@ async fn main(input: String) -> Result<String> {
         let mut next: Vec<Beam> = Vec::with_capacity(beam_width);
         let mut next_pending: Vec<Vec<u32>> = Vec::with_capacity(beam_width);
         for (score, parent, tok) in &cand {
-            let ws = beams[*parent]
-                .ws
-                .fork(&pipe)
-                .map_err(|e| format!("survivor fork: {e}"))?;
+            let ws = beams[*parent].ws.fork(&pipe).context("survivor fork")?;
             let mut tokens = beams[*parent].tokens.clone();
             tokens.push(*tok);
             next.push(Beam {

@@ -405,13 +405,15 @@ class ContractBuilder {
 public:
     ContractBuilder(const Checkpoint& checkpoint, const ModelFacts& facts,
                     const pie_loader::DeviceTarget& target, std::string_view runtime_quant,
-                    Mxfp4MoeRequest mxfp4_moe, Component component, ModelContract& out)
+                    Mxfp4MoeRequest mxfp4_moe, Component component,
+                    bool stream_routed_experts, ModelContract& out)
         : facts_(facts),
           target_(target),
           runtime_quant_(runtime_quant),
           mxfp4_moe_request_(mxfp4_moe),
           mxfp4_moe_(resolve_mxfp4_moe(mxfp4_moe, target.native_mxfp4_moe)),
           component_(component),
+          stream_routed_experts_(stream_routed_experts),
           tensors_(checkpoint.tensors()),
           contract_(out) {
         out.align(std::max<std::uint32_t>(1, target_.preferred_alignment));
@@ -437,6 +439,19 @@ public:
     /// Only an author with a reason to disagree with the device rule needs
     /// this, and the reason belongs in that author's file.
     Mxfp4MoeRequest mxfp4_moe_request() const noexcept { return mxfp4_moe_request_; }
+    /// Whether the operator asked for routed experts to be paged rather than
+    /// made resident.
+    ///
+    /// It reaches the author because it changes what the contract *says*, not
+    /// just what the driver does with it: a streamed family declares its
+    /// experts as a `group` of one expert each rather than as one stacked slab
+    /// per layer, and only the file that knows the family can say which of its
+    /// tensors constitute one instance. Every other consequence -- the slab,
+    /// the eviction, the graph gate -- follows from the driver reading that
+    /// group back, and the loader never learns which reading was meant.
+    ///
+    /// A family with nothing worth paging may ignore it.
+    bool stream_routed_experts() const noexcept { return stream_routed_experts_; }
     ModelContract& contract() noexcept { return contract_; }
     const std::vector<SourceTensor>& tensors() const noexcept { return tensors_; }
 
@@ -736,6 +751,26 @@ public:
         if (replicate_lm_head_ && ends_with(name, ".lm_head.weight")) {
             return std::nullopt;
         }
+        // A companion scale splits exactly like the weight it scales, so ask
+        // about the weight -- here, once, rather than in each family. Stating
+        // it as two parallel lists is what `hf_shard_axis` used to do, and the
+        // axis-0 list grew its scale entries while the axis-1 list never did:
+        // `o_proj`, `down_proj` and `w2` handed a rank its slice of the weight
+        // and the whole model's scale beside it. That fix lived inside
+        // `hf_shard_axis`, so a family that supplied its own `shard_axis_fn`
+        // silently opted out of it and had to remember the pairing by hand.
+        // Deriving it before the family is consulted is what makes it
+        // unforgettable.
+        for (const std::string_view suffix :
+             {".weight_scale_inv", ".weight_scale", ".weight_packed", ".scale"}) {
+            if (ends_with(name, suffix)) {
+                const std::string_view base =
+                    name.substr(0, name.size() - suffix.size());
+                const ShardAxis of_weight =
+                    shard_axis_fn_(std::string(base) + ".weight");
+                return of_weight.has_value() ? of_weight : shard_axis_fn_(base);
+            }
+        }
         return shard_axis_fn_(name);
     }
 
@@ -854,6 +889,29 @@ public:
 
     void publish_fused(const std::vector<FusedCandidate>& candidates) {
         for (const FusedCandidate& candidate : candidates) {
+            // A join is only a fusion of the GEMM if every part is distributed
+            // the same way. Column-parallel parts (q/k/v, gate/up) each hand a
+            // rank its own band and the join of those bands is this rank's
+            // fused weight. Replicated parts (MLA's `q_a_proj` and
+            // `kv_a_proj_with_mqa`, whose outputs feed unsharded per-rank
+            // norms) must stay whole: row-sharding them anyway produced a
+            // fused weight of `(q_lora + kv_lora + q_rope) / tp` rows while the
+            // forward still asked its GEMM for the full width, so every rank
+            // read past the end of the weight and MLA diverged from tp=1 in
+            // the first projection of layer 0 -- with no crash, because the
+            // over-read stayed inside the weight arena.
+            bool all_sharded = true;
+            bool all_replicated = true;
+            for (const SourceTensor* raw : candidate.parts) {
+                const ShardAxis axis = shard_axis(raw->name);
+                const bool row_sharded = axis.has_value() && *axis == 0;
+                all_sharded = all_sharded && row_sharded;
+                all_replicated = all_replicated && !axis.has_value();
+            }
+            // A mixed group has no single fused layout, so leave its parts to
+            // their own bind paths rather than inventing one.
+            if (!all_sharded && !all_replicated) continue;
+
             std::vector<Node> parts;
             std::vector<std::int64_t> local_rows;
             parts.reserve(candidate.parts.size());
@@ -865,9 +923,14 @@ public:
                 // q/k boundary and hand a rank a mix of two projections.
                 // Sharding first gives every rank its own band of each, and
                 // their join is exactly this rank's fused weight.
-                check_head_granularity(raw->name, shape_of(*raw), ShardAxis{0});
-                parts.push_back(split(contract_.src(std::string(raw->name)), 0));
-                local_rows.push_back(local_extent(raw->shape[0]));
+                if (all_sharded) {
+                    check_head_granularity(raw->name, shape_of(*raw), ShardAxis{0});
+                    parts.push_back(split(contract_.src(std::string(raw->name)), 0));
+                    local_rows.push_back(local_extent(raw->shape[0]));
+                } else {
+                    parts.push_back(contract_.src(std::string(raw->name)));
+                    local_rows.push_back(raw->shape[0]);
+                }
                 rows += local_rows.back();
             }
             define(candidate.output_name, contract_.concat(parts, 0),
@@ -982,6 +1045,27 @@ public:
             }
         }
         publish_fused(chosen);
+    }
+
+    /// Publish a second, quantized view of a source tensor under another name.
+    ///
+    /// Unlike `publish_remaining`'s runtime quantization this does **not**
+    /// consume the source, so the original encoding stays published beside it.
+    /// That is the difference between re-encoding a weight and adding a cheaper
+    /// copy of it for one path that wants one: Qwen3.5's speculative head reads
+    /// the same `lm_head` as the main path, in int8, while the main path keeps
+    /// reading bf16.
+    ///
+    /// Returns false when the checkpoint has no such tensor, so a caller can
+    /// state an optional view without first proving the source exists.
+    bool quantized_view(const std::string& source, std::string output,
+                        PieLoaderQuantScheme scheme) {
+        const SourceTensor* raw = find(source);
+        if (raw == nullptr) {
+            return false;
+        }
+        push_runtime_quant(*raw, std::move(output), scheme);
+        return true;
     }
 
     // -- the generic tail ----------------------------------------------------
@@ -1211,6 +1295,7 @@ private:
     Mxfp4MoeRequest mxfp4_moe_request_;
     Mxfp4MoePolicy mxfp4_moe_;
     Component component_;
+    bool stream_routed_experts_ = false;
     std::vector<SourceTensor> tensors_;
     std::unordered_map<std::string_view, const SourceTensor*> by_name_;
     std::unordered_set<std::uint32_t> consumed_;
@@ -1225,6 +1310,77 @@ private:
     bool allow_mxfp4_rq_ = false;
     bool encode_scope_allowed_ = false;
 };
+
+/// The same experts, declared as a group instead of a stack.
+///
+/// Structurally this is `hf_moe_expert_stacks` with the outer concatenation
+/// removed: the stack's per-expert slab was already built as its own subtree,
+/// so what is left after dropping the join is one instance, and the instance is
+/// the group. `src(".../experts.3.gate_proj.weight")` becomes
+/// `index_src(".../experts.{}.gate_proj.weight")` and nothing else moves.
+///
+/// The declared names carry no expert index. There is one plan and it is the
+/// same plan for every expert, which is the whole claim a group makes; the
+/// driver picks the instance at page-in time.
+///
+/// One group per layer, because a name template holds a single `{}`. The
+/// driver's slab spans groups, so this costs nothing.
+inline void hf_moe_streamed_expert_groups(
+    ContractBuilder& b, bool gate_second, std::uint32_t layer,
+    const std::string& bound, const std::string& prefix, std::int64_t num_experts,
+    std::int64_t inter, std::int64_t hidden, PieLoaderDType dtype) {
+    auto& c = b.contract();
+
+    // Claim every tensor the template will read. A group reads through a
+    // template, so no node names these and `publish_remaining` would otherwise
+    // publish all E of them as ordinary resident tensors.
+    std::vector<std::uint32_t> consumed;
+    for (std::int64_t e = 0; e < num_experts; ++e) {
+        const std::string tag = prefix + std::to_string(e) + ".";
+        for (const char* suffix : {"gate_proj.weight", "up_proj.weight", "down_proj.weight"}) {
+            const SourceTensor* part = b.find(tag + suffix);
+            if (part == nullptr) {
+                fail("qwen moe expert group: layer " + std::to_string(layer) + " expert " +
+                     std::to_string(e) + " missing gate/up/down");
+            }
+            consumed.push_back(part->id);
+        }
+    }
+
+    const Node gate_src = b.split(c.index_src(prefix + "{}.gate_proj.weight"), 0);
+    const Node up_src = b.split(c.index_src(prefix + "{}.up_proj.weight"), 0);
+    // Named the way the bound tensors beside it are named, minus the trailing
+    // dot: the driver resolves a group next to the weights it binds.
+    auto group = c.group(bound.substr(0, bound.size() - 1),
+                         static_cast<std::uint32_t>(num_experts));
+    // Rank 2, not 3: with no expert axis to stack along there is nothing to
+    // give the leading 1 to. The per-expert GEMM indexes the slab by `e` today
+    // and reads a slot base instead when streaming, so this is the shape it
+    // already wanted.
+    //
+    // Under TP each half is sharded before the join, never after: a shard of
+    // `[gate; up]` on the fused axis would hand rank 0 the whole gate and rank
+    // 1 the whole up. Sharding first is also what `fused_moe_gate_up_tp_slices`
+    // does to the pre-fused form of these same weights, so a rank's slot holds
+    // the bytes its resident counterpart would have held. `down_proj` is the
+    // matching row-parallel half, split on the intermediate axis it contracts
+    // over.
+    const std::int64_t local_inter = b.local_extent(inter);
+    group.define("gate_up_proj",
+                 c.concat(gate_second ? std::vector<Node>{up_src, gate_src}
+                                      : std::vector<Node>{gate_src, up_src},
+                          0),
+                 pie_loader::raw(dtype))
+        .expect({2 * local_inter, hidden});
+    group.define("down_proj",
+                 b.split(c.index_src(prefix + "{}.down_proj.weight"), 1),
+                 pie_loader::raw(dtype))
+        .expect({hidden, local_inter});
+
+    for (std::uint32_t id : consumed) {
+        b.consume(id);
+    }
+}
 
 /// Stack per-expert MoE weights into the fused 3-D tensors a fused-MoE
 /// forward consumes. This is the plain HF MoE source layout, not anything
@@ -1243,11 +1399,6 @@ private:
 /// set it and fall back to their per-expert path for quantised checkpoints.
 inline void hf_moe_expert_stacks(
     ContractBuilder& b, bool gate_second, bool float_only = false) {
-    if (b.target().tp_size != 1) {
-        // TP>1 per-expert sharding is not wired; the bind then fails loudly
-        // on the missing fused tensor rather than loading silently wrong.
-        return;
-    }
     const std::int64_t num_experts = b.facts().num_experts;
     if (num_experts <= 0) {
         return;
@@ -1279,6 +1430,20 @@ inline void hf_moe_expert_stacks(
         if (!is_dense_addressable(gate0->encoding)) {
             fail("qwen moe expert stack: '" + std::string(gate0->name) +
                  "' has a non-affine packed encoding");
+        }
+
+        if (b.stream_routed_experts()) {
+            hf_moe_streamed_expert_groups(b, gate_second, layer, bound, prefix,
+                                          num_experts, inter, hidden, dtype);
+            continue;
+        }
+        if (b.target().tp_size != 1) {
+            // The stack joins E per-expert slabs along a new leading axis, and
+            // nothing downstream slices that join per rank; the bind then fails
+            // loudly on the missing fused tensor rather than loading silently
+            // wrong. The group above has no such join -- one instance is one
+            // expert -- so it shards each half directly and does run under TP.
+            continue;
         }
 
         std::vector<Node> gate_up_parts;

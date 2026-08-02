@@ -1,6 +1,6 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::second_party_region_supported
 # source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 19
+# emitter_version: 21
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 320
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above

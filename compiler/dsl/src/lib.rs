@@ -35,8 +35,8 @@
 //!     let logits = intrinsics::logits();
 //!     let r = rng.take();
 //!     let g = gumbel(&r, [intrinsics::vocab()]);
-//!     let t = reduce_argmax(add(logits, g));
-//!     rng.put(add(&r, Tensor::constant([0u32, 1])));
+//!     let t = reduce_argmax(logits + g);
+//!     rng.put(&r + Tensor::constant([0u32, 1]));
 //!     tok.put(&t);
 //!     out.put(t);
 //! });
@@ -47,8 +47,9 @@
 //!
 //! ## Deviations from the spec (Rust limitations; flagged, manager-approved)
 //! - Model constants are functions (`intrinsics::vocab()`), not bare paths.
-//! - Bare integer-literal operands (`add(x, 1)`) resolve to `u32`; explicit
-//!   `i32` constants use `Tensor::constant(-1i32)`.
+//! - Bare integer-literal operands (`x + 1`) resolve to `i32`, but a scalar
+//!   operand adopts the dtype of the tensor it meets, so the suffix only
+//!   matters between two scalars.
 //! - Values reused as op operands take `&` (a taken value used at multiple sites).
 
 extern crate alloc;
@@ -64,7 +65,7 @@ pub mod model;
 pub mod value;
 
 pub use builder::{Builder, PortInput, Traced};
-pub use channel::{Channel, HostError, IntoPut, Put, Taken};
+pub use channel::{Channel, IntoPut, Put};
 pub use error::{Endpoint, Span, TraceError, TraceErrors};
 /// The eDSL op surface. Glob-re-exported rather than listed: an op is public
 /// exactly when it is `pub` in [`value`], so adding one is a single edit and
@@ -79,7 +80,7 @@ pub use pie_ir::types::{DType, Shape, ValueType};
 
 /// Glob-import surface for the DSL eDSL op/value names.
 /// The author-facing `ForwardPass`/`Pipeline`/`WorkingSet` surface lives in
-/// `inferlet::ptir::prelude`, which re-exports this plus those wrapper types.
+/// `inferlet::ptir::attention::prelude`, which re-exports this plus those wrapper types.
 pub mod prelude {
     pub use crate::builder::{Builder, PortInput};
     pub use crate::channel::Channel;

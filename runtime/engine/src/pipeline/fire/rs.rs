@@ -20,6 +20,7 @@
 //! than deleted, allowed rather than silently masked.
 #![allow(dead_code)]
 
+use crate::store::rs::write::RsBufferIntent;
 use crate::store::rs::write::{RsPreparedWrite, RsPublished};
 use crate::store::rs::{RsStore, RsWorkingSetId};
 
@@ -66,41 +67,91 @@ pub fn validate_count(
 
 /// What a pass does with the recurrent state of its bound working sets, with
 /// the per-row token counts the lowering needs resolved from the fire's
-/// geometry. The host-side mirror of WIT `rs-mode` at prepare time.
+/// geometry. Derived from WIT `rs-geometry.fold-len` at prepare time by
+/// `super::rs_plan_for` — a position for the folded boundary, classified into
+/// the three shapes the driver implements.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RsPlan {
     /// Advance the folded state in-forward over every row.
     Fold,
     /// Scatter each row's pre-recurrence activations into buffered slots
-    /// covering `[start_token, start_token + row_tokens[r])`, leaving the
-    /// folded state untouched.
+    /// covering `[start_tokens[r], start_tokens[r] + row_tokens[r])`, and
+    /// advance the folded boundary through `fold_tokens[r]` of the resulting
+    /// buffer.
+    ///
+    /// `start_tokens[r]` is row `r`'s existing buffer occupancy, so a non-zero
+    /// entry means the fire appends onto a NON-EMPTY buffer and its recurrence
+    /// must read what is already there. That is the buffer read path. It is
+    /// per-row rather than per-pass because occupancy is a property of the
+    /// working set, not of the fire: one request commits while another
+    /// speculates, and they arrive at different offsets in the same batch.
+    ///
+    /// `fold_tokens[r]` is where the folded boundary lands, counted in the
+    /// row's EXTENDED layout `[b | t]` — which is exactly the row's buffer
+    /// token space, so it is also just "fold this many buffered tokens". Zero
+    /// leaves the folded state untouched (a pure append). Any other value
+    /// makes the pass a fold as well as a write: the driver runs the whole
+    /// extended row but snapshots the recurrent state at token
+    /// `fold_tokens[r]` via `commit_len`, so the outputs cover every new token
+    /// while the boundary lands wherever the guest asked — including strictly
+    /// INSIDE this fire's own new tokens.
+    ///
+    /// `in_forward[r]` marks a row that owns NO buffer in this pass: it folds
+    /// its own new tokens straight into the folded state, exactly as
+    /// `RsPlan::Fold` does, while riding along in a fire whose other rows
+    /// buffer. Such a row carries `start_tokens = row_tokens = fold_tokens =
+    /// 0` — it has no buffered span to measure a fold against — and the driver
+    /// recognises it by its empty buffer CSR span.
     Buffer {
-        start_token: u32,
+        start_tokens: Vec<u32>,
         row_tokens: Vec<u32>,
+        fold_tokens: Vec<u32>,
+        in_forward: Vec<bool>,
     },
     /// Replay `tokens[r]` buffered tokens of row `r` into its folded state.
-    FoldBuffered { tokens: Vec<u32> },
+    ///
+    /// When `fold_len_is_device` the host never learned the count: `tokens[r]`
+    /// is its own UPPER BOUND (the whole live buffer), the real value comes
+    /// from the `rs_fold_len` descriptor port, and the driver clamps one to
+    /// the other. The host's boundary then becomes indeterminate until the
+    /// guest frees the buffer.
+    FoldBuffered {
+        tokens: Vec<u32>,
+        fold_len_is_device: bool,
+    },
 }
 
 impl RsPlan {
-    /// `(write_state, fold_tokens, buffer_tokens)` for row `index` — exactly
-    /// the arguments `RsStore::prepare` classifies against.
-    fn row(&self, index: usize) -> (bool, Option<u32>, Option<(u32, u32)>) {
+    /// `(write_state, fold_tokens, buffer_tokens, buffer_intent)` for row
+    /// `index` — exactly the arguments `RsStore::prepare` classifies against.
+    fn row(&self, index: usize) -> (bool, Option<u32>, Option<(u32, u32)>, RsBufferIntent) {
         match self {
-            RsPlan::Fold => (true, None, None),
+            RsPlan::Fold => (true, None, None, RsBufferIntent::Write),
             RsPlan::Buffer {
-                start_token,
+                start_tokens,
                 row_tokens,
-            } => (
-                false,
-                None,
-                Some((*start_token, row_tokens.get(index).copied().unwrap_or(0))),
-            ),
+                fold_tokens,
+                in_forward,
+            } => {
+                if in_forward.get(index).copied().unwrap_or(false) {
+                    return (true, None, None, RsBufferIntent::Write);
+                }
+                let n = fold_tokens.get(index).copied().unwrap_or(0);
+                (
+                    n > 0,
+                    (n > 0).then_some(n),
+                    Some((
+                        start_tokens.get(index).copied().unwrap_or(0),
+                        row_tokens.get(index).copied().unwrap_or(0),
+                    )),
+                    RsBufferIntent::Write,
+                )
+            }
             // A fold gathers the buffered PREFIX: the driver walks the CSR
             // from slab zero, so the span always starts at buffer token 0.
-            RsPlan::FoldBuffered { tokens } => {
+            RsPlan::FoldBuffered { tokens, .. } => {
                 let n = tokens.get(index).copied().unwrap_or(0);
-                (true, Some(n), Some((0, n)))
+                (true, Some(n), Some((0, n)), RsBufferIntent::Replay)
             }
         }
     }
@@ -117,7 +168,7 @@ pub fn demand(
 ) -> Result<usize, String> {
     let mut total = 0;
     for (index, &ws) in working_sets.iter().enumerate() {
-        let (write_state, _, buffer_tokens) = plan.row(index);
+        let (write_state, _, buffer_tokens, _) = plan.row(index);
         total += store
             .write_demand(ws, write_state, buffer_tokens)
             .map_err(|e| e.to_string())?;
@@ -138,8 +189,46 @@ pub struct PreparedRs {
     pub fold_lens: Vec<u32>,
     /// Buffered slab ids, flattened, with the per-row CSR boundaries the
     /// driver walks page-major. Empty unless the pass touches the buffer.
+    ///
+    /// These are the slabs the fire WRITES: `prepare` may materialize or
+    /// privatize them, so they are targets, not sources.
     pub buffer_slot_ids: Vec<u32>,
     pub buffer_slot_indptr: Vec<u32>,
+    /// The slabs the fire READS, and how many tokens of them, per row.
+    ///
+    /// Separate from the write CSR because reading and writing the buffer are
+    /// different intents on the same pages. A write may allocate; a read must
+    /// not, and a read of a page that was merely reserved would gather
+    /// uninitialized activations straight into the recurrence. The WIT draws
+    /// the same line, with `readable-buffer` and `writable-buffer` as distinct
+    /// page spans.
+    ///
+    /// Non-empty only when a row appends onto a NON-EMPTY buffer: its
+    /// recurrence has to start from `folded ⊕ replay(buffer)`, so the driver
+    /// gathers `buffer_read_lens[r]` tokens ahead of the row's own tokens.
+    pub buffer_read_slot_ids: Vec<u32>,
+    pub buffer_read_indptr: Vec<u32>,
+    pub buffer_read_lens: Vec<u32>,
+    /// Where each row's logical buffer token 0 physically sits, in tokens from
+    /// the start of its first page.
+    ///
+    /// A fold absorbs tokens off the front of the buffer but can only release
+    /// WHOLE covered pages, and `fold_granularity` is 1 in production while a
+    /// page is the KV page size — so a fold routinely lands mid-page and the
+    /// survivors keep their offsets. Every buffer span the driver walks is
+    /// therefore `head + logical`. Emitted whenever the pass touches the
+    /// buffer, including a pure write, because a buffer can be logically empty
+    /// and still be physically offset.
+    pub buffer_heads: Vec<u32>,
+    /// WorkingSet-relative buffer page -> physical slot, concatenated over
+    /// request rows with `translation_indptr` as the per-row CSR.
+    ///
+    /// Per REQUEST, not per pass: a pass binds one RS working set per request,
+    /// so unlike `kv_translation` there is no single table for the fire. Built
+    /// after the prepare, because materializing or copying-on-write a buffer
+    /// page changes the mapping it publishes.
+    pub translation: Vec<u32>,
+    pub translation_indptr: Vec<u32>,
     pub txn: Option<RsTxn>,
 }
 
@@ -156,6 +245,12 @@ impl PreparedRs {
         request.rs_fold_lens = self.fold_lens.clone();
         request.rs_buffer_slot_ids = self.buffer_slot_ids.clone();
         request.rs_buffer_slot_indptr = self.buffer_slot_indptr.clone();
+        request.rs_buffer_read_slot_ids = self.buffer_read_slot_ids.clone();
+        request.rs_buffer_read_indptr = self.buffer_read_indptr.clone();
+        request.rs_buffer_read_lens = self.buffer_read_lens.clone();
+        request.rs_buffer_heads = self.buffer_heads.clone();
+        request.rs_translation = self.translation.clone();
+        request.rs_translation_indptr = self.translation_indptr.clone();
     }
 }
 
@@ -189,7 +284,13 @@ fn empty_prepared() -> PreparedRs {
         copies: (Vec::new(), Vec::new()),
         fold_lens: Vec::new(),
         buffer_slot_ids: Vec::new(),
+        buffer_read_slot_ids: Vec::new(),
+        buffer_read_indptr: Vec::new(),
+        buffer_read_lens: Vec::new(),
+        buffer_heads: Vec::new(),
         buffer_slot_indptr: Vec::new(),
+        translation: Vec::new(),
+        translation_indptr: Vec::new(),
         txn: None,
     }
 }
@@ -219,7 +320,7 @@ fn prepare_many_impl(
     let mut prepared_rows: Vec<RsPreparedWrite> = Vec::with_capacity(working_sets.len());
 
     for (index, &ws) in working_sets.iter().enumerate() {
-        let (write_state, fold_tokens, buffer_tokens) = plan.row(index);
+        let (write_state, fold_tokens, buffer_tokens, buffer_intent) = plan.row(index);
 
         // Buffered execution reads the folded state it does not write, and
         // a fold advances it — both need one already to exist. The driver
@@ -240,13 +341,36 @@ fn prepare_many_impl(
         }
 
         let prepared = match granted.as_deref_mut() {
-            Some(granted) => {
-                store.prepare_reserved(ws, write_state, fold_tokens, buffer_tokens, granted)
+            Some(granted) => store.prepare_reserved(
+                ws,
+                write_state,
+                fold_tokens,
+                buffer_tokens,
+                buffer_intent,
+                granted,
+            ),
+            None => {
+                store.prepare_general(ws, write_state, fold_tokens, buffer_tokens, buffer_intent)
             }
-            None => store.prepare_general(ws, write_state, fold_tokens, buffer_tokens),
         };
         let prepared = match prepared {
-            Ok(prepared) => prepared,
+            Ok(mut prepared) => {
+                if matches!(
+                    plan,
+                    RsPlan::FoldBuffered {
+                        fold_len_is_device: true,
+                        ..
+                    }
+                ) {
+                    // The fold length that reached `prepare` is the host's own
+                    // upper bound, good enough to size the allocation and to
+                    // shape the replay CSR. Publishing it as if it were the
+                    // truth would move the boundary too far, so say so here
+                    // and let `publish_batch` hold the boundary instead.
+                    prepared.mark_fold_len_device();
+                }
+                prepared
+            }
             Err(error) => {
                 store.cancel_batch(prepared_rows);
                 return Err(error.to_string());
@@ -267,6 +391,24 @@ fn prepare_many_impl(
                 };
                 if state.fold_tokens.is_some() {
                     flags |= crate::driver::RS_FLAG_FOLD;
+                }
+                // The wire `fold_lens[r]` this row is about to carry is the
+                // host's upper bound, not the fold length. The driver replaces
+                // it with the resolved `rs_fold_len` port CLAMPED to the bound,
+                // which is what keeps a device-named count inside the buffer
+                // that can supply it.
+                if prepared.fold_len_is_bound() {
+                    flags |= crate::driver::RS_FLAG_FOLD_LEN_DEVICE;
+                }
+                // Orthogonal to FOLD. A pass that both writes the buffer and
+                // folds a prefix of the result runs the extended layout and
+                // snapshots the state at `fold_lens[r]`; a pure commit's rows
+                // ARE the replay. The driver cannot tell them apart from the
+                // fold flag alone.
+                if buffer_intent == RsBufferIntent::Write
+                    && buffer_tokens.is_some_and(|(_, len)| len > 0)
+                {
+                    flags |= crate::driver::RS_FLAG_BUFFER_WRITE;
                 }
                 out.slot_flags.push(flags);
                 if let Some(src) = state.copy_from {
@@ -308,9 +450,110 @@ fn prepare_many_impl(
 
     // Publish before returning: the successor fire's classification must see
     // this fire's decision without waiting for the device.
-    let published = store
+    //
+    // The FOLD advance is deferred (see `RsStore::commit_folds`). Everything
+    // below describes the buffer as THIS fire's rows are laid out — extended
+    // row `j` is physical `buffer_head + j` — and that frame is the pre-fold
+    // one. Advancing first would hand a fire whose rows straddle the boundary
+    // a head, and a page list, from the other side of it.
+    let (published, pending_folds) = store
         .publish_batch(prepared_rows)
         .map_err(|error| error.to_string())?;
+    // Everything from here to `commit_folds` runs inside a closure so that a
+    // failure cannot skip it. Once `publish_batch` returns, the store has
+    // ALREADY committed this fire's mapping and taken an in-flight hold, and
+    // two obligations outlive any error below: the deferred fold must be
+    // applied (dropping it would leave the boundary where no one expects it)
+    // and the hold must be settled (`retire_idle` gates ALL pool retirement
+    // on `in_flight == 0`, so leaking one wedges slot recycling for the rest
+    // of the process). `#[must_use]` does not help here -- the value is bound
+    // to a local, and the lint only catches a discarded temporary.
+    let read_side = (|out: &mut PreparedRs| -> Result<(), String> {
+        // Built AFTER the publish, so it reflects the pages this fire just
+        // materialized or privatized rather than the mapping the guest saw.
+        out.translation_indptr.push(0);
+        let page_tokens_of = |ws| -> Result<u32, String> {
+            store
+                .geometry(ws)
+                .map(|g| g.buffer_page_tokens.max(1))
+                .map_err(|error| error.to_string())
+        };
+        let mut any_read = false;
+        out.buffer_read_indptr.push(0);
+        for (index, &ws) in working_sets.iter().enumerate() {
+            let row = store
+                .buffer_translation(ws)
+                .map_err(|error| error.to_string())?;
+
+            let head = if buffered {
+                store.buffer_head(ws).map_err(|error| error.to_string())?
+            } else {
+                0
+            };
+            if buffered {
+                out.buffer_heads.push(head);
+            }
+
+            // The read prefix is the row's PRE-EXISTING occupancy, which is
+            // exactly where its own tokens begin.
+            let read_tokens = match plan.row(index).2 {
+                Some((start, _)) => start,
+                None => 0,
+            };
+            out.buffer_read_lens.push(read_tokens);
+            if read_tokens > 0 {
+                any_read = true;
+                let page = page_tokens_of(ws)?;
+                // Physical, not logical: the replay starts at `head`, which a
+                // mid-page fold leaves non-zero.
+                let first = (head / page) as usize;
+                let last = ((head + read_tokens - 1) / page) as usize;
+                for p in first..=last {
+                    match row.get(p) {
+                        Some(&slot) if slot != crate::store::rs::RS_TRANSLATION_UNMAPPED => {
+                            out.buffer_read_slot_ids.push(slot);
+                        }
+                        // Reserved-but-unmaterialized, or off the end. Either way
+                        // the recurrence would replay activations that were never
+                        // written, which is silent corruption of the state rather
+                        // than a visible failure -- so refuse.
+                        _ => {
+                            return Err(format!(
+                                "request row {index} must replay {read_tokens} buffered \
+                                 token(s), but buffer page {p} of its working set \
+                                 is not materialized"
+                            ));
+                        }
+                    }
+                }
+            }
+            out.buffer_read_indptr
+                .push(out.buffer_read_slot_ids.len() as u32);
+
+            out.translation.extend_from_slice(&row);
+            out.translation_indptr.push(out.translation.len() as u32);
+        }
+        // Keep the wire quiet for the overwhelmingly common empty-buffer fire: an
+        // all-zero read side is the same statement as an absent one, and the
+        // driver's shape checks are simpler when "no read" is literally no data.
+        if !any_read {
+            out.buffer_read_slot_ids.clear();
+            out.buffer_read_indptr.clear();
+            out.buffer_read_lens.clear();
+        }
+        Ok(())
+    })(&mut out);
+
+    // Every wire array is now built against the pre-fold buffer, so the
+    // boundary can finally move. A row that folds through its own new tokens
+    // sees its head advance here and NOT one array earlier.
+    store.commit_folds(pending_folds);
+    if let Err(error) = read_side {
+        // The mapping is committed and cannot be taken back, but the hold on
+        // pool retirement can and must be.
+        store.settle(published);
+        return Err(error);
+    }
     out.txn = Some(RsTxn { published });
     Ok(out)
 }
@@ -475,7 +718,9 @@ mod tests {
 
     fn buffer_plan(start_token: u32, row_tokens: Vec<u32>) -> RsPlan {
         RsPlan::Buffer {
-            start_token,
+            start_tokens: vec![start_token; row_tokens.len()],
+            fold_tokens: vec![0; row_tokens.len()],
+            in_forward: vec![false; row_tokens.len()],
             row_tokens,
         }
     }
@@ -539,8 +784,15 @@ mod tests {
         assert_eq!(slabs.len(), 3);
 
         // Fold the first 8 buffered tokens = slabs 0 and 1.
-        let out =
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8] }).unwrap();
+        let out = prepare_many(
+            &mut store,
+            &[ws],
+            &RsPlan::FoldBuffered {
+                tokens: vec![8],
+                fold_len_is_device: false,
+            },
+        )
+        .unwrap();
         assert_eq!(out.fold_lens, vec![8]);
         assert_eq!(out.buffer_slot_indptr, vec![0, 2]);
         assert_eq!(
@@ -570,8 +822,15 @@ mod tests {
 
         let error = prepare_many(&mut store, &[ws], &buffer_plan(0, vec![4])).unwrap_err();
         assert!(error.contains("no folded state"), "{error}");
-        let error =
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![4] }).unwrap_err();
+        let error = prepare_many(
+            &mut store,
+            &[ws],
+            &RsPlan::FoldBuffered {
+                tokens: vec![4],
+                fold_len_is_device: false,
+            },
+        )
+        .unwrap_err();
         assert!(error.contains("no folded state"), "{error}");
         assert_eq!(store.available_slots(), 4, "nothing leaked");
     }
@@ -583,7 +842,15 @@ mod tests {
         store.alloc_buffer(ws, 1).unwrap(); // capacity 4 tokens
         let free = store.available_slots();
         assert!(
-            prepare_many(&mut store, &[ws], &RsPlan::FoldBuffered { tokens: vec![8] }).is_err()
+            prepare_many(
+                &mut store,
+                &[ws],
+                &RsPlan::FoldBuffered {
+                    tokens: vec![8],
+                    fold_len_is_device: false
+                }
+            )
+            .is_err()
         );
         assert_eq!(store.available_slots(), free, "nothing leaked");
     }

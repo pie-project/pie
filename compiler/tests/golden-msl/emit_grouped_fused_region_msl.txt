@@ -34,12 +34,12 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: additive corpus growth: new lora_prologue golden (stage-4 lora sink); every pre-existing case's emitted text is unchanged — only the new case's sections were appended
+#   reason: cumsum/cumprod widened from F32-only to every numeric dtype; the m1 runtime's scan block now branches on the operand dtype instead of loading every lane through m1_load_f. The oracle dumps change only because that block is embedded verbatim in every emitted source -- no emitted structure moved, and the f32 path is byte-for-byte the arithmetic the oracle recorded.
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3s_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=50552 prefix=@runtime+@grouped tail_bytes=9971
+source: bytes=51440 prefix=@runtime+@grouped tail_bytes=9971
 kernel void ptir_m3s_b4fadd8446eb58dd_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -160,7 +160,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r0(
 function_name: ptir_m3s_b4fadd8446eb58dd_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=51456 prefix=@runtime+@grouped tail_bytes=10875
+source: bytes=52344 prefix=@runtime+@grouped tail_bytes=10875
 kernel void ptir_m3s_b4fadd8446eb58dd_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -298,7 +298,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r1(
 function_name: ptir_m3s_b4fadd8446eb58dd_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=50562 prefix=@runtime+@grouped tail_bytes=9981
+source: bytes=51450 prefix=@runtime+@grouped tail_bytes=9981
 kernel void ptir_m3s_b4fadd8446eb58dd_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -419,7 +419,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r2(
 function_name: ptir_m3s_b4fadd8446eb58dd_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=50562 prefix=@runtime+@grouped tail_bytes=9981
+source: bytes=51450 prefix=@runtime+@grouped tail_bytes=9981
 kernel void ptir_m3s_b4fadd8446eb58dd_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -540,7 +540,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r3(
 function_name: ptir_m3s_b4fadd8446eb58dd_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50575 prefix=@runtime+@grouped tail_bytes=9994
+source: bytes=51463 prefix=@runtime+@grouped tail_bytes=9994
 kernel void ptir_m3s_b4fadd8446eb58dd_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -661,7 +661,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r4(
 function_name: ptir_m3s_b4fadd8446eb58dd_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=50561 prefix=@runtime+@grouped tail_bytes=9980
+source: bytes=51449 prefix=@runtime+@grouped tail_bytes=9980
 kernel void ptir_m3s_b4fadd8446eb58dd_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -782,7 +782,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r5(
 function_name: ptir_m3s_b4fadd8446eb58dd_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=50562 prefix=@runtime+@grouped tail_bytes=9981
+source: bytes=51450 prefix=@runtime+@grouped tail_bytes=9981
 kernel void ptir_m3s_b4fadd8446eb58dd_r6(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -903,7 +903,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r6(
 function_name: ptir_m3s_b4fadd8446eb58dd_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=50561 prefix=@runtime+@grouped tail_bytes=9980
+source: bytes=51449 prefix=@runtime+@grouped tail_bytes=9980
 kernel void ptir_m3s_b4fadd8446eb58dd_r7(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1024,7 +1024,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r7(
 function_name: ptir_m3s_b4fadd8446eb58dd_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=50565 prefix=@runtime+@grouped tail_bytes=9984
+source: bytes=51453 prefix=@runtime+@grouped tail_bytes=9984
 kernel void ptir_m3s_b4fadd8446eb58dd_r10(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1145,7 +1145,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r10(
 function_name: ptir_m3s_b4fadd8446eb58dd_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50579 prefix=@runtime+@grouped tail_bytes=9998
+source: bytes=51467 prefix=@runtime+@grouped tail_bytes=9998
 kernel void ptir_m3s_b4fadd8446eb58dd_r12(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1266,7 +1266,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r12(
 function_name: ptir_m3s_b4fadd8446eb58dd_r14
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=50580 prefix=@runtime+@grouped tail_bytes=9999
+source: bytes=51468 prefix=@runtime+@grouped tail_bytes=9999
 kernel void ptir_m3s_b4fadd8446eb58dd_r14(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1387,7 +1387,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r14(
 function_name: ptir_m3s_b4fadd8446eb58dd_r15
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=50553 prefix=@runtime+@grouped tail_bytes=9972
+source: bytes=51441 prefix=@runtime+@grouped tail_bytes=9972
 kernel void ptir_m3s_b4fadd8446eb58dd_r15(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1508,7 +1508,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r15(
 function_name: ptir_m3s_b4fadd8446eb58dd_r16
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50580 prefix=@runtime+@grouped tail_bytes=9999
+source: bytes=51468 prefix=@runtime+@grouped tail_bytes=9999
 kernel void ptir_m3s_b4fadd8446eb58dd_r16(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1629,7 +1629,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r16(
 function_name: ptir_m3s_b4fadd8446eb58dd_r18
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50580 prefix=@runtime+@grouped tail_bytes=9999
+source: bytes=51468 prefix=@runtime+@grouped tail_bytes=9999
 kernel void ptir_m3s_b4fadd8446eb58dd_r18(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1750,7 +1750,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r18(
 function_name: ptir_m3s_b4fadd8446eb58dd_r25
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=50553 prefix=@runtime+@grouped tail_bytes=9972
+source: bytes=51441 prefix=@runtime+@grouped tail_bytes=9972
 kernel void ptir_m3s_b4fadd8446eb58dd_r25(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1871,7 +1871,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r25(
 function_name: ptir_m3s_b4fadd8446eb58dd_r26
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50594 prefix=@runtime+@grouped tail_bytes=10013
+source: bytes=51482 prefix=@runtime+@grouped tail_bytes=10013
 kernel void ptir_m3s_b4fadd8446eb58dd_r26(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -1992,7 +1992,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r26(
 function_name: ptir_m3s_b4fadd8446eb58dd_r28
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50580 prefix=@runtime+@grouped tail_bytes=9999
+source: bytes=51468 prefix=@runtime+@grouped tail_bytes=9999
 kernel void ptir_m3s_b4fadd8446eb58dd_r28(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -2113,7 +2113,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r28(
 function_name: ptir_m3s_b4fadd8446eb58dd_r30
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50580 prefix=@runtime+@grouped tail_bytes=9999
+source: bytes=51468 prefix=@runtime+@grouped tail_bytes=9999
 kernel void ptir_m3s_b4fadd8446eb58dd_r30(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -2234,7 +2234,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r30(
 function_name: ptir_m3s_b4fadd8446eb58dd_r31
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50580 prefix=@runtime+@grouped tail_bytes=9999
+source: bytes=51468 prefix=@runtime+@grouped tail_bytes=9999
 kernel void ptir_m3s_b4fadd8446eb58dd_r31(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -2355,7 +2355,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r31(
 function_name: ptir_m3s_b4fadd8446eb58dd_r35
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=50594 prefix=@runtime+@grouped tail_bytes=10013
+source: bytes=51482 prefix=@runtime+@grouped tail_bytes=10013
 kernel void ptir_m3s_b4fadd8446eb58dd_r35(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -2476,7 +2476,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r35(
 function_name: ptir_m3s_b4fadd8446eb58dd_r43
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50580 prefix=@runtime+@grouped tail_bytes=9999
+source: bytes=51468 prefix=@runtime+@grouped tail_bytes=9999
 kernel void ptir_m3s_b4fadd8446eb58dd_r43(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -2597,7 +2597,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r43(
 function_name: ptir_m3s_b4fadd8446eb58dd_r48
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=50710 prefix=@runtime+@grouped tail_bytes=10129
+source: bytes=51598 prefix=@runtime+@grouped tail_bytes=10129
 kernel void ptir_m3s_b4fadd8446eb58dd_r48(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -2721,7 +2721,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r48(
 function_name: ptir_m3s_b4fadd8446eb58dd_r75
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=50580 prefix=@runtime+@grouped tail_bytes=9999
+source: bytes=51468 prefix=@runtime+@grouped tail_bytes=9999
 kernel void ptir_m3s_b4fadd8446eb58dd_r75(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -2842,7 +2842,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r75(
 function_name: ptir_m3s_b4fadd8446eb58dd_r76
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=50565 prefix=@runtime+@grouped tail_bytes=9984
+source: bytes=51453 prefix=@runtime+@grouped tail_bytes=9984
 kernel void ptir_m3s_b4fadd8446eb58dd_r76(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -2963,7 +2963,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r76(
 function_name: ptir_m3_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=54922 prefix=@runtime+@grouped tail_bytes=14341
+source: bytes=55810 prefix=@runtime+@grouped tail_bytes=14341
 kernel void ptir_m3_b4fadd8446eb58dd_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3137,7 +3137,7 @@ kernel void ptir_m3_b4fadd8446eb58dd_r0(
 function_name: ptir_m3_b4fadd8446eb58dd_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=50578 prefix=@runtime+@grouped tail_bytes=9997
+source: bytes=51466 prefix=@runtime+@grouped tail_bytes=9997
 kernel void ptir_m3_b4fadd8446eb58dd_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3258,7 +3258,7 @@ kernel void ptir_m3_b4fadd8446eb58dd_r1(
 function_name: ptir_m3_b4fadd8446eb58dd_r2
 region: library=0 library_op=0 schedule=1 nodes=67 inputs=2 outputs=0 sinks=15
 ok: true
-source: bytes=70923 prefix=@runtime+@grouped tail_bytes=30342
+source: bytes=71811 prefix=@runtime+@grouped tail_bytes=30342
 kernel void ptir_m3_b4fadd8446eb58dd_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3610,7 +3610,7 @@ kernel void ptir_m3_b4fadd8446eb58dd_r2(
 function_name: ptir_m3s_f4e949004f50e90e_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=43830 prefix=@runtime+@grouped tail_bytes=3249
+source: bytes=44718 prefix=@runtime+@grouped tail_bytes=3249
 kernel void ptir_m3s_f4e949004f50e90e_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3661,7 +3661,7 @@ kernel void ptir_m3s_f4e949004f50e90e_r0(
 function_name: ptir_m3s_f4e949004f50e90e_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=43828 prefix=@runtime+@grouped tail_bytes=3247
+source: bytes=44716 prefix=@runtime+@grouped tail_bytes=3247
 kernel void ptir_m3s_f4e949004f50e90e_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3712,7 +3712,7 @@ kernel void ptir_m3s_f4e949004f50e90e_r1(
 function_name: ptir_m3s_f4e949004f50e90e_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=43853 prefix=@runtime+@grouped tail_bytes=3272
+source: bytes=44741 prefix=@runtime+@grouped tail_bytes=3272
 kernel void ptir_m3s_f4e949004f50e90e_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3763,7 +3763,7 @@ kernel void ptir_m3s_f4e949004f50e90e_r2(
 function_name: ptir_m3s_f4e949004f50e90e_r3
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=43985 prefix=@runtime+@grouped tail_bytes=3404
+source: bytes=44873 prefix=@runtime+@grouped tail_bytes=3404
 kernel void ptir_m3s_f4e949004f50e90e_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3817,7 +3817,7 @@ kernel void ptir_m3s_f4e949004f50e90e_r3(
 function_name: ptir_m3_f4e949004f50e90e_r0
 region: library=0 library_op=0 schedule=1 nodes=5 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=45264 prefix=@runtime+@grouped tail_bytes=4683
+source: bytes=46152 prefix=@runtime+@grouped tail_bytes=4683
 kernel void ptir_m3_f4e949004f50e90e_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3886,7 +3886,7 @@ kernel void ptir_m3_f4e949004f50e90e_r0(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45684 prefix=@runtime+@grouped tail_bytes=5103
+source: bytes=46572 prefix=@runtime+@grouped tail_bytes=5103
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3964,7 +3964,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r0(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44780 prefix=@runtime+@grouped tail_bytes=4199
+source: bytes=45668 prefix=@runtime+@grouped tail_bytes=4199
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4025,7 +4025,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r1(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r3
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44780 prefix=@runtime+@grouped tail_bytes=4199
+source: bytes=45668 prefix=@runtime+@grouped tail_bytes=4199
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4086,7 +4086,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r3(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44803 prefix=@runtime+@grouped tail_bytes=4222
+source: bytes=45691 prefix=@runtime+@grouped tail_bytes=4222
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4147,7 +4147,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r4(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44778 prefix=@runtime+@grouped tail_bytes=4197
+source: bytes=45666 prefix=@runtime+@grouped tail_bytes=4197
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4208,7 +4208,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r5(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=44816 prefix=@runtime+@grouped tail_bytes=4235
+source: bytes=45704 prefix=@runtime+@grouped tail_bytes=4235
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r6(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4269,7 +4269,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r6(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44790 prefix=@runtime+@grouped tail_bytes=4209
+source: bytes=45678 prefix=@runtime+@grouped tail_bytes=4209
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r7(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4330,7 +4330,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r7(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r8
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=44935 prefix=@runtime+@grouped tail_bytes=4354
+source: bytes=45823 prefix=@runtime+@grouped tail_bytes=4354
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r8(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4394,7 +4394,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r8(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44805 prefix=@runtime+@grouped tail_bytes=4224
+source: bytes=45693 prefix=@runtime+@grouped tail_bytes=4224
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r10(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4455,7 +4455,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r10(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r11
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44792 prefix=@runtime+@grouped tail_bytes=4211
+source: bytes=45680 prefix=@runtime+@grouped tail_bytes=4211
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r11(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4516,7 +4516,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r11(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44807 prefix=@runtime+@grouped tail_bytes=4226
+source: bytes=45695 prefix=@runtime+@grouped tail_bytes=4226
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r12(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4577,7 +4577,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r12(
 function_name: ptir_m3_4f4b856e5ef3e8b4_r0
 region: library=0 library_op=0 schedule=1 nodes=15 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=50011 prefix=@runtime+@grouped tail_bytes=9430
+source: bytes=50899 prefix=@runtime+@grouped tail_bytes=9430
 kernel void ptir_m3_4f4b856e5ef3e8b4_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4703,7 +4703,7 @@ kernel void ptir_m3_4f4b856e5ef3e8b4_r0(
 function_name: ptir_m3s_d01f407b22863878_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44259 prefix=@runtime+@grouped tail_bytes=3678
+source: bytes=45147 prefix=@runtime+@grouped tail_bytes=3678
 kernel void ptir_m3s_d01f407b22863878_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4766,7 +4766,7 @@ kernel void ptir_m3s_d01f407b22863878_r0(
 function_name: ptir_m3s_d01f407b22863878_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=43510 prefix=@runtime+@grouped tail_bytes=2929
+source: bytes=44398 prefix=@runtime+@grouped tail_bytes=2929
 kernel void ptir_m3s_d01f407b22863878_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4815,7 +4815,7 @@ kernel void ptir_m3s_d01f407b22863878_r1(
 function_name: ptir_m3_d01f407b22863878_r0
 region: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=44689 prefix=@runtime+@grouped tail_bytes=4108
+source: bytes=45577 prefix=@runtime+@grouped tail_bytes=4108
 kernel void ptir_m3_d01f407b22863878_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4884,7 +4884,7 @@ kernel void ptir_m3_d01f407b22863878_r0(
 function_name: ptir_m3s_f2566cc0c1e0529a_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44734 prefix=@runtime+@grouped tail_bytes=4153
+source: bytes=45622 prefix=@runtime+@grouped tail_bytes=4153
 kernel void ptir_m3s_f2566cc0c1e0529a_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4952,7 +4952,7 @@ kernel void ptir_m3s_f2566cc0c1e0529a_r0(
 function_name: ptir_m3s_f2566cc0c1e0529a_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43840 prefix=@runtime+@grouped tail_bytes=3259
+source: bytes=44728 prefix=@runtime+@grouped tail_bytes=3259
 kernel void ptir_m3s_f2566cc0c1e0529a_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5003,7 +5003,7 @@ kernel void ptir_m3s_f2566cc0c1e0529a_r1(
 function_name: ptir_m3s_f2566cc0c1e0529a_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43840 prefix=@runtime+@grouped tail_bytes=3259
+source: bytes=44728 prefix=@runtime+@grouped tail_bytes=3259
 kernel void ptir_m3s_f2566cc0c1e0529a_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5054,7 +5054,7 @@ kernel void ptir_m3s_f2566cc0c1e0529a_r2(
 function_name: ptir_m3s_f2566cc0c1e0529a_r4
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=43985 prefix=@runtime+@grouped tail_bytes=3404
+source: bytes=44873 prefix=@runtime+@grouped tail_bytes=3404
 kernel void ptir_m3s_f2566cc0c1e0529a_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5108,7 +5108,7 @@ kernel void ptir_m3s_f2566cc0c1e0529a_r4(
 function_name: ptir_m3_f2566cc0c1e0529a_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=47042 prefix=@runtime+@grouped tail_bytes=6461
+source: bytes=47930 prefix=@runtime+@grouped tail_bytes=6461
 kernel void ptir_m3_f2566cc0c1e0529a_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5207,272 +5207,11 @@ kernel void ptir_m3_f2566cc0c1e0529a_r0(
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 }
 === end
-=== lora_prologue#0 singleton#0
-function_name: ptir_m3s_26849b68dee54237_r0
-region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
-ok: true
-source: bytes=43830 prefix=@runtime+@grouped tail_bytes=3249
-kernel void ptir_m3s_26849b68dee54237_r0(
-    const device uchar* lane_bytes [[buffer(0)]],
-    const device M1ValueDesc* all_descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
-    const device M3GroupLayout* layout [[buffer(5)]],
-    const device uint* channel_bindings [[buffer(6)]],
-    device uchar* pending_flags [[buffer(7)]],
-    const device uint* lane_indices [[buffer(8)]],
-    const device M3RowMeta* all_row_meta [[buffer(9)]],
-    const device uint* row_indices [[buffer(10)]],
-    uint dispatch_lane [[threadgroup_position_in_grid]],
-    uint m3_tid [[thread_position_in_threadgroup]],
-    uint m3_threads [[threads_per_threadgroup]]) {
-  threadgroup M1ArgmaxCandidate m3_tgbuf[512];
-  if (dispatch_lane >= layout->lane_count) return;
-  const uint lane_index = lane_indices[dispatch_lane];
-  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
-  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
-  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
-  const M3LaneRecord lane = lanes[lane_index];
-  const M3RowMeta row_meta = all_row_meta[lane_index];
-  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
-  if (status->state != 1) return;
-  if (m3_threads > 512u) { if (m3_tid == 0) m1_fault(status, 0xB3u); return; }
-  const device M1ValueDesc* descriptors = all_descriptors + dispatch_lane * layout->value_count;
-  const device M1OpParams* lane_params = params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;
-  device uchar* temporary = scratch + layout->temporary_offset;
-  const device bfloat* logits = reinterpret_cast<const device bfloat*>(lane.logits_base);
-  const uint dense_0 = channel_bindings[dispatch_lane * layout->reserved0 + 0];
-  const M3LaneChannelSlot channel_0 = slots[lane.channel_slot_offset + dense_0];
-  const uint pending_index_0 = lane.channel_slot_offset + dense_0;
-  const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
-  device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  const uint dense_1 = channel_bindings[dispatch_lane * layout->reserved0 + 1];
-  const M3LaneChannelSlot channel_1 = slots[lane.channel_slot_offset + dense_1];
-  const uint pending_index_1 = lane.channel_slot_offset + dense_1;
-  const device uchar* current_1 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_1] != 0 ? channel_1.pending_cell : channel_1.committed_cell);
-  device uchar* pending_1 = reinterpret_cast<device uchar*>(channel_1.pending_cell);
-  ptir_m1_execute_mt(145u, status, descriptors, lane_params + 0, current_0, scratch, scratch, scratch + offsets[0], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-}
-=== end
-=== lora_prologue#0 singleton#2
-function_name: ptir_m3s_26849b68dee54237_r2
-region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
-ok: true
-source: bytes=43828 prefix=@runtime+@grouped tail_bytes=3247
-kernel void ptir_m3s_26849b68dee54237_r2(
-    const device uchar* lane_bytes [[buffer(0)]],
-    const device M1ValueDesc* all_descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
-    const device M3GroupLayout* layout [[buffer(5)]],
-    const device uint* channel_bindings [[buffer(6)]],
-    device uchar* pending_flags [[buffer(7)]],
-    const device uint* lane_indices [[buffer(8)]],
-    const device M3RowMeta* all_row_meta [[buffer(9)]],
-    const device uint* row_indices [[buffer(10)]],
-    uint dispatch_lane [[threadgroup_position_in_grid]],
-    uint m3_tid [[thread_position_in_threadgroup]],
-    uint m3_threads [[threads_per_threadgroup]]) {
-  threadgroup M1ArgmaxCandidate m3_tgbuf[512];
-  if (dispatch_lane >= layout->lane_count) return;
-  const uint lane_index = lane_indices[dispatch_lane];
-  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
-  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
-  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
-  const M3LaneRecord lane = lanes[lane_index];
-  const M3RowMeta row_meta = all_row_meta[lane_index];
-  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
-  if (status->state != 1) return;
-  if (m3_threads > 512u) { if (m3_tid == 0) m1_fault(status, 0xB3u); return; }
-  const device M1ValueDesc* descriptors = all_descriptors + dispatch_lane * layout->value_count;
-  const device M1OpParams* lane_params = params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;
-  device uchar* temporary = scratch + layout->temporary_offset;
-  const device bfloat* logits = reinterpret_cast<const device bfloat*>(lane.logits_base);
-  const uint dense_0 = channel_bindings[dispatch_lane * layout->reserved0 + 0];
-  const M3LaneChannelSlot channel_0 = slots[lane.channel_slot_offset + dense_0];
-  const uint pending_index_0 = lane.channel_slot_offset + dense_0;
-  const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
-  device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  const uint dense_1 = channel_bindings[dispatch_lane * layout->reserved0 + 1];
-  const M3LaneChannelSlot channel_1 = slots[lane.channel_slot_offset + dense_1];
-  const uint pending_index_1 = lane.channel_slot_offset + dense_1;
-  const device uchar* current_1 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_1] != 0 ? channel_1.pending_cell : channel_1.committed_cell);
-  device uchar* pending_1 = reinterpret_cast<device uchar*>(channel_1.pending_cell);
-  ptir_m1_execute_mt(129u, status, descriptors, lane_params + 2, scratch, scratch, scratch, scratch + offsets[2], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-}
-=== end
-=== lora_prologue#0 singleton#3
-function_name: ptir_m3s_26849b68dee54237_r3
-region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
-ok: true
-source: bytes=43854 prefix=@runtime+@grouped tail_bytes=3273
-kernel void ptir_m3s_26849b68dee54237_r3(
-    const device uchar* lane_bytes [[buffer(0)]],
-    const device M1ValueDesc* all_descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
-    const device M3GroupLayout* layout [[buffer(5)]],
-    const device uint* channel_bindings [[buffer(6)]],
-    device uchar* pending_flags [[buffer(7)]],
-    const device uint* lane_indices [[buffer(8)]],
-    const device M3RowMeta* all_row_meta [[buffer(9)]],
-    const device uint* row_indices [[buffer(10)]],
-    uint dispatch_lane [[threadgroup_position_in_grid]],
-    uint m3_tid [[thread_position_in_threadgroup]],
-    uint m3_threads [[threads_per_threadgroup]]) {
-  threadgroup M1ArgmaxCandidate m3_tgbuf[512];
-  if (dispatch_lane >= layout->lane_count) return;
-  const uint lane_index = lane_indices[dispatch_lane];
-  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
-  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
-  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
-  const M3LaneRecord lane = lanes[lane_index];
-  const M3RowMeta row_meta = all_row_meta[lane_index];
-  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
-  if (status->state != 1) return;
-  if (m3_threads > 512u) { if (m3_tid == 0) m1_fault(status, 0xB3u); return; }
-  const device M1ValueDesc* descriptors = all_descriptors + dispatch_lane * layout->value_count;
-  const device M1OpParams* lane_params = params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;
-  device uchar* temporary = scratch + layout->temporary_offset;
-  const device bfloat* logits = reinterpret_cast<const device bfloat*>(lane.logits_base);
-  const uint dense_0 = channel_bindings[dispatch_lane * layout->reserved0 + 0];
-  const M3LaneChannelSlot channel_0 = slots[lane.channel_slot_offset + dense_0];
-  const uint pending_index_0 = lane.channel_slot_offset + dense_0;
-  const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
-  device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  const uint dense_1 = channel_bindings[dispatch_lane * layout->reserved0 + 1];
-  const M3LaneChannelSlot channel_1 = slots[lane.channel_slot_offset + dense_1];
-  const uint pending_index_1 = lane.channel_slot_offset + dense_1;
-  const device uchar* current_1 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_1] != 0 ? channel_1.pending_cell : channel_1.committed_cell);
-  device uchar* pending_1 = reinterpret_cast<device uchar*>(channel_1.pending_cell);
-  ptir_m1_execute_mt(162u, status, descriptors, lane_params + 3, scratch + offsets[0], scratch + offsets[1], scratch + offsets[2], scratch, scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-}
-=== end
-=== lora_prologue#0 fused#0
-function_name: ptir_m3_26849b68dee54237_r0
-region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
-ok: true
-source: bytes=44379 prefix=@runtime+@grouped tail_bytes=3798
-kernel void ptir_m3_26849b68dee54237_r0(
-    const device uchar* lane_bytes [[buffer(0)]],
-    const device M1ValueDesc* all_descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
-    const device M3GroupLayout* layout [[buffer(5)]],
-    const device uint* channel_bindings [[buffer(6)]],
-    device uchar* pending_flags [[buffer(7)]],
-    const device uint* lane_indices [[buffer(8)]],
-    const device M3RowMeta* all_row_meta [[buffer(9)]],
-    const device uint* row_indices [[buffer(10)]],
-    uint dispatch_lane [[threadgroup_position_in_grid]],
-    uint m3_tid [[thread_position_in_threadgroup]],
-    uint m3_threads [[threads_per_threadgroup]]) {
-  threadgroup M1ArgmaxCandidate m3_tgbuf[512];
-  if (dispatch_lane >= layout->lane_count) return;
-  const uint lane_index = lane_indices[dispatch_lane];
-  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
-  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
-  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
-  const M3LaneRecord lane = lanes[lane_index];
-  const M3RowMeta row_meta = all_row_meta[lane_index];
-  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
-  if (status->state != 1) return;
-  if (m3_threads > 512u) { if (m3_tid == 0) m1_fault(status, 0xB3u); return; }
-  const device M1ValueDesc* descriptors = all_descriptors + dispatch_lane * layout->value_count;
-  const device M1OpParams* lane_params = params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;
-  device uchar* temporary = scratch + layout->temporary_offset;
-  const device bfloat* logits = reinterpret_cast<const device bfloat*>(lane.logits_base);
-  const uint dense_0 = channel_bindings[dispatch_lane * layout->reserved0 + 0];
-  const M3LaneChannelSlot channel_0 = slots[lane.channel_slot_offset + dense_0];
-  const uint pending_index_0 = lane.channel_slot_offset + dense_0;
-  const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
-  device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  const uint dense_1 = channel_bindings[dispatch_lane * layout->reserved0 + 1];
-  const M3LaneChannelSlot channel_1 = slots[lane.channel_slot_offset + dense_1];
-  const uint pending_index_1 = lane.channel_slot_offset + dense_1;
-  const device uchar* current_1 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_1] != 0 ? channel_1.pending_cell : channel_1.committed_cell);
-  device uchar* pending_1 = reinterpret_cast<device uchar*>(channel_1.pending_cell);
-  ptir_m1_execute_mt(145u, status, descriptors, lane_params + 0, current_0, scratch, scratch, scratch + offsets[0], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  ptir_m1_execute_mt(145u, status, descriptors, lane_params + 1, current_1, scratch, scratch, scratch + offsets[1], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-  ptir_m1_execute_mt(129u, status, descriptors, lane_params + 2, scratch, scratch, scratch, scratch + offsets[2], scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-}
-=== end
-=== lora_prologue#0 fused#1
-function_name: ptir_m3_26849b68dee54237_r1
-region: library=1 library_op=5 schedule=3 nodes=1 inputs=3 outputs=0 sinks=0
-ok: true
-source: bytes=43853 prefix=@runtime+@grouped tail_bytes=3272
-kernel void ptir_m3_26849b68dee54237_r1(
-    const device uchar* lane_bytes [[buffer(0)]],
-    const device M1ValueDesc* all_descriptors [[buffer(1)]],
-    const device M1OpParams* params [[buffer(2)]],
-    const device uint* offsets [[buffer(3)]],
-    device uchar* all_scratch [[buffer(4)]],
-    const device M3GroupLayout* layout [[buffer(5)]],
-    const device uint* channel_bindings [[buffer(6)]],
-    device uchar* pending_flags [[buffer(7)]],
-    const device uint* lane_indices [[buffer(8)]],
-    const device M3RowMeta* all_row_meta [[buffer(9)]],
-    const device uint* row_indices [[buffer(10)]],
-    uint dispatch_lane [[threadgroup_position_in_grid]],
-    uint m3_tid [[thread_position_in_threadgroup]],
-    uint m3_threads [[threads_per_threadgroup]]) {
-  threadgroup M1ArgmaxCandidate m3_tgbuf[512];
-  if (dispatch_lane >= layout->lane_count) return;
-  const uint lane_index = lane_indices[dispatch_lane];
-  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
-  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
-  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
-  const M3LaneRecord lane = lanes[lane_index];
-  const M3RowMeta row_meta = all_row_meta[lane_index];
-  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
-  if (status->state != 1) return;
-  if (m3_threads > 512u) { if (m3_tid == 0) m1_fault(status, 0xB3u); return; }
-  const device M1ValueDesc* descriptors = all_descriptors + dispatch_lane * layout->value_count;
-  const device M1OpParams* lane_params = params + dispatch_lane * layout->reserved2;
-  device uchar* scratch = all_scratch + dispatch_lane * layout->scratch_stride;
-  device uchar* temporary = scratch + layout->temporary_offset;
-  const device bfloat* logits = reinterpret_cast<const device bfloat*>(lane.logits_base);
-  const uint dense_0 = channel_bindings[dispatch_lane * layout->reserved0 + 0];
-  const M3LaneChannelSlot channel_0 = slots[lane.channel_slot_offset + dense_0];
-  const uint pending_index_0 = lane.channel_slot_offset + dense_0;
-  const device uchar* current_0 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_0] != 0 ? channel_0.pending_cell : channel_0.committed_cell);
-  device uchar* pending_0 = reinterpret_cast<device uchar*>(channel_0.pending_cell);
-  const uint dense_1 = channel_bindings[dispatch_lane * layout->reserved0 + 1];
-  const M3LaneChannelSlot channel_1 = slots[lane.channel_slot_offset + dense_1];
-  const uint pending_index_1 = lane.channel_slot_offset + dense_1;
-  const device uchar* current_1 = reinterpret_cast<const device uchar*>(pending_flags[pending_index_1] != 0 ? channel_1.pending_cell : channel_1.committed_cell);
-  device uchar* pending_1 = reinterpret_cast<device uchar*>(channel_1.pending_cell);
-  ptir_m1_execute_mt(162u, status, descriptors, lane_params + 3, scratch + offsets[0], scratch + offsets[1], scratch + offsets[2], scratch, scratch, temporary, m3_tid, m3_threads, m3_tgbuf);
-  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-  if (status->state != 1) return;
-}
-=== end
 === matrix_mask_apply_packed#0 singleton#0
 function_name: ptir_m3s_6612fe00a51d7edc_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44259 prefix=@runtime+@grouped tail_bytes=3678
+source: bytes=45147 prefix=@runtime+@grouped tail_bytes=3678
 kernel void ptir_m3s_6612fe00a51d7edc_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5535,7 +5274,7 @@ kernel void ptir_m3s_6612fe00a51d7edc_r0(
 function_name: ptir_m3s_6612fe00a51d7edc_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=43353 prefix=@runtime+@grouped tail_bytes=2772
+source: bytes=44241 prefix=@runtime+@grouped tail_bytes=2772
 kernel void ptir_m3s_6612fe00a51d7edc_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5581,7 +5320,7 @@ kernel void ptir_m3s_6612fe00a51d7edc_r1(
 function_name: ptir_m3s_6612fe00a51d7edc_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43365 prefix=@runtime+@grouped tail_bytes=2784
+source: bytes=44253 prefix=@runtime+@grouped tail_bytes=2784
 kernel void ptir_m3s_6612fe00a51d7edc_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5627,7 +5366,7 @@ kernel void ptir_m3s_6612fe00a51d7edc_r2(
 function_name: ptir_m3s_6612fe00a51d7edc_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=43379 prefix=@runtime+@grouped tail_bytes=2798
+source: bytes=44267 prefix=@runtime+@grouped tail_bytes=2798
 kernel void ptir_m3s_6612fe00a51d7edc_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5673,7 +5412,7 @@ kernel void ptir_m3s_6612fe00a51d7edc_r3(
 function_name: ptir_m3s_6612fe00a51d7edc_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43365 prefix=@runtime+@grouped tail_bytes=2784
+source: bytes=44253 prefix=@runtime+@grouped tail_bytes=2784
 kernel void ptir_m3s_6612fe00a51d7edc_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5719,7 +5458,7 @@ kernel void ptir_m3s_6612fe00a51d7edc_r4(
 function_name: ptir_m3s_6612fe00a51d7edc_r5
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=43510 prefix=@runtime+@grouped tail_bytes=2929
+source: bytes=44398 prefix=@runtime+@grouped tail_bytes=2929
 kernel void ptir_m3s_6612fe00a51d7edc_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5768,7 +5507,7 @@ kernel void ptir_m3s_6612fe00a51d7edc_r5(
 function_name: ptir_m3_6612fe00a51d7edc_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=45549 prefix=@runtime+@grouped tail_bytes=4968
+source: bytes=46437 prefix=@runtime+@grouped tail_bytes=4968
 kernel void ptir_m3_6612fe00a51d7edc_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5846,7 +5585,7 @@ kernel void ptir_m3_6612fe00a51d7edc_r0(
 function_name: ptir_m3s_101abcfb79b08b89_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44734 prefix=@runtime+@grouped tail_bytes=4153
+source: bytes=45622 prefix=@runtime+@grouped tail_bytes=4153
 kernel void ptir_m3s_101abcfb79b08b89_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5914,7 +5653,7 @@ kernel void ptir_m3s_101abcfb79b08b89_r0(
 function_name: ptir_m3s_101abcfb79b08b89_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=43830 prefix=@runtime+@grouped tail_bytes=3249
+source: bytes=44718 prefix=@runtime+@grouped tail_bytes=3249
 kernel void ptir_m3s_101abcfb79b08b89_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5965,7 +5704,7 @@ kernel void ptir_m3s_101abcfb79b08b89_r1(
 function_name: ptir_m3s_101abcfb79b08b89_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=43828 prefix=@runtime+@grouped tail_bytes=3247
+source: bytes=44716 prefix=@runtime+@grouped tail_bytes=3247
 kernel void ptir_m3s_101abcfb79b08b89_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6016,7 +5755,7 @@ kernel void ptir_m3s_101abcfb79b08b89_r2(
 function_name: ptir_m3s_101abcfb79b08b89_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=43866 prefix=@runtime+@grouped tail_bytes=3285
+source: bytes=44754 prefix=@runtime+@grouped tail_bytes=3285
 kernel void ptir_m3s_101abcfb79b08b89_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6067,7 +5806,7 @@ kernel void ptir_m3s_101abcfb79b08b89_r3(
 function_name: ptir_m3s_101abcfb79b08b89_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43840 prefix=@runtime+@grouped tail_bytes=3259
+source: bytes=44728 prefix=@runtime+@grouped tail_bytes=3259
 kernel void ptir_m3s_101abcfb79b08b89_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6118,7 +5857,7 @@ kernel void ptir_m3s_101abcfb79b08b89_r4(
 function_name: ptir_m3s_101abcfb79b08b89_r5
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=43985 prefix=@runtime+@grouped tail_bytes=3404
+source: bytes=44873 prefix=@runtime+@grouped tail_bytes=3404
 kernel void ptir_m3s_101abcfb79b08b89_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6172,7 +5911,7 @@ kernel void ptir_m3s_101abcfb79b08b89_r5(
 function_name: ptir_m3_101abcfb79b08b89_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=46312 prefix=@runtime+@grouped tail_bytes=5731
+source: bytes=47200 prefix=@runtime+@grouped tail_bytes=5731
 kernel void ptir_m3_101abcfb79b08b89_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6258,7 +5997,7 @@ kernel void ptir_m3_101abcfb79b08b89_r0(
 function_name: ptir_m3s_963137d4ffed0445_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45684 prefix=@runtime+@grouped tail_bytes=5103
+source: bytes=46572 prefix=@runtime+@grouped tail_bytes=5103
 kernel void ptir_m3s_963137d4ffed0445_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6336,7 +6075,7 @@ kernel void ptir_m3s_963137d4ffed0445_r0(
 function_name: ptir_m3s_963137d4ffed0445_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44780 prefix=@runtime+@grouped tail_bytes=4199
+source: bytes=45668 prefix=@runtime+@grouped tail_bytes=4199
 kernel void ptir_m3s_963137d4ffed0445_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6397,7 +6136,7 @@ kernel void ptir_m3s_963137d4ffed0445_r2(
 function_name: ptir_m3s_963137d4ffed0445_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44778 prefix=@runtime+@grouped tail_bytes=4197
+source: bytes=45666 prefix=@runtime+@grouped tail_bytes=4197
 kernel void ptir_m3s_963137d4ffed0445_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6458,7 +6197,7 @@ kernel void ptir_m3s_963137d4ffed0445_r3(
 function_name: ptir_m3s_963137d4ffed0445_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=44816 prefix=@runtime+@grouped tail_bytes=4235
+source: bytes=45704 prefix=@runtime+@grouped tail_bytes=4235
 kernel void ptir_m3s_963137d4ffed0445_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6519,7 +6258,7 @@ kernel void ptir_m3s_963137d4ffed0445_r4(
 function_name: ptir_m3s_963137d4ffed0445_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44790 prefix=@runtime+@grouped tail_bytes=4209
+source: bytes=45678 prefix=@runtime+@grouped tail_bytes=4209
 kernel void ptir_m3s_963137d4ffed0445_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6580,7 +6319,7 @@ kernel void ptir_m3s_963137d4ffed0445_r5(
 function_name: ptir_m3s_963137d4ffed0445_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44778 prefix=@runtime+@grouped tail_bytes=4197
+source: bytes=45666 prefix=@runtime+@grouped tail_bytes=4197
 kernel void ptir_m3s_963137d4ffed0445_r7(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6641,7 +6380,7 @@ kernel void ptir_m3s_963137d4ffed0445_r7(
 function_name: ptir_m3s_963137d4ffed0445_r8
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44803 prefix=@runtime+@grouped tail_bytes=4222
+source: bytes=45691 prefix=@runtime+@grouped tail_bytes=4222
 kernel void ptir_m3s_963137d4ffed0445_r8(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6702,7 +6441,7 @@ kernel void ptir_m3s_963137d4ffed0445_r8(
 function_name: ptir_m3s_963137d4ffed0445_r9
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44803 prefix=@runtime+@grouped tail_bytes=4222
+source: bytes=45691 prefix=@runtime+@grouped tail_bytes=4222
 kernel void ptir_m3s_963137d4ffed0445_r9(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6763,7 +6502,7 @@ kernel void ptir_m3s_963137d4ffed0445_r9(
 function_name: ptir_m3s_963137d4ffed0445_r13
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44794 prefix=@runtime+@grouped tail_bytes=4213
+source: bytes=45682 prefix=@runtime+@grouped tail_bytes=4213
 kernel void ptir_m3s_963137d4ffed0445_r13(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6824,7 +6563,7 @@ kernel void ptir_m3s_963137d4ffed0445_r13(
 function_name: ptir_m3s_963137d4ffed0445_r14
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44794 prefix=@runtime+@grouped tail_bytes=4213
+source: bytes=45682 prefix=@runtime+@grouped tail_bytes=4213
 kernel void ptir_m3s_963137d4ffed0445_r14(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6885,7 +6624,7 @@ kernel void ptir_m3s_963137d4ffed0445_r14(
 function_name: ptir_m3s_963137d4ffed0445_r15
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44793 prefix=@runtime+@grouped tail_bytes=4212
+source: bytes=45681 prefix=@runtime+@grouped tail_bytes=4212
 kernel void ptir_m3s_963137d4ffed0445_r15(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6946,7 +6685,7 @@ kernel void ptir_m3s_963137d4ffed0445_r15(
 function_name: ptir_m3s_963137d4ffed0445_r16
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44794 prefix=@runtime+@grouped tail_bytes=4213
+source: bytes=45682 prefix=@runtime+@grouped tail_bytes=4213
 kernel void ptir_m3s_963137d4ffed0445_r16(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7007,7 +6746,7 @@ kernel void ptir_m3s_963137d4ffed0445_r16(
 function_name: ptir_m3s_963137d4ffed0445_r18
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44808 prefix=@runtime+@grouped tail_bytes=4227
+source: bytes=45696 prefix=@runtime+@grouped tail_bytes=4227
 kernel void ptir_m3s_963137d4ffed0445_r18(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7068,7 +6807,7 @@ kernel void ptir_m3s_963137d4ffed0445_r18(
 function_name: ptir_m3s_963137d4ffed0445_r21
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=44938 prefix=@runtime+@grouped tail_bytes=4357
+source: bytes=45826 prefix=@runtime+@grouped tail_bytes=4357
 kernel void ptir_m3s_963137d4ffed0445_r21(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7132,7 +6871,7 @@ kernel void ptir_m3s_963137d4ffed0445_r21(
 function_name: ptir_m3_963137d4ffed0445_r0
 region: library=0 library_op=0 schedule=1 nodes=13 inputs=0 outputs=3 sinks=0
 ok: true
-source: bytes=50044 prefix=@runtime+@grouped tail_bytes=9463
+source: bytes=50932 prefix=@runtime+@grouped tail_bytes=9463
 kernel void ptir_m3_963137d4ffed0445_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7263,7 +7002,7 @@ kernel void ptir_m3_963137d4ffed0445_r0(
 function_name: ptir_m3_963137d4ffed0445_r1
 region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44792 prefix=@runtime+@grouped tail_bytes=4211
+source: bytes=45680 prefix=@runtime+@grouped tail_bytes=4211
 kernel void ptir_m3_963137d4ffed0445_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7324,7 +7063,7 @@ kernel void ptir_m3_963137d4ffed0445_r1(
 function_name: ptir_m3_963137d4ffed0445_r2
 region: library=0 library_op=0 schedule=1 nodes=11 inputs=3 outputs=0 sinks=3
 ok: true
-source: bytes=48127 prefix=@runtime+@grouped tail_bytes=7546
+source: bytes=49015 prefix=@runtime+@grouped tail_bytes=7546
 kernel void ptir_m3_963137d4ffed0445_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7424,7 +7163,7 @@ kernel void ptir_m3_963137d4ffed0445_r2(
 function_name: ptir_m3s_82921040f7bc2612_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45209 prefix=@runtime+@grouped tail_bytes=4628
+source: bytes=46097 prefix=@runtime+@grouped tail_bytes=4628
 kernel void ptir_m3s_82921040f7bc2612_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7497,7 +7236,7 @@ kernel void ptir_m3s_82921040f7bc2612_r0(
 function_name: ptir_m3s_82921040f7bc2612_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44305 prefix=@runtime+@grouped tail_bytes=3724
+source: bytes=45193 prefix=@runtime+@grouped tail_bytes=3724
 kernel void ptir_m3s_82921040f7bc2612_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7553,7 +7292,7 @@ kernel void ptir_m3s_82921040f7bc2612_r1(
 function_name: ptir_m3s_82921040f7bc2612_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44305 prefix=@runtime+@grouped tail_bytes=3724
+source: bytes=45193 prefix=@runtime+@grouped tail_bytes=3724
 kernel void ptir_m3s_82921040f7bc2612_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7609,7 +7348,7 @@ kernel void ptir_m3s_82921040f7bc2612_r2(
 function_name: ptir_m3s_82921040f7bc2612_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44315 prefix=@runtime+@grouped tail_bytes=3734
+source: bytes=45203 prefix=@runtime+@grouped tail_bytes=3734
 kernel void ptir_m3s_82921040f7bc2612_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7665,7 +7404,7 @@ kernel void ptir_m3s_82921040f7bc2612_r3(
 function_name: ptir_m3s_82921040f7bc2612_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44315 prefix=@runtime+@grouped tail_bytes=3734
+source: bytes=45203 prefix=@runtime+@grouped tail_bytes=3734
 kernel void ptir_m3s_82921040f7bc2612_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7721,7 +7460,7 @@ kernel void ptir_m3s_82921040f7bc2612_r4(
 function_name: ptir_m3s_82921040f7bc2612_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44328 prefix=@runtime+@grouped tail_bytes=3747
+source: bytes=45216 prefix=@runtime+@grouped tail_bytes=3747
 kernel void ptir_m3s_82921040f7bc2612_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7777,7 +7516,7 @@ kernel void ptir_m3s_82921040f7bc2612_r5(
 function_name: ptir_m3s_82921040f7bc2612_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44314 prefix=@runtime+@grouped tail_bytes=3733
+source: bytes=45202 prefix=@runtime+@grouped tail_bytes=3733
 kernel void ptir_m3s_82921040f7bc2612_r6(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7833,7 +7572,7 @@ kernel void ptir_m3s_82921040f7bc2612_r6(
 function_name: ptir_m3s_82921040f7bc2612_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44315 prefix=@runtime+@grouped tail_bytes=3734
+source: bytes=45203 prefix=@runtime+@grouped tail_bytes=3734
 kernel void ptir_m3s_82921040f7bc2612_r7(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7889,7 +7628,7 @@ kernel void ptir_m3s_82921040f7bc2612_r7(
 function_name: ptir_m3s_82921040f7bc2612_r9
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44328 prefix=@runtime+@grouped tail_bytes=3747
+source: bytes=45216 prefix=@runtime+@grouped tail_bytes=3747
 kernel void ptir_m3s_82921040f7bc2612_r9(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7945,7 +7684,7 @@ kernel void ptir_m3s_82921040f7bc2612_r9(
 function_name: ptir_m3s_82921040f7bc2612_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44331 prefix=@runtime+@grouped tail_bytes=3750
+source: bytes=45219 prefix=@runtime+@grouped tail_bytes=3750
 kernel void ptir_m3s_82921040f7bc2612_r10(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8001,7 +7740,7 @@ kernel void ptir_m3s_82921040f7bc2612_r10(
 function_name: ptir_m3s_82921040f7bc2612_r11
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44306 prefix=@runtime+@grouped tail_bytes=3725
+source: bytes=45194 prefix=@runtime+@grouped tail_bytes=3725
 kernel void ptir_m3s_82921040f7bc2612_r11(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8057,7 +7796,7 @@ kernel void ptir_m3s_82921040f7bc2612_r11(
 function_name: ptir_m3s_82921040f7bc2612_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=44346 prefix=@runtime+@grouped tail_bytes=3765
+source: bytes=45234 prefix=@runtime+@grouped tail_bytes=3765
 kernel void ptir_m3s_82921040f7bc2612_r12(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8113,7 +7852,7 @@ kernel void ptir_m3s_82921040f7bc2612_r12(
 function_name: ptir_m3s_82921040f7bc2612_r13
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44319 prefix=@runtime+@grouped tail_bytes=3738
+source: bytes=45207 prefix=@runtime+@grouped tail_bytes=3738
 kernel void ptir_m3s_82921040f7bc2612_r13(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8169,7 +7908,7 @@ kernel void ptir_m3s_82921040f7bc2612_r13(
 function_name: ptir_m3s_82921040f7bc2612_r14
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44333 prefix=@runtime+@grouped tail_bytes=3752
+source: bytes=45221 prefix=@runtime+@grouped tail_bytes=3752
 kernel void ptir_m3s_82921040f7bc2612_r14(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8225,7 +7964,7 @@ kernel void ptir_m3s_82921040f7bc2612_r14(
 function_name: ptir_m3s_82921040f7bc2612_r15
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44319 prefix=@runtime+@grouped tail_bytes=3738
+source: bytes=45207 prefix=@runtime+@grouped tail_bytes=3738
 kernel void ptir_m3s_82921040f7bc2612_r15(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8281,7 +8020,7 @@ kernel void ptir_m3s_82921040f7bc2612_r15(
 function_name: ptir_m3s_82921040f7bc2612_r16
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=44463 prefix=@runtime+@grouped tail_bytes=3882
+source: bytes=45351 prefix=@runtime+@grouped tail_bytes=3882
 kernel void ptir_m3s_82921040f7bc2612_r16(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8340,7 +8079,7 @@ kernel void ptir_m3s_82921040f7bc2612_r16(
 function_name: ptir_m3_82921040f7bc2612_r0
 region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
 ok: true
-source: bytes=45760 prefix=@runtime+@grouped tail_bytes=5179
+source: bytes=46648 prefix=@runtime+@grouped tail_bytes=5179
 kernel void ptir_m3_82921040f7bc2612_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8419,7 +8158,7 @@ kernel void ptir_m3_82921040f7bc2612_r0(
 function_name: ptir_m3_82921040f7bc2612_r1
 region: library=1 library_op=0 schedule=3 nodes=13 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=47829 prefix=@runtime+@grouped tail_bytes=7248
+source: bytes=48717 prefix=@runtime+@grouped tail_bytes=7248
 kernel void ptir_m3_82921040f7bc2612_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8511,7 +8250,7 @@ kernel void ptir_m3_82921040f7bc2612_r1(
 function_name: ptir_m3_82921040f7bc2612_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=44461 prefix=@runtime+@grouped tail_bytes=3880
+source: bytes=45349 prefix=@runtime+@grouped tail_bytes=3880
 kernel void ptir_m3_82921040f7bc2612_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8576,7 +8315,7 @@ error: Metal binds only the logits buffer for intrinsics; intrinsic id 3 has no 
 function_name: ptir_m3s_14f667a41eb30669_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43366 prefix=@runtime+@grouped tail_bytes=2785
+source: bytes=44254 prefix=@runtime+@grouped tail_bytes=2785
 kernel void ptir_m3s_14f667a41eb30669_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8622,7 +8361,7 @@ kernel void ptir_m3s_14f667a41eb30669_r1(
 function_name: ptir_m3s_14f667a41eb30669_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=43355 prefix=@runtime+@grouped tail_bytes=2774
+source: bytes=44243 prefix=@runtime+@grouped tail_bytes=2774
 kernel void ptir_m3s_14f667a41eb30669_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8668,7 +8407,7 @@ kernel void ptir_m3s_14f667a41eb30669_r2(
 function_name: ptir_m3s_14f667a41eb30669_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43365 prefix=@runtime+@grouped tail_bytes=2784
+source: bytes=44253 prefix=@runtime+@grouped tail_bytes=2784
 kernel void ptir_m3s_14f667a41eb30669_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8714,7 +8453,7 @@ kernel void ptir_m3s_14f667a41eb30669_r3(
 function_name: ptir_m3s_14f667a41eb30669_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=43378 prefix=@runtime+@grouped tail_bytes=2797
+source: bytes=44266 prefix=@runtime+@grouped tail_bytes=2797
 kernel void ptir_m3s_14f667a41eb30669_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8760,7 +8499,7 @@ kernel void ptir_m3s_14f667a41eb30669_r4(
 function_name: ptir_m3s_14f667a41eb30669_r5
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: true
-source: bytes=43353 prefix=@runtime+@grouped tail_bytes=2772
+source: bytes=44241 prefix=@runtime+@grouped tail_bytes=2772
 kernel void ptir_m3s_14f667a41eb30669_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8812,7 +8551,7 @@ error: Metal binds only the logits buffer for intrinsics; intrinsic id 3 has no 
 function_name: ptir_m3_14f667a41eb30669_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43365 prefix=@runtime+@grouped tail_bytes=2784
+source: bytes=44253 prefix=@runtime+@grouped tail_bytes=2784
 kernel void ptir_m3_14f667a41eb30669_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8858,7 +8597,7 @@ kernel void ptir_m3_14f667a41eb30669_r1(
 function_name: ptir_m3_14f667a41eb30669_r2
 region: library=0 library_op=0 schedule=1 nodes=3 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43653 prefix=@runtime+@grouped tail_bytes=3072
+source: bytes=44541 prefix=@runtime+@grouped tail_bytes=3072
 kernel void ptir_m3_14f667a41eb30669_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8907,7 +8646,7 @@ kernel void ptir_m3_14f667a41eb30669_r2(
 function_name: ptir_m3_14f667a41eb30669_r3
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: true
-source: bytes=43352 prefix=@runtime+@grouped tail_bytes=2771
+source: bytes=44240 prefix=@runtime+@grouped tail_bytes=2771
 kernel void ptir_m3_14f667a41eb30669_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8953,7 +8692,7 @@ kernel void ptir_m3_14f667a41eb30669_r3(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46159 prefix=@runtime+@grouped tail_bytes=5578
+source: bytes=47047 prefix=@runtime+@grouped tail_bytes=5578
 kernel void ptir_m3s_dff3bc6795a9dcdf_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9036,7 +8775,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r0(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r1
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45255 prefix=@runtime+@grouped tail_bytes=4674
+source: bytes=46143 prefix=@runtime+@grouped tail_bytes=4674
 kernel void ptir_m3s_dff3bc6795a9dcdf_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9102,7 +8841,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r1(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45265 prefix=@runtime+@grouped tail_bytes=4684
+source: bytes=46153 prefix=@runtime+@grouped tail_bytes=4684
 kernel void ptir_m3s_dff3bc6795a9dcdf_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9168,7 +8907,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r3(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45265 prefix=@runtime+@grouped tail_bytes=4684
+source: bytes=46153 prefix=@runtime+@grouped tail_bytes=4684
 kernel void ptir_m3s_dff3bc6795a9dcdf_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9234,7 +8973,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r4(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=45278 prefix=@runtime+@grouped tail_bytes=4697
+source: bytes=46166 prefix=@runtime+@grouped tail_bytes=4697
 kernel void ptir_m3s_dff3bc6795a9dcdf_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9300,7 +9039,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r5(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45264 prefix=@runtime+@grouped tail_bytes=4683
+source: bytes=46152 prefix=@runtime+@grouped tail_bytes=4683
 kernel void ptir_m3s_dff3bc6795a9dcdf_r6(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9366,7 +9105,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r6(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45265 prefix=@runtime+@grouped tail_bytes=4684
+source: bytes=46153 prefix=@runtime+@grouped tail_bytes=4684
 kernel void ptir_m3s_dff3bc6795a9dcdf_r7(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9432,7 +9171,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r7(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r8
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45264 prefix=@runtime+@grouped tail_bytes=4683
+source: bytes=46152 prefix=@runtime+@grouped tail_bytes=4683
 kernel void ptir_m3s_dff3bc6795a9dcdf_r8(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9498,7 +9237,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r8(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r19
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45256 prefix=@runtime+@grouped tail_bytes=4675
+source: bytes=46144 prefix=@runtime+@grouped tail_bytes=4675
 kernel void ptir_m3s_dff3bc6795a9dcdf_r19(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9564,7 +9303,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r19(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r20
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=45283 prefix=@runtime+@grouped tail_bytes=4702
+source: bytes=46171 prefix=@runtime+@grouped tail_bytes=4702
 kernel void ptir_m3s_dff3bc6795a9dcdf_r20(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9630,7 +9369,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r20(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r23
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=45296 prefix=@runtime+@grouped tail_bytes=4715
+source: bytes=46184 prefix=@runtime+@grouped tail_bytes=4715
 kernel void ptir_m3s_dff3bc6795a9dcdf_r23(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9696,7 +9435,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r23(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r25
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45269 prefix=@runtime+@grouped tail_bytes=4688
+source: bytes=46157 prefix=@runtime+@grouped tail_bytes=4688
 kernel void ptir_m3s_dff3bc6795a9dcdf_r25(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9762,7 +9501,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r25(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r28
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=45283 prefix=@runtime+@grouped tail_bytes=4702
+source: bytes=46171 prefix=@runtime+@grouped tail_bytes=4702
 kernel void ptir_m3s_dff3bc6795a9dcdf_r28(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9828,7 +9567,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r28(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r29
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=45283 prefix=@runtime+@grouped tail_bytes=4702
+source: bytes=46171 prefix=@runtime+@grouped tail_bytes=4702
 kernel void ptir_m3s_dff3bc6795a9dcdf_r29(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9894,7 +9633,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r29(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r31
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=45283 prefix=@runtime+@grouped tail_bytes=4702
+source: bytes=46171 prefix=@runtime+@grouped tail_bytes=4702
 kernel void ptir_m3s_dff3bc6795a9dcdf_r31(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9960,7 +9699,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r31(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r34
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=45413 prefix=@runtime+@grouped tail_bytes=4832
+source: bytes=46301 prefix=@runtime+@grouped tail_bytes=4832
 kernel void ptir_m3s_dff3bc6795a9dcdf_r34(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10029,7 +9768,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r34(
 function_name: ptir_m3_dff3bc6795a9dcdf_r0
 region: library=0 library_op=0 schedule=1 nodes=31 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=54611 prefix=@runtime+@grouped tail_bytes=14030
+source: bytes=55499 prefix=@runtime+@grouped tail_bytes=14030
 kernel void ptir_m3_dff3bc6795a9dcdf_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10199,7 +9938,7 @@ kernel void ptir_m3_dff3bc6795a9dcdf_r0(
 function_name: ptir_m3_dff3bc6795a9dcdf_r1
 region: library=1 library_op=1 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=45281 prefix=@runtime+@grouped tail_bytes=4700
+source: bytes=46169 prefix=@runtime+@grouped tail_bytes=4700
 kernel void ptir_m3_dff3bc6795a9dcdf_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10271,7 +10010,7 @@ error: Metal binds only the logits buffer for intrinsics; intrinsic id 4 has no 
 function_name: ptir_m3s_09a2719886970a85_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45684 prefix=@runtime+@grouped tail_bytes=5103
+source: bytes=46572 prefix=@runtime+@grouped tail_bytes=5103
 kernel void ptir_m3s_09a2719886970a85_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10349,7 +10088,7 @@ kernel void ptir_m3s_09a2719886970a85_r0(
 function_name: ptir_m3s_09a2719886970a85_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44790 prefix=@runtime+@grouped tail_bytes=4209
+source: bytes=45678 prefix=@runtime+@grouped tail_bytes=4209
 kernel void ptir_m3s_09a2719886970a85_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10410,7 +10149,7 @@ kernel void ptir_m3s_09a2719886970a85_r1(
 function_name: ptir_m3s_09a2719886970a85_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44790 prefix=@runtime+@grouped tail_bytes=4209
+source: bytes=45678 prefix=@runtime+@grouped tail_bytes=4209
 kernel void ptir_m3s_09a2719886970a85_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10471,7 +10210,7 @@ kernel void ptir_m3s_09a2719886970a85_r2(
 function_name: ptir_m3s_09a2719886970a85_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44803 prefix=@runtime+@grouped tail_bytes=4222
+source: bytes=45691 prefix=@runtime+@grouped tail_bytes=4222
 kernel void ptir_m3s_09a2719886970a85_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10532,7 +10271,7 @@ kernel void ptir_m3s_09a2719886970a85_r3(
 function_name: ptir_m3s_09a2719886970a85_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44789 prefix=@runtime+@grouped tail_bytes=4208
+source: bytes=45677 prefix=@runtime+@grouped tail_bytes=4208
 kernel void ptir_m3s_09a2719886970a85_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10593,7 +10332,7 @@ kernel void ptir_m3s_09a2719886970a85_r4(
 function_name: ptir_m3s_09a2719886970a85_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=44790 prefix=@runtime+@grouped tail_bytes=4209
+source: bytes=45678 prefix=@runtime+@grouped tail_bytes=4209
 kernel void ptir_m3s_09a2719886970a85_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10654,7 +10393,7 @@ kernel void ptir_m3s_09a2719886970a85_r5(
 function_name: ptir_m3s_09a2719886970a85_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44803 prefix=@runtime+@grouped tail_bytes=4222
+source: bytes=45691 prefix=@runtime+@grouped tail_bytes=4222
 kernel void ptir_m3s_09a2719886970a85_r7(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10715,7 +10454,7 @@ kernel void ptir_m3s_09a2719886970a85_r7(
 function_name: ptir_m3s_09a2719886970a85_r8
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44780 prefix=@runtime+@grouped tail_bytes=4199
+source: bytes=45668 prefix=@runtime+@grouped tail_bytes=4199
 kernel void ptir_m3s_09a2719886970a85_r8(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10776,7 +10515,7 @@ kernel void ptir_m3s_09a2719886970a85_r8(
 function_name: ptir_m3s_09a2719886970a85_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44806 prefix=@runtime+@grouped tail_bytes=4225
+source: bytes=45694 prefix=@runtime+@grouped tail_bytes=4225
 kernel void ptir_m3s_09a2719886970a85_r10(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10837,7 +10576,7 @@ kernel void ptir_m3s_09a2719886970a85_r10(
 function_name: ptir_m3s_09a2719886970a85_r12
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=44938 prefix=@runtime+@grouped tail_bytes=4357
+source: bytes=45826 prefix=@runtime+@grouped tail_bytes=4357
 kernel void ptir_m3s_09a2719886970a85_r12(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10901,7 +10640,7 @@ kernel void ptir_m3s_09a2719886970a85_r12(
 function_name: ptir_m3_09a2719886970a85_r0
 region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=49730 prefix=@runtime+@grouped tail_bytes=9149
+source: bytes=50618 prefix=@runtime+@grouped tail_bytes=9149
 kernel void ptir_m3_09a2719886970a85_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11024,7 +10763,7 @@ kernel void ptir_m3_09a2719886970a85_r0(
 function_name: ptir_m3s_4cf3882bf2fff913_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46159 prefix=@runtime+@grouped tail_bytes=5578
+source: bytes=47047 prefix=@runtime+@grouped tail_bytes=5578
 kernel void ptir_m3s_4cf3882bf2fff913_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11107,7 +10846,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r0(
 function_name: ptir_m3s_4cf3882bf2fff913_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45265 prefix=@runtime+@grouped tail_bytes=4684
+source: bytes=46153 prefix=@runtime+@grouped tail_bytes=4684
 kernel void ptir_m3s_4cf3882bf2fff913_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11173,7 +10912,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r1(
 function_name: ptir_m3s_4cf3882bf2fff913_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45255 prefix=@runtime+@grouped tail_bytes=4674
+source: bytes=46143 prefix=@runtime+@grouped tail_bytes=4674
 kernel void ptir_m3s_4cf3882bf2fff913_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11239,7 +10978,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r2(
 function_name: ptir_m3s_4cf3882bf2fff913_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45266 prefix=@runtime+@grouped tail_bytes=4685
+source: bytes=46154 prefix=@runtime+@grouped tail_bytes=4685
 kernel void ptir_m3s_4cf3882bf2fff913_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11305,7 +11044,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r4(
 function_name: ptir_m3s_4cf3882bf2fff913_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45253 prefix=@runtime+@grouped tail_bytes=4672
+source: bytes=46141 prefix=@runtime+@grouped tail_bytes=4672
 kernel void ptir_m3s_4cf3882bf2fff913_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11371,7 +11110,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r5(
 function_name: ptir_m3s_4cf3882bf2fff913_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=45291 prefix=@runtime+@grouped tail_bytes=4710
+source: bytes=46179 prefix=@runtime+@grouped tail_bytes=4710
 kernel void ptir_m3s_4cf3882bf2fff913_r6(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11437,7 +11176,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r6(
 function_name: ptir_m3s_4cf3882bf2fff913_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=45278 prefix=@runtime+@grouped tail_bytes=4697
+source: bytes=46166 prefix=@runtime+@grouped tail_bytes=4697
 kernel void ptir_m3s_4cf3882bf2fff913_r7(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11503,7 +11242,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r7(
 function_name: ptir_m3s_4cf3882bf2fff913_r8
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=45265 prefix=@runtime+@grouped tail_bytes=4684
+source: bytes=46153 prefix=@runtime+@grouped tail_bytes=4684
 kernel void ptir_m3s_4cf3882bf2fff913_r8(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11569,7 +11308,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r8(
 function_name: ptir_m3s_4cf3882bf2fff913_r9
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45253 prefix=@runtime+@grouped tail_bytes=4672
+source: bytes=46141 prefix=@runtime+@grouped tail_bytes=4672
 kernel void ptir_m3s_4cf3882bf2fff913_r9(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11635,7 +11374,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r9(
 function_name: ptir_m3s_4cf3882bf2fff913_r11
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=45413 prefix=@runtime+@grouped tail_bytes=4832
+source: bytes=46301 prefix=@runtime+@grouped tail_bytes=4832
 kernel void ptir_m3s_4cf3882bf2fff913_r11(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11704,7 +11443,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r11(
 function_name: ptir_m3_4cf3882bf2fff913_r0
 region: library=0 library_op=0 schedule=1 nodes=19 inputs=0 outputs=0 sinks=4
 ok: true
-source: bytes=51620 prefix=@runtime+@grouped tail_bytes=11039
+source: bytes=52508 prefix=@runtime+@grouped tail_bytes=11039
 kernel void ptir_m3_4cf3882bf2fff913_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11850,7 +11589,7 @@ kernel void ptir_m3_4cf3882bf2fff913_r0(
 function_name: ptir_m3s_1752e0dfb0bf5827_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46205 prefix=@runtime+@grouped tail_bytes=5624
+source: bytes=47093 prefix=@runtime+@grouped tail_bytes=5624
 kernel void ptir_m3s_1752e0dfb0bf5827_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11926,7 +11665,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r0(
 function_name: ptir_m3s_1752e0dfb0bf5827_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=46216 prefix=@runtime+@grouped tail_bytes=5635
+source: bytes=47104 prefix=@runtime+@grouped tail_bytes=5635
 kernel void ptir_m3s_1752e0dfb0bf5827_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12002,7 +11741,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r3(
 function_name: ptir_m3s_1752e0dfb0bf5827_r4
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=46360 prefix=@runtime+@grouped tail_bytes=5779
+source: bytes=47248 prefix=@runtime+@grouped tail_bytes=5779
 kernel void ptir_m3s_1752e0dfb0bf5827_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12081,7 +11820,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r4(
 function_name: ptir_m3s_1752e0dfb0bf5827_r5
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=46216 prefix=@runtime+@grouped tail_bytes=5635
+source: bytes=47104 prefix=@runtime+@grouped tail_bytes=5635
 kernel void ptir_m3s_1752e0dfb0bf5827_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12157,7 +11896,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r5(
 function_name: ptir_m3s_1752e0dfb0bf5827_r7
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=46216 prefix=@runtime+@grouped tail_bytes=5635
+source: bytes=47104 prefix=@runtime+@grouped tail_bytes=5635
 kernel void ptir_m3s_1752e0dfb0bf5827_r7(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12233,7 +11972,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r7(
 function_name: ptir_m3s_1752e0dfb0bf5827_r9
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=46215 prefix=@runtime+@grouped tail_bytes=5634
+source: bytes=47103 prefix=@runtime+@grouped tail_bytes=5634
 kernel void ptir_m3s_1752e0dfb0bf5827_r9(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12309,7 +12048,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r9(
 function_name: ptir_m3s_1752e0dfb0bf5827_r10
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46205 prefix=@runtime+@grouped tail_bytes=5624
+source: bytes=47093 prefix=@runtime+@grouped tail_bytes=5624
 kernel void ptir_m3s_1752e0dfb0bf5827_r10(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12385,7 +12124,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r10(
 function_name: ptir_m3s_1752e0dfb0bf5827_r11
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46205 prefix=@runtime+@grouped tail_bytes=5624
+source: bytes=47093 prefix=@runtime+@grouped tail_bytes=5624
 kernel void ptir_m3s_1752e0dfb0bf5827_r11(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12461,7 +12200,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r11(
 function_name: ptir_m3s_1752e0dfb0bf5827_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=46230 prefix=@runtime+@grouped tail_bytes=5649
+source: bytes=47118 prefix=@runtime+@grouped tail_bytes=5649
 kernel void ptir_m3s_1752e0dfb0bf5827_r12(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12537,7 +12276,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r12(
 function_name: ptir_m3s_1752e0dfb0bf5827_r14
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=46232 prefix=@runtime+@grouped tail_bytes=5651
+source: bytes=47120 prefix=@runtime+@grouped tail_bytes=5651
 kernel void ptir_m3s_1752e0dfb0bf5827_r14(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12613,7 +12352,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r14(
 function_name: ptir_m3s_1752e0dfb0bf5827_r15
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=46232 prefix=@runtime+@grouped tail_bytes=5651
+source: bytes=47120 prefix=@runtime+@grouped tail_bytes=5651
 kernel void ptir_m3s_1752e0dfb0bf5827_r15(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12689,7 +12428,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r15(
 function_name: ptir_m3s_1752e0dfb0bf5827_r16
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=46233 prefix=@runtime+@grouped tail_bytes=5652
+source: bytes=47121 prefix=@runtime+@grouped tail_bytes=5652
 kernel void ptir_m3s_1752e0dfb0bf5827_r16(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12765,7 +12504,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r16(
 function_name: ptir_m3s_1752e0dfb0bf5827_r17
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=46232 prefix=@runtime+@grouped tail_bytes=5651
+source: bytes=47120 prefix=@runtime+@grouped tail_bytes=5651
 kernel void ptir_m3s_1752e0dfb0bf5827_r17(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12841,7 +12580,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r17(
 function_name: ptir_m3s_1752e0dfb0bf5827_r24
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=46233 prefix=@runtime+@grouped tail_bytes=5652
+source: bytes=47121 prefix=@runtime+@grouped tail_bytes=5652
 kernel void ptir_m3s_1752e0dfb0bf5827_r24(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12917,7 +12656,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r24(
 function_name: ptir_m3s_1752e0dfb0bf5827_r25
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=46218 prefix=@runtime+@grouped tail_bytes=5637
+source: bytes=47106 prefix=@runtime+@grouped tail_bytes=5637
 kernel void ptir_m3s_1752e0dfb0bf5827_r25(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -12993,7 +12732,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r25(
 function_name: ptir_m3s_1752e0dfb0bf5827_r26
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=46219 prefix=@runtime+@grouped tail_bytes=5638
+source: bytes=47107 prefix=@runtime+@grouped tail_bytes=5638
 kernel void ptir_m3s_1752e0dfb0bf5827_r26(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13069,7 +12808,7 @@ kernel void ptir_m3s_1752e0dfb0bf5827_r26(
 function_name: ptir_m3_1752e0dfb0bf5827_r0
 region: library=0 library_op=0 schedule=1 nodes=29 inputs=0 outputs=0 sinks=4
 ok: true
-source: bytes=54029 prefix=@runtime+@grouped tail_bytes=13448
+source: bytes=54917 prefix=@runtime+@grouped tail_bytes=13448
 kernel void ptir_m3_1752e0dfb0bf5827_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13232,7 +12971,7 @@ kernel void ptir_m3_1752e0dfb0bf5827_r0(
 function_name: ptir_m3s_dc132d209d85d958_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44305 prefix=@runtime+@grouped tail_bytes=3724
+source: bytes=45193 prefix=@runtime+@grouped tail_bytes=3724
 kernel void ptir_m3s_dc132d209d85d958_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13288,7 +13027,7 @@ kernel void ptir_m3s_dc132d209d85d958_r0(
 function_name: ptir_m3s_dc132d209d85d958_r1
 region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=44328 prefix=@runtime+@grouped tail_bytes=3747
+source: bytes=45216 prefix=@runtime+@grouped tail_bytes=3747
 kernel void ptir_m3s_dc132d209d85d958_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13344,7 +13083,7 @@ kernel void ptir_m3s_dc132d209d85d958_r1(
 function_name: ptir_m3s_dc132d209d85d958_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=44460 prefix=@runtime+@grouped tail_bytes=3879
+source: bytes=45348 prefix=@runtime+@grouped tail_bytes=3879
 kernel void ptir_m3s_dc132d209d85d958_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13403,7 +13142,7 @@ kernel void ptir_m3s_dc132d209d85d958_r2(
 function_name: ptir_m3_dc132d209d85d958_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44304 prefix=@runtime+@grouped tail_bytes=3723
+source: bytes=45192 prefix=@runtime+@grouped tail_bytes=3723
 kernel void ptir_m3_dc132d209d85d958_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13459,7 +13198,7 @@ kernel void ptir_m3_dc132d209d85d958_r0(
 function_name: ptir_m3_dc132d209d85d958_r1
 region: library=1 library_op=2 schedule=3 nodes=1 inputs=1 outputs=2 sinks=0
 ok: true
-source: bytes=44327 prefix=@runtime+@grouped tail_bytes=3746
+source: bytes=45215 prefix=@runtime+@grouped tail_bytes=3746
 kernel void ptir_m3_dc132d209d85d958_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13515,7 +13254,7 @@ kernel void ptir_m3_dc132d209d85d958_r1(
 function_name: ptir_m3_dc132d209d85d958_r2
 region: library=0 library_op=0 schedule=0 nodes=2 inputs=2 outputs=0 sinks=2
 ok: true
-source: bytes=44890 prefix=@runtime+@grouped tail_bytes=4309
+source: bytes=45778 prefix=@runtime+@grouped tail_bytes=4309
 kernel void ptir_m3_dc132d209d85d958_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13580,7 +13319,7 @@ kernel void ptir_m3_dc132d209d85d958_r2(
 function_name: ptir_m3s_92d86f95b487e729_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44305 prefix=@runtime+@grouped tail_bytes=3724
+source: bytes=45193 prefix=@runtime+@grouped tail_bytes=3724
 kernel void ptir_m3s_92d86f95b487e729_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13636,7 +13375,7 @@ kernel void ptir_m3s_92d86f95b487e729_r0(
 function_name: ptir_m3s_92d86f95b487e729_r2
 region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44328 prefix=@runtime+@grouped tail_bytes=3747
+source: bytes=45216 prefix=@runtime+@grouped tail_bytes=3747
 kernel void ptir_m3s_92d86f95b487e729_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13692,7 +13431,7 @@ kernel void ptir_m3s_92d86f95b487e729_r2(
 function_name: ptir_m3s_92d86f95b487e729_r3
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=44460 prefix=@runtime+@grouped tail_bytes=3879
+source: bytes=45348 prefix=@runtime+@grouped tail_bytes=3879
 kernel void ptir_m3s_92d86f95b487e729_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13751,7 +13490,7 @@ kernel void ptir_m3s_92d86f95b487e729_r3(
 function_name: ptir_m3_92d86f95b487e729_r0
 region: library=0 library_op=0 schedule=0 nodes=2 inputs=0 outputs=2 sinks=0
 ok: true
-source: bytes=44580 prefix=@runtime+@grouped tail_bytes=3999
+source: bytes=45468 prefix=@runtime+@grouped tail_bytes=3999
 kernel void ptir_m3_92d86f95b487e729_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13810,7 +13549,7 @@ kernel void ptir_m3_92d86f95b487e729_r0(
 function_name: ptir_m3_92d86f95b487e729_r1
 region: library=1 library_op=4 schedule=3 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=44327 prefix=@runtime+@grouped tail_bytes=3746
+source: bytes=45215 prefix=@runtime+@grouped tail_bytes=3746
 kernel void ptir_m3_92d86f95b487e729_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13866,7 +13605,7 @@ kernel void ptir_m3_92d86f95b487e729_r1(
 function_name: ptir_m3_92d86f95b487e729_r2
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=44459 prefix=@runtime+@grouped tail_bytes=3878
+source: bytes=45347 prefix=@runtime+@grouped tail_bytes=3878
 kernel void ptir_m3_92d86f95b487e729_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13925,7 +13664,7 @@ kernel void ptir_m3_92d86f95b487e729_r2(
 function_name: ptir_m3s_9eda8aa42400c4c2_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=44180 prefix=@runtime+@grouped tail_bytes=3599
+source: bytes=45068 prefix=@runtime+@grouped tail_bytes=3599
 kernel void ptir_m3s_9eda8aa42400c4c2_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -13987,7 +13726,7 @@ kernel void ptir_m3s_9eda8aa42400c4c2_r0(
 function_name: ptir_m3s_9eda8aa42400c4c2_r2
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43365 prefix=@runtime+@grouped tail_bytes=2784
+source: bytes=44253 prefix=@runtime+@grouped tail_bytes=2784
 kernel void ptir_m3s_9eda8aa42400c4c2_r2(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14033,7 +13772,7 @@ kernel void ptir_m3s_9eda8aa42400c4c2_r2(
 function_name: ptir_m3s_9eda8aa42400c4c2_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
 ok: true
-source: bytes=43364 prefix=@runtime+@grouped tail_bytes=2783
+source: bytes=44252 prefix=@runtime+@grouped tail_bytes=2783
 kernel void ptir_m3s_9eda8aa42400c4c2_r3(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14079,7 +13818,7 @@ kernel void ptir_m3s_9eda8aa42400c4c2_r3(
 function_name: ptir_m3s_9eda8aa42400c4c2_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 ok: true
-source: bytes=43378 prefix=@runtime+@grouped tail_bytes=2797
+source: bytes=44266 prefix=@runtime+@grouped tail_bytes=2797
 kernel void ptir_m3s_9eda8aa42400c4c2_r4(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14125,7 +13864,7 @@ kernel void ptir_m3s_9eda8aa42400c4c2_r4(
 function_name: ptir_m3s_9eda8aa42400c4c2_r5
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 ok: true
-source: bytes=43510 prefix=@runtime+@grouped tail_bytes=2929
+source: bytes=44398 prefix=@runtime+@grouped tail_bytes=2929
 kernel void ptir_m3s_9eda8aa42400c4c2_r5(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14174,7 +13913,7 @@ kernel void ptir_m3s_9eda8aa42400c4c2_r5(
 function_name: ptir_m3_9eda8aa42400c4c2_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=47552 prefix=@runtime+@grouped tail_bytes=6971
+source: bytes=48440 prefix=@runtime+@grouped tail_bytes=6971
 kernel void ptir_m3_9eda8aa42400c4c2_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14288,7 +14027,7 @@ kernel void ptir_m3_9eda8aa42400c4c2_r0(
 function_name: ptir_m3s_a297c60f7a5de47e_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=43355 prefix=@runtime+@grouped tail_bytes=2774
+source: bytes=44243 prefix=@runtime+@grouped tail_bytes=2774
 kernel void ptir_m3s_a297c60f7a5de47e_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14334,7 +14073,7 @@ kernel void ptir_m3s_a297c60f7a5de47e_r0(
 function_name: ptir_m3s_a297c60f7a5de47e_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: true
-source: bytes=43353 prefix=@runtime+@grouped tail_bytes=2772
+source: bytes=44241 prefix=@runtime+@grouped tail_bytes=2772
 kernel void ptir_m3s_a297c60f7a5de47e_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14380,7 +14119,7 @@ kernel void ptir_m3s_a297c60f7a5de47e_r1(
 function_name: ptir_m3_a297c60f7a5de47e_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=43354 prefix=@runtime+@grouped tail_bytes=2773
+source: bytes=44242 prefix=@runtime+@grouped tail_bytes=2773
 kernel void ptir_m3_a297c60f7a5de47e_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14426,7 +14165,7 @@ kernel void ptir_m3_a297c60f7a5de47e_r0(
 function_name: ptir_m3_a297c60f7a5de47e_r1
 region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
 ok: true
-source: bytes=43352 prefix=@runtime+@grouped tail_bytes=2771
+source: bytes=44240 prefix=@runtime+@grouped tail_bytes=2771
 kernel void ptir_m3_a297c60f7a5de47e_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],

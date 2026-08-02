@@ -213,8 +213,7 @@ fn plan_with_every_instr() -> LoadPlan {
                 fusion: TransformFusion::Fp8ToMxfp4,
                 metadata_source: Some(TensorId(2)),
                 scale_factor_bits: 0.5f32.to_bits(),
-                scale_group: 32,
-                scale_axis: 1,
+                scale_blocks: vec![1, 32],
             },
         },
         StorageInstr::CreateView {
@@ -1045,6 +1044,7 @@ fn a_contract_naming_a_tensor_the_plan_does_not_deliver_is_a_violation() {
             &ModelContract {
                 alignment: 256,
                 tensors: Vec::new(),
+                groups: Vec::new(),
             },
         );
         assert_eq!(status, PieLoaderStatus::ContractViolation);
@@ -1224,6 +1224,7 @@ fn minimal_contract() -> crate::contract::ModelContract {
             Expr::Src("a.weight".to_string()),
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     }
 }
 
@@ -1244,6 +1245,7 @@ fn fused_contract() -> crate::contract::ModelContract {
             vec![4, 4],
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     }
 }
 
@@ -1275,6 +1277,7 @@ fn scaled_contract() -> crate::contract::ModelContract {
                 form: ScaleForm::F32Factors,
             }),
         ],
+        groups: Vec::new(),
     }
 }
 
@@ -1537,6 +1540,11 @@ fn mirror_enum_discriminants_are_pinned() {
     assert_eq!(PieLoaderCheckpointFormat::Safetensors as u32, 0);
     assert_eq!(PieLoaderCheckpointFormat::Gguf as u32, 1);
     assert_eq!(PieLoaderCheckpointFormat::Unknown as u32, 2);
+    assert_eq!(PieLoaderCheckpointFormat::Zt as u32, 3);
+    assert_eq!(PieLoaderCheckpointFormat::Npz as u32, 4);
+    assert_eq!(PieLoaderCheckpointFormat::Pt as u32, 5);
+    assert_eq!(PieLoaderCheckpointFormat::Hdf5 as u32, 6);
+    assert_eq!(PieLoaderCheckpointFormat::Onnx as u32, 7);
 }
 
 /// The operation tag is the first four bytes of `PieLoaderStorageOp`, and this
@@ -1584,8 +1592,7 @@ fn storage_op_tags_are_the_wire_values() {
             transform_scratch_bytes: 0,
             transform_metadata_source: PIE_LOADER_NO_TENSOR,
             transform_scale_factor_bits: 0,
-            transform_scale_group: 0,
-            transform_scale_axis: 0,
+            transform_scale_blocks: PieLoaderI64Slice::default(),
         }),
         2
     );
@@ -1627,6 +1634,55 @@ fn a_gather_carries_its_indices_across_the_ffi() {
             Expr::src("a.weight").gather(0, vec![3, 0, 7, 0]),
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
+    };
+    let owned = crate::testkit::contract_writer::write_contract(&contract);
+    let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
+    assert_eq!(read, contract);
+}
+
+/// A group is the one thing on the contract ABI that is not a flat list: the
+/// C++ side keeps its declarations in storage of its own, and the flattened
+/// form has to say which of the shared tensor entries belong to which group.
+/// Both index nodes ride along, `Select`'s stride in the `start` field, so a
+/// whole-contract equality is the check that pins that encoding down.
+#[test]
+fn a_group_survives_the_contract_ffi() {
+    use crate::contract::{Expr, GroupContract, ModelContract, TensorContract};
+    let contract = ModelContract {
+        alignment: 256,
+        tensors: vec![TensorContract::inferred(
+            "norm",
+            Expr::src("model.norm.weight"),
+            Encoding::Raw(DType::BF16),
+        )],
+        groups: vec![
+            GroupContract {
+                name: "experts".to_string(),
+                arity: 128,
+                tensors: vec![
+                    TensorContract::inferred(
+                        "gate_up",
+                        Expr::select(Expr::src("experts.gate_up_blocks"), 0, 1, 1),
+                        Encoding::Raw(DType::BF16),
+                    ),
+                    TensorContract::inferred(
+                        "down",
+                        Expr::src_indexed("model.layers.0.experts.{}.down.weight"),
+                        Encoding::Raw(DType::BF16),
+                    ),
+                ],
+            },
+            GroupContract {
+                name: "layers".to_string(),
+                arity: 4,
+                tensors: vec![TensorContract::inferred(
+                    "attn",
+                    Expr::src_indexed("model.layers.{}.attn.weight"),
+                    Encoding::Raw(DType::BF16),
+                )],
+            },
+        ],
     };
     let owned = crate::testkit::contract_writer::write_contract(&contract);
     let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
@@ -1653,6 +1709,7 @@ fn a_repack_that_names_no_kernel_is_refused_at_the_boundary() {
             ),
             Encoding::Raw(DType::BF16),
         )],
+        groups: Vec::new(),
     };
     let mut owned = crate::testkit::contract_writer::write_contract(&contract);
     let node = owned.first_repack().expect("the contract has a Repack");

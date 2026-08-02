@@ -10,10 +10,10 @@
 // straight into device memory and skips compile + materialize.
 //
 // This file owns only the *policy*: where the artifact lives (the cache dir +
-// key->path), the durable write (free-space guard + temp file + atomic rename),
-// and the read (mmap the file, restore through the shared staged-H2D engine).
-// The byte format + integrity checksum live in the loader codec
-// (loader/weight_store_codec.hpp); this layer treats them as an opaque stream.
+// key->path) and whether writing one is worth the disk. The file itself --
+// format, placement, digests, the temp-file-and-rename that publishes it -- is
+// the loader codec's (loader/weight_store_codec.hpp), which this layer drives by
+// path and never looks inside.
 //
 // OFF BY DEFAULT — strictly opt-in via PIE_CUDA_WEIGHT_CACHE_DIR. With the env
 // unset/empty the cache never reads or writes (zero disk). Even when enabled,
@@ -27,7 +27,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <string>
 
 #include "model/weight_store.hpp"
@@ -36,10 +35,6 @@
 
 #if __has_include(<cuda_runtime.h>)
 #define PIE_CUDA_WEIGHT_ARTIFACT_CACHE_HAS_CUDA 1
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #else
 #define PIE_CUDA_WEIGHT_ARTIFACT_CACHE_HAS_CUDA 0
 #endif
@@ -92,39 +87,8 @@ inline bool write_weight_artifact_cache(
         }
     }
 
-    const auto final_path = dir / (cache_key + ".weights");
-    const auto tmp_path = dir / (cache_key + ".weights.tmp");
-    {
-        std::ofstream os(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!os) {
-            std::fprintf(stderr,
-                "[pie-driver-cuda] weight cache: cannot open %s for write\n",
-                tmp_path.string().c_str());
-            return false;
-        }
-        if (!weight_codec::serialize_weight_store(store, cache_key, os)) {
-            os.close();
-            std::filesystem::remove(tmp_path, ec);
-            return false;
-        }
-        os.flush();
-        if (!os) {
-            std::fprintf(stderr, "[pie-driver-cuda] weight cache: write error\n");
-            os.close();
-            std::filesystem::remove(tmp_path, ec);
-            return false;
-        }
-    }
-
-    std::filesystem::rename(tmp_path, final_path, ec);
-    if (ec) {
-        std::fprintf(stderr,
-            "[pie-driver-cuda] weight cache: rename failed: %s\n",
-            ec.message().c_str());
-        std::filesystem::remove(tmp_path, ec);
-        return false;
-    }
-    return true;
+    return weight_codec::serialize_weight_store(
+        store, cache_key, dir / (cache_key + ".weights"));
 #endif
 }
 
@@ -148,23 +112,6 @@ inline bool read_weight_artifact_cache(
         return false;
     }
 
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        return false;
-    }
-    struct stat st{};
-    if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
-        ::close(fd);
-        return false;
-    }
-    const std::size_t size = static_cast<std::size_t>(st.st_size);
-    void* map = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (map == MAP_FAILED) {
-        return false;
-    }
-    ::madvise(map, size, MADV_SEQUENTIAL);
-
     const bool verify =
         std::getenv("PIE_CUDA_WEIGHT_CACHE_NO_VERIFY") == nullptr;
     const bool profile = []{
@@ -174,18 +121,11 @@ inline bool read_weight_artifact_cache(
     const auto t0 = std::chrono::steady_clock::now();
 
     // A local lane pool sized like the cold reader path; restore streams the
-    // blobs through it (pinned + pipelined) the same way materialize does.
+    // payloads through it (pinned + pipelined) the same way materialize does.
     PinnedLanePool pool(std::max<std::size_t>(loader_config::reader_lane_count(), 1),
                         loader_config::reader_buf_bytes());
-    bool ok = false;
-    try {
-        ok = weight_codec::restore_weight_store(
-            static_cast<const std::uint8_t*>(map), size, cache_key, verify,
-            builder, pool);
-    } catch (...) {
-        ::munmap(map, size);
-        throw;
-    }
+    const bool ok = weight_codec::restore_weight_store(
+        path, cache_key, verify, builder, pool);
     const auto t1 = std::chrono::steady_clock::now();
 
     if (ok && profile) {
@@ -199,7 +139,6 @@ inline bool read_weight_artifact_cache(
             gib, ms, ms > 0 ? gib / (ms / 1000.0) : 0.0, verify ? "on" : "off");
     }
 
-    ::munmap(map, size);
     return ok;
 #endif
 }

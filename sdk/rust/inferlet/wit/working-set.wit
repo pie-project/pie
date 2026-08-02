@@ -3,6 +3,14 @@ interface working-set {
     use types.{error};
     use pipeline.{pipeline};
 
+    // A working set exposes only what is TRUE OF ITSELF: its extent, its
+    // shape, its lineage. Driver constants that merely happen to be reachable
+    // through it -- KV page size, folded-state byte size, buffered RS page
+    // size -- live on `model` instead. The engine serves exactly one model, so
+    // a per-resource copy could never disagree with the global; it would just
+    // be a second name for one fact, and callers would have to know that the
+    // two agree.
+
     // A contiguous, half-open span [start, start + len) of WorkingSet-relative
     // page indexes. The ONLY references that ever cross this API are these
     // relative indexes — never physical page ids.
@@ -43,9 +51,6 @@ interface working-set {
     // working set ever observes another's mutation.
     resource kv-working-set {
         constructor();
-
-        // Tokens per KV page for this working set's model/driver.
-        page-size: func() -> u32;
 
         // Current logical extent in pages, including reserved space whose
         // pages have not been written yet.
@@ -111,14 +116,8 @@ interface working-set {
     resource rs-working-set {
         constructor();
 
-        // Size in bytes of one folded recurrent-state object for this model.
-        state-size: func() -> u64;
-
         // Current number of buffered page slots.
         buffer-size: func() -> u32;
-
-        // Tokens per buffered RS page for this working set's model/driver.
-        buffer-page-size: func() -> u32;
 
         // Append `n` fresh buffered page slots; returns the contiguous range.
         // Slots are materialized lazily on their first write.
@@ -127,6 +126,29 @@ interface working-set {
         // Remove buffered slots at `indices` and densely compact (call-time
         // interpretation). Invalid or duplicate indices return `error`.
         free-buffer: func(indices: list<u32>) -> result<_, error>;
+
+        // Forget the last `count` buffered tokens: they never happened.
+        //
+        // The twin of `rs-geometry.fold-len` on the other end of the buffer.
+        // A fold moves the folded boundary RIGHT and is irreversible; this
+        // moves the live end LEFT and is free, because the slots it releases
+        // are simply overwritten by the next append.
+        //
+        // Not part of `rs-geometry`, deliberately. `fold-len` is there because
+        // it changes what the DEVICE does -- it is where the recurrent state
+        // snapshot lands. This changes nothing on the device at all; it is a
+        // statement about the working set, which is what a resource method is
+        // for. It is also the token-granular sibling of `free-buffer`: that
+        // one releases CAPACITY, this one releases CONTENT.
+        //
+        // A speculative decoder is why it exists. A verify fire buffers a
+        // whole window and a prefix of it is accepted; without this, the only
+        // way to drop the rejected tail is `free-buffer`, which empties the
+        // buffer wholesale and so forces the accepted prefix to be folded
+        // away first -- in a second fire, since its length is not known until
+        // the verify has run. Discard the tail instead and the NEXT window's
+        // fire folds the previous prefix while writing its own tokens.
+        discard-buffered: func(count: u32) -> result<_, error>;
 
         // Reorder the buffered slots by the full bijection `perm`.
         reorder-buffer: func(perm: list<u32>) -> result<_, error>;
