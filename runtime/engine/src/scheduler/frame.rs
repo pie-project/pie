@@ -139,37 +139,22 @@ const STRICT_WATCHDOG_US: u64 = 1_000_000;
 /// the two is worth 2x on a sixteen-request fleet (206 -> 422 tok/s).
 const GATHER_POLL_US: u64 = 500;
 
-fn gather_poll_us() -> u64 {
-    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *US.get_or_init(|| {
-        std::env::var("PIE_GATHER_POLL_US")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(GATHER_POLL_US)
-    })
-}
-
-/// Grace period before a gather blocked EXCLUSIVELY on empty lanes whose
-/// owners hold an in-flight bind releases them (see the `missing` predicate
-/// in [`FramePolicy::plan_dispatch`]). Only consulted in escape mode 2.
-const REBIND_ESCAPE_US: u64 = 2_000;
-
-/// A/B toggle for the rebind escape (CONTENTION_FOLLOWUP §20.3):
-/// `0` = never escape (pre-fix; deadlocks), `1` = escape unconditionally
-/// (correct, but costs epoch density — measured -16% on a roomy
-/// decode-heavy fleet), `2` = escape only after [`REBIND_ESCAPE_US`] with
-/// nothing executing and every missing lane an empty rebinder. `2` is the
-/// default: it keeps the dense wait-all path for healthy gathers (which
-/// resolve in microseconds) and only releases the deadlock shape itself.
-fn rebind_escape_mode() -> u8 {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        std::env::var("PIE_FRAME_REBIND_ESCAPE")
-            .ok()
-            .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or(2)
-    })
-}
+/// Grace period before a gather escapes a cycle it cannot resolve by
+/// waiting. Two shapes share it because they are the same hazard seen from
+/// two sides — see the rebind escape in [`FramePolicy::plan_dispatch`] and
+/// [`FramePolicy::join_gate_circular`].
+///
+/// Neither escape is guest policy. `park()` and the submit deadline govern a
+/// guest's silence; these govern the ENGINE's own cycle, where a lane's next
+/// fire is ordered behind a bind that completes through the control slot this
+/// boundary is holding (`bind -> dispatch -> seal -> bind`). The deadline
+/// cannot break that tie by construction: a lane with a pending bind is owed
+/// something, so its clock is disarmed and it can never expire. Without the
+/// escape the fleet does not get killed, it wedges.
+///
+/// A healthy gather resolves in microseconds, so the grace period costs
+/// nothing and keeps the dense wait-all path.
+const ESCAPE_GRACE_US: u64 = 2_000;
 
 struct ArrivedFire {
     slot: u32,
@@ -381,7 +366,7 @@ pub(super) struct FramePolicy {
     truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
-    /// Deadline for the escape-mode-2 rebind grace period.
+    /// Deadline for the rebind escape's grace period.
     rebind_escape_deadline: Option<Instant>,
     /// Deadline for the join-gate grace period ([`FramePolicy::join_gate_circular`]).
     join_escape_deadline: Option<Instant>,
@@ -1227,8 +1212,9 @@ impl FramePolicy {
                 return FramePlan::Park;
             }
             // `missing` counts awaited lanes whose next frame is not fully
-            // submitted; `missing_rebind` is the subset that is EMPTY and
-            // whose owner holds an in-flight bind.
+            // submitted; `missing_idle` is the subset that is EMPTY, i.e. not
+            // mid-submission at all. The canonical case is a lane whose owner
+            // holds an in-flight bind.
             //
             // Such a lane is not a member that is about to submit: its next
             // fire is ordered behind the bind, and a bind completes through
@@ -1249,7 +1235,6 @@ impl FramePolicy {
             // Rejoin is implicit — the lane's next accepted fire restores it
             // to the quorum.
             let mut missing = 0usize;
-            let mut missing_rebind = 0usize;
             let mut missing_idle = 0usize;
             // The submit deadline's clock is armed HERE, per lane, because
             // this loop is the exact definition of the interval the guest is
@@ -1299,9 +1284,6 @@ impl FramePolicy {
                 missing += 1;
                 if lane.frames.is_empty() {
                     missing_idle += 1;
-                    if owes && !engine_owes {
-                        missing_rebind += 1;
-                    }
                 }
             }
             if !expired.is_empty() {
@@ -1315,24 +1297,23 @@ impl FramePolicy {
             let joining = if joining && self.join_gate_circular(executing) {
                 // Same grace period as the rebind escape, for the same
                 // reason: a healthy gather resolves in microseconds, so
-                // waiting REBIND_ESCAPE_US before concluding the cycle is
+                // waiting ESCAPE_GRACE_US before concluding the cycle is
                 // real costs nothing and keeps the dense wait-all path.
                 let deadline = *self
                     .join_escape_deadline
-                    .get_or_insert(now + Duration::from_micros(REBIND_ESCAPE_US));
+                    .get_or_insert(now + Duration::from_micros(ESCAPE_GRACE_US));
                 now < deadline
             } else {
                 self.join_escape_deadline = None;
                 joining
             };
-            let mode = rebind_escape_mode();
-            // Mode 2 escapes only from the deadlock shape itself: every missing
-            // lane is EMPTY and nothing is executing, so nothing the engine
-            // controls will ever make one of them submit -- their next fire is
-            // ordered behind a result only this seal can produce, which is the
-            // cycle `seal -> result -> submit -> seal`. An empty rebinder is one
-            // way to land there (its fire is ordered behind a bind that needs
-            // the control slot this boundary holds); a lane simply idle between
+            // Escape only from the deadlock shape itself: every missing lane is
+            // EMPTY and nothing is executing, so nothing the engine controls
+            // will ever make one of them submit -- their next fire is ordered
+            // behind a result only this seal can produce, which is the cycle
+            // `seal -> result -> submit -> seal`. An empty rebinder is one way
+            // to land there (its fire is ordered behind a bind that needs the
+            // control slot this boundary holds); a lane simply idle between
             // frames is another, and it is the shape two concurrent request
             // streams hit as soon as one of them drains its run-ahead window
             // while the other still has work. Escaping cannot reorder anything
@@ -1340,29 +1321,19 @@ impl FramePolicy {
             // period keeps a healthy gather (which resolves in microseconds) on
             // the dense wait-all path.
             let escaping = missing_idle > 0
-                && match mode {
-                    0 => false,
-                    1 => missing_rebind > 0,
-                    _ => {
-                        !joining && !executing && missing == missing_idle && {
-                            let deadline = *self
-                                .rebind_escape_deadline
-                                .get_or_insert(now + Duration::from_micros(REBIND_ESCAPE_US));
-                            now >= deadline
-                        }
-                    }
+                && !joining
+                && !executing
+                && missing == missing_idle
+                && {
+                    let deadline = *self
+                        .rebind_escape_deadline
+                        .get_or_insert(now + Duration::from_micros(ESCAPE_GRACE_US));
+                    now >= deadline
                 };
-            let escaped = if !escaping {
-                0
-            } else if mode == 1 {
-                missing_rebind
-            } else {
-                missing_idle
-            };
-            if !escaping && mode == 2 && (missing != missing_idle || executing || joining) {
+            if !escaping && (missing != missing_idle || executing || joining) {
                 self.rebind_escape_deadline = None;
             }
-            let missing = missing - escaped;
+            let missing = missing - if escaping { missing_idle } else { 0 };
             if joining || missing > 0 {
                 let mut stalled = false;
                 if executing {
@@ -1395,7 +1366,7 @@ impl FramePolicy {
                 let plan = FramePlan::Hold(
                     deadline
                         .saturating_duration_since(now)
-                        .min(Duration::from_micros(gather_poll_us())),
+                        .min(Duration::from_micros(GATHER_POLL_US)),
                 );
                 if stalled && crate::planner::trace_enabled() {
                     println!("[frame-stall] {}", self.debug_summary());
@@ -1504,7 +1475,7 @@ mod tests {
     }
 
     /// The mode-2 rebind escape arms its deadline on the first blocked plan
-    /// and only releases the idle rebinder once [`REBIND_ESCAPE_US`] has
+    /// and only releases the idle rebinder once [`ESCAPE_GRACE_US`] has
     /// passed, which is longer than the gather poll one
     /// [`drive_past_cold_hold`] step advances by.
     fn drive_past_rebind_escape(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
@@ -1513,7 +1484,7 @@ mod tests {
             FramePlan::Hold(_) => plan(
                 policy,
                 queued,
-                now + Duration::from_micros(REBIND_ESCAPE_US + 1),
+                now + Duration::from_micros(ESCAPE_GRACE_US + 1),
             ),
             plan => plan,
         }
@@ -1652,7 +1623,7 @@ mod tests {
             // way there with the GPU idle was the 2x regression that split
             // the two constants apart.
             FramePlan::Hold(hold) => {
-                assert_eq!(hold, Duration::from_micros(gather_poll_us()));
+                assert_eq!(hold, Duration::from_micros(GATHER_POLL_US));
                 assert!(hold < Duration::from_micros(STRICT_WATCHDOG_US));
             }
             plan => panic!("wait-all must hold for the incomplete lane, got {plan:?}"),
@@ -2096,10 +2067,10 @@ mod tests {
         // commits the lane is a full member again and the boundary waits
         // for it exactly as before.
         //
-        // Observed BEFORE the escape grace period. At the default mode 2 an
-        // idle lane is escaped generically once `REBIND_ESCAPE_US` passes
-        // with nothing executing, so driving past the hold would measure
-        // that timer instead of the bind scoping this test is about.
+        // Observed BEFORE the escape grace period. An idle lane is escaped
+        // generically once `ESCAPE_GRACE_US` passes with nothing executing,
+        // so driving past the hold would measure that timer instead of the
+        // bind scoping this test is about.
         policy.on_bind_completed(Some(rebinder));
         policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 14, 1, 1);
         let queued: QueuedFireIds = [14].into_iter().collect();

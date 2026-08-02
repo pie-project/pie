@@ -145,9 +145,11 @@ SCENARIOS: list[Scenario] = [
                           max_counters={"evict_rollbacks": _ROLLBACK_CAP}),
         warmup=1,
     ),
-    # Guards the narrow-epoch side effect of a rejected frame-seal fix: with
-    # the rebind escape applied unconditionally (`PIE_FRAME_REBIND_ESCAPE=1`)
-    # this served 12/128 with 116 starvation kills.
+    # Guards the narrow-epoch side effect of a rejected frame-seal fix: applying
+    # the rebind escape unconditionally (the old `PIE_FRAME_REBIND_ESCAPE=1`
+    # mode, since deleted) served 12/128 here with 116 starvation kills. The
+    # surviving escape waits out `ESCAPE_GRACE_US` and requires that nothing be
+    # executing, which is what keeps this scenario dense.
     #
     # The fleet does NOT fit: the shared prefix is 61 pages, so a 256-page
     # pool funds FOUR processes at a time out of 64. The correct outcome is
