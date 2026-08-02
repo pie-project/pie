@@ -316,6 +316,10 @@ struct Reference {
     /// incomparable, and it is layer 0's tie that matters most -- its
     /// consequences reach the whole rest of the step.
     float step_min_margin = 3.0e38f;
+    /// The most recent layer's router logits, as the reference computed them.
+    /// Compared against the device's to MEASURE how far apart the two routers
+    /// are, instead of assuming a number for it.
+    Vec last_router_logits;
 
     /// Run one token, recording every dispatch's output by DAG position.
     Trace step(const std::vector<Dispatch>& dag, int token, int position) {
@@ -518,6 +522,7 @@ struct Reference {
                     for (int r = 0; r < kk; ++r) {
                         worst_selected = std::min(worst_selected, logits[std::size_t(expert_ids[std::size_t(r)])]);
                     }
+                    last_router_logits = logits;
                     last_margin = worst_selected - best_rejected;
                     step_min_margin = std::min(step_min_margin, last_margin);
                     last_ids = expert_ids;
@@ -722,7 +727,7 @@ void build_model(const LlamaGeometry& g, Model& m) {
 /// makes, and it is checked here per DISPATCH rather than at the logits.
 void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
               const std::string& kernels_dir, float tol, int rows = 1, bool paged = false,
-              int steps = 0) {
+              int steps = 0, int requests = 1) {
     std::printf("\n-- %s --\n", who);
     const int R = rows < 1 ? 1 : rows;
     // `steps` is only meaningful at one row: it makes the sequential path run a
@@ -875,34 +880,59 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     // Fills the paged IO for a fire of `n` rows at positions `p0 .. p0+n-1`,
     // all of one request. The page list is the identity, so the page table is
     // exercised as a real indirection while staying easy to reason about.
-    auto write_paged_io = [&](int p0, int n, const std::vector<int>& toks) {
+    // One row of a fire: which token, at which position OF ITS OWN REQUEST,
+    // owned by which request, written to which physical KV page. Everything the
+    // paged ABI needs per row, and the reason there is one writer rather than
+    // two -- the single-request case is the plan where every row says req 0.
+    struct RowPlan {
+        int token = 0;
+        int pos = 0;
+        int req = 0;
+        int page = 0;
+    };
+
+    auto write_paged_io_rows = [&](const std::vector<RowPlan>& rows,
+                                   const std::vector<std::uint32_t>& page_indices,
+                                   const std::vector<std::uint32_t>& page_indptr,
+                                   const std::vector<std::uint32_t>& qo_indptr) {
         std::vector<std::uint32_t> ids, pos, req, wpage, woff, sample;
-        for (int r = 0; r < n; ++r) {
-            ids.push_back(std::uint32_t(toks[std::size_t(p0 + r)]));
-            pos.push_back(std::uint32_t(p0 + r));
-            req.push_back(0u);
-            wpage.push_back(std::uint32_t((p0 + r) / g.kv_page_size));
-            woff.push_back(std::uint32_t((p0 + r) % g.kv_page_size));
+        int max_pos = 0;
+        for (std::size_t r = 0; r < rows.size(); ++r) {
+            ids.push_back(std::uint32_t(rows[r].token));
+            pos.push_back(std::uint32_t(rows[r].pos));
+            req.push_back(std::uint32_t(rows[r].req));
+            wpage.push_back(std::uint32_t(rows[r].page));
+            woff.push_back(std::uint32_t(rows[r].pos % g.kv_page_size));
             sample.push_back(std::uint32_t(r));
+            max_pos = std::max(max_pos, rows[r].pos);
         }
-        std::vector<std::uint32_t> pages;
-        for (int i = 0; i < g.total_pages; ++i) pages.push_back(std::uint32_t(i));
         write_u32s(b.io[std::size_t(IoSlot::TokenId)], ids);
         write_u32s(b.io[std::size_t(IoSlot::Position)], pos);
         write_u32s(b.io[std::size_t(IoSlot::ReqOfToken)], req);
         write_u32s(b.io[std::size_t(IoSlot::WPage)], wpage);
         write_u32s(b.io[std::size_t(IoSlot::WOff)], woff);
-        write_u32s(b.io[std::size_t(IoSlot::KvPageIndices)], pages);
-        write_u32s(b.io[std::size_t(IoSlot::KvPageIndptr)],
-                   {0u, std::uint32_t(g.total_pages)});
-        write_u32s(b.io[std::size_t(IoSlot::QoIndptr)], {0u, std::uint32_t(n)});
+        write_u32s(b.io[std::size_t(IoSlot::KvPageIndices)], page_indices);
+        write_u32s(b.io[std::size_t(IoSlot::KvPageIndptr)], page_indptr);
+        write_u32s(b.io[std::size_t(IoSlot::QoIndptr)], qo_indptr);
         write_u32s(b.io[std::size_t(IoSlot::SampleRows)], sample);
-        write_u32(b.io[std::size_t(IoSlot::SeqLen)], std::uint32_t(p0 + n));
+        write_u32(b.io[std::size_t(IoSlot::SeqLen)], std::uint32_t(max_pos + 1));
         write_u32s(b.io[std::size_t(IoSlot::AttnMaskStride)], {0u});
         if (b.io[std::size_t(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
-            std::memset(b.io[std::size_t(IoSlot::AttnMaskEnabled)].contents(), 0,
-                        std::size_t(n));
+            std::memset(b.io[std::size_t(IoSlot::AttnMaskEnabled)].contents(), 0, rows.size());
         }
+    };
+
+    // The single-request plan: contiguous positions, the identity page list.
+    auto write_paged_io = [&](int p0, int n, const std::vector<int>& toks) {
+        std::vector<RowPlan> rows;
+        for (int r = 0; r < n; ++r) {
+            rows.push_back(RowPlan{toks[std::size_t(p0 + r)], p0 + r, 0,
+                                   (p0 + r) / g.kv_page_size});
+        }
+        std::vector<std::uint32_t> pages;
+        for (int i = 0; i < g.total_pages; ++i) pages.push_back(std::uint32_t(i));
+        write_paged_io_rows(rows, pages, {0u, std::uint32_t(g.total_pages)},
+                            {0u, std::uint32_t(n)});
     };
 
     // Compares one dispatch's output, at row `row` of a [rows, width] tensor.
@@ -910,10 +940,18 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     // expert-slot axis for the routed values -- a routed value is
     // [rows, k, width] and its M=1 trace is [k, width].
     float worst_pristine = 0.0f;
-    auto compare_all = [&](const Trace& want, int row, int label) {
+    // The four values stacked per expert SLOT. When the router picks the same
+    // experts in a different slot order these hold the same numbers permuted,
+    // which is not a disagreement about anything.
+    const auto is_slot_stacked = [](Kind k) {
+        return k == Kind::ExpertGate || k == Kind::ExpertUp || k == Kind::ExpertSiluMul ||
+               k == Kind::ExpertDown;
+    };
+    auto compare_all = [&](const Trace& want, int row, int label, bool skip_slots = false) {
         for (std::size_t i = 0; i < dag.size(); ++i) {
             const auto it = want.find(int(i));
             if (it == want.end()) continue;
+            if (skip_slots && is_slot_stacked(dag[i].kind)) continue;
             const int v = wrote[i];
             if (v < 0) continue;
             const int c = col.color_of_value[std::size_t(v)];
@@ -963,68 +1001,225 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         }
     };
 
+    // Which rows the router sent somewhere the reference did not, and whether
+    // that difference is decidable. Two expert logits close enough that fp32
+    // and bf16 sort them differently is a property of the weights, not of the
+    // driver, and every dispatch below such a row is computing a different
+    // expert's arithmetic -- so the row is excluded, LOUDLY. A routing
+    // difference at a clear margin is a real fault and is left to fail.
+    //
+    // One copy, used by both the single-request and the two-request arms: the
+    // rule for what counts as a tie must not be able to differ between them.
+    //
+    // The threshold is MEASURED, not chosen. The device's router logits and the
+    // reference's differ by some amount d -- bf16 against fp32, a different
+    // reduction order -- and a gap narrower than that is a gap neither
+    // implementation can be said to have resolved. Writing a constant here
+    // instead would be picking the number that makes today's run pass.
+    auto route_skips = [&](const std::vector<std::vector<int>>& want_ids,
+                           const std::vector<float>& want_margin,
+                           const std::vector<Vec>& want_logits, int n_rows, int& ambiguous,
+                           std::vector<bool>& permuted) {
+        std::vector<bool> skip(std::size_t(n_rows), false);
+        permuted.assign(std::size_t(n_rows), false);
+        ambiguous = 0;
+        if (!g.is_moe() || plan.expert_ids_value < 0) return skip;
+        const auto& ids_slot =
+            b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_ids_value)])];
+        const auto* ids = static_cast<const std::int32_t*>(ids_slot.contents());
+        if (ids == nullptr) return skip;
+        // The device's own router logits, for the last layer -- the same layer
+        // whose selection `ids` holds.
+        int router_disp = -1;
+        for (std::size_t i = 0; i < dag.size(); ++i) {
+            if (dag[i].kind == Kind::Router && wrote[i] >= 0) router_disp = int(i);
+        }
+        for (int r = 0; r < n_rows; ++r) {
+            bool apart = false;
+            for (int e = 0; e < g.experts_per_token; ++e) {
+                if (ids[r * g.experts_per_token + e] !=
+                    want_ids[std::size_t(r)][std::size_t(e)]) {
+                    apart = true;
+                }
+            }
+            if (!apart) continue;
+            // Same experts, different slot order? Then nothing was routed
+            // wrongly: the per-slot tensors are a permutation of each other and
+            // the combine -- which is what the rest of the model reads -- is
+            // unaffected. Only those four values are set aside.
+            std::vector<int> dev_set, ref_set;
+            for (int e = 0; e < g.experts_per_token; ++e) {
+                dev_set.push_back(ids[r * g.experts_per_token + e]);
+                ref_set.push_back(want_ids[std::size_t(r)][std::size_t(e)]);
+            }
+            std::sort(dev_set.begin(), dev_set.end());
+            std::sort(ref_set.begin(), ref_set.end());
+            if (dev_set == ref_set) {
+                permuted[std::size_t(r)] = true;
+                std::printf("    note: row %d selected the same experts in a different slot "
+                            "order; its per-slot tensors are a permutation, the combine is "
+                            "compared as usual\n", r);
+                continue;
+            }
+            // How far apart the two routers actually are on this row.
+            float d = 0.0f;
+            if (router_disp >= 0 && !want_logits[std::size_t(r)].empty()) {
+                const auto& rl = b.pool[std::size_t(
+                    col.color_of_value[std::size_t(wrote[std::size_t(router_disp)])])];
+                const auto* raw = static_cast<const std::uint16_t*>(rl.contents());
+                const std::size_t w = want_logits[std::size_t(r)].size();
+                if (raw != nullptr && (std::size_t(r + 1) * w) * 2 <= rl.size) {
+                    for (std::size_t e = 0; e < w; ++e) {
+                        d = std::max(d, std::fabs(from_bf16(raw[std::size_t(r) * w + e]) -
+                                                  want_logits[std::size_t(r)][e]));
+                    }
+                }
+            }
+            if (std::getenv("PIE_NUM_DEBUG") != nullptr && router_disp >= 0 &&
+                !want_logits[std::size_t(r)].empty()) {
+                const auto& rl = b.pool[std::size_t(
+                    col.color_of_value[std::size_t(wrote[std::size_t(router_disp)])])];
+                const auto* raw = static_cast<const std::uint16_t*>(rl.contents());
+                const std::size_t w = want_logits[std::size_t(r)].size();
+                std::printf("    [dbg] row %d ids dev", r);
+                for (int e = 0; e < g.experts_per_token; ++e) {
+                    std::printf(" %d", ids[r * g.experts_per_token + e]);
+                }
+                std::printf("  ref");
+                for (int e = 0; e < g.experts_per_token; ++e) {
+                    std::printf(" %d", want_ids[std::size_t(r)][std::size_t(e)]);
+                }
+                std::printf("\n    [dbg]   logits dev:");
+                for (std::size_t e = 0; e < w; ++e) {
+                    std::printf(" %.4f", double(from_bf16(raw[std::size_t(r) * w + e])));
+                }
+                std::printf("\n    [dbg]   logits ref:");
+                for (std::size_t e = 0; e < w; ++e) {
+                    std::printf(" %.4f", double(want_logits[std::size_t(r)][e]));
+                }
+                std::printf("\n");
+            }
+            // Two logits within 2d of each other are a coin flip: shifting
+            // either by the error already observed reverses the order.
+            const float kAmbiguous = 2.0f * d;
+            if (want_margin[std::size_t(r)] < kAmbiguous) {
+                skip[std::size_t(r)] = true;
+                ++ambiguous;
+                std::printf("    note: row %d routed differently at a margin of %.4f, inside "
+                            "the routers' own disagreement of %.4f; row excluded\n",
+                            r, double(want_margin[std::size_t(r)]), double(d));
+            } else {
+                std::printf("    row %d routed differently at a margin of %.4f, which the "
+                            "routers' disagreement of %.4f does NOT explain\n",
+                            r, double(want_margin[std::size_t(r)]), double(d));
+            }
+        }
+        return skip;
+    };
+
+    // ── two requests in ONE fire ──
+    //
+    // Everything above this fires a single sequence with an identity page list,
+    // which is the one arrangement where ignoring the page table still gives
+    // the right answer. Two requests is where paging becomes load-bearing: each
+    // owns its own pages, each counts positions from ITS OWN zero, and row r
+    // must attend only its own request's keys.
+    //
+    // The pages are deliberately SWAPPED -- request 0 lives on page 1 and
+    // request 1 on page 0 -- so an implementation that derives a page from the
+    // position, or that reads the page list in order and ignores the per-request
+    // slice of it, computes the other sequence's attention and fails.
+    if (requests == 2) {
+        const int a = R / 2;
+        const int bcount = R - a;
+        if (a < 1 || bcount < 1 || a > g.kv_page_size || bcount > g.kv_page_size) {
+            expect(false, std::string(who) + ": each request fits in one page");
+            return;
+        }
+        std::vector<RefKv> kv_b = ref_kv;  // its own cache, starting empty
+        Reference ref_b{g,       m.embed, m.head,  m.wq,      m.wk,    m.wv,
+                        m.wo,    m.wgate, m.wup,   m.wdown,   m.wrouter, m.n_attn,
+                        m.n_ffn, m.n_q,   m.n_k,   m.n_final, kv_b};
+
+        // Two different token streams, so a row that attends the wrong request
+        // gets visibly wrong numbers rather than coincidentally right ones.
+        std::vector<int> tok_a, tok_b;
+        for (int i = 0; i < a; ++i) tok_a.push_back(tokens[std::size_t(i)]);
+        for (int i = 0; i < bcount; ++i) {
+            tok_b.push_back(tokens[std::size_t((i * 31 + 5) % int(tokens.size()))]);
+        }
+
+        std::vector<Trace> wants;
+        std::vector<std::vector<int>> want_ids;
+        std::vector<float> want_margin;
+        std::vector<Vec> want_logits;
+        const auto take = [&](Reference& rf, int tok, int pos) {
+            rf.step_min_margin = 3.0e38f;
+            wants.push_back(rf.step(dag, tok, pos));
+            want_ids.push_back(rf.last_ids);
+            want_margin.push_back(rf.step_min_margin);
+            want_logits.push_back(rf.last_router_logits);
+        };
+        for (int i = 0; i < a; ++i) take(ref, tok_a[std::size_t(i)], i);
+        for (int i = 0; i < bcount; ++i) take(ref_b, tok_b[std::size_t(i)], i);
+
+        std::vector<RowPlan> rows;
+        for (int i = 0; i < a; ++i) rows.push_back(RowPlan{tok_a[std::size_t(i)], i, 0, 1});
+        for (int i = 0; i < bcount; ++i) {
+            rows.push_back(RowPlan{tok_b[std::size_t(i)], i, 1, 0});
+        }
+        // Request 0's slice of the page list is {1}; request 1's is {0}.
+        write_paged_io_rows(rows, {1u, 0u}, {0u, 1u, 2u},
+                            {0u, std::uint32_t(a), std::uint32_t(R)});
+        ctx.run_step([&](StepEncoder& se) {
+            encode_llama_step(se, dag, g, base, ll, /*ordinal_base=*/0, mbp, R, R);
+        });
+        int ambiguous = 0;
+        std::vector<bool> permuted;
+        const std::vector<bool> skip = route_skips(want_ids, want_margin, want_logits, R, ambiguous, permuted);
+        for (int r = 0; r < R; ++r) {
+            if (!skip[std::size_t(r)]) {
+                compare_all(wants[std::size_t(r)], r, r, permuted[std::size_t(r)]);
+            }
+        }
+        expect(ambiguous * 4 <= R,
+               std::string(who) + ": most rows routed the same way as the reference");
+
+        char msg[256];
+        std::snprintf(msg, sizeof msg,
+                      "%s: %d dispatch outputs match, both requests (worst rel_l2 %.4f)", who,
+                      compared, double(worst));
+        expect(first_bad < 0, msg);
+        if (first_bad >= 0) std::printf("    first divergence: %s\n", first_bad_name.c_str());
+        expect(compared > 0, std::string(who) + ": something was actually compared");
+        return;
+    }
+
     // The batched case: ONE fire over the whole prompt, then every row checked
     // against the decode the reference would have run at that position.
     if (R > 1) {
         std::vector<Trace> wants;
         std::vector<std::vector<int>> want_ids;
         std::vector<float> want_margin;
+        std::vector<Vec> want_logits;
         for (int step = 0; step < R; ++step) {
             ref.step_min_margin = 3.0e38f;
             wants.push_back(ref.step(dag, tokens[std::size_t(step)], step));
             want_ids.push_back(ref.last_ids);
             want_margin.push_back(ref.step_min_margin);
+            want_logits.push_back(ref.last_router_logits);
         }
         write_paged_io(0, R, tokens);
         ctx.run_step([&](StepEncoder& se) {
             encode_llama_step(se, dag, g, base, ll, /*ordinal_base=*/0, mbp, R, R);
         });
-        // A routed model can diverge for a reason that is not a bug in the
-        // batched path: two expert logits close enough that bf16 and fp32 sort
-        // them differently, after which the row runs different experts and
-        // every later dispatch disagrees. That is a property of random weights,
-        // not of the driver, so it is REPORTED rather than silently folded into
-        // the tolerance -- an unexplained routing difference and a real bug
-        // look identical at the residual.
-        // The margin below which the router's own arithmetic cannot decide.
-        // The routed matvec's measured relative error is a few percent, and the
-        // logits here are O(1), so two experts within this are a coin flip that
-        // fp32 and bf16 call differently.
-        const float kAmbiguous = 0.05f;
-        std::vector<bool> skip(std::size_t(R), false);
         int ambiguous = 0;
-        if (g.is_moe() && plan.expert_ids_value >= 0) {
-            const auto& ids_slot =
-                b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_ids_value)])];
-            const auto* ids = static_cast<const std::int32_t*>(ids_slot.contents());
-            for (int r = 0; r < R && ids != nullptr; ++r) {
-                bool apart = false;
-                for (int e = 0; e < g.experts_per_token; ++e) {
-                    if (ids[r * g.experts_per_token + e] !=
-                        want_ids[std::size_t(r)][std::size_t(e)]) {
-                        apart = true;
-                    }
-                }
-                if (!apart) continue;
-                // A routing difference at a CLEAR margin is a real fault and is
-                // left to fail. Only a near-tie is excused, and it is excused
-                // loudly: every dispatch after the router on that row is
-                // computing a different expert's arithmetic and says nothing
-                // about this path.
-                if (want_margin[std::size_t(r)] < kAmbiguous) {
-                    skip[std::size_t(r)] = true;
-                    ++ambiguous;
-                    std::printf("    note: row %d routed differently at a margin of %.4f -- "
-                                "a tie the two precisions break differently; row excluded\n",
-                                r, double(want_margin[std::size_t(r)]));
-                } else {
-                    std::printf("    row %d routed differently at a margin of %.4f, which is "
-                                "NOT a tie\n", r, double(want_margin[std::size_t(r)]));
-                }
-            }
-        }
+        std::vector<bool> permuted;
+        const std::vector<bool> skip = route_skips(want_ids, want_margin, want_logits, R, ambiguous, permuted);
         for (int r = 0; r < R; ++r) {
-            if (!skip[std::size_t(r)]) compare_all(wants[std::size_t(r)], r, r);
+            if (!skip[std::size_t(r)]) {
+                compare_all(wants[std::size_t(r)], r, r, permuted[std::size_t(r)]);
+            }
         }
         expect(ambiguous * 4 <= R, std::string(who) +
                ": most rows routed the same way as the reference");
@@ -1225,6 +1420,24 @@ int main() {
              /*rows=*/16, /*paged=*/true);
     run_case("qwen3-moe (routed, 16 rows: GEMM for the dense projections)", moe, *ctx,
              kernels_dir, 0.12f, /*rows=*/16, /*paged=*/true);
+
+    // The same eight rows as the two-request case below, but as ONE request.
+    // It is what separates "eight rows is wrong" from "two requests is wrong",
+    // and neither answer is guessable from the other.
+    run_case("qwen3-moe (routed, 8 rows, one request)", moe, *ctx, kernels_dir, 0.06f,
+             /*rows=*/8, /*paged=*/true);
+
+    // ── two requests, one fire ──
+    //
+    // The last untested dimension: everything above serves ONE sequence, so
+    // nothing had ever made two of them share a fire while attending different
+    // pages from their own positions.
+    run_case("llama-3 (dense, 2 requests x 4 rows)", base_geometry(), *ctx, kernels_dir, 0.06f,
+             /*rows=*/8, /*paged=*/true, /*steps=*/0, /*requests=*/2);
+    run_case("qwen3-moe (routed, 2 requests x 4 rows)", moe, *ctx, kernels_dir, 0.06f,
+             /*rows=*/8, /*paged=*/true, /*steps=*/0, /*requests=*/2);
+    run_case("llama-3 (dense, 2 requests x 8 rows: the GEMM)", base_geometry(), *ctx,
+             kernels_dir, 0.12f, /*rows=*/16, /*paged=*/true, /*steps=*/0, /*requests=*/2);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
