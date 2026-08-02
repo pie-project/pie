@@ -529,6 +529,13 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> gate_prompt;
     std::vector<int> gate_want;
 
+    // An ablated run's tokens are wrong ON PURPOSE -- that is the whole method
+    // (see `kernel_ablated`) -- so a correctness gate must not be able to stop
+    // it. It must not be able to PASS it either, and it cannot: every gate
+    // still runs and still prints its FAIL, and the run simply continues to
+    // the only line an ablation is read for, which is the wall clock.
+    const bool ablating = std::getenv("PIE_METAL_ABLATE") != nullptr;
+
     // ── does it compute the right thing at all? ──
     //
     // A benchmark that does not check its own output measures how fast the
@@ -865,7 +872,9 @@ int main(int argc, char** argv) {
         // still runs. Without it, stop: the numbers after a wrong answer are
         // the speed of computing the wrong thing.
         const bool dumping = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
-        if (!gate(p, want, "greedy continuation matches the recorded answer") && !dumping) return 1;
+        if (!gate(p, want, "greedy continuation matches the recorded answer") && !dumping &&
+            !ablating)
+            return 1;
 
         // The same check again on a prompt long enough to take the BATCHED
         // mixture. Stated as a precondition rather than assumed: the threshold
@@ -906,7 +915,7 @@ int main(int argc, char** argv) {
             const char* what = shape.n_experts > 0
                                    ? "batched-mixture continuation matches the recorded answer"
                                    : "batched-prefill continuation matches the recorded answer";
-            if (!gate(lp, ref->want_long, what) && !dumping) {
+            if (!gate(lp, ref->want_long, what) && !dumping && !ablating) {
                 return 1;
             }
         }
@@ -1093,7 +1102,7 @@ int main(int argc, char** argv) {
         };
         bool good = pair(long_p, short_p, "long then short");
         good = pair(short_p, long_p, "short then long") && good;
-        if (!good) return 1;
+        if (!good && !ablating) return 1;
     }
 
     // ── warm-up ──
@@ -1309,7 +1318,10 @@ int main(int argc, char** argv) {
                 for (const int v : gate_want) std::printf(" %d", v);
             }
             std::printf("\n");
-            if (!good) return 1;
+            // Same allowance the other gates get: an ablated run's tokens are
+            // wrong on purpose, and this one printing FAIL is the point. It
+            // must not also stop the wall clock the ablation exists to read.
+            if (!good && !ablating) return 1;
         }
 
         std::vector<Seq> fleet(nf);
@@ -1380,8 +1392,14 @@ int main(int argc, char** argv) {
                                     " (the same prompt alone said %d)\n",
                                     step, i, t, first_tok,
                                     r < s.tokens.size() ? int(s.tokens[r]) : -1);
-                        bad = true;
-                        break;
+                        // Under ablation the members are EXPECTED to differ:
+                        // the skipped kind leaves its output buffer holding
+                        // whatever the pool did, which is per-row. Printing is
+                        // still right; stopping is not.
+                        if (!ablating) {
+                            bad = true;
+                            break;
+                        }
                     }
                     if (i > 0 && outs[0].device_contents != nullptr &&
                         outs[std::size_t(i)].device_contents != nullptr &&

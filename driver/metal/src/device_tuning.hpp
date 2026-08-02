@@ -262,6 +262,26 @@ struct DeviceTuning {
     /// that it removes reductions.
     int sdpa_tile_min_rows_per_request = 32;
 
+    /// Whether a tiled prefill attention runs on the simdgroup MATRIX unit
+    /// rather than the scalar path.
+    ///
+    /// M1 Max: on. `sdpa_paged_tiled` computes Q Kᵀ and P V as hand-walked dot
+    /// products -- it was measured at 35.8% of a 2048-token gpt-oss prefill,
+    /// running near 0.5 TFLOP/s while the quantized GEMM one dispatch away
+    /// reaches ~5.6 on the same silicon. The arithmetic is a matmul; issuing it
+    /// as one is what `sdpa_paged_mma.metal` is.
+    ///
+    /// This is a PREFILL switch. The predicate that earns the tiled shape at
+    /// all (`sdpa_should_tile`) is unchanged and still keeps a fleet of decodes
+    /// on the per-row kernel, where staging a tile per request would lose.
+    ///
+    /// It exists as a switch rather than a replacement because the matrix path
+    /// depends on the register layout of `simdgroup_matrix<T,8,8>` -- see the
+    /// header of that file -- and a machine whose layout differs would produce
+    /// wrong numbers rather than slow ones. `PIE_METAL_SDPA_MMA=0` is the way
+    /// back, and the greedy gate in `llama_bench` is what would catch it.
+    bool sdpa_mma = true;
+
     /// Lanes that share one value row of the gated-delta scan.
     ///
     /// The scan is the only strictly sequential kernel in a prefill -- it walks
@@ -341,10 +361,28 @@ struct DeviceTuning {
     /// traffic, and wins 3.6%.
     ///
     /// The win is still small next to the traffic removed: 32 lanes at 4 rows
-    /// reads an eighth of what 16 lanes at 1 row does and is 5% faster. The
-    /// scan is serialized on the token loop, not on bandwidth, and only the
-    /// chunked form of the delta rule -- where a chunk's transition is a
-    /// matmul -- changes that. This is the last of the cheap wins.
+    /// reads an eighth of what 16 lanes at 1 row does and is 5% faster. Two
+    /// more experiments say why, and both failed:
+    ///
+    ///   * Software-pipelining the token loop -- read t+1's q, k, v and gates
+    ///     into a second register set while t computes -- gives 96.7 tok/s at
+    ///     every lane/row pair against 104.5. If the scan were waiting on
+    ///     memory latency, issuing the loads an iteration early is exactly the
+    ///     repair, and it is 8% WORSE. The registers cost more than the
+    ///     latency they hide, which is another way of saying it was hidden.
+    ///   * Staging q and k in threadgroup memory made bandwidth worse, not
+    ///     better (recorded above).
+    ///
+    /// So the scan is not short of bandwidth, not short of reduction rounds,
+    /// and not waiting on load latency. It is short of nothing an
+    /// implementation of THIS recurrence can give it: 128 dependent steps at
+    /// 7% of ALU peak is what a serial scan costs.
+    ///
+    /// Ablating the dispatch entirely -- wrong answers, right wall clock --
+    /// puts the prefill at 118.1 tok/s against 104.5, so the scan is 11.5% of
+    /// the fire and 11.5% is the budget any replacement has to beat. Only the
+    /// chunked form, where a chunk's transition is a matmul and the token loop
+    /// is gone, is a different implementation.
     int gdn_scan_rows = 4;
 
     /// Rows an expert's run must hold before the mixture sorts and batches at
@@ -493,6 +531,9 @@ bool fp16_qmm();
 
 /// The attention's tiled-vs-per-row crossover, in rows per request.
 int sdpa_tile_min_rows_per_request();
+
+/// Whether a tiled prefill attention runs on the simdgroup matrix unit.
+bool sdpa_mma();
 int gdn_scan_lanes();
 int gdn_scan_rows();
 

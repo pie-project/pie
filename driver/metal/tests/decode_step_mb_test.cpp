@@ -278,7 +278,13 @@ int main() {
         // spelled its routed BM as a literal 16 while everything around it
         // spelled it from the constant, and nothing noticed until the constant
         // moved.
-        bool gemm_bm_matches_sort = false;
+        //
+        // A family may run the whole mixture as matvecs -- qwen3.5's decode
+        // does, see `qwen35_routed_decode_batched` -- and then there is no tile
+        // to agree about and nothing here to check. Start true and let a
+        // disagreeing tile falsify it, rather than requiring a tile to exist:
+        // the padding is only wrong when something reads it.
+        bool gemm_bm_matches_sort = true;
         for (const Dispatch& d : moe_dag) {
             if (d.kind != Kernel::LlExpertGate && d.kind != Kernel::LlExpertUp &&
                 d.kind != Kernel::LlExpertDown) {

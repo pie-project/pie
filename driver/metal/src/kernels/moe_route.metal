@@ -379,6 +379,32 @@ constant constexpr uint kMaxExperts = 1024;
 // tails: bf16 has eight mantissa bits, so rounding the logit BEFORE the
 // nonlinearity moves the gate by up to a few parts in a thousand, on a term
 // that is added to every token's residual in every routed layer.
+/// The prefill's shape of the same fused line: rows a uniform `row_pitch`
+/// apart, so the whole prompt runs as one dispatch instead of one per token.
+///
+/// The GATE strides too, and that is the part worth stating. It is ONE number
+/// per row, so reading it at `row` rather than `row * row_pitch` looks right
+/// and gives every token row 0's gate -- a plausible answer and the wrong one.
+/// It strides because `qmv_out_size` answers 1 rather than 0 for
+/// `LlSharedGateProj`, which puts it on the projection arm of the prefill's
+/// row-stride binding: its output is written a full pitch apart like every
+/// other projection's.
+[[kernel]] void shared_expert_combine_strided(
+    const device bfloat* routed [[buffer(0)]],
+    const device bfloat* shared [[buffer(1)]],
+    const device bfloat* gate   [[buffer(2)]],
+    device bfloat* out          [[buffer(3)]],
+    constant uint& width        [[buffer(4)]],
+    const constant int& row_pitch [[buffer(5)]],
+    uint2 gid                   [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  if (c >= width) return;
+  const size_t row = size_t(gid.y) * size_t(row_pitch);
+  const float g = 1.0f / (1.0f + metal::exp(-float(gate[row])));
+  const size_t at = row + size_t(c);
+  out[at] = static_cast<bfloat>(float(routed[at]) + g * float(shared[at]));
+}
+
 [[kernel]] void shared_expert_combine(
     const device bfloat* routed [[buffer(0)]],   // [rows, width]
     const device bfloat* shared [[buffer(1)]],   // [rows, width]

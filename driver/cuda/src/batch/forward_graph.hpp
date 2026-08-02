@@ -41,6 +41,7 @@ bool prefill_graph_enabled();
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -115,20 +116,41 @@ constexpr int forward_graph_request_bucket(int requests,
 // paid for it.
 constexpr int kForwardGraphTokenGrain = 128;
 
-constexpr int forward_graph_token_bucket(int tokens, int max_tokens) noexcept {
+// `PIE_TOKEN_GRAIN` overrides the grain so the padding-vs-reuse trade can be
+// swept rather than argued: a coarser grain means fewer distinct keys (more
+// replay, fewer one-off captures) but more padded rows to compute. The value
+// above was measured on one cell, which §6's "no magic constants" rule makes
+// suspect; this is how it gets re-derived.
+inline int forward_graph_token_grain() {
+    static const int value = [] {
+        const char* const env = std::getenv("PIE_TOKEN_GRAIN");
+        if (env == nullptr || *env == '\0') return kForwardGraphTokenGrain;
+        const int parsed = std::atoi(env);
+        return parsed > 0 ? parsed : kForwardGraphTokenGrain;
+    }();
+    return value;
+}
+
+// Pure form, so the rounding rule stays compile-time checkable below.
+constexpr int forward_graph_token_bucket_at(
+    int tokens, int max_tokens, int grain) noexcept {
     if (tokens <= 0 || max_tokens <= 0 || tokens > max_tokens) return 0;
-    const int bucket =
-        ((tokens + kForwardGraphTokenGrain - 1) / kForwardGraphTokenGrain) *
-        kForwardGraphTokenGrain;
+    if (grain <= 0) return 0;
+    const int bucket = ((tokens + grain - 1) / grain) * grain;
     return bucket <= max_tokens ? bucket : max_tokens;
 }
 
-static_assert(forward_graph_token_bucket(1, 8192) == 128);
-static_assert(forward_graph_token_bucket(128, 8192) == 128);
-static_assert(forward_graph_token_bucket(129, 8192) == 256);
-static_assert(forward_graph_token_bucket(6003, 8192) == 6016);
-static_assert(forward_graph_token_bucket(8100, 8192) == 8192);
-static_assert(forward_graph_token_bucket(9000, 8192) == 0);
+inline int forward_graph_token_bucket(int tokens, int max_tokens) noexcept {
+    return forward_graph_token_bucket_at(
+        tokens, max_tokens, forward_graph_token_grain());
+}
+
+static_assert(forward_graph_token_bucket_at(1, 8192, 128) == 128);
+static_assert(forward_graph_token_bucket_at(128, 8192, 128) == 128);
+static_assert(forward_graph_token_bucket_at(129, 8192, 128) == 256);
+static_assert(forward_graph_token_bucket_at(6003, 8192, 128) == 6016);
+static_assert(forward_graph_token_bucket_at(8100, 8192, 128) == 8192);
+static_assert(forward_graph_token_bucket_at(9000, 8192, 128) == 0);
 
 static_assert(forward_graph_request_bucket(1, 512) == 1);
 static_assert(forward_graph_request_bucket(3, 512) == 4);

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include "decode_step_mb.hpp"
@@ -10,6 +11,7 @@
 #include "decode_dispatch_mb.hpp"
 #include "heap_bind.hpp"
 #include "batch/scratch.hpp"
+#include "batch/decode_timing.hpp"
 
 namespace pie::metal {
 namespace {
@@ -185,7 +187,9 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlExpertSiluMul:
             // The slot axis is gone -- a sorted row IS a slot -- so this is the
             // same elementwise shape over a taller batch.
-            elementwise_mb_dispatch(g.moe_intermediate, moe_sorted_rows(g, n), d.grid, d.tg);
+            elementwise_mb_dispatch(g.moe_intermediate,
+                                    moe_sorted_rows(g, n, qwen35_routed_decode_batched()),
+                                    d.grid, d.tg);
             break;
 
         // ── the mixture ──
@@ -199,10 +203,52 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlExpertUp:
         case Kernel::LlExpertDown: {
             const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
-            const int sorted = moe_sorted_rows(g, n);
-            // Routed, so the routed crossover.
+            // Asked with the SAME answer `bind_token_consts` gives the sort, so
+            // the stack the dispatch walks is the stack the sort built.
+            const int sorted = moe_sorted_rows(g, n, qwen35_routed_decode_batched());
+            // WRONG ANSWERS ON A DECODE FLEET, so this arm is currently shut.
+            //
+            // Qwen3.6-35B-A3B is 256 experts at top-8, so with
+            // `moe_batch_min_per_expert` at 1 the routed GEMM first engages at
+            // exactly 32 lanes -- and there it FAILS the recorded-answer gate:
+            // a 32-wide fleet answers `220 0 0 0 0 0` where mlx-lm says
+            // `220 24 11 220 16 15`, and the fleet's own members disagree
+            // ("member 18 says 20988, member 0 says 0", 6 of 31 members leaving
+            // member 0's arithmetic). Some rows are not written; it is not a
+            // rounding difference.
+            //
+            // Bisected, so the next reader does not repeat it:
+            //   * 30 and 31 lanes PASS, 32 FAILS. That is exactly the width at
+            //     which `n_pairs >= n_experts` first holds (30 -> 240 pairs,
+            //     31 -> 248, 32 -> 256), i.e. the first fire that takes this
+            //     branch rather than the matvec below.
+            //   * `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=2` (which moves the
+            //     crossover to 64 lanes) makes 32 lanes PASS. The crossover is
+            //     the variable; nothing else about the fire changed.
+            //   * NOT the recurrent state: ablating `gdn_core_slotted` and
+            //     `gdn_prep_slotted` leaves the zeros in place.
+            //   * NOT the dense GEMM: `PIE_METAL_QMM_MIN_BATCH=64` does not
+            //     help.
+            //   * NOT scale, and NOT this GEMM in general. Forced on at 8 lanes
+            //     with `MIN_PER=0` it reproduces mlx-lm exactly, and the
+            //     PREFILL runs the same kernel over 8192 pairs at 2048 tokens
+            //     and matches mlx-lm too. What the failing case has that both
+            //     passing ones lack is REQUESTS: a fleet is 32 of them where a
+            //     prefill is one.
+            //
+            // Shutting it costs a mixture's fleet decode the batched form above
+            // 32 lanes and costs nothing below, because below is where the
+            // matvec already ran. That is a throughput loss on one family and
+            // it is the correct trade against a wrong answer -- and this driver
+            // has now twice been talked out of a real bug by a gate, so the
+            // evidence is written down rather than the conclusion.
+            //
+            // The prefill is deliberately unaffected: its routed batching is
+            // `routed_group_shape`, a different call site, and these DAGs are
+            // built at `n_tokens == 1` where the predicate is false anyway.
             if (const int bn = qmm_bn(N, sorted, qmm_min_batch(true, qwen35_fp16_format(g)));
-                bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
+                qwen35_routed_decode_batched() && bn > 0 &&
+                shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
                 d.qmm_bn = bn;
                 d.qmm_bm = shared_kernels::moe_tile_rows(n * g.experts_per_token, g.n_experts);
                 d.qmm_split = 1;
@@ -219,8 +265,16 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LlMoeSort:
             shared_kernels::moe_route_sort_dispatch(g.n_experts, d.grid, d.tg); break;
         case Kernel::LlMoeGather:
-            shared_kernels::moe_route_rows_dispatch(g.hidden, moe_sorted_rows(g, n),
-                                                    d.grid, d.tg); break;
+            // The stack this fills is the one the sort writes, so it has to
+            // ask the same question the sort did. Launched over the padded
+            // count with an unpadded sort behind it, the gather walks rows the
+            // sort never grouped -- which at 512 tokens is 12800 rows of copy
+            // for 4096 of content, and is exactly the cost
+            // `qwen35_routed_decode_batched` was turned off to stop paying.
+            shared_kernels::moe_route_rows_dispatch(
+                g.hidden, moe_sorted_rows(g, n, qwen35_routed_decode_batched()),
+                d.grid, d.tg);
+            break;
         case Kernel::LlMoeCombine:
             shared_kernels::expert_combine_dispatch(g.hidden, d.grid, d.tg, n); break;
         case Kernel::LlSharedCombine:
@@ -270,7 +324,9 @@ bool is_routed_group(Kernel k) {
 /// matmul reads another.
 bool routed_group_shape(const Dispatch& d, const DecodeGeometry& g, int rows,
                         const MultiBatchPsos& mb, Grid& grid, Threadgroup& tg, Pso& pso) {
-    const int sorted = moe_sorted_rows(g, rows);
+    // A PREFILL still batches, and correctly: the same kernel over 8192 pairs
+    // at 2048 tokens reproduces mlx-lm. Only the decode's is shut.
+    const int sorted = moe_sorted_rows(g, rows, /*batched=*/true);
     switch (d.kind) {
         case Kernel::GoRouterTopK:
             shared_kernels::router_topk_dispatch(g.n_experts, grid, tg, rows);
@@ -639,7 +695,8 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::uint8_t>& row_needs_logits,
                             const DecodeGeometry* geometry,
                             int max_rows,
-                            const std::vector<GdnScanSegment>& gdn_scans) {
+                            const std::vector<GdnScanSegment>& gdn_scans,
+                            const MultiBatchPsos* mb_alt_psos) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -681,6 +738,48 @@ void encode_prefill_dags_mb(StepEncoder& se,
     }
     for (size_t i = 0; i < length; ++i) {
         const Dispatch& d0 = dags[0][i];
+        // Priced by ablation rather than by the trace; see `kernel_ablated`.
+        // Skipping the WHOLE kind here -- not one token's copy of it -- is what
+        // makes the wall-clock difference the kind's serial cost.
+        if (kernel_ablated(d0.kind)) continue;
+        // ── the alternate affine format ──
+        //
+        // A checkpoint may spare individual tensors from the model-wide format
+        // -- mlx-lm's predicate names them -- and Qwen3.6-35B-A3B leaves the MoE
+        // router and the shared expert's gate at 8 bits inside a 4-bit build.
+        // The strided arm below has to decline those two, because its pipelines
+        // read 4-bit bytes and running them over 8-bit ones is not a crash, it
+        // is a wrong answer: gemma4's router did exactly that once and produced
+        // logits at cosine 0.10 to mlx-lm's with every tensor feeding them at
+        // 0.9999.
+        //
+        // Declining is not the same as having nothing to run, though, and until
+        // now it was: both kinds fell all the way through to the per-token walk,
+        // so a prefill dispatched them once per row -- forty layers times two
+        // kinds times every token. In a 1024-row fire that was the largest line
+        // in the profile at 30-37% of GPU time, against 1.75% for the real
+        // GEMMs. The wide matvec is the batched shape they were missing: it is
+        // parametric in the row count, guards its last partial group, and reads
+        // each decoded weight chunk once for four token vectors. Asked of the
+        // ALT table, so the bytes and the pipeline agree.
+        if (strided_rows > 0 && geometry != nullptr && mb_alt_psos != nullptr &&
+            qwen35_uses_alt_quant(d0.kind, *geometry) && !d0.fuse_residual &&
+            mb_alt_psos->qmv_wide_strided.valid()) {
+            const int out = qmv_out_size(d0.kind, *geometry);
+            if (out != 0) {
+                constexpr int vecs = 4;
+                constexpr int lanes = 8;
+                se.set_pso(mb_alt_psos->qmv_wide_strided);
+                se.set_argtable(d0.kind, d0.ordinal);
+                se.dispatch(
+                    Grid{32u * std::uint32_t((int(n) + vecs - 1) / vecs),
+                         2u * std::uint32_t(
+                             (out + (64 / lanes) - 1) / (64 / lanes)), 1},
+                    Threadgroup{32, 2, 1});
+                se.barrier();
+                continue;
+            }
+        }
         if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead &&
             d0.kind != Kernel::LmHeadUntied &&
             !qwen35_uses_alt_quant(d0.kind, *geometry)) {
@@ -798,6 +897,37 @@ void encode_prefill_dags_mb(StepEncoder& se,
                 continue;
             }
         }
+        // ── the attention, over the whole prompt at once ──
+        //
+        // Priced by ablation (`PIE_METAL_ABLATE=sdpa_paged`) at 8.2% of a
+        // 128-token Qwen3.6-35B-A3B prefill and 16.5% of a 2048-token one --
+        // and at 2048 it is the WHOLE remaining gap to mlx-lm, whose 847.5
+        // tok/s this fire meets at 840.7 with the attention taken out.
+        //
+        // Two wins, and the second is the larger. One dispatch replaces N, and
+        // the tiled kernel stages a key tile ONCE PER 32 ROWS where the per-row
+        // kernel reads it once per row. `sdpa_should_tile`'s own note is that a
+        // prefill "is all one run and wins outright" -- every row shares a key
+        // span -- which is the opposite of a fleet of decodes, where 32 rows
+        // are 32 runs and tiling loses badly. A prefill is exactly one request,
+        // so this asks the predicate rather than assuming.
+        if (strided_rows > 0 && geometry != nullptr && d0.kind == Kernel::SdpaPaged &&
+            mb_psos.sdpa_paged_tiled_strided.valid() &&
+            sdpa_should_tile(int(n), /*requests=*/1)) {
+            Grid grid;
+            Threadgroup tg;
+            // `geometry->n_q_heads`, not `d0.grid.x`: the per-token dispatch
+            // already folded the 1024-thread threadgroup into x, so grid.x is
+            // `n_q_heads * 1024`. The kernel reads its head count back out of
+            // `threadgroups_per_grid.x`, so handing this the wrong number is a
+            // wrong answer rather than a refusal.
+            sdpa_paged_tiled_dispatch(geometry->n_q_heads, int(n), grid, tg);
+            se.set_pso(mb_psos.sdpa_paged_tiled_strided);
+            se.set_argtable(d0.kind, d0.ordinal);
+            se.dispatch(grid, tg);
+            se.barrier();
+            continue;
+        }
         // Row-independent kernels: the prefill's scratch rows are a uniform pitch
         // apart, so one dispatch over the whole prompt replaces one per token.
         // The row-blocked variants take that pitch explicitly and are otherwise
@@ -845,9 +975,52 @@ void encode_prefill_dags_mb(StepEncoder& se,
                         grid.y = uint32_t(n);
                     }
                     break;
+                // `elementwise_mb_dispatch` folds the row count onto x, so at
+                // the per-token DAG's n==1 the grid is exactly one row wide and
+                // the strided form only has to add the row axis.
+                case Kernel::Residual:
+                case Kernel::LayerOut:
+                    if (d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_psos.residual_add_strided;
+                        grid.y = uint32_t(n);
+                    }
+                    break;
+                // Already (width, 1, 1) from `expert_combine_dispatch`, which
+                // reads its row from gid.y -- so this one was ALREADY row-aware
+                // and only lacked the pitch.
+                case Kernel::LlSharedCombine:
+                    if (d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_psos.shared_expert_combine_strided;
+                        grid.y = uint32_t(n);
+                    }
+                    break;
                 case Kernel::GatedRms:
                     if (d0.grid.z == 1) {
                         strided = mb_psos.gated_rms_strided;
+                        grid.z = uint32_t(n);
+                    }
+                    break;
+                case Kernel::QSplit:
+                    // z was always the token row; the prompt just never went
+                    // there, so a 1024-row prefill deinterleaved one row at a
+                    // time -- 2820 dispatches in the fire this was found in.
+                    if (d0.grid.z == 1) {
+                        strided = mb_pso(d0, base_psos, mb_psos);
+                        grid.z = uint32_t(n);
+                    }
+                    break;
+                case Kernel::AttnGate:
+                    if (d0.grid.y == 1 && d0.grid.z == 1) {
+                        strided = mb_pso(d0, base_psos, mb_psos);
+                        grid.y = uint32_t(n);
+                    }
+                    break;
+                case Kernel::KvAppendPaged:
+                    // z is the token, and w_page/w_off are already arrays row
+                    // zero's table points at the front of. Only the source
+                    // pitch stood between this and the whole prompt.
+                    if (d0.grid.z == 1) {
+                        strided = mb_pso(d0, base_psos, mb_psos);
                         grid.z = uint32_t(n);
                     }
                     break;
@@ -935,6 +1108,8 @@ void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
+        // Priced by ablation, same as the prefill walk; see `kernel_ablated`.
+        if (kernel_ablated(d.kind)) continue;
         const int cast_elems = mb_fp16_cast_elems(d, mb_psos, g, n_tokens);
         // The staging cast, ahead of the GEMM that reads it. It rides the
         // GEMM's own argument table -- the source is already bound at buffer 3

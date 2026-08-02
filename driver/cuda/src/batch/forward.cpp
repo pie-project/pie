@@ -133,14 +133,30 @@ bool ForwardFn::invoke_prefill_graph_capturable() const {
     return model != nullptr && model->prefill_graph_capturable();
 }
 
-// `PIE_PREFILL_GRAPH=1` lets a wave carrying a prefill reach the graph cache
-// instead of falling to the eager path along with all of its decode lanes.
-// Default OFF: this changes which fires are captured, and the campaign's own
-// rule is that a single interleaved series is a hypothesis, not a result.
+// Lets a wave carrying a prefill reach the graph cache instead of falling to
+// the eager path along with all of its decode lanes. Without it one arriving
+// request costs every decode lane in its wave the replay: 7,290 us of host
+// enqueue against 10 us at the same width.
+//
+// **Default ON**; `PIE_PREFILL_GRAPH=0` restores the decode-only gate.
+// Measured on 4096x64 @c256: +10.6% (3 of 3 rounds), and mixed-sign neutral on
+// 768x512, 256x256 and the shared-prefix shape — it pays where request
+// turnover is high and costs nothing where it is not.
+//
+// The price is memory, not speed: sizing the float workspace for graph-mode
+// planning takes it 80 -> 672 MiB, i.e. 592 MiB out of the KV pool (338 pages
+// of 22,039, ~1.5%). A deployment tighter on KV than on throughput should turn
+// this off.
+//
+// It does NOT cost the decode path, despite an earlier reading to that effect:
+// normalised per LANE across runs of matched width the decode host cost rises
+// 6.1%, uniformly across phases that share no machinery, which tracks the 6.9%
+// shorter wall rather than any decode-side regression. Net on the cell is
+// -880 ms of prefill enqueue against +85 ms of decode.
 bool prefill_graph_enabled() {
     static const bool value = [] {
         const char* const env = std::getenv("PIE_PREFILL_GRAPH");
-        return env != nullptr && *env != '\0' && env[0] != '0';
+        return env == nullptr || *env == '\0' || env[0] != '0';
     }();
     return value;
 }

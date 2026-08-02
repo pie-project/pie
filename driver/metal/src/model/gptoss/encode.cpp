@@ -356,6 +356,16 @@ bool sdpa_tile_this_fire(int rows, int requests) {
     return requests > 0 && sdpa_should_tile(rows, requests);
 }
 
+/// Whether that tiled fire runs on the matrix unit. Split out for the same
+/// reason `sdpa_tile_this_fire` is: the pipeline and the grid ask it
+/// separately, and the two shapes have DIFFERENT threadgroup sizes -- 128
+/// against 1024 -- so disagreeing here is a grid that describes a kernel other
+/// than the one that runs.
+bool sdpa_mma_this_fire(const GptOssGeometry& g, int rows, int requests) {
+    return sdpa_tile_this_fire(rows, requests) && sdpa_mma() &&
+           g.head_dim == kSdpaMmaHeadDim;
+}
+
 /// The pipeline for a dispatch whose tiling depends on the batch. Split from
 /// `pso_for_mb` because the tile choice must mirror `launch_shape_mb`'s
 /// EXACTLY: a grid computed for one tiling against a pipeline compiled for
@@ -365,7 +375,8 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
                     const GptOssPsos& go, int head_rows, int requests) {
     const int N = rows < 1 ? 1 : rows;
     if (d.kind == Kind::SdpaSink && sdpa_tile_this_fire(N, requests)) {
-        return go.sdpa_sink_paged_tiled;
+        return sdpa_mma_this_fire(g, N, requests) ? go.sdpa_sink_paged_mma
+                                                  : go.sdpa_sink_paged_tiled;
     }
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
     const int m = d.kind == Kind::LmHead ? S : N;
@@ -448,8 +459,12 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
             kv_append_mb_dispatch(g.head_dim, g.n_kv_heads, N, grid, tg);
             return;
         case Kind::SdpaSink:
-            // Same predicate as `pso_for_mb_rows`, for the same reason.
-            if (sdpa_tile_this_fire(N, requests))
+            // Same predicates as `pso_for_mb_rows`, for the same reason. The
+            // matrix shape is 128 threads where the scalar one is 1024, so this
+            // is not just a different pipeline behind the same launch.
+            if (sdpa_mma_this_fire(g, N, requests))
+                sdpa_paged_mma_dispatch(g.n_q_heads, N, grid, tg);
+            else if (sdpa_tile_this_fire(N, requests))
                 sdpa_paged_tiled_dispatch(g.n_q_heads, N, grid, tg);
             else
                 sdpa_sink_dispatch(g.n_q_heads, grid, tg, N);

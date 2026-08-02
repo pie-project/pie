@@ -108,10 +108,23 @@ static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// partition machinery), so nothing is excluded — the boundary just opens
 /// before they get there. The wait-all rule keeps guarding what it must:
 /// dense gathering while an epoch executes (`executing` still parks).
-/// Default: strict wait-all.
+///
+/// **Default ON**; `PIE_SEAL_MODE=strict` restores holding for every awaited
+/// lane. Measured against strict on 4096x64 @c256: the inter-fire device gap
+/// falls 0.696 -> 0.517 s (-26%) and occupancy 91.8 -> 93.8%, because 87% of
+/// all device idle sits in front of a wave carrying an arrival — a lane is
+/// `awaited` from creation but needs ~200 us of its own work before it can
+/// submit, and strict spends that as GPU idle.
+///
+/// Throughput +1.22% at c256 (7 of 8 ABBA rounds), +1.27% at c32, +1.26% at
+/// c64, +0.19% (neutral) at c8: 14 of 17 rounds positive with no regression at
+/// any concurrency. Decode batch width is UNCHANGED (238.5 -> 240.8), which is
+/// the check that matters here — fragmenting the wave is what killed the
+/// no-quiescence variant below and the `=1` contributed-gate variant before it.
 fn seal_mode_ready() -> bool {
     static CONFIGURED: OnceLock<bool> = OnceLock::new();
-    *CONFIGURED.get_or_init(|| std::env::var("PIE_SEAL_MODE").is_ok_and(|value| value == "ready"))
+    *CONFIGURED
+        .get_or_init(|| !std::env::var("PIE_SEAL_MODE").is_ok_and(|value| value == "strict"))
 }
 
 /// Default ON; `PIE_GATE_CONTRIBUTED=0` restores the strict wait-all rule.

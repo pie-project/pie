@@ -1595,7 +1595,7 @@ struct QuantizedBlockLoader {
 // row pitches, K span, and epilogue; every exported variant keeps the same
 // unsafe full-tile contract and therefore the same hot loop.
 template <typename T, typename P, typename LoaderW, int BM, int BK, int BN,
-          bool WITH_RESIDUAL, bool WITH_BIAS>
+          bool WITH_RESIDUAL, bool WITH_BIAS, int WM = 2, int WN = 2>
 METAL_FUNC void qmm_t_loaded_impl(
     const device T* x,
     device P* y,
@@ -1609,8 +1609,6 @@ METAL_FUNC void qmm_t_loaded_impl(
     uint simd_gid,
     uint simd_lid,
     thread LoaderW& loader_w) {
-  constexpr int WM = 2;
-  constexpr int WN = 2;
   constexpr int BK_padded = BK + 16 / sizeof(T);
   using mma_t = mlx::steel::
       BlockMMA<T, P, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
@@ -1736,7 +1734,7 @@ METAL_FUNC void qmm_t_cast_loaded_impl(
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
-          bool WITH_RESIDUAL, bool WITH_BIAS = false>
+          bool WITH_RESIDUAL, bool WITH_BIAS = false, int WM = 2, int WN = 2>
 METAL_FUNC void qmm_t_aligned_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1755,7 +1753,7 @@ METAL_FUNC void qmm_t_aligned_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1766,7 +1764,8 @@ METAL_FUNC void qmm_t_aligned_impl(
   scales += y_col * K_g;
   biases += y_col * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS>(
+  qmm_t_loaded_impl<T, T, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS,
+                    WM, WN>(
       x, y, residual, Xs, Ws, K, N, K, tid, simd_gid, simd_lid, loader_w);
 }
 
@@ -1919,7 +1918,8 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       w, scales, biases, x, y, bias, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits, int BM, int BK, int BN>
+template <typename T, int group_size, int bits, int BM, int BK, int BN,
+          int WM = 2, int WN = 2>
 [[kernel]] void affine_qmm_t_aligned(
     const device uint32_t* w   [[buffer(0)]],
     const device T* scales     [[buffer(1)]],
@@ -1934,7 +1934,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false>(
+  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false, false, WM, WN>(
       w, scales, biases, x, y, nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
@@ -2619,16 +2619,25 @@ template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
   }
 }
 
-#define instantiate_qmv_wide_strided(v, kl)                                  \
-  template [[host_name("affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_" #v   \
+#define instantiate_qmv_wide_strided(b, v, kl)                               \
+  template [[host_name("affine_qmv_wide_strided_bfloat16_gs_64_b_" #b "_v_" #v \
                        "_kl_" #kl)]]                                         \
-  [[kernel]] void affine_qmv_wide_strided<bfloat, 64, 4, v, kl>(            \
+  [[kernel]] void affine_qmv_wide_strided<bfloat, 64, b, v, kl>(            \
       const device uint32_t*, const device bfloat*, const device bfloat*,    \
       const device bfloat*, device bfloat*, const constant int&,             \
       const constant int&, const constant int&, const constant int&,         \
       uint3, uint, uint);
 
-instantiate_qmv_wide_strided(4, 8)
+instantiate_qmv_wide_strided(4, 4, 8)
+// The 8-bit twin, for a checkpoint that spares individual tensors from the
+// model-wide format. mlx-lm's quantization predicate can single out a tensor by
+// NAME, and Qwen3.6-35B-A3B's build leaves the MoE router and the shared
+// expert's gate at 8 bits while everything else is 4. Those two kinds had no
+// batched shape to run in, so a prefill fell back to ONE MATVEC PER TOKEN for
+// them -- 40 layers times two kinds times every row -- and that was the single
+// largest line in the profile. The kernel body is parametric in `bits`; only
+// the instantiation was missing.
+instantiate_qmv_wide_strided(8, 4, 8)
 
 
 // Split-K's affine-loader adapter. The common loop runs `k_len` columns from
@@ -2867,3 +2876,33 @@ template [[host_name("qmm_splitk_reduce_f32_bfloat16")]] [[kernel]] void
 qmm_splitk_reduce<bfloat, float>(
     device bfloat*, const constant int&, const device float*,
     const constant int&, const constant int&, uint2);
+
+// Warp-shape variants, kept for `roofline_probe`'s PROBE_WM/PROBE_WN.
+//
+// The K loop's note says occupancy is how this GPU hides the kernel's latency,
+// and at 128 threads a threadgroup only three fit on a core. A 256-thread
+// threadgroup puts twice the threads there for the same threadgroup memory and
+// the same sixteen accumulators a lane already holds, so it is the one shape
+// argument the tile sweep never tested. It loses. M=1024, M1 Max, GFLOP/s over
+// the checkpoint's projections:
+//
+//     BM=64  BN=32  2x2  (128 thr)   4530   the shipping shape
+//     BM=64  BN=64  2x4  (256 thr)   4090   -9.7%
+//     BM=128 BN=32  4x2  (256 thr)   4470   -1.3%
+//
+// Fewer, fatter threadgroups is what it minds, which is the same thing BN=64
+// says in the model (104.6 vs 107.2 tok/s) from the other direction. These two
+// are instantiated and not dispatched ON PURPOSE: the sweep that closes an
+// axis is worth as much as the one that opens it, and the next person to
+// suspect occupancy should be able to re-run it rather than re-derive it.
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 64, 2, 4>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 128, 32, 32, 4, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);

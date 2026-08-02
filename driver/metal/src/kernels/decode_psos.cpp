@@ -307,8 +307,15 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         }
         want(qmm, "cast_qmm_input_strided_bfloat16_to_float16",
              &out.qmm_t_strided_cast);
-        want(qmm, "affine_qmv_wide_strided_bfloat16_gs_64_b_4_v_4_kl_8",
-             &out.qmv_wide_strided);
+    }
+    // The wide matvec, asked for the CHECKPOINT's own format rather than only
+    // for the 4-bit one the fp16 block above happens to also want. It is the
+    // batched primitive for a projection the strided GEMM declines -- one
+    // dispatch for the whole prompt instead of one per token -- and gating it
+    // on `fp16_strided` tied it to a feature it has nothing to do with, which
+    // left an alt-quant kind with no batched shape at all.
+    if (features.strided && quant.group == 64 && (quant.bits == 4 || quant.bits == 8)) {
+        want(qmm, "affine_qmv_wide_strided" + q + "_v_4_kl_8", &out.qmv_wide_strided);
     }
     want("embed_gather.metal", embed_mb_fn, &out.embed_mb);
     want("rope.metal", "rope_neox_mb_bfloat16", &out.rope_mb);
@@ -349,6 +356,14 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         want("rope.metal", "rope_neox_strided_bfloat16", &out.rope_strided);
         want("silu_mul.metal", "silu_mul_strided_bfloat16",
              &out.silu_mul_strided);
+        want("residual_add.metal", "residual_add_strided_bfloat16",
+             &out.residual_add_strided);
+        want("moe_route.metal", "shared_expert_combine_strided",
+             &out.shared_expert_combine_strided);
+        if (features.sdpa_d256) {
+            want("sdpa_paged.metal", "sdpa_paged_tiled_strided_bfloat16_d_256",
+                 &out.sdpa_paged_tiled_strided);
+        }
     }
 
     std::vector<std::string> errors;

@@ -18,6 +18,29 @@ template <typename T>
   out[tid] = T(float(x[tid]) + float(residual[tid]));
 }
 
+// Prefill variant: rows are a uniform `row_pitch` elements apart, so the whole
+// prompt runs as one dispatch instead of one per token. `tid.y` selects the
+// row; the arithmetic is identical, which is what makes this safe to swap in.
+// Mirrors `silu_mul_strided` exactly, including where the pitch sits.
+template <typename T>
+[[kernel]] void residual_add_strided(
+    const device T* x        [[buffer(0)]],
+    const device T* residual [[buffer(1)]],
+    device T* out            [[buffer(2)]],   // may alias x
+    const constant int& row_pitch [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]]) {
+  const size_t i = size_t(tid.y) * size_t(row_pitch) + size_t(tid.x);
+  out[i] = T(float(x[i]) + float(residual[i]));
+}
+
+#define instantiate_residual_add_strided(name, itype)             \
+  template [[host_name("residual_add_strided_" #name)]]           \
+  [[kernel]] void residual_add_strided<itype>(                    \
+      const device itype*, const device itype*, device itype*,    \
+      const constant int&, uint2);
+
+instantiate_residual_add_strided(bfloat16, bfloat)
+
 #define instantiate_residual_add(name, itype)                     \
   template [[host_name("residual_add_" #name)]]                   \
   [[kernel]] void residual_add<itype>(                            \

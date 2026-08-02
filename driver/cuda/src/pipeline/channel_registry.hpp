@@ -82,6 +82,40 @@ static __global__ void mark_seeded_channel_cells(
         tails[slot] == 0 ? 0 : 1;
 }
 
+// Initialize an arbitrary SET of channel slots in one launch: `triples` holds
+// (slot, cap1, tail) per pending slot.
+//
+// The range-based path this replaces cost 5 CUDA calls per run of consecutive
+// slot indices, and slots arrive ~2 at a time because `alloc_slot` recycles
+// out of capacity-keyed free buckets in free order — so an instance's channels
+// land scattered and the batching almost never fired. Scattering on the device
+// makes the cost independent of allocation order.
+//
+// `d_head_` and `d_full_` cannot be refreshed with a whole-array memset
+// instead: the device advances both past the host mirror while waves run, so a
+// blanket clear would corrupt live slots. Only the listed slots are touched.
+static __global__ void scatter_channel_initializations(
+    const std::uint32_t* __restrict__ triples,
+    std::uint32_t count,
+    std::uint32_t* __restrict__ cap1,
+    std::uint32_t* __restrict__ head,
+    std::uint32_t* __restrict__ tail,
+    std::uint8_t* __restrict__ full) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const std::uint32_t slot = triples[i * 3 + 0];
+    const std::uint32_t slot_cap1 = triples[i * 3 + 1];
+    const std::uint32_t slot_tail = triples[i * 3 + 2];
+    cap1[slot] = slot_cap1;
+    head[slot] = 0;
+    tail[slot] = slot_tail;
+    std::uint8_t* bits = full + static_cast<std::size_t>(slot) * kMaxRing;
+    for (std::uint32_t b = 0; b < kMaxRing; ++b) bits[b] = 0;
+    // Same rule the range path applied after its memset: a seeded channel
+    // starts with its first cell already full.
+    bits[0] = slot_tail == 0 ? 0 : 1;
+}
+
 struct PreparedHostPublish {
     std::uint64_t target_tail = 0;
     void* destination = nullptr;
@@ -985,13 +1019,21 @@ class DeviceChannelRegistry {
         host_tail_[slot] = desc.seeded != 0 ? 1 % cap1 : 0;
     }
 
-    void flush_pending_initializations() {
-        if (pending_initialization_slots_.empty()) return;
-        // Full bits gate every cell read, so empty payload bytes need no
-        // initialization. Batch only the shared ring metadata here.
-        std::sort(
-            pending_initialization_slots_.begin(),
-            pending_initialization_slots_.end());
+    // `PIE_INIT_SCATTER=0` restores the pre-existing range-based flush, kept
+    // so the two paths can be A/B'd in one binary. They are semantically
+    // identical; only the CUDA call count differs.
+    static bool init_scatter_enabled() {
+        static const bool value = [] {
+            const char* const env = std::getenv("PIE_INIT_SCATTER");
+            return env == nullptr || *env == '\0' || env[0] != '0';
+        }();
+        return value;
+    }
+
+    // The original path: one batch per run of consecutive slot indices,
+    // 5 CUDA calls each. Retained for the A/B; see the scatter kernel for why
+    // it underperforms once slot allocation fragments.
+    void flush_pending_initializations_by_range() {
         auto first = pending_initialization_slots_.begin();
         while (first != pending_initialization_slots_.end()) {
             auto last = first + 1;
@@ -1011,9 +1053,7 @@ class DeviceChannelRegistry {
                 cudaMemcpyHostToDevice,
                 initialization_stream_));
             CUDA_CHECK(cudaMemsetAsync(
-                d_head_ + first_slot,
-                0,
-                metadata_bytes,
+                d_head_ + first_slot, 0, metadata_bytes,
                 initialization_stream_));
             CUDA_CHECK(cudaMemcpyAsync(
                 d_tail_ + first_slot,
@@ -1028,14 +1068,63 @@ class DeviceChannelRegistry {
                 initialization_stream_));
             constexpr std::uint32_t threads = 128;
             mark_seeded_channel_cells<<<
-                (slot_count + threads - 1) / threads,
-                threads,
-                0,
+                (slot_count + threads - 1) / threads, threads, 0,
                 initialization_stream_>>>(
                     first_slot, slot_count, d_tail_, d_full_);
             CUDA_CHECK(cudaGetLastError());
             first = last;
         }
+        pending_initialization_slots_.clear();
+    }
+
+    void flush_pending_initializations() {
+        if (pending_initialization_slots_.empty()) return;
+        // Full bits gate every cell read, so empty payload bytes need no
+        // initialization. Batch only the shared ring metadata here.
+        //
+        // ONE upload + ONE launch for the whole pending set, whatever its slot
+        // indices look like. The previous range-based path emitted 5 CUDA
+        // calls per run of consecutive indices; measured on a 16-cohort cell
+        // the runs averaged 2.17 slots, so 73,728 slots cost ~170,000 calls
+        // and 3.6% of wall. See `scatter_channel_initializations`.
+        std::sort(
+            pending_initialization_slots_.begin(),
+            pending_initialization_slots_.end());
+        if (!init_scatter_enabled()) {
+            flush_pending_initializations_by_range();
+            return;
+        }
+        const std::size_t count = pending_initialization_slots_.size();
+        init_scatter_host_.clear();
+        init_scatter_host_.reserve(count * 3);
+        for (const std::uint32_t slot : pending_initialization_slots_) {
+            init_scatter_host_.push_back(slot);
+            init_scatter_host_.push_back(host_cap1_[slot]);
+            init_scatter_host_.push_back(host_tail_[slot]);
+        }
+        const std::size_t bytes =
+            init_scatter_host_.size() * sizeof(std::uint32_t);
+        ensure_device_capacity(
+            init_scatter_device_, init_scatter_capacity_, bytes);
+        CUDA_CHECK(cudaMemcpyAsync(
+            init_scatter_device_,
+            init_scatter_host_.data(),
+            bytes,
+            cudaMemcpyHostToDevice,
+            initialization_stream_));
+        constexpr std::uint32_t threads = 128;
+        scatter_channel_initializations<<<
+            static_cast<std::uint32_t>((count + threads - 1) / threads),
+            threads,
+            0,
+            initialization_stream_>>>(
+                static_cast<const std::uint32_t*>(init_scatter_device_),
+                static_cast<std::uint32_t>(count),
+                d_cap1_,
+                d_head_,
+                d_tail_,
+                d_full_);
+        CUDA_CHECK(cudaGetLastError());
         pending_initialization_slots_.clear();
     }
 
@@ -1308,6 +1397,13 @@ class DeviceChannelRegistry {
         free_slots_by_capacity_;
     std::vector<std::uint32_t> released_slots_;
     std::vector<std::uint32_t> pending_initialization_slots_;
+    // (slot, cap1, tail) triples staged for `scatter_channel_initializations`.
+    // The device block is grow-only and reused: every flush rides the same
+    // initialization stream, so a later upload is already ordered after the
+    // previous launch that read it.
+    std::vector<std::uint32_t> init_scatter_host_;
+    void* init_scatter_device_ = nullptr;
+    std::size_t init_scatter_capacity_ = 0;
     std::uint32_t next_slot_ = 0;
     std::uint32_t cap_slots_ = 0;
     std::size_t inactive_slots_ = 0;

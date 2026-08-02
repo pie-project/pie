@@ -291,8 +291,12 @@ class RawMetalContext {
         size_t size,
         size_t initial_commit_bytes = 0);
     bool ensure_elastic_buffer(const SlotHandle& h, size_t bytes);
+    // `step_requirement` marks targets a fire cannot run without, as opposed
+    // to growth held against a future one: the pressure clamp applies to the
+    // latter only. See `effective_elastic_budget_bytes`.
     bool ensure_elastic_buffers_atomically(
-        const std::vector<std::pair<SlotHandle, size_t>>& targets);
+        const std::vector<std::pair<SlotHandle, size_t>>& targets,
+        bool step_requirement = false);
     bool trim_elastic_buffer(const SlotHandle& h, size_t bytes);
     void release_elastic_buffer(const SlotHandle& h);
     bool zero_buffer_range(const SlotHandle& h, size_t offset, size_t bytes);

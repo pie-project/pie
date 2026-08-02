@@ -452,6 +452,21 @@ inline void sdpa_paged_tiled_dispatch(int n_q_heads, int N, Grid& g, Threadgroup
     tg = Threadgroup{1024, 1, 1};
 }
 
+// The head widths `sdpa_paged_mma.metal` is instantiated for. The matrix path
+// stages three tiles of KT*D halves in 32 KB of threadgroup memory, which is
+// what bounds the list: adding a width means choosing its KT there first.
+inline constexpr int kSdpaMmaHeadDim = 64;
+
+// sdpa_paged_mma: the same tile of `kSdpaQueryTile` rows, but a simdgroup owns
+// EIGHT of them and multiplies 8x8 fragments, so the threadgroup is 128 threads
+// rather than 1024. Same grid otherwise -- the tile height is what the grid
+// describes, and that has not moved.
+inline void sdpa_paged_mma_dispatch(int n_q_heads, int N, Grid& g, Threadgroup& tg) {
+    const uint32_t tiles = uint32_t((N + kSdpaQueryTile - 1) / kSdpaQueryTile);
+    g  = Grid{uint32_t(n_q_heads) * 128u, tiles < 1u ? 1u : tiles, 1};
+    tg = Threadgroup{128, 1, 1};
+}
+
 // kv_append (paged, delta's kernel): one thread per (channel, kv_head, token). grid=
 // (head_dim, n_kv_heads, N). Token m scatters to its phys_slot(position_ids[m]).
 inline void kv_append_mb_dispatch(int head_dim, int n_kv_heads, int N, Grid& g, Threadgroup& tg) {

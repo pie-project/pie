@@ -133,11 +133,14 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
 // the mixture's share of it. `const_slot` caches by (ordinal, index), so this
 // overwrites the same slots in place and allocates nothing after the first.
 int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                      const DecodeGeometry& g, int n_tokens, int row_pitch) {
+                      const DecodeGeometry& g, int n_tokens, int row_pitch,
+                      bool routed_batched) {
     int count = 0;
     const int rows = n_tokens > 0 ? n_tokens : 1;
     const int pairs = rows * g.experts_per_token;
-    const int sorted = moe_sorted_rows(g, rows);
+    // The sort's own contract, and it has to match the dispatch that reads it.
+    const int sorted = moe_sorted_rows(g, rows, routed_batched);
+    const int tile = moe_tile_rows_for(g, rows, routed_batched);
 
     for (const auto& d : dag) {
         const int ord = d.ordinal;
@@ -154,7 +157,7 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 const MoeRouteParams p{(uint32_t)pairs,
                                        (uint32_t)g.n_experts,
                                        (uint32_t)g.experts_per_token,
-                                       (uint32_t)shared_kernels::moe_tile_rows(pairs, g.n_experts),
+                                       (uint32_t)tile,
                                        (uint32_t)sorted,
                                        (uint32_t)g.hidden,
                                        (uint32_t)row_pitch};
@@ -275,6 +278,10 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
             case Kernel::QSplit:
                 bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::HeadDim, g.head_dim, &count);
+                // Packed by default; the prefill rebinds both to the arena's
+                // pitch on row zero's table when it runs the prompt at once.
+                bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::QgRowStride, 0, &count);
+                bind_const<int>(ctx, ord, (uint8_t)bind::QSplit::OutRowStride, 0, &count);
                 break;
 
             case Kernel::Rope:
@@ -303,6 +310,9 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                 g.kv_page_size, &count);
                 bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::NKvHeads,
                                 g.n_kv_heads, &count);
+                // Packed by default; the prefill rebinds this to the arena's
+                // pitch on row zero's table when it appends the whole prompt.
+                bind_const<int>(ctx, ord, (uint8_t)bind::KvAppendPaged::SrcRowStride, 0, &count);
                 break;
 
             case Kernel::Sdpa:
@@ -328,7 +338,11 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
 
             case Kernel::SiluMul:
+                break;
             case Kernel::AttnGate:
+                // Packed by default; the prefill rebinds this to the arena's
+                // pitch on row zero's table when it runs the prompt at once.
+                bind_const<int>(ctx, ord, (uint8_t)bind::AttnGate::RowStride, 0, &count);
                 break;
             case Kernel::LlExpertSiluMul:
             case Kernel::LlMoeSort:

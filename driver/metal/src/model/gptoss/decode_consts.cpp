@@ -143,6 +143,14 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     bind_const<std::int32_t>(ctx, ord,
                                              (std::uint8_t)bind::KvAppendPaged::NKvHeads,
                                              g.n_kv_heads, &count);
+                    // Packed rows: this family's batched step lays k_new and
+                    // v_new out as [N, n_kv_heads, head_dim]. Bound explicitly
+                    // because an ordinal the kernel DOES declare and nobody
+                    // wrote is a source pitch read out of whatever the table
+                    // held -- the wrong rows appended, not a crash.
+                    bind_const<std::int32_t>(ctx, ord,
+                                             (std::uint8_t)bind::KvAppendPaged::SrcRowStride,
+                                             0, &count);
                 }
                 break;
 

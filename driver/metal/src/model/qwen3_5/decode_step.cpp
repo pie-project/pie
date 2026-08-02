@@ -15,6 +15,7 @@
 // already-produced input and write disjoint slots.
 
 #include "decode_step.hpp"
+#include "batch/decode_timing.hpp"
 #include "decode_dispatch.hpp"
 #include "../shared_kernels.hpp"
 
@@ -270,6 +271,10 @@ void encode_decode_step(StepEncoder& se,
     const std::vector<int> run_ends = concurrent_run_ends(dag);
     for (size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
+        // Priced by ablation; see `kernel_ablated`. The M=1 walk needs it as
+        // much as the batched ones: a batch-one decode is the latency number,
+        // and it is the one the trace can say least about.
+        if (kernel_ablated(d.kind)) continue;
         if (timing && timing->mark) timing->mark(static_cast<int>(i));  // boundary i
         se.set_pso(d.fuse_residual ? psos.qmv_residual : psos[d.kind]);
         se.set_argtable(d.kind, d.ordinal);  // ordinal-keyed (unique, token-stable)

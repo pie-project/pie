@@ -522,6 +522,11 @@ struct MetalExecutor::Impl {
     std::vector<SlotHandle> pool_{};
     DecodeStepPsos psos_{};
     MultiBatchPsos mb_psos_{};
+    // The same table in the checkpoint's ALTERNATE affine format, built only
+    // when one exists. Only the strided entries are wanted from it: the two
+    // kinds an alt format covers here -- the router and the shared expert's
+    // gate -- need a batched shape for a prefill, and had none.
+    MultiBatchPsos mb_alt_psos_{};
     KvPagePool kv_pool_{};
     std::vector<Dispatch> mb_dag_{};
     ScratchSchedule mb_sched_{};
@@ -1328,6 +1333,19 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         ctx_.reset();
         return false;
     }
+    // The alternate format's batched matvec. Without it a prefill ran the
+    // router and the shared gate as ONE MATVEC PER TOKEN -- the largest single
+    // line in a Qwen3.6-35B-A3B prefill profile -- because the strided arm has
+    // to decline a kind whose bytes its pipelines cannot read. Strided only:
+    // nothing else in this table is ever asked of the alt format, and building
+    // the rest would be compiling pipelines with no caller.
+    if (g_.paged_kv_enabled && g_.has_alt_quant() &&
+        !load_multibatch_psos(*ctx_, kernels_dir, mb_alt_psos_, g_.alt_quant, &load_err,
+                              MultiBatchPsoFeatures{.strided = true})) {
+        if (err) *err = "multi-batch PSO load failed (alt format): " + load_err;
+        ctx_.reset();
+        return false;
+    }
     ptir_logits_copy_pso_ = ctx_->compile_ptir_pso_from_file(
         (std::filesystem::path(kernels_dir) / "ptir_logits_copy.metal").string(),
         "ptir_copy_logits_bf16",
@@ -1647,7 +1665,10 @@ bool MetalExecutor::Impl::ensure_elastic_storage(
             capacity;
         add_target(slot, bytes);
     }
-    if (ctx_->ensure_elastic_buffers_atomically(targets)) return true;
+    if (ctx_->ensure_elastic_buffers_atomically(
+            targets, /*step_requirement=*/true)) {
+        return true;
+    }
     if (err != nullptr) {
         // Which of the two it is decides what an operator does about it. A full
         // pool is a sizing problem; a clamped one is the OS having said the
@@ -1842,6 +1863,29 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                         case Kernel::KNorm:
                             ctx_->arg_bind_ordinal(d.ordinal, 4, prefill_row_stride_);
                             break;
+                        // `residual_add` takes three buffers, so its pitch is
+                        // the fourth; `shared_expert_combine` takes five.
+                        case Kernel::Residual:
+                        case Kernel::LayerOut:
+                            ctx_->arg_bind_ordinal(d.ordinal, 3, prefill_row_stride_);
+                            break;
+                        case Kernel::LlSharedCombine:
+                            ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
+                            break;
+                        // The batched attention. `Rows` is what lets its grid
+                        // round up to whole query tiles and still retire the
+                        // partial one; the two pitches are what let it read a
+                        // prefill's scratch, whose rows are a uniform
+                        // `scratch_widest_elems` apart rather than packed.
+                        // Bound on the PACKED pipeline's kind too, because
+                        // which of the two runs is decided per fire, after
+                        // this table is written.
+                        case Kernel::SdpaPaged:
+                            if (prefill_rows_.valid())
+                                ctx_->arg_bind_ordinal(d.ordinal, 17, prefill_rows_);
+                            ctx_->arg_bind_ordinal(d.ordinal, 18, prefill_row_stride_);
+                            ctx_->arg_bind_ordinal(d.ordinal, 19, prefill_row_stride_);
+                            break;
                         case Kernel::Rope:
                         case Kernel::RopeK:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
@@ -1852,6 +1896,28 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                         case Kernel::GdnInA:
                         case Kernel::GdnInB:
                             ctx_->arg_bind_ordinal(d.ordinal, 5, prefill_row_stride_);
+                            break;
+                        // The two gated-attention kernels. Both read and write
+                        // the scratch arena, whose rows share one pitch however
+                        // narrow the tensor is, so the 2x-wide q projection and
+                        // its two halves all take the same number.
+                        case Kernel::QSplit:
+                            ctx_->arg_bind_ordinal(
+                                d.ordinal, (std::uint8_t)bind::QSplit::QgRowStride,
+                                prefill_row_stride_);
+                            ctx_->arg_bind_ordinal(
+                                d.ordinal, (std::uint8_t)bind::QSplit::OutRowStride,
+                                prefill_row_stride_);
+                            break;
+                        case Kernel::AttnGate:
+                            ctx_->arg_bind_ordinal(
+                                d.ordinal, (std::uint8_t)bind::AttnGate::RowStride,
+                                prefill_row_stride_);
+                            break;
+                        case Kernel::KvAppendPaged:
+                            ctx_->arg_bind_ordinal(
+                                d.ordinal, (std::uint8_t)bind::KvAppendPaged::SrcRowStride,
+                                prefill_row_stride_);
                             break;
 
                         default:
@@ -2397,7 +2463,11 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     // slots are cached by (ordinal, index)) and moves no encoded byte, since
     // the argument table already holds the address whose contents change.
     if (g_.is_moe() && mb_bound_tokens_ != schedule.N) {
-        bind_token_consts(*ctx_, fire_dag, g_, schedule.N);
+        // The decode's routed projections do not batch; see
+        // `qwen35_routed_decode_batched`. Passing it here is what keeps the
+        // sort's padding off, and the padding is most of the cost.
+        bind_token_consts(*ctx_, fire_dag, g_, schedule.N, /*row_pitch=*/0,
+                          qwen35_routed_decode_batched());
         mb_bound_tokens_ = schedule.N;
     }
     // The FP16 staging buffer and, next to it, the element count the cast
@@ -2586,7 +2656,8 @@ bool MetalExecutor::Impl::run_prefill_step(
         }
         encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
                                force_barriers_, in.row_needs_logits, &g_,
-                               int(prefill_dags_.size()), gdn_scans);
+                               int(prefill_dags_.size()), gdn_scans,
+                               g_.has_alt_quant() ? &mb_alt_psos_ : nullptr);
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
