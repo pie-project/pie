@@ -85,6 +85,13 @@ void bind_llama_dag(RawMetalContext& ctx, const BoundLlama& b, const std::vector
                 bind_slot(ctx, ord, (std::uint8_t)bind::Sdpa::N, io(IoSlot::SeqLen));
                 break;
             }
+            // Declared by the shared routed template, never read at
+            // BIASED=false. See `BoundLlama::zero_bias`.
+            case Kind::ExpertGate:
+            case Kind::ExpertUp:
+            case Kind::ExpertDown:
+                bind_slot(ctx, ord, (std::uint8_t)bind::GoQmv::Bias, b.zero_bias);
+                break;
             case Kind::RowGather:
                 bind_slot(ctx, ord, (std::uint8_t)bind::RowGather::Rows, io(IoSlot::SampleRows));
                 break;

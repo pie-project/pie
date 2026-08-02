@@ -574,6 +574,9 @@ if(APPLE)
   add_metal_linked_test(llama_pso_test tests/llama_pso_test.cpp)
   target_compile_definitions(llama_pso_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  # Every slot the llama family's kernels declare, against a real argument
+  # table. Catches the unbound-slot class, which is never a crash.
+  add_metal_linked_test(llama_bind_test tests/llama_bind_test.cpp)
   # `heap_bind.cpp`'s `case K::Fill` on a real heap.
   add_metal_linked_test(loader_fill_test tests/loader_fill_test.cpp NEEDS_LOADER)
   # The host MSL emitter's whole corpus, through Apple's shader compiler. The

@@ -937,6 +937,20 @@ class LlamaEngine final : public SimpleFamilyEngine {
 
         b_.io.resize(kIoSlotCount);
         for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(4096);
+        // The routed matvec declares a bias it does not read; see
+        // `BoundLlama::zero_bias`. Wide enough for the widest routed output.
+        if (g_.is_moe()) {
+            const std::size_t bias_elems =
+                std::size_t(std::max(g_.hidden, g_.moe_intermediate));
+            b_.zero_bias = ctx.heap_alloc(bias_elems * 2);
+            if (!b_.zero_bias.valid()) {
+                if (err) *err = "llama routed bias allocation failed";
+                return false;
+            }
+            if (b_.zero_bias.contents() != nullptr) {
+                std::memset(b_.zero_bias.contents(), 0, b_.zero_bias.size);
+            }
+        }
         logits_ = ctx.heap_alloc(std::size_t(g_.vocab) * 2);
         if (!logits_.valid()) {
             if (err) *err = "llama logits allocation failed";

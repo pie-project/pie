@@ -237,9 +237,17 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
             }
 
-            // Weightless and constant-less: the embedding reads a token id, and
-            // the argmax reads the logits and a length it gets from `N`.
+            // The gather's row WIDTH. It looks like geometry the kernel could
+            // infer and is not: `embed_gather_4bit` derives the packed row
+            // pitch and the group count from it, so a stale value does not
+            // truncate the embedding, it reads a different row of the table.
             case Kind::EmbedGather:
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Embed::Hidden, g.hidden,
+                                         &count);
+                break;
+
+            // The argmax takes its length from the LM head's `N`, which the
+            // matvec branch above already bound.
             case Kind::Argmax:
             default:
                 break;

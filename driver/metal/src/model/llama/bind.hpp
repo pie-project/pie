@@ -39,6 +39,16 @@ struct BoundLlama {
     std::vector<SlotHandle> io;    // indexed by IoSlot
     std::vector<KvPages> kv;       // indexed by layer
     std::vector<SlotHandle> pool;  // activation buffers, indexed by colour
+    /// A zeroed buffer for the routed matvec's bias slot.
+    ///
+    /// `affine_qmv_routed` and `affine_qmv_routed_bias` are ONE template with
+    /// `BIASED` flipped, so the unbiased instantiation still DECLARES
+    /// `buffer(7)` and never dereferences it. Qwen's experts have no bias
+    /// tensor to put there, and leaving the slot unbound would leave whatever
+    /// that ordinal held last -- which is fine only for as long as the shader
+    /// keeps not reading it. Binding zeros costs one small allocation and makes
+    /// the guarantee independent of the kernel's internals.
+    SlotHandle zero_bias{};
 };
 
 /// Colour the dataflow's live ranges onto pool buffers, honouring the barriers
