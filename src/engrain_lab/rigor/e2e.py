@@ -81,6 +81,90 @@ SCHEMAS = [
 SUBJECTS = ["person", "book", "city"]
 
 
+def _agreed_schemas() -> list[dict]:
+    """Corpus schemas every engine will take, checked here rather than assumed.
+
+    A coverage sweep run against each library directly is not the same set vLLM
+    ends up with: its backends compile with their own options, and a schema one
+    of them refuses raises out of `generate` and takes the whole arm with it.
+    Three arms died that way. So the set is intersected here, with each engine
+    asked in the configuration vLLM will use it in, and the count is printed so
+    a reader knows what the comparison ran on.
+    """
+    import llguidance
+    import llguidance.hf
+    import xgrammar as xg
+    from transformers import AutoTokenizer
+    from vllm.v1.structured_output.backend_guidance import validate_guidance_grammar
+    from vllm.v1.structured_output.backend_xgrammar import (
+        has_xgrammar_unsupported_json_features,
+    )
+
+    from engrain.internals import Compiler
+
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    vocabulary = []
+    for token_id in range(len(tokenizer)):
+        piece = tokenizer.convert_ids_to_tokens(token_id)
+        try:
+            vocabulary.append(tokenizer.convert_tokens_to_string([piece]).encode())
+        except Exception:  # noqa: BLE001
+            vocabulary.append(b"")
+    ours = Compiler(vocabulary)
+    info = xg.TokenizerInfo.from_huggingface(tokenizer, vocab_size=len(tokenizer))
+    xgc = xg.GrammarCompiler(info)
+    llt = llguidance.hf.from_tokenizer(tokenizer)
+
+    instances = json.loads(
+        (RESULTS / "jsonschemabench-instances.json").read_text()
+    )["instances"]
+    kept: list[dict] = []
+    refused = {"engrain": 0, "xgrammar": 0, "guidance": 0, "not json": 0}
+    for instance in instances:
+        text = instance["schema"]
+        try:
+            schema = json.loads(text)
+        except Exception:  # noqa: BLE001
+            refused["not json"] += 1
+            continue
+        try:
+            ours.compile_json_schema(text, max_digits=8)
+        except Exception:  # noqa: BLE001
+            refused["engrain"] += 1
+            continue
+        # vLLM screens a schema before its backend ever sees it, and its
+        # allowlist is stricter than the library's compiler - the library takes
+        # every corpus schema and vLLM refuses several. Asking the library was
+        # what let three arms die inside `generate`.
+        try:
+            if has_xgrammar_unsupported_json_features(schema):
+                raise ValueError("vLLM refuses this for xgrammar")
+            xgc.compile_json_schema(text)
+        except Exception:  # noqa: BLE001
+            refused["xgrammar"] += 1
+            continue
+        try:
+            from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+
+            validate_guidance_grammar(
+                SamplingParams(
+                    structured_outputs=StructuredOutputsParams(json=schema)
+                ),
+                tokenizer=None,
+            )
+            matcher = llguidance.LLMatcher(
+                llt, llguidance.LLMatcher.grammar_from_json_schema(text)
+            )
+            if matcher.is_error():
+                raise ValueError(matcher.get_error()[:60])
+        except Exception:  # noqa: BLE001
+            refused["guidance"] += 1
+            continue
+        kept.append(schema)
+    print(f"schemas every engine takes: {len(kept)} of {len(instances)} {refused}")
+    return kept
+
+
 def _quantiles(values: list[float]) -> dict[str, float]:
     ordered = sorted(values)
     return {
@@ -139,11 +223,7 @@ def main() -> int:
     if arguments.unique:
         # Only schemas every engine compiles, so no arm is measured on a set
         # another could not have run. The list comes from the coverage sweep.
-        common = json.loads((RESULTS / "baseline-coverage.json").read_text())["common"]
-        instances = json.loads(
-            (RESULTS / "jsonschemabench-instances.json").read_text()
-        )["instances"]
-        corpus = [json.loads(instances[i]["schema"]) for i in common]
+        corpus = _agreed_schemas()
 
     report = {
         "backend": arguments.backend,
@@ -206,9 +286,15 @@ def main() -> int:
                 continue
             # Over a corpus of real schemas the cheap key check does not apply,
             # so parseability is what is counted and the soundness harness is
-            # what checks the schema.
+            # what checks the schema. A schema whose root is not an object is
+            # perfectly legal and its document is then a scalar, which has no
+            # keys to check - counting it as parseable is the whole claim here.
             required = schema.get("required") if isinstance(schema, dict) else None
-            if required is None or set(document) >= set(required):
+            if (
+                required is None
+                or not isinstance(document, dict)
+                or set(document) >= set(required)
+            ):
                 valid += 1
 
         row = {

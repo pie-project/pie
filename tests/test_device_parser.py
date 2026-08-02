@@ -886,6 +886,93 @@ class ArenaPaging(unittest.TestCase):
         self.DeviceGrammar = DeviceGrammar
         self.compiler = support.Compiler(VOCABULARY)
 
+    def test_a_live_identifier_past_the_live_count_is_still_usable(self):
+        """An eviction frees a slot; it does not shrink the identifier space.
+
+        `count` is how many grammars are live. Identifiers are recycled from a
+        free list and fresh ones are allocated past the high-water mark, so
+        once anything has been evicted the largest live identifier can exceed
+        `count`. Validating an id against `count` therefore refused a perfectly
+        live grammar - "grammar id past the end of the pool" - and a serving
+        run of 425 real schemas under a table budget is what found it.
+        """
+        pool = self.DeviceGrammar(budget_bytes=1 << 20)
+        held = {}
+        for index in range(24):
+            grammar = self.compiler.compile_json_schema(self._schema(index))
+            identifier = pool.admit(grammar)
+            held[index] = (identifier, pool.generation(identifier))
+        live = [
+            identifier for identifier, generation in held.values()
+            if pool.holds(identifier, generation)
+        ]
+        self.assertTrue(live, "the budget evicted everything")
+        # The premise: something was evicted, and an id outran the live count.
+        self.assertLess(pool.count, pool.slots)
+        self.assertGreaterEqual(max(live), pool.count)
+        # And the batch takes them, which is the thing that used to raise.
+        batch = pool.new_batch(len(live))
+        batch.set_grammars(live)
+
+    def test_a_recycled_slot_does_not_inherit_the_memo_of_its_last_tenant(self):
+        """A mask is remembered per (grammar, state); a slot changes hands.
+
+        The cross-step memo keys an entry on the grammar's *slot*, so once an
+        eviction frees a slot and the next admission reuses it, an entry left by
+        the schema that departed is handed to the one that arrived. The state
+        stored beside the entry cannot catch it - the identifier compares equal -
+        and the mask that comes back is *wider* than the truth, so it does not
+        raise the overflow flag either. It surfaces much later, as the model
+        emitting a token the matcher then refuses.
+
+        Emptying the memo on `revision` is not enough: that says the arrays have
+        moved, and admitting into spare capacity deliberately does not move it.
+        Two schemas of the same shape and different property names collide on
+        every part of the key, which is what makes the stale entry reachable.
+        """
+        brace = VOCABULARY.index(b"{")
+        pool = self.DeviceGrammar()
+
+        def seed(name):
+            matcher = self.compiler.compile_json_schema(self._named(name)).matcher(32)
+            self.assertTrue(matcher.accept_token(brace))
+            return matcher
+
+        first = pool.admit(self.compiler.compile_json_schema(self._named("a")))
+        batch = pool.new_batch(1)
+        batch.set_grammars([first])
+        batch.set_batch_configurations({0: seed("a").configurations()})
+        batch.fill_mask()
+
+        pool.release(first)
+        second = pool.admit(self.compiler.compile_json_schema(self._named("b")))
+        # The premise of the test: the same slot, a different grammar.
+        self.assertEqual(first, second)
+
+        matcher = seed("b")
+        batch.set_grammars([second])
+        batch.set_batch_configurations({0: matcher.configurations()})
+        mask = batch.fill_mask()[0].cpu()
+
+        reference = torch.zeros(mask.numel(), dtype=torch.int32)
+        matcher.fill_bitmask(reference)
+        extra = int(((mask & ~reference) != 0).sum())
+        self.assertEqual(
+            extra, 0, "the recycled slot was masked against its predecessor"
+        )
+        self.assertTrue(torch.equal(mask, reference))
+
+    @staticmethod
+    def _named(name):
+        return json.dumps(
+            {
+                "type": "object",
+                "properties": {name: {"type": "string"}},
+                "required": [name],
+                "additionalProperties": False,
+            }
+        )
+
     def _schema(self, index):
         # Distinguishable, and different enough in size that a hole left by one
         # does not automatically fit the next.
@@ -965,7 +1052,7 @@ class ArenaPaging(unittest.TestCase):
         pool = self.DeviceGrammar(budget_bytes=1)
         first = pool.admit(self._compile(0))
         stamp = pool.generation(first)
-        second = pool.admit(self._compile(1))
+        second = pool.admit(self._compile(4))
         self.assertGreater(pool.evictions, 0)
         # The slot is reused, so the identifier alone says nothing - which is
         # exactly why anyone holding one has to ask whether it still holds.

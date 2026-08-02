@@ -98,6 +98,13 @@ class Engine:
     `table_budget_bytes` bounds the arena. Past it a grammar no slot is running
     under is evicted and re-admitted from its compiled form if it comes back;
     nothing moves and no identifier changes, so a recorded graph survives.
+
+    `max_stack` is how deep a parse may go. It is a ceiling rather than a
+    prediction, because the depth a parse reaches is a property of the document
+    and not of the grammar, and the buffers scale with it - so raising it costs
+    memory whether or not anything uses the room. A document that needs more is
+    reported through `Verdict.narrowed` rather than silently truncated; one
+    schema in 425 of JSONSchemaBench needs 257.
     """
 
     def __init__(
@@ -105,6 +112,7 @@ class Engine:
         vocabulary: Sequence[bytes],
         *,
         max_configurations: int = 128,
+        max_stack: int = 256,
         table_budget_bytes: int | None = None,
     ) -> None:
         from engrain._engrain import Compiler
@@ -112,7 +120,9 @@ class Engine:
 
         self._compiler = Compiler(list(vocabulary))
         self._pool = DeviceGrammar(
-            max_configs=max_configurations, budget_bytes=table_budget_bytes
+            max_configs=max_configurations,
+            max_stack=max_stack,
+            budget_bytes=table_budget_bytes,
         )
         self._ids: dict[int, tuple[int, int]] = {}
         self._held: dict[int, CompiledGrammar] = {}

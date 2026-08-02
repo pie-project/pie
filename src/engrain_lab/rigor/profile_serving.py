@@ -89,6 +89,14 @@ def main() -> int:
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--batches", type=int, nargs="+", default=[16, 64, 256])
     parser.add_argument("--repeats", type=int, default=40)
+    parser.add_argument(
+        "--unique",
+        action="store_true",
+        help="give every row its own schema, drawn from the corpus. The three "
+        "built-in schemas share every row's grammar and parse state, which is "
+        "exactly what the fill deduplicates - so the shared case is the "
+        "flattering one and this is the case to attribute a loss in.",
+    )
     arguments = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(arguments.model)
@@ -100,16 +108,30 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             vocabulary.append(b"")
 
+    schemas = SCHEMAS
+    if arguments.unique:
+        from engrain_lab.rigor.e2e import _agreed_schemas
+
+        schemas = _agreed_schemas()[: max(arguments.batches)]
+
     ours = Compiler(vocabulary)
     pool = DeviceGrammar()
-    compiled = [ours.compile_json_schema(json.dumps(s), max_digits=8) for s in SCHEMAS]
+    compiled = []
+    kept = []
+    for schema in schemas:
+        try:
+            compiled.append(ours.compile_json_schema(json.dumps(schema), max_digits=8))
+        except Exception:  # noqa: BLE001
+            continue
+        kept.append(schema)
+    schemas = kept
     for grammar in compiled:
         pool.admit(grammar)
+    print(f"{len(schemas)} schemas, {pool.resident_bytes() / 2**20:.1f} MiB resident")
 
     info = xg.TokenizerInfo.from_huggingface(tokenizer, vocab_size=len(tokenizer))
-    theirs = [
-        xg.GrammarCompiler(info).compile_json_schema(json.dumps(s)) for s in SCHEMAS
-    ]
+    xgc = xg.GrammarCompiler(info)
+    theirs = [xgc.compile_json_schema(json.dumps(s), any_whitespace=True) for s in schemas]
 
     sync = torch.cuda.synchronize
     seed = json.loads(INSTANCES.read_text())["instances"][0]
@@ -122,7 +144,7 @@ def main() -> int:
     )
     report = []
     for batch in arguments.batches:
-        assignment = [index % len(SCHEMAS) for index in range(batch)]
+        assignment = [index % len(schemas) for index in range(batch)]
         matchers = []
         for index in assignment:
             matcher = compiled[index].matcher(0)

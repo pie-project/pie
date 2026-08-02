@@ -2,16 +2,16 @@
   "model": "Qwen/Qwen3-0.6B",
   "rows": [
     {
-      "batch": 256,
-      "host_advance_us": 11.602183803915977,
-      "set_matchers_us": 224.47016090154648,
-      "fill_us": 33.08197483420372,
-      "mask_to_host_us": 347.92092628777027,
-      "row_copies_us": 2226.2842394411564,
-      "row_copies_vectorised_us": 71.11788727343082,
-      "ours_total_us": 2843.359485268593,
-      "ours_total_vectorised_us": 688.1931331008673,
-      "xgrammar_us": 1869.294559583068
+      "batch": 128,
+      "host_advance_us": 5.891080945730209,
+      "set_matchers_us": 228.77659648656845,
+      "fill_us": 25.892863050103188,
+      "mask_to_host_us": 223.80263544619083,
+      "row_copies_us": 1117.3079255968332,
+      "row_copies_vectorised_us": 45.99057137966156,
+      "ours_total_us": 1601.671101525426,
+      "ours_total_vectorised_us": 530.3537473082542,
+      "xgrammar_us": 1124.3205517530441
     }
   ]
 }

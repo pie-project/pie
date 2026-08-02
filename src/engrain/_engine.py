@@ -2780,6 +2780,13 @@ class DeviceGrammar:
 
         self.count = 0
         self.revision = 0
+        # Which grammars occupy which slots, as a counter. Distinct from
+        # `revision`, which says the arrays have *moved* and a recorded graph is
+        # stale; this says a slot has changed hands and anything keyed on a
+        # grammar identifier is stale. Admitting into spare capacity moves this
+        # and deliberately does not move `revision`, because forcing a graph
+        # re-record on every arriving request is what residency exists to avoid.
+        self.tenancy = 0
         self.vocab_size = 0
         self.vocabulary_digest = 0
         # Every allocation below says `device="cuda"`, which means the *current*
@@ -3149,6 +3156,7 @@ class DeviceGrammar:
         self._stamp += 1
         self._used_at[identifier] = self._stamp
         self.count += 1
+        self.tenancy += 1
         self.admissions += 1
         return identifier
 
@@ -3175,6 +3183,7 @@ class DeviceGrammar:
         self._extent[identifier] = {}
         self._free_ids.append(identifier)
         self.count -= 1
+        self.tenancy += 1
 
     @property
     def dead_fraction(self) -> float:
@@ -3248,6 +3257,7 @@ class DeviceGrammar:
             for new in range(len(keep))
         ]
         self.revision += 1
+        self.tenancy += 1
         return remap
 
     def resident_bytes(self) -> int:
@@ -3283,6 +3293,21 @@ class DeviceGrammar:
     def arena_slots(self) -> int:
         """How many pointers `arena_struct` packs. Checked against the kernel."""
         return len(self._ARENA_FIELDS)
+
+    @property
+    def slots(self) -> int:
+        """How many identifiers the pool has ever handed out.
+
+        Not `count`, which is how many are *live*. An eviction frees a slot and
+        decrements the count, but the identifier space does not shrink: a freed
+        id goes on the free list to be reused, and a fresh one is allocated past
+        the high-water mark. So after any eviction the largest live identifier
+        can exceed `count` - measured at 29 against a count of 21 with forty
+        schemas under an 8 MB budget - and validating an id against `count`
+        rejects a perfectly live grammar. A workload of 425 real schemas under a
+        table budget is what found it.
+        """
+        return len(self._live)
 
     def new_batch(self, batch: int, rollback: int = 0) -> DeviceBatch:
         return DeviceBatch(self, batch, rollback)
@@ -3431,7 +3456,7 @@ class DeviceBatch:
         self.memo_slot = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
         self.memo_store = torch.full((batch,), -1, dtype=torch.int32, device="cuda")
         self.memo_want = torch.full((batch,), -2, dtype=torch.int32, device="cuda")
-        self.memo_revision = grammar.revision
+        self.memo_tenancy = grammar.tenancy
         # Which grammar each sequence is under. A serving batch mixes them, and
         # everything else in the step reads this to find its tables.
         self.grammar_of = torch.zeros(batch, dtype=torch.int32, device="cuda")
@@ -3608,7 +3633,7 @@ class DeviceBatch:
             )
         if int(values.min()) < 0:
             raise ValueError("negative grammar id")
-        if int(values.max()) >= self.grammar.count:
+        if int(values.max()) >= self.grammar.slots:
             raise ValueError("grammar id past the end of the pool")
         # `count` is how many slots exist, not which of them hold anything. A
         # slot an eviction freed is still inside `count`, and a sequence under
@@ -3963,6 +3988,7 @@ class DeviceBatch:
         the same tensor `fill_mask` returns.
         """
         self._check_assigned()
+        self._refresh_memo()
         self.token.copy_(tokens.to(torch.int32).reshape(-1)[: self.batch])
         if self.rollback_depth > 0:
             self.history_length = min(self.history_length + 1, self.rollback_depth)
@@ -4985,17 +5011,32 @@ class DeviceBatch:
             return self.draft_mask
         raise RuntimeError("call capture_draft first")
 
+    def _refresh_memo(self) -> None:
+        """Empty the memo if a slot has changed hands since it was filled.
+
+        An entry names a grammar by its slot, and a slot changes hands:
+        compaction renumbers the survivors, and an eviction frees a slot that
+        the next admission reuses. Either way an entry saying "grammar 2" now
+        names a different grammar, and the state stored beside it cannot catch
+        that - the identifier compares equal - so the mask of the schema that
+        left is handed to the one that arrived. It is always *wider* than the
+        truth rather than narrower, so it does not trip the overflow flag and
+        surfaces as the model emitting a token the matcher then refuses.
+
+        `revision` is the wrong signal for this. It says the arrays moved and a
+        recorded graph is stale, which admitting into spare capacity does not
+        do - so under a table budget a slot could be recycled with the memo
+        left holding the previous tenant's masks. Found by 409 distinct schemas
+        at batch 128, where a row that agreed with its own matcher when
+        computed alone had 455 words of extra bits in the batch.
+        """
+        if self.memo_tenancy != self.grammar.tenancy:
+            self.memo_hash.fill_(_MEMO_EMPTY)
+            self.memo_tenancy = self.grammar.tenancy
+
     def fill_mask(self) -> torch.Tensor:
         self._check_assigned()
-        if self.memo_revision != self.grammar.revision:
-            # Compaction renumbers the grammars, so an entry saying "grammar 2"
-            # now names a different one and its mask would be handed to it. The
-            # state beside each entry cannot catch that - the identifier
-            # compares equal - so the memo is emptied whenever the pool moves.
-            # Found by the test that replays a graph after compaction, which is
-            # the only place the identifiers change under a live batch.
-            self.memo_hash.fill_(_MEMO_EMPTY)
-            self.memo_revision = self.grammar.revision
+        self._refresh_memo()
         if self.graph is not None and self.recorded != self.grammar.revision:
             # The pool moved under us. Re-record rather than replay a graph that
             # points at where the tables used to be.
