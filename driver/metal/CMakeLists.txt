@@ -82,6 +82,7 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 set(PIE_METAL_EXPLICIT_SOURCES
   src/abi.cpp
   src/context.cpp
+  src/model_facts.cpp
   src/pipeline/registry.cpp
   src/batch/compose.cpp
   src/batch/forward.cpp)

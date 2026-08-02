@@ -48,6 +48,15 @@ inline void elementwise_dispatch(int n, Grid& g, Threadgroup& tg) {
     tg = Threadgroup{std::uint32_t(width), 1, 1};
 }
 
+/// The router's two hard bounds.
+///
+/// Both are the KERNEL's, mirrored here so the launch shape and the geometry
+/// that refuses an oversized config read the same number. The kernel clamps to
+/// them; a host that also clamped would route with fewer experts than the
+/// config asked for and say nothing, so `geometry_from_facts` refuses instead.
+constexpr int kRouterMaxTopK = 16;                // gptoss.metal:39
+constexpr std::uint32_t kRouterMaxExperts = 1024;  // one lane per expert
+
 /// `router_topk`: one threadgroup per token row, one lane per expert.
 ///
 /// Rounded up to a whole simdgroup, because the kernel reduces ACROSS
@@ -57,7 +66,7 @@ inline void elementwise_dispatch(int n, Grid& g, Threadgroup& tg) {
 inline void router_topk_dispatch(int n_experts, Grid& g, Threadgroup& tg, int rows = 1) {
     std::uint32_t w = std::uint32_t(n_experts < 1 ? 1 : n_experts);
     w = (w + 31u) / 32u * 32u;
-    if (w > 1024u) w = 1024u;
+    if (w > kRouterMaxExperts) w = kRouterMaxExperts;
     g = Grid{w, std::uint32_t(rows < 1 ? 1 : rows), 1};
     tg = Threadgroup{w, 1, 1};
 }

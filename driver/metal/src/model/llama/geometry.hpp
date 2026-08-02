@@ -27,6 +27,8 @@
 #include <cstddef>
 #include <string>
 
+#include "../shared_kernels.hpp"
+
 namespace pie::metal::llama {
 
 struct LlamaGeometry {
@@ -151,6 +153,32 @@ inline bool geometry_from_facts(const Facts& f, LlamaGeometry& out, std::string*
         }
         if (out.moe_intermediate <= 0) {
             return refuse("a routed FFN needs moe_intermediate_size");
+        }
+        // `router_topk` holds the chosen logits in a fixed threadgroup array
+        // and clamps k to its size. Clamping silently would route with fewer
+        // experts than the config asks for while every consumer still strides
+        // by the configured k, so the refusal the kernel documents lives here.
+        if (out.experts_per_token > shared_kernels::kRouterMaxTopK) {
+            return refuse("experts_per_token " + std::to_string(out.experts_per_token) +
+                          " exceeds the router's top-k limit of " +
+                          std::to_string(shared_kernels::kRouterMaxTopK));
+        }
+        // One lane per expert, one threadgroup per row: the expert count is
+        // bounded by the threadgroup size. `router_topk_dispatch` clamps, which
+        // would route among the first 1024 experts and never mention it.
+        if (out.n_experts > shared_kernels::kRouterMaxExperts) {
+            return refuse("n_experts " + std::to_string(out.n_experts) +
+                          " exceeds the " + std::to_string(shared_kernels::kRouterMaxExperts) +
+                          " a single threadgroup can rank");
+        }
+        // The router softmaxes the SELECTED logits, so its weights sum to one
+        // over the chosen experts -- exactly `norm_topk_prob: true`. A config
+        // that says false wants weights from the softmax over ALL experts,
+        // which sum to less than one and scale the FFN's whole contribution
+        // down. Same tokens, quietly wrong magnitudes; refuse instead.
+        if (!f.norm_topk_prob) {
+            return refuse("norm_topk_prob is false; the router normalizes over "
+                          "the selected experts only");
         }
     } else if (out.intermediate <= 0) {
         return refuse("a dense FFN needs intermediate_size");

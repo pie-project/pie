@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "batch/forward.hpp"
 #include "model/llama/decode_step.hpp"
 #include "model/llama/bind.hpp"
 #include "model/llama/decode_consts.hpp"
@@ -540,6 +541,79 @@ void check_pool_counts_the_slots() {
     expect(rsum > dsum, "the routed pool is strictly larger at the same widths");
 }
 
+// What the geometry REFUSES, which is the half of a contract tests usually
+// skip. Every one of these configs describes a model the kernels would happily
+// run and get quietly wrong -- not crash, not produce garbage, just return
+// plausible tokens from the wrong arithmetic. That is the failure mode a
+// refusal exists to prevent, so it is worth pinning that each one still fires.
+void check_refusals() {
+    using Facts = pie::metal::batch::SetupConfig::LlamaFacts;
+    const auto moe = [] {
+        Facts f;
+        f.n_layers = 48; f.hidden = 2048; f.vocab = 151936;
+        f.n_q_heads = 32; f.n_kv_heads = 4; f.head_dim = 128;
+        f.n_experts = 128; f.experts_per_token = 8; f.moe_intermediate = 768;
+        return f;
+    };
+    const auto refused = [](const Facts& f, const std::string& fragment,
+                            const std::string& what) {
+        LlamaGeometry g;
+        std::string err;
+        const bool ok = pie::metal::llama::geometry_from_facts(f, g, &err);
+        expect(!ok && err.find(fragment) != std::string::npos,
+               what + (ok ? " [ACCEPTED]" : " [" + err + "]"));
+    };
+    const auto accepted = [](const Facts& f, const std::string& what) {
+        LlamaGeometry g;
+        std::string err;
+        expect(pie::metal::llama::geometry_from_facts(f, g, &err), what + " [" + err + "]");
+    };
+
+    // Qwen3-30B-A3B exactly: 128 experts, top-8, renormalized. The baseline the
+    // refusals below are each one field away from.
+    accepted(moe(), "Qwen3-MoE's own shape is accepted");
+
+    // The router softmaxes the SELECTED logits. A config asking for the softmax
+    // over all of them wants weights summing to less than one, which scales the
+    // FFN's contribution down -- same tokens, quieter. Qwen1.5-MoE is this.
+    Facts unnormalized = moe();
+    unnormalized.norm_topk_prob = false;
+    refused(unnormalized, "norm_topk_prob", "norm_topk_prob=false is refused");
+
+    // The kernel holds the chosen logits in a fixed threadgroup array and
+    // clamps k to it, while every consumer keeps striding by the configured k.
+    Facts wide_k = moe();
+    wide_k.experts_per_token = pie::metal::shared_kernels::kRouterMaxTopK + 1;
+    refused(wide_k, "top-k limit", "experts_per_token past the router's top-k is refused");
+    Facts max_k = moe();
+    max_k.experts_per_token = pie::metal::shared_kernels::kRouterMaxTopK;
+    accepted(max_k, "experts_per_token exactly at the top-k limit is accepted");
+
+    // One lane per expert, one threadgroup per row.
+    Facts wide_n = moe();
+    wide_n.n_experts = int(pie::metal::shared_kernels::kRouterMaxExperts) + 1;
+    refused(wide_n, "single threadgroup can rank",
+            "n_experts past a threadgroup is refused");
+
+    // Llama 3.1's piecewise schedule, which `rope_neox` does not implement.
+    Facts llama3_rope = moe();
+    llama3_rope.rope_scaling_kind = "llama3";
+    refused(llama3_rope, "rope_scaling", "an unimplemented rope_scaling is refused");
+
+    // A routed config missing the half of itself the router needs.
+    Facts no_k = moe();
+    no_k.experts_per_token = 0;
+    refused(no_k, "num_experts_per_tok", "a routed FFN without a top-k is refused");
+    Facts no_width = moe();
+    no_width.moe_intermediate = 0;
+    refused(no_width, "moe_intermediate_size", "a routed FFN without a width is refused");
+
+    // GQA's own requirement.
+    Facts ragged = moe();
+    ragged.n_kv_heads = 5;
+    refused(ragged, "multiple", "n_q_heads not a multiple of n_kv_heads is refused");
+}
+
 int main() {
     std::printf("llama_decode_step_test — one family, four configurations\n");
 
@@ -597,6 +671,8 @@ int main() {
     // remove exactly the argmax.
     expect_eq(static_cast<long long>(build_llama_dag(llama3, false).size()), n(llama3) - 1,
               "with_argmax=false drops exactly one dispatch");
+
+    check_refusals();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

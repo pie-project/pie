@@ -67,39 +67,6 @@ inline void push_direct(ModelContract& out, const SourceTensor& raw, std::string
         .expect(shape_of(raw));
 }
 
-/// Declare an MLX affine-U4 weight from its `weight`/`scales`/`biases` triplet.
-///
-/// The checkpoint stores these 4-bit weights eight to a u32 word. The contract
-/// names them for what they are; no byte moves.
-inline void push_mlx_affine_u4(ModelContract& out, const SourceTensor& raw,
-                               const SourceTensor& scales, const SourceTensor& biases,
-                               std::string output) {
-    if (raw.shape.size() != 2 || scales.shape.size() != 2 ||
-        biases.shape.size() != scales.shape.size() ||
-        !std::equal(biases.shape.begin(), biases.shape.end(), scales.shape.begin())) {
-        fail("MLX affine-U4 triplet '" + std::string(raw.name) + "' has incompatible shapes");
-    }
-    const std::int64_t rows = raw.shape[0];
-    const std::int64_t logical_cols = raw.shape[1] * 8;
-    if (rows != scales.shape[0] || scales.shape[1] <= 0 || logical_cols % scales.shape[1] != 0) {
-        fail("MLX affine-U4 triplet '" + std::string(raw.name) + "' cannot derive a group size");
-    }
-    const std::uint32_t group_size =
-        u32_dim(logical_cols / scales.shape[1], "MLX affine-U4 group size");
-
-    PieLoaderQuantSpecView quant =
-        pie_loader::quant_spec(PieLoaderQuantScheme::MlxAffineU4, PieLoaderDType::BF16);
-    quant.bits_per_element = 4;
-    quant.group_size = group_size;
-    quant.channel_axis = 1;
-    const PieLoaderEncodingSpec encoding = pie_loader::quantized(quant);
-
-    out.define(std::move(output),
-               out.transmute(out.src(std::string(raw.name)), {rows, logical_cols}, encoding),
-               encoding)
-        .expect(std::vector<std::int64_t>{rows, logical_cols});
-}
-
 /// Declare an MLX affine weight whose leading axes are a STACK.
 ///
 /// A sparse-MoE checkpoint stores one tensor per projection with the expert on
@@ -152,6 +119,19 @@ inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
                out.transmute(out.src(std::string(raw.name)), {rows, logical_cols}, encoding),
                encoding)
         .expect(std::vector<std::int64_t>{rows, logical_cols});
+}
+
+/// The 4-bit case, under the name the families already call.
+///
+/// This used to be a second implementation that accepted rank 2 only, which is
+/// why a routed llama checkpoint -- whose experts arrive as `[n_experts, out,
+/// in/8]` -- was refused by a driver that had supported stacked weights for
+/// gpt-oss all along. Rank 2 IS the stacked case with an empty stack, so there
+/// is one implementation and the special case is gone rather than doubled.
+inline void push_mlx_affine_u4(ModelContract& out, const SourceTensor& raw,
+                               const SourceTensor& scales, const SourceTensor& biases,
+                               std::string output) {
+    push_mlx_affine_stacked(out, raw, scales, biases, 4, std::move(output));
 }
 
 /// The encoding this driver's quantized matvecs read.

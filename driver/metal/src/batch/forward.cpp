@@ -590,7 +590,9 @@ struct MetalExecutor::Impl {
     // with byte-identical output.
     static constexpr bool fuse_residual_ = true;
     static constexpr bool force_barriers_ = false;
-    static constexpr int max_ctx_ = int(kMetalMaxCtxTokens);
+    /// The KV ring, in tokens. `kMetalMaxCtxTokens` unless a `SetupConfig`
+    /// asked for less; see `SetupConfig::max_ctx_tokens`.
+    int max_ctx_ = int(kMetalMaxCtxTokens);
 
     // No checkpoint directory: since §6 the plan declares the files it reads,
     // so staging weights needs the plan and nothing else.
@@ -714,6 +716,9 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
                                        const pie_loader::LoadPlan& load_plan,
                                        std::string* err) {
     family_ = family;
+    if (cfg.max_ctx_tokens > 0) {
+        max_ctx_ = int(std::min<std::uint32_t>(cfg.max_ctx_tokens, kMetalMaxCtxTokens));
+    }
     // The heap: the weights the plan already sized, plus what the family needs
     // on top of them. `plan_heap` is not consulted -- it is `DecodeGeometry`'s.
     const std::size_t weights = load_plan.view().memory.persistent_bytes;

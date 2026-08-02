@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "batch/forward.hpp"
+#include "model_facts.hpp"
 
 using namespace pie::metal;
 using namespace pie::metal::batch;
@@ -132,28 +133,34 @@ int main(int argc, char** argv) {
     }
     std::printf("llama_bench (%s)\n", ckpt.c_str());
 
-    // Qwen3-1.7B's shape. Read off the checkpoint's config.json rather than
-    // guessed: this binary is a stopwatch, not a config parser, and a wrong
-    // geometry here would be timing a different model.
+    // The shape comes from the checkpoint's own config.json, through the SAME
+    // parser the runtime uses. Transcribing it here as literals would work for
+    // exactly one model, and would silently be timing a different one the day
+    // the config changed.
+    const ModelFacts facts = read_model_facts(ckpt);
     SetupConfig cfg;
     cfg.kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
     cfg.snapshot_dir = ckpt;
-    cfg.model_type = "qwen3";
-    cfg.vocab_size = 151936;
+    cfg.vocab_size = facts.vocab_size;
     cfg.max_forward_tokens = std::uint32_t(std::max(n_prompt, 1));
     cfg.max_forward_requests = 1;
     cfg.kv_page_size = 32;
-    cfg.llama.n_layers = 28;
-    cfg.llama.hidden = 2048;
-    cfg.llama.vocab = 151936;
-    cfg.llama.n_q_heads = 16;
-    cfg.llama.n_kv_heads = 8;
-    cfg.llama.head_dim = 128;
-    cfg.llama.intermediate = 6144;
-    cfg.llama.eps = 1e-6f;
-    cfg.llama.rope_theta = 1.0e6f;
-    cfg.llama.qk_norm = true;
-    cfg.llama.tied_embeddings = true;
+    // One sequence, so one sequence's worth of ring. The default is sized for a
+    // 64-request fleet and does not scale with the model: at 48 layers it is
+    // 13 GiB of KV, which beside a 17 GiB checkpoint does not fit a 32 GiB
+    // machine at all. A stopwatch that cannot load the model measures nothing.
+    cfg.max_ctx_tokens = std::uint32_t(std::max(n_prompt + n_decode, 1) + 64);
+    fill_family_geometry(cfg, facts);
+    std::printf("  %s: %d layers, hidden %d, %d/%d heads x %d", cfg.model_type.c_str(),
+                cfg.llama.n_layers, cfg.llama.hidden, cfg.llama.n_q_heads,
+                cfg.llama.n_kv_heads, cfg.llama.head_dim);
+    if (cfg.llama.n_experts > 0) {
+        std::printf(", %d experts top-%d x %d", cfg.llama.n_experts,
+                    cfg.llama.experts_per_token, cfg.llama.moe_intermediate);
+    } else {
+        std::printf(", ffn %d", cfg.llama.intermediate);
+    }
+    std::printf("\n");
 
     MetalExecutor exec;
     std::string err;
@@ -181,7 +188,30 @@ int main(int argc, char** argv) {
     {
         const std::vector<std::uint32_t> p{785,  6722, 315,  9625, 374, 12095,
                                            13,   576,  6722, 315,  6323, 374};
-        const std::vector<int> want{26194, 13, 576, 6722, 315, 279};  // " Tokyo. The capital of the"
+        // Keyed by shape rather than by directory name, because the same
+        // checkpoint lives under a different path on every machine. A model
+        // this table does not know is BENCHED BUT NOT GATED, and says so --
+        // the alternative, silently accepting whatever it produced, is how a
+        // benchmark starts measuring how fast the driver can be wrong.
+        struct Known {
+            const char* name;
+            int n_layers, n_experts;
+            std::vector<int> want;
+        };
+        const std::vector<Known> known{
+            // " Tokyo. The capital of the"
+            {"Qwen3-1.7B", 28, 0, {26194, 13, 576, 6722, 315, 279}},
+            // " Tokyo. The capital of Brazil"
+            {"Qwen3-30B-A3B", 48, 128, {26194, 13, 576, 6722, 315, 15948}},
+        };
+        const Known* ref = nullptr;
+        for (const Known& k : known) {
+            if (k.n_layers == cfg.llama.n_layers && k.n_experts == cfg.llama.n_experts) {
+                ref = &k;
+                break;
+            }
+        }
+        const std::vector<int> want = ref != nullptr ? ref->want : std::vector<int>{};
         std::uint32_t page = 0;
         Seq c;
         c.id = 1;
@@ -194,11 +224,16 @@ int main(int argc, char** argv) {
             c.tokens[p.size() + i] = std::uint32_t(t);
             t = fire(exec, c, 1, page_size, page, true);
         }
-        const bool ok = got == want;
-        std::printf("  %s  greedy continuation matches mlx-lm:", ok ? "PASS" : "FAIL");
+        const bool ok = ref != nullptr && got == want;
+        if (ref == nullptr) {
+            std::printf("  ....  UNGATED (no mlx-lm reference for this shape), produced:");
+        } else {
+            std::printf("  %s  greedy continuation matches mlx-lm (%s):",
+                        ok ? "PASS" : "FAIL", ref->name);
+        }
         for (const int v : got) std::printf(" %d", v);
         std::printf("\n");
-        if (!ok) {
+        if (ref != nullptr && !ok) {
             std::printf("        wanted:");
             for (const int v : want) std::printf(" %d", v);
             std::printf("\n");
@@ -281,13 +316,24 @@ int main(int argc, char** argv) {
     const double gib = 1024.0 * 1024.0 * 1024.0;
     double weight_bytes = 0;
     {
-        const double h = cfg.llama.hidden, i_ = cfg.llama.intermediate;
+        const double h = cfg.llama.hidden;
         const double q = double(cfg.llama.n_q_heads) * cfg.llama.head_dim;
         const double kv = double(cfg.llama.n_kv_heads) * cfg.llama.head_dim;
         // 4 bits per weight plus a bf16 scale and bias per group of 64.
         const double per = 0.5 + 2.0 * 2.0 / 64.0;
         const double attn = h * q + h * kv * 2 + q * h;
-        const double ffn = 3.0 * h * i_;
+        // A routed layer reads only the experts it CHOSE, so the width one
+        // token pulls through the FFN is `experts_per_token * moe_intermediate`
+        // -- not the whole bank, and not `intermediate_size`, which a routed
+        // config still carries and which happens to equal the active width on
+        // Qwen3-MoE (8 x 768) purely by coincidence.
+        const bool routed = cfg.llama.n_experts > 0;
+        const double ffn_width = routed ? double(cfg.llama.experts_per_token) *
+                                              cfg.llama.moe_intermediate
+                                        : double(cfg.llama.intermediate);
+        double ffn = 3.0 * h * ffn_width;
+        // The router itself is read in full, every token, every layer.
+        if (routed) ffn += h * double(cfg.llama.n_experts) * 2.0;
         weight_bytes = double(cfg.llama.n_layers) * (attn + ffn) * per;
         weight_bytes += double(cfg.llama.vocab) * h * per;  // the tied head
     }

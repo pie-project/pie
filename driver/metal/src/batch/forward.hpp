@@ -398,8 +398,24 @@ struct SetupConfig {
         /// and both are this family.
         bool qk_norm = false;
         bool tied_embeddings = true;
+        /// `norm_topk_prob`. True means the routing weights are renormalized
+        /// over the selected experts, which is what `router_topk` computes.
+        /// Defaults to true because a config that omits it (Mixtral, gpt-oss)
+        /// means it; only an explicit false is a model this driver refuses.
+        bool norm_topk_prob = true;
         bool present() const { return n_layers > 0 && hidden > 0; }
     } llama;
+
+    /// How many tokens the KV ring must hold, across ALL resident requests.
+    ///
+    /// Zero means `kMetalMaxCtxTokens`: a ring sized for a full fleet, which is
+    /// what `pie serve` wants and what every caller got when this was a
+    /// constant. It stopped being affordable as a constant. The ring does not
+    /// scale with the model, so at 48 layers it is 13 GiB of KV whatever the
+    /// weights are -- fine beside a 405 MB checkpoint, and the difference
+    /// between running and not beside a 17 GiB one. A caller that knows it
+    /// drives ONE sequence should not pay for sixty-four.
+    std::uint32_t max_ctx_tokens = 0;
     // `config.json`'s RoPE hyperparameters, read out of the nested
     // `rope_parameters` object this family uses (context.cpp). The defaults
     // below are Qwen3.5's, so a checkpoint that omits them still lands on the
