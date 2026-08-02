@@ -27,23 +27,17 @@ namespace pie::metal::gptoss {
 // `router_topk`, not of gpt-oss.
 using shared_kernels::router_topk_dispatch;
 
+using shared_kernels::ExpertCombineParams;
 using shared_kernels::RowGatherParams;
+using shared_kernels::RouterParams;
 using shared_kernels::elementwise_dispatch;
 
 /// Params structs, replicated EXACTLY from the .metal sources. A mismatch here
 /// is silent: the GPU reads whatever bytes are at the offset.
-struct RouterParams {          // gptoss.metal
-    std::uint32_t n_experts;
-    std::uint32_t experts_per_token;
-};
 struct SwiGluParams {          // gptoss.metal
     std::uint32_t n;
     float limit;
     float alpha;
-};
-struct ExpertCombineParams {   // gptoss.metal
-    std::uint32_t width;
-    std::uint32_t experts_per_token;
 };
 
 /// The PSOs this family needs beyond the shared set.
@@ -53,6 +47,7 @@ struct GptOssPsos {
     Pso qmv_tail{};
     Pso qmv_tail_bias{};
     Pso qmv_routed_bias{};
+    Pso qmm_routed_bias[3]{};
     /// The router's matvec, at whatever width the checkpoint quantized it to.
     /// `mlx_lm`'s predicate usually keeps it at 8 bits while everything else
     /// goes to 4, but a uniformly-quantized checkpoint ships a 4-bit one. Same
@@ -61,8 +56,10 @@ struct GptOssPsos {
     /// geometry of its own.
     Pso qmv_router{};
     Pso router_topk{};
+    Pso moe_sort{};
+    Pso moe_gather{};
+    Pso moe_combine{};
     Pso swiglu{};
-    Pso expert_combine{};
     /// head_dim 64, with the per-head sink in the softmax denominator.
     Pso sdpa_sink{};
     /// The same attention against page-addressed KV, which is what lets several
@@ -80,7 +77,8 @@ struct GptOssPsos {
     bool valid() const {
         return qmv_tail.valid() && qmv_tail_bias.valid() && qmv_routed_bias.valid() &&
                qmv_router.valid() && router_topk.valid() &&
-               swiglu.valid() && expert_combine.valid() && sdpa_sink.valid() &&
+               moe_sort.valid() && moe_gather.valid() && moe_combine.valid() &&
+               swiglu.valid() && sdpa_sink.valid() &&
                rope_freqs.valid();
     }
 };

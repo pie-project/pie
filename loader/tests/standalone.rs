@@ -71,8 +71,9 @@ fn production_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
 /// * `checkpoint/` — the reader. Turning a directory into a
 ///   `CheckpointMetadata` is precisely the step this test exists to keep
 ///   separate, so it has to live somewhere, and it lives in one module.
-/// * `testkit/host_executor.rs` — it runs a finished plan, which means copying
-///   weight bytes; that is its whole job.
+/// * `executor/host.rs` — it runs a finished plan, which means copying
+///   weight bytes; that is its whole job. (It lived under `testkit/` until
+///   `pie model convert` made it a production path.)
 /// * `cache_key.rs` — the on-disk plan cache. It stats and writes files that are
 ///   outputs of compilation, never inputs to it.
 /// * `weight_store.rs` — the materialized-weight artifact, which is an output
@@ -84,14 +85,19 @@ fn production_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
 ///   asking whether the files still have the recorded sizes is the check, not a
 ///   leak. A `compile` that could do this would be a different function.
 /// * `main.rs` — the CLI, which is a caller, not the library.
+/// * `testkit.rs` — feature-gated test support (the fixture writer). The
+///   build this property protects — the worker's — compiles with `testkit`
+///   off, so the gate enforces for production what this exemption relaxes
+///   for tests.
 #[test]
 fn nothing_below_the_reader_opens_a_file() {
     const ALLOWED: &[&str] = &[
-        "testkit/host_executor.rs",
+        "executor/host.rs",
         "cache_key.rs",
         "verify.rs",
         "weight_store.rs",
         "main.rs",
+        "testkit.rs",
     ];
     // `Path`/`PathBuf` are values and may be passed around freely; what must not
     // appear is anything that *touches* the filesystem.

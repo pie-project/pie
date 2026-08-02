@@ -179,22 +179,22 @@ enum class SdpaPaged : uint8_t {
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
-// RmsParams{eps, axis_size, w_stride, plus_one}. qwen3.5 sets plus_one=1 for ALL
-// norms (attn_norm/q_norm/k_norm/ffn_norm/final_norm) → effective gain (1+weight).
+// RmsParams{eps, axis_size, w_stride, plus_one, gain}. qwen3.5 sets plus_one=1
+// for every norm; Gemma 4's router uses gain=hidden^-0.5.
 enum class Rms : uint8_t { X = 0, W = 1, Out = 2, Params = 3 };
 
 // residual add (golden `attn_resid`, `layer_out`): Out = X + Residual, elementwise.
-enum class Residual : uint8_t { X = 0, Residual = 1, Out = 2, Width = 3 };
+enum class Residual : uint8_t { X = 0, Residual = 1, Out = 2 };
 
 // SwiGLU (golden `swiglu`): Out = silu(Gate) * Up, elementwise over intermediate.
-enum class SiluMul : uint8_t { Gate = 0, Up = 1, Out = 2, Width = 3 };
+enum class SiluMul : uint8_t { Gate = 0, Up = 1, Out = 2 };
 
 // q_gate_split: deinterleave 2x-wide q_proj output (qwen3.5 gated attn).
 // qg[n_q,2,head_dim] -> Q[n_q,head_dim] + gate[n_q,head_dim]. Internal (no golden tag).
 enum class QSplit : uint8_t { Qg = 0, QOut = 1, GateOut = 2, HeadDim = 3 };
 
 // attn_gate: attn *= sigmoid(gate) before o_proj (golden tag `attn_gated`). In-place.
-enum class AttnGate : uint8_t { Attn = 0, Gate = 1, Width = 2 };
+enum class AttnGate : uint8_t { Attn = 0, Gate = 1 };
 
 // single-token rope (NeoX, partial). In-place on buffer 0; matches rope.metal exactly:
 //   0=x (activation, in/out), 1=position (IO::Position, I1), 2=scale, 3=base=log2(theta),
@@ -316,6 +316,9 @@ enum class GdnCoreRecurrent : uint8_t {
     Params       = 10, // GdnCoreParams& (constant)
     SlotOfToken  = 11, // u32[N] — append-only slotted-MB variant only
 };
+// The prefill recurrent scan reuses these argument-table ordinals but reads
+// only RecurrentState, CoreOut, PreQ/PreK/PreGate, Params, and SlotOfToken;
+// buffers 0/1/4/5/9 belong only to the per-token recurrent kernel.
 
 // gated RMSNorm (GDN; golden `gdn_core` = post-norm): Out = (1+0)·rmsnorm(X)·silu(Z)
 // over V_d per V_head. W = gate_norm_w (RAW, F32, NO +1). Buffer 4 = GatedRmsParams

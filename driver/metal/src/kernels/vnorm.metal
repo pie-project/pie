@@ -11,10 +11,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct VNormParams {
-  float eps;
-  uint  axis_size;  // head_dim (e.g. 256)
-};
+#include "rms_params.h"
+#include "rms_reduce.h"
 
 template <typename T, int N_READS>
 [[kernel]] void vnorm_single_row(
@@ -25,43 +23,16 @@ template <typename T, int N_READS>
     uint lid                 [[thread_position_in_threadgroup]],
     uint simd_lane_id        [[thread_index_in_simdgroup]],
     uint simd_group_id       [[simdgroup_index_in_threadgroup]]) {
-  constexpr int SIMD_SIZE = 32;
   const uint axis_size = p.axis_size;
 
   threadgroup float local_inv_rms[1];
-  threadgroup float local_sums[SIMD_SIZE];
+  threadgroup float local_sums[32];
 
-  float acc = 0;
   x += gid * size_t(axis_size) + lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
-    for (int i = 0; i < N_READS; i++) {
-      float xi = x[i];
-      acc += xi * xi;
-    }
-  } else {
-    for (int i = 0; i < N_READS; i++) {
-      if ((lid * N_READS + i) < axis_size) {
-        float xi = x[i];
-        acc += xi * xi;
-      }
-    }
-  }
-
-  acc = simd_sum(acc);
-  if (simd_group_id == 0) {
-    local_sums[simd_lane_id] = 0;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_group_id == 0) {
-    acc = simd_sum(local_sums[simd_lane_id]);
-    if (simd_lane_id == 0) {
-      local_inv_rms[0] = precise::rsqrt(acc / float(axis_size) + p.eps);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float inv_rms = local_inv_rms[0];
+  const float inv_rms = rms_inv_from_lane_sum(
+      rms_lane_square_sum<T, N_READS>(x, axis_size, lid),
+      axis_size, p.eps, local_inv_rms, local_sums,
+      simd_lane_id, simd_group_id);
 
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {

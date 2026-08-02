@@ -46,9 +46,11 @@ MetalStorageFacts query_metal_storage_facts() {
     if (device == nil) {
         throw std::runtime_error("no Metal device");
     }
+    const MTLResourceOptions options =
+        MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
     const MTLSizeAndAlign sa = [device
         heapBufferSizeAndAlignWithLength:1
-        options:MTLResourceStorageModeShared];
+        options:options];
     const long page = ::sysconf(_SC_PAGESIZE);
     return MetalStorageFacts{
         .alignment = static_cast<std::uint32_t>(std::max<NSUInteger>(1, sa.align)),
@@ -78,7 +80,29 @@ inline constexpr std::uint32_t kMaxArgBinds = 31;
 struct StepState {
     id<MTL4ComputeCommandEncoder> en = nil;
     RawMetalContext::Impl*        ctx = nullptr;
+    // Per-dispatch attribution, off unless PIE_METAL_DISPATCH_TRACE is set.
+    // A fire is a hundred-odd dispatches behind one fence, so "the GPU spent
+    // 81 ms" is not an answer to "which kernel"; this brackets every dispatch
+    // with a timestamp and reports the shares. It lives in the encoder rather
+    // than in a family's encode function so that one implementation covers
+    // every model and every kernel.
+    void* trace_heap = nullptr;
+    std::uint32_t trace_slots = 0;
+    std::uint32_t trace_n = 0;
+    std::vector<std::string> trace_labels;
+    std::string trace_pso;
 };
+
+// `PIE_METAL_DISPATCH_TRACE=<n>` prints the accumulated table every n fires.
+int dispatch_trace_every() {
+    static const int n = [] {
+        const char* e = getenv("PIE_METAL_DISPATCH_TRACE");
+        if (e == nullptr || *e == '\0') return 0;
+        const int v = atoi(e);
+        return v > 0 ? v : 1;
+    }();
+    return n;
+}
 
 // ── RawMetalContext::Impl — owns the Metal-4 device objects ───────────────────
 struct RawMetalContext::Impl {
@@ -133,6 +157,7 @@ struct RawMetalContext::Impl {
     std::unordered_map<void*, size_t> external_allocations;
     bool saw_ptir_compile = false;
     bool last_ptir_fast_math_disabled = false;
+    uint64_t surfaced_feedback_error = 0;
     std::atomic<bool> force_wait_timeout_once{false};
     // Set when a wait was abandoned. Sticky: see run_steps.
     bool wedged = false;
@@ -331,7 +356,11 @@ id<MTL4ArgumentTable> RawMetalContext::Impl::argtable_for(int ordinal, bool crea
 // ── StepEncoder bridges ───────────────────────────────────────────────────────
 void StepEncoder::set_pso(Pso pso) {
     auto* s = static_cast<StepState*>(impl_);
-    [s->en setComputePipelineState:(__bridge id<MTLComputePipelineState>)pso.obj];
+    id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)pso.obj;
+    [s->en setComputePipelineState:p];
+    if (dispatch_trace_every() > 0) {
+        s->trace_pso = p.label != nil ? p.label.UTF8String : "<unlabelled>";
+    }
 }
 void StepEncoder::set_argtable(Kernel k, int ordinal) {
     (void)k;  // decorative tag; ordinal is the key
@@ -348,8 +377,19 @@ void StepEncoder::set_argtable_ordinal(int ordinal) {
 }
 void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
     auto* s = static_cast<StepState*>(impl_);
+    // Relaxed granularity, so the pair costs no encoder split; the cost of the
+    // marks themselves is charged to whichever dispatch they bracket, which is
+    // the same for all of them and so does not move the shares.
+    const bool trace = dispatch_trace_every() > 0 && s->trace_heap != nullptr &&
+                       2 * (s->trace_n + 1) <= s->trace_slots;
+    if (trace) mark_timestamp(s->trace_heap, 2 * s->trace_n, /*precise=*/true);
     [s->en dispatchThreads:MTLSizeMake(grid.x, grid.y, grid.z)
         threadsPerThreadgroup:MTLSizeMake(tg.x, tg.y, tg.z)];
+    if (trace) {
+        mark_timestamp(s->trace_heap, 2 * s->trace_n + 1, /*precise=*/true);
+        s->trace_labels.push_back(s->trace_pso);
+        ++s->trace_n;
+    }
 }
 // Map the pure-C++ BarrierVisibility to MTL4VisibilityOptions, honoring a one-shot
 // `PIE_BARRIER_VIS=none|device` global override (delta's visibility sweep): when set it
@@ -500,6 +540,7 @@ std::unique_ptr<RawMetalContext> RawMetalContext::create(
     MTLHeapDescriptor* hd = [MTLHeapDescriptor new];
     hd.type        = MTLHeapTypePlacement;
     hd.storageMode = MTLStorageModeShared;   // UMA: contents() valid for all slots
+    hd.hazardTrackingMode = MTLHazardTrackingModeUntracked;
     hd.size        = heap_bytes;
     I.heap = [I.dev newHeapWithDescriptor:hd];
     if (I.heap == nil) {
@@ -540,7 +581,8 @@ SlotHandle RawMetalContext::heap_alloc(size_t size, size_t align) {
     SlotHandle h;
     if (size == 0) return h;
 
-    MTLResourceOptions opts = MTLResourceStorageModeShared;
+    MTLResourceOptions opts =
+        MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
     MTLSizeAndAlign sa = [I.dev heapBufferSizeAndAlignWithLength:size options:opts];
     size_t a = align > sa.align ? align : sa.align;
     size_t off = align_up(I.bump, a);
@@ -1288,6 +1330,10 @@ Pso compile_pso_impl(
     fd.library = lib;
     MTL4ComputePipelineDescriptor* pd = [MTL4ComputePipelineDescriptor new];
     pd.computeFunctionDescriptor = fd;
+    // The entrypoint's name, carried on the pipeline, is what per-dispatch
+    // tracing has to report -- a `Pso` is an opaque pointer and an ordinal
+    // names a position in a DAG rather than a kernel.
+    pd.label = fd.name;
     id<MTLComputePipelineState> pso =
         [I.compiler newComputePipelineStateWithDescriptor:pd
                                       compilerTaskOptions:task_options
@@ -1548,6 +1594,7 @@ std::vector<Pso> RawMetalContext::compile_psos_from_files(
         fd.library = libraries[li];
         MTL4ComputePipelineDescriptor* pd = [MTL4ComputePipelineDescriptor new];
         pd.computeFunctionDescriptor = fd;
+        pd.label = fd.name;
         NSError* pe = nil;
         id<MTLComputePipelineState> pso =
             [I.compiler newComputePipelineStateWithDescriptor:pd
@@ -1814,16 +1861,25 @@ GpuCommitFeedback RawMetalContext::last_commit_feedback() const {
 static void apply_commit_feedback(const RawMetalContext& ctx,
                                   uint64_t event_value,
                                   StepTiming& tm) {
-    // The fence has already been reached, so the feedback for this event is
-    // either in or about to be: the handler is dispatched asynchronously and
-    // lands within microseconds of the signal. Giving it a bounded moment is
-    // the difference between reporting what went wrong and reporting nothing --
-    // a run whose every command buffer failed out of memory came back as a
-    // clean success, because the block had not landed when this looked.
+    // The fence has already been reached, but the feedback block is dispatched
+    // asynchronously. Normal inference does not put that CPU scheduling delay
+    // on every token: the handler logs an error immediately, and run_steps
+    // promotes a late error to a sticky failure before the next submission.
+    // Tracing and the sync-feedback probe do wait because their output
+    // specifically asks for this event's calibrated GPU timestamps.
+    //
+    // `PIE_METAL_GPU_METER` used to be a third reason and is not one any more:
+    // all three of the meters it fed are `if constexpr (false)` in
+    // `forward.cpp`, so arming it here bought a spin of up to 200 x 50us per
+    // fire for output that cannot be printed.
     GpuCommitFeedback fb = ctx.last_commit_feedback();
-    for (int spin = 0; fb.event_value != event_value && spin < 200; ++spin) {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-        fb = ctx.last_commit_feedback();
+    const bool synchronous =
+        dispatch_trace_every() > 0 || getenv("PIE_METAL_SYNC_FEEDBACK") != nullptr;
+    if (synchronous) {
+        for (int spin = 0; fb.event_value != event_value && spin < 200; ++spin) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            fb = ctx.last_commit_feedback();
+        }
     }
     if (fb.event_value != event_value) return;
     tm.gpu_ms = fb.gpu_ms;
@@ -1846,6 +1902,30 @@ void* encode_one_command_buffer(void* ctx_impl, int ab,
 
     I.step.en  = en;
     I.step.ctx = &I;
+    if (dispatch_trace_every() > 0 && I.step.trace_heap == nullptr) {
+        // Sized once and reused: a fire is bounded by its DAG, and a heap
+        // reallocated per fire would be timing the allocator.
+        // The driver caps a timestamp heap and says only "invalid heap size",
+        // so the size is found rather than assumed: the largest power of two
+        // it will hand over, down to a floor below which tracing is pointless.
+        for (std::uint32_t want = 8192; want >= 256; want /= 2) {
+            MTL4CounterHeapDescriptor* hd = [MTL4CounterHeapDescriptor new];
+            hd.type = MTL4CounterHeapTypeTimestamp;
+            hd.count = want;
+            NSError* he = nil;
+            id<MTL4CounterHeap> h = [I.dev newCounterHeapWithDescriptor:hd error:&he];
+            if (h == nil) continue;
+            [I.retained addObject:h];
+            I.step.trace_heap = (__bridge void*)h;
+            I.step.trace_slots = want;
+            break;
+        }
+        if (I.step.trace_heap == nullptr) {
+            fprintf(stderr, "[trace] no timestamp heap: dispatch tracing is off\n");
+        }
+    }
+    I.step.trace_n = 0;
+    I.step.trace_labels.clear();
     StepEncoder se(&I.step);
     encode_fn(se);
 
@@ -1860,6 +1940,56 @@ void* encode_one_command_buffer(void* ctx_impl, int ab,
     return (__bridge_retained void*)cb;
 }
 
+// Resolve the bracketed timestamps of the fire just waited for and fold them
+// into a running table. Reported as SHARES of the fire's own GPU time, which
+// needs no tick-to-nanosecond calibration: the question a trace answers is
+// which kernel to go and look at, and the absolute figure beside it is the
+// commit feedback's, which is already calibrated.
+void report_dispatch_trace(RawMetalContext::Impl& I, double gpu_ms) {
+    const int every = dispatch_trace_every();
+    if (every <= 0 || I.step.trace_heap == nullptr || I.step.trace_n == 0) return;
+    const std::uint32_t n = I.step.trace_n;
+    std::vector<std::uint64_t> ticks(std::size_t(2) * n, 0);
+    {
+        id<MTL4CounterHeap> h = (__bridge id<MTL4CounterHeap>)I.step.trace_heap;
+        NSData* d = [h resolveCounterRange:NSMakeRange(0, 2 * n)];
+        if (d == nil) return;
+        const auto* e = static_cast<const MTL4TimestampHeapEntry*>(d.bytes);
+        const std::size_t got = d.length / sizeof(MTL4TimestampHeapEntry);
+        for (std::size_t i = 0; i < ticks.size() && i < got; ++i) ticks[i] = e[i].timestamp;
+    }
+    static std::map<std::string, std::pair<double, long>> table;
+    static double total_ticks = 0.0;
+    static double total_gpu_ms = 0.0;
+    static long fires = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint64_t a = ticks[2 * i], b = ticks[2 * i + 1];
+        // A relaxed timestamp is not ordered against the dispatch it brackets,
+        // so a pair can come back inverted. Dropping those is honest; counting
+        // them as zero would quietly shrink whichever kernel is noisiest.
+        if (b <= a) continue;
+        auto& slot = table[I.step.trace_labels[i]];
+        slot.first += double(b - a);
+        slot.second += 1;
+        total_ticks += double(b - a);
+    }
+    total_gpu_ms += gpu_ms;
+    if (++fires % every != 0) return;
+    std::vector<std::pair<std::string, std::pair<double, long>>> rows(table.begin(), table.end());
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& x, const auto& y) { return x.second.first > y.second.first; });
+    fprintf(stderr, "[trace] %ld fires, %.2f ms of GPU, %zu kernels\n", fires, total_gpu_ms,
+            rows.size());
+    for (const auto& [name, v] : rows) {
+        const double share = total_ticks > 0 ? v.first / total_ticks : 0.0;
+        fprintf(stderr, "[trace]  %6.2f%%  %8.3f ms  n=%-6ld %s\n", 100.0 * share,
+                share * total_gpu_ms, v.second, name.c_str());
+    }
+    table.clear();
+    total_ticks = 0.0;
+    total_gpu_ms = 0.0;
+}
+
 StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,
                                      int ab) {
     return run_steps({encode_fn}, ab);
@@ -1871,6 +2001,14 @@ StepTiming RawMetalContext::run_steps(
     auto& I = *impl_;
     StepTiming tm;
     ab &= 1;
+    const GpuCommitFeedback pending = last_commit_feedback();
+    if (pending.had_error && pending.event_value > I.surfaced_feedback_error) {
+        I.surfaced_feedback_error = pending.event_value;
+        I.wedged = true;
+        tm.gpu_error = true;
+        tm.gpu_error_text = pending.error;
+        return tm;
+    }
     if (I.wedged) {
         tm.timed_out = true;
         return tm;
@@ -1909,6 +2047,7 @@ StepTiming RawMetalContext::run_steps(
     tm.encode_ms   = t1 - t0;
     tm.gpu_exec_ms = t2 - t1;
     apply_commit_feedback(*this, signalled, tm);
+    report_dispatch_trace(I, tm.gpu_ms > 0.0 ? tm.gpu_ms : tm.gpu_exec_ms);
     return tm;
 }
 
@@ -1919,6 +2058,14 @@ StepTiming RawMetalContext::run_segments(
     auto& I = *impl_;
     StepTiming tm;
     ab &= 1;
+    const GpuCommitFeedback pending = last_commit_feedback();
+    if (pending.had_error && pending.event_value > I.surfaced_feedback_error) {
+        I.surfaced_feedback_error = pending.event_value;
+        I.wedged = true;
+        tm.gpu_error = true;
+        tm.gpu_error_text = pending.error;
+        return tm;
+    }
     if (I.wedged) {
         tm.timed_out = true;
         return tm;

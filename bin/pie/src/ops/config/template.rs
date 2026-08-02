@@ -13,18 +13,29 @@ use pie_worker::driver_ffi::{self, Flavor};
 
 /// Render the default `config.toml`.
 pub fn default_config_content() -> String {
-    let driver_block = match driver_ffi::default_flavor() {
+    let flavor = driver_ffi::default_flavor();
+    let driver_block = match flavor {
         #[cfg(feature = "driver-cuda")]
         Some(Flavor::Cuda) => CUDA_DRIVER_BLOCK,
+        #[cfg(feature = "driver-metal")]
+        Some(Flavor::Metal) => METAL_DRIVER_BLOCK,
         Some(Flavor::Dummy) => DUMMY_DRIVER_BLOCK,
         // Fallback for exhaustiveness: `default_flavor` always returns `Some`
         // (dummy is linked unconditionally), and `pie-worker` may compile
         // `Flavor::Cuda`/`Metal` while this crate's matching `driver-*` arm is
         // cfg'd off (workspace feature-unification can desync the two) — those
-        // land here → the dummy block. Unreachable at runtime.
+        // land here → the dummy block.
         _ => DUMMY_DRIVER_BLOCK,
     };
-    format!("{HEADER}{driver_block}{TAIL}")
+    let model_block = match flavor {
+        // Metal's llama path binds `.weight`/`.scales`/`.biases` for every
+        // matvec and has no unquantized kernel, so the stock bf16 default
+        // imports fine and then cannot bind at load. A default has to run.
+        #[cfg(feature = "driver-metal")]
+        Some(Flavor::Metal) => METAL_MODEL_BLOCK,
+        _ => DEFAULT_MODEL_BLOCK,
+    };
+    format!("{HEADER}{model_block}{driver_block}{TAIL}")
 }
 
 const HEADER: &str = r#"# Pie configuration, written by `pie config init`. Edit freely.
@@ -44,9 +55,23 @@ telemetry = false
 # max_upload      = "256MiB"
 # python_snapshot = true
 
-[model]
+"#;
+
+const DEFAULT_MODEL_BLOCK: &str = r#"[model]
 name = "default"
 model = "Qwen/Qwen3-0.6B"
+# weight_cache_dir = ""       # empty derives $PIE_HOME/models
+"#;
+
+/// Metal's llama path is 4-bit-only, so the default names a quantized repo.
+#[cfg(feature = "driver-metal")]
+const METAL_MODEL_BLOCK: &str = r#"[model]
+name = "default"
+# Metal's llama path is 4-bit-only: every matvec binds `.weight`/`.scales`/
+# `.biases`, and there is no unquantized kernel to fall back to. So the default
+# is an MLX-quantized checkpoint -- a raw bf16 repo (e.g. `Qwen/Qwen3-0.6B`)
+# imports fine and then fails to bind at load.
+model = "mlx-community/Qwen3-0.6B-4bit"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/models
 "#;
 
@@ -103,6 +128,24 @@ gpu_mem_utilization = 0.90
 # random_seed     = 42
 "#;
 
+#[cfg(feature = "driver-metal")]
+const METAL_DRIVER_BLOCK: &str = r#"
+[driver]
+# Which keys are valid here depends on `type`: the common ones below, plus
+# whatever the named driver accepts. A key it does not know is a parse error
+# naming the driver that rejected it.
+type = "metal"
+device = ["metal:0"]
+activation_dtype = "bfloat16"
+kv_page_size = 32
+total_pages = 1024
+# max_forward_tokens      = 10240
+# max_forward_requests    = 512
+# cpu_pages               = 0      # 0 disables KV swapping to host memory
+# kv_cache_dtype          = "auto"
+# stream_routed_experts   = false  # page MoE experts from the checkpoint
+"#;
+
 const DUMMY_DRIVER_BLOCK: &str = r#"
 [driver]
 # Which keys are valid here depends on `type`: the common ones below, plus
@@ -125,6 +168,28 @@ mod tests {
         // not parse is the worst possible first impression.
         let content = default_config_content();
         pie_worker::Config::parse(&content).expect("generated config must parse");
+    }
+
+    #[test]
+    fn it_names_the_driver_this_binary_actually_has() {
+        // The whole promise of picking a block per flavor is that `pie config
+        // init` produces a file that runs. A missing match arm does not fail to
+        // compile -- it falls into the catch-all and writes the dummy driver,
+        // which parses perfectly and then generates random tokens. That is
+        // exactly what happened to Metal, so the invariant is checked rather
+        // than assumed: the template's `type` is the flavor this binary has.
+        let expected = match driver_ffi::default_flavor() {
+            #[cfg(feature = "driver-cuda")]
+            Some(Flavor::Cuda) => "cuda_native",
+            #[cfg(feature = "driver-metal")]
+            Some(Flavor::Metal) => "metal",
+            _ => "dummy",
+        };
+        let content = default_config_content();
+        assert!(
+            content.contains(&format!("type = \"{expected}\"")),
+            "template does not select the compiled flavor {expected:?}"
+        );
     }
 
     #[test]

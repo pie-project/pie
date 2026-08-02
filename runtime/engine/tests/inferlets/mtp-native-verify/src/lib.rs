@@ -141,18 +141,10 @@ where
     let pages = Channel::from_iter(0..pool_pages).named("w_pages");
     let page_indptr = Channel::from([0u32, (first_pos + count).div_ceil(PAGE_T).min(pool_pages)])
         .named("w_page_indptr");
-    let w_slot = Channel::from(
-        (first_pos..first_pos + pad)
-            .map(|p| p / PAGE_T)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_w_slot");
-    let w_off = Channel::from(
-        (first_pos..first_pos + pad)
-            .map(|p| p % PAGE_T)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_w_off");
+    let w_slot =
+        Channel::from_iter((first_pos..first_pos + pad).map(|p| p / PAGE_T)).named("w_w_slot");
+    let w_off =
+        Channel::from_iter((first_pos..first_pos + pad).map(|p| p % PAGE_T)).named("w_w_off");
     // A fold fire reads nothing, and `Channel::from([])` cannot express
     // that (an empty shape has no vector length). Omitting `readout` entirely
     // is the honest encoding of "this fire samples no rows" — and the driver

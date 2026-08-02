@@ -76,7 +76,7 @@ async fn main(input: String) -> Result<String> {
     let scores = Channel::from(vec![0.0f32; B as usize]).named("scores");
     let toks = Channel::from(vec![BOS; B as usize]).named("toks");
     let pos = Channel::from(vec![0u32; B as usize]).named("pos");
-    let fill = Channel::from(vec![INIT_FILL; 1]).named("fill");
+    let fill = Channel::from([INIT_FILL]).named("fill");
     let klen = Channel::from(vec![PAGE_T; B as usize]).named("klen");
     let w_slot = Channel::from(vec![phys0; B as usize]).named("w_slot");
     let w_off = Channel::from(vec![0u32; B as usize]).named("w_off");
@@ -158,7 +158,6 @@ async fn main(input: String) -> Result<String> {
         w_off.put(&w_off_v);
 
         let filled = &base + B;
-        klen.take();
         klen.put(broadcast(
             reshape(&Tensor::constant(vec![PAGE_T]), [1]),
             [B],
@@ -172,9 +171,7 @@ async fn main(input: String) -> Result<String> {
             broadcast(reshape(&pids, [1, POOL_PAGES]), [B, POOL_PAGES]),
             [B * POOL_PAGES],
         );
-        pages.take();
         pages.put(&pages_ig);
-        page_indptr.take();
         page_indptr.put(&Tensor::constant(
             (0..=B).map(|b| b * POOL_PAGES).collect::<Vec<_>>(),
         ));

@@ -13,12 +13,16 @@ use pie_engine::driver::{DriverBackend, SchedulerLimits};
 use super::mock_device::{Behavior, MockBackend, launch_observer};
 
 /// The mock model's logits/output vocab. MUST match what the engine model
-/// reports (`Model::vocab_size()`, which reads `vocab_size` from the
-/// fixture `config.json` beside the tokenizer, falling back to the
-/// tokenizer vocab): a guest declares its `logits` intrinsic as
-/// `[rows, output-vocab-size]` and the dummy driver validates that decl
+/// reports (`Model::vocab_size()`): a guest declares its `logits` intrinsic
+/// as `[rows, output-vocab-size]` and the dummy driver validates that decl
 /// against ITS capability vocab — a mismatch rejects every logits-using
 /// PTIR program at bind.
+///
+/// Read from the fixture `config.json` here, and written into the fixture
+/// descriptor below, so the two sides of that equality come from one number.
+/// The engine itself no longer reads a `config.json`: it takes `vocab_size`
+/// from the `pie.model/1` descriptor the worker hands it, which for a real
+/// boot is normalized from exactly this file.
 fn fixture_vocab_size() -> u32 {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/common/fixtures");
     let cfg =
@@ -202,8 +206,19 @@ impl MockEnv {
                 arch_name: String::new(),
                 kv_page_size: 16,
                 tokenizer_path,
-                // A fixture snapshot, not an artifact.
-                artifact: None,
+                // A fixture snapshot: the tokenizer is a file on disk, and the
+                // descriptor is what the worker would have normalized from the
+                // fixture's `config.json`. Only the two fields `register`
+                // reads are stated -- the rest of the schema is the
+                // normalizer's business, and this harness never runs it.
+                metadata: pie_model::ModelMetadata {
+                    tokenizer: None,
+                    descriptor: format!(
+                        r#"{{"version":"pie.model/1","vocab_size":{},"num_hidden_layers":2}}"#,
+                        fixture_vocab_size(),
+                    )
+                    .into_bytes(),
+                },
                 drivers,
                 scheduler: SchedulerConfig {
                     request_timeout_secs: 30,

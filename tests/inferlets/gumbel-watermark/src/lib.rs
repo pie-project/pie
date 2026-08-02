@@ -371,7 +371,7 @@ async fn main(input: Input) -> Result<Output> {
     if generated.len() < max_tokens {
         history[n as usize] = g0;
 
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
+        let tok_in = Channel::from([g0]).named("tok_in");
         let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let hist_c = Channel::from(history.clone()).named("hist");
         let hlen_c = Channel::from([n + 1]).named("hlen");
@@ -419,15 +419,14 @@ async fn main(input: Input) -> Result<Output> {
 
             let r_next = &r + iota(2);
             let next_length = &length + 1u32;
-            let page_count = (&next_length + (page_size - 1)) / page_size;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
-            page_indptr.take();
-            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             score_out.put(&score);
             null_out.put(&null);

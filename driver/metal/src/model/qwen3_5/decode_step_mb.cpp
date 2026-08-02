@@ -62,9 +62,15 @@ namespace {
 bool g_ab_arm = false;
 }  // namespace
 
-bool ab_all_barriers() { return false; }
+bool ab_all_barriers() {
+    static const bool on = std::getenv("PIE_METAL_AB_BARRIERS") != nullptr;
+    return on;
+}
 
-bool ab_enabled() { return false; }
+bool ab_enabled() {
+    static const bool on = std::getenv("PIE_METAL_AB") != nullptr;
+    return on;
+}
 bool ab_arm() { return g_ab_arm; }
 void ab_set_arm(bool b) { g_ab_arm = b; }
 
@@ -75,9 +81,29 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     if (const int out = qmv_out_size(d.kind, g); out != 0) {
         d.qmm_bn = qmm_bn(out, n);
         d.qmm_bm = qmm_bm(n);
-        d.qmm_split = (d.qmm_bn > 0)
-                          ? qmm_split_k(out, n, qmv_kn(d.kind, g).K, d.qmm_bm)
-                          : 1;
+        // NO split-K, for exactly the reason gemma4's `launch_shape_mb` gives:
+        // the split GEMM writes `split_k` partial [M, N] slices into a side
+        // buffer and needs a reduce pass to sum them, and NOTHING IN THIS
+        // DRIVER EVER DISPATCHES THAT PASS. `qmm_splitk_reduce` is compiled and
+        // has no caller; `affine_qmm_t_splitk` writes its result to buffer 8,
+        // the partials, and buffer 4 -- the projection's real output -- keeps
+        // whatever the last fire left in it.
+        //
+        // It survived because the split only engages at `qmm_bn != 0`, which
+        // needs a batch of at least `kQmmMinBatch`, and nothing fired one until
+        // the throughput harness did. With the harness's fleet check it is a
+        // one-line reproduction: sixteen copies of one prompt in one fire
+        // answer 74088 and 1125 at step 0 with the split on, and agree with the
+        // single-sequence decode for all 64 steps with it off.
+        //
+        // The measured cost of turning it off is the honest version of a number
+        // that was never real: 717 tok/s becomes 520 at sixteen lanes, and 717
+        // was the speed of computing the wrong answer.
+        //
+        // The fix is to emit the reduce, which this family cannot do here --
+        // `mb_geometry` decides the split while walking a DAG that is already
+        // built, so it has no way to insert a dispatch after itself.
+        d.qmm_split = 1;
         if (d.qmm_split > 1)
             qmm_t_splitk_dispatch(out, n, d.qmm_bm, d.qmm_split, d.grid, d.tg);
         else if (d.qmm_bn > 0)
@@ -215,7 +241,7 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             return base[d.kind];
         }
         default: {
-            const int wide_ = d.qmm_bm == kQmmBMWide ? 1 : 0;
+            const int wide_ = qmm_bm_slot(d.qmm_bm);
             if (d.qmm_split > 1 && mb.qmm_t_splitk[wide_].valid())
                 return mb.qmm_t_splitk[wide_];
             if (d.qmm_bn > 0) {
@@ -505,18 +531,53 @@ void encode_prefill_dags_mb(StepEncoder& se,
         if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead &&
             d0.kind != Kernel::LmHeadUntied) {
             const int out = qmv_out_size(d0.kind, *geometry);
+            if (out == 16 && !d0.fuse_residual && mb_psos.qmv_wide_strided.valid()) {
+                constexpr int vecs = 4;
+                constexpr int lanes = 8;
+                se.set_pso(mb_psos.qmv_wide_strided);
+                se.set_argtable(d0.kind, d0.ordinal);
+                se.dispatch(
+                    Grid{32u * std::uint32_t((int(n) + vecs - 1) / vecs),
+                         2u * std::uint32_t(
+                             (out + (64 / lanes) - 1) / (64 / lanes)), 1},
+                    Threadgroup{32, 2, 1});
+                se.barrier();
+                continue;
+            }
+            // N=16 GDN projections deliberately stay matvecs. A BN16 strided
+            // GEMM replaced 768 dispatches with six, but end-to-end prefill fell
+            // from 1408 to 1396 tok/s. The wide matvec above is the intermediate
+            // primitive: five vectors reuse each decoded weight chunk without
+            // paying a matrix tile's setup.
             if (out != 0 && out % 32 == 0) {
-                const bool wide = qmm_strided_bm(strided_rows) == kQmmBMWide &&
+                const bool wide = qmm_strided_bm(strided_rows) > kQmmBM &&
                                   mb_psos.qmm_t_strided_wide.valid();
-                const Pso& gemm =
-                    wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
-                                             : mb_psos.qmm_t_strided_wide)
-                         : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
-                                             : mb_psos.qmm_t_strided);
+                const bool fp16 = mb_psos.qmm_t_strided_cast.valid() &&
+                                  mb_psos.qmm_t_strided_fp16_precast.valid();
+                const Pso& gemm = fp16
+                    ? (wide ? (d0.fuse_residual
+                                   ? mb_psos.qmm_t_strided_fp16_precast_wide_residual
+                                   : mb_psos.qmm_t_strided_fp16_precast_wide)
+                            : (d0.fuse_residual
+                                   ? mb_psos.qmm_t_strided_fp16_precast_residual
+                                   : mb_psos.qmm_t_strided_fp16_precast))
+                    : (wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual
+                                                : mb_psos.qmm_t_strided_wide)
+                            : (d0.fuse_residual ? mb_psos.qmm_t_strided_residual
+                                                : mb_psos.qmm_t_strided));
                 if (gemm.valid()) {
                     Grid grid;
                     Threadgroup tg;
                     qmm_t_strided_dispatch(out, strided_rows, grid, tg);
+                    if (fp16) {
+                        se.set_pso(mb_psos.qmm_t_strided_cast);
+                        se.set_argtable(d0.kind, d0.ordinal);
+                        se.dispatch(
+                            Grid{std::uint32_t(qmv_kn(d0.kind, *geometry).K),
+                                 std::uint32_t(strided_rows), 1},
+                            Threadgroup{256, 1, 1});
+                        se.barrier();
+                    }
                     se.set_pso(gemm);
                     se.set_argtable(d0.kind, d0.ordinal);
                     se.dispatch(grid, tg);

@@ -43,7 +43,7 @@ type Anyhow<T> = anyhow::Result<T>;
 /// `model.pass-kind()` (`host/model.rs`) -- that call is how a guest picks its
 /// interface, and `core_gate` is how the host proves the pick was right.
 fn model_pass_kind() -> PassKind {
-    let model = pie_model::model();
+    let model = crate::model::model();
     match (model.kv_page_size() > 0, model.rs_caps().state_size > 0) {
         (_, false) => PassKind::Attention,
         (true, true) => PassKind::Hybrid,
@@ -1055,7 +1055,7 @@ impl ProcessCtx {
             pass.bindings.rs_fold_len = fold_len;
             return Ok(Ok(()));
         }
-        let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
+        let has_recurrent_state = crate::model::model().rs_caps().state_size > 0;
         let (kv_rep, qo_indptr) = {
             let pass = self.ctx().table.get(&this)?;
             let pending = pass

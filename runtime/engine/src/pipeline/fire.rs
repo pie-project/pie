@@ -899,7 +899,7 @@ fn prepare_bound_rs<C: FireContext>(
     plan: &rs::RsPlan,
     grant: &mut crate::planner::AllocationGrant,
 ) -> Anyhow<Result<rs::PreparedRs, ReservedError>> {
-    let has_recurrent_state = pie_model::model().rs_caps().state_size > 0;
+    let has_recurrent_state = crate::model::model().rs_caps().state_size > 0;
     if let Err(error) = rs::validate_count(rs_reps.len(), qo_indptr, has_recurrent_state) {
         return Ok(Err(ReservedError::Fatal(format!(
             "pipeline: recurrent-state binding: {error}"

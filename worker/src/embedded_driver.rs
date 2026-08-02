@@ -20,26 +20,28 @@ use crate::config::{
 };
 use crate::driver_ffi::Flavor;
 
-/// Anchors `pie-loader`'s C entry points into the final binary.
+/// Anchors the loader ABI's C entry points into the final binary.
 ///
-/// `pie-loader` is an rlib and the only callers of `pie_loader_compile_contract`
-/// and friends are the C++ drivers, which link *after* Rust. A linker never
-/// pulls an rlib member in on behalf of a C++ reference, so without a reference
-/// from reachable Rust the entry points are simply absent and the failure
-/// surfaces as an undefined symbol at final link (`loader/architecture.md`
-/// §3.4). The `#[used]` table inside `pie_loader::ffi::entry` keeps all six
-/// alive once the object is pulled in; this static is what pulls it in.
+/// `pie-loader-capi` is an rlib and the only callers of
+/// `pie_loader_compile_model` and friends are the C++ drivers, which link
+/// *after* Rust. A linker never pulls an rlib member in on behalf of a C++
+/// reference, so without a reference from reachable Rust the entry points are
+/// simply absent and the failure surfaces as an undefined symbol at final
+/// link (`loader/architecture.md` §3.4). The `#[used]` table inside
+/// `pie_loader_capi::entry` keeps all six alive once the object is pulled in;
+/// this static is what pulls it in.
 ///
 /// **This is load-bearing.** No Rust in this process calls the loader any more —
-/// §12 step 2 moved plan compilation behind the FFI and row 12 moved contract
-/// authorship to C++ — so this reference is the only thing keeping the object
-/// file in the link.
+/// §12 step 2 moved plan compilation behind the FFI, and the boot's request
+/// entry is `pie_loader_compile_model` (`plan/model-in-rust.md` §6) — so this
+/// reference is the only thing keeping the object file in the link.
 #[used]
 static PIE_LOADER_ENTRY_ANCHOR: unsafe extern "C" fn(
-    *const pie_loader::ffi::entry::PieLoaderContractRequest,
-    *mut *mut pie_loader::ffi::PieLoaderPlan,
-    *mut *mut pie_loader::ffi::PieLoaderDiagnostics,
-) -> pie_loader::ffi::PieLoaderStatus = pie_loader::ffi::entry::pie_loader_compile_contract;
+    *const pie_loader_capi::model::PieLoaderModelRequest,
+    *mut *mut pie_loader_capi::PieLoaderPlan,
+    *mut u32,
+    *mut *mut pie_loader_capi::PieLoaderDiagnostics,
+) -> pie_loader_capi::PieLoaderStatus = pie_loader_capi::model::pie_loader_compile_model;
 
 #[cfg(feature = "driver-cuda")]
 #[repr(C)]
@@ -202,21 +204,22 @@ fn path_string(path: &Path) -> String {
     path.display().to_string()
 }
 
-/// Writes an artifact's compiled model config beside the startup TOML and
-/// names it in `[model]`.
+/// Writes the compiled model config beside the startup TOML and names it in
+/// `[model]`.
 ///
 /// Beside rather than inlined: the driver already takes a path, and opening a
 /// second one is less machinery than teaching TOML to carry a JSON document.
-/// Absent for a legacy snapshot, which is exactly the case the drivers'
-/// `config.json` fallback still exists for.
+///
+/// Unconditional. It was optional while a snapshot reached the driver without
+/// a descriptor and each driver parsed `config.json` itself; `weights.rs`
+/// normalizes that case now, so there is one normalizer and every boot writes
+/// this file. The type says so, which is what keeps the deleted branch from
+/// growing back.
 fn write_descriptor_beside(
     out_path: &Path,
-    descriptor: Option<&[u8]>,
+    descriptor: &[u8],
     model: &mut toml::Table,
 ) -> Result<()> {
-    let Some(descriptor) = descriptor else {
-        return Ok(());
-    };
     let beside = out_path.with_file_name("model.descriptor.json");
     std::fs::write(&beside, descriptor)
         .with_context(|| format!("write model descriptor {beside:?}"))?;
@@ -382,7 +385,7 @@ pub fn write_metal_startup_toml(
     options: &MetalDriverOptions,
     snapshot_dir: &Path,
     _group_id: usize,
-    descriptor: Option<&[u8]>,
+    descriptor: &[u8],
 ) -> Result<()> {
     let mut doc = toml::Table::new();
 
@@ -463,7 +466,7 @@ pub(crate) fn write_cuda_startup_toml(
     snapshot_dir: &Path,
     _group_id: usize,
     tp: Option<&TpLaunch>,
-    descriptor: Option<&[u8]>,
+    descriptor: &[u8],
 ) -> Result<()> {
     let mut doc = toml::Table::new();
 
@@ -521,7 +524,23 @@ pub(crate) fn write_cuda_startup_toml(
     if let Some(pages) = opts.max_total_pages {
         insert_int(&mut batching, "total_pages", pages);
     }
+    // Omitted when absent, like the other derived keys: the driver defaults
+    // them to "let the planner choose", so writing a sentinel would be a
+    // second spelling of an absent key.
+    if let Some(tokens) = opts.max_forward_tokens {
+        insert_int(&mut batching, "max_forward_tokens", tokens);
+    }
+    if let Some(requests) = opts.max_forward_requests {
+        insert_int(&mut batching, "max_forward_requests", requests);
+    }
     insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
+    // Written only when asked for, like the derived keys above: the driver
+    // defaults it to false too, so emitting `false` would be a second spelling
+    // of an absent key. It also keeps the startup TOML saying nothing about
+    // calibration on every ordinary boot.
+    if opts.calibrate_planner {
+        insert_bool(&mut batching, "calibrate_planner", true);
+    }
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
@@ -643,7 +662,7 @@ fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
 pub(crate) fn create_driver_backend_group(
     rank_options: &[DriverOptions],
     snapshot_dir: &Path,
-    descriptor: Option<&[u8]>,
+    descriptor: &[u8],
     group_id: usize,
     tp_launches: &[TpLaunch],
     component: pie_driver_abi::ModelComponent,
@@ -675,7 +694,14 @@ pub(crate) fn create_driver_backend_group(
         }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
         let toml_path = state_dir.join("driver.toml");
-        write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp), descriptor)?;
+        write_cuda_startup_toml(
+            &toml_path,
+            opts,
+            snapshot_dir,
+            group_id,
+            Some(tp),
+            descriptor,
+        )?;
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 
@@ -711,7 +737,7 @@ pub(crate) fn create_driver_backend_group(
 pub(crate) fn create_driver_backend(
     options: &DriverOptions,
     snapshot_dir: &Path,
-    descriptor: Option<&[u8]>,
+    descriptor: &[u8],
     group_id: usize,
     tp: Option<&TpLaunch>,
     component: pie_driver_abi::ModelComponent,
@@ -773,6 +799,14 @@ pub(crate) fn create_driver_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in `pie.model/1` document for the tests that are about
+    /// something else. The writers move the bytes without reading them, so
+    /// the smallest valid document is the honest fixture: anything richer
+    /// would suggest these tests check the descriptor's content, and none of
+    /// them do (`the_startup_toml_always_carries_a_descriptor` is the one
+    /// that checks it arrives).
+    const DESCRIPTOR: &[u8] = br#"{"version":"pie.model/1"}"#;
 
     #[test]
     fn caps_json_round_trips() {
@@ -836,7 +870,7 @@ mod tests {
                 activation_dtype: "f32".to_string(),
             },
             &snapshot,
-            None,
+            DESCRIPTOR,
             0,
             None,
             pie_driver_abi::ModelComponent::Full,
@@ -1125,7 +1159,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("driver.toml");
         let snap = dir.path().join("snapshot");
-        write_cuda_startup_toml(&out, &CudaNativeDriverOptions::default(), &snap, 0, None, None)
+        write_cuda_startup_toml(&out, &CudaNativeDriverOptions::default(), &snap, 0, None, DESCRIPTOR)
             .unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(val["cache"]["dir"].as_str().unwrap(), "/pie-home/cache");
@@ -1160,6 +1194,49 @@ mod tests {
         );
     }
 
+    /// A calibration request reaches the driver, and only ever from memory.
+    ///
+    /// This is the whole route that replaced `[driver] calibrate_planner`:
+    /// `pie config tune` sets `server.calibrate_planner` on a config it
+    /// derived, `engine::apply_embedded_calibration` puts it on the driver
+    /// options, and this is where it becomes something the C++ side reads. The
+    /// per-launch startup TOML is the only file it ever appears in, and that
+    /// file is regenerated every boot -- so the request cannot outlive the boot
+    /// that made it.
+    #[test]
+    fn a_calibration_request_reaches_the_driver_and_stops_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.calibrate_planner = true;
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None, DESCRIPTOR).unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            val["batching"]["calibrate_planner"].as_bool(),
+            Some(true),
+            "the driver never hears the request"
+        );
+
+        // And the field is not part of the file format: a user config that
+        // spells it is refused, so this value can only have come from memory.
+        let asked = "\
+[model]
+name = \"m\"
+hf_repo = \"x\"
+[driver]
+type = \"cuda_native\"
+device = [\"cuda:0\"]
+calibrate_planner = true
+";
+        let err = crate::config::Config::parse(asked)
+            .expect_err("a measurement is not a setting")
+            .to_string();
+        assert!(err.contains("calibrate_planner"), "got: {err}");
+    }
+
     #[test]
     fn cuda_startup_toml_matches_driver_schema() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1168,7 +1245,7 @@ mod tests {
         let mut opts = CudaNativeDriverOptions::default();
         opts.device = "cuda:0".to_string();
 
-        write_cuda_startup_toml(&out, &opts, &snap, 0, None, None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None, DESCRIPTOR).unwrap();
 
         // Re-parse the emitted TOML to confirm the schema the cuda
         // driver expects matches what we wrote (driver-side parsing
@@ -1197,6 +1274,12 @@ mod tests {
         );
         assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
         assert!(val["batching"].get("total_pages").is_none());
+        // An ordinary boot says nothing about calibration: it is one run of a
+        // measurement, not a setting every startup file restates. The only
+        // thing that ever turns it on is `pie config tune`, on a config it
+        // derived in memory -- see `CudaNativeDriverOptions::calibrate_planner`
+        // for why it cannot come from a file.
+        assert!(val["batching"].get("calibrate_planner").is_none());
         assert_eq!(val["batching"].as_table().unwrap().len(), 4);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         // Expert streaming is off unless an operator asks for it: for a model
@@ -1226,7 +1309,7 @@ mod tests {
         let mut off = MetalDriverOptions::default();
         off.device = "metal:0".to_string();
         let out_off = tmp.path().join("off.toml");
-        write_metal_startup_toml(&out_off, &off, &snap, 0, None).unwrap();
+        write_metal_startup_toml(&out_off, &off, &snap, 0, DESCRIPTOR).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
         assert_eq!(val["model"]["backend"].as_str().unwrap(), "metal:0");
         assert_eq!(
@@ -1240,7 +1323,7 @@ mod tests {
         on.device = "metal:0".to_string();
         on.stream_routed_experts = true;
         let out_on = tmp.path().join("on.toml");
-        write_metal_startup_toml(&out_on, &on, &snap, 0, None).unwrap();
+        write_metal_startup_toml(&out_on, &on, &snap, 0, DESCRIPTOR).unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
         assert_eq!(
             val["model"]["stream_routed_experts"].as_bool().unwrap(),
@@ -1274,7 +1357,7 @@ mod tests {
         opts.device = "cuda:0".to_string();
         opts.verbose = true;
 
-        write_cuda_startup_toml(&out, &opts, &snap, 0, None, None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None, DESCRIPTOR).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
@@ -1290,7 +1373,7 @@ mod tests {
         opts.device = "cuda:1".to_string();
         opts.runtime_quant = "fp8".to_string();
 
-        write_cuda_startup_toml(&out, &opts, &snap, 3, None, None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 3, None, DESCRIPTOR).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
@@ -1307,7 +1390,7 @@ mod tests {
         opts.device = "cuda:0".to_string();
         opts.mxfp4_moe = "bf16".to_string();
 
-        write_cuda_startup_toml(&out, &opts, &snap, 0, None, None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None, DESCRIPTOR).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
@@ -1327,7 +1410,7 @@ mod tests {
             nccl_unique_id_hex: "abcd".to_string(),
         };
 
-        write_cuda_startup_toml(&out, &opts, &snap, 4, Some(&tp), None).unwrap();
+        write_cuda_startup_toml(&out, &opts, &snap, 4, Some(&tp), DESCRIPTOR).unwrap();
 
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
@@ -1343,15 +1426,19 @@ mod tests {
         );
     }
 
-    /// The compiled model config travels beside the startup TOML when there is
-    /// one, and the key is absent when there is not.
+    /// The compiled model config travels beside the startup TOML — always.
     ///
-    /// Both drivers take the same arrangement, so both are pinned here. The
-    /// writer takes the descriptor as an argument rather than deriving it from
-    /// the path — lifting it is the resolver's job, done once — so this test
-    /// is about the *contract*, not about where the bytes came from.
+    /// This used to assert the other half too: that the key is *absent* for a
+    /// snapshot, which is what let each driver keep a `config.json` parser for
+    /// the absent case. `weights.rs` normalizes a snapshot into a descriptor
+    /// now, so there is no absent case to pin and the parsers are gone. The
+    /// writers still take the descriptor as an argument rather than deriving
+    /// it from the path — lifting it is the resolver's job, done once — so
+    /// this is about the *contract*, not about where the bytes came from.
+    ///
+    /// Both drivers take the same arrangement, so both are pinned here.
     #[test]
-    fn the_startup_toml_carries_a_descriptor_only_when_there_is_one() {
+    fn the_startup_toml_always_carries_a_descriptor() {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = dir.path().join("snap");
         std::fs::create_dir(&snapshot).unwrap();
@@ -1372,31 +1459,18 @@ mod tests {
         };
 
         assert_eq!(
-            carried("cuda-artifact", &|out| {
-                write_cuda_startup_toml(out, &cuda, &snapshot, 0, None, Some(body)).unwrap()
+            carried("cuda", &|out| {
+                write_cuda_startup_toml(out, &cuda, &snapshot, 0, None, body).unwrap()
             })
             .as_deref(),
             Some(body.as_slice())
         );
         assert_eq!(
-            carried("metal-artifact", &|out| {
-                write_metal_startup_toml(out, &metal, &snapshot, 0, Some(body)).unwrap()
+            carried("metal", &|out| {
+                write_metal_startup_toml(out, &metal, &snapshot, 0, body).unwrap()
             })
             .as_deref(),
             Some(body.as_slice())
-        );
-        assert!(
-            carried("cuda-legacy", &|out| {
-                write_cuda_startup_toml(out, &cuda, &snapshot, 0, None, None).unwrap()
-            })
-            .is_none(),
-            "a snapshot has no compiled descriptor to point at"
-        );
-        assert!(
-            carried("metal-legacy", &|out| {
-                write_metal_startup_toml(out, &metal, &snapshot, 0, None).unwrap()
-            })
-            .is_none()
         );
     }
 }

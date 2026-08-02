@@ -22,7 +22,8 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     const std::string d = "_d_" + std::to_string(g.head_dim);
     const std::string q = g.quant.kernel_suffix();
     const std::string sdpa_name = "sdpa_vector_decode_bfloat16" + d;
-    const std::string paged_name = "sdpa_paged_decode_bfloat16" + d;
+    const std::string paged_name =
+        "sdpa_paged_decode_bfloat16" + d + (g.kv_page_size == 32 ? "_p32" : "");
     const std::string tiled_name = "sdpa_paged_tiled_bfloat16" + d;
     std::vector<Spec> specs = {
         {"sdpa_vector.metal", sdpa_name, &out.sdpa},
@@ -30,6 +31,10 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         {"sdpa_paged.metal", tiled_name, &out.sdpa_paged_tiled},
         {"row_gather.metal", "row_gather_bfloat16", &out.row_gather},
     };
+    if (g.head_dim == 64 && g.kv_page_size == 32) {
+        specs.push_back(
+            {"sdpa_paged.metal", paged_name + "_sg8", &out.sdpa_paged_sg8});
+    }
     if (g.rope_freq_table) {
         specs.push_back({"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs});
         specs.push_back({"rope.metal", "rope_neox_freqs_mb_bfloat16", &out.rope_freqs_mb});
@@ -38,7 +43,7 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // compiling them anyway would let an unrelated shader error fail a load
     // that would otherwise have worked.
     if (g.is_moe()) {
-        specs.push_back({"gptoss.metal", "router_topk_bfloat16", &out.router_topk});
+        specs.push_back({"moe_route.metal", "router_topk_bfloat16", &out.router_topk});
         specs.push_back({"quantized_qmv.metal", "affine_qmv_routed" + q, &out.qmv_routed});
         specs.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});
         specs.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});

@@ -266,15 +266,14 @@ async fn main(input: Input) -> Result<String> {
     uncond_decode.epilogue(move || {
         let length = u_klen.take();
         let next_length = &length + 1u32;
-        let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
+        let page_count = next_length.div_ceil(PAGE_T);
 
         u_logits_out.put(intrinsics::logits());
         u_klen.put(&next_length);
         u_pos.put(&length);
         u_slot.put(&length / PAGE_T);
         u_off.put(&length % PAGE_T);
-        u_page_indptr.take();
-        u_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+        u_page_indptr.put(indptr(1, &page_count));
     });
 
     let c_token = Channel::from([first as i32]).named("cond_token");
@@ -316,15 +315,14 @@ async fn main(input: Input) -> Result<String> {
         let length = c_klen.take();
         let (token, shift, kl) = cad_pick(&c_uncond.take(), alpha);
         let next_length = &length + 1u32;
-        let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
+        let page_count = next_length.div_ceil(PAGE_T);
 
         c_token.put(&token);
         c_klen.put(&next_length);
         c_pos.put(&length);
         c_slot.put(&length / PAGE_T);
         c_off.put(&length % PAGE_T);
-        c_page_indptr.take();
-        c_page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+        c_page_indptr.put(indptr(1, &page_count));
         c_token_out.put(&token);
         c_shift_out.put(&shift);
         c_kl_out.put(&kl);

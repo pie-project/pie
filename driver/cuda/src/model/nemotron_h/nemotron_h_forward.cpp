@@ -1,5 +1,5 @@
 #include "model/nemotron_h/nemotron_h_forward.hpp"
-#include "model/nemotron_h/nemotron_h_contract.hpp"
+#include "model/nemotron_h/nemotron_h.hpp"
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>

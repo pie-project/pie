@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
         std::string base_err;
         const bool base_ok = pie::metal::load_decode_psos(
             *ctx, kernels_dir, base, pie::metal::AffineFormat{4, 64},
-            /*with_argmax=*/true, &base_err);
+            &base_err, pie::metal::DecodePsoFeatures{.argmax = true});
         expect(base_ok, "the shared decode PSOs compile: " + (base_ok ? std::string("ok")
                                                                      : base_err));
         if (base_ok) {
@@ -219,7 +219,8 @@ int main(int argc, char** argv) {
             std::string mb_err;
             const bool mb_ok = pie::metal::load_multibatch_psos(
                 *ctx, kernels_dir, mb, pie::metal::AffineFormat{4, 64},
-                /*with_d512=*/true, &mb_err);
+                &mb_err, pie::metal::MultiBatchPsoFeatures{
+                             .d512 = true, .sdpa_d256 = true});
             expect(mb_ok, "the multi-batch PSOs compile: " + (mb_ok ? std::string("ok")
                                                                     : mb_err));
             if (mb_ok) {

@@ -56,11 +56,8 @@ async fn main(input: Input) -> Result<String> {
     let pool_ids = slots.ids().to_vec();
 
     let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
-    let prefill_slots = Channel::from(
-        (0..n)
-            .map(|position| pool_ids[(position / page_t) as usize])
-            .collect::<Vec<_>>(),
-    );
+    let prefill_slots =
+        Channel::from_iter((0..n).map(|position| pool_ids[(position / page_t) as usize]));
     let prefill_offsets = Channel::from_iter((0..n).map(|position| position % page_t));
     let prefill_klen = Channel::from([n]);
     let prefill_pages = Channel::from(pool_ids.clone());
@@ -68,7 +65,7 @@ async fn main(input: Input) -> Result<String> {
     // `kv_len = (page_count-1)*page_t + last_page_len`. A pool-wide constant page
     // count claims a kv length the pass does not have and silently corrupts
     // attention, so the count must track `kv_len` exactly.
-    let prefill_indptr = Channel::from_shaped([2], vec![0u32, n.div_ceil(page_t)]);
+    let prefill_indptr = Channel::from([0u32, n.div_ceil(page_t)]);
     let causal = Channel::from_shaped(
         [n, pool_len],
         (0..n)
@@ -134,7 +131,7 @@ async fn main(input: Input) -> Result<String> {
             .collect::<Vec<_>>(),
     );
     let pages = Channel::from(pool_ids.clone());
-    let page_indptr = Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(page_t)]);
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_t)]);
     let decode_embed_indptr = Channel::from([0u32, 1]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
@@ -166,27 +163,18 @@ async fn main(input: Input) -> Result<String> {
         let next = &base + 1u32;
 
         // Device-resolved geometry is loop-carried: the host never drains
-        // these rings, so the graph has to take before it puts or the
-        // readiness check sees a full ring and refuses to commit the pass.
-        token_in.take();
+        // these rings, so every fire's values are re-put here.
         token_in.put(&token);
         token_out.put(&token);
-        position.take();
         position.put(&base);
         fill.put(&next);
-        klen.take();
         klen.put(&next);
-        write_slot.take();
         write_slot.put(gather(&ids, &logical_slot));
-        write_offset.take();
         write_offset.put(&base % page_t);
-        mask.take();
         mask.put(&next_mask);
-        pages.take();
         pages.put(reshape(&ids, [pool_pages]));
-        page_indptr.take();
-        let page_count = (&next + (page_t - 1)) / page_t;
-        page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+        let page_count = next.div_ceil(page_t);
+        page_indptr.put(indptr(1, &page_count));
         pool_ids_input.put(&ids);
     });
 

@@ -15,7 +15,6 @@ use crate::inferlet::host::pipeline::Pipeline;
 use crate::store::registry as store_registry;
 use crate::store::rs::RsGeometry;
 use crate::store::rs::working_set::RsWorkingSet;
-use pie_model;
 
 type WitRange = pie::inferlet::working_set::PageRange;
 
@@ -26,7 +25,7 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
     async fn new(&mut self) -> Result<Resource<RsWorkingSet>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
         let model = 0;
-        let caps = pie_model::model().rs_caps();
+        let caps = crate::model::model().rs_caps();
         let geom = RsGeometry {
             state_size: caps.state_size,
             buffer_page_tokens: caps.buffer_page_size,

@@ -15,6 +15,7 @@
 #include <toml++/toml.hpp>
 #endif
 
+#include "batch/planner_calibration.hpp"
 #include "store/kv_cache_format.hpp"
 
 namespace pie_cuda_driver {
@@ -70,6 +71,18 @@ struct BatchingConfig {
     // tiny deterministic pool can be forced (contention/preempt tests + CI),
     // independent of the forward-layout budget floor. Mirrors metal's total_pages.
     std::int64_t total_pages = 0;
+    // HARD pins on the forward-step shape. 0 = let the memory planner choose,
+    // which is the normal case. A pin collapses that axis of the planner's
+    // candidate lattice to one value -- the same convention `kv_page_size`
+    // uses, and for the same reason: a value measured on this machine beats
+    // one scored by a model of it.
+    std::uint32_t max_forward_tokens = 0;
+    std::uint32_t max_forward_requests = 0;
+    // Time the forward step across the token-budget ladder on this boot and
+    // cache the winner, instead of selecting `max_forward_tokens` from the
+    // planner's analytic score. Costs seconds of startup; see
+    // batch/planner_calibration.hpp.
+    bool calibrate_planner = false;
 };
 
 // Tensor-parallel group geometry. Default {1, 0, ""} = single-GPU; nothing
@@ -184,6 +197,9 @@ inline Config load_config(const std::filesystem::path& path) {
             "swap_pool_size",
             "kv_cache_dtype",
             "total_pages",
+            "calibrate_planner",
+            "max_forward_tokens",
+            "max_forward_requests",
         };
         for (const auto& [key, _] : *b) {
             const auto name = key.str();
@@ -232,6 +248,25 @@ inline Config load_config(const std::filesystem::path& path) {
                 "config: [batching].total_pages must be >= 0 (0 = derive from util)");
         }
         c.batching.total_pages = total_pages;
+        const auto pin = [&](const char* key, std::uint32_t& into) {
+            const auto value = (*b)[key].value_or<int64_t>(0);
+            if (value < 0 ||
+                value > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::runtime_error(
+                    std::string{"config: [batching]."} + key +
+                    " must be in [0, u32::MAX] (0 = let the planner choose)");
+            }
+            into = static_cast<std::uint32_t>(value);
+        };
+        pin("max_forward_tokens", c.batching.max_forward_tokens);
+        pin("max_forward_requests", c.batching.max_forward_requests);
+        c.batching.calibrate_planner =
+            (*b)["calibrate_planner"].value_or(c.batching.calibrate_planner);
+        // Published here for the same reason as the cache dirs below: the
+        // memory planner and the batch engine both ask whether this boot is a
+        // calibration run, and neither is constructed anywhere that sees a
+        // `Config`.
+        set_planner_calibration_requested(c.batching.calibrate_planner);
     }
     if (auto d = tbl["distributed"].as_table()) {
         c.distributed.tp_size = static_cast<int>(

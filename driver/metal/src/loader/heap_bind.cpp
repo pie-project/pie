@@ -204,14 +204,19 @@ void copy_extent(
 }
 
 
-/// Where a load's wall clock went. Disabled; `on` is a compile-time false.
+/// Where a load's wall clock went, printed when `PIE_METAL_LOAD_TRACE` is set.
 ///
 /// Staging a stock gpt-oss checkpoint runs two transforms over twenty billion
 /// weights, and "the load is slow" is not a statement anyone can act on: the
 /// question is always whether the time is in the arithmetic, in the file, or in
 /// the allocator. This answers it without a profiler.
+///
+/// One switch, four reports: this breakdown, the `setup:` marks in
+/// `forward.cpp`, and the two `load:` lines below. They are read together --
+/// `forward.cpp` points at this one by name -- so arming three of them and not
+/// the fourth answers the question with its middle term missing.
 struct LoadTrace {
-    bool on = false;
+    bool on = std::getenv("PIE_METAL_LOAD_TRACE") != nullptr;
     double scratch_alloc_ms = 0, scratch_free_ms = 0;
     double extent_ms = 0, bulk_ms = 0, scale_ms = 0, encode_ms = 0;
     std::uint64_t scale_out_bytes = 0, encode_in_bytes = 0, scratch_bytes = 0;
@@ -777,11 +782,15 @@ WeightBytes weight_bytes(const std::unordered_map<std::string, SlotHandle>& weig
         const bool first = counted.emplace(slot.contents(), std::uint64_t(slot.size)).second;
         if (!first) continue;
         out.resident += slot.size;
-        // `mlp.experts.` is the runtime name every family's routed bank is
-        // staged under -- llama's, qwen3.5's and gpt-oss's alike -- and the
-        // shared expert beside it is `mlp.shared_expert.`, which every token
-        // reads whole and which this therefore leaves alone.
-        if (name.find("mlp.experts.") != std::string::npos) {
+        // `experts.` is the runtime name every family's routed bank is staged
+        // under: llama, qwen3.5 and gpt-oss spell it `mlp.experts.`, gemma4
+        // hangs it straight off the layer as `layers.N.experts.`. Matching the
+        // longer prefix therefore discounted nothing for gemma4 and reported
+        // the 26B reading its whole 13.47 GiB heap every token -- 806 GB/s on
+        // a 400 GB/s bus. The shared expert beside the bank is
+        // `mlp.shared_expert.`, singular, which this does not match and which
+        // is right: every token reads it whole.
+        if (name.find("experts.") != std::string::npos) {
             out.routed_resident += slot.size;
             out.per_token += double(slot.size) * share;
         } else if (name.rfind("embed_tokens", 0) == 0) {

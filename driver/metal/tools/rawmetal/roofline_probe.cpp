@@ -24,6 +24,9 @@
 #ifndef PIE_METAL_TOOL_KERNELS_DIR
 #define PIE_METAL_TOOL_KERNELS_DIR "."
 #endif
+#ifndef PIE_METAL_TOOL_LOCAL_KERNELS_DIR
+#define PIE_METAL_TOOL_LOCAL_KERNELS_DIR "."
+#endif
 
 using namespace pie::metal;
 
@@ -83,7 +86,9 @@ int main(int argc, char** argv) {
     if (!ctx) { printf("FAIL: no context\n"); return 1; }
     std::string err;
 
-    Pso stream = ctx->compile_pso_from_file(dir + "/roofline_stream.metal",
+    Pso stream = ctx->compile_pso_from_file(
+                                            std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) +
+                                                "/roofline_stream.metal",
                                             "stream_read_bf16", &err);
     if (!stream.valid()) { printf("FAIL stream compile: %s\n", err.c_str()); return 1; }
     Pso qmm = ctx->compile_pso_from_file(
@@ -132,7 +137,9 @@ int main(int argc, char** argv) {
     // What one more barrier-separated dispatch costs, with no compute and no
     // memory traffic in it -- the floor every dispatch in the step pays.
     {
-        Pso nop = ctx->compile_pso_from_file(dir + "/nop_probe.metal", "nop_probe", &err);
+        Pso nop = ctx->compile_pso_from_file(
+            std::string(PIE_METAL_TOOL_LOCAL_KERNELS_DIR) + "/nop_probe.metal",
+            "nop_probe", &err);
         if (nop.valid()) {
             LatencyHarness h(*ctx);
             for (int reps : {64, 256, 1024}) {

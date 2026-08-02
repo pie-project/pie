@@ -45,7 +45,7 @@
 //! per fire AND per pass instance, so the two streams need not be equal:
 //! the mock smoke (`lowlevel_chat_mock`) asserts only that the loops run to
 //! completion with the full `n=max_tokens` budget and a well-formed report.
-//! Token identity is the 4090 gate (`bin/pie/tests/cuda_lowlevel_chat.rs`).
+//! Token identity is the 4090 gate (`tests/gpu/tests/cuda_lowlevel_chat.rs`).
 //! The mock run passes `no-rollback-probe`, which skips the deep + forced-stop
 //! device paths exactly like the classic version did.
 //!
@@ -129,9 +129,9 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
     let w_slot_p = Channel::from(w_slot_pv).named("w_slot_p");
     let w_off_p = Channel::from(w_off_pv).named("w_off_p");
-    let klen_p = Channel::from(vec![n; 1]).named("klen_p");
+    let klen_p = Channel::from([n]).named("klen_p");
     let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-    let page_indptr_p = Channel::from_shaped([2], vec![0u32, pool_pages]).named("pidx_p");
+    let page_indptr_p = Channel::from([0u32, pool_pages]).named("pidx_p");
     let mask_pv: Vec<bool> = (0..n)
         .flat_map(|i| (0..pool).map(move |j| j <= i))
         .collect();
@@ -171,16 +171,16 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     //       the sampled token into the next fire's embed (the run-ahead
     //       carrier) and advances geometry + mask in-graph. ──
     let phys_n = pool_ids[(n / PAGE_T) as usize];
-    let tok_in = Channel::from(vec![g0 as i32; 1]).named("tok_in");
-    let pos = Channel::from(vec![n; 1]).named("pos");
-    let fill = Channel::from(vec![n + 1; 1]).named("fill");
-    let klen = Channel::from(vec![n + 1; 1]).named("klen");
-    let w_slot = Channel::from(vec![phys_n; 1]).named("w_slot");
-    let w_off = Channel::from(vec![n % PAGE_T; 1]).named("w_off");
+    let tok_in = Channel::from([g0 as i32]).named("tok_in");
+    let pos = Channel::from([n]).named("pos");
+    let fill = Channel::from([n + 1]).named("fill");
+    let klen = Channel::from([n + 1]).named("klen");
+    let w_slot = Channel::from([phys_n]).named("w_slot");
+    let w_off = Channel::from([n % PAGE_T]).named("w_off");
     let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
     let mask = Channel::from_shaped([1, pool], seed_mask).named("mask");
     let pages = Channel::from(pool_ids.clone()).named("pages");
-    let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr");
+    let page_indptr = Channel::from([0u32, pool_pages]).named("page_indptr");
     let pool_ids_ch = Channel::new([pool_pages], dtype::u32).named("pool_ids");
     let out = Channel::new([1], dtype::i32)
         .capacity(budget as u32 + 1)
@@ -225,17 +225,13 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
 
         tok_in.put(&tok); // the device carrier: next fire embeds this token
         out.put(&tok);
-        mask.take();
         mask.put(&new_mask);
         w_slot.put(&w_slot_v);
         w_off.put(&w_off_v);
-        klen.take();
         klen.put(&klen_v);
         pos.put(&base);
         fill.put(&next_free);
-        pages.take();
         pages.put(&pages_v);
-        page_indptr.take();
         page_indptr.put(&pidx_v);
     });
 

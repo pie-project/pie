@@ -30,18 +30,10 @@ async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i
     let positions = Channel::from_iter(suffix_start..N).named("positions");
     let pages = Channel::from_iter(0..max_pages).named("pages");
     let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
-    let w_slot = Channel::from(
-        (suffix_start..N)
-            .map(|position| position / PAGE_T)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot");
-    let w_off = Channel::from(
-        (suffix_start..N)
-            .map(|position| position % PAGE_T)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off");
+    let w_slot =
+        Channel::from_iter((suffix_start..N).map(|position| position / PAGE_T)).named("w_slot");
+    let w_off =
+        Channel::from_iter((suffix_start..N).map(|position| position % PAGE_T)).named("w_off");
     let out = Channel::new([1], dtype::i32).named("out");
 
     let fwd: ForwardPass = ForwardPass::new();
@@ -135,18 +127,10 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
     let positions_b = Channel::from_iter(PAGE_T..N).named("positions_b");
     let pages_b = Channel::from_iter(0..max_pages).named("pages_b");
     let page_indptr_b = Channel::from([0u32, max_pages]).named("page_indptr_b");
-    let w_slot_b = Channel::from(
-        (PAGE_T..N)
-            .map(|position| position / PAGE_T)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot_b");
-    let w_off_b = Channel::from(
-        (PAGE_T..N)
-            .map(|position| position % PAGE_T)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off_b");
+    let w_slot_b =
+        Channel::from_iter((PAGE_T..N).map(|position| position / PAGE_T)).named("w_slot_b");
+    let w_off_b =
+        Channel::from_iter((PAGE_T..N).map(|position| position % PAGE_T)).named("w_off_b");
     let out = Channel::new([1], dtype::i32).named("out_b");
     let fwd_b: ForwardPass = ForwardPass::new();
     fwd_b.embed(&toks_b, &embed_indptr_b)?;

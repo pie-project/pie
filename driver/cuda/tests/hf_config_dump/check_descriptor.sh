@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Round-trips every corpus config through the *new* path and diffs against the
-# old one.
+# Round-trips every corpus config through the descriptor path and diffs against
+# what the normalizer it replaced produced.
 #
-#   config.json --[C++ parse_hf_config]-------------------> golden
+#   config.json --[C++ parse_hf_config]-------------------> golden  (recorded)
 #   config.json --[Rust normalize]--> pie.model/1 --[C++ read]--> must equal it
 #
-# This is what says `parse_hf_config` can be deleted: both halves of the
+# This is what said `parse_hf_config` could be deleted: both halves of the
 # replacement, checked end to end against the thing being replaced, on 28 real
-# configs and 27 synthetic ones.
+# configs and 27 synthetic ones. It has been deleted, so the top line is now a
+# recording rather than a run -- `golden/` is checked in, which is what lets
+# this keep working with the oracle gone.
 #
 #   ./check_descriptor.sh
 #
@@ -20,7 +22,6 @@ repo="$(cd "$here/../../../.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-"$here/build.sh" "$work/dump_hf_config" >/dev/null
 "$here/build.sh" --descriptor "$work/dump_from_descriptor" >/dev/null
 (cd "$repo" && cargo build -q -p pie-model-config --bin descriptor)
 descriptor="$repo/target/debug/descriptor"

@@ -326,7 +326,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE LOOP (1-wide, run-ahead), with the TOVA tap. ──
     if generated.len() < max_tokens {
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
+        let tok_in = Channel::from([g0]).named("tok_in");
         // Same salt as `naive-baseline`. The coherence test asks whether an
         // all-keep page mask changes what the model produces, and that question
         // is only answerable if every other input is held fixed -- including
@@ -447,15 +447,14 @@ async fn main(input: Input) -> Result<Output> {
             let token = step(logits, temperature, &r);
 
             let next_length = &length + 1u32;
-            let page_count = (&next_length + (page_size - 1)) / page_size;
+            let page_count = next_length.div_ceil(page_size);
 
             tok_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
-            page_indptr.take();
-            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+            page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             rng.put(&(&r + iota(2)));
 

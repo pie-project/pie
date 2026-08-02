@@ -117,6 +117,11 @@ struct MemberForwardDesc {
     std::uint32_t query_len = 0;
     std::uint32_t key_len = 0;
     std::uint32_t kv_len = 0;
+    // Prefer the device's exact greedy token for every readout row and skip
+    // full-logits staging when the family supports it. Other families retain
+    // the existing logits path, so this is an optimization request, not a
+    // capability requirement.
+    bool greedy_token_only = false;
 };
 
 // f32 logits materialized for this fire's readout rows, in
@@ -133,6 +138,10 @@ struct LogitsOut {
     std::uint64_t device_gpu_address = 0;
     std::uint64_t device_bytes = 0;
     std::uint32_t device_row_offset = 0;
+    // Optional Shared-storage device-greedy result. Valid until the next fire,
+    // like the logits view; `greedy_row_offset` selects this member's rows.
+    const std::uint32_t* greedy_contents = nullptr;
+    std::uint32_t greedy_row_offset = 0;
 };
 
 struct PtirCommandCallbacks {
@@ -324,8 +333,8 @@ inline std::uint32_t paged_max_forward_tokens(std::uint32_t vocab,
 struct SetupConfig {
     std::string checkpoint_dir;  // HF snapshot dir (config.json + safetensors)
     std::string kernels_dir;     // compiled .metal library search dir
-    std::string arch_name;       // read_model_facts() arch, for a truthful early reject
-    std::uint32_t vocab_size = 0;      // config.json vocab_size, cross-checked vs the shipped geometry
+    std::string arch_name;       // descriptor `model_type`, for a truthful early reject
+    std::uint32_t vocab_size = 0;      // descriptor vocab_size, cross-checked vs the shipped geometry
     bool has_linear_attn = false;      // config-derived GDN/hybrid signal (qwen3.6 requires this)
     // Phase 1b/3 paged-KV bridge: the runtime's configured pool capacity
     // (cfg.batching.total_pages/kv_page_size) — MetalExecutor::setup()
@@ -340,6 +349,11 @@ struct SetupConfig {
     // itself, because only the driver knows the device
     // (`loader/architecture.md` §3).
     std::string snapshot_dir;
+    // The `pie.model/1` document this boot was handed, verbatim — what the
+    // compile request carries. Forwarded rather than distilled: the fields the
+    // authors read are decided beside the authors (`ModelFacts::from_descriptor`),
+    // so a fact nobody here has heard of still reaches them.
+    std::string descriptor_json;
     // Page this model's routed experts in from a mapping instead of keeping
     // them resident in the heap.
     //

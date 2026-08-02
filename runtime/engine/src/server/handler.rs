@@ -9,7 +9,7 @@ use pie_client::message::ServerMessage;
 use crate::inferlet::process;
 use crate::inferlet::program;
 use crate::inferlet::{Manifest, ProcessId, ProgramName};
-use pie_model as model;
+use crate::model;
 
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};

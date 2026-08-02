@@ -86,18 +86,10 @@ async fn forward_logits(
     let positions = Channel::from_iter(start..end).named("positions");
     let pages = Channel::from_iter(0..pool_pages).named("pages");
     let page_indptr = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr");
-    let w_slot = Channel::from(
-        (start..end)
-            .map(|position| position / page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot");
-    let w_off = Channel::from(
-        (start..end)
-            .map(|position| position % page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off");
+    let w_slot =
+        Channel::from_iter((start..end).map(|position| position / page_size)).named("w_slot");
+    let w_off =
+        Channel::from_iter((start..end).map(|position| position % page_size)).named("w_off");
     let logits_out = Channel::new([vocab], dtype::f32).named("logits_out");
 
     let fwd = ForwardPass::new();

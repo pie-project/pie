@@ -360,7 +360,7 @@ fn infer(
 
         Op::CumSum(v) | Op::CumProd(v) => {
             let t = g(v)?;
-            if t.dtype != DType::F32 {
+            if !t.dtype.is_numeric() {
                 return Err(dtype_err());
             }
             if t.shape.rank() == 0 {

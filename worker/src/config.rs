@@ -433,6 +433,20 @@ pub struct ServerConfig {
     /// debugging step -- it changes which wasmtime linker variant is built.
     #[serde(default = "default_true")]
     pub python_snapshot: bool,
+    /// Ask this boot to measure the memory planner instead of scoring it.
+    ///
+    /// Set by `pie config tune` on the config it derives in memory, never
+    /// read from a file — `#[serde(skip)]`, so it cannot be written down and
+    /// cannot outlive the boot that asked for it. See
+    /// [`CudaNativeDriverOptions::calibrate_planner`] for why a measurement
+    /// must not be a persisted setting.
+    ///
+    /// It rides here rather than in `[model.driver.options]` because that table
+    /// is the file's, and this never comes from the file. Same route as
+    /// `verbose`: a typed field the engine applies to whatever driver options it
+    /// builds.
+    #[serde(skip)]
+    pub calibrate_planner: bool,
 }
 
 impl Default for ServerConfig {
@@ -444,6 +458,7 @@ impl Default for ServerConfig {
             registry: default_registry(),
             max_concurrent_processes: None,
             python_snapshot: true,
+            calibrate_planner: false,
         }
     }
 }
@@ -839,7 +854,11 @@ impl Default for SchedulerConfig {
 /// submit simply waits for a slot and every submit re-serializes with no
 /// diagnostic at all. That silence is why this is rejected here rather than
 /// clamped: the config layer is the only place it can be caught.
-const UPLOAD_STAGING_DEPTH: u32 = 13;
+/// Public because `pie config tune` enumerates knob candidates against
+/// this bound rather than generating combinations the engine will refuse --
+/// and a second copy of the number is exactly the disagreement this
+/// constant's own doc warns about.
+pub const UPLOAD_STAGING_DEPTH: u32 = 13;
 
 impl SchedulerConfig {
     fn validate(&self) -> Result<()> {
@@ -1224,6 +1243,63 @@ pub struct CudaNativeDriverOptions {
     /// normal case. One name for two meanings is a question a reader cannot
     /// answer from the file.
     pub max_total_pages: Option<u32>,
+    /// HARD pin on the prefill token budget the forward step is built for.
+    ///
+    /// **Omit to let the memory planner choose.** Setting it collapses that
+    /// axis of the planner's lattice to a single candidate, the same way
+    /// `kv_page_size` does — which is the point: a value measured on this
+    /// machine beats one scored by a model of it.
+    ///
+    /// `pie config tune` and `calibrate_planner` are how you get a number
+    /// worth pinning. A guess here is worse than absence, because absence still
+    /// gets the planner's judgement.
+    ///
+    /// Named for the same quantity Metal calls `max_forward_tokens`, because
+    /// here they ARE the same quantity — unlike `total_pages`, where one name
+    /// covered two different things and this driver's field had to be renamed
+    /// `max_total_pages` to break the collision.
+    pub max_forward_tokens: Option<u32>,
+    /// HARD pin on the decode width — how many requests one forward step may
+    /// carry. **Omit to let the memory planner choose.**
+    ///
+    /// Pinning this moves `[server] max_concurrent_processes` underneath you
+    /// when that key is absent: admission derives from the driver's request
+    /// cap, so the two are one decision. Set both, or neither.
+    pub max_forward_requests: Option<u32>,
+    /// Measure the forward step on this boot instead of scoring it.
+    ///
+    /// The memory planner picks `max_forward_tokens` by scoring a candidate
+    /// lattice with an analytic model, and where that model disagreed with
+    /// reality the driver grew per-(model, GPU) special cases carrying
+    /// hand-measured constants. Setting this times the real forward body across
+    /// the budget ladder on THIS device and caches the winner, so the next boot
+    /// selects by evidence instead.
+    ///
+    /// **Not settable, and not a setting.** `pie config tune` turns it on
+    /// for the one boot it runs and never writes it anywhere; see below for why
+    /// it cannot be a key.
+    ///
+    /// It arrived as `PIE_CUDA_PLANNER_CALIBRATE`, and when the flag-deletion
+    /// rule removed that, it came back here — the choice was framed as "config
+    /// or environment variable", and both are wrong in the same way. This is not
+    /// a description of a deployment; it is one run of a measurement. Written
+    /// down, it needs the operator to perform a three-step ritual ("turn it on,
+    /// boot once, turn it off"), and forgetting the third step is not a
+    /// hypothetical failure: the planner abandons its score on a calibration
+    /// boot and builds the LARGEST forward shape it can fit, accepting the
+    /// starved KV pool that leaves, on the stated reasoning that such a boot
+    /// serves nothing. Nothing made that true. So the ritual is gone and the
+    /// third step cannot be forgotten, because there is no step to forget.
+    ///
+    /// `#[serde(skip)]` for the same reason `device` and `verbose` below are:
+    /// pie populates it, a config file does not. It also means the struct's
+    /// `deny_unknown_fields` refuses a hand-written `calibrate_planner = true`
+    /// rather than honouring it.
+    ///
+    /// Refused for `tensor_parallel_size > 1` and for recurrent-state models,
+    /// with a reason on stderr — see `batch/planner_calibration.hpp`.
+    #[serde(skip)]
+    pub calibrate_planner: bool,
     /// Dtype weights are materialized in. Separate from `activation_dtype`:
     /// narrower weights and wider compute is a normal combination.
     pub weight_dtype: String,
@@ -1323,6 +1399,9 @@ impl Default for CudaNativeDriverOptions {
             kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
             max_total_pages: None,
+            max_forward_tokens: None,
+            max_forward_requests: None,
+            calibrate_planner: false,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),
             verbose: false,

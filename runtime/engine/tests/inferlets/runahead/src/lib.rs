@@ -116,9 +116,9 @@ impl Decoder {
         let w_off_v: Vec<u32> = (base..base + n).map(|c| c % PAGE_T).collect();
         let w_slot = Channel::from(w_slot_v).named("w_slot_p");
         let w_off = Channel::from(w_off_v).named("w_off_p");
-        let klen = Channel::from(vec![base + n; 1]).named("klen_p");
+        let klen = Channel::from([base + n]).named("klen_p");
         let pages = Channel::from(self.pool_ids.clone()).named("pages_p");
-        let page_indptr = Channel::from_shaped([2], vec![0u32, self.pool_pages]).named("pidx_p");
+        let page_indptr = Channel::from([0u32, self.pool_pages]).named("pidx_p");
         // Causal mask [N, POOL]: query row i (abs pos base+i) attends j <= base+i.
         let mask_v: Vec<bool> = (0..n)
             .flat_map(|i| (0..self.pool).map(move |j| j <= base + i))
@@ -163,16 +163,16 @@ impl Decoder {
         let pool_pages = self.pool_pages;
         let phys_n = self.pool_ids[(n / PAGE_T) as usize];
 
-        let tok_in = Channel::from(vec![g0 as i32; 1]).named("tok_in");
-        let pos = Channel::from(vec![n; 1]).named("pos");
-        let fill = Channel::from(vec![n + 1; 1]).named("fill");
-        let klen = Channel::from(vec![n + 1; 1]).named("klen");
-        let w_slot = Channel::from(vec![phys_n; 1]).named("w_slot");
-        let w_off = Channel::from(vec![n % PAGE_T; 1]).named("w_off");
+        let tok_in = Channel::from([g0 as i32]).named("tok_in");
+        let pos = Channel::from([n]).named("pos");
+        let fill = Channel::from([n + 1]).named("fill");
+        let klen = Channel::from([n + 1]).named("klen");
+        let w_slot = Channel::from([phys_n]).named("w_slot");
+        let w_off = Channel::from([n % PAGE_T]).named("w_off");
         let seed_mask: Vec<bool> = (0..pool).map(|j| j <= n).collect();
         let mask = Channel::from_shaped([1, pool], seed_mask).named("mask");
         let pages = Channel::from(self.pool_ids.clone()).named("pages");
-        let page_indptr = Channel::from_shaped([2], vec![0u32, pool_pages]).named("page_indptr");
+        let page_indptr = Channel::from([0u32, pool_pages]).named("page_indptr");
         let pool_ids_ch = Channel::new([pool_pages], dtype::u32)
             .capacity(RING)
             .named("pool_ids");
@@ -217,17 +217,13 @@ impl Decoder {
 
             tok_in.put(&tok);
             out.put(&tok);
-            mask.take();
             mask.put(&new_mask);
             w_slot.put(&w_slot_v);
             w_off.put(&w_off_v);
-            klen.take();
             klen.put(&klen_v);
             pos.put(&base);
             fill.put(&next_free);
-            pages.take();
             pages.put(&pages_v);
-            page_indptr.take();
             page_indptr.put(&pidx_v);
         });
 

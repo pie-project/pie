@@ -1,11 +1,10 @@
 // Load-time transcode kernels: what a checkpoint ships, turned into what the
 // decode kernels read.
 //
-// gpt-oss ships its experts as MXFP4 and the rest as BF16, while every gpt-oss
-// matvec here reads MLX-style affine U4. Both transforms below run ONCE, during
-// staging, over the same Shared heap the decode path will bind — so this is a
-// rewrite in place, not a transfer, and after it the heap is byte-for-byte what
-// an offline `mlx_lm convert -q` would have produced.
+// GPT-OSS experts now run directly from native MXFP4. The MXFP4->BF16 path
+// remains for explicit load-plan transforms and compatibility artifacts; the
+// affine encoders serve runtime-quantized tensors. Each transform runs once
+// during staging over Shared storage.
 //
 // They are on the GPU because they are pure streaming: the pair moves roughly
 // eighty gigabytes through DRAM for twenty billion weights, which a host loop

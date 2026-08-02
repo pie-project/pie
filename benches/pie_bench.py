@@ -461,9 +461,10 @@ async def cli_pie_client(args: argparse.Namespace):
 
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
+        feature = "driver-metal" if args.driver == "metal" else "driver-cuda"
         raise FileNotFoundError(
-            f"missing {pie_bin}; build with: cargo build -p pie-worker --release "
-            "--no-default-features --features driver-cuda"
+            f"missing {pie_bin}; build with: cargo build --release -p pie-bin "
+            f"--no-default-features --features {feature}"
         )
 
     proc = await asyncio.create_subprocess_exec(

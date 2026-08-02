@@ -26,7 +26,6 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod config;
 pub mod config_layout;
 pub mod config_schema;
-pub mod contract_author;
 pub mod driver_ffi;
 pub mod embedded_driver;
 pub mod paths;

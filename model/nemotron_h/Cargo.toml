@@ -1,0 +1,19 @@
+[package]
+name = "pie-model-nemotron-h"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Nemotron-H — Mamba2 mixers sharded band-by-band, packed experts."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[features]
+# One feature per aspect, matching `pie-model-common`. A generation is linked
+# for the aspect a consumer reads and no other: the loader's C ABI takes
+# `contract` alone, so a driver link never carries a chat template.
+default = []
+contract = ["pie-model-common/contract", "dep:pie-loader"]
+
+[dependencies]
+pie-model-common = { path = "../common", default-features = false }
+pie-loader = { path = "../../loader", default-features = false, optional = true }

@@ -27,7 +27,7 @@
 #include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
 #include "pie_loader/checkpoint_source.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gemma4/bind.hpp"
 #include "model/gemma4/decode_consts.hpp"
 #include "model/gemma4/decode_step.hpp"
@@ -272,8 +272,10 @@ int main(int argc, char** argv) {
     pie_loader::LoadPlan plan;
     try {
         pie::metal::model::ContractFacts facts;
-        facts.first_kv_shared_layer = g.first_kv_shared();
-        plan = compile_load_plan(ckpt, metal_device_target(), "gemma4", facts);
+        facts.num_hidden_layers = g.n_layers;
+        facts.num_kv_shared_layers = g.num_kv_shared_layers;
+        plan = compile_load_plan(ckpt, metal_device_target(),
+                                 descriptor_for_testing("gemma4", facts));
     } catch (const std::exception& e) {
         std::printf("  FAIL  compile_load_plan: %s\n", e.what());
         return 1;
@@ -410,8 +412,10 @@ int main(int argc, char** argv) {
     DecodeStepPsos base;
     MultiBatchPsos mb;
     if (!build_gemma4_psos(*ctx, kernels_dir, g, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, g.quant, /*with_argmax=*/false, &err) ||
-        !load_multibatch_psos(*ctx, kernels_dir, mb, g.quant, /*with_d512=*/true, &err)) {
+        !load_decode_psos(*ctx, kernels_dir, base, g.quant, &err) ||
+        !load_multibatch_psos(
+            *ctx, kernels_dir, mb, g.quant, &err,
+            MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }
@@ -620,6 +624,96 @@ int main(int argc, char** argv) {
         }
         std::printf("    (32 rows, the wide row block: argmax %d)\n", bi);
         expect(bi == 818, "the wide-BM GEMM agrees with mlx-lm");
+        std::vector<float> per_row(std::size_t(g.vocab));
+        for (int i = 0; i < g.vocab; ++i) per_row[std::size_t(i)] = from_bf16(r[i]);
+
+        // The SAME rows through the tiled attention. Thirty-two rows of one
+        // request is the smallest fire that earns it, and the answer must not
+        // depend on which of the two attention pipelines computed it: the
+        // tiled kernel gives a row a simdgroup where the per-row kernel gives
+        // it a threadgroup, which changes the summation order and nothing
+        // else. Told `requests` -- without it the fire cannot be told from a
+        // fleet of decodes and keeps the per-row shape, so this case would
+        // silently be a second run of the check above.
+        for (int L = 0; L < g.n_layers; ++L) {
+            if (g.is_kv_shared(L)) continue;
+            std::memset(kpages[std::size_t(L)].contents(), 0, kpages[std::size_t(L)].size);
+            std::memset(vpages[std::size_t(L)].contents(), 0, vpages[std::size_t(L)].size);
+        }
+        fill_io(ids32, {0u}, g.total_pages);
+        ctx->run_step([&](StepEncoder& se) {
+            encode_gemma4_step_mb(se, dag, g, rows32, base, mb, psos, /*ordinal_base=*/0,
+                                  /*head_rows=*/0, /*base_alt=*/nullptr, /*mb_alt=*/nullptr,
+                                  /*requests=*/1);
+        });
+        int ti = -1;
+        float tv = -1e30f;
+        for (int i = 0; i < g.vocab; ++i) {
+            const float v = from_bf16(r[i]);
+            if (v > tv) { tv = v; ti = i; }
+        }
+        std::printf("    (32 rows, tiled attention: argmax %d)\n", ti);
+        expect(ti == 818, "the tiled attention agrees with mlx-lm too");
+        // Layer 0's attention output ALONE, both pipelines, by cutting the fire
+        // just past it -- the pool is colour-reused, so a whole fire leaves
+        // nothing of layer 0 to read.
+        std::size_t di_sdpa = dag.size();
+        for (std::size_t di = 0; di < dag.size(); ++di) {
+            if (dag[di].kind == Kind::Sdpa && dag[di].layer == 0) { di_sdpa = di; break; }
+        }
+        if (di_sdpa < dag.size()) {
+            int col = -1;
+            for (const auto& sb : coloring.per_dispatch[di_sdpa]) {
+                if (sb.bind_index == 3) col = int(sb.color);
+            }
+            const int w = g.n_q_heads * g.head_dim_of(0);
+            if (col >= 0 && col < int(b.pool.size()) && b.pool[std::size_t(col)].valid()) {
+                const std::size_t n = std::size_t(rows32) * std::size_t(w);
+                std::vector<float> a(n);
+                for (int pass = 0; pass < 2; ++pass) {
+                    fill_io(ids32, {0u}, g.total_pages);
+                    ctx->run_step([&](StepEncoder& se) {
+                        encode_gemma4_step_mb(se, dag, g, rows32, base, mb, psos, 0, 0, nullptr,
+                                              nullptr, pass == 0 ? 0 : 1, 0, di_sdpa + 1);
+                    });
+                    const auto* q =
+                        static_cast<const std::uint16_t*>(b.pool[std::size_t(col)].contents());
+                    if (pass == 0) {
+                        for (std::size_t i = 0; i < n; ++i) a[i] = from_bf16(q[i]);
+                    } else {
+                        float ad = 0, ax = 0;
+                        for (std::size_t i = 0; i < n; ++i) {
+                            ad = std::max(ad, std::fabs(a[i] - from_bf16(q[i])));
+                            ax = std::max(ax, std::fabs(a[i]));
+                        }
+                        std::printf("    (layer 0 attention, tiled vs per-row: "
+                                    "max|d|=%.4g over max|x|=%.4g)\n", ad, ax);
+                        // Sub-ulp. bf16 carries eight mantissa bits, so one ulp
+                        // at this tensor's largest value is ax/256; the two
+                        // pipelines land inside a thousandth of it. The bound
+                        // is loose on purpose -- it is not pinning the rounding,
+                        // it is catching a tiled kernel that reads the wrong
+                        // keys, drops a run or writes the wrong rows, all of
+                        // which move this by whole values rather than ulps.
+                        expect(ad < 1e-3f * ax,
+                               "the tiled attention agrees with the per-row one to below a ulp");
+                    }
+                }
+            }
+        }
+
+        float dmax = 0, amax = 0;
+        for (int i = 0; i < g.vocab; ++i) {
+            const float a = per_row[std::size_t(i)], b2 = from_bf16(r[i]);
+            dmax = std::max(dmax, std::fabs(a - b2));
+            amax = std::max(amax, std::fabs(a));
+        }
+        // Printed rather than bounded: after thirty-five layers this is no
+        // longer a rounding difference but an amplified one, and what it is
+        // allowed to be is a question about the model, not about the kernel.
+        // The number is here because it is the one that explains why
+        // `llama_bench`'s Gemma-4-26B row moves when this path turns on.
+        std::printf("    (tiled vs per-row logits: max|d|=%.4g over max|x|=%.4g)\n", dmax, amax);
     }
 
     // ── Two requests in one fire ──

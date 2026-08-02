@@ -132,15 +132,14 @@ async fn main(input: String) -> Result<String> {
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
         let tok = reshape(reduce_argmax(mask_apply(&lg, &m)), [1]); // [1] i32
         let next_length = &length + 1u32;
-        let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
+        let page_count = next_length.div_ceil(PAGE_T);
 
         tok_in.put(&tok);
         kv_len.put(&next_length);
         positions.put(&length);
         w_slot.put(&length / PAGE_T);
         w_off.put(&length % PAGE_T);
-        page_indptr.take();
-        page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+        page_indptr.put(indptr(1, &page_count));
         tok_out.put(&tok);
         raw.put(&lg);
     });

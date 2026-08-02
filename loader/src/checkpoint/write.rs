@@ -831,8 +831,11 @@ mod tests {
     fn a_shard_set_places_on_64_kib() {
         let dir = tmpdir("shard-align");
         let root = dir.join("model.zt");
-        let mut writer = CheckpointWriter::create_sharded(&root, &BTreeMap::new(), 100_000).unwrap();
-        writer.add_meta("model/descriptor", br#"{"arch":"llama3"}"#).unwrap();
+        let mut writer =
+            CheckpointWriter::create_sharded(&root, &BTreeMap::new(), 100_000).unwrap();
+        writer
+            .add_meta("model/descriptor", br#"{"arch":"llama3"}"#)
+            .unwrap();
         for i in 0..6 {
             let d = decl(&format!("w{i:02}"), vec![40_000], Encoding::Raw(DType::U8));
             writer.add_tensor(&d, &vec![i as u8 + 1; 40_000]).unwrap();
@@ -843,7 +846,9 @@ mod tests {
         let mut files = vec![root.clone()];
         files.extend((1..=3).map(|i| dir.join(format!("model-{i:05}.zt"))));
         for file in &files {
-            let manifest = ztensor::read::manifest_of(file).unwrap().expect("a manifest");
+            let manifest = ztensor::read::manifest_of(file)
+                .unwrap()
+                .expect("a manifest");
             for (name, object) in &manifest.objects {
                 for (part, blob) in &object.parts {
                     assert_eq!(

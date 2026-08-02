@@ -16,7 +16,7 @@ serialization — handled by `Server.__aenter__` before TOML-ifying.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Optional
 
 
@@ -152,27 +152,93 @@ class Config:
         return buf.getvalue().lstrip("\n")
 
     def to_toml(self) -> str:
-        """Serialize to the combined standalone TOML `pie serve --config` reads.
+        """Serialize to the six-section document `pie serve --config` reads.
 
-        The standalone file is one document with a top-level section per role
-        (`bin/pie/src/derive.rs::extract_section`), so every worker-domain
-        table is written under `[worker.*]`. A flat `[model]` at the root — the
-        shape this emitted before the role split — parses as an *empty*
-        `[worker]` section and fails with `missing field \u0060model\u0060`.
+        The file layout and the struct layout are deliberately different
+        shapes; `worker/src/config_layout.rs` is the one place they meet, and
+        this is its Python mirror. The file has six sections:
 
-        `[gateway].listen` is the client-facing edge, so `server.host`/`port`
-        is mirrored there: that is the address the harness dials.
+            [server]   where it listens, what it fetches from, what it reports
+            [model]    which weights
+            [driver]   which hardware, and every knob that hardware has
+            [runtime]  batching and timeouts
+            [sandbox]  what an inferlet may do, and how big it may get
+            [cluster]  distributed only; absent for single-node
+
+        `[controller]`, `[gateway]` and `[worker]` are retired and now rejected
+        outright (`config_layout::reshape`), as are `[model.driver]` and
+        `[model.scheduler]`. That is why this cannot just prefix the internal
+        tables the way `to_engine_toml` does: the embedded engine deserializes
+        the INTERNAL spelling, and only this method speaks the file's.
+
+        `[auth]` is not emitted: the section no longer exists in the file, and
+        the embedded server is always single-node and unauthenticated.
         """
+        server: dict = {}
+        runtime: dict = {}
+        sandbox: dict = {}
+
+        def put(table: dict, key: str, value) -> None:
+            if value is not None:
+                table[key] = value
+
+        s = self.server
+        for name in ("host", "port", "verbose", "registry", "python_snapshot"):
+            put(server, name, getattr(s, name))
+        # Admission is scheduling, so it sits in `[runtime]` in the file even
+        # though it is a `ServerConfig` field internally.
+        put(runtime, "max_concurrent_processes", s.max_concurrent_processes)
+
+        # Observability is three keys that belong with the process emitting
+        # them rather than in a section of their own.
+        t = self.telemetry
+        put(server, "telemetry", t.enabled)
+        put(server, "otlp_endpoint", t.endpoint)
+        put(server, "service_name", t.service_name)
+
+        # `[runtime]` internally is the sandbox: the box an inferlet runs in.
+        # The `wasm_` prefix drops off, since the section already says which
+        # box these size, and the `_mb` fields become size strings.
+        r = self.runtime
+        put(server, "worker_threads", r.worker_threads)
+        put(server, "max_upload", _mib(r.max_upload_mb))
+        put(sandbox, "max_instances", r.wasm_max_instances)
+        put(sandbox, "max_memory", _mib(r.wasm_max_memory_mb))
+        put(sandbox, "warm_memory", _mib(r.wasm_warm_memory_mb))
+        put(sandbox, "warm_slots", r.wasm_warm_slots)
+        for name in ("allow_fs", "fs_scratch_dir", "allow_network",
+                     "network_allowed_hosts"):
+            put(sandbox, name, getattr(r, name))
+
+        m = self.model
+        model: dict = {"name": m.name, "model": m.hf_repo}
+
+        # `[model.driver.options]` was four levels deep; the section is now
+        # split by NAME, so the common keys and the driver's own knobs sit
+        # side by side in one `[driver]`.
+        driver = _driver_block(m.driver)
+        for key, value in m.driver.options.items():
+            if key in driver:
+                raise ValueError(
+                    f"driver option {key!r} collides with a common [driver] key"
+                )
+            driver[key] = value
+
+        if m.scheduler is not None:
+            sch = m.scheduler
+            put(runtime, "request_timeout", _secs(sch.request_timeout_secs))
+            for f in fields(sch):
+                if f.name in ("request_timeout_secs",):
+                    continue
+                put(runtime, f.name, getattr(sch, f.name))
+
         buf = io.StringIO()
-        buf.write("[controller]\n")
-        host = self.server.host or "127.0.0.1"
-        port = self.server.port
-        buf.write("\n[gateway]\n")
-        if port is not None:
-            _emit_kv(buf, "listen", f"{host}:{port}")
-        _emit_table(buf, "worker", {}, leading_newline=True)
-        self._emit_worker_tables(buf, "worker.")
-        return buf.getvalue()
+        _emit_table(buf, "server", server)
+        _emit_table(buf, "model", model, leading_newline=True)
+        _emit_table(buf, "driver", driver, leading_newline=True)
+        _emit_table(buf, "runtime", runtime, leading_newline=True)
+        _emit_table(buf, "sandbox", sandbox, leading_newline=True)
+        return buf.getvalue().lstrip("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +261,16 @@ def _block(obj) -> dict:
             continue
         out[f.name] = v
     return out
+
+
+def _mib(value: Optional[int]) -> Optional[str]:
+    """`*_mb` fields are counts; the file's size keys are size STRINGS."""
+    return None if value is None else f"{value}MiB"
+
+
+def _secs(value: Optional[int]) -> Optional[str]:
+    """Likewise for `*_secs` against the file's duration strings."""
+    return None if value is None else f"{value}s"
 
 
 def _driver_block(d: DriverConfig) -> dict:

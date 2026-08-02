@@ -36,19 +36,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct GdnCoreParams {
-  int   Dk;            // k/q head dim (128)
-  int   Dv;            // v head dim (128)
-  int   Hk;            // k/q heads (16)
-  int   Hv;            // v heads (16)
-  int   conv_dim;      // 2*Hk*Dk + Hv*Dv (6144)
-  int   Kc;            // conv kernel width (4)
-  int   q_off;         // q channel offset within conv_dim (0)
-  int   k_off;         // k channel offset (Hk*Dk)
-  int   v_off;         // v channel offset (2*Hk*Dk)
-  float eps;           // l2norm eps (1e-6)
-  float inv_sqrt_dk;   // 1/sqrt(Dk) q pre-scale (0.0883883)
-};
+#include "gdn_params.h"
 
 // T  = core_out dtype (bf16/half/float); recurrent state is always fp32.
 // ── M>1 slot-indexed state seam (delta's GDN bridge, ckpt 030) ───────────────

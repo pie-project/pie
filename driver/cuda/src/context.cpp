@@ -60,7 +60,6 @@
 #include "model/kimi_k3/kimi_k3_forward.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/loaded_model.hpp"
-#include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/nemotron_h/nemotron_h.hpp"
 #include "model/nemotron_h/nemotron_h_forward.hpp"
 #include "model/qwen3_5/qwen3_5_config.hpp"
