@@ -3354,7 +3354,15 @@ impl BatchScheduler {
     }
 
     /// launch that reached the queue front has no queued copy left).
-    fn rotate_launch_for_wave_work(pending: &mut PendingQueue, allow_controls: bool) -> bool {
+    ///
+    /// `allow_lifecycle` is the wider of the two flags: a lifecycle control
+    /// needs no control slot, so a standalone copy in flight does not stop
+    /// it from being worth exposing at the front.
+    fn rotate_launch_for_wave_work(
+        pending: &mut PendingQueue,
+        allow_slot: bool,
+        allow_lifecycle: bool,
+    ) -> bool {
         if !matches!(pending.front(), Some(QueuedItem::Launch(_))) {
             return false;
         }
@@ -3363,9 +3371,8 @@ impl BatchScheduler {
         };
         let work = &pending[run_len];
         if !(Self::standalone_copy(work)
-            || (allow_controls
-                && (Self::lifecycle_control(work)
-                    || matches!(work, QueuedItem::PreLaunchCopy { .. }))))
+            || (allow_lifecycle && Self::lifecycle_control(work))
+            || (allow_slot && matches!(work, QueuedItem::PreLaunchCopy { .. })))
         {
             return false;
         }
@@ -3428,6 +3435,23 @@ impl BatchScheduler {
         // closes rotate and drain during the next generation's execution.
         // Shutdown never holds (the drain must retire everything).
         let hold_closes = !stopping && frame_policy.has_pending_binds();
+        // The control SLOT (depth 1) exists for controls that settle
+        // asynchronously; lifecycle controls execute on the lane FIFO and
+        // never take it (see `post_control`). So a standalone copy holding
+        // the slot must not block them: it addresses grant-pinned pages no
+        // bind, register or close can reference, and the lane FIFO already
+        // fixes their driver order. Blocking them on it wedged the fleet —
+        // the planner's suspend/restore copies are in flight almost
+        // continuously under churn, so every bind waited out the whole
+        // strict-watchdog window, its process sat in `staged` for the
+        // duration, and `is_joining()` therefore held the seal that would
+        // have retired the traffic the copy is waiting behind. Measured on
+        // `churn`: every one of 270 binds took 1.0-2.4 s end to end against
+        // a 59 us driver bind, and the probe found the slot held by a
+        // tracked KV copy in 100% of the samples.
+        let slot_blocks_lifecycle = in_flight_control
+            .as_ref()
+            .is_some_and(|control| control.holds_launches);
         loop {
             let Some(item) = pending.front() else {
                 break;
@@ -3438,7 +3462,11 @@ impl BatchScheduler {
                     // id, not queue position). A launch at the queue front
                     // only needs to yield to any dispatchable control behind
                     // it.
-                    if Self::rotate_launch_for_wave_work(pending, in_flight_control.is_none()) {
+                    if Self::rotate_launch_for_wave_work(
+                        pending,
+                        in_flight_control.is_none(),
+                        !slot_blocks_lifecycle,
+                    ) {
                         progress = true;
                         continue;
                     }
@@ -3452,7 +3480,10 @@ impl BatchScheduler {
                     // whole-pipe drain stalled every launch queued behind a
                     // front close during cohort swaps and made freshly-bound
                     // pipelines' credits ragged (V6 iteration 3).
-                    if in_flight_control.is_some() {
+                    // A close needs no control slot either (see
+                    // `slot_blocks_lifecycle`), only its own instance
+                    // quiesced.
+                    if slot_blocks_lifecycle {
                         break;
                     }
                     let id = *id;
@@ -3549,12 +3580,33 @@ impl BatchScheduler {
                     let item = pending.pop_front().expect("close front");
                     pending.push_back(item);
                 }
+                // A standalone copy waiting out the control slot must not sit
+                // on the front and block the lifecycle controls behind it:
+                // copies dispatch out of band from ANY queue position (see
+                // the scan below the loop), so their position is free to
+                // give up. Bounded, and no progress claim — a rotation
+                // dispatches nothing (same discipline as a held close).
+                _ if in_flight_control.is_some() && Self::standalone_copy(item) => {
+                    if close_rotations >= pending.len()
+                        || !pending.iter().skip(1).any(Self::lifecycle_control)
+                    {
+                        break;
+                    }
+                    close_rotations += 1;
+                    let item = pending.pop_front().expect("copy front");
+                    pending.push_back(item);
+                }
                 // Single control slot: a settling copy/resize blocks the
-                // next control (the slot only ever holds async-completing
-                // controls now — lifecycle controls execute on the lane
-                // without occupying it, their driver order guaranteed by the
-                // lane FIFO).
-                _ if in_flight_control.is_some() => break,
+                // next control that NEEDS the slot (the slot only ever holds
+                // async-completing controls now — lifecycle controls execute
+                // on the lane without occupying it, their driver order
+                // guaranteed by the lane FIFO, so they pass a standalone
+                // copy freely).
+                _ if slot_blocks_lifecycle
+                    || (in_flight_control.is_some() && !Self::lifecycle_control(item)) =>
+                {
+                    break;
+                }
                 _ if !in_flight_launches.is_empty() && !Self::pipe_concurrent_control(item) => {
                     break;
                 }
@@ -7313,6 +7365,7 @@ mod tests {
 
         assert!(BatchScheduler::rotate_launch_for_wave_work(
             &mut pending,
+            true,
             true
         ));
 
@@ -7365,13 +7418,14 @@ mod tests {
 
         let mut pending = make_pending();
         assert!(
-            !BatchScheduler::rotate_launch_for_wave_work(&mut pending, false),
+            !BatchScheduler::rotate_launch_for_wave_work(&mut pending, false, false),
             "a settling control slot (controls disallowed) must keep launch order"
         );
 
         let mut pending = make_pending();
         assert!(BatchScheduler::rotate_launch_for_wave_work(
             &mut pending,
+            true,
             true
         ));
         assert!(
@@ -7552,6 +7606,89 @@ mod tests {
             "the copy dispatches out-of-band past the launch and the resize"
         );
         assert_eq!(pending.len(), 2, "launch and resize keep their positions");
+    }
+
+    /// A lifecycle control never takes the depth-1 control slot, so an
+    /// in-flight standalone copy must not delay one — nor may a queued copy
+    /// blocking the front. Under churn the planner's suspend/restore copies
+    /// are in flight nearly continuously, and gating binds on them made
+    /// every bind wait out the strict-watchdog window: the process stayed
+    /// in `staged`, `is_joining()` held the seal, and the seal held back
+    /// the very traffic the copy was settling behind.
+    #[test]
+    fn a_bind_dispatches_past_an_in_flight_and_a_queued_standalone_copy() {
+        let mut pending: PendingQueue = VecDeque::from([
+            QueuedItem::CopyKvTracked {
+                plan: crate::driver::KvCopyPlan::default(),
+                completion: ControlCompletion::new(),
+            },
+            QueuedItem::BindInstance {
+                pipeline_id: Some(ProcessId::new_v4()),
+                plan: InstanceBindingPlan {
+                    driver_id: 0,
+                    program_id: 0,
+                    requested_instance_id: 0,
+                    pacing_wait_id: 0,
+                    channel_ids: Vec::new(),
+                    seed_values: Vec::new(),
+                    geometry_class: pie_driver_abi::GeometryClass::Host,
+                },
+                response: tokio::sync::oneshot::channel().0,
+            },
+        ])
+        .into();
+        let (lane, _lane_rx) = test_lane(None);
+        let mut lane_inflight = 0u64;
+        let mut lane_token = 0u64;
+        let mut instances = HashMap::new();
+        let mut in_flight_launches = VecDeque::new();
+        // The slot is taken by a settling standalone copy.
+        let mut in_flight_control = Some(PendingControl {
+            state: ControlSlotState::Posted { token: 1 },
+            logical_completion: None,
+            process_id: None,
+            pipeline_id: None,
+            tracked_completion: Some(ControlCompletion::new()),
+            operation: "tracked KV copy",
+            holds_launches: false,
+        });
+        let limits = SchedulerLimits {
+            max_forward_requests: 64,
+            max_forward_tokens: 64,
+            max_page_refs: 64,
+        };
+        let stats = Arc::new(SchedulerStats::default());
+        let mut frame_policy = FramePolicy::new(1, 1, 4096, None);
+
+        let (progress, _) = BatchScheduler::dispatch_ready_items(
+            &lane,
+            &mut lane_inflight,
+            &mut lane_token,
+            &mut instances,
+            &mut pending,
+            &mut in_flight_launches,
+            &mut in_flight_control,
+            16,
+            limits,
+            &stats,
+            &mut frame_policy,
+            &mut ScanCache::default(),
+            &mut SlotBuffer::new(),
+            false,
+        );
+
+        assert!(progress, "the bind dispatched");
+        assert!(
+            !pending
+                .iter()
+                .any(|item| matches!(item, QueuedItem::BindInstance { .. })),
+            "the bind must not wait out a copy it shares nothing with"
+        );
+        assert_eq!(
+            in_flight_control.as_ref().map(|control| control.operation),
+            Some("tracked KV copy"),
+            "the bind takes no control slot, so the copy still holds it"
+        );
     }
 
     /// §12 regression, barrier half: queued standalone copies and resizes
