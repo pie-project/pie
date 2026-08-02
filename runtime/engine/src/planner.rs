@@ -58,13 +58,27 @@ use crate::store::kv::page_table::ReclaimQuote;
 /// Process identity the planner tracks (FCFS clock key, residency key).
 pub type ProcessId = uuid::Uuid;
 
-/// Opt-in event markers (`PIE_CONTENTION_TRACE_MS`): `println!`, not
+/// Opt-in event markers (`PIE_CONTENTION_TRACE_EVENTS=1`): `println!`, not
 /// `tracing` — the embedded (pyo3) server installs no subscriber. The
 /// timestamp shares the fire-timing monotonic clock so planner events
 /// correlate with `PIE_FIRE_TIMING` wave records in one benchmark log.
+///
+/// **This is a separate switch from the periodic stall sampler**
+/// (`PIE_CONTENTION_TRACE_MS`) on purpose. The markers fire per planner
+/// EVENT — one line per park, serve, restore and eviction step — and a
+/// contended run emits tens of thousands of them. Tying them to the
+/// sampler's variable made `PIE_CONTENTION_TRACE_MS=0`, the natural
+/// spelling of "off", the single most expensive setting there is: the
+/// sampler thread never starts (it needs `ms > 0`) but every marker prints.
+/// Runs taken that way read 25-30% under the same build untraced, which is
+/// larger than most effects this planner is tuned against.
 pub(crate) fn trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PIE_CONTENTION_TRACE_MS").is_some())
+    *ENABLED.get_or_init(|| {
+        std::env::var("PIE_CONTENTION_TRACE_EVENTS")
+            .map(|raw| !matches!(raw.trim(), "" | "0" | "false" | "off"))
+            .unwrap_or(false)
+    })
 }
 
 macro_rules! ptrace {
