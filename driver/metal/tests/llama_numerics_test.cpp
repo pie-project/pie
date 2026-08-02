@@ -75,6 +75,8 @@ using llama::build_llama_psos;
 using llama::build_llama_scratch;
 using llama::color_llama_scratch;
 using llama::encode_llama_step;
+using pie::metal::MultiBatchPsos;
+using pie::metal::load_multibatch_psos;
 using llama::llama_kv_bytes_per_layer;
 using llama::llama_pool_elems;
 using llama::shared_kind;
@@ -589,6 +591,10 @@ void write_u32(SlotHandle s, std::uint32_t v) {
     if (s.contents() != nullptr) std::memcpy(s.contents(), &v, 4);
 }
 
+void write_u32s(SlotHandle s, const std::vector<std::uint32_t>& v) {
+    if (s.contents() != nullptr && !v.empty()) std::memcpy(s.contents(), v.data(), v.size() * 4);
+}
+
 /// Stage one quantized tensor under the three names `push_quant` asked for.
 void stage_quant(RawMetalContext& ctx, BoundLlama& b, const std::vector<WeightBind>& binds,
                  const QuantTensor& q) {
@@ -685,9 +691,22 @@ void build_model(const LlamaGeometry& g, Model& m) {
     }
 }
 
+/// `rows` > 1 runs the whole prompt as ONE fire instead of a token at a time,
+/// and `paged` swaps the attention ABI. Both compare against the SAME
+/// sequential fp32 reference: a batched fire's row r must compute what the
+/// r-th decode computes, because causal attention over the rows means row r
+/// sees keys 0..r and nothing else. That is the entire claim the M>1 path
+/// makes, and it is checked here per DISPATCH rather than at the logits.
 void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
-              const std::string& kernels_dir, float tol) {
+              const std::string& kernels_dir, float tol, int rows = 1, bool paged = false) {
     std::printf("\n-- %s --\n", who);
+    const int R = rows < 1 ? 1 : rows;
+    if (paged) {
+        g.paged_kv_enabled = true;
+        g.kv_page_size = 32;
+        g.kv_max_ctx = ((g.kv_max_ctx + 31) / 32) * 32;
+        g.total_pages = g.kv_max_ctx / 32;
+    }
     Model m;
     build_model(g, m);
 
@@ -731,7 +750,11 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     }
 
     b.pool.resize(std::size_t(col.colors_used));
-    const std::vector<std::size_t> elems = llama_pool_elems(dag, plan, col, g);
+    // Padded, like the engine's: a dense projection's GEMM rounds its batch up
+    // to a whole tile and writes the padding rows for real.
+    const int pool_rows = llama::llama_qmm_pool_rows(R);
+    const std::vector<std::size_t> elems =
+        llama_pool_elems(dag, plan, col, g, pool_rows, pool_rows);
     for (int c = 0; c < col.colors_used; ++c) {
         b.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2);
     }
@@ -742,7 +765,9 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         }
     }
     b.io.resize(kIoSlotCount);
-    for (int i = 0; i < kIoSlotCount; ++i) b.io[std::size_t(i)] = ctx.heap_alloc(4096);
+    const std::size_t io_bytes =
+        std::max<std::size_t>(4096, std::size_t(g.total_pages + 8) * 4);
+    for (int i = 0; i < kIoSlotCount; ++i) b.io[std::size_t(i)] = ctx.heap_alloc(io_bytes);
     b.kv.resize(std::size_t(g.n_layers));
     std::vector<RefKv> ref_kv(std::size_t(g.n_layers));
     for (int L = 0; L < g.n_layers; ++L) {
@@ -761,15 +786,21 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
 
     LlamaPsos ll;
     DecodeStepPsos base;
+    MultiBatchPsos mb;
     std::string err;
     if (!build_llama_psos(ctx, kernels_dir, g, ll, &err) ||
         !load_decode_psos(ctx, kernels_dir, base, /*with_argmax=*/false, &err)) {
         expect(false, std::string(who) + ": pipelines compiled (" + err + ")");
         return;
     }
-    bind_llama_consts(ctx, dag, g, /*rows=*/1, /*paged=*/false);
+    if (paged && !load_multibatch_psos(ctx, kernels_dir, mb, /*with_d512=*/false, &err)) {
+        expect(false, std::string(who) + ": multi-batch pipelines compiled (" + err + ")");
+        return;
+    }
+    const MultiBatchPsos* mbp = paged ? &mb : nullptr;
+    bind_llama_consts(ctx, dag, g, R, paged);
     try {
-        bind_llama_dag(ctx, b, dag, g, col);
+        bind_llama_dag(ctx, b, dag, g, col, /*ordinal_base=*/0, paged);
     } catch (const std::exception& e) {
         expect(false, std::string(who) + ": bound (" + e.what() + ")");
         return;
@@ -808,12 +839,116 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     float worst = 0.0f;
     int compared = 0;
 
+    // Fills the paged IO for a fire of `n` rows at positions `p0 .. p0+n-1`,
+    // all of one request. The page list is the identity, so the page table is
+    // exercised as a real indirection while staying easy to reason about.
+    auto write_paged_io = [&](int p0, int n, const std::vector<int>& toks) {
+        std::vector<std::uint32_t> ids, pos, req, wpage, woff, sample;
+        for (int r = 0; r < n; ++r) {
+            ids.push_back(std::uint32_t(toks[std::size_t(p0 + r)]));
+            pos.push_back(std::uint32_t(p0 + r));
+            req.push_back(0u);
+            wpage.push_back(std::uint32_t((p0 + r) / g.kv_page_size));
+            woff.push_back(std::uint32_t((p0 + r) % g.kv_page_size));
+            sample.push_back(std::uint32_t(r));
+        }
+        std::vector<std::uint32_t> pages;
+        for (int i = 0; i < g.total_pages; ++i) pages.push_back(std::uint32_t(i));
+        write_u32s(b.io[std::size_t(IoSlot::TokenId)], ids);
+        write_u32s(b.io[std::size_t(IoSlot::Position)], pos);
+        write_u32s(b.io[std::size_t(IoSlot::ReqOfToken)], req);
+        write_u32s(b.io[std::size_t(IoSlot::WPage)], wpage);
+        write_u32s(b.io[std::size_t(IoSlot::WOff)], woff);
+        write_u32s(b.io[std::size_t(IoSlot::KvPageIndices)], pages);
+        write_u32s(b.io[std::size_t(IoSlot::KvPageIndptr)],
+                   {0u, std::uint32_t(g.total_pages)});
+        write_u32s(b.io[std::size_t(IoSlot::QoIndptr)], {0u, std::uint32_t(n)});
+        write_u32s(b.io[std::size_t(IoSlot::SampleRows)], sample);
+        write_u32(b.io[std::size_t(IoSlot::SeqLen)], std::uint32_t(p0 + n));
+        write_u32s(b.io[std::size_t(IoSlot::AttnMaskStride)], {0u});
+        if (b.io[std::size_t(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
+            std::memset(b.io[std::size_t(IoSlot::AttnMaskEnabled)].contents(), 0,
+                        std::size_t(n));
+        }
+    };
+
+    // Compares one dispatch's output, at row `row` of a [rows, width] tensor.
+    // The row pitch is the M=1 trace's own length, which already carries the
+    // expert-slot axis for the routed values -- a routed value is
+    // [rows, k, width] and its M=1 trace is [k, width].
+    auto compare_all = [&](const Trace& want, int row, int label) {
+        for (std::size_t i = 0; i < dag.size(); ++i) {
+            const auto it = want.find(int(i));
+            if (it == want.end()) continue;
+            const int v = wrote[i];
+            if (v < 0) continue;
+            const int c = col.color_of_value[std::size_t(v)];
+            const SlotHandle& slot = b.pool[std::size_t(c)];
+            if (slot.contents() == nullptr) continue;
+            const std::size_t w = it->second.size();
+            const std::size_t off = std::size_t(row) * w;
+            if ((off + w) * 2 > slot.size) continue;
+            const auto* raw = static_cast<const std::uint16_t*>(slot.contents()) + off;
+            Vec got(w);
+            for (std::size_t e = 0; e < w; ++e) got[e] = from_bf16(raw[e]);
+            ++compared;
+            const float w1 = rel_l2(got, it->second);
+            if (w1 > worst) worst = w1;
+            if (w1 <= tol) continue;
+            if (std::getenv("PIE_NUM_DEBUG") != nullptr) {
+                std::printf("    [dbg] row %d disp %zu kind %d layer %d rel_l2 %.4f got/want:",
+                            label, i, int(dag[i].kind), dag[i].layer, double(w1));
+                for (std::size_t e = 0; e < w && e < 4; ++e) {
+                    std::printf(" %.4f/%.4f", double(got[e]), double(it->second[e]));
+                }
+                std::printf("\n");
+            }
+            if (first_bad < 0) {
+                first_bad = int(i);
+                char buf[160];
+                std::snprintf(buf, sizeof buf, "row %d, dispatch %d (kind %d, layer %d)", label,
+                              int(i), int(dag[i].kind), dag[i].layer);
+                first_bad_name = buf;
+            }
+        }
+    };
+
+    // The batched case: ONE fire over the whole prompt, then every row checked
+    // against the decode the reference would have run at that position.
+    if (R > 1) {
+        std::vector<Trace> wants;
+        for (int step = 0; step < R; ++step) {
+            wants.push_back(ref.step(dag, tokens[std::size_t(step)], step));
+        }
+        write_paged_io(0, R, tokens);
+        ctx.run_step([&](StepEncoder& se) {
+            encode_llama_step(se, dag, g, base, ll, /*ordinal_base=*/0, mbp, R, R);
+        });
+        for (int r = 0; r < R; ++r) compare_all(wants[std::size_t(r)], r, r);
+
+        char msg2[256];
+        std::snprintf(msg2, sizeof msg2,
+                      "%s: %d dispatch outputs match the reference (worst rel_l2 %.4f)", who,
+                      compared, double(worst));
+        expect(first_bad < 0, msg2);
+        if (first_bad >= 0) std::printf("    first divergence: %s\n", first_bad_name.c_str());
+        expect(compared > 0, std::string(who) + ": something was actually compared");
+        return;
+    }
+
     for (int step = 0; step < int(tokens.size()); ++step) {
-        write_u32(b.io[std::size_t(IoSlot::TokenId)], std::uint32_t(tokens[std::size_t(step)]));
-        write_u32(b.io[std::size_t(IoSlot::Position)], std::uint32_t(step));
-        write_u32(b.io[std::size_t(IoSlot::SeqLen)], std::uint32_t(step) + 1u);
-        write_u32(b.io[std::size_t(IoSlot::SampleRows)], 0u);
-        ctx.run_step([&](StepEncoder& se) { encode_llama_step(se, dag, g, base, ll); });
+        if (paged) {
+            write_paged_io(step, 1, tokens);
+        } else {
+            write_u32(b.io[std::size_t(IoSlot::TokenId)],
+                      std::uint32_t(tokens[std::size_t(step)]));
+            write_u32(b.io[std::size_t(IoSlot::Position)], std::uint32_t(step));
+            write_u32(b.io[std::size_t(IoSlot::SeqLen)], std::uint32_t(step) + 1u);
+            write_u32(b.io[std::size_t(IoSlot::SampleRows)], 0u);
+        }
+        ctx.run_step([&](StepEncoder& se) {
+            encode_llama_step(se, dag, g, base, ll, /*ordinal_base=*/0, mbp, 1, 1);
+        });
 
         const Trace want = ref.step(dag, tokens[std::size_t(step)], step);
         if (g.is_moe() && std::getenv("PIE_NUM_DEBUG") != nullptr && plan.expert_ids_value >= 0) {
@@ -937,6 +1072,28 @@ int main() {
     moe.experts_per_token = 2;
     moe.moe_intermediate = 512;
     run_case("qwen3-moe (routed)", moe, *ctx, kernels_dir, 0.06f);
+
+    // ── the paged ABI ──
+    //
+    // The same arithmetic through a page table. Run at one row first, so that
+    // a failure here means the paged attention and NOT the batching: the two
+    // changed together and are the only two things that could have.
+    run_case("llama-3 (dense, paged)", base_geometry(), *ctx, kernels_dir, 0.06f,
+             /*rows=*/1, /*paged=*/true);
+    run_case("qwen3-moe (routed, paged)", moe, *ctx, kernels_dir, 0.06f, /*rows=*/1,
+             /*paged=*/true);
+
+    // ── the batched path ──
+    //
+    // Four tokens as ONE fire, checked row by row against the four decodes the
+    // reference runs. This is the whole claim M>1 makes: row r must compute
+    // what the r-th decode computes, because causal attention gives row r keys
+    // 0..r and nothing more. Checked per dispatch, so a divergence names the
+    // kernel rather than showing up as different text.
+    run_case("llama-3 (dense, 4 rows in one fire)", base_geometry(), *ctx, kernels_dir, 0.06f,
+             /*rows=*/4, /*paged=*/true);
+    run_case("qwen3-moe (routed, 4 rows in one fire)", moe, *ctx, kernels_dir, 0.06f,
+             /*rows=*/4, /*paged=*/true);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
