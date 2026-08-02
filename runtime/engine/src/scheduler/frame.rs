@@ -139,22 +139,16 @@ const STRICT_WATCHDOG_US: u64 = 1_000_000;
 /// the two is worth 2x on a sixteen-request fleet (206 -> 422 tok/s).
 const GATHER_POLL_US: u64 = 500;
 
-/// Grace period before a gather escapes a cycle it cannot resolve by
-/// waiting. Two shapes share it because they are the same hazard seen from
-/// two sides — see the rebind escape in [`FramePolicy::plan_dispatch`] and
-/// [`FramePolicy::join_gate_circular`].
+/// Grace period before the join gate gives up on a joiner and seals without
+/// it — see [`FramePolicy::join_gate_circular`] and the `missing == 0` arm in
+/// [`FramePolicy::plan_dispatch`].
 ///
-/// Neither escape is guest policy. `park()` and the submit deadline govern a
-/// guest's silence; these govern the ENGINE's own cycle, where a lane's next
-/// fire is ordered behind a bind that completes through the control slot this
-/// boundary is holding (`bind -> dispatch -> seal -> bind`). The deadline
-/// cannot break that tie by construction: a lane with a pending bind is owed
-/// something, so its clock is disarmed and it can never expire. Without the
-/// escape the fleet does not get killed, it wedges.
-///
-/// A healthy gather resolves in microseconds, so the grace period costs
-/// nothing and keeps the dense wait-all path.
-const ESCAPE_GRACE_US: u64 = 2_000;
+/// This is not guest policy: `park()` and the submit deadline govern a guest's
+/// silence, whereas this governs the ENGINE's own bookkeeping, where `staged`
+/// and `pending_slots` claim an arrival is imminent. A healthy join resolves
+/// in microseconds, so the grace costs nothing and keeps the dense wait-all
+/// path for the case the claim is true.
+const JOIN_GRACE_US: u64 = 2_000;
 
 /// How long a successor that has already consumed its execution slot may keep
 /// an otherwise fully-submitted boundary waiting for its first fire. A healthy
@@ -373,8 +367,6 @@ pub(super) struct FramePolicy {
     truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
-    /// Deadline for the rebind escape's grace period.
-    rebind_escape_deadline: Option<Instant>,
     /// Deadline for the join-gate grace period ([`FramePolicy::join_gate_circular`]).
     join_escape_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
@@ -423,7 +415,6 @@ impl FramePolicy {
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
-            rebind_escape_deadline: None,
             join_escape_deadline: None,
             cold_hold_deadline: None,
             in_flight_lanes: BTreeSet::new(),
@@ -781,10 +772,9 @@ impl FramePolicy {
     /// is still behind an unfinished bind, none of them is imminent at all:
     /// a bind completes through the driver lane's control slot, which is
     /// ordered behind the dispatch this unsealed boundary is holding. The
-    /// wait then closes the same `bind -> dispatch -> seal -> bind` cycle
-    /// the rebind escape breaks on the `missing` side (§20.3) — but by a
-    /// route that escape cannot reach, because it only ever decrements
-    /// `missing`. Observed under open-loop arrivals as `lanes=29 awaited=29
+    /// wait then closes a `bind -> dispatch -> seal -> bind` cycle on the
+    /// JOINING side, which no amount of accounting on `missing` can reach:
+    /// the holder is not a member at all. Observed under open-loop arrivals as `lanes=29 awaited=29
     /// sealed=0 pending_binds=99 staged=99 pending_slots=99
     /// joins_in_flight=0`, every lane's front frame complete, nothing
     /// executing: the GPU sat idle and the fleet never moved again.
@@ -965,7 +955,6 @@ impl FramePolicy {
         self.ever_sealed = false;
         self.cold_hold_deadline = None;
         self.strict_watchdog_deadline = None;
-        self.rebind_escape_deadline = None;
         self.join_escape_deadline = None;
     }
 
@@ -1214,35 +1203,25 @@ impl FramePolicy {
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
-                self.rebind_escape_deadline = None;
                 self.join_escape_deadline = None;
                 return FramePlan::Park;
             }
             // `missing` counts awaited lanes whose next frame is not fully
-            // submitted; `missing_idle` is the subset that is EMPTY, i.e. not
-            // mid-submission at all. The canonical case is a lane whose owner
-            // holds an in-flight bind.
+            // submitted. There is deliberately NO escape hatch for an EMPTY
+            // one: an idle member is waited for like any other.
             //
-            // Such a lane is not a member that is about to submit: its next
-            // fire is ordered behind the bind, and a bind completes through
-            // the driver lane's control slot — behind the dispatch this
-            // boundary is holding. Waiting for it closes the cycle
-            // `bind -> dispatch -> seal -> bind`, which wedges the whole
-            // fleet permanently once the KV pool is oversubscribed enough
-            // that the boundary has nothing else executing to re-decide it
-            // (CONTENTION_FOLLOWUP §20.3: `awaited=24` with
-            // `pending_binds=8` and eight zero-frame lanes,
-            // `joins_in_flight=0`).
-            //
-            // This is the same hazard `on_bind_enqueued` avoids for
-            // successors it declines to re-stage; reached here through the
-            // lane's own wait-set membership instead. Restricting it to
-            // EMPTY lanes is what keeps the epoch dense: a lane with queued
-            // frames is genuinely mid-submission and is still waited for.
-            // Rejoin is implicit — the lane's next accepted fire restores it
-            // to the quorum.
+            // The `bind -> dispatch -> seal -> bind` cycle this used to fear
+            // is broken a layer down instead. A bind never orders against a
+            // queued launch (`Scheduler::lifecycle_control`), launches are
+            // dispatched by id rather than queue position, and
+            // `rotate_launch_for_wave_work` rotates a front launch run to the
+            // back so a queued bind reaches the driver while this boundary is
+            // still unsealed — so a rebinder's next fire is not gated on this
+            // seal at all. Measured on `churn` (2048 requests, 512-way): with
+            // the escape removed the shape it fired on never persisted 3ms,
+            // `wave_missing_sum` stayed 0 across 1886 fires, and wall time was
+            // unchanged.
             let mut missing = 0usize;
-            let mut missing_idle = 0usize;
             // The submit deadline's clock is armed HERE, per lane, because
             // this loop is the exact definition of the interval the guest is
             // answerable for: the lane is a member, it is not complete, and
@@ -1289,9 +1268,6 @@ impl FramePolicy {
                     }
                 }
                 missing += 1;
-                if lane.frames.is_empty() {
-                    missing_idle += 1;
-                }
             }
             if !expired.is_empty() {
                 // One process can own several lanes, so the same owner can
@@ -1321,12 +1297,11 @@ impl FramePolicy {
             let joining = if joining
                 && (self.join_gate_circular(executing) || (missing == 0 && !executing))
             {
-                // Same grace period as the rebind escape, for the same
-                // reason: a healthy gather resolves in microseconds, so
-                // waiting ESCAPE_GRACE_US before concluding the cycle is
-                // real costs nothing and keeps the dense wait-all path.
+                // A healthy gather resolves in microseconds, so waiting
+                // JOIN_GRACE_US before concluding the claim is false costs
+                // nothing and keeps the dense wait-all path.
                 let grace = if self.joins_in_flight.is_empty() {
-                    ESCAPE_GRACE_US
+                    JOIN_GRACE_US
                 } else {
                     JOIN_SETTLE_US
                 };
@@ -1338,30 +1313,6 @@ impl FramePolicy {
                 self.join_escape_deadline = None;
                 joining
             };
-            // Escape only from the deadlock shape itself: every missing lane is
-            // EMPTY and nothing is executing, so nothing the engine controls
-            // will ever make one of them submit -- their next fire is ordered
-            // behind a result only this seal can produce, which is the cycle
-            // `seal -> result -> submit -> seal`. An empty rebinder is one way
-            // to land there (its fire is ordered behind a bind that needs the
-            // control slot this boundary holds); a lane simply idle between
-            // frames is another, and it is the shape two concurrent request
-            // streams hit as soon as one of them drains its run-ahead window
-            // while the other still has work. Escaping cannot reorder anything
-            // that was going to resolve, because nothing is executing. The grace
-            // period keeps a healthy gather (which resolves in microseconds) on
-            // the dense wait-all path.
-            let escaping =
-                missing_idle > 0 && !joining && !executing && missing == missing_idle && {
-                    let deadline = *self
-                        .rebind_escape_deadline
-                        .get_or_insert(now + Duration::from_micros(ESCAPE_GRACE_US));
-                    now >= deadline
-                };
-            if !escaping && (missing != missing_idle || executing || joining) {
-                self.rebind_escape_deadline = None;
-            }
-            let missing = missing - if escaping { missing_idle } else { 0 };
             if joining || missing > 0 {
                 let mut stalled = false;
                 if executing {
@@ -1402,7 +1353,6 @@ impl FramePolicy {
                 return plan;
             }
             self.strict_watchdog_deadline = None;
-            self.rebind_escape_deadline = None;
             self.join_escape_deadline = None;
             // EARLY seal: the gate held (every awaited lane's next frame is
             // fully submitted, no earmarked successor assembling), so seal NOW — normally
@@ -1502,17 +1452,17 @@ mod tests {
         }
     }
 
-    /// The mode-2 rebind escape arms its deadline on the first blocked plan
-    /// and only releases the idle rebinder once [`ESCAPE_GRACE_US`] has
-    /// passed, which is longer than the gather poll one
-    /// [`drive_past_cold_hold`] step advances by.
-    fn drive_past_rebind_escape(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
+    /// The join gate arms its deadline on the first blocked plan and only
+    /// seals without the joiner once [`JOIN_GRACE_US`] has passed, which is
+    /// longer than the gather poll one [`drive_past_cold_hold`] step
+    /// advances by.
+    fn drive_past_join_grace(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
         let now = Instant::now();
         match plan(policy, queued, now) {
             FramePlan::Hold(_) => plan(
                 policy,
                 queued,
-                now + Duration::from_micros(ESCAPE_GRACE_US + 1),
+                now + Duration::from_micros(JOIN_GRACE_US + 1),
             ),
             plan => plan,
         }
@@ -1976,10 +1926,9 @@ mod tests {
         assert_eq!(fires(&sealed), vec![95]);
     }
 
-    /// REGRESSION (the join-gate wedge). The same
-    /// `bind -> dispatch -> seal -> bind` cycle as above, reached through
-    /// [`FramePolicy::is_joining`] instead of through `missing`, which the
-    /// rebind escape cannot break because it only decrements `missing`.
+    /// REGRESSION (the join-gate wedge). A `bind -> dispatch -> seal -> bind`
+    /// cycle reached through [`FramePolicy::is_joining`] rather than through
+    /// `missing`: the holder is a staged successor, not a wait-set member.
     ///
     /// Every awaited lane's front frame is COMPLETE, so the quorum is
     /// ready; the seal is held solely by staged successors that are still
@@ -2006,7 +1955,7 @@ mod tests {
 
         policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 11, 1, 1);
         let queued: QueuedFireIds = [11].into_iter().collect();
-        let sealed = drive_past_rebind_escape(&mut policy, &queued);
+        let sealed = drive_past_join_grace(&mut policy, &queued);
         assert_eq!(
             fires(&sealed),
             vec![11],
@@ -2014,7 +1963,7 @@ mod tests {
              cannot commit until this dispatch releases the control slot"
         );
 
-        // Scoped to the bind, exactly like the rebind escape: once the bind
+        // Scoped to the bind: once the bind
         // commits, the successor's admission is imminent again and the seal
         // waits for it.
         policy.on_bind_completed(Some(successor));
@@ -2047,70 +1996,10 @@ mod tests {
 
         policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 11, 1, 1);
         let queued: QueuedFireIds = [11].into_iter().collect();
-        match drive_past_rebind_escape(&mut policy, &queued) {
+        match drive_past_join_grace(&mut policy, &queued) {
             FramePlan::Hold(_) | FramePlan::Park => {}
             plan => panic!("an admitted successor's first fire must be waited for, got {plan:?}"),
         }
-    }
-
-    /// REGRESSION (the rebind-seal wedge, CONTENTION_FOLLOWUP.md §20).
-    /// A process whose lane has drained to empty and that has a bind in
-    /// flight must not hold the boundary: its next fire is ordered behind
-    /// the bind, and the bind completes through the driver lane's control
-    /// slot — behind the very dispatch the seal is holding. Waiting for it
-    /// closes `bind -> dispatch -> seal -> bind` and wedges the fleet
-    /// permanently (observed at 32x KV oversubscription: `awaited=24`,
-    /// `pending_binds=8`, eight zero-frame lanes, `joins_in_flight=0`,
-    /// nothing executing, ~10% of runs).
-    #[test]
-    fn an_empty_lane_awaiting_its_own_rebind_does_not_hold_the_seal() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let runner = pid();
-        let rebinder = pid();
-
-        // Both lanes fire once and the epoch dispatches.
-        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 10, 1, 1);
-        policy.on_fire_enqueued(stamp(rebinder, 0, 0, 1), Some(rebinder), 11, 1, 1);
-        let queued: QueuedFireIds = [10, 11].into_iter().collect();
-        let mut wave0 = fires(&drive_past_cold_hold(&mut policy, &queued));
-        wave0.sort_unstable();
-        assert_eq!(wave0, vec![10, 11]);
-
-        // The runner submits its next frame. The rebinder's lane drained
-        // empty and it is waiting on a bind (prefill -> decode, the
-        // ordinary shape), so it cannot submit until the bind commits.
-        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 12, 1, 1);
-        policy.on_bind_enqueued(Some(rebinder));
-
-        let queued: QueuedFireIds = [12].into_iter().collect();
-        let sealed = drive_past_rebind_escape(&mut policy, &queued);
-        assert_eq!(
-            fires(&sealed),
-            vec![12],
-            "the boundary must seal without the rebinder, whose fire cannot \
-             arrive until this dispatch releases the control slot"
-        );
-
-        // The exclusion is scoped to the bind, not permanent: once it
-        // commits the lane is a full member again and the boundary waits
-        // for it exactly as before.
-        //
-        // Observed BEFORE the escape grace period. An idle lane is escaped
-        // generically once `ESCAPE_GRACE_US` passes with nothing executing,
-        // so driving past the hold would measure that timer instead of the
-        // bind scoping this test is about.
-        policy.on_bind_completed(Some(rebinder));
-        policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 14, 1, 1);
-        let queued: QueuedFireIds = [14].into_iter().collect();
-        match plan(&mut policy, &queued, Instant::now()) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("the committed rebinder must hold the seal, got {plan:?}"),
-        }
-        policy.on_fire_enqueued(stamp(rebinder, 1, 0, 1), Some(rebinder), 13, 1, 1);
-        let queued: QueuedFireIds = [13, 14].into_iter().collect();
-        let mut wave = fires(&drive_past_cold_hold(&mut policy, &queued));
-        wave.sort_unstable();
-        assert_eq!(wave, vec![13, 14], "the rebinder gathered back in");
     }
 
     /// A freed slot with a staged taker holds the seal; the successor's
@@ -2583,9 +2472,7 @@ mod tests {
         ));
 
         // b's result came back and it is part-way through its next frame; a's
-        // has not, so a is still owed while b drives the gather. b's partial
-        // submission is also what keeps the rebind escape out of this test:
-        // the escape only fires when every missing lane is empty.
+        // has not, so a is still owed while b drives the gather.
         policy.on_frame_retired([b]);
         policy.on_fire_enqueued(stamp(b, 1, 0, 2), Some(b), 310, 1, 1);
         let queued: QueuedFireIds = [310].into_iter().collect();
