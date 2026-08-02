@@ -89,6 +89,20 @@ exclude = [
 # rather than edit it to match whatever is installed.
 rust-version = "1.91"
 
+# The checkpoint readers, in one place because releasing them is a two-repo
+# dance: `ztensor` owns the container format and its validation,
+# `ztensor-compat` owns the foreign-format projections.
+#
+# These are path dependencies on a sibling checkout, which works on a machine
+# that has one and nowhere else. Before this workspace can build in CI or
+# anywhere but a developer's laptop, ztensor has to be released and these two
+# lines have to become a version (or a tagged git) requirement — which is why
+# they are here rather than spread across `loader/Cargo.toml`: it is one edit,
+# in one file, on the day that happens.
+[workspace.dependencies]
+ztensor = { path = "../../ztensor/ztensor" }
+ztensor-compat = { path = "../../ztensor/ztensor-compat" }
+
 # Shared lint table. Opt in per crate with `[lints] workspace = true`; today
 # only the `compiler/*` crates do, because they are the only ones at zero
 # clippy warnings and therefore the only ones CI can gate with `-D warnings`

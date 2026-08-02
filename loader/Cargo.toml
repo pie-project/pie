@@ -40,10 +40,10 @@ testkit = []
 
 [dependencies]
 half = "2"
-# The checkpoint readers. `ztensor` owns the container format and its
-# validation; `ztensor-compat` owns the foreign-format projections.
-ztensor = { path = "../../../ztensor/ztensor", features = ["zstd"] }
-ztensor-compat = { path = "../../../ztensor/ztensor-compat", features = [
+# The checkpoint readers; the requirement itself lives in the workspace
+# manifest, because releasing them is a two-repo dance.
+ztensor = { workspace = true, features = ["zstd"] }
+ztensor-compat = { workspace = true, features = [
     "safetensors",
     "gguf",
     "npz",
@@ -56,4 +56,4 @@ serde_json = "1.0"
 thiserror = "2.0"
 
 [dev-dependencies]
-ztensor = { path = "../../../ztensor/ztensor" }
+ztensor = { workspace = true }
