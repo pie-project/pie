@@ -67,6 +67,13 @@ Pso pso_for_mb(const Dispatch& d, const Gemma4Geometry& g, int rows,
 /// choice cannot disagree with the fit check.
 bool gemma4_uses_alt_quant(Kind k);
 
+/// Whether this dispatch's GEMM reads an FP16 copy of its input, and whether it
+/// is the one that stages it. Public because the binding needs the same answer
+/// the encoder gets -- slot 12 has to be bound on exactly the dispatches that
+/// read it.
+bool gemma4_fp16_qmm(const Gemma4Geometry& g, const Dispatch& d, int m);
+bool gemma4_fp16_cast_before(Kind k);
+
 void encode_gemma4_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const Gemma4Geometry& g, int rows,
                            const DecodeStepPsos& base, const MultiBatchPsos& mb,

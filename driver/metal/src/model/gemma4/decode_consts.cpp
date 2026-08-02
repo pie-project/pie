@@ -420,4 +420,46 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     return count;
 }
 
+
+/// Bind the FP16 staging buffer to every projection that reads one.
+///
+/// Slot 12 is the staged input the FP16 GEMM reads instead of slot 3, and slot
+/// 13 is how many elements the staging pass writes. Both are bound on the
+/// PROJECTION's table rather than a table of their own, because the staging
+/// pass has no DAG entry to own one.
+int bind_gemma4_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                         const Gemma4Geometry& g, int rows, int head_rows,
+                         const SlotHandle& staging, std::vector<SlotHandle>& keep) {
+    keep.clear();
+    if (!staging.valid()) return 0;
+    const int R = rows < 1 ? 1 : rows;
+    const int S = head_rows < 1 ? R : std::min(head_rows, R);
+    std::vector<std::pair<std::int32_t, SlotHandle>> counts;
+    int bound = 0;
+    for (const Dispatch& d : dag) {
+        const int m = d.kind == Kind::LmHead ? S : R;
+        if (!gemma4_fp16_qmm(g, d, m)) continue;
+        const std::int32_t elems = std::int32_t(gemma4_qmm_rows(m)) *
+                                   std::int32_t(qmv_kn(d.kind, g, d.layer).K);
+        SlotHandle count;
+        for (const auto& entry : counts) {
+            if (entry.first == elems) {
+                count = entry.second;
+                break;
+            }
+        }
+        if (!count.valid()) {
+            count = ctx.create_standalone_buffer(sizeof(std::int32_t));
+            if (!count.valid()) continue;
+            *static_cast<std::int32_t*>(count.contents()) = elems;
+            counts.push_back({elems, count});
+            keep.push_back(count);
+        }
+        ctx.arg_bind_ordinal(d.ordinal, 12, staging);
+        ctx.arg_bind_ordinal(d.ordinal, 13, count);
+        ++bound;
+    }
+    return bound;
+}
+
 }  // namespace pie::metal::gemma4

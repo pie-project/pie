@@ -61,12 +61,15 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         extra.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});
         extra.push_back({"moe_route.metal", "moe_combine_sorted", &out.moe_combine});
         extra.push_back({"residual_add.metal", "residual_add_bfloat16", &out.residual_add});
-        const std::string routed_bm =
-            "affine_qmm_t_routed" + q + "_bm_" + std::to_string(shared_kernels::kMoeTileRows);
-        for (int i = 0; i < 3; ++i) {
-            extra.push_back({"quantized_qmm_t.metal",
-                             routed_bm + "_bn_" + std::to_string(16 << i),
-                             &out.qmm_routed[i]});
+        for (int t = 0; t < 3; ++t) {
+            const std::string bm =
+                "affine_qmm_t_routed" + q + "_bm_" +
+                std::to_string(shared_kernels::kMoeTileWidths[t]);
+            for (int i = 0; i < 3; ++i) {
+                extra.push_back({"quantized_qmm_t.metal",
+                                 bm + "_bn_" + std::to_string(16 << i),
+                                 &out.qmm_routed[t][i]});
+            }
         }
     }
     for (const Spec& spec : extra) {

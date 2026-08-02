@@ -417,7 +417,10 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
         if (!load_multibatch_psos(
                 ctx, kernels_dir, mb_, g_.quant, err,
-                MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
+                MultiBatchPsoFeatures{
+                    .d512 = true, .sdpa_d256 = true,
+                    .fp16_precast = !g_.is_moe() && g_.quant.bits == 4 &&
+                                    g_.quant.group == 64})) {
             return false;
         }
         // A checkpoint may quantize the dense FFN and the router at a DIFFERENT
@@ -437,7 +440,30 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             }
         }
 
+        if (!g_.is_moe() && g_.quant.bits == 4 && g_.quant.group == 64) {
+            // The widest input any staged projection reads, times the rows the
+            // GEMM rounds up to. Asked of the DAG rather than of the geometry
+            // because gemma4's `o_proj` K is per-layer -- a sliding layer's is
+            // 8x256 where a full layer's is 8x512, and only one of those is
+            // `hidden`.
+            std::size_t widest = 0;
+            for (const gemma4::Dispatch& d : dag_) {
+                if (!gemma4::gemma4_fp16_qmm(g_, d, max_rows_)) continue;
+                widest = std::max(widest, std::size_t(gemma4::qmv_kn(d.kind, g_, d.layer).K));
+            }
+            if (widest > 0) {
+                const std::size_t elems =
+                    std::size_t(gemma4::gemma4_qmm_pool_rows(max_rows_)) * widest;
+                fp16_input_ = ctx.heap_alloc(elems * sizeof(std::uint16_t));
+                if (!fp16_input_.valid()) {
+                    if (err) *err = "gemma4 FP16 QMM input allocation failed";
+                    return false;
+                }
+            }
+        }
         gemma4::bind_gemma4_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
+        gemma4::bind_gemma4_fp16_qmm(ctx, dag_, g_, /*rows=*/1, /*head_rows=*/1,
+                                     fp16_input_, fp16_keep_);
         bound_rows_ = 1;
         bound_head_rows_ = 1;
         try {
@@ -544,6 +570,11 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
         if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
             gemma4::bind_gemma4_consts(ctx, dag_, g_, rows, /*paged=*/true, head_rows);
+            // The staged element count is a row count, so it moves with the
+            // fire. Rebound here and not in the encoder: the encoder writes a
+            // command buffer, and this writes an argument table.
+            gemma4::bind_gemma4_fp16_qmm(ctx, dag_, g_, rows, head_rows, fp16_input_,
+                                         fp16_keep_);
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
@@ -637,6 +668,10 @@ class Gemma4Engine final : public SimpleFamilyEngine {
     /// has a second affine format.
     DecodeStepPsos base_alt_{};
     MultiBatchPsos mb_alt_{};
+    // The FP16 staging buffer every dense projection's GEMM reads, and the
+    // element-count buffers the staging pass bounds itself with.
+    SlotHandle fp16_input_{};
+    std::vector<SlotHandle> fp16_keep_{};
     std::vector<SlotHandle> kpages_{};
     std::vector<SlotHandle> vpages_{};
     SlotHandle logits_{};
@@ -850,6 +885,17 @@ class GptOssEngine final : public SimpleFamilyEngine {
             }
             return false;
         }
+        // And the projections', which is a third width again -- refused on the
+        // same grounds, because reading 8-bit rows with a 4-bit matvec is the
+        // failure that produces fluent noise rather than an error.
+        g_.proj_bits = gptoss::proj_bits_from_weights(b_.weights);
+        if (g_.proj_bits == 0) {
+            if (err) {
+                *err = "gpt-oss: could not solve the projections' quantization width from "
+                       "`layers.0.self_attn.q_proj.{weight,scales}`";
+            }
+            return false;
+        }
 
         // Paged KV. The sorted MoE is a true M>1 path: rows are grouped by
         // expert, then the native MXFP4 routed GEMM serves each run.
@@ -919,13 +965,16 @@ class GptOssEngine final : public SimpleFamilyEngine {
         }
 
         if (!gptoss::build_gptoss_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        // b4/g64, NOT the (mxfp4, 32) pair gpt-oss's config declares globally.
+        // The checkpoint's projection width at g64, NOT the (mxfp4, 32) pair
+        // gpt-oss's config declares globally.
         // That global is overridden back to affine g64 by nearly every tensor,
         // and this shared table only ever compiles the affine entrypoints --
         // gpt-oss's own mxfp4 kernels are named explicitly in `gptoss/kernels.cpp`.
-        // This used to be the parameter's default, which meant the driver was
-        // making the same choice without saying so.
-        const AffineFormat kGptOssBase{/*bits=*/4, /*group=*/64};
+        // The width used to be a literal 4 here, which was right for a
+        // uniformly-4-bit checkpoint and silently wrong for a mixed one --
+        // and this table builds the PREFILL GEMMs, so it was the more
+        // damaging of the two hardcodings.
+        const AffineFormat kGptOssBase{/*bits=*/g_.proj_bits, /*group=*/64};
         if (!load_decode_psos(ctx, kernels_dir, base_, kGptOssBase, err))
             return false;
         if (!load_multibatch_psos(
@@ -1027,12 +1076,18 @@ class GptOssEngine final : public SimpleFamilyEngine {
             bound_rows_ = rows;
             bound_head_rows_ = head_rows;
         }
-        const auto walk = [this, rows, head_rows, &pre, &post](StepEncoder& se,
-                                                               std::size_t begin,
-                                                               std::size_t end) {
+        // Rows alone cannot tell a prefill from a fleet of decodes -- both can
+        // be 32 rows. The CSR can: `qo_indptr` is one entry per request plus a
+        // terminator.
+        const int requests =
+            csr.qo_indptr.empty() ? 0 : int(csr.qo_indptr.size()) - 1;
+        const auto walk = [this, rows, head_rows, requests, &pre, &post](StepEncoder& se,
+                                                                        std::size_t begin,
+                                                                        std::size_t end) {
             if (begin == 0 && pre) pre(se);
             gptoss::encode_gptoss_step_mb(se, dag_, g_, rows, base_, mb_, psos_,
-                                          /*ordinal_base=*/0, head_rows, begin, end);
+                                          /*ordinal_base=*/0, head_rows, requests, begin,
+                                          end);
             if (end == dag_.size() && post) post(se);
         };
         if (paging_.active()) return paging_.fire(ctx, rows, walk);

@@ -43,6 +43,13 @@ bool mxfp4_experts_from_weights(const std::unordered_map<std::string, SlotHandle
 
 int router_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights);
 
+/// The attention projections' quantization width, solved off
+/// `layers.0.self_attn.q_proj.{weight,scales}` by the same arithmetic --
+/// they are affine group-64 at whatever width the checkpoint chose. Returns 0
+/// when the tensors are missing or the ratio is not a width these kernels
+/// have, so the caller refuses rather than guessing.
+int proj_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights);
+
 /// Everything staged before a step can be bound.
 struct BoundGptOss {
     std::unordered_map<std::string, SlotHandle> weights;

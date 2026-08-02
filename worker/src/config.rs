@@ -1125,6 +1125,15 @@ pub struct MetalDriverOptions {
     pub max_forward_requests: u32,
     /// Host-memory KV pages to swap into. `0` disables swapping.
     pub cpu_pages: u32,
+    /// Tokens the KV ring holds across the whole resident fleet. Absent -- the
+    /// default -- keeps the driver's own constant, which is what a `pie serve`
+    /// fleet wants and what every run got before this existed.
+    ///
+    /// The one knob that shrinks the KV, and it only shrinks: the driver
+    /// clamps to its own ceiling, so this cannot ask for a ring it will not
+    /// build. `total_pages` is NOT that knob and never was -- the simple
+    /// families derive their pool from this context and discard it.
+    pub max_model_len: Option<u32>,
     /// Dtype KV pages are stored in. `"auto"` follows the activation dtype;
     /// a narrower one buys pages at some accuracy.
     pub kv_cache_dtype: String,
@@ -1163,6 +1172,7 @@ impl Default for MetalDriverOptions {
             max_forward_tokens: 10240,
             max_forward_requests: 512,
             cpu_pages: 0,
+            max_model_len: None,
             kv_cache_dtype: "auto".to_string(),
             stream_routed_experts: false,
             device: "metal:0".to_string(),

@@ -1711,7 +1711,11 @@ int main() {
     // Stated as an expectation rather than assumed, because the threshold is
     // arithmetic on the geometry and a change to either side of it would
     // silently move this case back onto the path the other five already cover.
-    expect(llama_moe_tile_rows(moe, 48) == pie::metal::shared_kernels::kMoeTileRows,
+    //
+    // What is pinned is the PATH, not the width: `moe_tile_rows` returns 1 for
+    // the matvec and a tile for the batched form, and which tile is a tuning
+    // answer that moves with the measurements behind it.
+    expect(llama_moe_tile_rows(moe, 48) > 1,
            "48 routed rows take the batched path");
     expect(llama_moe_tile_rows(moe, 16) == 1, "16 routed rows do not");
     run_case("qwen3-moe (routed, 48 rows: the batched mixture)", moe, *ctx, kernels_dir, 0.12f,
