@@ -43,8 +43,9 @@ enum class Kind : std::uint8_t {
     // Dense SwiGLU.
     QmvGate, QmvUp, SiluMul, QmvDown,
 
-    // Routed mixture. `Router` is a small DENSE gemv -- `mlp.gate` is bf16 and
-    // `n_experts` wide, so quantising it buys nothing and costs a rounding.
+    // Routed mixture. `Router` is an ordinary matvec: `mlp.gate` is
+    // `[n_experts, hidden]`, which is the same shape as a narrow attention
+    // projection, so it goes through the same kernel rather than a new one.
     Router,
     RouterTopK,
     /// The three routed projections. Each reads the expert stack at

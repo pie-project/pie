@@ -1,0 +1,58 @@
+#pragma once
+
+/// The llama families' activation dataflow: which value every dispatch touches.
+///
+/// Pure -- no Metal, no allocation. Colouring the live ranges onto a buffer
+/// pool is the shared half and happens after.
+
+#include <cstdint>
+#include <vector>
+
+#include "decode_step.hpp"
+#include "geometry.hpp"
+
+namespace pie::metal::llama {
+
+/// One buffer of one dispatch, and the activation value it carries.
+///
+/// `index` is the dispatch's POSITION in the DAG, not its argument-table
+/// ordinal. The two coincide on the decode path and diverge on the prefill one,
+/// whose ordinals are shifted clear of it -- and position is what this means:
+/// the colouring uses it as a time axis.
+struct Use {
+    int index = 0;
+    std::uint8_t bind_index = 0;
+    int value = 0;
+    bool is_write = false;
+};
+
+struct ScratchPlan {
+    std::vector<Use> uses;
+    int value_count = 0;
+    /// The value the logits land in -- what the sampler reads.
+    int logits_value = -1;
+    /// The routing decision, live from `RouterTopK` to `ExpertCombine`. -1 on a
+    /// dense model. Recorded because these two are the only values a routed
+    /// layer keeps alive ACROSS the expert projections, so a pool that colours
+    /// them like ordinary temporaries would recycle them mid-FFN.
+    int expert_ids_value = -1;
+    int expert_weights_value = -1;
+};
+
+/// Element width, in units of the model's hidden size, of each activation.
+///
+/// The pool sizes its slots from this. A routed model's expert stack is the
+/// only place a value is `experts_per_token` times wider than its dense
+/// counterpart, and that is exactly the fact a colouring pass cannot infer.
+struct ValueExtent {
+    int elems = 0;   // per row
+    int rows_are_slots = 0;  // 1 if the value is [rows * experts_per_token, elems]
+};
+
+ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeometry& g);
+
+/// Per-value extents, indexed by value id, sized `plan.value_count`.
+std::vector<ValueExtent> llama_value_extents(const std::vector<Dispatch>& dag,
+                                             const ScratchPlan& plan, const LlamaGeometry& g);
+
+}  // namespace pie::metal::llama

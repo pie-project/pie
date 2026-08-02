@@ -1,0 +1,351 @@
+// The llama families' activation dataflow.
+//
+// The same job `gemma4/scratch.cpp` does for gemma4: walk the DAG in order and
+// say, for every dispatch, which activation value each buffer reads or writes.
+// Colouring those live ranges onto a pool is the shared half and is reused.
+//
+// llama is the plain case, and that is worth saying plainly: a pre-norm
+// residual stream, `x += block(norm(x))` twice per layer, with nothing
+// normalised on the way out and no second stream. Everything interesting here
+// is the routed FFN, and it is interesting for one reason -- it is the only
+// place in any family where a single dispatch writes `experts_per_token`
+// results per row instead of one. The expert activations are [rows, k, width],
+// and a pool that sized them like the dense ones would overrun by a factor of
+// k. `llama_value_extents` exists to say so.
+//
+// The routing decision is the other thing this file has to get right. Dense
+// temporaries die at their next consumer, so a colouring pass can recycle them
+// aggressively. `expert_ids` and `expert_weights` do not: they are written by
+// `RouterTopK` and still read by `ExpertCombine`, five dispatches later, with
+// three matvecs in between allocating freely. They are tracked as ordinary
+// values with honest live ranges so the shared colouring sees the extent rather
+// than being told about it.
+
+#include "scratch.hpp"
+
+namespace pie::metal::llama {
+
+namespace bi {
+// The bind indices this dataflow touches, named so the walk below reads as
+// dataflow rather than as arithmetic.
+constexpr std::uint8_t RmsX = 0, RmsOut = 2;
+// The quantized matvec's activation in and out. The ROUTED matvec shares them:
+// it is the same kernel with the weight stack indexed by `expert_ids`, so the
+// activation binds do not move.
+constexpr std::uint8_t QmvX = 3, QmvOut = 4;
+constexpr std::uint8_t QmvExpertIds = 8;
+constexpr std::uint8_t EmbedOut = 4;
+constexpr std::uint8_t RopeX = 0;
+constexpr std::uint8_t SdpaQ = 0, SdpaOut = 3;
+constexpr std::uint8_t KvAppendK = 0, KvAppendV = 1;
+constexpr std::uint8_t SiluGate = 0, SiluUp = 1, SiluOut = 2;
+constexpr std::uint8_t ResidX = 0, ResidR = 1, ResidOut = 2;
+constexpr std::uint8_t RouterLogits = 0, RouterIds = 1, RouterWeights = 2;
+constexpr std::uint8_t CombineY = 0, CombineWeights = 1, CombineOut = 2;
+constexpr std::uint8_t GatherIn = 0, GatherOut = 1;
+}  // namespace bi
+
+ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeometry& g) {
+    ScratchPlan plan;
+    int next_value = 0;
+    auto fresh = [&] { return next_value++; };
+    auto rd = [&](int o, std::uint8_t b, int v) { plan.uses.push_back({o, b, v, false}); };
+    auto wr = [&](int o, std::uint8_t b, int v) { plan.uses.push_back({o, b, v, true}); };
+
+    // The residual stream, and the temporaries that hang off it.
+    int resid = -1;
+    int normed = -1;
+    int q = -1, kk = -1, vv = -1, attn = -1;
+    int gp = -1, up = -1, act = -1;
+    int block = -1;  // a block's output, between its projection and its residual add
+    int router_logits = -1, expert_ids = -1, expert_weights = -1;
+
+    for (std::size_t di = 0; di < dag.size(); ++di) {
+        const Dispatch& d = dag[di];
+        // Position, not `d.ordinal`: the prefill DAG shifts its ordinals clear
+        // of the decode path's, and this is a time axis.
+        const int o = static_cast<int>(di);
+        switch (d.kind) {
+            case Kind::EmbedGather:
+                resid = fresh();
+                wr(o, bi::EmbedOut, resid);
+                break;
+
+            // ── attention ──
+            case Kind::AttnNorm:
+                normed = fresh();
+                rd(o, bi::RmsX, resid);
+                wr(o, bi::RmsOut, normed);
+                break;
+            case Kind::QmvQ:
+                q = fresh();
+                rd(o, bi::QmvX, normed);
+                wr(o, bi::QmvOut, q);
+                break;
+            case Kind::QmvK:
+                kk = fresh();
+                rd(o, bi::QmvX, normed);
+                wr(o, bi::QmvOut, kk);
+                break;
+            case Kind::QmvV:
+                vv = fresh();
+                rd(o, bi::QmvX, normed);
+                wr(o, bi::QmvOut, vv);
+                break;
+            // Qwen3's per-head norms, in place: they rescale q and k where they
+            // already are, before the rotation reads them.
+            case Kind::QNorm:
+                rd(o, bi::RmsX, q);
+                wr(o, bi::RmsOut, q);
+                break;
+            case Kind::KNorm:
+                rd(o, bi::RmsX, kk);
+                wr(o, bi::RmsOut, kk);
+                break;
+            case Kind::RopeQ:
+                rd(o, bi::RopeX, q);
+                wr(o, bi::RopeX, q);
+                break;
+            case Kind::RopeK:
+                rd(o, bi::RopeX, kk);
+                wr(o, bi::RopeX, kk);
+                break;
+            case Kind::KvAppend:
+                // Writes the cache, which the pool does not own -- so this
+                // consumes k and v and produces nothing colourable. It is also
+                // what ENDS their live ranges, which is why it is recorded at
+                // all rather than skipped.
+                rd(o, bi::KvAppendK, kk);
+                rd(o, bi::KvAppendV, vv);
+                break;
+            case Kind::Sdpa:
+                attn = fresh();
+                rd(o, bi::SdpaQ, q);
+                wr(o, bi::SdpaOut, attn);
+                break;
+            case Kind::QmvO:
+                block = fresh();
+                rd(o, bi::QmvX, attn);
+                wr(o, bi::QmvOut, block);
+                break;
+            case Kind::AttnResidual: {
+                const int next = fresh();
+                rd(o, bi::ResidX, block);
+                rd(o, bi::ResidR, resid);
+                wr(o, bi::ResidOut, next);
+                resid = next;
+                break;
+            }
+
+            // ── FFN, dense ──
+            case Kind::FfnNorm:
+                normed = fresh();
+                rd(o, bi::RmsX, resid);
+                wr(o, bi::RmsOut, normed);
+                break;
+            case Kind::QmvGate:
+                gp = fresh();
+                rd(o, bi::QmvX, normed);
+                wr(o, bi::QmvOut, gp);
+                break;
+            case Kind::QmvUp:
+                up = fresh();
+                rd(o, bi::QmvX, normed);
+                wr(o, bi::QmvOut, up);
+                break;
+            case Kind::SiluMul:
+                act = fresh();
+                rd(o, bi::SiluGate, gp);
+                rd(o, bi::SiluUp, up);
+                wr(o, bi::SiluOut, act);
+                break;
+            case Kind::QmvDown:
+                block = fresh();
+                rd(o, bi::QmvX, act);
+                wr(o, bi::QmvOut, block);
+                break;
+
+            // ── FFN, routed ──
+            case Kind::Router:
+                router_logits = fresh();
+                rd(o, bi::QmvX, normed);
+                wr(o, bi::QmvOut, router_logits);
+                break;
+            case Kind::RouterTopK:
+                // Two outputs, and both outlive the three matvecs that follow.
+                expert_ids = fresh();
+                expert_weights = fresh();
+                rd(o, bi::RouterLogits, router_logits);
+                wr(o, bi::RouterIds, expert_ids);
+                wr(o, bi::RouterWeights, expert_weights);
+                break;
+            case Kind::ExpertGate:
+                gp = fresh();
+                rd(o, bi::QmvX, normed);
+                rd(o, bi::QmvExpertIds, expert_ids);
+                wr(o, bi::QmvOut, gp);
+                break;
+            case Kind::ExpertUp:
+                up = fresh();
+                rd(o, bi::QmvX, normed);
+                rd(o, bi::QmvExpertIds, expert_ids);
+                wr(o, bi::QmvOut, up);
+                break;
+            case Kind::ExpertSiluMul:
+                // Elementwise over the whole [rows, k, width] stack: the slot
+                // axis needs no special handling here because gate, up and out
+                // are all laid out the same way.
+                act = fresh();
+                rd(o, bi::SiluGate, gp);
+                rd(o, bi::SiluUp, up);
+                wr(o, bi::SiluOut, act);
+                break;
+            case Kind::ExpertDown:
+                // Still [rows, k, hidden]: each slot projects back on its own,
+                // and the k results are only summed by ExpertCombine.
+                block = fresh();
+                rd(o, bi::QmvX, act);
+                rd(o, bi::QmvExpertIds, expert_ids);
+                wr(o, bi::QmvOut, block);
+                break;
+            case Kind::ExpertCombine: {
+                const int combined = fresh();
+                rd(o, bi::CombineY, block);
+                rd(o, bi::CombineWeights, expert_weights);
+                wr(o, bi::CombineOut, combined);
+                block = combined;
+                break;
+            }
+
+            case Kind::FfnResidual: {
+                const int next = fresh();
+                rd(o, bi::ResidX, block);
+                rd(o, bi::ResidR, resid);
+                wr(o, bi::ResidOut, next);
+                resid = next;
+                break;
+            }
+
+            // ── tail ──
+            // The sampled rows, compacted: everything after this is [S, *]. It
+            // writes a value of its own rather than in place, because its input
+            // is [N, hidden] and its output is a DIFFERENT shape -- aliasing
+            // them would make the pool's slot sizing a lie.
+            case Kind::RowGather: {
+                const int gathered = fresh();
+                rd(o, bi::GatherIn, resid);
+                wr(o, bi::GatherOut, gathered);
+                resid = gathered;
+                break;
+            }
+            case Kind::FinalRms:
+                normed = fresh();
+                rd(o, bi::RmsX, resid);
+                wr(o, bi::RmsOut, normed);
+                break;
+            case Kind::LmHead: {
+                const int logits = fresh();
+                rd(o, bi::QmvX, normed);
+                wr(o, bi::QmvOut, logits);
+                plan.logits_value = logits;
+                break;
+            }
+            case Kind::Argmax:
+                rd(o, 0, plan.logits_value);
+                break;
+        }
+    }
+    plan.value_count = next_value;
+    plan.expert_ids_value = expert_ids;
+    plan.expert_weights_value = expert_weights;
+    return plan;
+}
+
+std::vector<ValueExtent> llama_value_extents(const std::vector<Dispatch>& dag,
+                                             const ScratchPlan& plan, const LlamaGeometry& g) {
+    std::vector<ValueExtent> ext(std::size_t(plan.value_count));
+
+    // Attribute each value to the dispatch that WROTE it: a value's shape is
+    // its producer's output shape, and every value here has exactly one
+    // producer. Reading the extent off the consumer instead would be ambiguous
+    // for anything read twice.
+    for (const Use& u : plan.uses) {
+        if (!u.is_write) continue;
+        const Kind k = dag[std::size_t(u.index)].kind;
+        ValueExtent e;
+        switch (k) {
+            case Kind::EmbedGather:
+            case Kind::AttnNorm:
+            case Kind::FfnNorm:
+            case Kind::FinalRms:
+            case Kind::AttnResidual:
+            case Kind::FfnResidual:
+            case Kind::RowGather:
+            case Kind::QmvO:
+                e.elems = g.hidden;
+                break;
+            case Kind::QmvQ:
+            case Kind::QNorm:
+            case Kind::Sdpa:
+                e.elems = g.q_width();
+                break;
+            case Kind::QmvK:
+            case Kind::QmvV:
+            case Kind::KNorm:
+                e.elems = g.kv_width();
+                break;
+            case Kind::RopeQ:
+                e.elems = g.q_width();
+                break;
+            case Kind::RopeK:
+                e.elems = g.kv_width();
+                break;
+            case Kind::QmvGate:
+            case Kind::QmvUp:
+            case Kind::SiluMul:
+                e.elems = g.intermediate;
+                break;
+            case Kind::QmvDown:
+                e.elems = g.hidden;
+                break;
+            case Kind::Router:
+                e.elems = g.n_experts;
+                break;
+            case Kind::RouterTopK:
+                // Both outputs are k-wide, one int and one activation. The
+                // pool's element type is uniform, so the int side is sized in
+                // the same units and rounded up rather than special-cased.
+                e.elems = g.experts_per_token;
+                break;
+            case Kind::ExpertGate:
+            case Kind::ExpertUp:
+            case Kind::ExpertSiluMul:
+                e.elems = g.moe_intermediate;
+                e.rows_are_slots = 1;
+                break;
+            case Kind::ExpertDown:
+                e.elems = g.hidden;
+                e.rows_are_slots = 1;
+                break;
+            case Kind::ExpertCombine:
+                // The k slots collapse here: back to one row's worth.
+                e.elems = g.hidden;
+                break;
+            case Kind::LmHead:
+                e.elems = g.vocab;
+                break;
+            case Kind::Argmax:
+            case Kind::KvAppend:
+                break;
+        }
+        // A value written more than once (rope and the qk-norms write in place)
+        // keeps the widest claim, so an in-place pass can never shrink a slot
+        // under the value already living in it.
+        ValueExtent& slot = ext[std::size_t(u.value)];
+        if (e.elems > slot.elems) slot.elems = e.elems;
+        if (e.rows_are_slots != 0) slot.rows_are_slots = 1;
+    }
+    return ext;
+}
+
+}  // namespace pie::metal::llama

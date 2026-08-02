@@ -21,13 +21,19 @@
 #include <vector>
 
 #include "model/llama/decode_step.hpp"
+#include "model/llama/scratch.hpp"
 
 using pie::metal::llama::Dispatch;
 using pie::metal::llama::Kind;
 using pie::metal::llama::LlamaGeometry;
 using pie::metal::llama::build_llama_dag;
 using pie::metal::llama::build_llama_dag_mb;
+using pie::metal::llama::ScratchPlan;
+using pie::metal::llama::Use;
+using pie::metal::llama::ValueExtent;
+using pie::metal::llama::build_llama_scratch;
 using pie::metal::llama::dag_stats;
+using pie::metal::llama::llama_value_extents;
 
 namespace {
 
@@ -182,6 +188,140 @@ void check_family(const char* who, const LlamaGeometry& g) {
     check_ordinals(mb, 50000, std::string(who) + " MB");
 }
 
+
+/// The dataflow's own invariants. These are the ones that fail silently: a
+/// value read before it is written reads whatever the pool last left there, and
+/// the model still produces fluent text.
+void check_scratch(const char* who, const LlamaGeometry& g) {
+    std::printf("\n-- scratch: %s --\n", who);
+    const std::vector<Dispatch> dag = build_llama_dag(g);
+    const ScratchPlan plan = build_llama_scratch(dag, g);
+
+    // Uses are emitted in dispatch order, which the colouring relies on to
+    // treat `index` as a time axis.
+    bool ordered = true;
+    for (std::size_t i = 1; i < plan.uses.size(); ++i) {
+        if (plan.uses[i].index < plan.uses[i - 1].index) ordered = false;
+    }
+    expect(ordered, std::string(who) + ": uses are in dispatch order");
+
+    bool in_range = true;
+    for (const Use& u : plan.uses) {
+        if (u.value < 0 || u.value >= plan.value_count) in_range = false;
+        if (u.index < 0 || u.index >= static_cast<int>(dag.size())) in_range = false;
+    }
+    expect(in_range, std::string(who) + ": every use names a real value and dispatch");
+
+    // Single assignment, except for the deliberate in-place passes. Two
+    // producers for one value means the second silently clobbers the first.
+    std::map<int, std::vector<int>> writers;
+    for (const Use& u : plan.uses) {
+        if (u.is_write) writers[u.value].push_back(u.index);
+    }
+    bool inplace_only = true;
+    for (const auto& [value, ws] : writers) {
+        if (ws.size() == 1) continue;
+        // The FIRST write is the value's producer. Every write AFTER it is
+        // legal only if the same dispatch also reads the value -- that is what
+        // "in place" means, and rope and the qk-norms are the only dispatches
+        // that do it.
+        for (std::size_t wi = 1; wi < ws.size(); ++wi) {
+            const int w = ws[wi];
+            bool reads_too = false;
+            for (const Use& u : plan.uses) {
+                if (u.index == w && !u.is_write && u.value == value) reads_too = true;
+            }
+            const Kind k = dag[std::size_t(w)].kind;
+            const bool expected_inplace = k == Kind::RopeQ || k == Kind::RopeK ||
+                                          k == Kind::QNorm || k == Kind::KNorm;
+            if (!reads_too || !expected_inplace) inplace_only = false;
+        }
+    }
+    expect(inplace_only, std::string(who) + ": repeated writes are in-place rope/qk-norm only");
+
+    // No read before write. This is the one that matters.
+    std::map<int, int> first_write;
+    for (const Use& u : plan.uses) {
+        if (u.is_write && first_write.find(u.value) == first_write.end()) {
+            first_write[u.value] = u.index;
+        }
+    }
+    bool defined = true;
+    int undefined_value = -1;
+    for (const Use& u : plan.uses) {
+        if (u.is_write) continue;
+        auto it = first_write.find(u.value);
+        if (it == first_write.end() || it->second > u.index) {
+            defined = false;
+            undefined_value = u.value;
+        }
+    }
+    if (!defined) std::printf("        value %d read before written\n", undefined_value);
+    expect(defined, std::string(who) + ": every read follows the value's write");
+
+    // Every value produced is consumed. A dead value is a dispatch whose result
+    // nothing needs -- which on this DAG means a wiring mistake, not a saving.
+    std::map<int, int> reads;
+    for (const Use& u : plan.uses) {
+        if (!u.is_write) ++reads[u.value];
+    }
+    int dead = 0;
+    for (const auto& [value, ws] : writers) {
+        (void)ws;
+        if (reads.find(value) == reads.end()) ++dead;
+    }
+    // The logits are read by the argmax, so nothing should be dead at all.
+    expect_eq(dead, 0, std::string(who) + ": no value is written and never read");
+
+    expect(plan.logits_value >= 0, std::string(who) + ": the logits value is identified");
+
+    // The routing decision must be live ACROSS the expert matvecs, not recycled
+    // between them. This is the specific thing a naive colouring gets wrong.
+    if (g.is_moe()) {
+        expect(plan.expert_ids_value >= 0 && plan.expert_weights_value >= 0,
+               std::string(who) + ": routing values are identified");
+        // Per layer: written once by RouterTopK, read three times by the
+        // expert matvecs (ids) and once by the combine (weights).
+        int id_reads = 0, weight_reads = 0;
+        for (const Use& u : plan.uses) {
+            if (u.is_write) continue;
+            const Kind k = dag[std::size_t(u.index)].kind;
+            if (k == Kind::ExpertGate || k == Kind::ExpertUp || k == Kind::ExpertDown) {
+                if (u.bind_index == 8) ++id_reads;
+            }
+            if (k == Kind::ExpertCombine && u.bind_index == 1) ++weight_reads;
+        }
+        expect_eq(id_reads, 3 * g.n_layers,
+                  std::string(who) + ": each expert matvec reads the router's ids");
+        expect_eq(weight_reads, g.n_layers,
+                  std::string(who) + ": the combine reads the router's weights");
+    } else {
+        expect(plan.expert_ids_value < 0,
+               std::string(who) + ": a dense model has no routing values");
+    }
+
+    // Extents. The expert stack is the only place a value is k times taller,
+    // and getting that wrong overruns the pool by exactly that factor.
+    const std::vector<ValueExtent> ext = llama_value_extents(dag, plan, g);
+    expect_eq(static_cast<long long>(ext.size()), plan.value_count,
+              std::string(who) + ": one extent per value");
+    expect_eq(ext[std::size_t(plan.logits_value)].elems, g.vocab,
+              std::string(who) + ": the logits are vocab-wide");
+
+    int slotted = 0;
+    for (const ValueExtent& e : ext) if (e.rows_are_slots != 0) ++slotted;
+    // gate, up, silu-out and down-out per routed layer.
+    expect_eq(slotted, g.is_moe() ? 4 * g.n_layers : 0,
+              std::string(who) + ": only the expert stack is slot-major");
+
+    bool sized = true;
+    for (std::size_t v = 0; v < ext.size(); ++v) {
+        // KvAppend and Argmax write nothing, so no value can come back zero.
+        if (ext[v].elems <= 0) sized = false;
+    }
+    expect(sized, std::string(who) + ": every value has a positive width");
+}
+
 }  // namespace
 
 int main() {
@@ -223,6 +363,10 @@ int main() {
     // between the dense and per-expert intermediate size.
     expect_eq(qwen3_moe.ffn_width(), 768, "moe ffn_width is the per-expert width");
     expect_eq(llama3.ffn_width(), 8192, "dense ffn_width is the intermediate size");
+
+    check_scratch("llama-3", llama3);
+    check_scratch("qwen3", qwen3);
+    check_scratch("qwen3-moe", qwen3_moe);
 
     // Sampling can be off (the caller wants logits, not a token), and that must
     // remove exactly the argmax.
