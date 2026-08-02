@@ -46,7 +46,19 @@ void dump_golden_taps(const std::vector<Dispatch>& dag,
                       int pool_n,
                       const DecodeGeometry& g,
                       int n_rows,
-                      std::size_t row_stride_bytes);
+                      std::size_t row_stride_bytes,
+                      /// Prepended to every filename. The decode and the prefill
+                      /// tap the same kernels at the same layers, so without one
+                      /// the fire that runs LAST silently wins the file -- and on
+                      /// this bench that is always a prefill, because the gate
+                      /// re-prompts after it decodes.
+                      const char* prefix = "",
+                      /// Rows in the sorted stack, `moe_sorted_rows()`. Zero
+                      /// skips the sort-order taps, which is right for any
+                      /// caller that is not bisecting a routed FFN.
+                      int sorted_rows = 0,
+                      /// Entries in `tile_expert`, `sorted / tile`.
+                      int tile_rows = 0);
 
 // Write one already-materialized bf16 tensor (the lm_head logits live in IO, not
 // scratch, so they never pass through the schedule).

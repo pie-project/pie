@@ -789,10 +789,48 @@ struct LaneLaunch(crate::driver::FrameSubmission);
 unsafe impl Send for LaneLaunch {}
 
 /// Worker → lane requests, executed strictly in FIFO order.
+/// Charges one lane request's wall time to `lane_launch_us` or
+/// `lane_control_us` on drop, so an early `return`/`continue` inside the
+/// arm still accounts. Diagnostic only.
+struct LaneCharge<'a> {
+    stats: &'a SchedulerStats,
+    began: Instant,
+    control: bool,
+    charge: bool,
+    prefill: bool,
+}
+
+impl Drop for LaneCharge<'_> {
+    fn drop(&mut self) {
+        if !self.charge {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let us = self.began.elapsed().as_micros() as u64;
+        let q = &self.stats.fire.quorum;
+        if self.control {
+            q.lane_control_us.fetch_add(us, Relaxed);
+            q.lane_control_n.fetch_add(1, Relaxed);
+            q.lane_control_max_us.fetch_max(us, Relaxed);
+        } else if self.prefill {
+            q.lane_prefill_us.fetch_add(us, Relaxed);
+            q.lane_prefill_n.fetch_add(1, Relaxed);
+        } else {
+            q.lane_launch_us.fetch_add(us, Relaxed);
+            q.lane_launch_n.fetch_add(1, Relaxed);
+        }
+    }
+}
+
 enum LaneRequest {
     Launch {
         token: u64,
         submission: LaneLaunch,
+        /// Does this wave carry a prefill? (`tokens > rows`, i.e. some lane
+        /// contributed more than one token.) Diagnostic only: it splits the
+        /// lane's launch time so the cost of enqueuing a prefill-carrying
+        /// wave can be read against a pure-decode one of the same width.
+        prefill: bool,
     },
     /// A control `QueuedItem` (never `Launch`): the lane runs the driver
     /// half of the old `dispatch_ordered_item` arm.
@@ -987,8 +1025,22 @@ impl DriverLane {
     ) {
         let mut channels: HashSet<u64> = HashSet::new();
         while let Ok(request) = Self::next_request(&launch_rx, &control_rx) {
+            let lane_began = Instant::now();
+            let lane_was_control = matches!(request, LaneRequest::Control { .. });
+            let lane_was_prefill = matches!(request, LaneRequest::Launch { prefill: true, .. });
+            let lane_was_work =
+                lane_was_control || matches!(request, LaneRequest::Launch { .. });
+            let _lane_charge = LaneCharge {
+                stats: &stats,
+                began: lane_began,
+                control: lane_was_control,
+                charge: lane_was_work,
+                prefill: lane_was_prefill,
+            };
             match request {
-                LaneRequest::Launch { token, submission } => {
+                LaneRequest::Launch {
+                    token, submission, ..
+                } => {
                     let LaneLaunch(submission) = submission;
                     // Folded admission (ABI v14): EXHAUSTED retries in place —
                     // the lane is FIFO, so retrying here preserves global
@@ -1768,6 +1820,11 @@ struct PendingControl {
     /// settles, exactly as the original single slot did.
     holds_launches: bool,
 }
+
+/// How often to re-check a control op that is holding launches while the
+/// device sits idle. Matches the frame policy's own gather poll: the same
+/// "something will settle shortly, do not sleep on the hang backstop" case.
+const CONTROL_SETTLE_POLL_US: u64 = 500;
 
 /// The async-completing controls the worker is waiting on — copies and pool
 /// resizes; lifecycle controls execute on the lane without ever entering
@@ -2626,7 +2683,56 @@ impl BatchScheduler {
                 // completion nudge in between.
                 let backstop = Duration::from_millis(250);
                 let recv_wait = wait_hint.map(|hold| hold.min(backstop)).unwrap_or(backstop);
+                // Attribute the park: sleeping with the device IDLE and an
+                // in-flight control op holding launches is the state that
+                // produces this cell's ~300 ms stalls, because a `Posted`
+                // control slot arms no nudge (see the match above) and only
+                // the 250 ms backstop can end the wait.
+                let idle_park = in_flight_launches.is_empty();
+                let control_park = idle_park && in_flight_control.holds_launches();
+                let park_began = Instant::now();
                 let parked = rx.recv_timeout(recv_wait);
+                if idle_park {
+                    let slept = park_began.elapsed().as_micros() as u64;
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if control_park {
+                        stats
+                            .fire
+                            .quorum
+                            .idle_park_control_us
+                            .fetch_add(slept, Relaxed);
+                        // Name the operation that held the device idle. Same
+                        // env switch as the device-idle census; only the long
+                        // ones are worth a line.
+                        if slept >= frame::idle_dump_threshold_us() {
+                            let who: Vec<String> = in_flight_control
+                                .iter()
+                                .filter(|c| c.holds_launches)
+                                .map(|c| {
+                                    format!(
+                                        "{}({})",
+                                        c.operation,
+                                        match &c.state {
+                                            ControlSlotState::Posted { .. } => "posted",
+                                            ControlSlotState::Ready(comp) =>
+                                                if comp.is_settled() { "ready-settled" } else { "ready-unsettled" },
+                                        }
+                                    )
+                                })
+                                .collect();
+                            println!(
+                                "[idle-park] {slept}us woke={} holders=[{}]",
+                                match &parked {
+                                    Ok(_) => "channel",
+                                    Err(_) => "backstop",
+                                },
+                                who.join(",")
+                            );
+                        }
+                    } else {
+                        stats.fire.quorum.idle_park_other_us.fetch_add(slept, Relaxed);
+                    }
+                }
                 match parked {
                     Ok(item) => Some(item),
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
@@ -3761,17 +3867,27 @@ impl BatchScheduler {
     /// rider, and the lanes a frame post must hold for.
     ///
     /// Only a queued `PreLaunchCopy` blocks a lane — it is order-coupled to
-    /// its consumer fire by construction. Standalone copies and pool
-    /// resizes never barrier fires: reservations pin every page they touch
+    /// its consumer fire by construction. Standalone copies never barrier
+    /// fires: reservations pin every page they touch
     /// and no queued fire can reference those pages (the planner's eviction
     /// fences and quiesces a victim's working sets before its D2H, and a
     /// restored process is only readmitted after its H2D copy retired —
     /// `planner::exec` awaits the tracked completion before the commit).
-    /// Resizes were exempted first, on the same pinning argument (~45x on
+    /// Resizes were exempted here first, on the same pinning argument (~45x on
     /// gen-boundary teardown); the copy barrier that remained composed with
     /// frame atomicity and the resize rotation refusal into a three-party
     /// queue-order deadlock under contention — a sealed frame straddling a
     /// {resize, copy} pair never posted (CONTENTION_FOLLOWUP.md §12).
+    ///
+    /// That exemption is about this SCAN — which lanes a frame post must hold
+    /// for — and does not extend to the in-flight rule: a posted resize DOES
+    /// hold launches (`holds_launches = !standalone_copy`), and must, because
+    /// the CUDA driver refuses a resize outright unless the compute and swap
+    /// streams are already drained (`context.cpp` `resize_pool`: "the
+    /// quiescence gate above IS the horizon-empty condition"). The hold is
+    /// what manufactures that drain. This doc used to claim resizes "never
+    /// barrier fires" full stop, which read as a licence to drop the hold;
+    /// dropping it would only get the resize refused and retried.
     fn scan_queue<'a>(
         cache: &'a mut ScanCache,
         pending: &PendingQueue,
@@ -3848,12 +3964,48 @@ impl BatchScheduler {
             // (`PendingControl::holds_launches`) — frames keep posting
             // while suspend/restore traffic settles.
             if in_flight_control.holds_launches() {
+                // Counted when it happens with the DEVICE IDLE: the frame
+                // policy is not even consulted here, so a gate that would
+                // have sealed cannot. See `probe::QuorumProbes`.
+                if in_flight_launches.is_empty() {
+                    stats
+                        .fire
+                        .quorum
+                        .idle_break_control
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // ...and the park below must not sleep on the 250 ms hang
+                    // backstop while it does. A holding control's completion
+                    // nudge is armed but does NOT reliably fire: measured on
+                    // the 4-cohort cell, a `pool resize` slot read
+                    // `ready(settled=false, armed=true)` going into the park
+                    // and `ready-settled` coming out of it 250,124 us later,
+                    // woken by the backstop, with every awaited lane holding a
+                    // complete frame the whole time. That single stall is ~2.5%
+                    // of the run and it is the whole of this cell's
+                    // bimodality.
+                    //
+                    // A hint, not a nudge fix: the settle is cheap to poll and
+                    // the device is by definition idle here, so this bounds the
+                    // damage the way the wait-all hold already bounds its own.
+                    // The lost publish is still worth finding.
+                    merge_hint(
+                        &mut wait_hint,
+                        Duration::from_micros(CONTROL_SETTLE_POLL_US),
+                    );
+                }
                 break;
             }
             // Run-ahead depth in FRAMES: the enqueue horizon. Retirement
             // frees a slot; posting never waits on completion beyond this
             // backpressure.
             if in_flight_launches.len() >= frame::configured_dispatch_depth() {
+                if in_flight_launches.is_empty() {
+                    stats
+                        .fire
+                        .quorum
+                        .idle_break_depth
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 break;
             }
             let now = Instant::now();
@@ -4083,6 +4235,9 @@ impl BatchScheduler {
         driver_lane.post(LaneRequest::Launch {
             token,
             submission: LaneLaunch(submission),
+            // More tokens than requests means at least one lane contributed a
+            // multi-token pass, i.e. this wave carries a prefill.
+            prefill: total_tokens > batch_size as usize,
         });
         (true, true)
     }

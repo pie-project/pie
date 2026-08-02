@@ -55,7 +55,12 @@ void launch_mxfp4_moe_gemm_w4a16_bf16(
     int                  num_experts,
     int                  top_k,
     bool                 mul_topk_weights,
-    int                  prob_m,            // total routes (num_tokens*top_k)
+    // NUMBER OF TOKENS, i.e. rows of `act_bf16` -- NOT the route count. The
+    // kernel expands by `top_k` itself. This said "total routes
+    // (num_tokens*top_k)" and was wrong: both callers pass tokens
+    // (`mixtral.cpp:1135` passes `N`, `bench/moe_bench.cu` passes `N`), and
+    // passing routes here makes the kernel walk top_k times too far and HANG.
+    int                  prob_m,
     int                  prob_n,
     int                  prob_k,
     cudaStream_t         stream);

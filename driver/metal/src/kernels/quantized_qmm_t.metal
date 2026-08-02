@@ -1380,6 +1380,18 @@ inline constexpr short get_bytes_per_pack() {
 
 
 // ── quantized.h dequantize ──
+//
+// Priced before optimising it, because a 4-bit GEMM that looked like 53% of
+// this GPU's peak invited the theory that unpacking was eating the other half.
+// It is not, and the 53% was also the wrong fraction -- a pure fp16 GEMM with
+// no quantization measures 6.32 TFLOP/s at this model's shape (M=128, K=N=5120)
+// and 7.27 at its best, so 5.6 is 89% of what the hardware gives anyone, not
+// 53% of an fp32 ALU peak no GEMM reaches. See finding 15 in the bench wiki.
+//
+// Unpacking itself: one Ws tile is BN*BK elements at three ops each -- an AND,
+// a multiply and an add, with the nibble shift folded into `scale / 16` rather
+// than issued -- against BM*BN*BK*2 flops of MMA over the same tile. That is
+// 3 / (2 * BM), or 2.3% at BM = 64. Deleting dequantization outright buys 2.3%.
 template <typename U, int N, int bits, typename W>
 inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
@@ -1636,6 +1648,14 @@ METAL_FUNC void qmm_t_loaded_impl(
   // hand-pipelining one threadgroup does not pay for the two it evicted. The
   // loss shrinks with row count (-7.5%, -7.2%, -1.4%) exactly as that story
   // predicts. Not a tuning knob: there is no shape here where it wins.
+  //
+  // This also settles THE TWO FENCES below, which read like separate targets
+  // and are not. The first guards WAR (last iteration's `mma` still reading
+  // Xs/Ws) and the second RAW (this iteration's loads not landed yet), and
+  // the only way to drop the first is to give the next tile its own buffer --
+  // which is the double buffering the table above already priced and lost. A
+  // fence here is not a latency to remove; it is what lets three threadgroups
+  // share a core, and that sharing is worth more than the stall it costs.
   for (int k = 0; k < k_len; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     loader_x.load_unsafe();
@@ -2903,6 +2923,48 @@ template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_64_wn_4")]]
 
 template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_128_bn_32_wm_4")]]
 [[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 128, 32, 32, 4, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+// The other direction, which the note above argues for and never tested. If
+// "fewer, fatter threadgroups is what it minds" then 128 threads is not the
+// floor of that argument -- 64 is. A 2x1 or 1x2 warp shape halves the
+// threadgroup at the same tile, so six fit on a core where three do, and a
+// standalone `matmul2d` sweep at this checkpoint's prefill shape (M=128,
+// K=N=5120) does put its best arm at two simdgroups: 6.33 TFLOP/s against
+// 6.29 at four and 3.23 at eight.
+//
+// IT LOSES, and it loses to the cost the argument predicted. A lane holds
+// TM*TN*2 accumulator fragments and halving the simdgroups doubles one of TM
+// or TN, so 16 becomes 32 and the registers give back what the threadgroup
+// count won. `roofline_probe <kernels> 128 32`, M1 Max, whole-step TFLOP/s:
+//
+//     BM=64  2x2  (128 thr)   3.88   the shipping shape
+//     BM=64  2x1  ( 64 thr)   3.61   -7.0%
+//     BM=64  1x2  ( 64 thr)   3.58   -7.7%
+//     BM=32  1x2  ( 64 thr)   3.34   -13.9%
+//
+// So the occupancy axis is now closed in BOTH directions around 2x2 -- eight
+// simdgroups is -9.7% by the table above, two is -7.0% by this one. That is
+// worth more than either arm winning would have been: it means the shipping
+// warp shape is a peak and not a default nobody questioned. Kept instantiated
+// and undispatched, like the 256-thread pair, so the next person to have this
+// idea can re-run it in a minute instead of re-deriving it.
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_2_wn_1")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 32, 2, 1>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_64_bn_32_wm_1_wn_2")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 64, 32, 32, 1, 2>(
+    const device uint32_t*, const device bfloat*, const device bfloat*,
+    const device bfloat*, device bfloat*, const constant int&,
+    const constant int&, uint3, uint, uint);
+
+template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32_wm_1_wn_2")]]
+[[kernel]] void affine_qmm_t_aligned<bfloat, 64, 4, 32, 32, 32, 1, 2>(
     const device uint32_t*, const device bfloat*, const device bfloat*,
     const device bfloat*, device bfloat*, const constant int&,
     const constant int&, uint3, uint, uint);

@@ -8,6 +8,10 @@
 //===----------------------------------------------------------------------===//
 #include "ops/attention_flashinfer_common.cuh"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 namespace pie_cuda_driver::ops {
 
 void DecodePlanCacheDeleter::operator()(DecodePlanCache* p) const noexcept {
@@ -168,6 +172,7 @@ void plan_static_nonsplit_decode(
             cache.int_base_bytes,
         cursor, cudaMemcpyHostToDevice, stream));
 
+    decode_window_hint() = -1;
     cache.num_requests = num_requests;
     cache.num_q_heads  = num_q_heads;
     cache.num_kv_heads = num_kv_heads;
@@ -195,7 +200,8 @@ void plan_attention_flashinfer_decode_bf16(
     cudaStream_t stream,
     bool enable_cuda_graph,
     bool full_attention_variant,
-    bool hnd_layout)
+    bool hnd_layout,
+    int window_left)
 {
     const int gqa_group_size = num_q_heads / num_kv_heads;
     // Checked up front, not just in the switch below: the static non-split
@@ -206,7 +212,13 @@ void plan_attention_flashinfer_decode_bf16(
         throw_unsupported_head_dim("flashinfer decode", head_dim);
     }
 
-    if (can_use_static_nonsplit_decode_plan(
+    // A windowed layer wants the real planner: the static plan is unsplit by
+    // construction, which is what leaves a sliding layer at batch*kv_heads
+    // CTAs (8 on 148 SMs for gemma-4) and ~50x off its bandwidth roofline.
+    const bool windowed_split =
+        window_split_kv_enabled() && window_left >= 0;
+    decode_window_hint() = windowed_split ? window_left : -1;
+    if (!windowed_split && can_use_static_nonsplit_decode_plan(
             static_cast<uint32_t>(num_requests))) {
         plan_static_nonsplit_decode(
             cache, kv_page_indptr_h, num_requests, num_q_heads, num_kv_heads,
@@ -383,6 +395,28 @@ void plan_attention_flashinfer_prefill_bf16(
             2 * 16;  // two 16-byte-aligned allocations
         if (carve_bytes > workspace.float_bytes()) {
             enable_cuda_graph = false;
+            // `PIE_GRAPH_STATS=1`: this demotion is invisible from above --
+            // the wave simply reports itself uncapturable and the refusal is
+            // attributed to the planner. Print the two numbers that decided
+            // it, bounded, so the workspace grant can be compared against the
+            // carve it is supposed to cover instead of re-derived by hand.
+            if (const char* const env = std::getenv("PIE_GRAPH_STATS");
+                env != nullptr && *env != '\0' && env[0] != '0') {
+                static std::atomic<int> shown{0};
+                if (shown.fetch_add(1) < 8) {
+                    std::fprintf(
+                        stderr,
+                        "[graph-stats]   plan demoted: carve=%.1f MiB > "
+                        "float_ws=%.1f MiB (N=%d R=%d tile_q=%llu "
+                        "padded_batch=%llu)\n",
+                        static_cast<double>(carve_bytes) / (1024.0 * 1024.0),
+                        static_cast<double>(workspace.float_bytes()) /
+                            (1024.0 * 1024.0),
+                        total_tokens, num_requests,
+                        static_cast<unsigned long long>(cta_tile_q),
+                        static_cast<unsigned long long>(padded_batch));
+                }
+            }
         }
     } else {
         enable_cuda_graph = enable_cuda_graph && !disable_split_kv;

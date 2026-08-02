@@ -720,6 +720,21 @@ void mixtral_forward_paged(
         // "no progress, work queued or in flight", and nothing timed out.
         CUDA_CHECK(cudaMemsetAsync(d_marlin_ws.data(), 0,
                                    d_marlin_ws.size(), stream));
+        // fc2 reads K = Ip_marlin, but the GLU that fills this buffer only
+        // writes the first I columns of each route (`glu_strided` bails on
+        // `col >= cols`), so columns [I, Ip_marlin) are never written. The
+        // allocation comment above already states the requirement -- "the tail
+        // left zero" -- and nothing enforced it.
+        //
+        // It is NOT harmless just because the down projection zeroes its own K
+        // padding. `0 * NaN` is NaN, not 0, and Marlin accumulates in fp32, so
+        // one NaN bit pattern anywhere in that tail poisons the entire output
+        // row. Uninitialised arena memory read as bf16 hits a NaN or Inf
+        // exponent easily, which is exactly the intermittent, mid-generation,
+        // all-zero-logits corruption ('!' = token 0) seen on the native path.
+        CUDA_CHECK(cudaMemsetAsync(d_marlin_act.data(), 0,
+                                   d_marlin_act.size() *
+                                       sizeof(std::uint16_t), stream));
     }
 #endif
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
@@ -771,10 +786,48 @@ void mixtral_forward_paged(
             ws.v.data(), N, Hk, H, stream);
         }
 
+        // RoPE and the KV append are one kernel when the cache is plain bf16
+        // and no Quest envelopes need refreshing. write_kv runs one block per
+        // current-step token, so at decode it is a single block on 148 SMs
+        // moving 2 KB, while RoPE has already fanned the heads across
+        // blockIdx.y and holds the rotated K in registers exactly where
+        // write_kv would re-read it. Measured 4.38 -> 2.76 us in graph replay,
+        // bit-identical in q, k and both page arrays across NHD/HND, multiple
+        // requests and head_dim 128 (driver/cuda/bench/smallop_bench.cu).
+        //
+        // Quantised schemes and the envelope refresh stay on the two-kernel
+        // path: both do work after the raw store that this kernel does not.
+        auto kv_view = cache.layer_view(L);
+        // N == 1 only, conservatively.
+        //
+        // gpt-oss is CORRUPT at concurrency ("Whitening? Algar Whitening Adem
+        // Adem Adem..."), and this fusion was the obvious suspect: gpt-oss is
+        // the only model carrying it, and gemma-4, which does not, stays
+        // clean. It is NOT the cause -- gating it to N == 1 leaves the
+        // corruption exactly as it was (distinct=2, STUCK, at c=8). Whatever
+        // breaks batched decode here is something else, and is not yet found.
+        //
+        // The gate stays anyway: the fusion was validated bit-exactly at one
+        // token per request, and the N>1 path has never been checked against
+        // the two-kernel path with `row_valid` padding present, which is what
+        // graph capture introduces at concurrency. It costs nothing today,
+        // since concurrency is broken for an unrelated reason.
+        const bool fused_rope_kv =
+            N == 1 && kv_view.is_native_bf16() && !kv_view.has_envelopes();
+        if (fused_rope_kv) {
+            kernels::launch_rope_write_kv_bf16(
+                ws.q.data(), ws.k.data(), ws.v.data(), positions,
+                kv_view.k_pages, kv_view.v_pages,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                row_valid_d, N, R, kv_view.page_size,
+                num_q_heads_local, num_kv_heads_local, d,
+                cfg.rope_theta, kv_view.hnd_layout, stream);
+        } else {
         kernels::launch_rope_bf16(
             ws.q.data(), ws.k.data(), positions,
             N, num_q_heads_local, num_kv_heads_local, d,
             cfg.rope_theta, stream);
+        }
         // Fires POST-rope (and post q/k-norm): the query a PTIR program
         // observes here is the one that actually enters attention, so an
         // observer scoring it against the cached keys -- which are stored
@@ -786,11 +839,12 @@ void mixtral_forward_paged(
             static_cast<std::uint32_t>(Hq),
             static_cast<std::uint32_t>(L), stream);
 
-        auto kv_view = cache.layer_view(L);
-        kernels::launch_write_kv_to_pages(
-            kv_view, ws.k.data(), ws.v.data(),
-            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            N, R, stream, row_valid_d);
+        if (!fused_rope_kv) {
+            kernels::launch_write_kv_to_pages(
+                kv_view, ws.k.data(), ws.v.data(),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                N, R, stream, row_valid_d);
+        }
 
         // Only ask flashinfer for lse on layers that actually use sinks.
         // Saves a per-layer kernel write on plain Mixtral, and on
@@ -1075,34 +1129,34 @@ void mixtral_forward_paged(
             layer.experts[0].w_gate_mxfp4 != nullptr) {
             const int routes = N * top_k;
             const auto& e0 = layer.experts[0];
-            if (!layer.marlin_scales_ready) {
-                // One-time per layer: the checkpoint's `[E, n, k/32]` scales
-                // are the transpose of what Marlin walks.
-                const std::size_t gu_elems =
-                    static_cast<std::size_t>(num_experts) * Ip_marlin * (H / 32);
-                const std::size_t dn_elems =
-                    static_cast<std::size_t>(num_experts) * H * (Ip_marlin / 32);
-                layer.marlin_gate_scales =
-                    DeviceBuffer<std::uint8_t>::alloc(gu_elems);
-                layer.marlin_up_scales =
-                    DeviceBuffer<std::uint8_t>::alloc(gu_elems);
-                layer.marlin_down_scales =
-                    DeviceBuffer<std::uint8_t>::alloc(dn_elems);
-                kernels::launch_transpose_expert_scales_u8(
-                    e0.w_gate_mxfp4_scale->data(),
-                    layer.marlin_gate_scales.data(), num_experts, Ip_marlin,
-                    H / 32, stream);
-                kernels::launch_transpose_expert_scales_u8(
-                    e0.w_up_mxfp4_scale->data(),
-                    layer.marlin_up_scales.data(), num_experts, Ip_marlin,
-                    H / 32, stream);
-                kernels::launch_transpose_expert_scales_u8(
-                    e0.w_down_mxfp4_scale->data(),
-                    layer.marlin_down_scales.data(), num_experts, H,
-                    Ip_marlin / 32, stream);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                layer.marlin_scales_ready = true;
-            }
+            // DELIBERATELY NOT TRANSPOSED. This block used to run
+            // `launch_transpose_expert_scales_u8` over these three
+            // tensors, on the stated belief that they were "the
+            // checkpoint's `[E, n, k/32]` scales". They are not: the
+            // loader already repacked them. `model/gpt_oss`'s contract
+            // publishes all three through `RepackLayout::MarlinMxfp4Scale`
+            // (contract.rs `native_gate_up` and `native_down`), which
+            // `transcode_engine.hpp` executes as
+            // `launch_mxfp4_scales_to_marlin_e8m0` -- already K-major AND
+            // already carrying Marlin's 64-wide plus four-lane
+            // permutation. Transposing that again destroyed it.
+            //
+            // What hid the bug: the contract DECLARES the repacked tensor
+            // as `[experts, intermediate_native, groups]` while the repack
+            // writes `[groups, intermediate_native]`. Identical byte
+            // count, so nothing errored and `gpt_oss.cpp` views it at the
+            // declared shape -- the label and the bytes simply disagreed,
+            // and this code trusted the label.
+            //
+            // Measured with `bench/marlin_moe_verify.cu` at gpt-oss's own
+            // shape (N=2944, K=2880, E=32, top_k=4), mean relative error
+            // against a host reference:
+            //     loader repack, used as-is          0.0017  (this)
+            //     plain transpose of raw scales      0.8760
+            //     loader repack THEN this transpose  0.9350  (was)
+            // 0.9350 is uncorrelated output, which is why gpt-oss was
+            // wrong from the first prefill token under the native
+            // lowering while the routed-dequant path stayed correct.
             // `close` first: `moe_prep` is open on entry to this branch, and
             // opening on top of it would leave one span per layer on the stack
             // for `resolve()` to close at teardown. Every other stage boundary
@@ -1135,10 +1189,10 @@ void mixtral_forward_paged(
             };
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_gate_up, stream); }
             moe_gemm(ws.norm_y.data(), e0.w_gate_mxfp4->data(),
-                     layer.marlin_gate_scales.data(), d_marlin_gate.data(),
+                     e0.w_gate_mxfp4_scale->data(), d_marlin_gate.data(),
                      N, top_k, Ip_marlin, H, false);
             moe_gemm(ws.norm_y.data(), e0.w_up_mxfp4->data(),
-                     layer.marlin_up_scales.data(), d_marlin_up.data(),
+                     e0.w_up_mxfp4_scale->data(), d_marlin_up.data(),
                      N, top_k, Ip_marlin, H, false);
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_act, stream); }
             // GPT-OSS publishes its expert biases at the UNPADDED width, which
@@ -1164,7 +1218,7 @@ void mixtral_forward_paged(
             }
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_down, stream); }
             moe_gemm(d_marlin_act.data(), e0.w_down_mxfp4->data(),
-                     layer.marlin_down_scales.data(), d_mxfp4_route_out.data(),
+                     e0.w_down_mxfp4_scale->data(), d_mxfp4_route_out.data(),
                      routes, /*top_k=*/1, H, Ip_marlin, false);
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_reduce, stream); }
             if (e0.b_down != nullptr && tp_is_leader) {
@@ -1191,9 +1245,14 @@ void mixtral_forward_paged(
             !layer.expert_gate_up_packed_ptrs.empty()) {
             const int routes = N * top_k;
             if (prof.enabled) { prof.close(stream); prof.open(&prof.moe_align, stream); }
-            kernels::launch_bf16_to_fp16(
-                ws.norm_y.data(), d_mxfp4_act_fp16.data(),
-                static_cast<std::size_t>(N) * H, stream);
+            // No cast here: the mlp_norm above already emitted this exact
+            // buffer. `launch_rmsnorm_bf16_with_fp16` writes ws.norm_y and its
+            // fp16 image in one pass, `d_mxfp4_act_fp16` is only allocated
+            // when use_mxfp4_decode_gemv (the condition guarding this branch),
+            // and nothing between the two writes ws.norm_y. Re-casting it cost
+            // a launch per layer -- 1.75 us x 24 layers = 42 us per decode
+            // step on B200, 1.8% of the step, for a buffer that already held
+            // the answer.
             // The activation rides the gate/up epilogue when this model uses
             // the gpt-oss GLU and the routes are not bucketed by expert (the
             // grouped kernel has its own epilogue). Then the glu kernel and

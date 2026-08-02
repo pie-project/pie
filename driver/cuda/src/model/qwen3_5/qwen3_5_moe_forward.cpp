@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cctype>
 #include <cstdlib>
 #include <iostream>
@@ -167,6 +168,28 @@ constexpr int kQwen35MoeDecodeFastMaxTokens = 1024;
 // is capturing a graph, and which under TP stalls one rank inside a collective
 // the other rank has already left. Either way the engine dies mid-run instead
 // of reporting numbers, so a capturing stream runs the work untimed.
+// Opt-in stage profiler for the Qwen3.5/3.6 MoE forward. A profiled run gives
+// up CUDA graphs (see `Qwen35MoeModel`), so its absolute numbers are inflated
+// by launch latency; use it to see WHICH stage dominates, not what a stage
+// costs in production.
+// TIMING ABLATION (PIE_QWEN35_ABLATE=<name>). Skips a stage so its true
+// marginal cost can be read off the end-to-end rate WITH CUDA graphs enabled —
+// the event profiler cannot do that, because timing forbids capture, and this
+// box has neither a usable ncu (ERR_NVGPUCTRPERM) nor an nsys new enough for
+// CUDA 13. OUTPUT IS WRONG under any ablation; diagnostic only.
+inline bool qwen35_ablate(const char* name) {
+    static const char* v = std::getenv("PIE_QWEN35_ABLATE");
+    return v != nullptr && std::strcmp(v, name) == 0;
+}
+
+inline bool qwen35_moe_profile_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_QWEN35_MOE_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
 inline bool profile_stream_is_capturing(cudaStream_t stream) {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &status) != cudaSuccess) return true;
@@ -250,8 +273,13 @@ struct Qwen35MoeForwardProfile {
     }
 
     void begin(int n, int r, bool decode, int rank, cudaStream_t stream) {
-        enabled = false;
-        return;
+        // Opt-in via PIE_QWEN35_MOE_PROFILE=1. Off by default: the stage
+        // timing needs event syncs, so a profiled run is NOT a production
+        // run — read the stage split as relative attribution, never as
+        // device truth. `Qwen35MoeModel` drops `graph_safe` when this is
+        // set, because timing a capturing stream is illegal.
+        enabled = qwen35_moe_profile_enabled();
+        if (!enabled) return;
         ensure_events();
         tp_rank = rank;
         N = n;
@@ -331,7 +359,46 @@ void profile_cuda_detail_stage(
     profile_cuda_stage(profile, dst, stream, std::forward<F>(fn));
 }
 
-void maybe_print_profile(const Qwen35MoeForwardProfile&) {}
+void maybe_print_profile(const Qwen35MoeForwardProfile& p) {
+    if (!p.enabled || p.timing_suspended) return;
+    if (p.forward_ms <= 0.0) return;
+    auto row = [&](const char* name, double ms) {
+        if (ms <= 0.0) return;
+        std::fprintf(stderr, "[qwen35-moe] %-22s %8.3f ms  %5.1f%%\n",
+                     name, ms, 100.0 * ms / p.forward_ms);
+    };
+    std::fprintf(stderr,
+                 "[qwen35-moe] N=%d R=%d decode=%d layers(lin/full/moe)=%d/%d/%d"
+                 " forward=%.3f ms\n",
+                 p.N, p.R, p.pure_decode ? 1 : 0,
+                 p.linear_layers, p.full_layers, p.moe_layers, p.forward_ms);
+    row("embed", p.embed_ms);
+    row("norm", p.norm_ms);
+    row("linear_attn", p.linear_attn_ms);
+    row("  linear_proj", p.linear_proj_ms);
+    row("  linear_conv", p.linear_conv_ms);
+    row("  linear_prep", p.linear_prep_ms);
+    row("  linear_recur", p.linear_recur_ms);
+    row("  linear_post", p.linear_post_ms);
+    row("full_attn", p.full_attn_ms);
+    row("moe_router", p.moe_router_ms);
+    row("moe_route_setup", p.moe_route_setup_ms);
+    row("moe_align", p.moe_align_ms);
+    row("moe_gather", p.moe_gather_ms);
+    row("moe_ptrs", p.moe_ptrs_ms);
+    row("moe_gate_up", p.moe_gate_up_ms);
+    row("moe_act", p.moe_act_ms);
+    row("moe_down", p.moe_down_ms);
+    row("moe_reduce", p.moe_reduce_ms);
+    row("moe_routed(total)", p.moe_routed_ms);
+    row("moe_shared", p.moe_shared_ms);
+    row("  shared_gate_up", p.moe_shared_gate_up_ms);
+    row("  shared_down", p.moe_shared_down_ms);
+    row("  shared_gate", p.moe_shared_gate_ms);
+    row("moe_allreduce", p.moe_allreduce_ms);
+    row("residual", p.residual_ms);
+    row("lm_head", p.lm_head_ms);
+}
 
 struct MtpProfile {
     bool enabled = false;
@@ -723,23 +790,27 @@ void linear_attn_body(
                 const auto* x =
                     static_cast<const std::uint16_t*>(ws.norm_x.data()) +
                     static_cast<std::size_t>(src0) * H;
+                if (!qwen35_ablate("qkv"))
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     x, Lw.la_in_proj_qkv->data(),
                     la.mixed_qkv.data() +
                         static_cast<std::size_t>(dst0) * conv_dim,
                     rows, conv_dim, H);
+                if (!qwen35_ablate("z"))
                 ops::gemm_act_x_wt_bf16(cublas.handle(),
                     x, Lw.la_in_proj_z->data(),
                     la.z.data() + static_cast<std::size_t>(src0) * V_dim,
                     rows, V_dim, H);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    x, Lw.la_in_proj_a->data(),
-                    la.a.data() + static_cast<std::size_t>(dst0) * V_h,
-                    rows, V_h, H);
-                ops::gemm_act_x_wt_bf16(cublas.handle(),
-                    x, Lw.la_in_proj_b->data(),
-                    la.b.data() + static_cast<std::size_t>(dst0) * V_h,
-                    rows, V_h, H);
+                if (!qwen35_ablate("ab")) {
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        x, Lw.la_in_proj_a->data(),
+                        la.a.data() + static_cast<std::size_t>(dst0) * V_h,
+                        rows, V_h, H);
+                    ops::gemm_act_x_wt_bf16(cublas.handle(),
+                        x, Lw.la_in_proj_b->data(),
+                        la.b.data() + static_cast<std::size_t>(dst0) * V_h,
+                        rows, V_h, H);
+                }
             };
             if (!has_buffer_read) {
                 in_proj_rows(0, 0, N);
@@ -885,6 +956,7 @@ void linear_attn_body(
             }
         });
 
+    if (!qwen35_ablate("conv"))
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_conv_ms : nullptr,
         stream, [&] {
@@ -957,6 +1029,7 @@ void linear_attn_body(
         linear_decode &&
         slot_ids_d != nullptr &&
         V_h % K_h == 0;
+    if (!qwen35_ablate("prep"))
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_prep_ms : nullptr,
         stream, [&] {
@@ -986,6 +1059,7 @@ void linear_attn_body(
     const float* k_recur_full =
         (V_h == K_h) ? la.k_pre.data() : la.k_norm.data();
 
+    if (!qwen35_ablate("recur"))
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_recur_ms : nullptr,
         stream, [&] {
@@ -1192,6 +1266,7 @@ void linear_attn_body(
         core_rows = packed;
     }
 
+    if (!qwen35_ablate("post"))
     profile_cuda_detail_stage(
         profile, profile ? &profile->linear_post_ms : nullptr,
         stream, [&] {
@@ -1678,6 +1753,8 @@ bool moe_block(
                                     N, K, H, stream);
                             }
                         });
+                } else if (qwen35_ablate("routed")) {
+                    // timing ablation: skip the routed experts entirely
                 } else if (
                            (H % 8) == 0 && (Im % 8) == 0) {
                     profile_cuda_detail_stage(
@@ -1826,7 +1903,7 @@ bool moe_block(
     // ── Shared expert (Qwen3.5 / 3.6-MoE: always-on dense MLP + sigmoid
     //    gate). Qwen3-MoE has no shared expert — skip the whole block
     //    when the bind didn't wire `shared_*` pointers (Is == 0).
-    if (Is > 0 && Lw.shared_gate_proj != nullptr) {
+    if (Is > 0 && Lw.shared_gate_proj != nullptr && !qwen35_ablate("shared")) {
         profile_cuda_stage(profile, profile ? &profile->moe_shared_ms : nullptr,
             stream, [&] {
                 const bool fused_shared_scalar_gate =
@@ -2210,6 +2287,9 @@ void qwen3_5_moe_forward_paged(
                 }
             }
             ++linear_idx;
+            if (qwen35_ablate("linear")) {
+                // timing ablation: skip the whole GDN linear-attention body
+            } else
             profile_cuda_stage(&profile, &profile.linear_attn_ms, stream, [&] {
                 linear_attn_body(
                     Lw, cfg, fwd_cfg, ws, la_ws, state_cache,

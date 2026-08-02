@@ -110,21 +110,69 @@ static DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// dense gathering while an epoch executes (`executing` still parks).
 ///
 /// **Default ON**; `PIE_SEAL_MODE=strict` restores holding for every awaited
-/// lane. Measured against strict on 4096x64 @c256: the inter-fire device gap
-/// falls 0.696 -> 0.517 s (-26%) and occupancy 91.8 -> 93.8%, because 87% of
-/// all device idle sits in front of a wave carrying an arrival — a lane is
-/// `awaited` from creation but needs ~200 us of its own work before it can
-/// submit, and strict spends that as GPU idle.
+/// lane. Two independent measurements, one per tree, agreeing:
 ///
-/// Throughput +1.22% at c256 (7 of 8 ABBA rounds), +1.27% at c32, +1.26% at
-/// c64, +0.19% (neutral) at c8: 14 of 17 rounds positive with no regression at
-/// any concurrency. Decode batch width is UNCHANGED (238.5 -> 240.8), which is
-/// the check that matters here — fragmenting the wave is what killed the
-/// no-quiescence variant below and the `=1` contributed-gate variant before it.
+///   * upstream, against strict on 4096x64 @c256 — the inter-fire device gap
+///     falls 0.696 -> 0.517 s (-26%) and occupancy 91.8 -> 93.8%, because 87%
+///     of all device idle sits in front of a wave carrying an arrival: a lane
+///     is `awaited` from creation but needs ~200 us of its own work before it
+///     can submit, and strict spends that as GPU idle. Throughput +1.22% at
+///     c256 (7 of 8 ABBA rounds), +1.27% at c32, +1.26% at c64, +0.19% at c8.
+///   * here, three interleaved pairs per cell on top of the channel-init
+///     scatter fix — S +1.91% (3 of 3), c32 +1.35% (3 of 3), D +1.62%,
+///     c256 +0.23%, c64 -0.25%. The two levers compose rather than overlap.
+///
+/// The check that matters is WIDTH, not throughput: fragmenting the wave is
+/// what killed the no-quiescence variant below and the `=1` contributed-gate
+/// variant before it, and an earlier ready-mode attempt was rejected at -1.0%
+/// having cut decode batch 171 -> 99. This one does not — 238.5 -> 240.8 and
+/// `avg_active_pipelines_at_fire` 242.5 -> 243.7 / `wave_fires` 1096 -> 1098:
+/// the same waves, the same width, opened earlier.
+/// Threshold for the `[idle-gap]` dump, in microseconds. `u64::MAX` (never)
+/// unless `PIE_IDLE_DUMP_US` names one. Read once.
+/// Seat floor for the `[device-idle]` dump. `0` (report every gap) unless
+/// `PIE_IDLE_DUMP_MIN_SEATS` names one — see the call site for why this is a
+/// knob rather than a constant.
+fn idle_dump_min_seats() -> usize {
+    static SEATS: OnceLock<usize> = OnceLock::new();
+    *SEATS.get_or_init(|| {
+        std::env::var("PIE_IDLE_DUMP_MIN_SEATS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+pub(super) fn idle_dump_threshold_us() -> u64 {
+    static THRESHOLD: OnceLock<u64> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("PIE_IDLE_DUMP_US")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(u64::MAX)
+    })
+}
+
 fn seal_mode_ready() -> bool {
     static CONFIGURED: OnceLock<bool> = OnceLock::new();
-    *CONFIGURED
-        .get_or_init(|| !std::env::var("PIE_SEAL_MODE").is_ok_and(|value| value == "strict"))
+    *CONFIGURED.get_or_init(|| match std::env::var("PIE_SEAL_MODE") {
+        Ok(value) => match value.trim() {
+            "strict" => false,
+            "ready" => true,
+            // Anything else is a config error, not a vote. Reading every
+            // unrecognised value as "ready" makes `PIE_SEAL_MODE=0` silently
+            // select the mode the operator was trying to turn off.
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "PIE_SEAL_MODE must be \"ready\" or \"strict\"; \
+                     ignoring and keeping the default (ready)"
+                );
+                true
+            }
+        },
+        Err(_) => true,
+    })
 }
 
 /// Default ON; `PIE_GATE_CONTRIBUTED=0` restores the strict wait-all rule.
@@ -207,6 +255,11 @@ struct PendingFrame {
     /// has sealed.
     park: bool,
     fires: Vec<ArrivedFire>,
+    /// When this frame first read COMPLETE. Diagnostic only: the age of the
+    /// oldest complete front at a device-idle census separates "the guests
+    /// had not submitted yet" (age ~0) from "the work was sitting here and
+    /// nobody ran the policy" (age ~ the whole gap).
+    complete_at: Option<Instant>,
 }
 
 impl PendingFrame {
@@ -222,6 +275,17 @@ struct LaneState {
     /// member the seal waits on), released by close/terminate, by the guest
     /// itself through `forward.park()`, or by the leash below.
     awaited: bool,
+    /// Has this lane ever been sealed into a partition? Splits the lanes that
+    /// deny a gate into the two populations that need different answers: one
+    /// that has never been served (a fresh arrival still paying instantiate +
+    /// bind + prefill) and one between frames (paying the result -> guest ->
+    /// resubmit round trip). Diagnostic only.
+    served: bool,
+    /// When this lane's last frame retired, i.e. when the engine handed its
+    /// guest a result. The gate's TAIL is the age of this on the lanes that
+    /// are still blocking: how long the slowest guest of ~250 has taken to
+    /// turn a result back into a submission. Diagnostic only.
+    retired_at: Option<Instant>,
     /// Left the wait-set through `forward.park()` rather than close/terminate.
     /// Distinguished from a cleared `awaited` so that rejoin can be implicit
     /// (the next accepted fire) without disturbing the suspend path, which
@@ -396,6 +460,18 @@ pub(super) struct FramePolicy {
     /// deterministic admission order.
     lanes: BTreeMap<ProcessId, LaneState>,
     sealed: VecDeque<SealedFrame>,
+    /// The worker's in-flight signal as of the current `plan_dispatch` call,
+    /// stashed so `seal` can classify each partition it produces as chained
+    /// (sealed behind a running frame) or cold (sealed with the device idle).
+    /// Diagnostic only — nothing reads it to make a decision.
+    executing_now: bool,
+    /// When the most recent frame retired. With `executing_now` false at a
+    /// post, the span from here to the post is device idle. Diagnostic only.
+    last_retire_at: Option<Instant>,
+    /// Whether the current device-idle episode has already been dumped, so
+    /// `PIE_IDLE_DUMP_US` prints one census per episode rather than one per
+    /// pass. Cleared wherever the gather clock is. Diagnostic only.
+    idle_dumped: bool,
     /// Bind controls accepted by the scheduler but not yet completed.
     /// Feeds [`FramePolicy::has_pending_binds`] (the worker defers teardown
     /// closes while bring-up owns the driver lane); binds do NOT hold the
@@ -465,13 +541,28 @@ pub(super) struct FramePolicy {
     truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
-    /// Monotonic count of accepted frame-fire arrivals — the ready-mode
-    /// quiescence signal: the gate opens early only after one full hold
-    /// cycle in which this did not move (the arrival burst has ended).
-    arrival_seq: u64,
-    /// `arrival_seq` observed at the last held gate evaluation that had a
-    /// seal candidate. `Some(seq) == arrival_seq` at the next evaluation
-    /// means no new arrival landed in between: quiesced.
+    /// Monotonic count of accepted fires that landed in a lane's FRONT frame
+    /// — the ready-mode quiescence signal: the gate opens early only after
+    /// one full hold cycle in which this did not move.
+    ///
+    /// It counts front-frame arrivals rather than all arrivals because the
+    /// question the quiescence test asks is local, not global. A lane whose
+    /// front frame is already complete is not one this boundary is waiting
+    /// for; its next fire builds the frame AFTER this one and says nothing
+    /// about whether the missing lanes are about to land. Counting it reset
+    /// the clock anyway, and at c256 — 255 lanes resubmitting continuously —
+    /// that meant two consecutive evaluations with zero arrivals ANYWHERE
+    /// essentially never happened: the `[device-idle]` census found
+    /// `boundary_open=false` at **all 85** dumped gaps while 246 of 255 lanes
+    /// were ready and the only missing ones were between frames.
+    ///
+    /// Still pure event arithmetic — no timers, no thresholds — and still the
+    /// same rule; it is the burst that is being detected, just measured on
+    /// the lanes the boundary is actually held by.
+    gather_seq: u64,
+    /// `gather_seq` observed at the last held gate evaluation that had a
+    /// seal candidate. `Some(seq) == gather_seq` at the next evaluation
+    /// means nothing landed for a lane this boundary waits on: quiesced.
     quiesce_mark: Option<u64>,
     /// Lanes with fires the engine has dispatched but not yet retired: the
     /// engine owes them a result, so the submit deadline's clock must not run
@@ -506,6 +597,10 @@ pub(super) struct FramePolicy {
     /// life (and overridable in tests without touching the process
     /// environment). `false` is the strict wait-all rule.
     gate_contributed: bool,
+    /// [`seal_mode_ready`], read once, for the same reason and with the same
+    /// test override. `false` is the strict wait-all rule, which stays
+    /// reachable through `PIE_SEAL_MODE=strict` and so still needs coverage.
+    seal_mode_ready: bool,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
     stats: Option<Arc<SchedulerStats>>,
 }
@@ -559,6 +654,17 @@ impl FramePolicy {
         self
     }
 
+    /// Pin the seal mode for one policy, for the reasons above. Needed the
+    /// moment ready mode became the DEFAULT: two tests assert the strict rule
+    /// directly (`incomplete_lane_holds_the_seal_until_it_completes`,
+    /// `engine_debt_suspends_the_deadline_clock`) and a bare default flip
+    /// turns both red without saying so.
+    #[cfg(test)]
+    fn with_seal_mode_ready(mut self, on: bool) -> Self {
+        self.seal_mode_ready = on;
+        self
+    }
+
     pub fn new(
         k: usize,
         max_wave_rows: usize,
@@ -571,6 +677,9 @@ impl FramePolicy {
             max_wave_rows,
             lanes: BTreeMap::new(),
             sealed: VecDeque::new(),
+            executing_now: false,
+            last_retire_at: None,
+            idle_dumped: false,
             pending_binds: BTreeMap::new(),
             staged: BTreeSet::new(),
             pending_slots: 0,
@@ -581,13 +690,14 @@ impl FramePolicy {
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
-            arrival_seq: 0,
+            gather_seq: 0,
             quiesce_mark: None,
             in_flight_lanes: BTreeSet::new(),
             in_flight_since: BTreeMap::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
             gate_contributed: gate_contributed(),
+            seal_mode_ready: seal_mode_ready(),
             stats,
         }
     }
@@ -608,6 +718,7 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
     ) {
+        let accept_began = self.stats.is_some().then(Instant::now);
         self.record_arrival(
             stamp,
             owner,
@@ -618,6 +729,15 @@ impl FramePolicy {
                 rows,
             },
         );
+        if let (Some(began), Some(stats)) = (accept_began, &self.stats) {
+            use std::sync::atomic::Ordering::Relaxed;
+            stats
+                .fire
+                .quorum
+                .accept_us
+                .fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+            stats.fire.quorum.accept_calls.fetch_add(1, Relaxed);
+        }
     }
 
     /// A stamped fire was rejected at scheduler admission: it still counts
@@ -671,6 +791,8 @@ impl FramePolicy {
         let lane = self.lanes.entry(stamp.lane).or_insert_with(|| LaneState {
             owner,
             awaited: !suspended,
+            served: false,
+            retired_at: None,
             // A lane born under its owner's suspension is not a member, but
             // it must become one on its first post-restore fire — the same
             // implicit-rejoin latch every park-shaped exit carries.
@@ -700,6 +822,12 @@ impl FramePolicy {
         // consecutive silence while blocking a seal, not elapsed lifetime.
         lane.leashed = false;
         lane.clock_from = None;
+        // Is this fire for the frame the gather is actually held by? A lane
+        // with no frames yet is about to have this one as its front.
+        let for_front_frame = lane
+            .frames
+            .front()
+            .is_none_or(|front| front.seq == stamp.seq);
         let frame = match lane.frames.iter_mut().find(|frame| frame.seq == stamp.seq) {
             Some(frame) => frame,
             None => {
@@ -709,13 +837,16 @@ impl FramePolicy {
                     truncated: false,
                     park: false,
                     fires: Vec::with_capacity(stamp.fires as usize),
+                    complete_at: None,
                 });
                 lane.frames.back_mut().expect("frame just pushed")
             }
         };
         frame.truncated |= late || suspended;
         frame.fires.push(fire);
-        self.arrival_seq = self.arrival_seq.wrapping_add(1);
+        if for_front_frame {
+            self.gather_seq = self.gather_seq.wrapping_add(1);
+        }
         frame.expected = if frame.truncated {
             frame.fires.len() as u32
         } else {
@@ -723,6 +854,9 @@ impl FramePolicy {
         };
         // Cut below what the guest declared: the slots still to come belong
         // to a frame that has already sealed, so remember the seq.
+        if frame.complete_at.is_none() && frame.is_complete() {
+            frame.complete_at = Some(Instant::now());
+        }
         let cut = frame.truncated && frame.expected < stamp.fires;
         if cut {
             self.truncated_seqs.insert(stamp.lane, stamp.seq);
@@ -778,6 +912,7 @@ impl FramePolicy {
                 truncated: true,
                 park: true,
                 fires: Vec::new(),
+                complete_at: Some(Instant::now()),
             },
         );
     }
@@ -797,11 +932,14 @@ impl FramePolicy {
     /// and a live one is charged for engine latency. Re-arming from each
     /// retirement is monotonically safe under both.
     pub fn on_frame_retired(&mut self, lanes: impl IntoIterator<Item = ProcessId>) {
+        let now = Instant::now();
+        self.last_retire_at = Some(now);
         for lane in lanes {
             self.in_flight_lanes.remove(&lane);
             self.in_flight_since.remove(&lane);
             if let Some(state) = self.lanes.get_mut(&lane) {
                 state.clock_from = None;
+                state.retired_at = Some(now);
             }
         }
     }
@@ -1162,6 +1300,7 @@ impl FramePolicy {
             return;
         }
         self.strict_watchdog_deadline = None;
+            self.idle_dumped = false;
     }
 
     fn have_seal_candidate(&self) -> bool {
@@ -1281,6 +1420,7 @@ impl FramePolicy {
                 let Some(front) = lane.frames.front() else {
                     continue;
                 };
+                let frame_complete_at = front.complete_at;
                 let live: Vec<&ArrivedFire> = front
                     .fires
                     .iter()
@@ -1309,6 +1449,19 @@ impl FramePolicy {
                     fire_waves.insert(fire_id, wave);
                 }
                 members.insert(lane_id);
+                // Turnaround sample: this frame is being sealed now, so the
+                // span from the lane's last retirement to its completion is
+                // the whole result -> guest -> resubmit round trip.
+                if let (Some(done), Some(from)) = (frame_complete_at, lane.retired_at) {
+                    let us = done.saturating_duration_since(from).as_micros() as u64;
+                    if let Some(stats) = &self.stats {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        stats.fire.quorum.turnaround_sum_us.fetch_add(us, Relaxed);
+                        stats.fire.quorum.turnaround_n.fetch_add(1, Relaxed);
+                        stats.fire.quorum.turnaround_max_us.fetch_max(us, Relaxed);
+                    }
+                }
+                lane.served = true;
                 lane.frames.pop_front();
             }
             if fire_waves.is_empty() {
@@ -1331,6 +1484,7 @@ impl FramePolicy {
                 }
             }
             self.record_sealed_waves(waves.iter().filter(|wave| !wave.is_empty()).count());
+            self.record_seal_engagement();
             let _ = &fire_waves;
             self.sealed.push_back(SealedFrame {
                 waves,
@@ -1371,6 +1525,21 @@ impl FramePolicy {
         }
     }
 
+    /// Chain engagement, one sample per sealed partition: was the device
+    /// still working when this boundary was assembled? `seal_while_executing
+    /// / seal_events` at 1.0 means the host chain is fully hidden behind the
+    /// running frame; at 0.0 every boundary is gathered from a standing start
+    /// and the 2.9 ms host chain (§3.3) is exposed on every one of them.
+    fn record_seal_engagement(&self) {
+        if let Some(stats) = &self.stats {
+            use std::sync::atomic::Ordering::Relaxed;
+            stats.fire.quorum.seal_events.fetch_add(1, Relaxed);
+            if self.executing_now {
+                stats.fire.quorum.seal_while_executing.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
     /// The next sealed frame the worker should POST WHOLE, if any.
     ///
     /// `still_queued` tells the policy which ids remain in the worker queue —
@@ -1396,6 +1565,108 @@ impl FramePolicy {
         executing: bool,
         now: Instant,
     ) -> FramePlan {
+        self.executing_now = executing;
+        // Device-idle census, taken at the TOP so it catches every way the
+        // policy can leave the device starved -- the gate hold is only one of
+        // them, and measurement showed it is NOT the one that produces this
+        // cell's long stalls. `PIE_IDLE_DUMP_US` arms it; once per episode.
+        let threshold = idle_dump_threshold_us();
+        if threshold != u64::MAX
+            && !executing
+            && let Some(since) = self.last_retire_at
+        {
+            let idle = now.saturating_duration_since(since).as_micros() as u64;
+            // The bring-up idles ~34 ms with an almost-empty wait-set every
+            // run, which is a startup cost rather than the stall this hunts —
+            // but a fixed seat floor makes the instrument SILENTLY exclude the
+            // ramp, and a census that hides a phase is a census that can be
+            // read as covering one. `PIE_IDLE_DUMP_MIN_SEATS` names the floor
+            // and defaults to 0, so the dump reports everything unless the
+            // analyst asks it not to.
+            let seated = self.lanes.values().filter(|lane| lane.awaited).count();
+            if idle >= threshold
+                && !self.idle_dumped
+                && seated >= idle_dump_min_seats()
+            {
+                self.idle_dumped = true;
+                let (mut ready, mut empty_owed, mut empty_unowed, mut partial) = (0, 0, 0, 0);
+                let (mut unowed_fresh, mut unowed_between) = (0, 0);
+                // Turnaround age of the lanes actually denying this gate.
+                let (mut turn_max, mut turn_sum, mut turn_n) = (0u64, 0u64, 0u64);
+                let mut oldest_ready_us = 0u64;
+                let mut newest_ready_us = u64::MAX;
+                for (lane_id, lane) in &self.lanes {
+                    if !lane.awaited {
+                        continue;
+                    }
+                    if lane.frames.front().is_some_and(PendingFrame::is_complete) {
+                        ready += 1;
+                        if let Some(at) = lane.frames.front().and_then(|f| f.complete_at) {
+                            let age = now.saturating_duration_since(at).as_micros() as u64;
+                            oldest_ready_us = oldest_ready_us.max(age);
+                            newest_ready_us = newest_ready_us.min(age);
+                        }
+                    } else if lane.frames.is_empty() {
+                        let owes = self.in_flight_lanes.contains(lane_id)
+                            || lane
+                                .owner
+                                .is_some_and(|owner| self.pending_binds.contains_key(&owner));
+                        if owes {
+                            empty_owed += 1;
+                        } else {
+                            empty_unowed += 1;
+                            if lane.served {
+                                unowed_between += 1;
+                                if let Some(at) = lane.retired_at {
+                                    let age =
+                                        now.saturating_duration_since(at).as_micros() as u64;
+                                    turn_max = turn_max.max(age);
+                                    turn_sum += age;
+                                    turn_n += 1;
+                                }
+                            } else {
+                                unowed_fresh += 1;
+                            }
+                        }
+                    } else {
+                        partial += 1;
+                    }
+                }
+                // Why the policy is not sealing, in its own terms: is a
+                // boundary open (so only un-fired lanes may seal), and of the
+                // lanes with a complete front, how many are fresh vs already
+                // contributed. `fresh == 0` with a boundary open is the one
+                // state that makes `seal` return None with work everywhere.
+                let open = self.boundary_open();
+                let (mut fresh, mut continuing) = (0, 0);
+                for lane in self.lanes.values() {
+                    if lane.frames.front().is_some_and(PendingFrame::is_complete) {
+                        if open && lane.fired_this_boundary {
+                            continuing += 1;
+                        } else {
+                            fresh += 1;
+                        }
+                    }
+                }
+                println!(
+                    "[device-idle] {idle}us awaited={} ready={ready} empty+owed={empty_owed} \
+empty+unowed={empty_unowed}(fresh={unowed_fresh},between={unowed_between}) \
+partial_front={partial} sealed={} staged={} \
+pending_slots={} joins={} binds={} boundary_open={open} fresh={fresh} \
+continuing={continuing} turnaround_max={turn_max}us \
+turnaround_mean={}us ready_age_oldest={oldest_ready_us}us \
+ready_age_newest={}us",
+                    ready + empty_owed + empty_unowed + partial,
+                    self.sealed.len(),
+                    self.staged.len(),
+                    self.pending_slots,
+                    self.joins_in_flight.len(),
+                    self.pending_binds.values().sum::<usize>(),
+                    if turn_n > 0 { turn_sum / turn_n } else { 0 },
+                    if newest_ready_us == u64::MAX { 0 } else { newest_ready_us },
+                );
+            }
+        }
         loop {
             // A guest that parked leaves the wait-set before anything is
             // counted missing, so the gather below never sees it.
@@ -1421,6 +1692,13 @@ impl FramePolicy {
                 {
                     // The copy's retirement re-decides through the scheduler
                     // channel; the hold is only a liveness backstop.
+                    if let Some(stats) = &self.stats {
+                        stats
+                            .fire
+                            .quorum
+                            .dispatch_blocked_holds
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     return FramePlan::Hold(Duration::from_micros(500));
                 }
                 let frame = self.sealed.pop_front().expect("front frame exists");
@@ -1438,6 +1716,34 @@ impl FramePolicy {
                 // tick late for reasons nothing can see.
                 for member in frame.members.iter().copied() {
                     self.in_flight_since.entry(member).or_insert(now);
+                }
+                // Device starvation, stamped where it is decided: nothing was
+                // executing when this frame was posted, so the device has been
+                // idle since the last retirement. `executing` is the worker's
+                // own in-flight signal, so this counts real idle, not a gap
+                // covered by a frame still on the device.
+                let mut starved_us = 0u64;
+                if !self.executing_now
+                    && let Some(since) = self.last_retire_at
+                    && let Some(stats) = &self.stats
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let idle = now.saturating_duration_since(since).as_micros() as u64;
+                    stats.fire.quorum.device_idle_us.fetch_add(idle, Relaxed);
+                    stats.fire.quorum.device_idle_gaps.fetch_add(1, Relaxed);
+                    stats.record_bubble_us(idle);
+                    starved_us = idle;
+                }
+                // `PIE_IDLE_DUMP_US=<us>`: name what the fleet was doing across
+                // a starvation gap longer than the threshold. There are ~6 of
+                // these per cohort turnover and their DURATION is the whole
+                // remaining deficit, so what they were waiting for is the
+                // question. Off unless the variable is set.
+                if starved_us >= idle_dump_threshold_us() {
+                    println!(
+                        "[idle-gap] {starved_us}us  {}",
+                        self.debug_summary()
+                    );
                 }
                 return FramePlan::Dispatch(frame.waves);
             }
@@ -1472,6 +1778,7 @@ impl FramePolicy {
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
+            self.idle_dumped = false;
                 return FramePlan::Park;
             }
             // `missing` counts awaited lanes whose next frame is not fully
@@ -1628,9 +1935,19 @@ impl FramePolicy {
                 if executing {
                     // An epoch is executing: its retirements re-decide and
                     // the gather continues in the background.
+                    //
+                    // Drop any quiescence mark on the way out. The rule is
+                    // "one full HOLD CYCLE in which nothing landed", and this
+                    // exit is not a hold cycle -- a mark left here survives an
+                    // entire execution and is then compared against a counter
+                    // that an arrival for a complete-but-unsealed lane does
+                    // not move, so the next idle evaluation can seal with no
+                    // hold cycle at all. That is the no-quiescence behaviour
+                    // the comment below records as fragmenting waves.
+                    self.quiesce_mark = None;
                     return FramePlan::Park;
                 }
-                if seal_mode_ready() && self.have_seal_candidate() {
+                if self.seal_mode_ready && self.have_seal_candidate() {
                     // Ready mode, arrival-quiescence rule: open the
                     // boundary from the arrival-complete subset only after
                     // one full hold cycle in which NO new fire arrived —
@@ -1641,9 +1958,10 @@ impl FramePolicy {
                     // fragmented the waves and lost 13% (see the analysis
                     // addendum): the burst is still landing at that point.
                     // Pure event arithmetic — no timers, no thresholds.
-                    if self.quiesce_mark == Some(self.arrival_seq) {
+                    if self.quiesce_mark == Some(self.gather_seq) {
                         self.quiesce_mark = None;
                         self.strict_watchdog_deadline = None;
+            self.idle_dumped = false;
                         match self.seal() {
                             Some(FramePlan::Dispatch(_)) => continue,
                             Some(plan) => return plan,
@@ -1653,7 +1971,7 @@ impl FramePolicy {
                             None => {}
                         }
                     } else {
-                        self.quiesce_mark = Some(self.arrival_seq);
+                        self.quiesce_mark = Some(self.gather_seq);
                     }
                 }
                 let deadline = self
@@ -1670,6 +1988,12 @@ impl FramePolicy {
                 return plan;
             }
             self.strict_watchdog_deadline = None;
+            self.idle_dumped = false;
+            // Nothing is missing, so this evaluation is not a hold cycle
+            // either: retire the mark for the same reason the executing exit
+            // does. After this the mark can only ever bridge one held
+            // evaluation to the next, which is what the rule says it means.
+            self.quiesce_mark = None;
             // EARLY seal: the gate held (every awaited lane's next frame is
             // fully submitted, no earmarked successor assembling), so seal NOW — normally
             // while the previous frame still executes. Sealing early is
@@ -1854,8 +2178,13 @@ mod tests {
     /// behind — which stays forbidden however long the wait runs.
     #[test]
     fn incomplete_lane_holds_the_seal_until_it_completes() {
-        let mut policy =
-            FramePolicy::new(2, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
+        // The STRICT rule is what this asserts, and strict is no longer the
+        // default — pin it rather than assert on whatever the suite was run
+        // with. Ready mode's own behaviour is covered by
+        // `ready_mode_opens_the_boundary_only_after_arrivals_quiesce`.
+        let mut policy = FramePolicy::new(2, 64, 4096, None)
+            .with_seal_mode_ready(false)
+            .with_submit_deadline(Duration::from_secs(86_400));
         let (fast, slow) = (pid(), pid());
         policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1);
         policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1);
@@ -1890,6 +2219,58 @@ mod tests {
         };
         assert_eq!(waves[0].len(), 2, "dense wave 0 holds BOTH lanes");
         assert!(waves[0].contains(&1) && waves[0].contains(&3));
+    }
+
+    /// The DEFAULT rule, which the test above pins off: ready mode opens the
+    /// boundary from the arrival-complete subset — but only after one full
+    /// hold cycle in which no new fire arrived. Both halves matter and the
+    /// second is the one that has been got wrong before: opening on the first
+    /// idle evaluation fragments the wave while the arrival burst is still
+    /// landing, which is what sank the no-quiescence variant.
+    #[test]
+    fn ready_mode_opens_the_boundary_only_after_arrivals_quiesce() {
+        let mut policy = FramePolicy::new(2, 64, 4096, None)
+            .with_seal_mode_ready(true)
+            .with_submit_deadline(Duration::from_secs(86_400));
+        let (fast, slow) = (pid(), pid());
+        policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1);
+        policy.on_fire_enqueued(stamp(slow, 0, 0, 2), Some(slow), 3, 1, 1);
+
+        let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
+        let t0 = Instant::now();
+        // First evaluation: arrivals have NOT quiesced, so it still holds even
+        // though `fast` is complete and could be sealed alone.
+        match plan(&mut policy, &queued, t0) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("the first idle evaluation must arm quiescence, got {plan:?}"),
+        }
+        // Second evaluation with nothing new arrived: the burst is over, the
+        // missing lane is genuinely slow, and the boundary opens with `fast`.
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, t0) else {
+            panic!("quiesced: ready mode must open the boundary");
+        };
+        assert_eq!(waves[0], vec![1], "only the arrival-complete lane seals");
+
+        // A fire arriving between evaluations re-arms quiescence: the next
+        // look holds again rather than sealing on stale evidence.
+        let mut policy = FramePolicy::new(2, 64, 4096, None)
+            .with_seal_mode_ready(true)
+            .with_submit_deadline(Duration::from_secs(86_400));
+        let (fast, slow) = (pid(), pid());
+        policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 10, 1, 1);
+        policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 11, 1, 1);
+        policy.on_fire_enqueued(stamp(slow, 0, 0, 2), Some(slow), 12, 1, 1);
+        let queued: QueuedFireIds = [10, 11, 12].into_iter().collect();
+        let t0 = Instant::now();
+        assert!(matches!(plan(&mut policy, &queued, t0), FramePlan::Hold(_)));
+        let third = pid();
+        policy.on_fire_enqueued(stamp(third, 0, 0, 2), Some(third), 13, 1, 1);
+        let queued: QueuedFireIds = [10, 11, 12, 13].into_iter().collect();
+        match plan(&mut policy, &queued, t0) {
+            FramePlan::Hold(_) => {}
+            plan => panic!("a new arrival must re-arm quiescence, got {plan:?}"),
+        }
     }
 
     /// Venus: a sealed frame dispatches WHOLE — every wave in slot order in
@@ -2792,7 +3173,11 @@ mod tests {
     #[test]
     fn engine_debt_suspends_the_deadline_clock() {
         let deadline = Duration::from_millis(50);
-        let mut policy = FramePolicy::new(2, 64, 4096, None).with_submit_deadline(deadline);
+        // Strict: the debt clock only runs while a lane is missing, and ready
+        // mode seals past the missing lane before the clock can be observed.
+        let mut policy = FramePolicy::new(2, 64, 4096, None)
+            .with_seal_mode_ready(false)
+            .with_submit_deadline(deadline);
         let (a, b) = (pid(), pid());
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 500, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 501, 1, 1);

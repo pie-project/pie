@@ -8,6 +8,11 @@
 // Defined in `batch/forward.cpp`.
 namespace pie_cuda_driver {
 bool prefill_graph_enabled();
+// Graph-mode PLANNING half of the same lever; see `PIE_PREFILL_GRAPH_PLAN` in
+// `batch/forward.cpp`. Follows `prefill_graph_enabled()` unless overridden.
+bool prefill_graph_plan_enabled();
+// Request/token padding half; see `PIE_PREFILL_GRAPH_PAD` in `forward.cpp`.
+bool prefill_graph_pad_enabled();
 }  // namespace pie_cuda_driver
 
 // CUDA-graph cache for the decode forward body.
@@ -41,8 +46,10 @@ bool prefill_graph_enabled();
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -110,10 +117,16 @@ constexpr int forward_graph_request_bucket(int requests,
 //     G=128 -> 67 keys, 63.2% reuse, 6.9% padding waste
 //     G=256 -> 56 keys, 69.2% reuse, 13.6% padding waste
 //
-// 128 is the finest grain whose key set still fits `kMaxEntries` beside the
-// 51 upfront decode graphs (67 + 51 = 118). G=64 would need 132 entries and
-// evict its own working set, spending the padding and losing the reuse that
-// paid for it.
+// 128 was chosen because it is the finest grain whose key set still fits
+// `kMaxEntries` beside the 51 upfront decode graphs (67 + 51 = 118) — G=64
+// would have needed 132 entries and evicted its own working set.
+//
+// That reason no longer binds (`PIE_GRAPH_CACHE_ENTRIES` lifts the ceiling),
+// and the grain was swept with it lifted: G = 64/128/256 gives 81/67/47
+// captures and 3.1%/6.9%/13.6% padding waste, and throughput does not move at
+// all. **The two terms cancel** — a finer grain pays less padding and captures
+// more shapes, a coarser one the reverse — so no grain wins and 128 stays the
+// default for want of a better one rather than for the reason above.
 constexpr int kForwardGraphTokenGrain = 128;
 
 // `PIE_TOKEN_GRAIN` overrides the grain so the padding-vs-reuse trade can be
@@ -180,22 +193,80 @@ public:
         std::uint64_t misses = 0;
         std::uint64_t captures = 0;
         std::uint64_t evictions = 0;
+        // Split by path. An aggregate hit rate is dominated by pure decode
+        // (4/5 of steps here) and stays ~95% whether or not a single
+        // prefill-carrying wave ever reaches the cache -- which is the
+        // question `PIE_PREFILL_GRAPH` exists to answer. `ineligible` counts
+        // waves that never looked up, so eligibility and cache behaviour are
+        // not read off one number.
+        std::uint64_t prefill_hits = 0;
+        std::uint64_t prefill_misses = 0;
+        std::uint64_t prefill_ineligible = 0;
+        std::uint64_t decode_ineligible = 0;
     };
+
+    // Counts a wave that never reached `get` because the gate refused it,
+    // against the clause that refused. `reason` must be a string literal --
+    // the tally keys on the pointer, not the contents.
+    void note_refusal(bool is_pure_decode, const char* reason) const noexcept {
+        if (is_pure_decode) ++metrics_.decode_ineligible;
+        else ++metrics_.prefill_ineligible;
+        for (auto& [name, count] : refusals_) {
+            if (name == reason) { ++count; return; }
+        }
+        if (refusals_.size() < kMaxRefusalReasons) {
+            refusals_.emplace_back(reason, 1);
+        }
+    }
     ForwardGraphCache() = default;
     ~ForwardGraphCache() noexcept {
+        // `PIE_GRAPH_STATS=1`. These counters existed but had no reader
+        // outside a unit test, so "is the prefill path actually replaying"
+        // was not answerable from a run -- the question the whole lattice
+        // above exists to serve. Reported at teardown, off the hot path.
+        if (const char* const env = std::getenv("PIE_GRAPH_STATS");
+            env != nullptr && *env != '\0' && env[0] != '0') {
+            const std::uint64_t lookups = metrics_.hits + metrics_.misses;
+            std::fprintf(
+                stderr,
+                "[graph-stats] lookups=%llu hits=%llu (%.1f%%) misses=%llu "
+                "captures=%llu evictions=%llu resident=%zu/%zu | "
+                "prefill: hits=%llu misses=%llu ineligible=%llu | "
+                "decode: ineligible=%llu\n",
+                static_cast<unsigned long long>(lookups),
+                static_cast<unsigned long long>(metrics_.hits),
+                lookups == 0 ? 0.0
+                             : 100.0 * static_cast<double>(metrics_.hits) /
+                                   static_cast<double>(lookups),
+                static_cast<unsigned long long>(metrics_.misses),
+                static_cast<unsigned long long>(metrics_.captures),
+                static_cast<unsigned long long>(metrics_.evictions),
+                execs_.size(), max_entries(),
+                static_cast<unsigned long long>(metrics_.prefill_hits),
+                static_cast<unsigned long long>(metrics_.prefill_misses),
+                static_cast<unsigned long long>(metrics_.prefill_ineligible),
+                static_cast<unsigned long long>(metrics_.decode_ineligible));
+            for (const auto& [name, count] : refusals_) {
+                std::fprintf(stderr, "[graph-stats]   refused by %-18s %llu\n",
+                             name, static_cast<unsigned long long>(count));
+            }
+        }
         for (auto& [_, exec] : execs_) cudaGraphExecDestroy(exec);
     }
     ForwardGraphCache(const ForwardGraphCache&) = delete;
     ForwardGraphCache& operator=(const ForwardGraphCache&) = delete;
 
     // Returns a captured graph for `key`, or nullptr if none cached.
-    cudaGraphExec_t get(const ForwardGraphKey& key) const noexcept {
+    cudaGraphExec_t get(const ForwardGraphKey& key,
+                        bool is_pure_decode = true) const noexcept {
         auto it = execs_.find(key);
         if (it == execs_.end()) {
             ++metrics_.misses;
+            if (!is_pure_decode) ++metrics_.prefill_misses;
             return nullptr;
         }
         ++metrics_.hits;
+        if (!is_pure_decode) ++metrics_.prefill_hits;
         return it->second;
     }
 
@@ -208,7 +279,7 @@ public:
             return;
         }
 
-        if (execs_.size() >= kMaxEntries && !execs_.empty()) {
+        if (execs_.size() >= max_entries() && !execs_.empty()) {
             auto victim = execs_.begin();
             cudaGraphExecDestroy(victim->second);
             execs_.erase(victim);
@@ -219,13 +290,35 @@ public:
     }
 
     std::size_t size() const noexcept { return execs_.size(); }
+    /// The ceiling `put` evicts against. Public so a pre-capture pass can
+    /// refuse to store more graphs than the cache can hold: eviction picks an
+    /// arbitrary bucket, so overrunning it discards entries captured earlier
+    /// in the SAME pass -- including the decode lattice.
+    std::size_t capacity() const noexcept { return max_entries(); }
     Metrics metrics() const noexcept { return metrics_; }
 
 private:
     static constexpr std::size_t kMaxEntries = 128;
+    static constexpr std::size_t kMaxRefusalReasons = 24;
+    // `PIE_GRAPH_CACHE_ENTRIES` overrides the ceiling. A CALIBRATION knob, not
+    // a tuning one: 128 was sized against ONE cell's key set (the comment on
+    // `kForwardGraphTokenGrain` says so — "67 + 51 = 118"), and at 4x the
+    // request count the prefill key set overflows it and the cache thrashes
+    // (§33: 74 captures at 4,096 requests, 169-196 at 16,384, for a key set
+    // that should saturate). Unset keeps 128 exactly.
+    static std::size_t max_entries() {
+        static const std::size_t value = [] {
+            const char* const env = std::getenv("PIE_GRAPH_CACHE_ENTRIES");
+            if (env == nullptr || *env == '\0') return kMaxEntries;
+            const long long parsed = std::atoll(env);
+            return parsed > 0 ? static_cast<std::size_t>(parsed) : kMaxEntries;
+        }();
+        return value;
+    }
     std::unordered_map<ForwardGraphKey, cudaGraphExec_t,
                        ForwardGraphKeyHash> execs_;
     mutable Metrics metrics_;
+    mutable std::vector<std::pair<const char*, std::uint64_t>> refusals_;
 };
 
 }  // namespace pie_cuda_driver

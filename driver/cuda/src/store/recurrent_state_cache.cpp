@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cstdlib>
 #include "recurrent_state_cache.hpp"
 
 #include <algorithm>
@@ -84,6 +86,25 @@ RecurrentStateCache RecurrentStateCache::allocate(
     if (c.hidden_size_ > 0) {
         c.mtp_pending_hidden_ = DeviceBuffer<std::uint16_t>::alloc(
             static_cast<std::size_t>(c.hidden_size_) * max_slots);
+    }
+    {
+        static const bool dbg = [] {
+            const char* v = std::getenv("PIE_RS_DEBUG");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (dbg) {
+            const double mb = 1048576.0;
+            const std::size_t L = static_cast<std::size_t>(c.num_linear_layers_);
+            std::fprintf(stderr,
+                "[rs] slots=%d linear_layers=%zu bf16=%d conv=%.1fMiB "
+                "rec=%.1fMiB mtp_hidden=%.1fMiB | per_slot=%.1fMiB\n",
+                max_slots, L, (int)c.recurrent_state_bf16_,
+                conv_total * L * 2 / mb,
+                rec_total * L * (c.recurrent_state_bf16_ ? 2.0 : 4.0) / mb,
+                (double)c.hidden_size_ * max_slots * 2 / mb,
+                (conv_slot_elems * 2.0 +
+                 rec_slot_elems * (c.recurrent_state_bf16_ ? 2.0 : 4.0)) * L / mb);
+        }
     }
     c.reset();
     return c;
@@ -379,6 +400,17 @@ void RecurrentStateCache::configure_verify_hidden_stash(
 {
     if (max_tokens <= 0 || hidden_size <= 0 || num_linear_layers_ <= 0) {
         return;
+    }
+    // PIE_RS_STASH_TOKENS caps the stash stride. It is sized from
+    // `max_workspace_tokens` (a PREFILL width, 8192 on Qwen3.6-27B), but the
+    // stash is only ever written on a frozen-verify fire, whose width is
+    // draft-tokens x requests -- ~256 here. At 8192 x 10336 x 48 layers x 2 B
+    // it is 7752 MiB, the largest single item in the state arena, and the state
+    // arena is charged in full at every frame commit. Prefill never touches it,
+    // unlike the logits slab.
+    if (const char* cap = std::getenv("PIE_RS_STASH_TOKENS")) {
+        const int want = std::atoi(cap);
+        if (want > 0 && want < max_tokens) max_tokens = want;
     }
     verify_stash_max_tokens_ = max_tokens;
     verify_stash_hidden_ = hidden_size;

@@ -251,7 +251,16 @@ class Config:
 def _block(obj) -> dict:
     """Reflect an `Optional[...]`-heavy dataclass into `{key: value}`,
     dropping fields whose value is None. `default_factory=list/dict`
-    fields stay even when empty (needed for `device = []` etc.)."""
+    fields stay even when empty (needed for `device = []` etc.).
+
+    `*_mb` / `*_secs` fields carry COUNTS, while every schema this feeds
+    spells the same knob as a size/duration STRING under the bare stem
+    (`wasm_warm_memory_mb=64` -> `wasm_warm_memory="64MiB"`). `to_engine_toml`
+    has always converted them; this emitter did not, so any `_mb` field set
+    through the embedded path was rejected by the engine as an unknown key.
+    `wasm_warm_slots` hid it — it is the one sized-sounding knob whose name
+    has no suffix, so it was the only one anybody had reason to set.
+    """
     from dataclasses import fields, is_dataclass
     out = {}
     if not is_dataclass(obj):
@@ -260,7 +269,12 @@ def _block(obj) -> dict:
         v = getattr(obj, f.name)
         if v is None:
             continue
-        out[f.name] = v
+        if f.name.endswith("_mb"):
+            out[f.name[: -len("_mb")]] = _mib(v)
+        elif f.name.endswith("_secs"):
+            out[f.name[: -len("_secs")]] = _secs(v)
+        else:
+            out[f.name] = v
     return out
 
 

@@ -38,6 +38,40 @@ bool kernel_ablated(Kernel k) {
                      "[ablate] PIE_METAL_ABLATE=%s -- these kinds are NOT "
                      "DISPATCHED. The tokens are wrong on purpose; only the "
                      "wall clock means anything.\n", e);
+        // A token that matched nothing skips nothing, and the run then
+        // reports the baseline while looking armed -- the banner above still
+        // prints. That has cost a whole session's worth of "trace said 46%,
+        // ablation says 0%" readings, all of them no-ops, because this takes
+        // a kernel KIND and the dispatch trace prints a pipeline HOST NAME:
+        // paste `affine_qmv_routed_bfloat16_gs_64_b_4` in here and it matches
+        // no kind at all. Say so, loudly, and list what it does take.
+        for (std::size_t at = 0; at <= spec.size();) {
+            const std::size_t end = std::min(spec.find(',', at), spec.size());
+            const std::string token = spec.substr(at, end - at);
+            at = end + 1;
+            if (token.empty()) continue;
+            bool matched = false;
+            for (int i = 0; i < kKernelKindCount && !matched; ++i) {
+                const char* n = kernel_name(static_cast<Kernel>(i));
+                matched = n != nullptr && token == n;
+            }
+            if (matched) continue;
+            std::fprintf(stderr,
+                         "[ablate] '%s' IS NOT A KERNEL KIND -- it ablates "
+                         "NOTHING and this run will report the baseline. This "
+                         "takes kind names, not the pipeline host names the "
+                         "dispatch trace prints. Known kinds:\n[ablate]  ",
+                         token.c_str());
+            for (int i = 0; i < kKernelKindCount; ++i) {
+                const char* n = kernel_name(static_cast<Kernel>(i));
+                // The enum is sparse -- unassigned ordinals all answer
+                // "unknown" -- and printing that seventy times buries the list.
+                if (n != nullptr && std::strcmp(n, "unknown") != 0) {
+                    std::fprintf(stderr, "%s ", n);
+                }
+            }
+            std::fprintf(stderr, "\n");
+        }
         return t;
     }();
     const int i = static_cast<int>(k);
@@ -99,6 +133,61 @@ const char* kernel_name(Kernel k) {
         case Kernel::LlSharedDown:      return "ll_shared_down";
         case Kernel::LlSharedGateProj:  return "ll_shared_gate_proj";
         case Kernel::LlSharedCombine:   return "ll_shared_combine";
+        // The remaining half of the enum, which reported as `unknown` -- 50 of
+        // 99 kinds had no entry here, so the attribution report was blind to
+        // gemma4's mixture and PLE, all of gpt-oss, and both untied-embedding
+        // kinds, and `PIE_METAL_ABLATE` could not name any of them. Generated
+        // from the enum rather than written by hand, so the mapping is the
+        // identity and cannot drift.
+        case Kernel::G4AttnPostNorm:         return "g4_attn_post_norm";
+        case Kernel::G4FfnPreNorm:           return "g4_ffn_pre_norm";
+        case Kernel::G4FfnPostNorm:          return "g4_ffn_post_norm";
+        case Kernel::G4VNorm:                return "g4_v_norm";
+        case Kernel::G4Geglu:                return "g4_geglu";
+        case Kernel::G4LayerScalar:          return "g4_layer_scalar";
+        case Kernel::G4Softcap:              return "g4_softcap";
+        case Kernel::G4RowGather:            return "g4_row_gather";
+        case Kernel::G4SdpaSliding:          return "g4_sdpa_sliding";
+        case Kernel::G4PleTokenGather:       return "g4_ple_token_gather";
+        case Kernel::G4PleProjGemv:          return "g4_ple_proj_gemv";
+        case Kernel::G4PleProjNorm:          return "g4_ple_proj_norm";
+        case Kernel::G4PleCombine:           return "g4_ple_combine";
+        case Kernel::G4PleGateGemv:          return "g4_ple_gate_gemv";
+        case Kernel::G4PleGeglu:             return "g4_ple_geglu";
+        case Kernel::G4PleProjLayerGemv:     return "g4_ple_proj_layer_gemv";
+        case Kernel::G4PleNorm:              return "g4_ple_norm";
+        case Kernel::G4PleResidual:          return "g4_ple_residual";
+        case Kernel::G4AttnPostResidual:     return "g4_attn_post_residual";
+        case Kernel::G4FfnPostResidual:      return "g4_ffn_post_residual";
+        case Kernel::G4PleResidualScaled:    return "g4_ple_residual_scaled";
+        case Kernel::EmbedUntied:            return "embed_untied";
+        case Kernel::LmHeadUntied:           return "lm_head_untied";
+        case Kernel::GoQmvQ:                 return "go_qmv_q";
+        case Kernel::GoQmvK:                 return "go_qmv_k";
+        case Kernel::GoQmvV:                 return "go_qmv_v";
+        case Kernel::GoQmvO:                 return "go_qmv_o";
+        case Kernel::GoSdpaSink:             return "go_sdpa_sink";
+        case Kernel::GoRouter:               return "go_router";
+        case Kernel::GoExpertGate:           return "go_expert_gate";
+        case Kernel::GoExpertUp:             return "go_expert_up";
+        case Kernel::GoExpertDown:           return "go_expert_down";
+        case Kernel::GoRouterTopK:           return "go_router_top_k";
+        case Kernel::GoSwiGlu:               return "go_swi_glu";
+        case Kernel::GoExpertCombine:        return "go_expert_combine";
+        case Kernel::G4Router:               return "g4_router";
+        case Kernel::G4RouterNorm:           return "g4_router_norm";
+        case Kernel::G4RouterTopK:           return "g4_router_top_k";
+        case Kernel::G4MoeNorm:              return "g4_moe_norm";
+        case Kernel::G4DenseBranchNorm:      return "g4_dense_branch_norm";
+        case Kernel::G4MoeBranchNorm:        return "g4_moe_branch_norm";
+        case Kernel::G4ExpertGate:           return "g4_expert_gate";
+        case Kernel::G4ExpertUp:             return "g4_expert_up";
+        case Kernel::G4ExpertDown:           return "g4_expert_down";
+        case Kernel::G4ExpertGeglu:          return "g4_expert_geglu";
+        case Kernel::G4MoeSort:              return "g4_moe_sort";
+        case Kernel::G4MoeGather:            return "g4_moe_gather";
+        case Kernel::G4ExpertCombine:        return "g4_expert_combine";
+        case Kernel::G4BranchAdd:            return "g4_branch_add";
         default: break;
     }
     return "unknown";

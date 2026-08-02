@@ -121,8 +121,22 @@ class ExpertPaging {
     /// `encode(se, begin, end)` walks the dispatches in `[begin, end)`. The
     /// caller recognises the first segment by `begin == 0` and the last by
     /// `end == dag_size`, which is where any pre/post hook belongs.
+    ///
+    /// `ids_row_stride_bytes` is how far apart two rows' routing decisions sit
+    /// in the ids buffer, and zero means "packed", which is what the router
+    /// kernel produces whenever one dispatch covers every row -- it advances
+    /// `expert_ids` by `row * experts_per_token` and never by a row pitch.
+    /// It is not always packed: qwen3.5 encodes a prefill as one DAG PER TOKEN
+    /// over a shared scratch pool, and when the prompt is too wide to route as
+    /// one group each token routes off its own binding, a whole scratch row
+    /// apart. Reading a strided fire as packed renumbers row 0 `rows` times and
+    /// leaves every other row holding TRUE expert ids, which then index slots --
+    /// experts read from whatever slot happened to hold them, which is fluent
+    /// wrong text rather than an error. `prefill_routed_group` is the predicate
+    /// that decides which of the two a fire is.
     StepTiming fire(RawMetalContext& ctx, int rows,
-                    const std::function<void(StepEncoder&, std::size_t, std::size_t)>& encode) {
+                    const std::function<void(StepEncoder&, std::size_t, std::size_t)>& encode,
+                    std::size_t ids_row_stride_bytes = 0) {
         std::vector<std::function<void(StepEncoder&)>> segs;
         segs.reserve(cuts_.size());
         std::size_t begin = 0;
@@ -131,19 +145,39 @@ class ExpertPaging {
             segs.push_back([&encode, begin, end](StepEncoder& se) { encode(se, begin, end); });
             begin = end;
         }
-        const std::size_t ids = std::size_t(rows) * std::size_t(experts_per_token_);
-        return ctx.run_segments(segs, [this, ids](std::size_t k) {
+        const std::size_t per_row = std::size_t(experts_per_token_);
+        const std::size_t stride = ids_row_stride_bytes != 0
+                                       ? ids_row_stride_bytes
+                                       : per_row * sizeof(std::int32_t);
+        const std::size_t n_rows = std::size_t(rows > 0 ? rows : 0);
+        const bool trace = std::getenv("PIE_METAL_PAGING_TRACE") != nullptr;
+        return ctx.run_segments(segs, [this, per_row, stride, n_rows, trace](std::size_t k) {
             // Give the previous segment's pins back FIRST: its command buffer
             // has completed, which is exactly the condition that makes its
             // slots reusable. Doing it after the page-in would hold two layers
             // at once and need twice the budget.
             slab_->end_batch();
             if (k + 1 >= cuts_.size()) return;  // the tail owns no experts
-            auto* p = static_cast<std::int32_t*>(cuts_[k].ids.contents());
-            for (std::size_t i = 0; i < ids; ++i) {
-                const std::int32_t e = p[i];
-                if (e < 0 || e >= n_experts_) continue;  // a padded slot
-                p[i] = std::int32_t(slab_->ensure_resident(std::uint32_t(k), std::uint32_t(e)));
+            auto* base = static_cast<std::uint8_t*>(cuts_[k].ids.contents());
+            for (std::size_t r = 0; r < n_rows; ++r) {
+                auto* p = reinterpret_cast<std::int32_t*>(base + r * stride);
+                if (trace && k < 2) {
+                    std::fprintf(stderr, "[trace] cut %zu row %zu rows=%zu in:", k, r, n_rows);
+                    for (std::size_t i = 0; i < per_row; ++i)
+                        std::fprintf(stderr, " %d", p[i]);
+                }
+                for (std::size_t i = 0; i < per_row; ++i) {
+                    const std::int32_t e = p[i];
+                    if (e < 0 || e >= n_experts_) continue;  // a padded slot
+                    p[i] =
+                        std::int32_t(slab_->ensure_resident(std::uint32_t(k), std::uint32_t(e)));
+                }
+                if (trace && k < 2) {
+                    std::fprintf(stderr, " out:");
+                    for (std::size_t i = 0; i < per_row; ++i)
+                        std::fprintf(stderr, " %d", p[i]);
+                    std::fprintf(stderr, "\n");
+                }
             }
         });
     }

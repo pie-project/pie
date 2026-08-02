@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace pie::metal::scratch {
@@ -40,7 +41,16 @@ struct Coloring {
 /// `run_ends[i]` is the last ordinal of the concurrency run containing `i`, or
 /// `i` itself when it runs alone.
 inline Coloring color_live_ranges(const std::vector<Use>& uses, const std::vector<int>& run_ends,
-                                  int value_count, bool no_recycle) {
+                                  int value_count, bool no_recycle,
+                                  /// Values that must keep a buffer of their own while
+                                  /// everything else still recycles. `no_recycle` preserves
+                                  /// every intermediate and is the honest instrument, but it
+                                  /// multiplies the pool by the DAG's length -- on a 40-layer
+                                  /// mixture that is 18 GiB of scratch and the run dies before
+                                  /// it dumps. Pinning ONE layer costs a layer's worth of slots
+                                  /// and answers the same question, as long as the question is
+                                  /// about that layer.
+                                  const std::vector<bool>* pinned = nullptr) {
     Coloring out;
     const int n = value_count;
     std::vector<int> def(static_cast<std::size_t>(n), -1);
@@ -74,7 +84,19 @@ inline Coloring color_live_ranges(const std::vector<Use>& uses, const std::vecto
             free_at.push_back(last[std::size_t(v)]);
         }
     } else {
+        // Pinned values take their buffers first and keep them: `free_at` at
+        // INT_MAX never satisfies the `< def[v]` test below, so the linear scan
+        // can see these slots and will never choose one.
+        if (pinned != nullptr) {
+            for (int v = 0; v < n; ++v) {
+                if (std::size_t(v) < pinned->size() && (*pinned)[std::size_t(v)]) {
+                    out.color[std::size_t(v)] = static_cast<int>(free_at.size());
+                    free_at.push_back(std::numeric_limits<int>::max());
+                }
+            }
+        }
         for (int v : order) {
+            if (out.color[std::size_t(v)] >= 0) continue;  // pinned above
             int chosen = -1;
             for (std::size_t b = 0; b < free_at.size(); ++b) {
                 if (free_at[b] < def[std::size_t(v)]) {  // strictly before: no overlap

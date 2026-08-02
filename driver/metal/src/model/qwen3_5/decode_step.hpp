@@ -124,20 +124,39 @@ inline int moe_tile_rows_for(const DecodeGeometry& g, int n_tokens, bool batched
 
 /// Whether a DECODE fire's routed projections run batched.
 ///
-/// False, and not as a tuning choice: qwen3.5's routed batched GEMM answers
-/// wrongly on a decode fleet. See the routed arm of `mb_geometry` for the
-/// bisection. Named rather than written as a literal `false` at each site
-/// because three places have to agree on the sorted count -- the dispatch
-/// shape, `MoeRouteParams` and the pool sizing -- and a disagreement between
-/// them is a read off the end of the routing.
+/// Gate for the routing traces on both sides of the contract: what the sort was
+/// told (`bind_token_consts`) and what the projections were dispatched at
+/// (`mb_geometry`). Off unless asked for, and printed to stderr so it cannot
+/// land in a measured number.
+inline bool moe_trace_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PIE_METAL_MOE_TRACE");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    return on;
+}
+
+/// Whether a DECODE fire's routed projections run batched.
+///
+/// True. It was false for as long as the routed GEMM answered wrongly on a
+/// decode fleet, which it did because `bind_mb_fp16_qmm` bound the FP16
+/// staging buffer over `GoQmv::TileExpert` -- see the skip in
+/// `bind_mb_fp16_qmm`, which is the whole fix. With that gone the arm is worth
+/// 161.3 -> 214.5 tok/s on a 32-lane Qwen3.6-35B-A3B fleet, +33%, at an
+/// unchanged M=1 decode (the mixture does not batch eight pairs over 256
+/// experts) and an unchanged greedy continuation.
+///
+/// Named rather than written as a literal at each site because three places
+/// have to agree on the sorted count -- the dispatch shape, `MoeRouteParams`
+/// and the pool sizing -- and a disagreement between them is a read off the
+/// end of the routing.
 inline bool qwen35_routed_decode_batched() {
-    // Overridable, like every other tuned constant in this driver and for the
-    // same reason: whoever fixes the GEMM has to run the same binary with the
-    // arm on and off, and a rebuild between arms is a different binary. It is
-    // also the one-line reproduction of the bug.
+    // Overridable, like every other tuned constant in this driver: the arm
+    // changes the shape of every routed dispatch in a decode, so anything that
+    // regresses here has to be bisectable against the matvec without a rebuild.
     static const bool on = [] {
         const char* e = std::getenv("PIE_METAL_QWEN_ROUTED_DECODE_GEMM");
-        return e != nullptr && *e != '\0' && *e != '0';
+        return e == nullptr || (*e != '\0' && *e != '0');
     }();
     return on;
 }
@@ -177,10 +196,18 @@ struct StepTimingHook {
 // concurrency. If the non-determinism vanishes with force_barriers=true, the cause is a
 // ‖-pair concurrency/barrier issue; if it persists, the race is elsewhere (in-kernel/state).
 // `timing` (optional): when non-null, emit per-boundary timestamp marks for attribution.
+// `begin`/`end` walk a SUB-RANGE of the DAG, which is what expert paging needs: a bank
+// bigger than the working set has to be read through slots the host refills between
+// dispatches, so a step becomes one command buffer per mixture layer instead of one for
+// the step. The default is the whole DAG, so a caller that does not page is unchanged.
+// Barrier decisions still consult the WHOLE dag -- a concurrency run is a property of the
+// step, not of the segment -- and cuts are placed at run ends, so no run is ever split.
 void encode_decode_step(StepEncoder& se,
                         const std::vector<Dispatch>& dag,
                         const DecodeStepPsos& psos,
                         bool force_barriers = false,
-                        const StepTimingHook* timing = nullptr);
+                        const StepTimingHook* timing = nullptr,
+                        std::size_t begin = 0,
+                        std::size_t end = ~std::size_t(0));
 
 }  // namespace pie::metal

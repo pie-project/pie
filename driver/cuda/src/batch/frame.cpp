@@ -479,6 +479,14 @@ struct StepTiming {
     fire_timing::Clock::time_point wire_parse_end{};
     fire_timing::Clock::time_point prepare_end{};
     fire_timing::Clock::time_point enqueue_start{};
+    // `h2d_prepare_us` is a misnomer inherited from when the span WAS the
+    // uploads: it runs from `enqueue_start` to the end of the attention plan
+    // and holds five unrelated things. §29 makes it the second-largest block
+    // on the lane, so it gets split at its own seams rather than guessed at.
+    fire_timing::Clock::time_point enq_begin_end{};
+    fire_timing::Clock::time_point enq_geometry_end{};
+    fire_timing::Clock::time_point enq_uploads_end{};
+    fire_timing::Clock::time_point enq_compose_end{};
     fire_timing::Clock::time_point h2d_end{};
     fire_timing::Clock::time_point forward_enqueue_end{};
     fire_timing::Clock::time_point settlement_enqueue_end{};
@@ -534,7 +542,45 @@ struct StepTiming {
                        << R"(,"begin_pass_c_us":)"
                        << begin_breakdown.pass_c_us
                        << R"(,"begin_pull_validate_us":)"
-                       << begin_breakdown.pull_validate_us;
+                       << begin_breakdown.pull_validate_us
+                       << R"(,"begin_pull_seq_us":)"
+                       << begin_breakdown.pull_seq_us
+                       << R"(,"begin_pull_alloc_us":)"
+                       << begin_breakdown.pull_alloc_us
+                       << R"(,"begin_pull_alloc_order_us":)"
+                       << begin_breakdown.pull_alloc_order_us
+                       << R"(,"begin_init_flush_us":)"
+                       << begin_breakdown.init_flush_us
+                       << R"(,"begin_init_wait_us":)"
+                       << begin_breakdown.init_wait_us
+                       << R"(,"begin_init_flush_slots":)"
+                       << begin_breakdown.init_flush_slots
+                       << R"(,"begin_init_flush_calls":)"
+                       << begin_breakdown.init_flush_calls
+                       << R"(,"begin_pull_alloc_malloc_us":)"
+                       << begin_breakdown.pull_alloc_malloc_us
+                       << R"(,"begin_pull_alloc_events_us":)"
+                       << begin_breakdown.pull_alloc_events_us
+                       << R"(,"begin_pull_alloc_claim_us":)"
+                       << begin_breakdown.pull_alloc_claim_us
+                       << R"(,"begin_pull_stage_us":)"
+                       << begin_breakdown.pull_stage_us
+                       << R"(,"begin_pull_flush_us":)"
+                       << begin_breakdown.pull_flush_us
+                       << R"(,"begin_pull_staged":)"
+                       << begin_breakdown.pull_staged
+                       << R"(,"begin_pull_lanes":)"
+                       << begin_breakdown.pull_lanes
+                       << R"(,"begin_pull_tickets":)"
+                       << begin_breakdown.pull_tickets
+                       << R"(,"begin_pull_descriptors":)"
+                       << begin_breakdown.pull_descriptors
+                       << R"(,"begin_pool_growth_bytes":)"
+                       << begin_breakdown.pool_growth_bytes
+                       << R"(,"begin_membership_carried":)"
+                       << begin_breakdown.membership_carried
+                       << R"(,"begin_membership_identical":)"
+                       << begin_breakdown.membership_identical;
             }
             if (begin_end != fire_timing::Clock::time_point{} &&
                 resolve_end != fire_timing::Clock::time_point{}) {
@@ -564,6 +610,25 @@ struct StepTiming {
                 h2d_end != fire_timing::Clock::time_point{}) {
                 output << R"(,"h2d_prepare_us":)"
                        << fire_timing::duration_us(enqueue_start, h2d_end);
+                // Sub-spans of the same window, in order. Each is emitted only
+                // when its own mark was reached, so a step that skipped a
+                // phase (fold, plan-once-per-frame, empty) reports nothing for
+                // it rather than a zero that would read as "free".
+                auto span = [&](const char* name,
+                                fire_timing::Clock::time_point from,
+                                fire_timing::Clock::time_point to) {
+                    if (from == fire_timing::Clock::time_point{} ||
+                        to == fire_timing::Clock::time_point{}) {
+                        return;
+                    }
+                    output << ",\"" << name << "\":"
+                           << fire_timing::duration_us(from, to);
+                };
+                span("enq_begin_us", enqueue_start, enq_begin_end);
+                span("enq_geometry_us", enq_begin_end, enq_geometry_end);
+                span("enq_uploads_us", enq_geometry_end, enq_uploads_end);
+                span("enq_compose_us", enq_uploads_end, enq_compose_end);
+                span("enq_attn_plan_us", enq_compose_end, h2d_end);
             }
             if (h2d_end != fire_timing::Clock::time_point{} &&
                 forward_enqueue_end !=
@@ -605,7 +670,21 @@ struct StepTiming {
                        << R"(,"finish_exec_upload_us":)"
                        << finish_breakdown.epilogue_exec_upload_us
                        << R"(,"finish_exec_launch_us":)"
-                       << finish_breakdown.epilogue_exec_launch_us;
+                       << finish_breakdown.epilogue_exec_launch_us
+                       << R"(,"finish_exec_around_us":)"
+                       << finish_breakdown.epilogue_exec_around_us
+                       << R"(,"finish_exec_effects_us":)"
+                       << finish_breakdown.epilogue_exec_effects_us
+                       << R"(,"finish_try_ok":)"
+                       << finish_breakdown.group_try_add_ok
+                       << R"(,"finish_try_fail":)"
+                       << finish_breakdown.group_try_add_fail
+                       << R"(,"finish_try_ok_us":)"
+                       << finish_breakdown.group_try_ok_us
+                       << R"(,"finish_try_fail_us":)"
+                       << finish_breakdown.group_try_fail_us
+                       << R"(,"finish_census_us":)"
+                       << finish_breakdown.group_census_us;
             }
             if (finish_groups >= 0) {
                 output << R"(,"finish_groups":)" << finish_groups
@@ -621,8 +700,24 @@ struct StepTiming {
                 host_total += fire_timing::duration_us(t0, prepare_end);
             }
             if (enqueue_start != fire_timing::Clock::time_point{}) {
+                // The enqueue half ends at SETTLE, not at `now`. This record
+                // is emitted when the `PreparedStep` dies, and every step of a
+                // frame dies together in `Context::Impl::launch`'s `prepared`
+                // vector -- so `now` for step 0 of a k=2 frame is after step 1
+                // has prepared, enqueued and settled, and `host_total` for the
+                // FIRST step of every frame silently carried the second one's
+                // whole span. Measured: residual-over-phases 782 us on
+                // even-index records against 209 on odd, and step-0
+                // `host_total` 2,235 us against step-1's 1,368 for the same
+                // 256-token wave. `now` remains the fallback for the abort and
+                // error paths, which never reach settle and whose host time is
+                // still real.
+                const auto enqueue_end =
+                    settlement_enqueue_end != fire_timing::Clock::time_point{}
+                        ? settlement_enqueue_end
+                        : now;
                 host_total +=
-                    fire_timing::duration_us(enqueue_start, now);
+                    fire_timing::duration_us(enqueue_start, enqueue_end);
             }
             output << R"(,"host_total_us":)" << host_total << '}';
             fire_timing::write(output.str());
@@ -654,6 +749,10 @@ struct PreparedStep::Impl {
     int R = 0;
     int N = 0;
     int num_sampling = 0;
+    // Rows the FORWARD gathers/emits: `num_sampling` padded up to the request
+    // bucket when the wave is graph-padded, so the baked count is keyed. See
+    // the comment where it is set. Settlement still uses `num_sampling`.
+    int num_logit_rows = 0;
     bool is_pure_decode = false;
     bool empty_step = false;
     bool settle_plain = false;   // empty or fold settle: finish(nullptr, 0)
@@ -1581,7 +1680,7 @@ void prepare_step(
         // what costs -- it is what leaves the shape off-lattice and forces the
         // one-off capture.
         const bool prefill_pad_ok =
-            prefill_graph_enabled() && !s.have_custom_mask;
+            prefill_graph_pad_enabled() && !s.have_custom_mask;
         const bool eligible = forward_graph_replay_eligible(
             engine,
             is_pure_decode || prefill_pad_ok,
@@ -1595,7 +1694,11 @@ void prepare_step(
             s.fR_real,
             s.img_num_images,
             s.aud_num_clips,
-            s.has_attention_stages);
+            s.has_attention_stages,
+            // Nothing is baked yet at this point -- this call only decides
+            // whether to PAD. The dispatch-side call is the authority on
+            // replay and re-checks the real row count.
+            /*num_logit_rows=*/0);
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
                 engine.max_forward_requests, engine.max_workspace_tokens);
@@ -1766,10 +1869,7 @@ void prepare_step(
     if (!s.rs_is_fold && N > tensor_rows(ws.logits)) {
         throw std::runtime_error("forward batch exceeds logits workspace");
     }
-    if (!s.sample_rows.empty() && !s.rpg.device_composed) {
-        s.up_sample_idx = pi.sample_idx.stage_from_host(
-            std::span<const std::int32_t>(s.sample_rows));
-    }
+    // MTP plans against the REAL rows, before any padding below.
     s.mtp_plan = preflight_mtp_draft_logits(
         engine, s.composed, s.sample_rows, s.mtp_draft_counts);
     s.compact_logits =
@@ -1777,6 +1877,50 @@ void prepare_step(
         s.mtp_plan.work.empty() &&
         num_sampling > 0 &&
         num_sampling < s.fN_real;
+    // `num_logit_rows` is baked into a captured body (it sizes the gather and
+    // the lm_head rows) but `ForwardGraphKey` carries only the (R, N) buckets,
+    // so a compact row count that varies per fire cannot be replayed safely --
+    // two waves in the same bucket pair would gather different row counts and
+    // the surplus requests would sample the previous fire's residue.
+    //
+    // Padding the row list up to `s.forward_R` makes the baked count equal to
+    // a value the key already carries. The extra entries name row 0, which is
+    // always in range; their logits land in slots [num_sampling, forward_R)
+    // of `ws.logits`, and settlement reads only [0, num_sampling), so they are
+    // computed and never read. `s.num_sampling` stays the REAL count for
+    // exactly that reason.
+    //
+    // Only worth doing when the wave was padded at all; an unpadded wave has
+    // nothing to gain and the dispatch gate will refuse it either way.
+    //
+    // Pad to the POST-pad request count, computed here from its two parts.
+    // `s.forward_R` is documented "final (post-pad)" but does not receive that
+    // value until the pad-lane block far below; at this point it still holds
+    // the pre-pad `s.fR_real` it was seeded with. Padding to it left
+    // `num_logit_rows == fR_real` while the dispatch gate compares against
+    // `fR_real + graph_pad_requests`, so the invariant failed by exactly the
+    // pad width and EVERY prefill-carrying wave was refused the graph --
+    // measured on the S cell as `refused by logit_rows 176`, prefill hits 0,
+    // with the printed pairs (234,240) (248,256) (256,272) each differing by
+    // their own `graph_pad_requests`.
+    const int padded_R = s.fR_real + s.graph_pad_requests;
+    const int padded_N = s.fN_real + s.graph_pad_tokens;
+    s.num_logit_rows = num_sampling;
+    if (s.compact_logits && s.graph_pad_requests > 0 &&
+        !s.rpg.device_composed &&
+        static_cast<int>(s.sample_rows.size()) < padded_R &&
+        padded_R < padded_N) {
+        s.sample_rows.resize(static_cast<std::size_t>(padded_R), 0);
+        s.num_logit_rows = padded_R;
+    }
+    if (s.sample_rows.size() > pi.sample_idx.size()) {
+        throw std::runtime_error(
+            "padded sampling rows exceed persistent input capacity");
+    }
+    if (!s.sample_rows.empty() && !s.rpg.device_composed) {
+        s.up_sample_idx = pi.sample_idx.stage_from_host(
+            std::span<const std::int32_t>(s.sample_rows));
+    }
     // Fold the greedy argmax into the LM head GEMM when every epilogue in the
     // launch is a bare argmax over `logits`, so the vocabulary is reduced as
     // it is produced instead of making a round trip through HBM (§20.37).
@@ -2137,7 +2281,18 @@ struct EnqProfile {
     // read as a 2.5ms steady cost when its steady value is ~2us.
     std::uint64_t steps = 0;
     static constexpr std::uint64_t warmup() { return 32ull; }
-    static constexpr bool enabled() { return false; }
+    // Read at runtime, matching the `PIE_STEP_PROFILE=1` the comment above
+    // has always advertised: this was `constexpr false`, so the only way to
+    // get the breakdown was to edit and rebuild, and the enclosing
+    // `h2d_prepare_us` span is the largest host phase left on the S cell.
+    // Same cached-static form as `DeviceIntervalProbe::enabled()` below.
+    static bool enabled() {
+        static const bool value = [] {
+            const char* const env = std::getenv("PIE_STEP_PROFILE");
+            return env != nullptr && *env != '\0' && env[0] != '0';
+        }();
+        return value;
+    }
     static EnqProfile& instance() { static EnqProfile p; return p; }
     ~EnqProfile() {
         if (!enabled()) return;
@@ -2323,8 +2478,42 @@ class DeviceIntervalProbe {
 
 }  // namespace
 
+// `PIE_STEP_BALLAST_DECODE_US` / `PIE_STEP_BALLAST_PREFILL_US`: the §29 ballast
+// again, but SPLIT by what the step carries. §30's flush cut returned 2.3x the
+// uniform exchange rate, on the theory that a cut landing at the prefill /
+// turnover boundary — where the device is measured draining — is worth more per
+// microsecond than the same cut spread over every launch. That is a claim about
+// POSITION, and it is testable by adding host time at one position only.
+// Calibration probes; zero/unset costs one predicted branch each.
+namespace {
+std::uint64_t step_ballast_us(const char* name) {
+    const char* const env = std::getenv(name);
+    if (env == nullptr || *env == '\0') return 0;
+    const long long parsed = std::atoll(env);
+    return parsed > 0 ? static_cast<std::uint64_t>(parsed) : 0;
+}
+std::uint64_t decode_ballast_us() {
+    static const std::uint64_t value =
+        step_ballast_us("PIE_STEP_BALLAST_DECODE_US");
+    return value;
+}
+std::uint64_t prefill_ballast_us() {
+    static const std::uint64_t value =
+        step_ballast_us("PIE_STEP_BALLAST_PREFILL_US");
+    return value;
+}
+void spin_us(std::uint64_t microseconds) {
+    if (microseconds == 0) return;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(microseconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+    }
+}
+}  // namespace
+
 void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     PreparedStep::Impl& s = *step.impl();
+    spin_us(s.is_pure_decode ? decode_ballast_us() : prefill_ballast_us());
     const bool dbg_fire = s.timing.enabled;
     if (dbg_fire) s.timing.enqueue_start = fire_timing::Clock::now();
     if (DeviceIntervalProbe::enabled()) {
@@ -2338,6 +2527,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         EnqTimer begin_timer(EnqProfile::kBeginEnq);
         engine.dispatch->begin_enqueue(*s.staged);
     }
+    if (dbg_fire) s.timing.enq_begin_end = fire_timing::Clock::now();
     // Original wave order: the Prologue (begin_enqueue) runs against the
     // pre-resolution state; the resolved geometry lands on the wave only
     // now, before every later phase (attention hooks, Epilogue, settle).
@@ -2346,6 +2536,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         engine.dispatch->update_launch_geometry(
             *s.staged, s.dispatch_view, s.program_token_starts);
     }
+    if (dbg_fire) s.timing.enq_geometry_end = fire_timing::Clock::now();
 
     // Wake the follower FIRST, before this rank's uploads, compose and payload
     // broadcast, so it gets that window as a head start. Rank 0 pre-enqueues
@@ -2382,7 +2573,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             s.rs_is_fold ? 0 : s.mask_indptr_count,
             /*has_slot_ids=*/s.use_slots,
             !s.rs_is_fold && s.has_write_desc,
-            s.compact_logits ? s.num_sampling : 0,
+            s.compact_logits ? s.num_logit_rows : 0,
             s.structured_window_left,
             s.rs_plan.mode,
             static_cast<int>(s.rs_fold_len_view.size()),
@@ -2465,6 +2656,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             cublas.stream()));
     }
     uploads_timer.stop();
+    if (dbg_fire) s.timing.enq_uploads_end = fire_timing::Clock::now();
     std::optional<EnqTimer> forward_timer;
     EnqTimer compose_timer(EnqProfile::kCompose);
     if (s.has_decode_envelopes) {
@@ -2529,7 +2721,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             s.rs_is_fold ? 0 : s.mask_indptr_count,
                             /*has_slot_ids=*/s.use_slots,
                             !s.rs_is_fold && s.has_write_desc,
-                            s.compact_logits ? s.num_sampling : 0,
+                            s.compact_logits ? s.num_logit_rows : 0,
                             s.structured_window_left,
                             s.rs_plan.mode,
                             static_cast<int>(s.rs_fold_len_view.size()),
@@ -2566,6 +2758,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     // Plan-once-per-frame: a step whose every plan input is content-
     // identical to the frame's previous step skips the hook — the
     // workspace already holds the identical plan.
+    if (dbg_fire) s.timing.enq_compose_end = fire_timing::Clock::now();
     if (!s.rs_is_fold && !s.skip_plan) {
         compose_timer.stop();
         EnqTimer plan_timer(EnqProfile::kAttnPlan);
@@ -2598,8 +2791,15 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             });
         engine.attn_ws.end_plan_update(cublas.stream());
         plan_timer.stop();
-        forward_timer.emplace(EnqProfile::kForward);
     }
+    // Outside the plan branch, so the two phases stay exclusive on EVERY step.
+    // Started inside it, a step that took the `skip_plan` fast path (a third of
+    // S's steps -- exactly the graph-replay ones this is meant to price) left
+    // `compose_timer` running across its forward enqueue and never opened
+    // `kForward`: the cheap steps were charged to compose and the mean over
+    // `kForward` described only the expensive ones.
+    compose_timer.stop();
+    forward_timer.emplace(EnqProfile::kForward);
     if (dbg_fire) s.timing.h2d_end = fire_timing::Clock::now();
 
     // ── Forward pass ────────────────────────────────────────────────
@@ -2670,6 +2870,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .forward_R = s.forward_R,
             .forward_N = s.forward_N,
             .num_sampling = s.num_sampling,
+            .num_logit_rows = s.compact_logits ? s.num_logit_rows : 0,
             .is_pure_decode = s.is_pure_decode,
             .have_custom_mask = s.have_custom_mask,
             .compact_logits = s.compact_logits,

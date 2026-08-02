@@ -35,6 +35,11 @@ struct BoundDecode {
     /// nothing rather than a model that fails.
     std::shared_ptr<void> weight_mapping;
 
+    /// The routed experts' paging cache, when a budget asked for one. Null
+    /// whenever the bank is resident -- which is every model that fits -- and
+    /// the one thing that tells the fire path whether a step has to be cut.
+    std::shared_ptr<ExpertSlab> slab;
+
     // load-once weights, keyed by HF tensor name (tied lm_head appears once).
     std::unordered_map<std::string, SlotHandle> weights;
 
@@ -193,7 +198,8 @@ BoundDecode stage_decode_storage(
     const pie_loader::LoadPlan& load_plan,
     const DecodeGeometry& g,
     const HeapPlan& heap_plan,
-    const std::function<bool(const std::string&)>& streams = {});
+    const std::function<bool(const std::string&)>& streams = {},
+    const ExpertSlabRequest& slab = {});
 
 // Walk beta's DAG; bind delta's weight/state/KV/IO slots for each dispatch by ordinal.
 void bind_decode_dag(RawMetalContext& ctx, const BoundDecode& b,

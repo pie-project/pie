@@ -153,6 +153,68 @@ bool ForwardFn::invoke_prefill_graph_capturable() const {
 // 6.1%, uniformly across phases that share no machinery, which tracks the 6.9%
 // shorter wall rather than any decode-side regression. Net on the cell is
 // -880 ms of prefill enqueue against +85 ms of decode.
+bool graph_key_check_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_GRAPH_KEY_CHECK");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+
+// `PIE_PREFILL_GRAPH_PLAN` -- graph-mode planning for the real prefill/mixed
+// batch, which is what makes a prefill-carrying wave capturable at all.
+//
+// **Default OFF, and the default is the measurement.** `PIE_PREFILL_GRAPH`
+// gates three separate things: this plan mode, the request/token padding in
+// `frame.cpp`, and the enlarged float workspace in `batch/workspace.cu`. Until
+// this knob existed they could only be moved together, which is how
+// `8775dda9` came to be credited with "prefill graph replay" -- a mechanism
+// that, measured by `PIE_GRAPH_STATS`, had never run: `prefill: hits=0
+// misses=0 ineligible=175`.
+//
+// Armed, the mechanism works (`prefill: hits=115 misses=62`, 4096/4096, zero
+// key-check violations) and it LOSES. Holding the workspace and the padding
+// fixed and toggling only this, on the S cell, 4 rounds ABBA:
+//
+//     plan on   31317  30720  31396  31695   mean 31282
+//     plan off  32140  32585  32246  32753   mean 32431   -3.54%, 4/4
+//
+// Prefill capture buys a ~1.3 ms eager enqueue back on a wave that replays,
+// but graph-mode planning always splits KV and carves float partials sized by
+// the PADDED work-item count, and on this cell that costs more than the
+// enqueue it saves. Off by default until a cell is found where it wins;
+// everything downstream of it stays built, tested and reachable behind
+// `PIE_PREFILL_GRAPH_PLAN=1`.
+bool prefill_graph_plan_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_PREFILL_GRAPH_PLAN");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+
+// `PIE_PREFILL_GRAPH_PAD` -- the request/token padding half of the lever, so
+// it can be priced against the workspace half. `PIE_PREFILL_GRAPH` moves both
+// plus the plan mode; `PIE_PREFILL_GRAPH_PLAN` already split the plan off, and
+// this splits the remaining two. Follows `prefill_graph_enabled()` unless
+// overridden, so default behaviour is unchanged.
+bool prefill_graph_pad_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_PREFILL_GRAPH_PAD");
+        if (env == nullptr || *env == '\0') return prefill_graph_enabled();
+        return env[0] != '0';
+    }();
+    return value;
+}
+
+bool graph_stats_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_GRAPH_STATS");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
+
 bool prefill_graph_enabled() {
     static const bool value = [] {
         const char* const env = std::getenv("PIE_PREFILL_GRAPH");
@@ -245,7 +307,19 @@ class CudaStreamOwner {
         bool active_ = true;
 };
 
-constexpr bool step_profile_enabled() { return false; }
+// `PIE_STEP_PROFILE=1` (any non-empty, non-"0" value). Frozen to
+// `constexpr false`, which compiled out the only instrument that says which
+// (R, N, variant) keys the forward graph cache CAPTURES rather than replays —
+// the question §28 answered by inference and §32 needs answered by count.
+// Same restoration `fire_timing::full()` got, for the same reason. Read once;
+// off by default, so the hot path pays one predicted branch.
+inline bool step_profile_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_STEP_PROFILE");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
+}
 
 constexpr std::uint64_t step_profile_limit() {
     return std::uint64_t{32};
@@ -460,6 +534,8 @@ static std::size_t skip_upfront_capture(const char* why) {
     return 0;
 }
 
+std::size_t capture_prefill_graph_lattice(BatchEngine& engine);
+
 std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
     if (engine.graph_cache == nullptr) return 0;
     if (!engine.forward_fn.graph_safe) {
@@ -564,7 +640,8 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             make_graph_variant(/*small_spec=*/false, /*rs_verify=*/false,
                                /*custom_mask=*/false,
                                /*fused_argmax=*/lattice_chunk > 0,
-                               graph_layout);
+                               graph_layout,
+                               /*compact_logits=*/false);
         const ForwardGraphKey key{R, N, graph_variant};
         if (engine.graph_cache->get(key) != nullptr) continue;
 
@@ -600,6 +677,288 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
                   << " (cache size=" << engine.graph_cache->size()
                   << ", graph_mem~" << (graph_bytes / (1024 * 1024))
                   << " MiB"
+                  << ", " << dt << " ms)\n";
+    }
+    captured += capture_prefill_graph_lattice(engine);
+    return captured;
+}
+
+// The same argument the decode lattice above is built on, for the OTHER axis.
+//
+// A wave carrying a prefill can replay — §44 measured that a graph captured
+// from one wave replays bit-identically against other distributions of the
+// same `(R, N)`, so the reuse is sound — but on the hot path each new key pays
+// a lazy capture, measured at **~10 ms, stream-synced**, exactly what this
+// file's own `skip_upfront_capture` comment warns about for decode. On a
+// 4096x64 @c256 cell that is 0.7-1.0 s of an 8.6 s run, and it is why
+// `PIE_PREFILL_GRAPH` measures negative despite the replay saving being real
+// and worth ~2.4%.
+//
+// A warm-up cannot absorb them: `(R, N)` depends on how many prefills happen
+// to land in a wave, which varies run to run, so the keys a warm-up touches
+// are not the keys the run asks for. The lattice has to be ENUMERATED.
+//
+// `PIE_PREFILL_GRAPH_LATTICE=1` (default OFF, and doubly gated on
+// `PIE_PREFILL_GRAPH` since the captures are useless without it). Off, this
+// function returns before touching anything.
+std::size_t capture_prefill_graph_lattice(BatchEngine& engine) {
+    static const bool enabled = [] {
+        const char* const env = std::getenv("PIE_PREFILL_GRAPH_LATTICE");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    if (!enabled || !prefill_graph_enabled()) return 0;
+    if (engine.graph_cache == nullptr || !engine.forward_fn.graph_safe) return 0;
+    if (engine.forward_fn.model == nullptr) return 0;
+    if (engine.tp_comm != nullptr) {
+        // Not under TP. `invoke_prefill_graph_capturable()` is a PER-RANK
+        // planner verdict (head counts are split by tp_size), so it can
+        // disagree across ranks for the same (R, N) — and the capture barrier
+        // is collective, so a rank that skips leaves its peers waiting in a
+        // barrier that never completes. Making the decision collective needs
+        // an all-reduce this path does not have, and the decode lattice avoids
+        // the question entirely by having no per-rank skip. Refusing is the
+        // honest option for a default-off feature.
+        if (engine.verbose && engine.tp_comm->rank() == 0) {
+            std::cerr << "[pie-driver-cuda] prefill graph lattice SKIPPED: "
+                         "not supported under tensor parallelism\n";
+        }
+        return 0;
+    }
+    // The budget is DERIVED, not chosen: fill the graph cache's free room and
+    // stop. The cache evicts an arbitrary bucket when it overruns, so anything
+    // past that destroys entries captured earlier in this same pass —
+    // including the decode lattice, which ran immediately before us and is the
+    // one thing whose absence costs a lazy capture per bucket inside the ramp.
+    // So the ceiling the cache already has IS the right budget, and there is
+    // no second number to invent. `PIE_PREFILL_GRAPH_LATTICE_MAX` can lower it
+    // (a deployment that would rather spend less load time than fill the
+    // cache); it cannot raise it past what the cache can hold.
+    const std::size_t held = engine.graph_cache->size();
+    const std::size_t room =
+        engine.graph_cache->capacity() > held
+            ? engine.graph_cache->capacity() - held
+            : 0;
+    static const int requested_budget = [] {
+        const char* const env = std::getenv("PIE_PREFILL_GRAPH_LATTICE_MAX");
+        if (env == nullptr || *env == '\0') return -1;  // no cap of its own
+        const long long parsed = std::atoll(env);
+        return parsed > 0 ? static_cast<int>(parsed) : -1;
+    }();
+    const int budget = requested_budget < 0
+        ? static_cast<int>(room)
+        : std::min<int>(requested_budget, static_cast<int>(room));
+    if (budget <= 0) {
+        if (engine.verbose &&
+            (engine.tp_comm == nullptr || engine.tp_comm->rank() == 0)) {
+            std::cerr << "[pie-driver-cuda] prefill graph lattice SKIPPED: the"
+                         " graph cache is full (" << held << " of "
+                      << engine.graph_cache->capacity()
+                      << " entries). Raise PIE_GRAPH_CACHE_ENTRIES.\n";
+        }
+        return 0;
+    }
+
+    const int max_requests =
+        std::min(engine.max_forward_requests, engine.max_workspace_tokens);
+    const int max_tokens = engine.max_workspace_tokens;
+    const int page = engine.kv_cache.page_size();
+    if (max_requests <= 0 || max_tokens <= 0 || page <= 0) return 0;
+    const auto r_buckets = forward_graph_request_lattice(max_requests);
+    if (r_buckets.empty()) return 0;
+    const int grain = forward_graph_token_grain();
+
+    auto& pi = engine.inputs;
+    const bool log_rank =
+        engine.verbose &&
+        (engine.tp_comm == nullptr || engine.tp_comm->rank() == 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::size_t captured = 0;
+    std::size_t skipped_geometry = 0;
+    // Every ITERATION counts against the budget, not only the ones that
+    // capture. A configuration whose planner declines these shapes increments
+    // nothing else, and the sweep would otherwise walk the whole R x N grid
+    // paying a full `invoke_prepare` and nine H2D copies per cell for zero
+    // graphs.
+    std::size_t attempts = 0;
+
+    // N-OFFSET MAJOR, not R major. The grid is 51 R buckets x up to 128 N
+    // buckets and the budget covers a fraction of it, so the ORDER decides
+    // what gets covered. Both R orderings were measured and both fail for the
+    // same reason: ascending spends the allowance on R = 1, 2, 4, 8 and
+    // descending spends it on R = 512, 496, 480 — and the fleet sits at
+    // neither end (it runs at whatever width admission gives it, ~256 here).
+    // Ascending left 72-97 lazy captures in the run, descending 47-49.
+    //
+    // Sweeping the OFFSET instead covers every R at N = R + 1 first, then
+    // every R one grain wider, and so on. Coverage is then uniform in the
+    // axis nothing can predict and expands in the axis that is bounded in
+    // practice — a wave's prefill tokens sit near its request count.
+    const int max_steps = max_tokens / std::max(grain, 1) + 1;
+    for (int step = 0; step < max_steps; ++step) {
+        if (static_cast<int>(attempts) >= budget) break;
+        for (int R : r_buckets) {
+            if (static_cast<int>(attempts) >= budget) break;
+            const int base =
+                forward_graph_token_bucket_at(R + 1, max_tokens, grain);
+            if (base <= 0) continue;
+            const int N = base + step * grain;
+            if (N <= R || N > max_tokens) continue;
+            // Past every cheap skip: this cell is going to do real work
+            // (a plan and nine uploads at least), so it costs a budget slot
+            // whether or not it ends in a capture.
+            ++attempts;
+            // One fat lane among decoders: the shape an arriving request makes
+            // when it joins a steady fleet. Any distribution with this (R, N)
+            // replays against this graph (§44), so the choice is
+            // representative rather than load-bearing.
+            const int head = N - (R - 1);
+            if (head < 1) continue;
+            std::vector<std::uint32_t> tokens(
+                static_cast<std::size_t>(N), 0u);
+            std::vector<std::uint32_t> positions(
+                static_cast<std::size_t>(N), 0u);
+            std::vector<std::uint32_t> qo(
+                static_cast<std::size_t>(R) + 1, 0u);
+            std::vector<std::uint32_t> kvpp(
+                static_cast<std::size_t>(R) + 1, 0u);
+            std::vector<std::uint32_t> kvlpl(
+                static_cast<std::size_t>(R), 1u);
+            std::vector<std::int32_t> sample_idx(
+                static_cast<std::size_t>(R), 0);
+            std::uint32_t token_cursor = 0;
+            std::uint32_t page_cursor = 0;
+            for (int r = 0; r < R; ++r) {
+                const int len = (r == 0) ? head : 1;
+                qo[static_cast<std::size_t>(r)] = token_cursor;
+                kvpp[static_cast<std::size_t>(r)] = page_cursor;
+                for (int t = 0; t < len; ++t) {
+                    positions[token_cursor + t] =
+                        static_cast<std::uint32_t>(t);
+                }
+                const int pages = (len + page - 1) / page;
+                kvlpl[static_cast<std::size_t>(r)] =
+                    static_cast<std::uint32_t>(len - (pages - 1) * page);
+                // The sampled row of a prefill lane is its LAST token.
+                sample_idx[static_cast<std::size_t>(r)] =
+                    static_cast<std::int32_t>(token_cursor + len - 1);
+                token_cursor += static_cast<std::uint32_t>(len);
+                page_cursor += static_cast<std::uint32_t>(pages);
+            }
+            qo[static_cast<std::size_t>(R)] = token_cursor;
+            kvpp[static_cast<std::size_t>(R)] = page_cursor;
+            if (static_cast<int>(token_cursor) != N) {
+                ++skipped_geometry;
+                continue;
+            }
+            std::vector<std::uint32_t> kvpi(
+                static_cast<std::size_t>(page_cursor), 0u);
+            std::vector<std::uint32_t> write_page(
+                static_cast<std::size_t>(N), 0u);
+            std::vector<std::uint32_t> write_offset(
+                static_cast<std::size_t>(N), 0u);
+            if (kvpi.size() > pi.kv_page_indices.size() ||
+                static_cast<std::size_t>(N) > pi.tokens.size() ||
+                static_cast<std::size_t>(R) + 1 > pi.qo_indptr.size() ||
+                static_cast<std::size_t>(R) > pi.sample_idx.size()) {
+                ++skipped_geometry;
+                continue;
+            }
+            engine.kv_cache.ensure_pages(1);
+
+            pi.tokens.copy_from_host(std::span<const std::uint32_t>(tokens));
+            pi.positions.copy_from_host(
+                std::span<const std::uint32_t>(positions));
+            pi.qo_indptr.copy_from_host(std::span<const std::uint32_t>(qo));
+            pi.kv_page_indices.copy_from_host(
+                std::span<const std::uint32_t>(kvpi));
+            pi.kv_page_indptr.copy_from_host(
+                std::span<const std::uint32_t>(kvpp));
+            pi.kv_last_page_lens.copy_from_host(
+                std::span<const std::uint32_t>(kvlpl));
+            pi.w_page.copy_from_host(
+                std::span<const std::uint32_t>(write_page));
+            pi.w_off.copy_from_host(
+                std::span<const std::uint32_t>(write_offset));
+            pi.sample_idx.copy_from_host(
+                std::span<const std::int32_t>(sample_idx));
+            CUDA_CHECK(cudaMemsetAsync(
+                pi.row_valid.data(), 1,
+                static_cast<std::size_t>(N), nullptr));
+
+            engine.forward_fn.invoke_prepare(
+                engine.attn_ws,
+                ForwardFn::PrepareInputs{
+                    .qo_indptr_h = qo.data(),
+                    .kv_page_indices_h = kvpi.data(),
+                    .kv_page_indices_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_page_indices.data()),
+                    .kv_page_indptr_h = kvpp.data(),
+                    .kv_page_indptr_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_page_indptr.data()),
+                    .kv_last_page_lens_h = kvlpl.data(),
+                    .kv_last_page_lens_d =
+                        reinterpret_cast<const std::uint32_t*>(
+                            pi.kv_last_page_lens.data()),
+                    .total_tokens = N,
+                    .num_requests = R,
+                    .is_pure_decode = false,
+                });
+            if (!engine.forward_fn.invoke_prefill_graph_capturable()) {
+                // The planner declined this shape (SM90 path, custom mask,
+                // whatever) — the hot path will decline it too, so there is
+                // nothing to pre-capture.
+                ++skipped_geometry;
+                continue;
+            }
+            // Same variant arithmetic the decode lattice uses; hardcoding
+            // `fused_argmax=false` keyed every entry to a variant the hot path
+            // never asks for once `PIE_LOGITS_CHUNK_TOKENS` is set.
+            const int lattice_chunk =
+                engine.tp_comm == nullptr &&
+                        engine.forward_fn.supports_fused_lm_head_argmax
+                    ? logits_argmax_chunk_tokens()
+                    : 0;
+            const std::uint32_t graph_variant = make_graph_variant(
+                /*small_spec=*/false, /*rs_verify=*/false,
+                /*custom_mask=*/false, /*fused_argmax=*/lattice_chunk > 0,
+                engine.forward_fn.invoke_graph_layout(),
+                // This pass always records the compact R-row gather below,
+                // padded to `R` so the baked count is derivable from the key.
+                /*compact_logits=*/true);
+            const ForwardGraphKey key{R, N, graph_variant};
+            if (engine.graph_cache->get(key) != nullptr) continue;
+
+            // No `tp_graph_capture_barrier` here: this function refuses to
+            // run under TP at all (see the early return), so the barrier would
+            // be a no-op that reads as if the TP case were handled.
+            cudaGraphExec_t exec = capture_forward_graph_exec(
+                engine, qo.data(), kvpi.data(), kvpp.data(), kvlpl.data(),
+                N, R, /*is_pure_decode=*/false,
+                /*have_custom_mask=*/false,
+                /*slot_ids_h=*/nullptr, /*is_fresh_h=*/nullptr,
+                /*slot_ids_d=*/nullptr,
+                // A prefill capture records the COMPACT row list; the
+                // eligibility gate pins its count to R.
+                pi.sample_idx.data(), R,
+                pi.w_page.data(), pi.w_off.data(),
+                /*has_write_desc=*/true,
+                /*runtime_window_left=*/-2,
+                lattice_chunk);
+            engine.graph_cache->put(key, exec);
+            ++captured;
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    if (log_rank) {
+        const auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::cerr << "[pie-driver-cuda] CUDA graph upfront capture: "
+                  << captured << " prefill graphs (grain=" << grain
+                  << ", budget=" << budget
+                  << ", geometry-skipped=" << skipped_geometry
+                  << ", cache size=" << engine.graph_cache->size()
                   << ", " << dt << " ms)\n";
     }
     return captured;
@@ -639,7 +998,8 @@ bool forward_graph_replay_eligible(
     int forward_R,
     int num_images,
     int num_clips,
-    bool has_stage_hooks) {
+    bool has_stage_hooks,
+    int num_logit_rows) {
     const bool mask_pointers_stable =
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
@@ -652,27 +1012,82 @@ bool forward_graph_replay_eligible(
     // Without the second clause one arriving request costs every decode lane in
     // the wave its replay: measured 7,290 us of host enqueue on a prefill-
     // carrying wave against 10 us on a pure-decode wave of the SAME width.
+    // `num_logit_rows` is BAKED INTO the captured body -- it sizes the logits
+    // gather and the lm_head rows -- but `ForwardGraphKey` carries only the
+    // (R, N) buckets. Replay is therefore safe only when the baked count is
+    // itself derivable from the key: either 0 (full-N emit, which is what
+    // every pure-decode capture gets, since `compact_logits` requires
+    // `!is_pure_decode`) or exactly `forward_R`, which `frame.cpp` arranges by
+    // padding the compact row list up to the request bucket.
+    //
+    // This is the invariant rather than a proxy for it on purpose: a wave whose
+    // row list could not be padded -- device-composed, over capacity, unpadded
+    // -- fails this test and runs eager, instead of replaying a body that
+    // gathers the wrong number of rows and leaves the surplus requests sampling
+    // the previous fire's residue.
+    const bool logit_rows_keyed =
+        num_logit_rows == 0 || num_logit_rows == forward_R;
+    const bool planner_capturable =
+        engine.forward_fn.invoke_prefill_graph_capturable();
     const bool geometry_replayable =
         is_pure_decode ||
         (prefill_graph_enabled() &&
-         engine.forward_fn.invoke_prefill_graph_capturable());
-    return engine.graph_cache != nullptr &&
-        engine.forward_fn.graph_safe &&
-        geometry_replayable &&
-        mask_pointers_stable &&
-        !rs_buffer_write &&
-        !rs_buffer_fold &&
-        structured_window_left == -2 &&
+         logit_rows_keyed &&
+         planner_capturable);
+
+    // Named terms, then a first-failure scan, so `PIE_GRAPH_STATS` can say
+    // WHICH clause refused a wave. A bare bool told us only that 175 of 175
+    // prefill-carrying waves were ineligible on the S cell, which is the same
+    // report whether the planner refused, the row list could not be padded, or
+    // the flag was simply off -- three findings with nothing in common.
+    // Order is the reporting order; a wave is attributed to its first
+    // failing clause.
+    const struct { const char* name; bool ok; } clauses[] = {
+        {"cache_absent",      engine.graph_cache != nullptr},
+        {"forward_not_safe",  engine.forward_fn.graph_safe},
+        {"flag_off",          is_pure_decode || prefill_graph_enabled()},
+        {"logit_rows",        is_pure_decode || logit_rows_keyed},
+        {"planner_refused",   is_pure_decode || planner_capturable},
+        {"mask_pointers",     mask_pointers_stable},
+        {"rs_buffer_write",   !rs_buffer_write},
+        {"rs_buffer_fold",    !rs_buffer_fold},
+        {"structured_window", structured_window_left == -2},
         // Pure-decode captures record the explicit w_page/w_off KV-write
         // path, so a decode fire without write descriptors must stay eager.
-        has_write_desc &&
-        graph_replay_has_no_host_resets(
-            use_slots,
-            is_fresh_h_data,
-            static_cast<std::size_t>(std::max(forward_R, 0))) &&
-        num_images == 0 &&
-        num_clips == 0 &&
-        !has_stage_hooks;
+        {"no_write_desc",     has_write_desc},
+        {"host_resets",       graph_replay_has_no_host_resets(
+                                  use_slots, is_fresh_h_data,
+                                  static_cast<std::size_t>(
+                                      std::max(forward_R, 0)))},
+        {"images",            num_images == 0},
+        {"clips",             num_clips == 0},
+        {"stage_hooks",       !has_stage_hooks},
+    };
+    for (const auto& clause : clauses) {
+        if (!clause.ok) {
+            if (engine.graph_cache != nullptr) {
+                engine.graph_cache->note_refusal(is_pure_decode, clause.name);
+            }
+            // The `logit_rows` clause is the one `frame.cpp` is supposed to
+            // satisfy by padding, so a refusal here means the padding did not
+            // fire. Print the pair it disagreed on, bounded, rather than
+            // leaving the count to be explained by reading the padding
+            // conditions and guessing which one was false.
+            if (!is_pure_decode && clause.name[0] == 'l' &&
+                graph_stats_enabled()) {
+                static std::atomic<int> shown{0};
+                if (shown.fetch_add(1) < 10) {
+                    std::fprintf(stderr,
+                                 "[graph-stats]   logit_rows refusal: "
+                                 "num_logit_rows=%d forward_R=%d\n",
+                                 num_logit_rows, forward_R);
+                }
+            }
+            return false;
+        }
+    }
+    static_cast<void>(geometry_replayable);
+    return true;
 }
 
 void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) {
@@ -696,7 +1111,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.forward_R,
         in.num_images,
         in.num_clips,
-        in.stage_hooks != nullptr);
+        in.stage_hooks != nullptr,
+        in.num_logit_rows);
     if (graph_eligible) {
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
@@ -706,13 +1122,35 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 /*rs_verify=*/false,
                 in.have_custom_mask,
                 /*fused_argmax=*/in.logits_argmax_chunk_tokens > 0,
-                graph_layout);
+                graph_layout,
+                /*compact_logits=*/in.num_logit_rows > 0);
         const ForwardGraphKey key{
             in.forward_R,
             in.forward_N,
             graph_variant,
         };
-        cudaGraphExec_t exec = engine.graph_cache->get(key);
+        // `PIE_GRAPH_KEY_CHECK=1`: the invariant this whole path rests on is
+        // that a key determines the baked `num_logit_rows`. Assert it directly
+        // rather than inferring it from output agreement -- a mismatch here
+        // produces occasional wrong tokens, which is indistinguishable from
+        // this engine's own run-to-run nondeterminism and is exactly how the
+        // first version of this shipped.
+        if (graph_key_check_enabled()) {
+            static std::mutex mu;
+            static std::unordered_map<ForwardGraphKey, int,
+                                      ForwardGraphKeyHash> seen;
+            std::lock_guard<std::mutex> lock(mu);
+            auto [it, fresh] = seen.emplace(key, in.num_logit_rows);
+            if (!fresh && it->second != in.num_logit_rows) {
+                std::fprintf(stderr,
+                             "[graph-key-check] VIOLATION R=%d N=%d var=%u "
+                             "baked=%d now=%d\n",
+                             key.num_requests, key.num_tokens, key.variant,
+                             it->second, in.num_logit_rows);
+            }
+        }
+        cudaGraphExec_t exec =
+            engine.graph_cache->get(key, in.is_pure_decode);
         if (exec == nullptr) {
             if (step_profile_enabled()) {
                 std::fprintf(stderr,
@@ -738,7 +1176,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 // capture records the compact row list instead — its count
                 // is pinned to R by the eligibility gate above.
                 in.compact_logits ? pi.sample_idx.data() : nullptr,
-                in.compact_logits ? in.num_sampling : 0,
+                in.num_logit_rows,
                 pi.w_page.data(),
                 pi.w_off.data(),
                 in.has_write_desc,
@@ -791,7 +1229,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.logit_row_indices_d =
         in.compact_logits ? pi.sample_idx.data() : nullptr;
     fwd_in.num_logit_rows =
-        in.compact_logits ? in.num_sampling : 0;
+        in.num_logit_rows;
     fwd_in.emit_logits         = in.num_sampling > 0;
     fwd_in.logits_argmax_chunk_tokens = in.logits_argmax_chunk_tokens;
     // Multimodal: image data for the encode+scatter (no-op if none).

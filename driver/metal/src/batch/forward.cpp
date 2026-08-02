@@ -17,6 +17,7 @@
 
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
+#include "expert_paging.hpp"
 #include "model/facts.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
@@ -532,6 +533,13 @@ struct MetalExecutor::Impl {
     ScratchSchedule mb_sched_{};
     std::vector<std::vector<Dispatch>> prefill_dags_{};
     ScratchSchedule prefill_sched_{};
+    /// Expert paging, one per encode path, because each walks a different DAG
+    /// and a cut is an index into the DAG it was derived from. Inactive --
+    /// `active()` false, `fire` never called -- unless a budget asked for a
+    /// slab, which is every model that fits.
+    batch::ExpertPaging paging_{};
+    batch::ExpertPaging mb_paging_{};
+    batch::ExpertPaging prefill_paging_{};
     bool mb_bound_ = false;
     // The token count `mb_dag_`'s width-dependent constants are currently bound
     // at. Seeded from the setup bind so a first fire at `max_tokens` rebinds
@@ -620,6 +628,7 @@ struct MetalExecutor::Impl {
         const pie_loader::LoadPlan& load_plan,
         std::size_t storage_page_size,
         bool stream_routed_experts,
+        std::uint64_t expert_slab_bytes,
         std::uint32_t max_ctx_tokens,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
@@ -1127,11 +1136,48 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     return true;
 }
 
+/// One cut per mixture layer, immediately after its router: the first point at
+/// which the chosen experts exist and the last before anything reads the bank.
+///
+/// Cuts are pushed out to the end of the router's concurrency run. A run is a
+/// set of dispatches the encoder deliberately does NOT barrier between, and
+/// splitting one across two command buffers would serialize exactly the
+/// dispatches that were grouped to overlap.
+///
+/// The ids buffer is resolved from the SCHEDULE rather than from a per-family
+/// side table: `build_scratch_schedule` already records, for every dispatch,
+/// which pool colour each bind index was given, and the router's `RouterIds`
+/// bind is the buffer its decision lands in. Reading it back here is what lets
+/// this family page without publishing an `expert_ids_by_layer` of its own.
+static std::vector<batch::ExpertPaging::Cut> qwen35_paging_cuts(
+    const std::vector<Dispatch>& dag,
+    const ScratchSchedule& sched,
+    const std::vector<SlotHandle>& pool) {
+    constexpr std::uint8_t kRouterIdsBind = 1;  // bi::RouterIds in batch/scratch.cpp
+    const std::vector<int> run_ends = concurrent_run_ends(dag);
+    std::vector<batch::ExpertPaging::Cut> cuts;
+    for (std::size_t i = 0; i < dag.size(); ++i) {
+        if (dag[i].kind != Kernel::GoRouterTopK) continue;
+        batch::ExpertPaging::Cut c;
+        c.end = std::size_t(run_ends[i]) + 1;
+        if (i < sched.per_dispatch.size()) {
+            for (const ScratchBind& sb : sched.per_dispatch[i].binds) {
+                if (sb.bind_index != kRouterIdsBind) continue;
+                if (sb.buffer_id < 0 || std::size_t(sb.buffer_id) >= pool.size()) continue;
+                c.ids = pool[std::size_t(sb.buffer_id)];
+            }
+        }
+        cuts.push_back(c);
+    }
+    return cuts;
+}
+
 bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                             const DecodeGeometry& geom,
                             const pie_loader::LoadPlan& load_plan,
                             std::size_t storage_page_size,
                             bool stream_routed_experts,
+                            std::uint64_t expert_slab_bytes,
                             std::uint32_t max_ctx_tokens,
                             std::string* err) {
     g_ = geom;
@@ -1206,24 +1252,32 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // WITHOUT them: a heap sized for weights that are then also mapped is the
     // footprint doubled rather than halved, which on a machine where the model
     // only just fits is the difference between running and reading zeros.
-    const auto streams = SimpleFamilyEngine::stream_predicate(stream_routed_experts);
+    //
+    // A BUDGET is the other arrangement, and the arithmetic mirrors
+    // `setup_simple` exactly: mapping goes off, the routed bank leaves the ask
+    // entirely because it is read from an mmap the GPU never sees, and the
+    // budget is added to the heap because the slots themselves are wired.
+    const bool slab = expert_slab_bytes > 0;
+    const auto streams =
+        SimpleFamilyEngine::stream_predicate(stream_routed_experts || slab, slab);
     // Not gated on `streams`; see `setup_simple`.
-    const size_t streamed = size_t(streamable_plan_bytes(load_plan, streams));
+    const size_t streamed = size_t(streamable_plan_bytes(load_plan, streams, slab));
     // Saturating; see `setup_simple` on why equality is the case that matters.
     const size_t resident_weights =
         plan_.weights_bytes >= streamed ? plan_.weights_bytes - streamed : 0;
     const size_t heap_bytes =
-        resident_weights + plan_.io_bytes + plan_.mb_io_bytes +
+        resident_weights + (slab ? size_t(expert_slab_bytes) : 0) +
+        plan_.io_bytes + plan_.mb_io_bytes +
         consts_budget + (32u << 20);
     const size_t elastic_budget =
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
-        plan_.kv_pool_bytes + (taps ? 0u : scratch_pool_bytes);
+        plan_.kv_pool_bytes + (taps || slab ? 0u : scratch_pool_bytes);
 
     // Heap plus mapping: see `setup_simple`. What leaves the heap does not
     // leave the working set.
     const ElasticBreakdown elastic_parts{
         plan_.kv_bytes, plan_.kv_pool_bytes, plan_.state_bytes,
-        plan_.scratch_bytes + (taps ? 0u : scratch_pool_bytes)};
+        plan_.scratch_bytes + (taps || slab ? 0u : scratch_pool_bytes)};
     // The same four numbers the refusal prints, printed on the path that
     // SUCCEEDS too. A knob whose effect is only visible when the model fails
     // to load is a knob nobody can tune.
@@ -1238,8 +1292,17 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // `resident_weights` is exactly what gets copied: the model minus whatever
     // is bound where it lies. Only a window of it is off the mapping at once --
     // see `fits_on_this_gpu`.
-    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err,
-                          &elastic_parts, resident_weights))
+    //
+    // Under a budget the mapped bank is neither allocated nor resident, so
+    // adding `streamed` back would refuse exactly the models a slab exists to
+    // run; and what has to be COPIED is the heap minus the budget, which is
+    // filled from the mapping a band at a time rather than in one window.
+    if (!fits_on_this_gpu(slab ? heap_bytes : heap_bytes + streamed, elastic_budget,
+                          slab ? heap_bytes : plan_.weights_bytes, err, &elastic_parts,
+                          slab ? (heap_bytes >= size_t(expert_slab_bytes)
+                                      ? heap_bytes - size_t(expert_slab_bytes)
+                                      : 0)
+                               : resident_weights))
         return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
@@ -1249,7 +1312,12 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_storage(*ctx_, std::move(view), load_plan, g_, plan_, streams);
+    ExpertSlabRequest slab_req;
+    if (slab && g_.is_moe() && g_.n_experts > 1) {
+        slab_req.n_experts = g_.n_experts;
+        slab_req.budget_bytes = expert_slab_bytes;
+    }
+    b_ = stage_decode_storage(*ctx_, std::move(view), load_plan, g_, plan_, streams, slab_req);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
@@ -1261,10 +1329,20 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // so an uncommitted slot is read as whatever the sparse mapping returns.
     // The GDN and KV allocations next door go through `alloc_zeroed`, which
     // always passes a commit size; this one was the exception.
+    //
+    // A slab takes the same standalone allocation `taps` does, and for a
+    // reason that is not diagnostic: paging reads the router's decision on the
+    // HOST between command buffers, and an elastic slot is a placement-sparse
+    // VA that publishes no CPU pointer -- `contents()` is null, which
+    // `ExpertPaging::plan` refuses by name. The pool is small beside the bank a
+    // budget just took off the device, so buying host-readability with it is
+    // the cheap half of the trade.
+    const bool pool_standalone = taps || slab;
     for (size_t i = 0; i < pool_.size(); ++i) {
-        pool_[i] = taps ? ctx_->create_standalone_buffer(plan_.scratch_slot_bytes)
-                        : ctx_->create_elastic_buffer(
-                              plan_.scratch_slot_bytes, plan_.scratch_slot_bytes);
+        pool_[i] = pool_standalone
+                       ? ctx_->create_standalone_buffer(plan_.scratch_slot_bytes)
+                       : ctx_->create_elastic_buffer(
+                             plan_.scratch_slot_bytes, plan_.scratch_slot_bytes);
         if (!pool_[i].valid()) {
             if (err) {
                 *err = "scratch slot " + std::to_string(i) + " (" +
@@ -1276,6 +1354,30 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         }
     }
     bind_scratch(*ctx_, dag_, sched_, pool_.data(), int(pool_.size()));
+
+    // ── Expert paging, when a budget asked for a slab. ──
+    //
+    // Planned per encode path, after the pool exists, because a cut names the
+    // pool slot the router's decision lands in. `max_rows` differs by path and
+    // is what the budget is checked against: every expert one fire can route to
+    // has to be resident AT ONCE, so the widest fire sets the floor.
+    if (b_.slab) {
+        const int mb_rows = std::max(1, g_.max_tokens);
+        if (!paging_.plan(b_.slab, qwen35_paging_cuts(dag_, sched_, pool_), dag_.size(),
+                          g_.n_experts, g_.experts_per_token, 1, "qwen3.5", err) ||
+            (!mb_dag_.empty() &&
+             !mb_paging_.plan(b_.slab, qwen35_paging_cuts(mb_dag_, mb_sched_, pool_),
+                              mb_dag_.size(), g_.n_experts, g_.experts_per_token, mb_rows,
+                              "qwen3.5 batched", err)) ||
+            (!prefill_dags_.empty() &&
+             !prefill_paging_.plan(
+                 b_.slab, qwen35_paging_cuts(prefill_dags_.front(), prefill_sched_, pool_),
+                 prefill_dags_.front().size(), g_.n_experts, g_.experts_per_token,
+                 int(prefill_dags_.size()), "qwen3.5 prefill", err))) {
+            ctx_.reset();
+            return false;
+        }
+    }
 
     // ── Geometry const-params. ──
     bind_decode_consts(*ctx_, dag_, g_, max_ctx_, gdn_prep_);
@@ -1812,7 +1914,14 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         if (!mb_bound_) {
             bind_scratch(*ctx_, mb_dag_, mb_sched_, pool_.data(), int(pool_.size()));
             bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_,
-                               std::max(1, g_.max_tokens));
+                               std::max(1, g_.max_tokens), /*row_pitch=*/0,
+                               // The arm, not the default. `mb_bound_tokens_`
+                               // is seeded on the next line with the width
+                               // bound here, so a first fire that arrives at
+                               // exactly `max_tokens` takes the memo below and
+                               // never rebinds -- and would then run the sort
+                               // padded while the projections dispatch unpadded.
+                               qwen35_routed_decode_batched());
             mb_bound_tokens_ = std::max(1, g_.max_tokens);
             prefill_scan_rows_.assign(prefill_dags_.size(), SlotHandle{});
             for (size_t t = 0; t < prefill_dags_.size(); ++t) {
@@ -2226,23 +2335,33 @@ StepTiming MetalExecutor::Impl::step(
         if (rs_bind >= 0) ctx_->arg_bind_ordinal(gd.ord, uint8_t(rs_bind), R, recur_off);
     }
 
-    StepTiming t = ctx_->run_step(
-        [&](StepEncoder& se) {
-            if (ptir != nullptr && ptir->pre_forward) {
-                ptir->pre_forward(se);
-            }
-            encode_decode_step(se, dag_, psos_, force_barriers_);
-            if (ptir != nullptr && ptir->post_forward) {
-                ptir->post_forward(se);
-            }
-            // The staging copy rides this buffer too, for the same reason it
-            // rides the batch paths': a second submission and a second fence
-            // per token is most of a decode's host cost, and the destination
-            // row is a bump allocation the caller made before the fire.
-            std::string stage_err;
-            if (!encode_logits_stage(se, &stage_err)) step_stage_error_ = stage_err;
-        },
-        sc & 1);
+    const auto walk = [&](StepEncoder& se, std::size_t begin, std::size_t end) {
+        if (begin == 0 && ptir != nullptr && ptir->pre_forward) {
+            ptir->pre_forward(se);
+        }
+        encode_decode_step(se, dag_, psos_, force_barriers_, nullptr, begin, end);
+        if (end < dag_.size()) return;
+        if (ptir != nullptr && ptir->post_forward) {
+            ptir->post_forward(se);
+        }
+        // The staging copy rides this buffer too, for the same reason it
+        // rides the batch paths': a second submission and a second fence
+        // per token is most of a decode's host cost, and the destination
+        // row is a bump allocation the caller made before the fire.
+        std::string stage_err;
+        if (!encode_logits_stage(se, &stage_err)) step_stage_error_ = stage_err;
+    };
+    // A paged step is several ordered command buffers with the host awake
+    // between them, so it cannot also be the A/B interleave's arm: that parity
+    // is a property of ONE submission. Paging is off on every model that fits,
+    // which is where the interleave is read.
+    StepTiming t = paging_.active()
+                       ? paging_.fire(*ctx_, 1,
+                                      [&](StepEncoder& se, std::size_t b, std::size_t e) {
+                                          walk(se, b, e);
+                                      })
+                       : ctx_->run_step(
+                             [&](StepEncoder& se) { walk(se, 0, dag_.size()); }, sc & 1);
     ++sc;
     return t;
 }
@@ -2479,18 +2598,27 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
                          mb_fp16_keep_);
         mb_fp16_tokens_ = schedule.N;
     }
-    const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
-        if (ptir != nullptr) {
+    const auto walk_mb = [&](StepEncoder& se, std::size_t begin, std::size_t end) {
+        if (begin == 0 && ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.pre_forward) callbacks.pre_forward(se);
         }
-        encode_decode_step_mb(se, fire_dag, psos_, mb_psos_, force_barriers_, &g_, schedule.N);
+        encode_decode_step_mb(se, fire_dag, psos_, mb_psos_, force_barriers_, &g_, schedule.N,
+                              begin, end);
+        if (end < fire_dag.size()) return;
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
         }
         if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
-    });
+    };
+    const StepTiming timing =
+        mb_paging_.active()
+            ? mb_paging_.fire(*ctx_, schedule.N,
+                              [&](StepEncoder& se, std::size_t b, std::size_t e) {
+                                  walk_mb(se, b, e);
+                              })
+            : ctx_->run_step([&](StepEncoder& se) { walk_mb(se, 0, fire_dag.size()); });
     if (!timing.succeeded())
         return fail(step_failure_reason(timing));
     if (stage_failed) return fail(stage_err);
@@ -2555,6 +2683,27 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
                          pre_fb[lanes] / (n[0][lanes] + n[1][lanes]),
                          pre_fn[lanes] / (n[0][lanes] + n[1][lanes]));
         }
+    }
+
+    // The mixture's wrong-answer bug lives in the DECODE, and until now only
+    // the prefill dumped. Dumping the FIRST decode fire is what makes an A/B
+    // possible at all: the prefill is identical whatever the routed decode arm
+    // is, so at step 0 both arms enter with the same KV, the same recurrent
+    // state and the same token, and any difference in a layer's values is the
+    // arm. By the last step they have diverged for pages and a diff says only
+    // that they diverged. Pair it with `PIE_METAL_TAPS_LAYER` -- this
+    // checkpoint's no-recycle pool does not fit, and without pinning a layer
+    // the recycling leaves only the final one readable.
+    static bool mb_taps_dumped = false;
+    if (golden_taps_enabled() && !mb_taps_dumped) {
+        mb_taps_dumped = true;
+        dump_golden_taps(fire_dag, mb_sched_, pool_.data(), int(pool_.size()), g_, schedule.N,
+                         /*row_stride_bytes=*/0, "dec.",
+                         moe_sorted_rows(g_, schedule.N,
+                                         qwen35_routed_decode_batched()),
+                         moe_sorted_rows(g_, schedule.N, qwen35_routed_decode_batched()) /
+                             std::max(1, moe_tile_rows_for(g_, schedule.N,
+                                                           qwen35_routed_decode_batched())));
     }
 
     for (uint32_t slot : schedule.slot_of_token) ++step_count_for(slot);
@@ -2649,21 +2798,48 @@ bool MetalExecutor::Impl::run_prefill_step(
                           scratch_widest_elems(g_));
     }
     bool stage_failed = false;
-    const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
-        if (ptir != nullptr) {
+    const std::size_t prefill_len =
+        prefill_dags_.empty() ? 0 : prefill_dags_.front().size();
+    const auto walk_prefill = [&](StepEncoder& se, std::size_t begin, std::size_t end) {
+        if (begin == 0 && ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.pre_forward) callbacks.pre_forward(se);
         }
         encode_prefill_dags_mb(se, prefill_dags_, schedule.N, psos_, mb_psos_,
                                force_barriers_, in.row_needs_logits, &g_,
                                int(prefill_dags_.size()), gdn_scans,
-                               g_.has_alt_quant() ? &mb_alt_psos_ : nullptr);
+                               g_.has_alt_quant() ? &mb_alt_psos_ : nullptr, begin, end);
+        if (end < prefill_len) return;
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
         }
         if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
-    });
+    };
+    // The stride follows the routing's own shape, and only one of the two is
+    // ever right. Grouped, one dispatch writes every token's ids into dag[0]'s
+    // binding packed `experts_per_token` apart, so the rows are contiguous;
+    // ungrouped, each token routes off its own binding a scratch row away. The
+    // router advances `expert_ids` by `row * k` and never by the row pitch --
+    // the pitch is for the logits it reads -- so the packed case is the one a
+    // stride of zero already describes. Reading the wrong one renumbers row 0
+    // and leaves the rest holding true expert ids that index slots: fluent
+    // wrong text rather than an error.
+    const int grouped =
+        prefill_paging_.active()
+            ? prefill_routed_group(g_, schedule.N, int(prefill_dags_.size()))
+            : 0;
+    const std::size_t prefill_ids_stride =
+        grouped > 0 ? 0u : std::size_t(scratch_widest_elems(g_)) * 2u;
+    const StepTiming timing =
+        prefill_paging_.active()
+            ? prefill_paging_.fire(*ctx_, schedule.N,
+                                   [&](StepEncoder& se, std::size_t b, std::size_t e) {
+                                       walk_prefill(se, b, e);
+                                   },
+                                   prefill_ids_stride)
+            : ctx_->run_step(
+                  [&](StepEncoder& se) { walk_prefill(se, 0, prefill_len); });
     if (!timing.succeeded())
         return fail(step_failure_reason(timing));
     if (stage_failed) return fail(stage_err);
@@ -2897,6 +3073,19 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // shape" before it ever reached `setup_simple`, which builds its own
     // geometry from its own facts.
     if (family == model::ModelFamily::Qwen35) {
+        // `expert_slab_bytes` is read here rather than in `setup_simple`,
+        // because this family builds its own engine and does not go through
+        // it. It was UNREAD for a while, which is worse than unsupported: the
+        // ask stayed the whole bank and the fit check refused with "this model
+        // does not fit this GPU", silent about the knob the operator had set
+        // to make it fit. Now the sizing above subtracts the bank and adds the
+        // budget, and `plan_expert_paging` below cuts the step.
+        //
+        // Nothing about the family ever prevented this. Its routed FFN is
+        // built from the same shared kernels the llama family pages -- and
+        // renumbering needs no kernel change anywhere, because a routed matvec
+        // does `base += expert_ids[sel] * stride` and a slot number in a
+        // shorter stack is the same instruction against different bytes.
         std::string gerr;
         if (cfg.quant_bits != 0) geom.quant.bits = cfg.quant_bits;
         if (cfg.quant_group_size != 0) geom.quant.group = cfg.quant_group_size;
@@ -3028,6 +3217,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             load_plan,
             cfg.storage_page_size,
             cfg.stream_routed_experts,
+            cfg.expert_slab_bytes,
             cfg.max_ctx_tokens,
             &derr)) {
         if (err != nullptr) *err = "Metal forward setup failed: " + derr;

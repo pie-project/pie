@@ -141,6 +141,19 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     // The sort's own contract, and it has to match the dispatch that reads it.
     const int sorted = moe_sorted_rows(g, rows, routed_batched);
     const int tile = moe_tile_rows_for(g, rows, routed_batched);
+    // What the sort was ACTUALLY told, against what the projections were
+    // actually dispatched at. Kept rather than deleted for the same reason
+    // `PIE_METAL_PAGING_TRACE` is: the one open wrong-answer bug on this family
+    // is a disagreement between these two numbers, the failure mode is a
+    // fluent wrong answer rather than a fault, and every attempt to find it by
+    // reading has been wrong. See `moe_trace` in decode_step_mb.cpp.
+    if (moe_trace_enabled()) {
+        std::fprintf(stderr,
+                     "[moe] bind  n=%d pairs=%d E=%d k=%d batched=%d tile=%d sorted=%d"
+                     " row_pitch=%d\n",
+                     rows, pairs, g.n_experts, g.experts_per_token, int(routed_batched), tile,
+                     sorted, row_pitch);
+    }
 
     for (const auto& d : dag) {
         const int ord = d.ordinal;
@@ -178,11 +191,11 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
 int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                        const DecodeGeometry& g, int max_ctx, bool gdn_prep, int n_tokens,
-                       int row_pitch) {
+                       int row_pitch, bool routed_batched) {
     // The width-dependent ones first, so a DAG is never left half-bound: this
     // function is the complete binding, and the fire path's rebind is a subset
     // of it rather than a second, separate contract.
-    int count = bind_token_consts(ctx, dag, g, n_tokens, row_pitch);
+    int count = bind_token_consts(ctx, dag, g, n_tokens, row_pitch, routed_batched);
 
     // rope: x[h*head_dim + i], rotary half from grid.x. scale=1.0 (qwen3.6 default mrope),
     // base = log2(theta).
@@ -408,6 +421,37 @@ int bind_mb_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     int bound = 0;
     for (const Dispatch& d : dag) {
         if (d.qmm_bn <= 0) continue;
+        // NOT the routed projections, whatever their `qmm_bn` says.
+        //
+        // On a dense dispatch buffer 12 is where `affine_qmm_t_fp16_precast`
+        // reads the staged half activations. On a ROUTED one it is
+        // `GoQmv::TileExpert` -- the per-tile expert index `moe_route_sort`
+        // wrote and `affine_qmm_t_routed` reads to pick its weight slice. One
+        // argument table ordinal serves both pipelines, so binding this here
+        // handed the routed GEMM a buffer of half-precision activations and
+        // asked it to read them as `int`.
+        //
+        // That is the whole of the qwen3.5 routed-decode wrong answer:
+        //
+        //   * a garbage expert per tile, so every touched expert read some
+        //     other expert's weights -- fluent, plausible, wrong;
+        //   * and where the reinterpreted half happened to be negative, the
+        //     kernel's `if (e < 0) return;` left the tile UNWRITTEN, which is
+        //     why a dump of `gp` showed whole tiles of exact zero next to
+        //     tiles of wrong numbers.
+        //
+        // Everything upstream stayed correct, which is what made it so hard to
+        // see: the sort's own `tile_expert` buffer still held the right eight
+        // experts, and a tap of it read them back. The gate simply was not
+        // pointed at it any more. The routed MATVEC reads its expert from
+        // buffer 8 instead, which is why the same fire was right the moment
+        // the batched arm was off -- and the PREFILL never had the bind at all,
+        // because `routed_group_shape` computes its shape at encode time and
+        // leaves `Dispatch::qmm_bn` at zero.
+        //
+        // Neither routed kernel wants staging anyway: `affine_qmm_t_routed_fp16`
+        // stages both tiles itself from the bf16 `x` at buffer 3.
+        if (is_routed(d.kind)) continue;
         const int K = int(qmv_kn(d.kind, g).K);
         if (K <= 0) continue;
         const std::int32_t elems = std::int32_t(rows) * std::int32_t(K);

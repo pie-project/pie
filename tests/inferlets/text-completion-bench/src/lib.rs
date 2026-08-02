@@ -319,13 +319,37 @@ macro_rules! define_run_one {
             // fires ride the queue immediately behind the prefill — the host drain
             // runs in parallel off the critical path.
             let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
-            let toks_p = Channel::from(prompt_i32).named("toks_p");
-            let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
-            let positions_p = Channel::from_iter(0..n).named("positions_p");
+
+            // Prefill is chunked against the driver's per-launch token capacity
+            // `max_embed_length()` (C). A single pass over the whole prompt is
+            // rejected outright once L > C —
+            //     "forward request has 1047 forward tokens, exceeding driver limit 1024"
+            // — and C is derived from the memory plan, so on a model whose weights
+            // leave a small workspace (Qwen3.6-35B-A3B: 71.9 GB on an 80 GB card)
+            // C stays at 1024 and no `--gpu-mem-util` / `--memory-profile` setting
+            // raises it. Chunking is guest-side by design (see model.wit
+            // `max-embed-length`), and `prefill_chunks` is the same SDK splitter
+            // naive-baseline and the trackb/quest/tova inferlets use, so chunk
+            // boundaries match theirs.
+            //
+            // Only the LAST chunk carries the sampling epilogue that seeds the
+            // decode's loop-carried `tok_in`; earlier chunks just extend the KV
+            // and are submitted straight to the pipeline. When the prompt fits in
+            // one chunk the loop body runs zero times and the pass built below is
+            // byte-for-byte what this inferlet built before.
+            let spans = prefill_chunks(n, None);
+            let (last_base, last_end) = *spans.last().expect("prefill_chunks is non-empty");
+
+            let toks_p = Channel::from(&prompt_i32[last_base as usize..last_end as usize])
+                .named("toks_p");
+            let embed_indptr_p = Channel::from([0u32, last_end - last_base]).named("embed_indptr_p");
+            let positions_p = Channel::from_iter(last_base..last_end).named("positions_p");
             let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
             let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-            let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
-            let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
+            let w_slot_p =
+                Channel::from_iter((last_base..last_end).map(|p| p / page_size)).named("w_slot_p");
+            let w_off_p =
+                Channel::from_iter((last_base..last_end).map(|p| p % page_size)).named("w_off_p");
             // Decode fires: the prefill sample already spends one of the
             // `max_tokens` sampler activations.
             let budget = input.max_tokens - 1;
@@ -398,6 +422,70 @@ macro_rules! define_run_one {
             } else {
                 Vec::new()
             };
+
+            // One pipeline for the whole prefill+decode program, created here so
+            // the leading prefill chunks (below) and the first frame share it and
+            // stay ordered.
+            let pipe = Pipeline::new();
+
+            // Leading prefill chunks: everything except the last span. They only
+            // need to extend the KV, but a pass with no epilogue is rejected at
+            // registration (`pie_cuda_register_program failed with status -1`), so
+            // each one samples into a throwaway channel that is drained right
+            // after — the same shape naive-baseline / quest / tova use. Only the
+            // last span's token continues the prompt; these are discarded. The
+            // loop body runs zero times whenever the prompt fits in one chunk.
+            for &(base, end) in &spans[..spans.len() - 1] {
+                let toks_c =
+                    Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
+                let embed_indptr_c = Channel::from([0u32, end - base]).named("embed_indptr_p");
+                let positions_c = Channel::from_iter(base..end).named("positions_p");
+                let pages_c = Channel::from_iter(0..max_pages).named("pages_p");
+                let page_indptr_c =
+                    Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
+                let w_slot_c =
+                    Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
+                let w_off_c =
+                    Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
+                let kv_len_c = Channel::from([end]).named("kv_len_p");
+                let fwd_c = ForwardPass::new();
+                fwd_c.embed(&toks_c, &embed_indptr_c)?;
+                fwd_c
+                    .bind_state(
+                        &ws,
+                        KvGeometry {
+                            readable_pages: ..,
+                            writable_pages: ..,
+                            kv_len: &kv_len_c,
+                            pages: &pages_c,
+                            page_indptr: &page_indptr_c,
+                            w_slot: &w_slot_c,
+                            w_off: &w_off_c,
+                            positions: &positions_c,
+                            mask: None,
+                        },
+                        &rs_ws,
+                    )
+                    .with_context(|| format!("bind prefill chunk @{base}"))?;
+                let drop_tok_c = Channel::new([1], dtype::i32).named("drop_tok_c");
+                let drop_sink = drop_tok_c.clone();
+                fwd_c.epilogue(move || {
+                    let t = reshape(
+                        sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
+                        [1],
+                    );
+                    drop_sink.put(&t);
+                });
+                fwd_c
+                    .submit(&pipe)
+                    .with_context(|| format!("prefill chunk submit @{base}"))?;
+                // Must be drained: an epilogue put that is never taken fills the
+                // channel and stalls the lane.
+                drop_tok_c
+                    .take_host::<i32>()
+                    .await
+                    .with_context(|| format!("drain prefill chunk @{base}"))?;
+            }
 
             let fwd_p = ForwardPass::new();
             fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -481,7 +569,8 @@ macro_rules! define_run_one {
                 None
             };
 
-            let pipe = Pipeline::new();
+            // (`pipe` was created before the leading prefill chunks so they and
+            // this frame share one pipeline and stay ordered.)
 
             // First frame: the prefill chunk in slot 0, then up to live_slots-1
             // decode slots. At live_slots = 1 this is a bare prefill submit
@@ -577,6 +666,25 @@ macro_rules! define_run_one {
                 }
             }
 
+            // Leaving the wait-set is an END-OF-STREAM statement, not a
+            // teardown step: from the moment this lane will not submit again,
+            // every other lane in the fleet is holding its frame seal for a
+            // guest that has nothing left to contribute. The engine cannot
+            // infer this -- an empty queue looks identical between a guest
+            // that is finished and one that is mid-decode -- so the guest,
+            // which does know, has to say it. Closing here rather than after
+            // the drain is what makes that statement on time; the remaining
+            // takes below are unaffected (close never waits for an unsettled
+            // fire). `closed` is not redundant with the engine's `first_close`
+            // latch -- that latch only suppresses the wait-set notify, while
+            // each `close()` still crosses into the host and drains settled
+            // entries -- so the trailing call stays correct but is worth
+            // skipping.
+            let mut closed = false;
+            if submitted >= budget {
+                pipe.close();
+                closed = true;
+            }
             let mut taken = 0usize;
             while taken < submitted {
                 let t = out.take_host::<Vec<i32>>().await?;
@@ -589,6 +697,10 @@ macro_rules! define_run_one {
                 }
                 if stop_tokens.contains(&(t0 as u32)) {
                     stopped = true;
+                    if !closed {
+                        pipe.close();
+                        closed = true;
+                    }
                     continue;
                 }
                 emitted += 1;
@@ -611,8 +723,14 @@ macro_rules! define_run_one {
                 // Refill the window after draining an accepted token. A stopped lane
                 // `continue`s above and never reaches here, so it never submits more.
                 submitted = submit_ahead(submitted, taken)?;
+                if !closed && submitted >= budget {
+                    pipe.close();
+                    closed = true;
+                }
             }
-            pipe.close();
+            if !closed {
+                pipe.close();
+            }
 
             Ok(RunResult {
                 num_prompt_tokens,

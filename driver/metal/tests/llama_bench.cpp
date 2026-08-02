@@ -407,10 +407,25 @@ int main(int argc, char** argv) {
     // the entire capability, stated as the one thing that distinguishes it from
     // every earlier arrangement. Nothing on this machine is bigger than its
     // working set, so this stands in for the case that cannot be run directly.
+    //
+    // NOT WHEN A TAP DUMP WAS ASKED FOR, and for the same reason the fleet
+    // exception further down exists: the probes below are FOUR full setups of
+    // the checkpoint, and on the model whose bug needs dumping they leave the
+    // machine without the memory the dump itself needs. Qwen3.6-35B-A3B under a
+    // slab admits at 5.335 GiB, but `PIE_METAL_GOLDEN_DIR` turns off pool
+    // recycling -- 0.184 GiB of scratch becomes 2.616 -- and after these probes
+    // have paged 18 GiB through the page cache twice the real setup measures
+    // 2.801 GiB reclaimable and refuses. The harness would assert its admission
+    // arithmetic and then be unable to run the one thing the operator asked
+    // for. These gates are not what a dump is testing, and every run that is
+    // not a dump still performs them.
     const std::uint64_t weight_bytes = checkpoint_weight_bytes(cfg.snapshot_dir);
     const bool paging = cfg.expert_slab_bytes > 0;
+    const bool taps_wanted = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
     for (const std::uint64_t hold :
-         {std::uint64_t(256u << 20), weight_bytes / 2}) {
+         taps_wanted ? std::initializer_list<std::uint64_t>{}
+                     : std::initializer_list<std::uint64_t>{
+         std::uint64_t(256u << 20), weight_bytes / 2}) {
         if (hold == 0) continue;
         if (paging && hold == weight_bytes / 2) {
             RawMetalContext::set_device_working_set_bytes_for_test(std::size_t(hold));
@@ -467,24 +482,58 @@ int main(int argc, char** argv) {
     // peak footprint, with zero swaps, because `copy_storage_bytes` hands each
     // tile back to the kernel before it takes the next. Gating the discredited
     // number here is how it survived being wrong.
-    {
-        const std::size_t left = std::size_t(weight_bytes);
+    //
+    // With a slab budget this probe inverts for the same reason the device one
+    // does, and leaving it uninverted is how the paged path went unmeasured.
+    // A budget means the routed bank is never wired -- 10.17 GB of gpt-oss
+    // reaches the GPU through 0.42 GB of slots -- so a host holding the whole
+    // checkpoint is not the squeeze this asserts, and the refusal it demanded
+    // could not come. The bench exited here, BEFORE the continuation gates,
+    // which is why "the model can exceed the machine" was a claim about
+    // admission alone: nothing downstream of setup had ever run under a budget.
+    // So the host term is halved and the expectation flipped, which asks the
+    // stronger question -- not whether paging survives a full machine, but
+    // whether it still loads one that has room for only half the weights.
+    //
+    // Plus the flat reserve the admission keeps for the load itself, and that
+    // term is not slack: without it this gate is decided by the slab budget the
+    // operator happened to pass. gpt-oss at 1024 MB of slots asks for 3.260 GiB
+    // against 5.205 GiB of half-weights and is refused, because 3.260 + 2 GiB
+    // is 55 MiB over -- while the same model at 512 MB passes. A gate that
+    // flips on a knob unrelated to what it asserts reports the knob. The
+    // reserve is about the machine and not the checkpoint, so squeezing it is
+    // not the question here; the weights are.
+    if (!taps_wanted) {
+        constexpr std::size_t kAdmissionReserve = 2ull << 30;  // forward.cpp kHostMargin
+        const std::size_t left =
+            std::size_t(paging ? weight_bytes / 2 + kAdmissionReserve : weight_bytes);
         RawMetalContext::set_host_reclaimable_bytes_for_test(left);
         MetalExecutor probe;
         std::string why;
         const bool set_up = probe.setup(cfg, &why);
         RawMetalContext::set_host_reclaimable_bytes_for_test(0);
-        if (set_up) {
-            std::printf("  FAIL  setup succeeded on a machine with only %.2f GiB left, "
-                        "against %.2f GiB of weights it has to wire\n",
+        if (paging) {
+            if (!set_up) {
+                std::printf("  FAIL  paging refused a host that should hold it: %s\n",
+                            why.c_str());
+                return 1;
+            }
+            std::printf("  PASS  paged the experts onto a machine with %.2f GiB left,"
+                        " against %.2f GiB of weights\n",
                         double(left) / (1 << 30), double(weight_bytes) / (1 << 30));
-            return 1;
+        } else {
+            if (set_up) {
+                std::printf("  FAIL  setup succeeded on a machine with only %.2f GiB left, "
+                            "against %.2f GiB of weights it has to wire\n",
+                            double(left) / (1 << 30), double(weight_bytes) / (1 << 30));
+                return 1;
+            }
+            if (why.find("does not fit the memory this machine has left") == std::string::npos) {
+                std::printf("  FAIL  refused, but not for the host: %s\n", why.c_str());
+                return 1;
+            }
+            std::printf("  PASS  refused a model the machine could not hold: %s\n", why.c_str());
         }
-        if (why.find("does not fit the memory this machine has left") == std::string::npos) {
-            std::printf("  FAIL  refused, but not for the host: %s\n", why.c_str());
-            return 1;
-        }
-        std::printf("  PASS  refused a model the machine could not hold: %s\n", why.c_str());
     }
 
     MetalExecutor exec;

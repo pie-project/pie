@@ -267,9 +267,12 @@ void encode_decode_step(StepEncoder& se,
                         const std::vector<Dispatch>& dag,
                         const DecodeStepPsos& psos,
                         bool force_barriers,
-                        const StepTimingHook* timing) {
+                        const StepTimingHook* timing,
+                        std::size_t begin,
+                        std::size_t end) {
     const std::vector<int> run_ends = concurrent_run_ends(dag);
-    for (size_t i = 0; i < dag.size(); ++i) {
+    const std::size_t stop = std::min(end, dag.size());
+    for (size_t i = begin; i < stop; ++i) {
         const Dispatch& d = dag[i];
         // Priced by ablation; see `kernel_ablated`. The M=1 walk needs it as
         // much as the batched ones: a batch-one decode is the latency number,
@@ -281,7 +284,12 @@ void encode_decode_step(StepEncoder& se,
         se.dispatch(d.grid, d.tg);
         if (force_barriers || barrier_after(dag, i, run_ends)) se.barrier();
     }
-    if (timing && timing->mark) timing->mark(static_cast<int>(dag.size()));  // final boundary
+    // Only the segment that ends the step closes the attribution, so a paged
+    // walk marks the same boundaries a whole one does rather than one per
+    // command buffer.
+    if (stop == dag.size() && timing && timing->mark) {
+        timing->mark(static_cast<int>(dag.size()));  // final boundary
+    }
 }
 
 }  // namespace pie::metal

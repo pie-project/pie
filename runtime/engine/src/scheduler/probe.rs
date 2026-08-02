@@ -148,6 +148,93 @@ pub struct QuorumProbes {
     pub wave_active_sum: AtomicU64,
     pub wave_missing_sum: AtomicU64,
     pub wave_fires: AtomicU64,
+
+    /// CHAIN ENGAGEMENT, restored (the campaign's `seal_exec`). `seal_events`
+    /// counts sealed partitions; `seal_while_executing` counts the subset
+    /// sealed while a frame was still on the device. Their ratio is the one
+    /// number that says whether the fleet is PIPELINED: at 1.0 the next
+    /// boundary is assembled behind the current launch and the host chain is
+    /// hidden, at 0.0 every boundary is gathered from a standing start with
+    /// the device idle. §10.22 built its whole per-decile account on this and
+    /// the counter was deleted afterwards, which is why every section since
+    /// has had to reason about chaining without being able to see it.
+    pub seal_events: AtomicU64,
+    pub seal_while_executing: AtomicU64,
+
+    /// Times `plan_dispatch` held the ENTIRE sealed queue because the front
+    /// frame had a member with a queued pre-launch copy. The queue is FIFO
+    /// and only its front is examined, so one arriving lane's copy barrier
+    /// stalls every frame behind it. Pure decode generates almost no
+    /// pre-launch copies, so this counter is expected to be ~0 without
+    /// turnover — which is exactly what makes it a discriminator.
+    pub dispatch_blocked_holds: AtomicU64,
+
+    /// DEVICE STARVATION, measured where it happens: when a frame is posted
+    /// and nothing was executing, the device sat idle from the previous
+    /// frame's retirement until now. `device_idle_us` sums those gaps and
+    /// `device_idle_gaps` counts them.
+    ///
+    /// This is the quantity §3.3 identified as the whole recoverable prize
+    /// (8.03 s of 38.2 s contended against 0.42 s of 28.1 s uncontended) and
+    /// it has had no instrument since. Chain engagement does NOT substitute
+    /// for it: a seal that lands while the device is busy counts as chained
+    /// whether it beat the retirement by 30 ms or by 30 us, so engagement can
+    /// read ~97% while the pipeline is in fact running on empty.
+    pub device_idle_us: AtomicU64,
+    pub device_idle_gaps: AtomicU64,
+
+    /// Passes that left the dispatch loop WITHOUT consulting the frame
+    /// policy at all, while the device was idle. Two `break`s sit in front of
+    /// `plan_dispatch`: an in-flight control op that holds launches, and the
+    /// run-ahead depth cap. The first can starve the device while every lane
+    /// has a complete frame, and no gate counter can see it because the gate
+    /// never runs.
+    pub idle_break_control: AtomicU64,
+    pub idle_break_depth: AtomicU64,
+
+    /// Microseconds the scheduler thread spent PARKED with the device idle,
+    /// split by whether an in-flight control op was holding launches at the
+    /// moment it parked. A `Posted` control slot arms no completion nudge, so
+    /// that park can only end on the 250 ms backstop — which is exactly the
+    /// length of the stalls that decide the turnover cell's mode.
+    pub idle_park_control_us: AtomicU64,
+    pub idle_park_other_us: AtomicU64,
+
+    /// The scheduler thread's own SERIAL cost of ingesting arrivals:
+    /// microseconds inside `on_fire_enqueued` and the number of calls. A
+    /// boundary at 256-wide ingests ~256 of these on ONE thread, so if the
+    /// per-call cost is microseconds the gate cannot open until milliseconds
+    /// after the last guest actually submitted -- and the tail would be the
+    /// scheduler, not the guests.
+    pub accept_us: AtomicU64,
+    pub accept_calls: AtomicU64,
+
+    /// Guest turnaround, sampled for every lane at every seal: the span from
+    /// the retirement that handed it a result to the moment its next frame
+    /// read complete. The boundary period is the MAX of these across the
+    /// fleet, so `turnaround_max / (turnaround_sum / turnaround_n)` says
+    /// whether the fleet is uniformly slow (a serial host cost everyone pays)
+    /// or fast with a tail (a few lanes late, which is what the device-idle
+    /// census sees).
+    pub turnaround_sum_us: AtomicU64,
+    pub turnaround_max_us: AtomicU64,
+    pub turnaround_n: AtomicU64,
+
+    /// The driver lane is ONE thread running every driver call in FIFO order,
+    /// and it already prefers launches (`next_request` tries `launch_rx`
+    /// first). What it cannot do is preempt: once a control op starts, a
+    /// launch that arrives waits it out. These split the lane's own busy time
+    /// so "should control leave the launch lane?" is a measured question.
+    pub lane_launch_us: AtomicU64,
+    pub lane_launch_n: AtomicU64,
+    /// The same, for waves that carry a prefill. `lane_prefill_us /
+    /// lane_prefill_n` against `lane_launch_us / lane_launch_n` is the cost
+    /// of an arrival to the one thread that posts every frame.
+    pub lane_prefill_us: AtomicU64,
+    pub lane_prefill_n: AtomicU64,
+    pub lane_control_us: AtomicU64,
+    pub lane_control_n: AtomicU64,
+    pub lane_control_max_us: AtomicU64,
 }
 
 /// Probes that fire *during* the non-blocking accumulator pass — i.e.

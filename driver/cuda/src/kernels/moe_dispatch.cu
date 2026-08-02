@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cuda_bf16.h>
+
+#include <type_traits>
 #include <mma.h>
 
 namespace pie_cuda_driver::kernels {
@@ -591,7 +593,27 @@ __global__ void moe_decode_wmma_bf16_kernel(
 // `ActByToken` selects the input row: gate/up reads the token's hidden
 // state (shared by the token's top_k routes), down reads the route's own
 // activation.
-template <bool ActByToken, int kWarps>
+// `kUnroll` hoists several loads above the math that consumes them, as
+// gemv.cu's row-per-warp kernel does. MEASURED AND NOT WORTH IT HERE, which
+// is why the default stays 1 (identical code to before it was templated).
+//
+// The reasoning that motivated it was sound and still wrong: with no unroll
+// each lane keeps one load in flight, the condition gemv.cu records as having
+// cost it ~963 GB/s. But this kernel does not have that problem -- it already
+// runs near roofline. Swept at gemma-4-26B-A4B's real shapes (from its config
+// and cross-checked against its decode trace, 60 calls/step at 11.50 us):
+//
+//   gate/up N=1408 K=2816 (63 MB): w4,u1 10.91us 5.81TB/s  <- shipping
+//                                  w4,u4 10.87us 5.84TB/s  (noise)
+//   down    N=2816 K=704  (32 MB): w4,u1 10.29us 3.08TB/s  <- shipping
+//                                  w8,u2  9.40us 3.38TB/s  (-8.6%)
+//
+// 5.81 TB/s against a ~6.7 TB/s machine roof leaves nothing to win on gate/up.
+// The `down` shape is latency-bound (K=704 is 2.75 float4 per lane) and does
+// improve, but it is 30 calls of a 7599 us step: -0.35% end to end, well under
+// the run-to-run spread. The template and the sweep entry point are kept so
+// the next person can re-check rather than re-derive.
+template <bool ActByToken, int kWarps, int kUnroll = 1>
 __global__ void moe_decode_gemv_bf16_kernel(
     const std::int32_t* __restrict__ topk_idx,
     const __nv_bfloat16* __restrict__ act,
@@ -613,7 +635,28 @@ __global__ void moe_decode_gemv_bf16_kernel(
     const int vec = K / 8;
     const float4* w4 = reinterpret_cast<const float4*>(w);
     const float4* x4 = reinterpret_cast<const float4*>(x);
-    for (int i = lane; i < vec; i += 32) {
+    int i = lane;
+    for (; i + 32 * (kUnroll - 1) < vec; i += 32 * kUnroll) {
+        float4 wv[kUnroll];
+        float4 xv[kUnroll];
+        #pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            wv[u] = w4[i + 32 * u];
+            xv[u] = x4[i + 32 * u];
+        }
+        #pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const __nv_bfloat16* wb =
+                reinterpret_cast<const __nv_bfloat16*>(&wv[u]);
+            const __nv_bfloat16* xb =
+                reinterpret_cast<const __nv_bfloat16*>(&xv[u]);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+            }
+        }
+    }
+    for (; i < vec; i += 32) {
         float4 wv = w4[i];
         float4 xv = x4[i];
         const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wv);
@@ -631,6 +674,39 @@ __global__ void moe_decode_gemv_bf16_kernel(
 }
 
 }  // namespace
+
+// Sweep entry point for the microbenchmark: the unroll depth and warps per
+// block, chosen explicitly. Not for engine use.
+bool launch_moe_decode_gemv_tuned(
+    const std::int32_t* topk_idx, const void* act, const void* weight_base,
+    void* out, int routes, int top_k, int K, int N, long long expert_stride,
+    int warps, int unroll, cudaStream_t stream)
+{
+    if (routes <= 0 || K <= 0 || N <= 0 || (K % 8) != 0) return false;
+    const auto* ti = topk_idx;
+    const auto* a = static_cast<const __nv_bfloat16*>(act);
+    const auto* w = static_cast<const __nv_bfloat16*>(weight_base);
+    auto* o = static_cast<__nv_bfloat16*>(out);
+    auto go = [&](auto W, auto U) {
+        constexpr int kW = decltype(W)::value, kU = decltype(U)::value;
+        const dim3 grid((N + kW - 1) / kW, routes);
+        const dim3 block(32, kW);
+        moe_decode_gemv_bf16_kernel<true, kW, kU><<<grid, block, 0, stream>>>(
+            ti, a, w, o, top_k, K, N, expert_stride);
+    };
+#define PIE_MOE_CASE(W, U) \
+    if (warps == (W) && unroll == (U)) {                                   \
+        go(std::integral_constant<int, W>{},                               \
+           std::integral_constant<int, U>{});                              \
+        return true;                                                       \
+    }
+    PIE_MOE_CASE(4, 1) PIE_MOE_CASE(4, 2) PIE_MOE_CASE(4, 4)
+    PIE_MOE_CASE(2, 1) PIE_MOE_CASE(2, 2) PIE_MOE_CASE(2, 4)
+    PIE_MOE_CASE(8, 1) PIE_MOE_CASE(8, 2) PIE_MOE_CASE(8, 4)
+    PIE_MOE_CASE(1, 2) PIE_MOE_CASE(16, 2)
+#undef PIE_MOE_CASE
+    return false;
+}
 
 void launch_moe_gate_up_decode_gemv_bf16(
     const std::int32_t* topk_idx,

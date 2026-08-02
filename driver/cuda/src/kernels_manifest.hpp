@@ -98,8 +98,41 @@ inline bool native_mxfp4_moe_opt_out() {
     return off;
 }
 
+// `PIE_CUDA_NATIVE_MXFP4_MOE=1` forces the lowering back ON where the default
+// declines it. Separate from "not opted out" on purpose: the Blackwell gate
+// below is a correctness quarantine, and the only way to test a fix for it is
+// to be able to ask for the quarantined path explicitly.
+inline bool native_mxfp4_moe_opt_in() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_CUDA_NATIVE_MXFP4_MOE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
 constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
 #if defined(PIE_CUDA_HAS_MARLIN_MOE)
+    // sm_80 stays IN, as it was, but note what that used to mean: until the two
+    // lowering bugs fixed alongside this comment, native MXFP4 was the DEFAULT
+    // on Ampere and it produced garbage there -- the same failure quarantined
+    // for sm_100 below, from the same two architecture-independent causes.
+    // With those fixed, sm_80 measures 0/64 degenerate requests at 32-wide and
+    // 0/16 at concurrency 1 under a per-request distinct-word gate.
+    //
+    // Which lowering is FASTER is a workload question, not a device one, and
+    // the answer is split. On gpt-oss-20b, A100:
+    //
+    //     single-stream (5 reps)   native 159.13   routed-dequant 201.93
+    //     throughput 64/32/256     native 626.91   routed-dequant 492.7
+    //
+    // matching `bench/moe_bench.cu`, where Marlin trails the per-route GEMV at
+    // N=1 (0.0395 vs 0.0316 ms) and only pulls ahead from about N=8 (3.44x at
+    // N=32, 6.58x at N=64). The two are mutually exclusive -- publishing the
+    // native slabs gives up the routed-dequant slabs for the life of the model
+    // -- so a latency-bound deployment on Ampere may well want
+    // `PIE_CUDA_NATIVE_MXFP4_MOE=0`. Left at the existing default rather than
+    // flipped, because that is a deployment policy call and not mine to make
+    // from a benchmark.
     return cc_major >= 8;
 #elif defined(PIE_CUDA_HAS_MARLIN)
     return cc_major >= 10;
@@ -109,10 +142,56 @@ constexpr bool device_supports_native_mxfp4_moe(int cc_major) {
 #endif
 }
 
+// The Marlin MXFP4 MoE kernels produce WRONG VALUES on sm_100.
+//
+// Measured on a B200 with gpt-oss-20b: under this lowering decode emits
+// uniform garbage ("nasquorashBR @@ Put ShortfacesInte Imper fmt Ind tass"),
+// a 0% function-word rate against 39% for the same prompt on vLLM and
+// SGLang. Under the routed-dequant GEMV the same build answers correctly at
+// 314 tok/s. Bisected against CUDA graph capture: corrupt both captured and
+// eager, correct both ways with the GEMV, so the lowering is the only
+// variable. The generated kernel set is sm80-shaped
+// (`sm80_kernel_bfloat16_fe2m1f_bfloat16.cu`) and was never exercised above
+// sm_90.
+//
+// This is quarantined rather than left to the deployment to discover because
+// the gate above answers TRUE on Blackwell whether or not Marlin was built --
+// so without this, every sm_100 deployment serves gpt-oss as garbage BY
+// DEFAULT, and the failure is silent: the tokens arrive, at a plausible rate,
+// and only reading them reveals it.
+//
+// UPDATE: the root cause is found, and it is NOT the kernel. Two bugs in the
+// lowering ABOVE the GEMM, both architecture-independent, so they were
+// corrupting sm_80 exactly as described here for sm_100:
+//
+//   1. the MXFP4 group scales were transposed twice -- the loader already
+//      publishes them in Marlin's order and `mixtral.cpp` transposed them
+//      again. Mean relative error against a host reference, measured with
+//      `bench/marlin_moe_verify.cu` at gpt-oss's shape: 0.0017 correct,
+//      0.9350 double-transposed, i.e. uncorrelated output.
+//   2. `d_marlin_act`'s padding tail was never initialised, and `0 * NaN` is
+//      NaN, so one NaN pattern poisoned a whole fp32-accumulated output row.
+//
+// The Marlin MoE kernel and the weight repack are themselves correct on
+// sm_80 (0.0017-0.0023 mean rel err across E in {1,4,32}, top_k in {1,4}).
+// After both fixes sm_80 measures 0/64 degenerate requests at 32-wide and
+// 0/16 at concurrency 1, against 8-12/32 and 2/16 before.
+//
+// This quarantine is therefore very likely stale: the B200 garbage described
+// above has the same signature and the same two causes. It is left in place
+// only because there is no Blackwell here to verify on. RE-TEST sm_100 with
+// `PIE_CUDA_NATIVE_MXFP4_MOE=1` and drop this if it is clean.
+constexpr bool native_mxfp4_moe_known_broken(int cc_major) {
+    return cc_major >= 10;
+}
+
 // The compile-time gate above, with the deployment's answer applied.
 inline bool native_mxfp4_moe_enabled(int cc_major) {
-    return device_supports_native_mxfp4_moe(cc_major) &&
-           !native_mxfp4_moe_opt_out();
+    if (!device_supports_native_mxfp4_moe(cc_major)) return false;
+    if (native_mxfp4_moe_opt_out()) return false;
+    if (native_mxfp4_moe_known_broken(cc_major))
+        return native_mxfp4_moe_opt_in();
+    return true;
 }
 
 }  // namespace pie_cuda_driver

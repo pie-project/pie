@@ -49,6 +49,39 @@ using namespace pie::driver::launch;
 // for the supported scheduler depths without truncating declarations.
 inline constexpr std::uint32_t kMaxRing = 64;
 
+// A launch-scoped set of channel SLOTS: which slots a lane has already taken
+// from or put to inside this wave, and which the Prologue is statically known
+// to write.
+//
+// This was `std::unordered_set<std::uint32_t>`, and there are two of them per
+// lane on a per-WAVE object -- so a 256-lane decode wave constructed 512 hash
+// tables, each to hold the one to four slots an inferlet actually declares.
+// Measured at 116 us a wave (0.45 us per lane, the shape of one bucket-array
+// allocation plus a node), against the 6 us the launch those tables describe
+// costs. A linear scan over one vector is faster than a hash lookup at this
+// size and allocates once; `contains` keeps the reading call sites unchanged.
+class SlotSet {
+  public:
+    void insert(std::uint32_t slot) {
+        if (contains(slot)) return;
+        slots_.push_back(slot);
+    }
+    bool contains(std::uint32_t slot) const {
+        for (const std::uint32_t candidate : slots_) {
+            if (candidate == slot) return true;
+        }
+        return false;
+    }
+    bool empty() const { return slots_.empty(); }
+    std::size_t size() const { return slots_.size(); }
+    void clear() { slots_.clear(); }
+    const std::uint32_t* begin() const { return slots_.data(); }
+    const std::uint32_t* end() const { return slots_.data() + slots_.size(); }
+
+  private:
+    std::vector<std::uint32_t> slots_;
+};
+
 // ─────────────────────────── device-side kernels ─────────────────────────
 
 // Stage readiness: AND this stage's requirement into the pass commit flag.

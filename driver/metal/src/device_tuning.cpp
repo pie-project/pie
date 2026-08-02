@@ -21,6 +21,33 @@ int env_int(const char* name, int fallback) {
     return int(v);
 }
 
+/// `env_int` for a knob whose ZERO is a value.
+///
+/// Every other tuned constant here is a width, a row count or a threshold that
+/// has to be at least one, so `env_int` folds "0" in with "not a number" and
+/// hands back the default. `moe_batch_min_per_expert` is not one of those: zero
+/// is the meaningful setting "batch at any width", and it is the ONLY way to
+/// reach the routed GEMM below its crossover, which is how a wrong-answer bug
+/// in that kernel is bisected.
+///
+/// Silently ignoring it cost this driver two false conclusions that were both
+/// written down as fact. `gemma4/encode.cpp` records that the family was fired
+/// with this knob at 0 "so even a one-row decode takes the batched path", and
+/// `qwen3_5/decode_step_mb.cpp` recorded a bisection whose passing arms were
+/// all supposedly forced onto the batched path the same way. Neither run ever
+/// took that path: `env_int` returned 1 both times, the fire took the matvec,
+/// and the gate passed for a reason that had nothing to do with what was being
+/// tested. A knob that reports the default when you set it is worse than no
+/// knob, because the experiment still prints PASS.
+int env_int_allow_zero(const char* name, int fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') return fallback;
+    char* end = nullptr;
+    const long v = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || v < 0) return fallback;
+    return int(v);
+}
+
 bool env_bool(const char* name, bool fallback) {
     const char* raw = std::getenv(name);
     if (raw == nullptr || *raw == '\0') return fallback;
@@ -95,14 +122,20 @@ DeviceTuning tuning_for(const DeviceInfo& info) {
                 env_int("PIE_METAL_QMM_MIN_BATCH", t.qmm_min_batch_emulated));
     t.qmm_bn_crossover_tg =
         env_int("PIE_METAL_QMM_BN_CROSSOVER_TG", t.qmm_bn_crossover_tg);
-    t.moe_tile_mid_per = env_int("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
-    t.moe_tile_wide_per = env_int("PIE_METAL_MOE_TILE_WIDE_PER", t.moe_tile_wide_per);
+    // Zero is a MEANING here and not a typo: it is "widen unconditionally",
+    // which is the only way to reach the 32- and 64-row routed tiles on a
+    // decode, where `per` is `experts_per_token * n / n_experts` and rounds to
+    // nothing. `env_int` would have taken it for a parse failure and reported
+    // the default, which is how this pair spent so long looking like a knob
+    // that did nothing to a routed answer.
+    t.moe_tile_mid_per = env_int_allow_zero("PIE_METAL_MOE_TILE_MID_PER", t.moe_tile_mid_per);
+    t.moe_tile_wide_per = env_int_allow_zero("PIE_METAL_MOE_TILE_WIDE_PER", t.moe_tile_wide_per);
     t.fp16_qmm = env_bool("PIE_METAL_FP16_QMM", t.fp16_qmm);
     t.sdpa_tile_min_rows_per_request =
         env_int("PIE_METAL_SDPA_TILE_MIN_ROWS", t.sdpa_tile_min_rows_per_request);
     t.sdpa_mma = env_bool("PIE_METAL_SDPA_MMA", t.sdpa_mma);
     t.moe_batch_min_per_expert =
-        env_int("PIE_METAL_MOE_BATCH_MIN_PER_EXPERT", t.moe_batch_min_per_expert);
+        env_int_allow_zero("PIE_METAL_MOE_BATCH_MIN_PER_EXPERT", t.moe_batch_min_per_expert);
     t.gdn_scan_lanes = env_int("PIE_METAL_GDN_SCAN_LANES", t.gdn_scan_lanes);
     t.gdn_scan_rows = env_int("PIE_METAL_GDN_SCAN_ROWS", t.gdn_scan_rows);
     return t;

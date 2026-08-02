@@ -1,5 +1,5 @@
 // Wrapper around FlashInfer's INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM used by
-// third_party/flashinfer_generated/gemm_grouped/100/.
+// third_party/flashinfer_generated/gemm_grouped/{90,100}/.
 //
 // Why this exists instead of calling the upstream macro directly:
 //
@@ -30,6 +30,15 @@
 #define PIE_TMA_WS_OK_PtrArrayNoSmemWarpSpecialized_FINALIZE 1
 #define PIE_TMA_WS_OK_PtrArrayTmaWarpSpecialized_NONE 0
 #define PIE_TMA_WS_OK_PtrArrayTmaWarpSpecialized_FINALIZE 1
+
+// Hopper (Sm90) does not parameterise the launcher on an epilogue schedule --
+// the template takes `void` in that position. It splits the same way Blackwell's
+// TMA schedule does: NONE hits the documented type error above (the launcher
+// feeds `alpha_scale_ptr_array`, a `float const**`, into a LinearCombination
+// whose Arguments open with a scalar `float alpha`), FINALIZE compiles.
+// Verified by building both: NONE fails at moe_gemm_tma_ws_launcher.inl:65.
+#define PIE_TMA_WS_OK_void_NONE 0
+#define PIE_TMA_WS_OK_void_FINALIZE 1
 
 #define PIE_TMA_WS_CAT_(a, b) a##b
 #define PIE_TMA_WS_CAT(a, b) PIE_TMA_WS_CAT_(a, b)

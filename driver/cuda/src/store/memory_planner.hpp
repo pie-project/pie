@@ -82,6 +82,7 @@ CudaMemoryPlan plan_cuda_memory(
     bool kimi_selected,
     bool glm5_selected,
     bool kimi_k3_selected,
+    bool prefill_graph_capable,
     const KvCacheFormat& kv_format,
     const ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose);

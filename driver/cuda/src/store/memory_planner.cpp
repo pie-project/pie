@@ -301,6 +301,12 @@ CudaMemoryPlan plan_cuda_memory(
     bool kimi_selected,
     bool glm5_selected,
     bool kimi_k3_selected,
+    // Only the family that overrides `IModel::prefill_graph_capturable` can
+    // replay a prefill-carrying wave, and only it should pay the enlarged
+    // graph-mode attention workspace. Passed rather than derived by excluding
+    // the specialised flags above: Mixtral, Gemma and Qwen3VL have no flag
+    // here, so "none of the above" would wrongly include them.
+    bool prefill_graph_capable,
     const pie_cuda_driver::KvCacheFormat& kv_format,
     const pie_cuda_driver::ops::RuntimeQuantScratchSpec& runtime_quant_scratch_base,
     bool verbose)
@@ -626,7 +632,7 @@ CudaMemoryPlan plan_cuda_memory(
             }
             const std::size_t attn_float_bytes =
                 pie_cuda_driver::attention_float_workspace_bytes(
-                    hf, cfg, prop, N, R0);
+                    hf, cfg, prop, N, R0, prefill_graph_capable);
             arena += attn_float_bytes;     // AttentionWorkspace float section
             arena += 8ull * 1024 * 1024;  // AttentionWorkspace int section
             const std::size_t persistent_bytes =
@@ -642,7 +648,18 @@ CudaMemoryPlan plan_cuda_memory(
             if (arena + persistent_bytes >= budget) continue;
 
             int R = R0;
-            const int state_slots = state_slot_bytes > 0 ? R : 0;
+            // PIE_RS_SLOT_MULT: the RS pool is sized to R, but admission needs
+            // `dispatch_depth` slots PER LANE (bootstrap.rs:328 --
+            // rs_seat_cap = rs_cache_slots / seat_cost), so a pool of R seats
+            // only R/depth lanes. Sizing it R*depth instead lets R lanes seat
+            // at the configured depth and keeps frame pipelining, rather than
+            // buying lanes by dropping to depth 1.
+            const int slot_mult = [] {
+                const char* v = std::getenv("PIE_RS_SLOT_MULT");
+                const int n = (v != nullptr) ? std::atoi(v) : 1;
+                return (n >= 1 && n <= 8) ? n : 1;
+            }();
+            const int state_slots = state_slot_bytes > 0 ? R * slot_mult : 0;
             const std::size_t state_bytes =
                 static_cast<std::size_t>(state_slots) * state_slot_bytes;
             const std::size_t minimum_wave_kv_bytes =

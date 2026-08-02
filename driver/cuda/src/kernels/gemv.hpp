@@ -44,6 +44,27 @@ bool launch_gemv_bf16(
 // counts. Row-per-block with the warps splitting K, so the two small
 // projections inherit the grid of the large one instead of running alone.
 // Returns false and touches nothing if any argument is unsuitable.
+// Sweep entry point for the microbenchmark: selects the row-per-warp GEMV's
+// rows-per-block and unroll depth explicitly. Returns false for combinations
+// that were not instantiated. Not for engine use -- the shipping path is
+// launch_gemv_bf16.
+bool launch_gemv_bf16_tuned(
+    const void* weight, const void* act, const void* bias, void* out,
+    int N, int K, int warps, int unroll, cudaStream_t stream);
+
+// Sweep entry point for the split-K form's warps-per-block. Microbenchmark
+// only; the shipping path is launch_gemv_bf16.
+bool launch_gemv_splitk_tuned(
+    const void* weight, const void* act, const void* bias, void* out,
+    int N, int K, int warps, int unroll, cudaStream_t stream);
+
+// Sweep entry point for the microbenchmark.
+bool launch_gemv3_bf16_tuned(
+    const void* w0, const void* w1, const void* w2,
+    const void* act, void* o0, void* o1, void* o2,
+    int n0, int n1, int n2, int K, int warps, int unroll,
+    cudaStream_t stream);
+
 bool launch_gemv3_bf16(
     const void* w0, const void* w1, const void* w2,
     const void* b0, const void* b1, const void* b2,  // may be null

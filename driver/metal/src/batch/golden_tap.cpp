@@ -21,6 +21,18 @@ struct Tap {
     const char* name;
     std::uint8_t out_bind;
     int width;
+    /// Rows are the SORT's, not the batch's. The sorted stack is a driver-only
+    /// row order, so these diff against no reference -- but they diff perfectly
+    /// against ANOTHER RUN of this driver, which is what an arm-on/arm-off
+    /// bisect of a routed wrong answer needs and what the note below used to
+    /// rule out for the wrong reason.
+    bool sorted = false;
+    /// The tap is int32, not bf16. The routing tensors are indices; dumping
+    /// them as floats would read every id as a denormal.
+    bool i32 = false;
+    /// Rows, when the tap is neither one-per-token nor one-per-sorted-row.
+    /// `tile_expert` is one per TILE.
+    int tile_rows = 0;
 };
 
 bool tap_for(const Dispatch& d, const DecodeGeometry& g, Tap& out) {
@@ -69,13 +81,29 @@ bool tap_for(const Dispatch& d, const DecodeGeometry& g, Tap& out) {
         case Kernel::LayerOut:      out = {"layer_out",  2, g.hidden};       return true;
 
         // ── the mixture, in TOKEN order ──
-        // The sorted tensors are deliberately untapped: their row order is the
-        // driver's own, so a dump of them would diff against nothing. What is
-        // here is every value a reference can also produce, which until now was
-        // nothing at all -- the routed FFN was the one block of this family no
-        // parity run could see, and it is where Qwen3.6-35B-A3B went wrong.
+        // What a reference can also produce. The sorted stack below is ours
+        // alone, and both are needed: these say WHETHER the mixture is wrong,
+        // those say WHERE.
         case Kernel::LlRouter:      out = {"router",     4, g.n_experts}; return true;
         case Kernel::LlMoeCombine:  out = {"moe_out",    2, g.hidden};   return true;
+
+        // ── the mixture, in SORT order ──
+        // Only comparable to another run of this driver, which is exactly the
+        // comparison a routed wrong answer needs: the routed GEMM and the
+        // routed matvec compute the same thing over the same rows, so with the
+        // router bit-identical between the two arms every one of these must be
+        // too. The first one that is not is the kernel at fault.
+        case Kernel::LlMoeGather:      out = {"moe_sorted_x", 1, g.hidden, true}; return true;
+        case Kernel::LlExpertGate:     out = {"moe_gp",   4, g.moe_intermediate, true}; return true;
+        case Kernel::LlExpertUp:       out = {"moe_up",   4, g.moe_intermediate, true}; return true;
+        case Kernel::LlExpertSiluMul:  out = {"moe_hh",   2, g.moe_intermediate, true}; return true;
+        case Kernel::LlExpertDown:     out = {"moe_sorted_out", 4, g.hidden, true}; return true;
+
+        // ── the routing itself ──
+        // The sort's four outputs. `tile_expert` is what the routed MATMUL
+        // reads and the routed MATVEC does not, so it is the one input the two
+        // arms of a batched/unbatched bisect do not share.
+        case Kernel::LlMoeSort:        out = {"moe_row_expert", 2, 1, true, true}; return true;
         case Kernel::LlSharedGate:  out = {"shared_gate", 4, g.shared_intermediate}; return true;
         case Kernel::LlSharedUp:    out = {"shared_up",  4, g.shared_intermediate};  return true;
         case Kernel::LlSharedDown:  out = {"shared_down", 4, g.hidden};   return true;
@@ -132,8 +160,30 @@ const std::string& golden_tap_dir() {
 }
 
 bool golden_taps_recycle() {
-    static const bool on = std::getenv("PIE_METAL_TAPS_RECYCLE") != nullptr;
+    // `PIE_METAL_TAPS_LAYER` implies this: it asks for exactly one layer to be
+    // kept out of the recycling, which is pointless if the recycling is off
+    // everywhere anyway and fatal on a checkpoint whose no-recycle pool does
+    // not fit. See the pinning in `build_scratch_schedule`.
+    static const bool on = std::getenv("PIE_METAL_TAPS_RECYCLE") != nullptr ||
+                           std::getenv("PIE_METAL_TAPS_LAYER") != nullptr;
     return on;
+}
+
+/// The taps a dispatch publishes. Usually one -- the value it computes -- but
+/// the sort has four outputs and three of them are what a routed bisect needs
+/// to see, so this is a list rather than the single `Tap` it was.
+int taps_for(const Dispatch& d, const DecodeGeometry& g, Tap out[4]) {
+    int n = 0;
+    Tap primary{};
+    if (tap_for(d, g, primary)) out[n++] = primary;
+    if (d.kind == Kernel::LlMoeSort) {
+        out[n++] = {"moe_perm", 1, 1, true, true};  // llama::kMoeSortPermBind
+        out[n++] = {"moe_inv", 5, 1, true, true};
+        // One entry per TILE, not per row: the count is the batched layout's
+        // `sorted / tile`, which only the caller knows.
+        out[n++] = {"moe_tile_expert", 3, 1, false, true, -1};
+    }
+    return n;
 }
 
 void dump_golden_taps(const std::vector<Dispatch>& dag,
@@ -142,7 +192,10 @@ void dump_golden_taps(const std::vector<Dispatch>& dag,
                       int pool_n,
                       const DecodeGeometry& g,
                       int n_rows,
-                      std::size_t row_stride_bytes) {
+                      std::size_t row_stride_bytes,
+                      const char* prefix,
+                      int sorted_rows,
+                      int tile_rows) {
     const std::string& dir = golden_tap_dir();
     if (dir.empty() || n_rows <= 0) return;
     const std::size_t n = std::min(dag.size(), sched.per_dispatch.size());
@@ -154,18 +207,21 @@ void dump_golden_taps(const std::vector<Dispatch>& dag,
     // is really just the dump lying. Only the final writer of a colour is named.
     std::vector<int> last_writer(std::size_t(pool_n), -1);
     for (std::size_t di = 0; di < n; ++di) {
-        Tap tap{};
-        if (!tap_for(dag[di], g, tap)) continue;
-        for (const ScratchBind& sb : sched.per_dispatch[di].binds)
-            if (sb.bind_index == tap.out_bind && sb.buffer_id < pool_n) {
-                last_writer[std::size_t(sb.buffer_id)] = int(di);
-                break;
-            }
+        Tap taps[4]{};
+        const int nt = taps_for(dag[di], g, taps);
+        for (int ti = 0; ti < nt; ++ti)
+            for (const ScratchBind& sb : sched.per_dispatch[di].binds)
+                if (sb.bind_index == taps[ti].out_bind && sb.buffer_id < pool_n) {
+                    last_writer[std::size_t(sb.buffer_id)] = int(di);
+                    break;
+                }
     }
 
     for (std::size_t di = 0; di < n; ++di) {
-        Tap tap{};
-        if (!tap_for(dag[di], g, tap)) continue;
+        Tap taps[4]{};
+        const int nt = taps_for(dag[di], g, taps);
+        for (int ti = 0; ti < nt; ++ti) {
+        const Tap& tap = taps[ti];
         int color = -1;
         for (const ScratchBind& sb : sched.per_dispatch[di].binds)
             if (sb.bind_index == tap.out_bind) { color = sb.buffer_id; break; }
@@ -174,18 +230,39 @@ void dump_golden_taps(const std::vector<Dispatch>& dag,
         const auto* base = static_cast<const std::uint8_t*>(pool[color].contents());
         if (base == nullptr) continue;
 
-        std::vector<float> rows(std::size_t(n_rows) * std::size_t(tap.width));
-        for (int t = 0; t < n_rows; ++t) {
-            const auto* src = reinterpret_cast<const std::uint16_t*>(
-                base + std::size_t(t) * row_stride_bytes);
-            for (int i = 0; i < tap.width; ++i)
-                rows[std::size_t(t) * std::size_t(tap.width) + std::size_t(i)] =
-                    bf16_to_f32(src[i]);
+        // The sorted stack is packed: one row per (token, slot) pair the sort
+        // emitted, contiguous at the tap's own width. The token-major stride
+        // the caller passes is the batch's and does not apply to it.
+        const int rn = tap.tile_rows < 0 ? tile_rows
+                     : tap.sorted        ? sorted_rows
+                                         : n_rows;
+        const std::size_t elem = tap.i32 ? 4 : 2;
+        const std::size_t stride = (tap.sorted || tap.tile_rows < 0)
+                                       ? std::size_t(tap.width) * elem
+                                       : row_stride_bytes;
+        if (rn <= 0) continue;
+
+        std::vector<float> rows(std::size_t(rn) * std::size_t(tap.width));
+        for (int t = 0; t < rn; ++t) {
+            const auto* src = base + std::size_t(t) * stride;
+            for (int i = 0; i < tap.width; ++i) {
+                const std::size_t o = std::size_t(t) * std::size_t(tap.width) + std::size_t(i);
+                if (tap.i32) {
+                    std::int32_t v = 0;
+                    std::memcpy(&v, src + std::size_t(i) * 4, 4);
+                    rows[o] = float(v);
+                } else {
+                    std::uint16_t v = 0;
+                    std::memcpy(&v, src + std::size_t(i) * 2, 2);
+                    rows[o] = bf16_to_f32(v);
+                }
+            }
         }
         const std::string name = dag[di].layer < 0
-            ? std::string(tap.name)
-            : std::to_string(dag[di].layer) + "." + tap.name;
-        write_npy(dir + "/" + name + ".npy", rows, n_rows, tap.width);
+            ? std::string(prefix) + tap.name
+            : std::string(prefix) + std::to_string(dag[di].layer) + "." + tap.name;
+        write_npy(dir + "/" + name + ".npy", rows, rn, tap.width);
+        }
     }
 }
 

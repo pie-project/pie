@@ -12,6 +12,9 @@ hand and were, repeatedly, before it existed.
 most effects worth chasing, and it drifts. Engines therefore alternate which
 goes first every round (ABBA), and per-round ratios are printed alongside the
 mean so a result carried by one outlier is visible instead of averaged away.
+The alternation only cancels over an EVEN number of complete rounds, so
+`--reps` defaults to 4, only rounds where both engines finished enter the mean,
+and anything short of that is printed as a warning rather than folded in.
 
 **Output-length uniformity.** By default every request gets the same
 `--max-tokens`, and that single property dominates the comparison: it is the
@@ -29,7 +32,7 @@ same-work guard in each harness still applies.
 
 Example:
 
-    python contention_sweep.py --out /tmp/sweep --spread 0.5 --reps 3
+    python contention_sweep.py --out /tmp/sweep --spread 0.5 --reps 4
 """
 
 from __future__ import annotations
@@ -130,13 +133,21 @@ def run_one(engine, cell_name, cell, out_dir, rep, spread, args) -> dict | None:
     env.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 
     t0 = time.time()
-    with log.open("w") as fh:
-        proc = subprocess.run(cmd, cwd=HERE, env=env, stdout=fh,
-                              stderr=subprocess.STDOUT, timeout=args.timeout)
+    # A hung engine is a failed *run*, not a failed sweep: a sweep is hours
+    # long, so letting the timeout propagate would discard every cell already
+    # measured. Report it like any other non-zero exit and carry on.
+    try:
+        with log.open("w") as fh:
+            proc = subprocess.run(cmd, cwd=HERE, env=env, stdout=fh,
+                                  stderr=subprocess.STDOUT,
+                                  timeout=args.timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        rc = f"TIMEOUT>{args.timeout:.0f}s"
     elapsed = time.time() - t0
-    if proc.returncode != 0 or not out.exists():
+    if rc != 0 or not out.exists():
         print(f"    !! {engine:5s} {cell_name:5s} spread={spread} r{rep} "
-              f"FAILED rc={proc.returncode} ({elapsed:.0f}s) -> {log}",
+              f"FAILED rc={rc} ({elapsed:.0f}s) -> {log}",
               flush=True)
         return None
 
@@ -148,7 +159,27 @@ def run_one(engine, cell_name, cell, out_dir, rep, spread, args) -> dict | None:
     return s
 
 
-def report(rows: list[dict], cells: list[str], spreads: list[float]) -> None:
+def paired_reps(rows: list[dict], cell: str, sp: float
+                ) -> list[tuple[int, float, float]]:
+    """(rep, pie, vllm) for the reps where BOTH engines produced a row.
+
+    Reps are matched by number, not by position: a run can now fail without
+    aborting the sweep, and an unpaired rep would otherwise both mis-zip the
+    per-round ratios and unbalance the ABBA alternation the mean relies on --
+    an engine's surviving half of a broken round would land in its mean with
+    no counterpart in the other's. Only complete rounds are comparable.
+    """
+    def by_rep(engine: str) -> dict[int, float]:
+        return {r["rep"]: r["output_tok_per_s"] for r in rows
+                if r["cell"] == cell and r["engine"] == engine
+                and r["spread"] == sp}
+
+    p, v = by_rep("pie"), by_rep("vllm")
+    return [(rep, p[rep], v[rep]) for rep in sorted(p.keys() & v.keys())]
+
+
+def report(rows: list[dict], cells: list[str], spreads: list[float],
+           reps: int) -> None:
     width = 6 + 35 * len(spreads)
     print("\n" + "=" * width)
     print(f"{'cell':<6}" + "".join(
@@ -156,18 +187,18 @@ def report(rows: list[dict], cells: list[str], spreads: list[float]) -> None:
     print(f"{'':<6}" + "".join(
         f"{'pie':>10}{'vllm':>10}{'ratio':>8}{'var':>7}" for _ in spreads))
     print("-" * width)
+    dropped: list[str] = []
     for cell in cells:
         line = f"{cell:<6}"
         for sp in spreads:
-            p = [r["output_tok_per_s"] for r in rows
-                 if r["cell"] == cell and r["engine"] == "pie"
-                 and r["spread"] == sp]
-            v = [r["output_tok_per_s"] for r in rows
-                 if r["cell"] == cell and r["engine"] == "vllm"
-                 and r["spread"] == sp]
-            if not p or not v:
+            pairs = paired_reps(rows, cell, sp)
+            if len(pairs) < reps:
+                dropped.append(f"{cell}/spread={sp}: {len(pairs)}/{reps}")
+            if not pairs:
                 line += f"{'-':>10}{'-':>10}{'-':>8}{'-':>7}"
                 continue
+            p = [a for _, a, _ in pairs]
+            v = [b for _, _, b in pairs]
             pm, vm = statistics.fmean(p), statistics.fmean(v)
             var = (max(p) - min(p)) / pm * 100 if len(p) > 1 else 0.0
             line += f"{pm:>10.0f}{vm:>10.0f}{pm / vm:>8.3f}{var:>6.1f}%"
@@ -177,17 +208,19 @@ def report(rows: list[dict], cells: list[str], spreads: list[float]) -> None:
     # Per-round ratios: a mean whose rounds disagree in sign is not a result.
     for cell in cells:
         for sp in spreads:
-            p = [r["output_tok_per_s"] for r in sorted(
-                (r for r in rows if r["cell"] == cell
-                 and r["engine"] == "pie" and r["spread"] == sp),
-                key=lambda r: r["rep"])]
-            v = [r["output_tok_per_s"] for r in sorted(
-                (r for r in rows if r["cell"] == cell
-                 and r["engine"] == "vllm" and r["spread"] == sp),
-                key=lambda r: r["rep"])]
-            if len(p) > 1 and len(v) == len(p):
-                per = "  ".join(f"{a / b:.3f}" for a, b in zip(p, v))
+            pairs = paired_reps(rows, cell, sp)
+            if len(pairs) > 1:
+                per = "  ".join(f"{a / b:.3f}" for _, a, b in pairs)
                 print(f"  {cell:<5} spread={sp}: {per}")
+
+    # Say what the table is NOT averaging. A silently short column reads like a
+    # clean result; incomplete rounds are exactly when the order bias survives.
+    for d in dropped:
+        print(f"  !! incomplete rounds, order bias uncancelled -- {d}")
+    if reps % 2 != 0:
+        print(f"  !! --reps {reps} is odd: one engine ran first "
+              f"{reps // 2 + 1} of {reps} rounds, so the mean ratio still "
+              f"carries the first-position bias ABBA exists to cancel")
 
 
 def main() -> int:
@@ -197,7 +230,11 @@ def main() -> int:
     ap.add_argument("--out", required=True,
                     help="directory for per-run JSON and logs")
     ap.add_argument("--cells", default="c256,S,D,X")
-    ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--reps", type=int, default=4,
+                    help="rounds per cell. EVEN, so the ABBA alternation "
+                         "gives each engine the first slot equally often; an "
+                         "odd count leaves the bias in the mean and is "
+                         "reported as such.")
     ap.add_argument("--spread", type=float, default=None,
                     help="also run every cell with this --output-spread and "
                          "report both columns. Uniform-only is the DEFAULT "
@@ -236,9 +273,13 @@ def main() -> int:
                     if s is not None:
                         rows.append({**s, "cell": cell_name, "engine": engine,
                                      "rep": rep, "spread": spread})
+                    # After every run, not at the end: a sweep is hours long
+                    # and Ctrl-C or a box reboot must not cost the cells that
+                    # already finished.
+                    (out_dir / "rows.json").write_text(
+                        json.dumps(rows, indent=2))
 
-    (out_dir / "rows.json").write_text(json.dumps(rows, indent=2))
-    report(rows, cells, spreads)
+    report(rows, cells, spreads, args.reps)
     return 0
 
 

@@ -273,6 +273,26 @@ class DeviceChannelRegistry {
         CUDA_CHECK(cudaStreamWaitEvent(stream, init_done_, 0));
     }
 
+    /// Fire-timing only: how many slots the pending-initialization flush
+    /// covered and how many times it ran. `flushes` counts FLUSH CALLS, not
+    /// the contiguous slot runs the pre-scatter path measured -- the scatter
+    /// issues one upload and one kernel for the whole set, so there is exactly
+    /// one per flush and comparing it against the old 2.17-slots-per-run
+    /// figure would read as fragmentation collapsing when only the counter
+    /// changed meaning.
+    struct InitFlushProbe {
+        std::int64_t slots = 0;
+        std::int64_t flushes = 0;
+    };
+    InitFlushProbe take_init_flush_probe() {
+        const InitFlushProbe probe = init_flush_probe_;
+        init_flush_probe_ = InitFlushProbe{};
+        return probe;
+    }
+    bool initialization_pending() const { return initialization_pending_; }
+    cudaEvent_t initialization_done() const { return init_done_; }
+
+
     // Slab-pooled device blocks for lane-thread consumers beyond the channel
     // cells (the tier-0 baked lists): a cold cohort's first-touch acquires
     // come out of the same 1 MB slabs instead of one cudaMalloc per instance
@@ -1079,6 +1099,9 @@ class DeviceChannelRegistry {
 
     void flush_pending_initializations() {
         if (pending_initialization_slots_.empty()) return;
+        init_flush_probe_.slots += static_cast<std::int64_t>(
+            pending_initialization_slots_.size());
+        ++init_flush_probe_.flushes;
         // Full bits gate every cell read, so empty payload bytes need no
         // initialization. Batch only the shared ring metadata here.
         //
@@ -1401,6 +1424,7 @@ class DeviceChannelRegistry {
     // The device block is grow-only and reused: every flush rides the same
     // initialization stream, so a later upload is already ordered after the
     // previous launch that read it.
+    InitFlushProbe init_flush_probe_{};
     std::vector<std::uint32_t> init_scatter_host_;
     void* init_scatter_device_ = nullptr;
     std::size_t init_scatter_capacity_ = 0;

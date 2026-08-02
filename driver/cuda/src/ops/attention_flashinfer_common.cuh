@@ -243,6 +243,30 @@ inline bool force_split_kv_small_enabled() {
     return on;
 }
 
+// The window of the layer about to be planned, or -1.
+//
+// FlashInfer's decode work estimator has a fixed signature with no window
+// parameter, so the only way to tell it that a sliding layer's real KV is
+// bounded is a side channel. Planning is synchronous and immediately precedes
+// the estimator call on the same thread, so a thread-local carries it safely.
+//
+// This matters because the whole reason split-kv is force-disabled below is
+// host cost, and that cost is a function of how many work items the split
+// produces. A sliding layer reads at most `window` tokens no matter how long
+// the request has run, so its split is bounded and cheap -- while an unbounded
+// one at 1k context took a 256-token generation from 22 s to over 2400 s.
+inline int& decode_window_hint() {
+    static thread_local int w = -1;
+    return w;
+}
+
+// Opt-in while it is being validated. PIE_CUDA_WINDOW_SPLIT_KV=1.
+inline bool window_split_kv_enabled() {
+    static const bool on =
+        std::getenv("PIE_CUDA_WINDOW_SPLIT_KV") != nullptr;
+    return on;
+}
+
 constexpr bool static_nonsplit_decode_plan_enabled() { return true; }
 
 inline std::size_t align_up_bytes(std::size_t n, std::size_t alignment) {
@@ -291,7 +315,15 @@ struct DecodeWorkEstimator {
             }
             max_num_pages_per_batch = std::max(max_num_pages_per_batch, max_pages_per_req);
         }
-        if (!force_split_kv_small_enabled() &&
+        // A sliding layer keeps whatever split the estimator chose: its KV is
+        // bounded by the window, so the work items are bounded too, and the
+        // grid is padded to a fixed size under cuda graph while the per-CTA
+        // work comes from device buffers -- which is what makes it survive
+        // replay. Everything else keeps the unsplit plan, whose schedule is
+        // independent of KV length and therefore needs no re-planning.
+        const bool windowed =
+            window_split_kv_enabled() && decode_window_hint() >= 0;
+        if (!windowed && !force_split_kv_small_enabled() &&
             current_device_major() >= 8 && batch_size <= 512) {
             split_kv = false;
             new_batch_size = batch_size;

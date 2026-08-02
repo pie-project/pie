@@ -1705,8 +1705,13 @@ int main() {
     // The batched mixture itself. `moe_should_batch` wants an expert's run to
     // hold `moe_batch_min_per_expert` rows, which for eight experts at two
     // slots a token is `8 * min_per / 2` rows -- sixteen at the measured four.
-    // At forty-eight the sort pads, the three routed projections become
-    // `affine_qmm_t_routed`, and this is the ONLY case that runs them.
+    // At forty-eight the sort pads and the three routed projections become
+    // `affine_qmm_t_routed` -- as a DISPATCH. This line used to claim it was
+    // the only case that ran that KERNEL, and that was wrong: forty-eight rows
+    // over eight experts at two slots sorts to 224, `qmm_bn` refuses any
+    // `sorted` that its 64-row tile does not divide, and the arm quietly falls
+    // back to the matvec. The routed GEMM is reached by the one-row-a-tile
+    // cases below, whose `sorted` is a multiple of the tile by construction.
     //
     // Stated as an expectation rather than assumed, because the threshold is a
     // TUNING answer and a change to either side of it would silently move this
@@ -1724,6 +1729,38 @@ int main() {
     expect(llama_moe_tile_rows(moe, batches_at - 1) == 1, "one row short does not");
     run_case("qwen3-moe (routed, 48 rows: the batched mixture)", moe, *ctx, kernels_dir, 0.12f,
              /*rows=*/48, /*paged=*/true);
+
+    // The batched mixture at ONE REAL ROW A TILE.
+    //
+    // Every case above fills its tiles: 48 rows over 8 experts at 2 slots is
+    // twelve rows an expert, so the routed GEMM never runs a tile that is
+    // mostly padding. A DECODE is the opposite shape -- Qwen3.6-35B-A3B routes
+    // eight pairs over 256 experts, so every touched expert gets exactly one
+    // row and fifteen zeros -- and that is the shape the one open wrong-answer
+    // bug on this driver lives in. Reproduced here by asking for as many slots
+    // as there are experts, which makes `n_experts` tiles of one row at the
+    // DEFAULT `moe_batch_min_per_expert`: `pairs == n_experts` clears
+    // `moe_should_batch` exactly, and `per == 1` picks the 16-row tile.
+    //
+    // Cheaper than the model it was found on by four orders of magnitude: the
+    // bisect that produced it needed a 18.16 GiB checkpoint and ten minutes a
+    // run.
+    LlamaGeometry moe_sparse = moe;
+    moe_sparse.experts_per_token = moe_sparse.n_experts;
+    expect(llama_moe_tile_rows(moe_sparse, 1) > 1,
+           "one row over as many slots as experts still takes the batched path");
+    run_case("qwen3-moe (routed, 1 row: one live row a tile)", moe_sparse, *ctx, kernels_dir,
+             0.12f, /*rows=*/1, /*paged=*/true);
+
+    // The same one-row-a-tile shape at a LARGER MIXTURE is not covered here,
+    // and is known wrong. At one row, `n_experts = 8` passes and 64 and 128
+    // diverge at `ExpertGate` by rel_l2 3.6 and 4.5; at eight slots, 256
+    // experts pass at 8 rows and fail at 24 and 32. It is NOT the buffer-12
+    // collision that sent this file's sparse case here -- that one is qwen3.5's
+    // alone, since `bind_llama_fp16_qmm` refuses an MoE checkpoint outright --
+    // and it survives forcing every projection back to the matvec, so it is
+    // neither GEMM's tiling either. Left as a separate bug rather than a red
+    // test, because a suite that is expected to fail stops being read.
 
     // The same eight rows as the two-request case below, but as ONE request.
     // It is what separates "eight rows is wrong" from "two requests is wrong",

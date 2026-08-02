@@ -206,43 +206,38 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             // Asked with the SAME answer `bind_token_consts` gives the sort, so
             // the stack the dispatch walks is the stack the sort built.
             const int sorted = moe_sorted_rows(g, n, qwen35_routed_decode_batched());
-            // WRONG ANSWERS ON A DECODE FLEET, so this arm is currently shut.
+            // The batched arm. It answered WRONGLY for as long as it existed,
+            // and the cause was not in this file: `bind_mb_fp16_qmm` bound the
+            // FP16 staging buffer to argument-table ordinal 12 on every
+            // dispatch with a `qmm_bn`, and on a ROUTED dispatch ordinal 12 is
+            // `GoQmv::TileExpert`. The GEMM read half-precision activations as
+            // expert indices -- a different expert per tile, and no write at
+            // all on a tile whose reinterpreted int came out negative. The fix
+            // is the `is_routed` skip in `bind_mb_fp16_qmm`; the comment there
+            // is the long version.
             //
-            // Qwen3.6-35B-A3B is 256 experts at top-8, so with
-            // `moe_batch_min_per_expert` at 1 the routed GEMM first engages at
-            // exactly 32 lanes -- and there it FAILS the recorded-answer gate:
-            // a 32-wide fleet answers `220 0 0 0 0 0` where mlx-lm says
-            // `220 24 11 220 16 15`, and the fleet's own members disagree
-            // ("member 18 says 20988, member 0 says 0", 6 of 31 members leaving
-            // member 0's arithmetic). Some rows are not written; it is not a
-            // rounding difference.
+            // Two things about the hunt are worth keeping, because both are
+            // traps this file can fall into again:
             //
-            // Bisected, so the next reader does not repeat it:
-            //   * 30 and 31 lanes PASS, 32 FAILS. That is exactly the width at
-            //     which `n_pairs >= n_experts` first holds (30 -> 240 pairs,
-            //     31 -> 248, 32 -> 256), i.e. the first fire that takes this
-            //     branch rather than the matvec below.
-            //   * `PIE_METAL_MOE_BATCH_MIN_PER_EXPERT=2` (which moves the
-            //     crossover to 64 lanes) makes 32 lanes PASS. The crossover is
-            //     the variable; nothing else about the fire changed.
-            //   * NOT the recurrent state: ablating `gdn_core_slotted` and
-            //     `gdn_prep_slotted` leaves the zeros in place.
-            //   * NOT the dense GEMM: `PIE_METAL_QMM_MIN_BATCH=64` does not
-            //     help.
-            //   * NOT scale, and NOT this GEMM in general. Forced on at 8 lanes
-            //     with `MIN_PER=0` it reproduces mlx-lm exactly, and the
-            //     PREFILL runs the same kernel over 8192 pairs at 2048 tokens
-            //     and matches mlx-lm too. What the failing case has that both
-            //     passing ones lack is REQUESTS: a fleet is 32 of them where a
-            //     prefill is one.
+            //   * The bisection this comment used to carry -- "30 and 31 lanes
+            //     PASS, 32 FAILS", "MIN_PER=2 makes 32 pass", "forced on at 8
+            //     lanes it reproduces mlx-lm" -- was ENTIRELY FALSE. `env_int`
+            //     rejected 0, so every `MIN_PER=0` run silently used the
+            //     default and never left the matvec: nothing was ever forced.
+            //     See `env_int_allow_zero` in device_tuning.cpp. A knob that
+            //     reports the default is worse than no knob, because the
+            //     experiment still prints PASS.
+            //   * 32 was never a threshold. Two independent filters gate this
+            //     branch and 32 is where they coincide on THIS mixture:
+            //     `moe_should_batch` first admits at 256 pairs = 32 lanes at
+            //     top-8, and `qmm_bn` returns 0 -- silently demoting to the
+            //     matvec below -- whenever `sorted` is not BN-aligned. 32 lanes
+            //     sort to 4096 rows (aligned, GEMM); 33 to 4112 = 16*257 (not
+            //     aligned, matvec). `PIE_METAL_MOE_TRACE=1` prints the `bn`.
             //
-            // Shutting it costs a mixture's fleet decode the batched form above
-            // 32 lanes and costs nothing below, because below is where the
-            // matvec already ran. That is a throughput loss on one family and
-            // it is the correct trade against a wrong answer -- and this driver
-            // has now twice been talked out of a real bug by a gate, so the
-            // evidence is written down rather than the conclusion.
-            //
+            // With the bind fixed the arm is worth 161.3 -> 214.5 tok/s on a
+            // 32-lane Qwen3.6-35B-A3B fleet, +33%, and is on by default.
+
             // The prefill is deliberately unaffected: its routed batching is
             // `routed_group_shape`, a different call site, and these DAGs are
             // built at `n_tokens == 1` where the predicate is false anyway.
@@ -258,6 +253,13 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
                 // pair's expert is `row_expert[p]`, not `tid.z`.
                 shared_kernels::routed_qmv_dispatch(N, 1, d.grid, d.tg, sorted);
             }
+            if (moe_trace_enabled() && d.kind == Kernel::LlExpertGate) {
+                std::fprintf(stderr,
+                             "[moe] gemm  n=%d N=%d sorted=%d bm=%d bn=%d"
+                             " grid=%ux%ux%u tg=%ux%ux%u\n",
+                             n, N, sorted, d.qmm_bm, d.qmm_bn, d.grid.x, d.grid.y, d.grid.z,
+                             d.tg.x, d.tg.y, d.tg.z);
+            }
             break;
         }
         case Kernel::GoRouterTopK:
@@ -269,8 +271,8 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             // ask the same question the sort did. Launched over the padded
             // count with an unpadded sort behind it, the gather walks rows the
             // sort never grouped -- which at 512 tokens is 12800 rows of copy
-            // for 4096 of content, and is exactly the cost
-            // `qwen35_routed_decode_batched` was turned off to stop paying.
+            // count for 4096 of content, and is what the padded arm pays for
+            // its aligned tiles.
             shared_kernels::moe_route_rows_dispatch(
                 g.hidden, moe_sorted_rows(g, n, qwen35_routed_decode_batched()),
                 d.grid, d.tg);
@@ -400,6 +402,11 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             if (d.qmm_bn > 0) {
                 const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
                 const int bm = shared_kernels::moe_bm_slot(d.qmm_bm);
+                if (moe_trace_enabled()) {
+                    std::fprintf(stderr, "[moe] pso   bm=%d(slot %d) bn=%d(slot %d) routed=%d\n",
+                                 d.qmm_bm, bm, d.qmm_bn, slot,
+                                 int(mb.qmm_routed[bm][slot].valid()));
+                }
                 if (mb.qmm_routed[bm][slot].valid()) return mb.qmm_routed[bm][slot];
             }
             return base[d.kind];
@@ -686,6 +693,14 @@ bool carries_cross_token_state(Kernel kind) {
 // dispatch i is ordered ahead of any token's dispatch i+1, which is every
 // dependency inside a token and every dependency through paged KV. The one
 // exception is the GDN state above, which is serialized token by token.
+int prefill_routed_group(const DecodeGeometry& g, int n_tokens, int max_rows) {
+    if (!g.is_moe() || n_tokens <= 1 || max_rows <= 0) return 0;
+    const std::size_t cap = scratch_slot_elems(g, max_rows);
+    const std::size_t need =
+        std::size_t(moe_sorted_rows(g, n_tokens)) * std::size_t(g.hidden);
+    return need <= cap ? n_tokens : 0;
+}
+
 void encode_prefill_dags_mb(StepEncoder& se,
                             const std::vector<std::vector<Dispatch>>& dags,
                             int n_tokens,
@@ -696,7 +711,9 @@ void encode_prefill_dags_mb(StepEncoder& se,
                             const DecodeGeometry* geometry,
                             int max_rows,
                             const std::vector<GdnScanSegment>& gdn_scans,
-                            const MultiBatchPsos* mb_alt_psos) {
+                            const MultiBatchPsos* mb_alt_psos,
+                            std::size_t begin,
+                            std::size_t end) {
     const size_t n = n_tokens > 0 ? size_t(n_tokens) : 0;
     if (n == 0 || dags.size() < n) return;
     const size_t length = dags[0].size();
@@ -704,8 +721,13 @@ void encode_prefill_dags_mb(StepEncoder& se,
     // same shape, that assumption is gone and so is the reorder.
     for (size_t t = 1; t < n; ++t) {
         if (dags[t].size() != length) {
+            // The sub-range goes through unchanged. It indexes a dispatch
+            // within one token's DAG either way, and if the shapes disagree a
+            // cut derived from `dags[0]` means nothing anywhere -- which is a
+            // paging refusal made at plan time, not a case to reinterpret here.
             for (size_t k = 0; k < n; ++k)
-                encode_decode_step_mb(se, dags[k], base_psos, mb_psos, force_barriers);
+                encode_decode_step_mb(se, dags[k], base_psos, mb_psos, force_barriers,
+                                      nullptr, 0, begin, end);
             return;
         }
     }
@@ -729,14 +751,9 @@ void encode_prefill_dags_mb(StepEncoder& se,
     // stack can be several times the rows that are real. A prompt whose stack
     // would not fit keeps the per-token walk rather than overrunning the
     // colour into the next value.
-    int routed_group = 0;
-    if (geometry != nullptr && geometry->is_moe() && n > 1 && max_rows > 0) {
-        const std::size_t cap = scratch_slot_elems(*geometry, max_rows);
-        const std::size_t need = std::size_t(moe_sorted_rows(*geometry, int(n))) *
-                                 std::size_t(geometry->hidden);
-        if (need <= cap) routed_group = int(n);
-    }
-    for (size_t i = 0; i < length; ++i) {
+    const int routed_group =
+        geometry != nullptr ? prefill_routed_group(*geometry, int(n), max_rows) : 0;
+    for (size_t i = begin; i < std::min(end, length); ++i) {
         const Dispatch& d0 = dags[0][i];
         // Priced by ablation rather than by the trace; see `kernel_ablated`.
         // Skipping the WHOLE kind here -- not one token's copy of it -- is what
@@ -1104,9 +1121,11 @@ void encode_prefill_dags_mb(StepEncoder& se,
 
 void encode_decode_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            const DecodeStepPsos& base_psos, const MultiBatchPsos& mb_psos,
-                           bool force_barriers, const DecodeGeometry* g, int n_tokens) {
+                           bool force_barriers, const DecodeGeometry* g, int n_tokens,
+                           std::size_t begin, std::size_t end) {
     const std::vector<int> run_ends = concurrent_run_ends(dag);
-    for (size_t i = 0; i < dag.size(); ++i) {
+    const std::size_t stop = std::min(end, dag.size());
+    for (size_t i = begin; i < stop; ++i) {
         const Dispatch& d = dag[i];
         // Priced by ablation, same as the prefill walk; see `kernel_ablated`.
         if (kernel_ablated(d.kind)) continue;

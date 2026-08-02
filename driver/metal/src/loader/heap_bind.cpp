@@ -1496,7 +1496,8 @@ BoundDecode stage_decode_storage(
     const pie_loader::LoadPlan& load,
     const DecodeGeometry& g,
     const HeapPlan& heap_plan,
-    const std::function<bool(const std::string&)>& streams) {
+    const std::function<bool(const std::string&)>& streams,
+    const ExpertSlabRequest& slab) {
     BoundDecode b;
     b.plan = heap_plan;
     b.gdn.resize(g.n_layers);
@@ -1504,10 +1505,11 @@ BoundDecode stage_decode_storage(
 
     {
         StagedWeights staged =
-            stage_plan_weights(ctx, std::move(view), load, heap_plan.weights_bytes, streams);
+            stage_plan_weights(ctx, std::move(view), load, heap_plan.weights_bytes, streams, slab);
         b.weights_region = staged.weights_region;
         b.weights = std::move(staged.weights);
         b.weight_mapping = std::move(staged.weight_mapping);
+        b.slab = std::move(staged.slab);
     }
 
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──

@@ -1004,6 +1004,11 @@ int Context::Impl::load_model(
         family == model::Family::Kimi,
         family == model::Family::Glm5,
         family == model::Family::KimiK3,
+        // Only LlamaLike overrides `IModel::prefill_graph_capturable`, so it is
+        // the only family that can replay a prefill-carrying wave -- and the
+        // only one that should be charged the enlarged graph-mode attention
+        // workspace.
+        family == model::Family::LlamaLike,
         kv_format, runtime_quant_scratch_base, verbose);
     std::size_t free_device_bytes = 0;
     std::size_t total_device_bytes = 0;
@@ -1085,8 +1090,16 @@ int Context::Impl::load_model(
         || (family == model::Family::NemotronH &&
             nemotron_h_mamba_layers > 0)
         ;
+    // Must match the planner's `state_slots` (see PIE_RS_SLOT_MULT there):
+    // the pool has to physically hold what the budget reserved, or admission
+    // seats lanes the cache cannot back.
+    const int rs_slot_mult = [] {
+        const char* v = std::getenv("PIE_RS_SLOT_MULT");
+        const int n = (v != nullptr) ? std::atoi(v) : 1;
+        return (n >= 1 && n <= 8) ? n : 1;
+    }();
     const int runtime_state_slots =
-        has_recurrent_state_cache ? mem_plan.max_requests : 0;
+        has_recurrent_state_cache ? mem_plan.max_requests * rs_slot_mult : 0;
     const int graph_pad_slot =
         has_recurrent_state_cache && runtime_state_slots > 0 && graph_pad_page >= 0
             ? runtime_state_slots
@@ -1278,13 +1291,50 @@ int Context::Impl::load_model(
                 cfg_q.hidden_size,
                 qwen3_5_runtime_rs_slots);
         }
+        if (std::getenv("PIE_RS_DEBUG") != nullptr) {
+            std::fprintf(stderr, "[rs-arena] after cache: %.1fMiB\n",
+                         state_allocator_->allocated_bytes() / 1048576.0);
+        }
         const int stash_width = conv_dim + 2 * local_linear_value_heads;
         {
             ScopedCudaArenaAllocator arena(*state_allocator_);
+            // Size the frozen-verify stash by the widest VERIFY fire, not by
+            // `max_workspace_tokens`.
+            //
+            // The stash caches in-proj activations so a commit-advance replay
+            // can skip the GEMM; it is only ever written when
+            // `verify_frozen()`, i.e. on a speculative verify fire. Such a fire
+            // carries at most one base token per request plus that request's
+            // drafts -- `aggregate_mtp_draft_capacity` is already
+            // max_requests * native_mtp_num_drafts. Prefill never touches it.
+            //
+            // Sized from max_workspace_tokens it was 8192 x 10336 x 48 x 2 =
+            // 7752 MiB on Qwen3.6-27B, LARGER than the recurrent states, and
+            // the state arena is charged in full at every frame commit -- so it
+            // was spending ~7.6 GiB of the lane budget on a buffer this
+            // workload never writes. The bound below is 256 tokens there.
+            //
+            // PIE_RS_STASH_TOKENS still overrides, for bisecting.
+            const int verify_stash_tokens = std::min(
+                max_workspace_tokens,
+                std::max(1, aggregate_mtp_draft_capacity +
+                               mem_plan.max_requests));
             qwen3_5_state_cache.configure_verify_hidden_stash(
-                max_workspace_tokens, stash_width);
+                verify_stash_tokens, stash_width);
+            if (std::getenv("PIE_RS_DEBUG") != nullptr) {
+                std::fprintf(stderr, "[rs-arena] after stash: %.1fMiB\n",
+                             state_allocator_->allocated_bytes() / 1048576.0);
+            }
             qwen3_5_state_cache.configure_rs_buffer_pool(
                 mem_plan.kv_page_size, stash_width, qwen3_5_runtime_rs_slots);
+            if (std::getenv("PIE_RS_DEBUG") != nullptr) {
+                std::fprintf(stderr,
+                             "[rs-arena] after buffer_pool: %.1fMiB "
+                             "(page_tokens=%d stash_width=%d slots=%d)\n",
+                             state_allocator_->allocated_bytes() / 1048576.0,
+                             mem_plan.kv_page_size, stash_width,
+                             qwen3_5_runtime_rs_slots);
+            }
         }
         if (family == model::Family::Qwen3_5Moe) {
             ScopedCudaArenaAllocator arena(*workspace_allocator_);
@@ -2096,6 +2146,24 @@ Context::Impl::frame_targets(
         {workspace_allocator_.get(), 1, 1},
         {attention_allocator_.get(), 1, 1},
     };
+    {
+        static const bool dbg = [] {
+            const char* v = std::getenv("PIE_ARENA_DEBUG");
+            return v != nullptr && v[0] == '1';
+        }();
+        static std::atomic<int> n{0};
+        if (dbg && n.fetch_add(1) < 4) {
+            std::fprintf(stderr,
+                "[arena] kv_req=%zu/%zu kv_alloc=%.1fMiB | state_req=%zu/%zu "
+                "state_alloc=%.1fMiB | ws_alloc=%.1fMiB | attn_alloc=%.1fMiB\n",
+                kv_required, kv_capacity,
+                kv_allocator_->allocated_bytes() / 1048576.0,
+                state_required, state_capacity,
+                state_allocator_->allocated_bytes() / 1048576.0,
+                workspace_allocator_->allocated_bytes() / 1048576.0,
+                attention_allocator_->allocated_bytes() / 1048576.0);
+        }
+    }
     if (target_bytes != nullptr) {
         *target_bytes = {
             kv_allocator_->target_bytes(kv_required, kv_capacity),
@@ -2182,7 +2250,33 @@ class StepPhaseTimer {
 
 }  // namespace
 
+// `PIE_LANE_BALLAST_US`: spin this many microseconds of pure host time at the
+// top of every launch. A CALIBRATION probe, never a behaviour: the driver lane
+// is one thread and every launch's host work is serial on it, so before
+// spending effort shaving that work we need its marginal price in tok/s. Adding
+// a known amount and reading the slope answers that in one sweep; the answer
+// divides through to say what a microsecond saved is worth. Zero/unset = off,
+// one predicted branch.
+namespace {
+std::uint64_t lane_ballast_us() {
+    static const std::uint64_t value = [] {
+        const char* const env = std::getenv("PIE_LANE_BALLAST_US");
+        if (env == nullptr || *env == '\0') return std::uint64_t{0};
+        const long long parsed = std::atoll(env);
+        return parsed > 0 ? static_cast<std::uint64_t>(parsed)
+                          : std::uint64_t{0};
+    }();
+    return value;
+}
+}  // namespace
+
 int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
+    if (const std::uint64_t ballast = lane_ballast_us(); ballast != 0) {
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::microseconds(ballast);
+        while (std::chrono::steady_clock::now() < deadline) {
+        }
+    }
     pie_cuda_driver::ops::ScopedRuntimeQuantContext quant_scope(
         runtime_quant_context_);
     const PieStepDesc* steps = frame.steps.ptr;
