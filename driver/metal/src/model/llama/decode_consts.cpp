@@ -160,6 +160,13 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::NKvHeads, g.n_kv_heads,
                                              &count);
                     bind_const<float>(ctx, ord, (std::uint8_t)P::Scale, scale, &count);
+                    // Full attention, but the window is still BOUND. One paged
+                    // kernel serves the sliding families and this one, so the
+                    // slot exists either way, and <= 0 is how "no window" is
+                    // spelled. Leaving it unbound reads whatever the argument
+                    // table last held at that ordinal -- a window nobody asked
+                    // for, which truncates attention rather than crashing.
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Window, 0, &count);
                     break;
                 }
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Sdpa::GqaFactor, gqa,

@@ -31,8 +31,16 @@ Kernel shared_kind(Kind k, const LlamaGeometry& g);
 Kernel pso_kind(Kind k);
 
 /// The pipeline a dispatch runs on.
+///
+/// `g.paged_kv_enabled` decides the two ATTENTION kinds, and it decides them
+/// together. gpt-oss answers this with a second selector, `pso_for_paged`,
+/// which is a switch over two kinds falling through to the first -- but the
+/// choice is a property of the geometry, not of the caller, and the geometry
+/// is already an argument here. `mb` is where the paged KV scatter lives; a
+/// paged geometry without it is a load-time error rather than a silent run of
+/// the ring kernel against page-table binds.
 Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& base,
-            const LlamaPsos& ll);
+            const LlamaPsos& ll, const MultiBatchPsos* mb = nullptr);
 
 /// Its grid and threadgroup.
 void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadgroup& tg);
@@ -44,6 +52,6 @@ std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag);
 /// Walk the DAG with a real encoder.
 void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                        const LlamaGeometry& g, const DecodeStepPsos& base, const LlamaPsos& ll,
-                       int ordinal_base = 0);
+                       int ordinal_base = 0, const MultiBatchPsos* mb = nullptr);
 
 }  // namespace pie::metal::llama

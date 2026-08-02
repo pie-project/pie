@@ -122,11 +122,21 @@ Kernel pso_kind(Kind k) {
 }
 
 Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& base,
-            const LlamaPsos& ll) {
+            const LlamaPsos& ll, const MultiBatchPsos* mb) {
     switch (d.kind) {
         // The family's own PSOs: a 128-wide head, and the routed set.
         case Kind::Sdpa:
             return g.paged_kv_enabled ? ll.sdpa_paged_d128 : ll.sdpa_d128;
+        // The append follows attention. Both KV kinds must agree on the ABI:
+        // the binder writes page tables into slots the ring kernel reads as a
+        // head stride, so a mismatch here is a scatter through a pointer made
+        // of arithmetic, not an unbound slot.
+        case Kind::KvAppend:
+            if (g.paged_kv_enabled) {
+                if (mb == nullptr || !mb->kv_append_paged.valid()) return Pso{};
+                return mb->kv_append_paged;
+            }
+            break;
         case Kind::RowGather:     return ll.row_gather;
         case Kind::RouterTopK:    return ll.router_topk;
         case Kind::ExpertCombine: return ll.expert_combine;
@@ -295,14 +305,15 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
 }
 
 void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag, const LlamaGeometry& g,
-                       const DecodeStepPsos& base, const LlamaPsos& ll, int ordinal_base) {
+                       const DecodeStepPsos& base, const LlamaPsos& ll, int ordinal_base,
+                       const MultiBatchPsos* mb) {
     const std::vector<int> run_ends = llama_run_ends(dag);
     for (std::size_t i = 0; i < dag.size(); ++i) {
         const Dispatch& d = dag[i];
         Grid grid;
         Threadgroup tg;
         launch_shape(d, g, grid, tg);
-        se.set_pso(pso_for(d, g, base, ll));
+        se.set_pso(pso_for(d, g, base, ll, mb));
         se.set_argtable_ordinal(ordinal_base + d.ordinal);
         se.dispatch(grid, tg);
         // A barrier after every dispatch except inside a concurrency run: the

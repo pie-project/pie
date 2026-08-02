@@ -94,7 +94,16 @@ LlamaGeometry base() {
 /// place the answer lives. A count that is too LOW passes vacuously, so these
 /// are the full declared arity of each shader rather than the part that seemed
 /// interesting.
-int declared_slots(Kind k) {
+int declared_slots(Kind k, bool paged = false) {
+    // The two attention kinds have two ABIs, and the paged one is WIDER. Its
+    // extra slots are the page tables, the per-token request map and the
+    // sliding window -- and the window is the interesting one, because llama
+    // is full-attention and so looks like it has nothing to say about it. One
+    // paged kernel serves both, so the slot is read either way.
+    if (paged && k == Kind::KvAppend) return 15;   // KvAppendPaged, K..WOff
+    // SdpaPaged Q..Window. `Sinks` (16) is gpt-oss's, and this family compiles
+    // the non-sink instantiation, so it is deliberately not counted.
+    if (paged && k == Kind::Sdpa) return 16;
     switch (k) {
         // w, scales, biases, x, y, K, N.
         case Kind::QmvQ:
@@ -210,8 +219,9 @@ void stage_dummy_weights(RawMetalContext& ctx, BoundLlama& b, const std::vector<
     }
 }
 
-void check_binds(const char* who, LlamaGeometry g, RawMetalContext& ctx) {
+void check_binds(const char* who, LlamaGeometry g, RawMetalContext& ctx, bool paged = false) {
     std::printf("\n-- %s --\n", who);
+    g.paged_kv_enabled = paged;
     const std::vector<Dispatch> dag = build_llama_dag(g, /*with_argmax=*/false);
     const ScratchPlan plan = build_llama_scratch(dag, g);
     const model::ScratchColoring col = color_llama_scratch(dag, plan);
@@ -236,11 +246,11 @@ void check_binds(const char* who, LlamaGeometry g, RawMetalContext& ctx) {
         b.kv[std::size_t(L)].v = ctx.heap_alloc(bytes);
     }
 
-    const int bound = bind_llama_consts(ctx, dag, g, /*rows=*/1, /*paged=*/false);
+    const int bound = bind_llama_consts(ctx, dag, g, /*rows=*/1, paged);
     expect(bound > 0, std::string(who) + ": constants were bound");
     bool threw = false;
     try {
-        bind_llama_dag(ctx, b, dag, g, col);
+        bind_llama_dag(ctx, b, dag, g, col, /*ordinal_base=*/0, paged);
     } catch (const std::exception& e) {
         threw = true;
         std::printf("    bind threw: %s\n", e.what());
@@ -250,7 +260,7 @@ void check_binds(const char* who, LlamaGeometry g, RawMetalContext& ctx) {
     // The question this test exists for.
     int missing = 0;
     for (const Dispatch& d : dag) {
-        const int n = declared_slots(d.kind);
+        const int n = declared_slots(d.kind, paged);
         for (int slot = 0; slot < n; ++slot) {
             if (ctx.arg_slot_is_bound(d.ordinal, std::uint8_t(slot))) continue;
             if (missing < 12) {
@@ -299,6 +309,14 @@ int main() {
     LlamaGeometry untied = base();
     untied.tied_embeddings = false;
     check_binds("untied head", untied, *ctx);
+
+    // The paged ABI, which is the same DAG bound against wider attention
+    // kernels. Worth its own pass rather than trusting the ring one: the two
+    // differ only in two switch arms, and the slots those arms do NOT write
+    // are exactly the ones nobody notices -- an unbound page table reads as a
+    // pointer made from whatever the ordinal held last.
+    check_binds("llama-3 (dense, paged)", base(), *ctx, /*paged=*/true);
+    check_binds("qwen3-moe (routed, paged)", moe, *ctx, /*paged=*/true);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

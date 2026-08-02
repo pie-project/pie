@@ -56,9 +56,24 @@ struct BoundLlama {
 ScratchColoring color_llama_scratch(const std::vector<Dispatch>& dag, const ScratchPlan& plan,
                                     bool no_recycle = false);
 
+/// Bind one step's argument tables.
+///
+/// `paged` selects the ATTENTION ABI, and it is one binder rather than two.
+/// gpt-oss carries a second, near-identical `bind_*_dag_paged`, and the only
+/// thing that genuinely differs between the two is a pair of switch arms: the
+/// paged KV kernels take the page tables and the per-token request map, where
+/// the ring takes a single base pointer and a length. Everything else -- the
+/// weights, the activations, the embedding and rope IO -- is the same code
+/// twice. Llama does not need the sink-slot remap that motivated the split
+/// there, so it takes the flag instead.
+///
+/// It must agree with the `paged` passed to `bind_llama_consts`, which selects
+/// the matching constant layout. Disagreeing is not a crash: the ring's
+/// `KHeadStride` lands on the paged ABI's `KvPageIndices`, and the kernel
+/// walks a page table made of a stride.
 void bind_llama_dag(RawMetalContext& ctx, const BoundLlama& b, const std::vector<Dispatch>& dag,
                     const LlamaGeometry& g, const ScratchColoring& scratch,
-                    int ordinal_base = 0);
+                    int ordinal_base = 0, bool paged = false);
 
 /// Bytes of k (== bytes of v) one layer needs for `max_ctx` tokens.
 inline std::size_t llama_kv_bytes_per_layer(const LlamaGeometry& g, int max_ctx,

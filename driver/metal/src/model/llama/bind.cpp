@@ -40,8 +40,12 @@ ScratchColoring color_llama_scratch(const std::vector<Dispatch>& dag, const Scra
 }
 
 void bind_llama_dag(RawMetalContext& ctx, const BoundLlama& b, const std::vector<Dispatch>& dag,
-                    const LlamaGeometry& g, const ScratchColoring& scratch, int ordinal_base) {
+                    const LlamaGeometry& g, const ScratchColoring& scratch, int ordinal_base,
+                    bool paged) {
     auto io = [&](IoSlot s) -> const SlotHandle& { return b.io[static_cast<int>(s)]; };
+    if (paged && b.kv.size() < std::size_t(g.n_layers)) {
+        throw std::runtime_error("llama bind: KV pages do not cover all layers");
+    }
 
     for (std::size_t di = 0; di < dag.size(); ++di) {
         const Dispatch& d = dag[di];
@@ -72,6 +76,19 @@ void bind_llama_dag(RawMetalContext& ctx, const BoundLlama& b, const std::vector
                 break;
             case Kind::KvAppend: {
                 const auto& kv = b.kv[std::size_t(L)];
+                if (paged) {
+                    using P = bind::KvAppendPaged;
+                    bind_slot(ctx, ord, (std::uint8_t)P::KPages, kv.k);
+                    bind_slot(ctx, ord, (std::uint8_t)P::VPages, kv.v);
+                    bind_slot(ctx, ord, (std::uint8_t)P::PositionIds, io(IoSlot::Position));
+                    bind_slot(ctx, ord, (std::uint8_t)P::KvPageIndices,
+                              io(IoSlot::KvPageIndices));
+                    bind_slot(ctx, ord, (std::uint8_t)P::KvPageIndptr, io(IoSlot::KvPageIndptr));
+                    bind_slot(ctx, ord, (std::uint8_t)P::ReqOfToken, io(IoSlot::ReqOfToken));
+                    bind_slot(ctx, ord, (std::uint8_t)P::WPage, io(IoSlot::WPage));
+                    bind_slot(ctx, ord, (std::uint8_t)P::WOff, io(IoSlot::WOff));
+                    break;
+                }
                 bind_slot(ctx, ord, (std::uint8_t)bind::KvAppend::KPages, kv.k);
                 bind_slot(ctx, ord, (std::uint8_t)bind::KvAppend::VPages, kv.v);
                 bind_slot(ctx, ord, (std::uint8_t)bind::KvAppend::PositionPtr,
@@ -80,6 +97,22 @@ void bind_llama_dag(RawMetalContext& ctx, const BoundLlama& b, const std::vector
             }
             case Kind::Sdpa: {
                 const auto& kv = b.kv[std::size_t(L)];
+                if (paged) {
+                    using P = bind::SdpaPaged;
+                    bind_slot(ctx, ord, (std::uint8_t)P::KPages, kv.k);
+                    bind_slot(ctx, ord, (std::uint8_t)P::VPages, kv.v);
+                    bind_slot(ctx, ord, (std::uint8_t)P::PositionIds, io(IoSlot::Position));
+                    bind_slot(ctx, ord, (std::uint8_t)P::ReqOfToken, io(IoSlot::ReqOfToken));
+                    bind_slot(ctx, ord, (std::uint8_t)P::KvPageIndices,
+                              io(IoSlot::KvPageIndices));
+                    bind_slot(ctx, ord, (std::uint8_t)P::KvPageIndptr, io(IoSlot::KvPageIndptr));
+                    bind_slot(ctx, ord, (std::uint8_t)P::AttnMask, io(IoSlot::AttnMask));
+                    bind_slot(ctx, ord, (std::uint8_t)P::AttnMaskStride,
+                              io(IoSlot::AttnMaskStride));
+                    bind_slot(ctx, ord, (std::uint8_t)P::AttnMaskEnabled,
+                              io(IoSlot::AttnMaskEnabled));
+                    break;
+                }
                 bind_slot(ctx, ord, (std::uint8_t)bind::Sdpa::K, kv.k);
                 bind_slot(ctx, ord, (std::uint8_t)bind::Sdpa::V, kv.v);
                 bind_slot(ctx, ord, (std::uint8_t)bind::Sdpa::N, io(IoSlot::SeqLen));
