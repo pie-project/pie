@@ -12,6 +12,12 @@ struct PieLoaderPlan;
 
 namespace pie_loader {
 
+/// The alignment to write. 16 KiB is Apple silicon's page; x86-64 Linux uses 4
+/// KiB, which divides it, so one artifact is streamable on both. Padding to the
+/// larger costs at most 12 KiB per aligned tensor, against the megabytes that
+/// make a tensor worth streaming in the first place.
+constexpr static const uint64_t STREAM_PAGE_BYTES = 16384;
+
 /// `PieLoaderExprNode::src` when the node has no single operand.
 constexpr static const uint32_t PIE_LOADER_NO_NODE = UINT32_MAX;
 
@@ -194,6 +200,9 @@ enum class PieLoaderScaleForm : uint32_t {
   RawE8M0 = 0,
   /// F32 multipliers; expand before the GEMM sees them.
   F32Factors = 1,
+  /// BF16 multipliers paired with the zero points named by
+  /// `zero_point_tensor_id`: an element is `code * scale + zero`.
+  Bf16AffineFactors = 2,
 };
 
 /// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
@@ -844,6 +853,12 @@ struct PieLoaderTargetView {
 struct PieLoaderQuantAttachmentView {
   uint32_t tensor_id;
   uint32_t scale_tensor_id;
+  /// The tensor holding this weight's zero points, for an affine scheme, or
+  /// [`PIE_LOADER_NO_TENSOR`] for a symmetric one. An affine weight without it
+  /// cannot be dequantized, so a driver reading a `Bf16AffineFactors`
+  /// attachment is entitled to treat the sentinel as a malformed plan rather
+  /// than as an offset of zero.
+  uint32_t zero_point_tensor_id;
   PieLoaderQuantGranularity granularity;
   uint32_t group_size;
   uint32_t channel_axis;

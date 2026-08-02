@@ -315,6 +315,17 @@ impl HostExecutor<'_> {
             TileMapKind::Scale => {
                 self.scale_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
             }
+            // The one transform with more than one output, so it writes its own
+            // buffers and returns rather than falling through to the single
+            // -destination tail below.
+            TileMapKind::Encode => {
+                let written = self.encode_bytes(&input, outputs, &transform)?;
+                for (buffer, bytes) in written {
+                    self.max_tile_write_bytes = self.max_tile_write_bytes.max(bytes.len());
+                    self.write_buffer(buffer, 0, &bytes)?;
+                }
+                return Ok(());
+            }
             other => {
                 return Err(invalid(format!(
                     "host storage executor does not implement {other:?} transforms"
@@ -434,6 +445,112 @@ impl HostExecutor<'_> {
     /// The factors' own extents are derived from the two, not read: the shape
     /// ratio is what defines the blocking, and reading a third statement of it
     /// would be a third thing to disagree.
+    /// `Encode` quantizes, and is the only transform that writes more than one
+    /// tensor: a quantized weight is unreadable without the metadata the same
+    /// pass computes, so the scales -- and, for an affine scheme, the zero
+    /// points -- come out of the kernel that decided them.
+    ///
+    /// `outputs` is positional and the loader fixed the order: the weight, then
+    /// the metadata in the order `quant_metadata_outputs` declared it.
+    fn encode_bytes(
+        &self,
+        bytes: &[u8],
+        outputs: &[BufferId],
+        transform: &TransformSpec,
+    ) -> Result<Vec<(BufferId, Vec<u8>)>, Error> {
+        let Some(scheme) = transform.to else {
+            return Err(invalid("Encode carries no destination scheme"));
+        };
+        if scheme != QuantScheme::MlxAffineU4 {
+            return Err(invalid(format!(
+                "host Encode does not implement {scheme:?}"
+            )));
+        }
+        let [weight, scales, biases] = outputs else {
+            return Err(invalid(format!(
+                "encoding to {scheme:?} writes a weight, its scales and its zero \
+                 points, but the instruction has {} outputs",
+                outputs.len()
+            )));
+        };
+        let shape = self
+            .index
+            .buffer_tensor(self.plan, *weight)
+            .ok_or_else(|| invalid("Encode output has no tensor type"))?
+            .shape
+            .clone();
+        let [rows, cols] = shape[..] else {
+            return Err(invalid(format!(
+                "encoding to {scheme:?} walks [rows, cols] tiles, not {shape:?}"
+            )));
+        };
+        let group = i64::from(scheme.default_group_size());
+        if group <= 0 || cols % group != 0 {
+            return Err(invalid(format!(
+                "encoding to {scheme:?} groups {group} columns, which does not \
+                 divide the {cols} of {shape:?}"
+            )));
+        }
+        // The operand is whatever the chain decoded to; `decode_values` gives
+        // f64 and the quantizer works in f32, which is what MLX's own encoder
+        // does and therefore what the codes have to be rounded from.
+        let values = decode_values(bytes, self.buffer_dtype_of_input(*weight, bytes.len())?)?;
+        if values.len() as i64 != rows * cols {
+            return Err(invalid(format!(
+                "Encode was handed {} elements for the {shape:?} it must quantize",
+                values.len()
+            )));
+        }
+
+        let n_groups = (rows * cols / group) as usize;
+        let mut packed = Vec::with_capacity(values.len() / 8 * 4);
+        let mut scale_values = Vec::with_capacity(n_groups);
+        let mut bias_values = Vec::with_capacity(n_groups);
+        for chunk in values.chunks(group as usize) {
+            let (scale, bias) = mlx_affine_group_params(chunk);
+            for word in chunk.chunks(8) {
+                let mut out: u32 = 0;
+                for (k, &value) in word.iter().enumerate() {
+                    let code = (((value as f32) - bias) / scale)
+                        .round_ties_even()
+                        .clamp(0.0, 15.0) as u32;
+                    out |= code << (k * 4);
+                }
+                packed.extend_from_slice(&out.to_le_bytes());
+            }
+            scale_values.push(f64::from(scale));
+            bias_values.push(f64::from(bias));
+        }
+        Ok(vec![
+            (*weight, packed),
+            (*scales, encode_values(&scale_values, DType::BF16)?),
+            (*biases, encode_values(&bias_values, DType::BF16)?),
+        ])
+    }
+
+    /// The dtype an Encode's operand bytes are read as.
+    ///
+    /// The operand is an intermediate the chain produced, so its width is what
+    /// the byte count and the destination's element count agree on: the
+    /// destination buffer is quantized, and asking it for a `DType` would get
+    /// the scheme's logical type rather than the operand's storage type.
+    fn buffer_dtype_of_input(&self, weight: BufferId, bytes: usize) -> Result<DType, Error> {
+        let shape = &self
+            .index
+            .buffer_tensor(self.plan, weight)
+            .ok_or_else(|| invalid("Encode output has no tensor type"))?
+            .shape;
+        let elements: i64 = shape.iter().product();
+        match bytes as i64 / elements.max(1) {
+            2 => Ok(DType::BF16),
+            4 => Ok(DType::F32),
+            other => Err(invalid(format!(
+                "Encode operand is {other} bytes per element, which is neither \
+                 the BF16 nor the F32 a quantizer reads"
+            ))),
+        }
+    }
+
     fn scale_per_block(
         &self,
         mut values: Vec<f64>,
@@ -869,8 +986,50 @@ fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
         .collect()
 }
 
-fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(values.len() * dtype.bytes() as usize);
+/// One group's affine scale and zero point, by MLX's rule.
+///
+/// Transcribed from `mlx/backend/cpu/quantized.cpp::quantize`, because the
+/// scheme is MLX's and a checkpoint this produces is meant to be
+/// interchangeable with one `mlx_lm convert` produced. Three details are worth
+/// naming, since none is what an independently written affine quantizer would
+/// do:
+///
+///  * **The scale is usually negative.** It is negated unless the group's
+///    minimum is the larger in magnitude, which puts code 0 on whichever end
+///    dominates. Dequantization is `code * scale + zero` either way, so a
+///    consumer never sees the difference -- but a producer that "fixed" the sign
+///    would place the codes on the other end of the group's range.
+///  * **The endpoint is snapped, not the scale.** `scale` is recomputed as
+///    `edge / rint(edge / scale)` so that the dominant endpoint lands exactly on
+///    a code, which is what keeps the largest magnitude in the group exact.
+///  * **`eps` floors the scale** so a constant group -- every expert bias row
+///    that is all zeros, for one -- divides by `1e-7` instead of by zero.
+fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
+    const N_BINS: f32 = 15.0;
+    const EPS: f32 = 1e-7;
+    let mut w_min = f32::INFINITY;
+    let mut w_max = f32::NEG_INFINITY;
+    for &value in values {
+        let value = value as f32;
+        w_min = w_min.min(value);
+        w_max = w_max.max(value);
+    }
+    let mask = w_min.abs() > w_max.abs();
+    let mut scale = ((w_max - w_min) / N_BINS).max(EPS);
+    if !mask {
+        scale = -scale;
+    }
+    let edge = if mask { w_min } else { w_max };
+    let q0 = (edge / scale).round_ties_even();
+    let mut bias = 0.0f32;
+    if q0 != 0.0 {
+        scale = edge / q0;
+        bias = edge;
+    }
+    (scale, bias)
+}
+
+fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {    let mut out = Vec::with_capacity(values.len() * dtype.bytes() as usize);
     for &value in values {
         match dtype {
             DType::F32 => out.extend_from_slice(&(value as f32).to_le_bytes()),

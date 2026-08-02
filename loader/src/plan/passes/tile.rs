@@ -32,11 +32,15 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme, TensorDe
 pub const CUDA_TILE_MAP_MASK: u32 =
     TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_REBLOCK | TILE_MAP_REPACK | TILE_MAP_SCALE;
 
-/// Metal's load executor binds tensors into a heap and runs no tile-map
-/// transforms at all. The loader will therefore not emit a transform this
-/// backend could not run: every `TileMap` that reaches Metal lowering is a
-/// contradiction `validate-target-support` has already rejected.
-pub const METAL_TILE_MAP_MASK: u32 = 0;
+/// The transforms `driver/metal`'s load-time kernels implement. Mirrored in C++
+/// as `kMetalTileMapMask`, which is defined in terms of the generated bits
+/// rather than restated, so the two cannot drift.
+///
+/// `SCALE` decodes a block-scaled scheme to values and `CAST` re-encodes them as
+/// the affine-U4 that driver's matvecs read, which is what lets it load the
+/// published MXFP4 gpt-oss checkpoint directly. It has no repacking or
+/// reblocking kernels, so those bits stay clear.
+pub const METAL_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE;
 
 /// The transforms `host_executor` implements. Not a device capability, so it is
 /// not part of the C surface.

@@ -2481,6 +2481,7 @@
     {
       "tensor": 2,
       "scale_tensor": 21,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2489,6 +2490,7 @@
     {
       "tensor": 3,
       "scale_tensor": 22,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2497,6 +2499,7 @@
     {
       "tensor": 4,
       "scale_tensor": 23,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2505,6 +2508,7 @@
     {
       "tensor": 5,
       "scale_tensor": 24,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2513,6 +2517,7 @@
     {
       "tensor": 7,
       "scale_tensor": 25,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2521,6 +2526,7 @@
     {
       "tensor": 8,
       "scale_tensor": 26,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2529,6 +2535,7 @@
     {
       "tensor": 9,
       "scale_tensor": 27,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2537,6 +2544,7 @@
     {
       "tensor": 11,
       "scale_tensor": 28,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2545,6 +2553,7 @@
     {
       "tensor": 12,
       "scale_tensor": 29,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2553,6 +2562,7 @@
     {
       "tensor": 13,
       "scale_tensor": 30,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2561,6 +2571,7 @@
     {
       "tensor": 14,
       "scale_tensor": 31,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2569,6 +2580,7 @@
     {
       "tensor": 16,
       "scale_tensor": 32,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2577,6 +2589,7 @@
     {
       "tensor": 17,
       "scale_tensor": 33,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,
@@ -2585,6 +2598,7 @@
     {
       "tensor": 18,
       "scale_tensor": 34,
+      "zero_point_tensor": null,
       "granularity": "PerChannel",
       "group_size": 0,
       "channel_axis": 0,

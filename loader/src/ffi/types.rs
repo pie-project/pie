@@ -533,6 +533,9 @@ pub enum PieLoaderScaleForm {
     RawE8M0 = 0,
     /// F32 multipliers; expand before the GEMM sees them.
     F32Factors = 1,
+    /// BF16 multipliers paired with the zero points named by
+    /// `zero_point_tensor_id`: an element is `code * scale + zero`.
+    Bf16AffineFactors = 2,
 }
 
 impl From<QuantGranularity> for PieLoaderQuantGranularity {
@@ -569,6 +572,7 @@ impl From<ScaleForm> for PieLoaderScaleForm {
         match value {
             ScaleForm::RawE8M0 => Self::RawE8M0,
             ScaleForm::F32Factors => Self::F32Factors,
+            ScaleForm::Bf16AffineFactors => Self::Bf16AffineFactors,
         }
     }
 }
@@ -578,6 +582,7 @@ impl From<PieLoaderScaleForm> for ScaleForm {
         match value {
             PieLoaderScaleForm::RawE8M0 => Self::RawE8M0,
             PieLoaderScaleForm::F32Factors => Self::F32Factors,
+            PieLoaderScaleForm::Bf16AffineFactors => Self::Bf16AffineFactors,
         }
     }
 }
@@ -588,6 +593,7 @@ impl TryFrom<u32> for PieLoaderScaleForm {
         Ok(match value {
             0 => Self::RawE8M0,
             1 => Self::F32Factors,
+            2 => Self::Bf16AffineFactors,
             other => return Err(other),
         })
     }
@@ -604,6 +610,12 @@ impl TryFrom<u32> for PieLoaderScaleForm {
 pub struct PieLoaderQuantAttachmentView {
     pub tensor_id: u32,
     pub scale_tensor_id: u32,
+    /// The tensor holding this weight's zero points, for an affine scheme, or
+    /// [`PIE_LOADER_NO_TENSOR`] for a symmetric one. An affine weight without it
+    /// cannot be dequantized, so a driver reading a `Bf16AffineFactors`
+    /// attachment is entitled to treat the sentinel as a malformed plan rather
+    /// than as an offset of zero.
+    pub zero_point_tensor_id: u32,
     pub granularity: PieLoaderQuantGranularity,
     pub group_size: u32,
     pub channel_axis: u32,

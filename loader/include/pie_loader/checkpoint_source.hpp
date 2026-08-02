@@ -181,6 +181,36 @@ class CheckpointSource {
         }
     }
 
+    /// Hand a span of the mapping to `read`, then release it from the page
+    /// cache once.
+    ///
+    /// `copy_storage_bytes` is the right shape for a whole tensor and the wrong
+    /// one for a selection: splitting gpt-oss's fused expert projections copies
+    /// millions of 1.4 KB runs, and a `madvise` per run costs a syscall each
+    /// while a `memcpy` that size costs nothing. This lets a caller take all of
+    /// them from the mapping and pay for the release exactly once — which is
+    /// also what makes the runs parallelizable, since nothing in `read` has to
+    /// serialize on the kernel.
+    template <typename Read>
+    void with_mapped_span(
+        std::uint32_t file_id,
+        std::uint64_t file_offset,
+        std::uint64_t span_bytes,
+        const Read& read) const {
+        const File& file = checked_file(file_id, file_offset, span_bytes);
+        const std::uint8_t* base = file.data + file_offset;
+        read(base);
+        const auto start = reinterpret_cast<std::uintptr_t>(base);
+        const auto end = start + span_bytes;
+        const std::uintptr_t from = start - start % page_size_;
+        const std::uintptr_t to = end + (page_size_ - end % page_size_) % page_size_;
+        if (to > from) {
+            (void)::madvise(
+                reinterpret_cast<void*>(from), static_cast<std::size_t>(to - from),
+                MADV_DONTNEED);
+        }
+    }
+
     /// Copy a span out of the mapping in `max_tile_bytes` chunks, releasing each
     /// chunk from the page cache behind it.
     ///

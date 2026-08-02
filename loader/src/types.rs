@@ -363,4 +363,15 @@ pub enum ScaleForm {
     /// Consumed as F32 multipliers. Whatever the scales were stored as (E8M0
     /// bytes, BF16, or F32 already) is expanded before the GEMM sees them.
     F32Factors,
+    /// Consumed as BF16 multipliers that are only half of the dequantization:
+    /// the scheme is affine, so a second tensor holds the zero point each group
+    /// is offset by, and an element is `code * scale + zero`.
+    ///
+    /// The zero point is named by [`QuantAttachment::zero_point_tensor`] rather
+    /// than implied by a suffix, for the same reason the scale is: a kernel that
+    /// cannot find it does not read a coarser weight, it reads a wrong one.
+    ///
+    /// New variants go on the end. The FFI discriminants follow declaration
+    /// order and the C++ side reads them as integers.
+    Bf16AffineFactors,
 }
