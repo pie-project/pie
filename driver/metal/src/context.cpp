@@ -572,17 +572,18 @@ std::uint32_t simple_family_row_budget(const Config& cfg, const ModelFacts& fact
 /// fire the driver accepts and cannot hold.
 ///
 /// Three answers. gemma4 and gpt-oss batch, and their bound is the memory their
-/// pool costs, so it is derived. The llama families are RING-BACKED for now --
-/// their engine reports `paged() == false` and the batch path is refused -- so
-/// the honest advertisement is one row, and a longer prompt is replayed a token
-/// at a time rather than rejected mid-fire. Everything else keeps the config's.
+/// pool costs, so it is derived. Everything else keeps the config's.
 std::uint32_t simple_family_max_forward_tokens(const Config& cfg, const ModelFacts& facts) {
     switch (pie::metal::model::model_family_of(facts.model_type)) {
         case pie::metal::model::ModelFamily::Gemma4:
         case pie::metal::model::ModelFamily::GptOss:
-            return simple_family_row_budget(cfg, facts);
+        // Llama used to advertise one row here, because its engine was
+        // ring-backed and refused the batch path. It pages and batches now, so
+        // it is budgeted like the others -- and it is the family that gains the
+        // most from a real budget, because a batch of rows on a dense
+        // projection is a GEMM rather than R matvecs re-reading the weight.
         case pie::metal::model::ModelFamily::Llama:
-            return 1;
+            return simple_family_row_budget(cfg, facts);
         case pie::metal::model::ModelFamily::Qwen35:
         case pie::metal::model::ModelFamily::Unknown:
             break;

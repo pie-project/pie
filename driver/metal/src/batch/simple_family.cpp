@@ -861,22 +861,38 @@ class GptOssEngine final : public SimpleFamilyEngine {
 
 /// Llama, Mistral, Qwen2/3 and Qwen3-MoE.
 ///
-/// RING-BACKED, and deliberately so for now. The family's encoder, binder and
-/// constants are the M=1 contiguous path; the batched one is a separate body of
-/// work (a row-strided embedding and rope, and a GEMM tiling for the dense
-/// projections) that gpt-oss and gemma4 each needed ~300 lines for. Reporting
-/// `paged() == false` is the honest description of what exists: one sequence at
-/// a time, `fire` refused with a message that says so, and `step` replaying a
-/// token at a time. `SimpleFamilyEngine`'s ring case was written for exactly
-/// this and is not a fallback bolted on here.
+/// PAGED and BATCHED. Several sequences, each attending its own page list, and
+/// a fire of R rows encoded as ONE pass rather than R.
+///
+/// That last part is where this family differs from gpt-oss, whose fire of R
+/// rows is R passes because its FFN is always a mixture and a mixture picks its
+/// weights per row. A llama is usually dense, so its projections are ordinary
+/// matrices and a batch of rows is a GEMM -- which is the whole point, because
+/// the matvec re-reads the entire weight for every row it computes. A routed
+/// llama keeps the per-row matvec for its experts and gets the GEMM everywhere
+/// else.
+///
+/// This engine is short compared to gpt-oss's and gemma4's for one reason: the
+/// family has a single `launch_shape` and a single binder, both taking a row
+/// count, rather than a decode copy and a prefill copy of each. There is no
+/// `encode_llama_step_mb` to call because `encode_llama_step` already takes the
+/// rows.
 class LlamaEngine final : public SimpleFamilyEngine {
   public:
     bool init(RawMetalContext& ctx, const std::string& kernels_dir, const SetupConfig& cfg,
               const pie_loader::LoadPlan& load_plan, int max_ctx, std::string* err) {
         if (!llama_geometry(cfg, g_, max_ctx, err)) return false;
         max_ctx_ = max_ctx;
-        g_.paged_kv_enabled = false;
-        g_.kv_max_ctx = max_ctx_;
+        g_.paged_kv_enabled = true;
+        g_.kv_page_size = cfg.kv_page_size > 0 ? int(cfg.kv_page_size) : 32;
+        {
+            const int ps = g_.kv_page_size;
+            g_.kv_max_ctx = ((max_ctx_ + ps - 1) / ps) * ps;
+            g_.total_pages = g_.kv_max_ctx / ps;
+        }
+        max_rows_ = cfg.max_forward_tokens > 0 ? int(cfg.max_forward_tokens) : 1;
+        max_sampled_ = cfg.max_forward_requests > 0 ? int(cfg.max_forward_requests) : 1;
+        if (max_sampled_ > max_rows_) max_sampled_ = max_rows_;
 
         try {
             const auto storage = load_plan.view();
@@ -900,12 +916,14 @@ class LlamaEngine final : public SimpleFamilyEngine {
             return false;
         }
 
-        // A contiguous KV ring per layer. Uniform layers, so one size serves
-        // the stack -- there is no shared tail and no second head width.
+        // Paged KV per layer. Uniform layers, so one size serves the stack --
+        // there is no shared tail and no second head width.
         b_.kv.resize(std::size_t(g_.n_layers));
         kv_.resize(std::size_t(g_.n_layers));
         for (int L = 0; L < g_.n_layers; ++L) {
-            const std::size_t bytes = llama::llama_kv_bytes_per_layer(g_, max_ctx_, 2);
+            const std::size_t bytes = std::size_t(g_.total_pages) *
+                                      std::size_t(g_.kv_page_size) *
+                                      std::size_t(g_.n_kv_heads) * std::size_t(g_.head_dim) * 2;
             kv_[std::size_t(L)].k = ctx.heap_alloc(bytes);
             kv_[std::size_t(L)].v = ctx.heap_alloc(bytes);
             if (!kv_[std::size_t(L)].k.valid() || !kv_[std::size_t(L)].v.valid()) {
@@ -925,8 +943,12 @@ class LlamaEngine final : public SimpleFamilyEngine {
             return false;
         }
         b_.pool.resize(std::size_t(coloring_.colors_used));
-        const std::vector<std::size_t> elems =
-            llama::llama_pool_elems(dag_, plan_, coloring_, g_, /*rows=*/1, /*head_rows=*/1);
+        // Sized at the PADDED row counts. A dense projection's GEMM rounds its
+        // batch up to a whole tile and writes the padding rows for real, so a
+        // pool sized at the batch itself is short by up to a tile.
+        const std::vector<std::size_t> elems = llama::llama_pool_elems(
+            dag_, plan_, coloring_, g_, llama::llama_qmm_pool_rows(max_rows_),
+            llama::llama_qmm_pool_rows(max_sampled_));
         for (int c = 0; c < coloring_.colors_used; ++c) {
             b_.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2);
             if (!b_.pool[std::size_t(c)].valid()) {
@@ -936,7 +958,10 @@ class LlamaEngine final : public SimpleFamilyEngine {
         }
 
         b_.io.resize(kIoSlotCount);
-        for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(4096);
+        // The page list is the largest of these and grows with the context.
+        const std::size_t io_bytes =
+            std::max<std::size_t>(4096, std::size_t(g_.total_pages + 8) * 4);
+        for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(io_bytes);
         // The routed matvec declares a bias it does not read; see
         // `BoundLlama::zero_bias`. Wide enough for the widest routed output.
         if (g_.is_moe()) {
@@ -951,7 +976,10 @@ class LlamaEngine final : public SimpleFamilyEngine {
                 std::memset(b_.zero_bias.contents(), 0, b_.zero_bias.size);
             }
         }
-        logits_ = ctx.heap_alloc(std::size_t(g_.vocab) * 2);
+        // One row per SAMPLED row, padded like the pool: the tail is a GEMM
+        // too, and its padding rows land here.
+        logits_ = ctx.heap_alloc(std::size_t(llama::llama_qmm_pool_rows(max_sampled_)) *
+                                 std::size_t(g_.vocab) * 2);
         if (!logits_.valid()) {
             if (err) *err = "llama logits allocation failed";
             return false;
@@ -959,10 +987,13 @@ class LlamaEngine final : public SimpleFamilyEngine {
 
         if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
         if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err)) return false;
 
-        llama::bind_llama_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/false);
+        llama::bind_llama_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
+        bound_rows_ = 1;
         try {
-            llama::bind_llama_dag(ctx, b_, dag_, g_, coloring_);
+            llama::bind_llama_dag(ctx, b_, dag_, g_, coloring_, /*ordinal_base=*/0,
+                                  /*paged=*/true);
         } catch (const std::exception& e) {
             if (err) *err = std::string("binding llama: ") + e.what();
             return false;
@@ -970,6 +1001,10 @@ class LlamaEngine final : public SimpleFamilyEngine {
         // The logits leave the pool: the sampler reads a slot of its own, so
         // the tail writes there and nothing copies afterwards.
         ctx.arg_bind_ordinal(dag_.back().ordinal, (std::uint8_t)bind::Qmv::Out, logits_);
+        write_u32s(b_.io[int(IoSlot::AttnMaskStride)], {0u});
+        if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
+            std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, 1);
+        }
         return true;
     }
 
@@ -983,17 +1018,77 @@ class LlamaEngine final : public SimpleFamilyEngine {
         }
     }
 
+    /// A single token, expressed as a one-row fire. The decode path is not a
+    /// separate encoder here -- it is `fire` with one row, which is what makes
+    /// `llama_numerics_test`'s verification of the M=1 shapes carry over.
     StepTiming step(RawMetalContext& ctx, std::uint32_t token_id,
                     std::uint32_t position) override {
-        write_u32s(b_.io[int(IoSlot::TokenId)], {token_id});
-        write_u32s(b_.io[int(IoSlot::Position)], {position});
-        // The attention reads `position + 1` keys: everything appended so far,
-        // including this token's own, which `KvAppend` wrote a few dispatches
-        // earlier in the same command buffer.
-        write_i32(b_.io[int(IoSlot::SeqLen)], std::int32_t(position) + 1);
-        write_u32s(b_.io[int(IoSlot::SampleRows)], {0u});
+        FireCsr csr;
+        csr.token_ids = {token_id};
+        csr.position_ids = {position};
+        csr.req_of_token = {0u};
+        csr.w_page = {position / std::uint32_t(g_.kv_page_size)};
+        csr.w_off = {position % std::uint32_t(g_.kv_page_size)};
+        csr.qo_indptr = {0u, 1u};
+        csr.kv_page_indices.resize(std::size_t(g_.total_pages));
+        for (int p = 0; p < g_.total_pages; ++p) {
+            csr.kv_page_indices[std::size_t(p)] = std::uint32_t(p);
+        }
+        csr.kv_page_indptr = {0u, std::uint32_t(g_.total_pages)};
+        csr.sample_rows = {0u};
+        return fire(ctx, csr, {}, {});
+    }
+
+    bool paged() const override { return true; }
+    /// Unlike gpt-oss, a fire of R rows is ONE pass. The row budget costs
+    /// memory -- the activation pool is [rows, width] -- rather than time.
+    int max_rows() const override { return max_rows_; }
+    int max_sampled_rows() const override { return max_sampled_; }
+    int page_size() const override { return g_.kv_page_size; }
+    int total_pages() const override { return g_.total_pages; }
+
+    StepTiming fire(RawMetalContext& ctx, const FireCsr& csr, const EncodeHook& pre,
+                    const EncodeHook& post) override {
+        const int rows = int(csr.token_ids.size());
+        if (rows <= 0 || rows > max_rows()) return StepTiming{};
+        write_u32s(b_.io[int(IoSlot::TokenId)], csr.token_ids);
+        write_u32s(b_.io[int(IoSlot::Position)], csr.position_ids);
+        write_u32s(b_.io[int(IoSlot::ReqOfToken)], csr.req_of_token);
+        write_u32s(b_.io[int(IoSlot::WPage)], csr.w_page);
+        write_u32s(b_.io[int(IoSlot::WOff)], csr.w_off);
+        write_u32s(b_.io[int(IoSlot::QoIndptr)], csr.qo_indptr);
+        write_u32s(b_.io[int(IoSlot::KvPageIndices)], csr.kv_page_indices);
+        write_u32s(b_.io[int(IoSlot::KvPageIndptr)], csr.kv_page_indptr);
+        // The ring ABI's key count. Harmless under the paged one, which bounds
+        // each row by its own `position_ids[row]`, but it is the slot the M=1
+        // contiguous path reads and leaving it stale would be a trap for
+        // anything that switches back.
+        write_i32(b_.io[int(IoSlot::SeqLen)], std::int32_t(csr.position_ids.back()) + 1);
+        const int head_rows = csr.sample_rows.empty() ? rows : int(csr.sample_rows.size());
+        if (csr.sample_rows.empty()) {
+            std::vector<std::uint32_t> every;
+            every.resize(std::size_t(rows));
+            for (int r = 0; r < rows; ++r) every[std::size_t(r)] = std::uint32_t(r);
+            write_u32s(b_.io[int(IoSlot::SampleRows)], every);
+        } else {
+            write_u32s(b_.io[int(IoSlot::SampleRows)], csr.sample_rows);
+        }
+        if (b_.io[int(IoSlot::AttnMaskEnabled)].contents() != nullptr) {
+            std::memset(b_.io[int(IoSlot::AttnMaskEnabled)].contents(), 0, std::size_t(rows));
+        }
+        // The constants carry the row count into the elementwise widths and
+        // the row-gather's pitch, so they are rebound whenever it changes --
+        // and only then, because this is every dispatch's argument table.
+        if (bound_rows_ != rows || bound_head_rows_ != head_rows) {
+            llama::bind_llama_consts(ctx, dag_, g_, rows, /*paged=*/true);
+            bound_rows_ = rows;
+            bound_head_rows_ = head_rows;
+        }
         return ctx.run_step([&](StepEncoder& se) {
-            llama::encode_llama_step(se, dag_, g_, base_, psos_);
+            if (pre) pre(se);
+            llama::encode_llama_step(se, dag_, g_, base_, psos_, /*ordinal_base=*/0, &mb_, rows,
+                                     head_rows);
+            if (post) post(se);
         });
     }
 
@@ -1008,9 +1103,14 @@ class LlamaEngine final : public SimpleFamilyEngine {
     llama::BoundLlama b_{};
     llama::LlamaPsos psos_{};
     DecodeStepPsos base_{};
+    MultiBatchPsos mb_{};
     std::vector<llama::KvPages> kv_{};
     /// Keeps the streamed weights' mapping alive; see the gpt-oss engine.
     std::shared_ptr<void> stream_pack_{};
+    int max_rows_ = 1;
+    int max_sampled_ = 1;
+    int bound_rows_ = 0;
+    int bound_head_rows_ = 0;
     SlotHandle logits_{};
 };
 
@@ -1155,17 +1255,29 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         std::string ignore;
         if (!llama_geometry(cfg, g, max_ctx, &ignore)) return bytes;
         bytes += llama::llama_kv_region_bytes(g, max_ctx, 2);
-        // The pool, summed from the SAME colouring the engine will build. One
-        // row: this engine is ring-backed, so its row budget is not a memory
-        // one and `max_forward_tokens` does not size anything here.
-        const auto dag = llama::build_llama_dag(g, /*with_argmax=*/false);
-        const llama::ScratchPlan plan = llama::build_llama_scratch(dag, g);
+        // The engine pages its KV, so `max_ctx` rounds up to a whole page per
+        // layer. One page's slack per layer, per side.
+        bytes += std::size_t(g.n_layers) * 2 * 32 * std::size_t(g.n_kv_heads) *
+                 std::size_t(g.head_dim) * 2;
+        // The pool, summed from the SAME colouring the engine will build, at
+        // the SAME padded row counts. The engine batches, so the row budget IS
+        // a memory budget here -- every activation is [rows, width], and a
+        // guess that under-counts fails at `heap_alloc` naming nothing.
+        int rows = cfg.max_forward_tokens > 0 ? int(cfg.max_forward_tokens) : 1;
+        int sampled = cfg.max_forward_requests > 0 ? int(cfg.max_forward_requests) : 1;
+        if (sampled > rows) sampled = rows;
+        rows = llama::llama_qmm_pool_rows(rows);
+        sampled = llama::llama_qmm_pool_rows(sampled);
+        llama::LlamaGeometry pg = g;
+        pg.paged_kv_enabled = true;
+        const auto dag = llama::build_llama_dag(pg, /*with_argmax=*/false);
+        const llama::ScratchPlan plan = llama::build_llama_scratch(dag, pg);
         const model::ScratchColoring col =
             llama::color_llama_scratch(dag, plan, /*no_recycle=*/golden_taps_enabled());
-        for (const std::size_t e : llama::llama_pool_elems(dag, plan, col, g, 1, 1)) {
+        for (const std::size_t e : llama::llama_pool_elems(dag, plan, col, pg, rows, sampled)) {
             bytes += e * 2;
         }
-        bytes += std::size_t(g.vocab) * 2;  // the logits slot
+        bytes += std::size_t(sampled) * std::size_t(g.vocab) * 2;  // the logits slot
     }
     return bytes;
 }
