@@ -96,6 +96,25 @@ class ForwardPlan {
         return ForwardPlan(raw);
     }
 
+    /// Trace the LOWERED qwen3_5 hybrid — the same text as
+    /// `trace_qwen3_5_hybrid`, with the CUDA backend facts and a fire
+    /// class in hand (north-star-dsl.md rung 4c). Classes 2/3 (the MTP
+    /// service classes) are refused until 4c-iv.
+    static ForwardPlan trace_qwen3_5_hybrid_cuda(
+        const PieForwardQwen35HybridFacts& facts,
+        const PieForwardQwen35CudaFacts& cuda,
+        PieForwardFireClass fire_class) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_qwen3_5_hybrid_cuda(
+            &facts, &cuda, static_cast<std::uint32_t>(fire_class), &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: lowered qwen3_5 trace failed (" +
+                status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
     /// Trace the qwen3_5_moe MoE MLP-block FRAGMENT — the first traced form
     /// carrying `dyn` ops (`TopK`, selector-carrying `Matmul`s,
     /// `WeightedSum`, `SigmoidGateAdd`).

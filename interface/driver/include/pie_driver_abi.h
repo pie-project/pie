@@ -339,6 +339,13 @@
  */
 #define PIE_STAGE_REQUIRES_LORA (1 << 7)
 
+/**
+ * [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
+ * sentinel. Not zero: zero is a legitimate planned value ("no fast
+ * prefix" — an all-hooked step).
+ */
+#define PIE_HOOK_FREE_PREFIX_UNPLANNED UINT32_MAX
+
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
 #define RS_FLAG_RESET 1
@@ -1413,6 +1420,22 @@ typedef struct PieStepDesc {
   struct PieU64Slice channel_expected_head;
   struct PieU64Slice channel_expected_tail;
   struct PieU32Slice channel_ticket_indptr;
+  /**
+   * The fire planner's hook-free prefix for this step, in WIRE request
+   * rows: rows `[0, n)` belong to no attention-stage program by the
+   * SCHEDULER's plan (`fire_plan`'s qkv_postprocess site — the
+   * planner's first consumed lowering). [`PIE_HOOK_FREE_PREFIX_UNPLANNED`]
+   * means the scheduler sent no plan and the driver derives the prefix
+   * itself (the pre-plan behavior); any other value the driver
+   * cross-checks against its own compiled-plan derivation and refuses
+   * the launch on drift — the declaration-side hook stamp and the
+   * compiled stage plans must agree.
+   */
+  uint32_t planned_hook_free_prefix_rows;
+  /**
+   * Reserved; must be zero.
+   */
+  uint32_t reserved_step_tail0;
 } PieStepDesc;
 
 /**

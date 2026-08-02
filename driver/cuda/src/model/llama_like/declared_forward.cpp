@@ -1,12 +1,16 @@
 #include "model/llama_like/declared_forward.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -19,6 +23,10 @@
 #include "kernels/rope.hpp"
 #include "kernels/split_packed.hpp"
 #include "kernels/swiglu.hpp"
+#include "model/attn_page_mask.hpp"
+#include "model/attn_score.hpp"
+#include "model/lora.hpp"
+#include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_xqa.hpp"
 #include "ops/gemm.hpp"
@@ -101,8 +109,12 @@ enum class LaunchKernel {
     AttentionFlashinferDecode,
     DequantKvCacheLayerToBf16Active,
     AttentionFlashinferPrefill,
+    AttentionFlashinferPrefillCustom,
+    AttentionFlashinferDecodeCapture,
+    AttentionFlashinferPrefillCapture,
     WriteKvExplicit,
     WriteKvToPages,
+    LoraQkvCorrection,
 };
 
 LaunchKernel resolve_launch_kernel(std::string_view kernel) {
@@ -127,11 +139,23 @@ LaunchKernel resolve_launch_kernel(std::string_view kernel) {
     if (kernel == "dispatch_attention_flashinfer_prefill_bf16") {
         return LaunchKernel::AttentionFlashinferPrefill;
     }
+    if (kernel == "dispatch_attention_flashinfer_prefill_custom") {
+        return LaunchKernel::AttentionFlashinferPrefillCustom;
+    }
+    if (kernel == "dispatch_attention_flashinfer_decode_capture") {
+        return LaunchKernel::AttentionFlashinferDecodeCapture;
+    }
+    if (kernel == "dispatch_attention_flashinfer_prefill_capture_bf16") {
+        return LaunchKernel::AttentionFlashinferPrefillCapture;
+    }
     if (kernel == "launch_write_kv_explicit_bf16") {
         return LaunchKernel::WriteKvExplicit;
     }
     if (kernel == "launch_write_kv_to_pages") {
         return LaunchKernel::WriteKvToPages;
+    }
+    if (kernel == "pie_lora_qkv_correction") {
+        return LaunchKernel::LoraQkvCorrection;
     }
     throw std::runtime_error(
         "declared forward: stated kernel '" + std::string(kernel) +
@@ -150,12 +174,25 @@ void validate_stated_kernels(const pie_forward::ForwardPlan& plan) {
     }
 }
 
+// Row-offset views into `[N, width]` bf16 buffers — the Peel regions'
+// window binding (A3), the hand-written `bf16_row` twins. Offset zero is
+// the identity, so the windowed call forms serve the unwindowed walk too.
+inline void* bf16_row(void* base, int row, int width) {
+    return static_cast<std::uint16_t*>(base) +
+           static_cast<std::size_t>(row) * width;
+}
+inline const void* bf16_row(const void* base, int row, int width) {
+    return static_cast<const std::uint16_t*>(base) +
+           static_cast<std::size_t>(row) * width;
+}
+
 // Rung 3 (north-star-dsl.md): the static C++ form of the class traces,
 // emitted by `cargo run -p pie-forward --bin emit-cuda` and committed.
 // Uses the helpers above (require, make_weight_view); the digest constant
 // it defines names the deployment it was emitted from, and the dispatch
 // in `llama_like_forward_declared` runs it only on exact match.
 #include "model/llama_like/generated/qwen3_0_6b.inc"
+#include "model/llama_like/generated/olmo2_1b.inc"
 
 // PIE_DECLARED_FORWARD_GENERATED=1 routes digest-matched fires through
 // the generated static form instead of the interpreter walk — the third
@@ -351,49 +388,89 @@ void llama_like_forward_declared(
     const std::uint32_t* w_off_d,
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
-    int runtime_window_left)
+    int runtime_window_left,
+    const std::uint8_t* custom_mask_d,
+    const std::int32_t* custom_mask_indptr_d,
+    const StageHooks* stage_hooks,
+    const LoraTable* lora)
 {
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
     // below — the parity gate's third leg proves it — with every choice
     // resolved at EMISSION time instead of at walk time.
     if (generated_forward_enabled() &&
-        declared.facts_digest != kGeneratedForDigest &&
+        declared.facts_digest != kGeneratedDigest_qwen3_0_6b &&
+        declared.facts_digest != kGeneratedDigest_olmo2_1b &&
         std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
         // Silent non-engagement is this path's failure mode; say why.
         std::fprintf(stderr,
                      "[declared-forward-generated] digest mismatch:\n"
-                     "  live:    %s\n  emitted: %s\n",
-                     declared.facts_digest.c_str(), kGeneratedForDigest);
+                     "  live:    %s\n  emitted: %s | %s\n",
+                     declared.facts_digest.c_str(),
+                     kGeneratedDigest_qwen3_0_6b,
+                     kGeneratedDigest_olmo2_1b);
     }
-    if (generated_forward_enabled() &&
-        declared.facts_digest == kGeneratedForDigest) {
-        (is_pure_decode ? generated_llama_like_decode
-                        : generated_llama_like_prefill)(
-            w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
-            token_ids, positions, qo_indptr,
-            kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            qo_indptr_h, kv_page_indptr_h,
-            total_tokens, num_requests,
-            logit_row_indices_d, num_logit_rows,
-            w_page_d, w_off_d, row_valid_d, has_write_desc);
-        return;
+    // A1 (the class-collapse amendment): a custom mask no longer picks a
+    // class — the decode/prefill traces carry it as their HasCustomMask
+    // guard arm, so the generated static form serves masked fires too
+    // (the mask data crosses as arguments).
+    // The static form covers EVERY fire the digest matches (rung 3
+    // complete): the emitter constructs the lora staging AND the hook
+    // sidebands (page mask, score captures) and spells the sites,
+    // brackets and corrections with constant layers.
+    if (generated_forward_enabled()) {
+        const auto run = [&](auto decode_fn, auto prefill_fn) {
+            (is_pure_decode ? decode_fn : prefill_fn)(
+                w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
+                token_ids, positions, qo_indptr,
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                total_tokens, num_requests,
+                logit_row_indices_d, num_logit_rows,
+                w_page_d, w_off_d, row_valid_d, has_write_desc,
+                custom_mask_d, custom_mask_indptr_d,
+                stage_hooks, lora);
+        };
+        if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
+            run(generated_llama_like_decode_qwen3_0_6b,
+                generated_llama_like_prefill_qwen3_0_6b);
+            return;
+        }
+        if (declared.facts_digest == kGeneratedDigest_olmo2_1b) {
+            run(generated_llama_like_decode_olmo2_1b,
+                generated_llama_like_prefill_olmo2_1b);
+            return;
+        }
     }
-    // Rung 2: the fire's class picks its trace, and the trace states every
-    // kernel — nothing below derives a path (north-star-dsl.md).
+    // Rung 2 + A2: the fire's SHAPE picks its trace, and the trace
+    // states every kernel — attachments (mask, hooks) are its guard
+    // arms, nothing below derives a path (north-star-dsl.md).
     const pie_forward::ForwardPlan& plan =
         is_pure_decode ? declared.decode : declared.prefill;
-    // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
-    // it a silent fallback to the hand-written path would be
-    // indistinguishable from a passing A/B run.
-    if (std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
-        std::fprintf(stderr,
-                     "[declared-forward] N=%d R=%d decode=%d ops=%zu\n",
-                     total_tokens, num_requests, is_pure_decode ? 1 : 0,
-                     plan.op_count());
-    }
     const int N = total_tokens;
     const int R = num_requests;
+    // The Peel split (A3): the hook-free prefix row count — the
+    // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
+    // the stated Peel op, not a choice: with no hooks every row is the
+    // prefix; the dispatch proved rows [0, fast_rows) belong to no
+    // attention-stage program.
+    const int fast_rows = stage_hooks == nullptr
+        ? R
+        : std::min(static_cast<int>(stage_hooks->hook_free_prefix_rows), R);
+    // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
+    // it a silent fallback to the hand-written path would be
+    // indistinguishable from a passing A/B run; fast_rows is what proves
+    // a MIXED fire walked the declared Peel.
+    if (std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
+        std::fprintf(stderr,
+                     "[declared-forward] N=%d R=%d decode=%d fast_rows=%d "
+                     "mask=%d hooked=%d lora=%d ops=%zu\n",
+                     N, R, is_pure_decode ? 1 : 0, fast_rows,
+                     custom_mask_d != nullptr ? 1 : 0,
+                     stage_hooks != nullptr ? 1 : 0,
+                     (lora != nullptr && lora->usable()) ? 1 : 0,
+                     plan.op_count());
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
@@ -413,6 +490,20 @@ void llama_like_forward_declared(
     // Inherit cublas's stream so every launch lands on the captured graph,
     // for the reason llama_like_forward_paged states at its stream setup.
     cudaStream_t stream = cublas.stream();
+    // The §5.1 lora fire staging: adapters cast + grouped once per fire
+    // (the hand-written `lora_state`), consumed by the HasLora guard's
+    // correction launches. Constructed only when the predicate holds.
+    const bool has_lora = lora != nullptr && lora->usable();
+    std::optional<LoraFireStateHandle> lora_state;
+    if (has_lora) {
+        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, /*tp=*/1, stream);
+        if (std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[lora-fire] declared R=%d lanes=%u grouping=%s\n",
+                         R, lora->count, lora_state->grouping_desc().c_str());
+        }
+    }
+
     // With padding the attention kernel runs at `dk` but the softmax must
     // stay scaled to the real head dim — `1/sqrt(d)`, the hand-written
     // override. Unpadded, -1 lets the dispatch pick `1/sqrt(dk)` (== d).
@@ -428,6 +519,18 @@ void llama_like_forward_declared(
     void* const attn_v = head_dim_padded ? ws.v_padded.data() : ws.v.data();
     void* const attn_out_buf =
         head_dim_padded ? ws.attn_out_padded.data() : ws.attn_out.data();
+
+    // The HookSite slice's fire-level sidebands: the page-mask sink the
+    // OnAttnProj site offers, the per-layer score captures the attention
+    // publishes through, and the per-layer (possibly compacted) page
+    // list the attention handlers consume. All argument-driven — an
+    // unhooked fire constructs an inactive mask and none of it launches.
+    model::FirePageMask page_mask(stage_hooks, stream);
+    const std::uint32_t* attn_page_indices = kv_page_indices;
+    const std::uint32_t* attn_page_indptr = kv_page_indptr;
+    const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
+    std::optional<model::LayerScoreCapture> score_capture;
+    std::optional<model::LayerPrefillScoreCapture> prefill_score_capture;
 
     // The plan caches the (unchanged) prepare hook filled. The executor no
     // longer chooses between them — each stated attention kernel's handler
@@ -461,17 +564,41 @@ void llama_like_forward_declared(
     // swiglu kernel the following Swiglu op launches (the hand-written
     // `use_fused_gu` pairing).
     bool gate_up_used_fused = false;
-    // Guard skip state: when a taken then-region ends, the else-region is
-    // dead and the walk jumps it (regions are flat — the builder refuses
-    // nesting — so one pending skip suffices).
-    std::size_t guard_else_at = SIZE_MAX;
-    std::size_t guard_else_len = 0;
+    // Guard skip STACK (A1): when a taken region ends, everything to the
+    // chain's end is dead and the walk jumps it. Guards NEST since the
+    // class-collapse amendment (the mask arm carries the write-mechanism
+    // guard), so pending skips stack — inner skips (pushed later) always
+    // end at or before their enclosing region's skip point, so popping
+    // in LIFO order at each index is exact.
+    std::vector<std::pair<std::size_t, std::size_t>> guard_skips;
+    // The Peel row window (A3): `{win_start, win_len}` over token rows,
+    // `{0, N}` outside peel regions. Region transitions are index
+    // events, the guard skips' peer; the windowed call forms below bind
+    // it (offset zero + full length is the identity).
+    int win_start = 0;
+    int win_len = N;
+    struct WinEvent {
+        std::size_t at;
+        int start;
+        int len;
+    };
+    std::vector<WinEvent> win_events;
     for (std::size_t i = 0; i < op_count; ++i) {
-        if (i == guard_else_at) {
-            guard_else_at = SIZE_MAX;
-            i += guard_else_len;
-            if (i >= op_count) break;
+        for (;;) {
+            if (!guard_skips.empty() && i == guard_skips.back().first) {
+                i += guard_skips.back().second;
+                guard_skips.pop_back();
+                continue;
+            }
+            if (!win_events.empty() && i == win_events.back().at) {
+                win_start = win_events.back().start;
+                win_len = win_events.back().len;
+                win_events.pop_back();
+                continue;
+            }
+            break;
         }
+        if (i >= op_count) break;
         const PieForwardOp& op = plan.op(i);
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
@@ -649,10 +776,17 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::SplitQkv: {
+            // Windowed (A3): inside a Peel's tail region this splits the
+            // hook-visible rows only, at their ABSOLUTE offsets, so the
+            // full-N consumers (hooks, attention) see one contiguous
+            // buffer — the hand-written tail split verbatim. Offset 0 +
+            // full length is the plain full-N split.
             kernels::launch_split_qkv_bf16(
-                ws.qkv_fused.data(),
-                ws.q.data(), ws.k.data(), ws.v.data(),
-                N, Hq, Hk, stream);
+                bf16_row(ws.qkv_fused.data(), win_start, Hq + 2 * Hk),
+                bf16_row(ws.q.data(), win_start, Hq),
+                bf16_row(ws.k.data(), win_start, Hk),
+                bf16_row(ws.v.data(), win_start, Hk),
+                win_len, Hq, Hk, stream);
             break;
         }
         case PieForwardOpKind::RmsnormPerHead: {
@@ -698,42 +832,13 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::KvAppend: {
-            // Padded head_dim: the cache stores `dk`-wide cells, so Q/K/V
-            // are zero-padded to the `*_padded` staging buffers first —
-            // the hand-written pad block, same launch order (q, k, v),
-            // placed exactly where it sits there: after rope, before the
-            // write. Identity when unpadded (`attn_*` alias ws.q/k/v).
-            if (head_dim_padded) {
-                kernels::launch_pad_head_dim_bf16(
-                    ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
-                kernels::launch_pad_head_dim_bf16(
-                    ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);
-                kernels::launch_pad_head_dim_bf16(
-                    ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
-            }
-            auto kv_view = cache.layer_view(static_cast<int>(op.param0));
-            if (has_write_desc) {
-                // Explicit-descriptor write, N cells (one per query token) —
-                // the hand-written `has_write_desc` branch, including why N
-                // and not R (llama_like.cpp's B2 comment). Graph-replayed
-                // decode fires always take this branch: their captures
-                // record the w_page/w_off path so padded rows stay steerable
-                // at replay time.
-                kernels::launch_write_kv_explicit_bf16(
-                    kv_view,
-                    attn_k, attn_v,
-                    w_page_d, w_off_d, N, stream, row_valid_d);
-            } else {
-                // Page-derived append (the hand-written non-write-desc
-                // branch): position re-derived from the page table.
-                kernels::launch_write_kv_to_pages(
-                    kv_view,
-                    attn_k, attn_v,
-                    qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens,
-                    N, R, stream, row_valid_d);
-            }
-            break;
+            // RUNG 5: the write-mechanism branch is deleted — every
+            // lowered trace states the KV write through the HasWriteDesc
+            // guard's two launches, so the semantic kind cannot reach
+            // this walk.
+            throw std::runtime_error(
+                "declared forward: semantic KvAppend in a class trace "
+                "(the declaration states the KV write)");
         }
         case PieForwardOpKind::Attention: {
             // A class trace states its attention kernel as a Launch op;
@@ -748,6 +853,32 @@ void llama_like_forward_declared(
             // Each handler is the corresponding branch of the old path
             // cascade, minus the choosing; the state layer rides param1.
             const int L = static_cast<int>(op.param1);
+            // The page-mask bracket (HookSite mechanics): a written mask
+            // substitutes the layer's page list into the SAME stated
+            // kernel — legal only on the static (page-count-independent)
+            // decode plan, the hand-written contract verbatim.
+            const auto resolve_masked_pages = [&](bool takes_paged_decode) {
+                if (!page_mask.written_for(static_cast<std::uint32_t>(L))) {
+                    return;
+                }
+                if (!takes_paged_decode || decode_plan == nullptr) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            };
             switch (resolve_launch_kernel(plan.weight_name(op))) {
             case LaunchKernel::RopeStandardTable: {
                 if (ws.rope_table.empty()) {
@@ -792,7 +923,11 @@ void llama_like_forward_declared(
                     has_write_desc ? w_page_d : nullptr,
                     has_write_desc ? w_off_d : nullptr,
                     row_valid_d,
-                    R, num_q_heads, num_kv_heads, d,
+                    // Windowed (A3): a Peel's prefix region owns rows
+                    // [0, fast_rows) — the hand-written fused call's
+                    // `fast_rows` row count. Outside a peel the window
+                    // is full and this is R (pure decode, N == R).
+                    win_len, num_q_heads, num_kv_heads, d,
                     cache.page_size(), cache.hnd_layout(),
                     cfg.rope_theta, eps, stream);
                 break;
@@ -809,15 +944,22 @@ void llama_like_forward_declared(
                 const ParsedWeightName q_nm = parse_weight_name(q_name);
                 if (q_nm.field != "q_norm") throw_unknown_weight(q_name);
                 const auto& layer = layer_of(w, q_nm, q_name);
+                // Windowed (A3): a Peel's tail region norms+ropes the
+                // hook-visible rows at their absolute offsets (the
+                // hand-written tail call); offset 0 + full length is
+                // the plain full-N form.
                 kernels::launch_qk_rmsnorm_rope_bf16(
-                    ws.q.data(), ws.k.data(),
+                    bf16_row(ws.q.data(), win_start, Hq),
+                    bf16_row(ws.k.data(), win_start, Hk),
                     require(layer.q_norm, q_name)->data(),
                     require(layer.k_norm, k_name)->data(),
-                    positions, N, num_q_heads, num_kv_heads, d,
+                    positions + win_start, win_len,
+                    num_q_heads, num_kv_heads, d,
                     cfg.rope_theta, eps, stream);
                 break;
             }
             case LaunchKernel::AttentionXqaDecodePrepared: {
+                resolve_masked_pages(/*takes_paged_decode=*/false);
                 auto kv_view = cache.layer_view(L);
                 ops::launch_attention_xqa_decode_bf16_prepared(
                     attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
@@ -843,12 +985,71 @@ void llama_like_forward_declared(
                              fwd_cfg.per_layer_window_left.size()))
                         ? fwd_cfg.per_layer_window_left[L]
                         : fwd_cfg.sliding_window;
+                resolve_masked_pages(/*takes_paged_decode=*/true);
                 ops::dispatch_attention_flashinfer_decode(
                     *decode_plan,
                     attn_q, kv_view, attn_out_buf,
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
+                break;
+            }
+            case LaunchKernel::AttentionFlashinferDecodeCapture: {
+                if (decode_plan == nullptr) {
+                    throw std::runtime_error(
+                        "declared forward: trace states the capture decode "
+                        "kernel but prepare built no decode plan");
+                }
+                if (!score_capture || !score_capture->active()) {
+                    throw std::runtime_error(
+                        "declared forward: capture decode stated but no "
+                        "active score capture (guard/pred drift)");
+                }
+                resolve_masked_pages(/*takes_paged_decode=*/true);
+                auto kv_view = cache.layer_view(L);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *decode_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+                break;
+            }
+            case LaunchKernel::AttentionFlashinferPrefillCapture: {
+                const ops::PrefillPlanCache* pp =
+                    is_pure_decode ? prefill_decode_plan : prefill_plan;
+                if (pp == nullptr) {
+                    throw std::runtime_error(
+                        "declared forward: trace states the capture "
+                        "prefill kernel but prepare built no plan");
+                }
+                if (!prefill_score_capture ||
+                    !prefill_score_capture->active()) {
+                    throw std::runtime_error(
+                        "declared forward: capture prefill stated but no "
+                        "active score capture (guard/pred drift)");
+                }
+                resolve_masked_pages(/*takes_paged_decode=*/false);
+                auto kv_view = cache.layer_view(L);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *pp,
+                    attn_q, kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    attn_out_buf,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                prefill_score_capture->publish();
                 break;
             }
             case LaunchKernel::DequantKvCacheLayerToBf16Active: {
@@ -858,20 +1059,102 @@ void llama_like_forward_declared(
                     kv_view, kv_page_indices, num_pages_in_batch, stream);
                 break;
             }
+            case LaunchKernel::AttentionFlashinferPrefillCustom: {
+                // The hand-written custom-mask branch, minus the choosing
+                // (llama_like.cpp:1457): the custom dispatch takes the
+                // layer view whole (no dequant) and the mask data rides
+                // as runtime args of the stated kernel.
+                if (prefill_plan == nullptr) {
+                    throw std::runtime_error(
+                        "declared forward: trace states the custom-mask "
+                        "prefill kernel but prepare built no plan");
+                }
+                auto kv_view = cache.layer_view(L);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *prefill_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
+                break;
+            }
             case LaunchKernel::WriteKvExplicit: {
                 auto kv_view = cache.layer_view(L);
+                // Mechanical pad staging for padded head dims (the
+                // hand-written pre-write pad block; exactly one write
+                // region runs, so this launches once per layer). A
+                // windowed write never coincides with padding: the Peel
+                // exists only in the fused deployment, whose facts
+                // require the unpadded head dim.
+                if (head_dim_padded) {
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
+                }
+                // Windowed (A3): the tail rows' cells only, from their
+                // slice of the descriptors — the hand-written tail
+                // write; offset 0 + full length is the plain form.
                 kernels::launch_write_kv_explicit_bf16(
-                    kv_view, attn_k, attn_v,
-                    w_page_d, w_off_d, N, stream, row_valid_d);
+                    kv_view,
+                    bf16_row(attn_k, win_start, Hk),
+                    bf16_row(attn_v, win_start, Hk),
+                    w_page_d + win_start, w_off_d + win_start,
+                    win_len, stream,
+                    row_valid_d != nullptr ? row_valid_d + win_start
+                                           : nullptr);
+                break;
+            }
+            case LaunchKernel::LoraQkvCorrection: {
+                // The pseudo-symbol: one operation, many calls — the
+                // hand-written apply, argument for argument (qkv_in is
+                // the buffer the projections read; scratch borrows
+                // ws.gate exactly as the hand-written call does). The
+                // LAYER comes from the op's own tag, NOT the state
+                // param (this launch addresses no implicit store, so
+                // param1 rests at 0 — reading it applied layer 0's
+                // adapter slice everywhere, the bug the first live A/B
+                // caught).
+                if (!lora_state) {
+                    throw std::runtime_error(
+                        "declared forward: lora correction stated but no "
+                        "usable lora table (guard/pred drift)");
+                }
+                if (op.layer < 0) {
+                    throw std::runtime_error(
+                        "declared forward: lora correction without a "
+                        "layer tag");
+                }
+                const void* const qkv_in =
+                    post_norm ? ws.y.data() : ws.norm_x.data();
+                lora_state->apply(
+                    cublas.handle(), op.layer, qkv_in, H, Hq, Hk,
+                    ws.q.data(), ws.v.data(), ws.gate.data());
                 break;
             }
             case LaunchKernel::WriteKvToPages: {
                 auto kv_view = cache.layer_view(L);
+                // (Pad staging comment above applies here too.)
+                if (head_dim_padded) {
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);
+                    kernels::launch_pad_head_dim_bf16(
+                        ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
+                }
+                // Windowed (A3): base pointers stay; `first_token` skips
+                // the fused-prefix rows the peel's other region already
+                // wrote — the hand-written tail call verbatim (0 is the
+                // plain form's default).
                 kernels::launch_write_kv_to_pages(
                     kv_view, attn_k, attn_v,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
-                    N, R, stream, row_valid_d);
+                    N, R, stream, row_valid_d,
+                    /*first_token=*/win_start);
                 break;
             }
             case LaunchKernel::AttentionFlashinferPrefill: {
@@ -903,15 +1186,18 @@ void llama_like_forward_declared(
             // The attention launches land in the padded staging buffer
             // when the head dim is padded; strip before the o_proj GEMM
             // reads `[N, num_q*d]` — mechanical staging, as the pad in
-            // KvAppend (the hand-written post-attention strip).
+            // the write handlers (the hand-written post-attention strip).
+            // Keyed by NAME, not by outputs: since A1 the attention
+            // launches are guard-region (output-less) forms — the guard
+            // owns the value; the launch is still the buffer's writer.
+            const std::string_view launch_name = plan.weight_name(op);
             const bool is_attention_out =
-                plan.outputs(op).size == 1 &&
-                (plan.weight_name(op) ==
-                     "launch_attention_xqa_decode_bf16_prepared" ||
-                 plan.weight_name(op) ==
-                     "dispatch_attention_flashinfer_decode" ||
-                 plan.weight_name(op) ==
-                     "dispatch_attention_flashinfer_prefill_bf16");
+                launch_name == "launch_attention_xqa_decode_bf16_prepared" ||
+                launch_name == "dispatch_attention_flashinfer_decode" ||
+                launch_name == "dispatch_attention_flashinfer_prefill_bf16" ||
+                launch_name == "dispatch_attention_flashinfer_prefill_custom" ||
+                launch_name == "dispatch_attention_flashinfer_decode_capture" ||
+                launch_name == "dispatch_attention_flashinfer_prefill_capture_bf16";
             if (is_attention_out && head_dim_padded) {
                 kernels::launch_strip_head_dim_bf16(
                     attn_out_buf, ws.attn_out.data(),
@@ -919,39 +1205,164 @@ void llama_like_forward_declared(
             }
             break;
         }
+        case PieForwardOpKind::Peel: {
+            // A3: both regions run, over complementary row ranges —
+            // prefix `[0, fast_rows)`, tail `[fast_rows, N)`. An empty
+            // range skips its region's launches, exactly the
+            // hand-written `fast_rows > 0` / `unfused_tail_rows > 0`
+            // gates: fast_rows == N is the classic all-fused fire,
+            // 0 the all-hooked one, anything between the mixed fire.
+            const std::size_t prefix_len = op.param0;
+            const std::size_t tail_len = op.param1;
+            const std::size_t tail_start = i + 1 + prefix_len;
+            const std::size_t end = tail_start + tail_len;
+            const int tail_rows = N - fast_rows;
+            win_events.push_back({end, 0, N});
+            if (fast_rows > 0) {
+                win_start = 0;
+                win_len = fast_rows;
+                if (tail_rows > 0) {
+                    win_events.push_back({tail_start, fast_rows, tail_rows});
+                } else {
+                    guard_skips.emplace_back(tail_start, tail_len);
+                }
+                // the loop's ++i lands on the prefix region
+            } else {
+                win_start = 0;
+                win_len = N;
+                i = tail_start - 1;  // skip the empty prefix region
+            }
+            break;
+        }
+        case PieForwardOpKind::HookSite: {
+            // A3: the sites live in the ONE body every unmasked fire
+            // walks — a fire with no attached programs passes through
+            // by argument, zero launches, zero sideband setup.
+            if (stage_hooks == nullptr) break;
+            const int L = static_cast<int>(op.param1);
+            if (op.param0 == 0) {
+                // OnAttnProj: reset the layer's page view, re-seed the
+                // mask ("keep everything" unless this layer's program
+                // narrows it), stage the score capture the attention
+                // will publish through, and run the programs.
+                attn_page_indices = kv_page_indices;
+                attn_page_indptr = kv_page_indptr;
+                attn_last_page_lens = kv_last_page_lens;
+                page_mask.begin_layer(stream);
+                if (is_pure_decode) {
+                    score_capture.emplace(
+                        stage_hooks, static_cast<std::uint32_t>(L),
+                        static_cast<std::uint32_t>(num_q_heads),
+                        /*capturable=*/true, stream);
+                } else {
+                    prefill_score_capture.emplace(
+                        stage_hooks, static_cast<std::uint32_t>(L),
+                        static_cast<std::uint32_t>(num_q_heads),
+                        plan_state.prefill_score_window,
+                        /*capturable=*/true, stream);
+                }
+                invoke_stage_hook(
+                    stage_hooks, StageHookPoint::OnAttnProj,
+                    ws.q.data(),
+                    static_cast<std::uint32_t>(N),
+                    static_cast<std::uint32_t>(Hq),
+                    static_cast<std::uint32_t>(L),
+                    stream, /*query_is_f32=*/false,
+                    {.mask_sink = page_mask.sink()});
+            } else {
+                // OnAttn: the programs read what the attention published.
+                invoke_stage_hook(
+                    stage_hooks, StageHookPoint::OnAttn,
+                    ws.q.data(),
+                    static_cast<std::uint32_t>(N),
+                    static_cast<std::uint32_t>(Hq),
+                    static_cast<std::uint32_t>(L),
+                    stream, /*query_is_f32=*/false,
+                    {.scores = score_capture && score_capture->scores()
+                                   ? score_capture->scores()
+                                   : (prefill_score_capture
+                                          ? prefill_score_capture->scores()
+                                          : nullptr)});
+            }
+            break;
+        }
         case PieForwardOpKind::Guard: {
-            // The one branch a class trace carries — over a runtime input
-            // (closed predicate vocabulary, `PieForwardGuardPred`).
-            // param1 = then-region op count; the else count rides a
-            // one-entry aux run.
+            // The one branch a class trace carries — a CHAIN of arms over
+            // runtime inputs (closed predicate vocabulary,
+            // `PieForwardGuardPred`): param0 = arm count, aux run =
+            // [pred kind, payload, region len] per arm + trailing
+            // else-region len. Evaluate arms in order, run the first that
+            // holds (or the else), jump everything dead.
             const auto aux = plan.aux_names(op);
-            if (aux.size != 1) {
+            const std::uint32_t n_arms = op.param0;
+            if (aux.size != static_cast<std::size_t>(n_arms) * 3 + 1) {
                 throw std::runtime_error(
                     "declared forward: Guard aux run has " +
-                    std::to_string(aux.size) + " entries, wants 1");
+                    std::to_string(aux.size) + " entries for " +
+                    std::to_string(n_arms) + " arms");
             }
-            const std::uint32_t then_ops = op.param1;
-            const std::uint32_t else_ops = aux[0];
-            bool cond;
-            switch (op.param0) {
-            case static_cast<std::uint32_t>(
-                pie_forward::PieForwardGuardPred::HasWriteDesc):
-                cond = has_write_desc;
-                break;
-            default:
-                throw std::runtime_error(
-                    "declared forward: guard predicate " +
-                    std::to_string(op.param0) +
-                    " is not in this executor's vocabulary");
+            const auto pred_holds = [&](std::uint32_t kind,
+                                        std::uint32_t payload) -> bool {
+                switch (kind) {
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::HasWriteDesc):
+                    return has_write_desc;
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::TokensLE):
+                    return N <= static_cast<int>(payload);
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::TokensGT):
+                    return N > static_cast<int>(payload);
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::WantsAttnScore):
+                    return stage_hooks != nullptr &&
+                           stage_hooks->wants_attn_score;
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::HasCustomMask):
+                    // A1 (the class-collapse amendment): the mask arm
+                    // of the decode/prefill traces.
+                    return custom_mask_d != nullptr;
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::HasStageHooks):
+                    // A2: the hooked arm (retired vocabulary since A3;
+                    // kept for any trace that still states it).
+                    return stage_hooks != nullptr;
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::HasLora):
+                    // The §5.1 correction arm: usable lora lanes take the
+                    // general sequence + the correction pseudo-symbol.
+                    return has_lora;
+                default:
+                    throw std::runtime_error(
+                        "declared forward: guard predicate kind " +
+                        std::to_string(kind) +
+                        " is not in this executor's vocabulary");
+                }
+            };
+            // Region layout: arm regions in order, then the else region.
+            std::size_t chosen_start = SIZE_MAX;
+            std::uint32_t chosen_len = 0;
+            std::size_t cursor = i + 1;
+            for (std::uint32_t a = 0; a < n_arms; ++a) {
+                const std::uint32_t len = aux[a * 3 + 2];
+                if (chosen_start == SIZE_MAX &&
+                    pred_holds(aux[a * 3], aux[a * 3 + 1])) {
+                    chosen_start = cursor;
+                    chosen_len = len;
+                }
+                cursor += len;
             }
-            if (cond) {
-                // Fall into the then-region; jump the else when it ends.
-                guard_else_at = i + 1 + then_ops;
-                guard_else_len = else_ops;
-            } else {
-                // Jump the then-region; ++i lands on the first else op.
-                i += then_ops;
+            const std::uint32_t else_len = aux[n_arms * 3];
+            if (chosen_start == SIZE_MAX) {
+                chosen_start = cursor;
+                chosen_len = else_len;
             }
+            const std::size_t total_end = cursor + else_len;
+            // Jump to the chosen region; when it ends, jump to total_end
+            // (stacked, so a nested guard inside the region composes).
+            guard_skips.emplace_back(chosen_start + chosen_len,
+                                     total_end - (chosen_start + chosen_len));
+            i = chosen_start - 1;  // the loop's ++i lands on the region
             break;
         }
         case PieForwardOpKind::Swiglu: {

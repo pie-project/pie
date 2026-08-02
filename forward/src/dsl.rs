@@ -167,6 +167,12 @@ impl M {
         &self.f
     }
 
+    /// The tape, for the few call sites (value-producing guards) that
+    /// need it directly.
+    pub fn trace(&self) -> &Trace {
+        &self.t
+    }
+
     /// The lowering in hand, if this is a lowered trace: the backend
     /// facts and the fire class the declaration's class arms match on.
     pub fn lowering(&self) -> Option<(&LlamaLikeCudaFacts, FireClass)> {
@@ -260,6 +266,15 @@ pub fn trace(
             match class {
                 FireClass::Decode => "decode",
                 FireClass::Prefill => "prefill",
+                // The service classes are qwen3_5's; llama_like has no
+                // spec-decode repair pass. The ffi entry rejects them
+                // before tracing; this is the same statement for direct
+                // Rust callers.
+                FireClass::CommitAdvance
+                | FireClass::StateOnly
+                | FireClass::FrozenVerify => {
+                    panic!("llama_like has no MTP service classes")
+                }
             }
         ),
     };
@@ -588,28 +603,153 @@ impl std::ops::AddAssign<Val> for Val {
 
 // ── The runtime branch ─────────────────────────────────────────────────
 
-/// Record a [`OpKind::Guard`]: `then_f`'s ops run when `pred` holds at
-/// fire time, `else_f`'s when it does not. The ONE branch a lowered
-/// declaration may write over a runtime input — the predicate vocabulary
-/// is closed ([`GuardPred`]), the regions are flat, and neither region's
-/// values may escape (side-effect launches only; the builder has no way
-/// to stop a determined escape yet, so the discipline is reviewed, not
-/// enforced — a value-producing guard is a later design).
-pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f: impl FnOnce()) {
+/// An open [`OpKind::Guard`] chain: `.arm(pred, f)` regions are tried in
+/// order at fire time, `.otherwise(f)` closes the chain with the
+/// fallback region. The ONE branch a lowered declaration may write over
+/// runtime inputs — the predicate vocabulary is closed ([`GuardPred`]),
+/// the regions are flat and consecutive, and a region's OWN values may
+/// not escape (its launches are lowerings of the guard's outputs, which
+/// [`guarded_value`] created up front; the discipline is reviewed, not
+/// enforced).
+#[must_use = "a guard chain must be closed with .otherwise(..)"]
+pub struct GuardCtx {
+    t: Trace,
+    idx: usize,
+    arms: Vec<crate::trace::GuardArm>,
+    emitted: u32,
+}
+
+impl GuardCtx {
+    pub fn arm(mut self, pred: crate::trace::GuardPred, f: impl FnOnce()) -> Self {
+        f();
+        let total = {
+            let b = self.t.inner.borrow();
+            (b.op_count_now() - self.idx - 1) as u32
+        };
+        self.arms.push(crate::trace::GuardArm {
+            pred,
+            ops: total - self.emitted,
+        });
+        self.emitted = total;
+        self
+    }
+
+    pub fn otherwise(self, f: impl FnOnce()) {
+        f();
+        let mut b = self.t.inner.borrow_mut();
+        let total = (b.op_count_now() - self.idx - 1) as u32;
+        b.close_guard(self.idx, self.arms, total - self.emitted);
+    }
+}
+
+/// Open a side-effect-only guard chain.
+pub fn guarded(m: &M) -> GuardCtx {
+    guarded_on(&m.t)
+}
+
+pub(crate) fn guarded_on(t: &Trace) -> GuardCtx {
     let idx = {
-        let mut b = m.t.inner.borrow_mut();
+        let mut b = t.inner.borrow_mut();
         b.set_layer(None);
-        b.open_guard(pred)
+        b.open_guard(vec![]).0
     };
-    then_f();
-    let then_ops = {
-        let b = m.t.inner.borrow();
+    GuardCtx {
+        t: t.clone(),
+        idx,
+        arms: Vec::new(),
+        emitted: 0,
+    }
+}
+
+/// Open a VALUE-PRODUCING guard chain: the returned [`Val`]s are the
+/// guard's outputs — one producer whichever arm runs — and each region's
+/// launches are their lowerings, binding the same output buffer and
+/// recording no SSA outputs of their own.
+pub fn guarded_value(t: &Trace, layer: Option<u32>, shape: (Shape, DType)) -> (GuardCtx, Val) {
+    let (idx, outs) = {
+        let mut b = t.inner.borrow_mut();
+        b.set_layer(layer);
+        b.open_guard(vec![shape])
+    };
+    (
+        GuardCtx {
+            t: t.clone(),
+            idx,
+            arms: Vec::new(),
+            emitted: 0,
+        },
+        Val {
+            t: t.clone(),
+            id: outs[0],
+            layer,
+        },
+    )
+}
+
+/// Two-way sugar over [`GuardCtx`] — the 4a form llama_like writes.
+pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f: impl FnOnce()) {
+    guarded(m).arm(pred, then_f).otherwise(else_f);
+}
+
+/// Record an [`OpKind::Peel`] (A3): BOTH region closures run at trace
+/// time — the prefix over rows `[0, fast_rows)` at fire time, the tail
+/// over `[fast_rows, N)`, the split a runtime input. The returned [`Val`]s
+/// are the peel's outputs, jointly lowered: both regions' ops bind
+/// disjoint row windows of the same buffers and their own values stay
+/// region-internal.
+pub fn peel(
+    t: &Trace,
+    layer: Option<u32>,
+    shape: (Shape, DType),
+    prefix_f: impl FnOnce(),
+    tail_f: impl FnOnce(),
+) -> Val {
+    let (idx, outs) = {
+        let mut b = t.inner.borrow_mut();
+        b.set_layer(layer);
+        b.open_peel(vec![shape])
+    };
+    prefix_f();
+    let prefix = {
+        let b = t.inner.borrow();
         (b.op_count_now() - idx - 1) as u32
     };
-    else_f();
-    let mut b = m.t.inner.borrow_mut();
-    let else_ops = (b.op_count_now() - idx - 1) as u32 - then_ops;
-    b.close_guard(idx, then_ops, else_ops);
+    tail_f();
+    let (total, _) = {
+        let b = t.inner.borrow();
+        ((b.op_count_now() - idx - 1) as u32, ())
+    };
+    t.inner.borrow_mut().close_peel(idx, prefix, total - prefix);
+    Val {
+        t: t.clone(),
+        id: outs[0],
+        layer,
+    }
+}
+
+/// [`guard`] for declarations that carry no [`M`] (the qwen3_5 bodies
+/// build their own weight namespaces and run against a bare [`Trace`]):
+/// the same two-way chain, opened on the tape directly.
+pub(crate) fn guard_on(
+    t: &Trace,
+    pred: crate::trace::GuardPred,
+    then_f: impl FnOnce(),
+    else_f: impl FnOnce(),
+) {
+    guarded_on(t).arm(pred, then_f).otherwise(else_f);
+}
+
+/// Record a [`OpKind::HookSite`] (the HookSite slice): the layer's
+/// attached programs run here at fire time, observing `q`. Since A2
+/// (the class-collapse amendment) the sites live INSIDE the
+/// `HasStageHooks` guard arm of the Decode/Prefill traces — the one
+/// text carries them, and an unhooked fire's walk never reaches them,
+/// which is the launch-list truth (the SITES' bracketing launches —
+/// begin_layer, compact — exist only on hooked fires).
+pub fn hook_site(stage: crate::trace::HookStage, q: &Val, layer: u32) {
+    q.t.with(Some(layer), |b| {
+        b.push_hook_site(stage, layer, q.id);
+    });
 }
 
 // ── Raw kernel signatures ──────────────────────────────────────────────
@@ -652,6 +792,15 @@ pub mod cuda {
         Some(StateRef {
             store: StateStore::KvCache,
             layer: kv.l,
+        })
+    }
+
+    /// The GDN ops' state mark, [`kv_state`]-style: the layer's
+    /// per-request conv/recurrent slabs.
+    fn rs_state(rs: &Rs) -> Option<StateRef> {
+        Some(StateRef {
+            store: StateStore::RecurrentState,
+            layer: rs.l,
         })
     }
 
@@ -758,6 +907,17 @@ pub mod cuda {
         attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
     }
 
+    /// `ops::dispatch_attention_flashinfer_prefill_bf16` ALONE — no
+    /// dequant launch. The llama_like pair above is llama-specific: its
+    /// cache may be quantized, so the hand-written prefill path dequants
+    /// the layer first. qwen3_5's full-attention path gates on a
+    /// native-bf16 cache and launches only the dispatch
+    /// (`qwen3_5_forward.cpp::full_attn_layer_body`), so its lowered arm
+    /// states exactly one launch.
+    pub fn attention_flashinfer_prefill_planned(q: &Val, kv: &Kv, q_width: u32) -> Val {
+        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
+    }
+
     /// `kernels::launch_write_kv_explicit_bf16`: the explicit-descriptor
     /// KV write (graph-replay steering; N cells, one per query token).
     /// Stated inside the `HasWriteDesc` guard's then-region.
@@ -786,6 +946,356 @@ pub mod cuda {
             vec![k.id, v.id],
             None,
         );
+    }
+
+    /// `kernels::launch_causal_conv1d_update_batched_bf16`: the
+    /// slot-indirected decode conv update (+ fused SiLU) against the
+    /// layer's per-request conv slab. Shape-preserving, like the
+    /// semantic [`causal_conv1d`] it lowers.
+    pub fn gdn_conv_update_batched(x: &Val, w: &ConvW, rs: &Rs) -> Val {
+        gdn_conv(x, w, rs, "launch_causal_conv1d_update_batched_bf16")
+    }
+
+    /// `kernels::launch_causal_conv1d_prefill_batched_bf16`: the batched
+    /// prefill conv walk (each request walking its qo_indptr window and
+    /// persisting the trailing K-window into the slab).
+    pub fn gdn_conv_prefill_batched(x: &Val, w: &ConvW, rs: &Rs) -> Val {
+        gdn_conv(x, w, rs, "launch_causal_conv1d_prefill_batched_bf16")
+    }
+
+    fn gdn_conv(x: &Val, w: &ConvW, rs: &Rs, kernel: &str) -> Val {
+        let ids = x.t.with(Some(w.layer), |b| {
+            let shape = b.value_shape(x.id);
+            b.launch(
+                kernel,
+                vec![w.name.clone()],
+                rs_state(rs),
+                vec![x.id],
+                vec![(shape, DType::BF16)],
+            )
+        });
+        Val {
+            t: x.t.clone(),
+            id: ids[0],
+            layer: Some(w.layer),
+        }
+    }
+
+    /// `kernels::launch_recurrent_gated_delta_step_batched[_gqa][_state_bf16]`:
+    /// the one-token decode recurrence step against the layer's
+    /// per-request recurrent state. `gqa` states the compact-K_h-indexing
+    /// GQA variant (value heads != key heads); `state_bf16` the store
+    /// dtype. Output = the semantic [`gated_delta`]'s: the core keeps v's
+    /// `[Tokens, Vh, Vd]` f32 shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_step_batched(
+        q: &Val,
+        k: &Val,
+        v: &Val,
+        g: &Val,
+        beta: &Val,
+        rs: &Rs,
+        gqa: bool,
+        state_bf16: bool,
+    ) -> Val {
+        let kernel = match (gqa, state_bf16) {
+            (true, true) => "launch_recurrent_gated_delta_step_batched_gqa_state_bf16",
+            (true, false) => "launch_recurrent_gated_delta_step_batched_gqa",
+            (false, true) => "launch_recurrent_gated_delta_step_batched_state_bf16",
+            (false, false) => "launch_recurrent_gated_delta_step_batched",
+        };
+        let ids = q.t.with(Some(rs.l), |b| {
+            let shape = b.value_shape(v.id);
+            b.launch(
+                kernel,
+                vec![],
+                rs_state(rs),
+                vec![q.id, k.id, v.id, g.id, beta.id],
+                vec![(shape, DType::F32)],
+            )
+        });
+        Val {
+            t: q.t.clone(),
+            id: ids[0],
+            layer: Some(rs.l),
+        }
+    }
+
+    /// `kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled[_gqa][_state_bf16]`:
+    /// the warp-tiled small-N prefill recurrence. NOT a value producer:
+    /// the three prefill recurrence signatures record launches with NO
+    /// outputs, because each runs inside a value-producing guard chain
+    /// ([`guarded_value`]) whose output IS the recurrence core — the
+    /// region launches bind the guard's buffer and add no SSA values of
+    /// their own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_prefill_warp_tiled(
+        q: &Val,
+        k: &Val,
+        v: &Val,
+        g: &Val,
+        beta: &Val,
+        rs: &Rs,
+        gqa: bool,
+        state_bf16: bool,
+    ) {
+        let kernel = match (gqa, state_bf16) {
+            (true, true) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+            (true, false) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa",
+            (false, true) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+            (false, false) => "launch_chunk_gated_delta_prefill_batched_warp_tiled",
+        };
+        gdn_prefill(q, k, v, g, beta, rs, kernel);
+    }
+
+    /// `kernels::launch_chunk_gated_delta_prefill_batched_cached[_state_bf16]`:
+    /// the env-gated cached prefill recurrence. No `_gqa` variant exists —
+    /// this family indexes the REPEATED `[Vh]`-head layout, which is why
+    /// its guard arm materializes [`repeat_interleave_heads`] first.
+    /// Guard-region launch, output-less like the warp-tiled form.
+    pub fn gdn_prefill_cached(
+        q: &Val,
+        k: &Val,
+        v: &Val,
+        g: &Val,
+        beta: &Val,
+        rs: &Rs,
+        state_bf16: bool,
+    ) {
+        let kernel = if state_bf16 {
+            "launch_chunk_gated_delta_prefill_batched_cached_state_bf16"
+        } else {
+            "launch_chunk_gated_delta_prefill_batched_cached"
+        };
+        gdn_prefill(q, k, v, g, beta, rs, kernel);
+    }
+
+    /// `kernels::launch_chunk_gated_delta_prefill_batched[_state_bf16]`:
+    /// the batched GQA-aware FLA prefill recurrence — the fallback arm
+    /// (it indexes the compact K_h layout directly, so no repeats).
+    /// Guard-region launch, output-less like the warp-tiled form.
+    pub fn gdn_prefill_fla(
+        q: &Val,
+        k: &Val,
+        v: &Val,
+        g: &Val,
+        beta: &Val,
+        rs: &Rs,
+        state_bf16: bool,
+    ) {
+        let kernel = if state_bf16 {
+            "launch_chunk_gated_delta_prefill_batched_state_bf16"
+        } else {
+            "launch_chunk_gated_delta_prefill_batched"
+        };
+        gdn_prefill(q, k, v, g, beta, rs, kernel);
+    }
+
+    fn gdn_prefill(q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val, rs: &Rs, kernel: &str) {
+        record(
+            &q.t,
+            Some(rs.l),
+            kernel,
+            vec![],
+            rs_state(rs),
+            vec![q.id, k.id, v.id, g.id, beta.id],
+            None,
+        );
+    }
+
+    /// `kernels::launch_repeat_interleave_heads_fp32`: materialize the
+    /// K_h → V_h head repeat of a compact per-head f32 value into the
+    /// workspace buffer the cached recurrence family reads. Output-less:
+    /// where that buffer lives is the driver's binding, not dataflow —
+    /// the same stance as the KV writes. Stated only inside the cached
+    /// arm, because only that kernel family consumes the repeated layout
+    /// (the decode-GQA step, warp-tiled and FLA kernels all index the
+    /// compact layout directly).
+    pub fn repeat_interleave_heads(x: &Val) {
+        record(
+            &x.t,
+            x.layer,
+            "launch_repeat_interleave_heads_fp32",
+            vec![],
+            None,
+            vec![x.id],
+            None,
+        );
+    }
+
+    /// `"qwen35_verify_stash_load"`: replay the layer's stashed in-proj
+    /// outputs — `[mixed_qkv | a | b]` from the verify hidden stash slab
+    /// into the workspace buffers the following conv/prep read.
+    ///
+    /// A PSEUDO-SYMBOL, the first: it names an OPERATION the driver
+    /// implements as a `cudaMemcpyAsync` trio, not a `__global__` entry
+    /// point. The contract stands regardless — a launcher may be three
+    /// API calls; the symbol names the operation, and the driver's
+    /// name→launcher registry resolves it like any other. No inputs
+    /// (the stash is the layer's per-request state, marked below);
+    /// THREE outputs, the in-proj triple the GEMMs would have produced —
+    /// mixed_qkv `[Tokens, conv_dim]`, a `[Tokens, value_heads]`, b
+    /// `[Tokens, value_heads]`, all bf16 — so the CommitAdvance pass's
+    /// dataflow into `gdn_prep` stays complete. WHERE those buffers
+    /// live is the driver's binding, [`repeat_interleave_heads`]-style.
+    pub fn verify_stash_load(t: &Trace, rs: &Rs, conv_dim: u32, value_heads: u32) -> (Val, Val, Val) {
+        let ids = t.with(Some(rs.l), |b| {
+            b.launch(
+                "qwen35_verify_stash_load",
+                vec![],
+                rs_state(rs),
+                vec![],
+                vec![
+                    (Shape(vec![Dim::Tokens, Dim::Const(conv_dim)]), DType::BF16),
+                    (Shape(vec![Dim::Tokens, Dim::Const(value_heads)]), DType::BF16),
+                    (Shape(vec![Dim::Tokens, Dim::Const(value_heads)]), DType::BF16),
+                ],
+            )
+        });
+        let mk = |id| Val {
+            t: t.clone(),
+            id,
+            layer: Some(rs.l),
+        };
+        (mk(ids[0]), mk(ids[1]), mk(ids[2]))
+    }
+
+    /// `"qwen35_verify_stash_store"`: persist a linear layer's in-proj
+    /// triple `[qkv, a, b]` into the layer's verify hidden stash slab —
+    /// [`verify_stash_load`]'s writing half, the same pseudo-symbol
+    /// contract (a memcpy trio behind one name). Output-less: the stash
+    /// is the layer's per-request state, not dataflow.
+    ///
+    /// No class this rung states it: its consumer is the future
+    /// frozen-verify class (the `write_state=false` verify pass that
+    /// fills the stash the commit pass replays — semantic this rung).
+    /// The pair is declared together because the load's contract is only
+    /// meaningful against the store's layout.
+    pub fn verify_stash_store(qkv: &Val, a: &Val, b: &Val, rs: &Rs) {
+        record(
+            &qkv.t,
+            Some(rs.l),
+            "qwen35_verify_stash_store",
+            vec![],
+            rs_state(rs),
+            vec![qkv.id, a.id, b.id],
+            None,
+        );
+    }
+
+    /// `ops::dispatch_attention_flashinfer_decode_capture`: the
+    /// score-capturing decode dispatch (the OnAttn sideband's producer;
+    /// its contract includes the capture publish against the possibly
+    /// page-mask-compacted CSR). Region launch of the WantsAttnScore
+    /// guard — output-less; the guard owns the attention output.
+    pub fn attention_flashinfer_decode_capture(q: &Val, kv: &Kv) {
+        record(
+            &q.t,
+            Some(kv.l),
+            "dispatch_attention_flashinfer_decode_capture",
+            vec![],
+            kv_state(kv),
+            vec![q.id],
+            None,
+        );
+    }
+
+    /// `ops::dispatch_attention_flashinfer_prefill_capture_bf16` — the
+    /// prefill counterpart, same guard-region contract.
+    pub fn attention_flashinfer_prefill_capture(q: &Val, kv: &Kv) {
+        record(
+            &q.t,
+            Some(kv.l),
+            "dispatch_attention_flashinfer_prefill_capture_bf16",
+            vec![],
+            kv_state(kv),
+            vec![q.id],
+            None,
+        );
+    }
+
+    /// Output-less plain-dispatch forms for guard regions (the guard owns
+    /// the output; these bind it).
+    pub fn attention_flashinfer_decode_region(q: &Val, kv: &Kv) {
+        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_decode",
+               vec![], kv_state(kv), vec![q.id], None);
+    }
+    pub fn attention_flashinfer_prefill_region(q: &Val, kv: &Kv) {
+        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_bf16",
+               vec![], kv_state(kv), vec![q.id], None);
+    }
+    pub fn attention_xqa_decode_region(q: &Val, kv: &Kv) {
+        record(&q.t, Some(kv.l), "launch_attention_xqa_decode_bf16_prepared",
+               vec![], kv_state(kv), vec![q.id], None);
+    }
+
+    /// Output-less [`qkv_decode_qk_norm_rope_write_kv`] for the Peel's
+    /// prefix region (A3): the peel owns q; this launch binds its
+    /// `[0, fast_rows)` rows. Same operands, same aux contract.
+    pub fn qkv_decode_qk_norm_rope_write_kv_region(
+        packed: &Val,
+        q_norm: &NormW,
+        k_norm: &NormW,
+        kv: &Kv,
+        table: Option<&Val>,
+    ) {
+        let mut inputs = vec![packed.id];
+        if let Some(t) = table {
+            inputs.push(t.id);
+        }
+        record(
+            &packed.t,
+            Some(kv.l),
+            "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+            vec![q_norm.name.clone(), k_norm.name.clone()],
+            kv_state(kv),
+            inputs,
+            None,
+        );
+    }
+
+    /// `ops::dispatch_attention_flashinfer_prefill_custom`: the
+    /// custom-mask prefill dispatch — a genuinely distinct launcher, so
+    /// no pseudo-symbol is needed. The mask data (BRLE bytes + indptr)
+    /// crosses as runtime args of the stated kernel, commit_lens's peer.
+    /// Since A1 (the class-collapse amendment) it is stated inside the
+    /// `HasCustomMask` guard arm of the Decode/Prefill traces — the
+    /// output-less region form below is what the arm records; this
+    /// value-producing form remains for consumers outside a guard.
+    pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv, q_width: u32) -> Val {
+        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_custom")
+    }
+    pub fn attention_flashinfer_prefill_custom_region(q: &Val, kv: &Kv) {
+        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_custom",
+               vec![], kv_state(kv), vec![q.id], None);
+    }
+
+    /// `"pie_lora_qkv_correction"`: the §5.1 adapter correction — every
+    /// usable lora lane's `x·Aᵀ·Bᵀ` delta landed on the materialized q/v
+    /// projections, before anything consumes them (bias, norms, rope,
+    /// KV append). A PSEUDO-SYMBOL, the stash pair's peer: the driver
+    /// implements it as the per-lane / grouped GEMM-pair sequence of
+    /// `LoraFireState::apply` — a launcher may be many calls; the symbol
+    /// names the operation. Output-less and in place on q/v; stated
+    /// inside the `HasLora` guard's then-region (the else is empty — a
+    /// fire with no adapters launches nothing, which is the truth).
+    pub fn lora_qkv_correction(q: &Val, v: &Val, l: u32) {
+        record(
+            &q.t,
+            Some(l),
+            "pie_lora_qkv_correction",
+            vec![],
+            None,
+            vec![q.id, v.id],
+            None,
+        );
+    }
+
+    /// The standalone dequant staging launch, for arms whose attention
+    /// lives inside a guard (the dequant is common to both regions, so
+    /// it precedes the guard).
+    pub fn dequant_only(kv: &Kv) {
+        dequant(kv);
     }
 
     fn dequant(kv: &Kv) {

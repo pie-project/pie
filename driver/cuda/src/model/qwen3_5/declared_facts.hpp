@@ -53,6 +53,23 @@ bool qwen35_declared_forward_enabled();
 // the hand-written path either way.
 struct Qwen35DeclaredPlan {
     pie_forward::ForwardPlan plan;
+    // Rung 4c-iii (north-star-dsl.md): the CLASS traces — the hybrid
+    // declaration run with this deployment's derived CUDA facts and a
+    // fire class, every kernel choice STATED. Normal decode/prefill
+    // fires walk these; the MTP/verify/legacy service fires keep the
+    // semantic `plan` until 4c-iv brings their classes.
+    pie_forward::ForwardPlan decode;
+    pie_forward::ForwardPlan prefill;
+    // 4c-iv: the MTP service classes — the spec-decode repair pass and
+    // the epilogue-less whole-backbone flavor. (The frozen-verify class
+    // is the next slice; frozen fires stay on the semantic walk.)
+    pie_forward::ForwardPlan commit_advance;
+    pie_forward::ForwardPlan state_only;
+    // The frozen-verify class: the prefill body + a stash store per
+    // linear layer; write_state=false is a runtime arg, not a trace
+    // difference. With it, every batched body() fire has a class —
+    // rung 5's precondition.
+    pie_forward::ForwardPlan frozen_verify;
     // The binding facts the trace committed to (llama_like's `fused_qkv`
     // precedent); arc 2's per-fire gate re-checks them against the live
     // workspace before emitting.
@@ -62,6 +79,24 @@ struct Qwen35DeclaredPlan {
     // geometry's `is_full_attn` formula) — recorded so arc 2 need not
     // re-derive it from cfg.layer_types.
     int full_attn_interval = 0;
+    // The recurrent-state dtype the class traces committed to. Derived
+    // from `RecurrentStateCache::recurrent_state_bf16_default()` at
+    // build — the cache itself is engine-owned and not visible here —
+    // so the executor CROSS-CHECKS the live cache per fire and falls
+    // back to the semantic walk (loudly, once) on mismatch rather than
+    // running a trace whose kernels bind the wrong dtype.
+    bool cuda_state_bf16 = false;
+    // The verify-stash fact the CommitAdvance trace committed to (stash
+    // configured → the trace replays in-proj activations from it). The
+    // stash is engine-configured like the state dtype, so the executor
+    // cross-checks `verify_hidden_stash_enabled()` per commit fire and
+    // falls back to the semantic walk on mismatch.
+    bool cuda_verify_stash = false;
+    // What the class traces were taken from, in the format the future
+    // generated .inc embeds (`emit_qwen35::facts_digest`, the llama
+    // mechanism's port); the static-form dispatch runs only on exact
+    // match, and the live boot corrects any guessed emission fact.
+    std::string facts_digest;
 
     explicit operator bool() const noexcept {
         return static_cast<bool>(plan);

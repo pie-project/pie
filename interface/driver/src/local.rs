@@ -1181,7 +1181,24 @@ pub struct PieStepDesc {
     pub channel_expected_head: PieU64Slice,
     pub channel_expected_tail: PieU64Slice,
     pub channel_ticket_indptr: PieU32Slice,
+    /// The fire planner's hook-free prefix for this step, in WIRE request
+    /// rows: rows `[0, n)` belong to no attention-stage program by the
+    /// SCHEDULER's plan (`fire_plan`'s qkv_postprocess site — the
+    /// planner's first consumed lowering). [`PIE_HOOK_FREE_PREFIX_UNPLANNED`]
+    /// means the scheduler sent no plan and the driver derives the prefix
+    /// itself (the pre-plan behavior); any other value the driver
+    /// cross-checks against its own compiled-plan derivation and refuses
+    /// the launch on drift — the declaration-side hook stamp and the
+    /// compiled stage plans must agree.
+    pub planned_hook_free_prefix_rows: u32,
+    /// Reserved; must be zero.
+    pub reserved_step_tail0: u32,
 }
+
+/// [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
+/// sentinel. Not zero: zero is a legitimate planned value ("no fast
+/// prefix" — an all-hooked step).
+pub const PIE_HOOK_FREE_PREFIX_UNPLANNED: u32 = u32::MAX;
 
 impl Default for PieStepDesc {
     fn default() -> Self {
@@ -1237,6 +1254,8 @@ impl Default for PieStepDesc {
             channel_expected_head: PieU64Slice::default(),
             channel_expected_tail: PieU64Slice::default(),
             channel_ticket_indptr: PieU32Slice::default(),
+            planned_hook_free_prefix_rows: PIE_HOOK_FREE_PREFIX_UNPLANNED,
+            reserved_step_tail0: 0,
         }
     }
 }

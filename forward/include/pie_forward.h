@@ -124,13 +124,27 @@ enum class PieForwardOpKind : uint32_t {
   /// resolves the symbol in its name→launcher registry and launches —
   /// adding a kernel never grows this enum again.
   Launch = 23,
-  /// The lowered branch over a per-fire RUNTIME input (`GuardPred` in
-  /// param0 as a wire value; then-region op count in param1; else-region
-  /// op count as a one-entry `aux_names` run). The `then_ops` ops after
-  /// this one run when the predicate holds, the `else_ops` after those
-  /// when it does not; regions are flat (no nesting) and produce no
-  /// values consumed outside. The ONLY branch a class trace carries.
+  /// The lowered branch CHAIN over per-fire RUNTIME inputs: arm count
+  /// in param0; the `aux_names` run is [pred kind, pred payload, region
+  /// len] per arm plus a trailing else-region length. Regions are flat,
+  /// consecutive, in arm order then else; the first arm whose predicate
+  /// holds runs. May produce values: the guard's outputs are the ONE
+  /// producer whichever region runs — region launches bind the same
+  /// output buffer and record no outputs of their own. The ONLY branch
+  /// a class trace carries.
   Guard = 24,
+  /// A model-body hook site (the HookSite slice): stage wire value in
+  /// param0 (0 = OnAttnProj, 1 = OnAttn), layer in param1. The
+  /// executor brackets the site's mechanics (page-mask begin/compact,
+  /// score sideband) and invokes the fire's attached programs; a fire
+  /// with nothing attached passes through by argument.
+  HookSite = 25,
+  /// Loop peeling (A3, the class-collapse amendment): two regions
+  /// that BOTH run over complementary row ranges — prefix `[0,
+  /// fast_rows)`, tail `[fast_rows, N)`. Prefix-region op count in
+  /// `param0`, tail-region count in `param1`; the split is the
+  /// fire's hook-free prefix row count, a runtime input.
+  Peel = 26,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -170,13 +184,45 @@ enum class PieForwardQkNorm : uint32_t {
 enum class PieForwardFireClass : uint32_t {
   Decode = 0,
   Prefill = 1,
+  /// qwen3_5 MTP service classes (2/3/4); llama_like rejects them.
+  CommitAdvance = 2,
+  StateOnly = 3,
+  /// Reserved (the frozen-verify slice); both entries reject it today.
+  FrozenVerify = 4,
+  /// RETIRED (A1/A2, the class-collapse amendment): a custom mask is
+  /// a HasCustomMask guard arm and attached stage hooks are a
+  /// HasStageHooks guard arm of classes 0/1. The discriminants stay
+  /// reserved (append-only rule); both entries reject them.
+  MaskedDecode = 5,
+  MaskedPrefill = 6,
+  HookedDecode = 7,
+  HookedPrefill = 8,
 };
 
-/// Mirrors [`crate::trace::GuardPred`] — the values `Guard.param0`
-/// carries; same appended-only discriminant rule as [`PieForwardOpKind`].
+/// Mirrors [`crate::trace::GuardPred`]'s wire KINDS (each arm crosses as
+/// a (kind, payload) pair in the guard's aux run); same appended-only
+/// discriminant rule as [`PieForwardOpKind`].
 enum class PieForwardGuardPred : uint32_t {
   /// The fire carries explicit KV-write descriptors (`has_write_desc`).
+  /// Payload unused.
   HasWriteDesc = 0,
+  /// `N <= payload` (token rows within a threshold).
+  TokensLE = 1,
+  /// `N > payload`.
+  TokensGT = 2,
+  /// The fire's programs read attention scores at OnAttn
+  /// (`StageHooks::wants_attn_score`). Payload unused.
+  WantsAttnScore = 3,
+  /// The fire carries a custom attention mask (`custom_mask_d !=
+  /// nullptr`) — A1, the class-collapse amendment. Payload unused.
+  HasCustomMask = 4,
+  /// The fire carries attached stage-hook programs (`stage_hooks !=
+  /// nullptr`) — A2, the class-collapse amendment. Payload unused.
+  /// Retired since A3 (reserved, unstated).
+  HasStageHooks = 5,
+  /// The fire carries usable lora lanes (the §5.1 correction).
+  /// Payload unused.
+  HasLora = 6,
 };
 
 /// The llama_like facts, as C states them. Mirrors
@@ -477,6 +523,37 @@ struct PieForwardQwen35HybridFacts {
   PieForwardQwen35MoeMlpFacts moe;
 };
 
+/// The CUDA backend facts for a LOWERED qwen3_5 hybrid trace, as C
+/// states them. Mirrors [`crate::facts::Qwen35CudaFacts`] field for
+/// field; same input-side rules as [`PieForwardLlamaLikeFacts`] (the
+/// bools are `uint8_t`, non-zero is true; the thresholds are plain
+/// `uint32_t` values the tracer has no basis to second-guess).
+///
+/// The driver fills this from its OWN derivation (the env gates
+/// `PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST` /
+/// `..._WARP_TILED_MAX_TOKENS` / `..._CACHED_PREFILL_MAX_TOKENS`, the
+/// state dtype, the K_d bound) at cold start — the same terms
+/// `declared_forward.cpp`'s hoisted predicates compute today.
+struct PieForwardQwen35CudaFacts {
+  /// The recurrent-state store dtype is bf16; non-zero is true.
+  uint8_t state_bf16;
+  /// The warp-tiled prefill arm exists at all (K_d bound && the
+  /// state-persist env gate); non-zero is true.
+  uint8_t warp_tiled;
+  /// `qwen35_gdn_warp_tiled_max_tokens()` — the warp-tiled arm's
+  /// `TokensLE` payload.
+  uint32_t warp_tiled_max;
+  /// `qwen35_gdn_cached_prefill_max_tokens()` — the cached arm's
+  /// `TokensLE` payload.
+  uint32_t cached_max;
+  /// The deployment configures the verify hidden stash
+  /// (`RecurrentStateCache::configure_verify_hidden_stash`): the
+  /// CommitAdvance class replays the linear layers' in-proj outputs
+  /// from the stash instead of re-running the GEMMs. Non-zero is true.
+  /// Appended field (4c-iv) — the append-only struct discipline.
+  uint8_t verify_stash;
+};
+
 extern "C" {
 
 /// Trace the llama_like family against `facts` and publish the traced form
@@ -582,6 +659,30 @@ PieForwardStatus pie_forward_trace_qwen3_5_full_attn(const PieForwardQwen35FullA
 /// `out_plan` is null or a writable slot.
 PieForwardStatus pie_forward_trace_qwen3_5_hybrid(const PieForwardQwen35HybridFacts *facts,
                                                   PieForwardPlan *out_plan);
+
+/// Trace the LOWERED qwen3_5 hybrid — the same text as
+/// [`pie_forward_trace_qwen3_5_hybrid`], with the CUDA backend facts and
+/// a fire class in hand, so the class arms run and the traced form
+/// states its kernels as `Launch` ops with the recurrence three-way
+/// behind value-producing `Guard` chains (north-star-dsl.md rung 4c).
+/// Call once per class the deployment fires; the semantic entry remains
+/// the parity reference.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardQwen35HybridFacts`] / [`PieForwardQwen35CudaFacts`];
+/// `out_plan` is null or a writable slot. `class` is a
+/// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
+/// enum rule); anything else answers `InvalidArgument`. ALL FOUR classes
+/// are traceable here (4c-iv): the service classes CommitAdvance (2 —
+/// family `qwen3_5_hybrid.cuda.commit_advance`) and StateOnly (3 —
+/// `...state_only`) alongside Decode/Prefill. They remain qwen3_5's:
+/// the llama_like entry keeps refusing them.
+PieForwardStatus pie_forward_trace_qwen3_5_hybrid_cuda(const PieForwardQwen35HybridFacts *facts,
+                                                       const PieForwardQwen35CudaFacts *cuda,
+                                                       uint32_t class_,
+                                                       PieForwardPlan *out_plan);
 
 /// Free the storage behind a plan header filled by
 /// [`pie_forward_trace_llama_like`], [`pie_forward_trace_qwen3_5_moe_mlp`],

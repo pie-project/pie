@@ -52,6 +52,7 @@
 #include "model/qwen3_5/declared_facts.hpp"
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -62,13 +63,21 @@ namespace pie_cuda_driver::model {
 // lights up both families.
 bool qwen35_declared_exec_trace_enabled();
 
-// Execute one eligible fire by walking `declared.plan`. The caller
+// Boot validation (rung 4c-iii): every Launch symbol a class trace
+// states must resolve in this executor's name→launcher registry, so a
+// declaration/executor drift fails at model load, not mid-fire.
+void qwen35_validate_stated_kernels(const pie_forward::ForwardPlan& plan);
+
+// Execute one eligible fire by walking its CLASS trace (rung 5: the
+// semantic walk is deleted from this executor). Returns false when the
+// fire has no class (legacy harness shapes, live-fact mismatches) — the
+// caller then runs the hand-written path. The caller
 // (Qwen35Model::body) has already applied the eligibility gate; this
 // function additionally throws (never silently diverges) when the plan
 // carries an op or payload outside the executor's vocabulary — a trace
 // whose shape drifted must fail loudly, exactly the llama_like executor's
 // contract.
-void qwen3_5_forward_declared(
+bool qwen3_5_forward_declared(
     const Qwen35DeclaredPlan& declared,
     const Qwen3_5Weights& w,
     const HfConfig& cfg,
@@ -105,6 +114,10 @@ void qwen3_5_forward_declared(
     // [R] confirmed-prefix lengths — the hand-written `commit_len`
     // threading (`in.commit_advance_gather_d`; the rs_buffer_fold flavor
     // stays gate-excluded, so this is always the verify-stash replay).
-    const std::int32_t* commit_lens);
+    const std::int32_t* commit_lens,
+    // A4: the fire's attached stage-hook programs (null = none). The
+    // class traces carry the HookSite ops; qwen3_5's sites are
+    // observation-only, so nothing else crosses.
+    const StageHooks* stage_hooks);
 
 }  // namespace pie_cuda_driver::model

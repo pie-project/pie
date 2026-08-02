@@ -1,5 +1,7 @@
 #include "model/llama_like/llama_like_model.hpp"
 
+#include "model/stage_hooks.hpp"
+
 #include <cstdlib>
 #include <utility>
 
@@ -92,19 +94,17 @@ void LlamaLikeModel::body(Workspace& ws,
                           AttentionWorkspace& attn_ws,
                           ops::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
-    // The declared executor covers exactly the hand-written UNFUSED path's
-    // vocabulary; anything it cannot express falls back, per fire, to the
+    // The declared executor covers the hand-written path's vocabulary;
+    // anything it cannot express falls back, per fire, to the
     // hand-written body below. Build-time exclusions (TP, quantized
     // projections, non-standard rope, ...) already left `declared_` empty.
+    // Hooked fires (A3, the Peel op): EVERY hook composition —
+    // all-hooked, mixed (0 < fast_rows < R), none, and masked+hooked
+    // (the mask arm carries the sites; the custom dispatch publishes no
+    // scores, which is the hand-written contract) — walks the shape
+    // trace.
     const bool declared_eligible =
         static_cast<bool>(declared_) &&
-        in.stage_hooks == nullptr &&
-        // The declared plan has no correction op yet: a lora fire falls back
-        // to the hand-written body, which applies the delta. Running the
-        // declared executor here would silently drop the adapter — the
-        // honest gate is exclusion.
-        in.lora == nullptr &&
-        in.custom_mask_d == nullptr &&
         // Explicit KV-write fires are in scope (declared_forward.hpp says
         // why: every graph-replayed decode fire carries them), but only
         // when the descriptors actually arrived — the same guard the
@@ -128,7 +128,10 @@ void LlamaLikeModel::body(Workspace& ws,
             in.logit_row_indices_d, in.num_logit_rows,
             in.w_page_d, in.w_off_d,
             in.row_valid_d, in.has_write_desc,
-            in.runtime_window_left);
+            in.runtime_window_left,
+            in.custom_mask_d, in.custom_mask_indptr_d,
+            in.stage_hooks,
+            in.lora);
         return;
     }
     llama_like_forward_paged(

@@ -73,6 +73,11 @@ struct StepLaunch {
     PieU64Slice channel_expected_head;
     PieU64Slice channel_expected_tail;
     PieU32Slice channel_ticket_indptr;
+    // The scheduler's planned hook-free prefix in WIRE request rows
+    // (fire_plan's qkv_postprocess site, converted through the
+    // attribution CSR). PIE_HOOK_FREE_PREFIX_UNPLANNED = no plan sent.
+    std::uint32_t planned_hook_free_prefix_rows =
+        PIE_HOOK_FREE_PREFIX_UNPLANNED;
 };
 
 }  // namespace pie_native

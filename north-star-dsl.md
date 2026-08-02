@@ -121,7 +121,17 @@ peepholes, eligibility predicates, thresholds.
    fused predicate are deleted; the switch dispatches on op kind + stated
    variant only. Parity: byte-identical to the current executor on the
    full battery (which is itself byte-identical to hand-written).
-3. **Static C++ emission** — DONE (2026-08-02): `emit_cuda.rs` walks the
+3. **Static C++ emission** — DONE (2026-08-02); COMPLETE AT FULL
+   WIDTH (2026-08-03, `31a28eed`): after the class collapse, the
+   static form grew to cover every admitted fire — the mask arms, the
+   Peel's row-windowed regions, the lora arms (the emitter constructs
+   the fire staging and spells each correction's layer as a constant),
+   and the hook machinery (sideband preamble, 280 constant-layer
+   sites, page-mask brackets, capture publishes). The generated
+   dispatch keeps NO per-attachment exclusions: digest match means
+   static C++, full stop. Hook A/B through the generated path is
+   byte-identical 12/12 under live page eviction. Original rung-3
+   record: `emit_cuda.rs` walks the
    class traces and writes `generated/qwen3_0_6b.inc` (committed,
    regeneration-clean-tested) — 4.5k lines of straight-line C++, one
    statement per op, the XQA-or-not question answered at emission, the
@@ -173,8 +183,217 @@ peepholes, eligibility predicates, thresholds.
      lowered traces state the batched kernels only, and the parity
      entry keeps the semantic trace + interpreter. If the harness path
      ever hits a lowered trace, the loud unknown-kernel throw names it.
-5. **Delete** the hand-written arm code and the semantic-only trace path
-   once every consumer reads class traces.
+5. **Delete** the choice-deriving code once every body() fire has a
+   class. Scope, precisely — rung 5 deletes from the DECLARED executors:
+   the semantic-walk cascades (the conv/recurrence/attention/KV-write
+   choice arms), the hoisted `use_*` booleans, and the
+   commit/state-only op filters. It does NOT delete the semantic TRACE
+   (parity reference, site summaries, the Metal emitter's input) nor the
+   hand-written paged bodies (they serve everything the declared gate
+   excludes: hooks, lora, custom masks, TP, quantized projections — the
+   fallback tier is a feature, not a leftover).
+
+   **The mask classes (direction set in review, 2026-08-02).** Custom
+   masks are the other load-bearing per-fire attachment, and they are
+   CLASSES, not guards: a masked decode swaps the attention kernel to
+   the custom-mask prefill dispatch AND breaks the fused decode-QKV
+   arm's predicate — the op list changes. `MaskedDecode` (wire 5) and
+   `MaskedPrefill` (wire 6): the general QKV arm + the fused
+   qk-norm+rope + a DISTINCT stated symbol for the masked attention
+   (`dispatch_attention_flashinfer_prefill_bf16_masked` — the stash
+   pseudo-symbol precedent: same C++ dispatch, different operation,
+   because "bind the mask if present" back in the driver would be the
+   smarts we deleted). Mask data crosses as runtime args of the stated
+   kernel, commit_lens's peer. This EXPANDS the declared gate — masked
+   fires fall back to the hand-written path entirely today — and the
+   item-A harnesses (naive-masked, attention-sink, sliding-window) are
+   the ready-made parity gates. llama_like first, qwen3_5 after.
+
+   **The hook axis (design set in review, 2026-08-02).** The PTIR stage
+   programs (Prologue / OnAttnProj / OnAttn / Epilogue) also vary per
+   forward pass — and they are NEITHER classes NOR guards. They are the
+   third mechanism, the one plan.md's sketch carried from the start:
+   `forward(tok, h: dyn Hooks)`. Three reasons, each disqualifying an
+   axis: they are PER-LANE (a fire mixes hooked and hook-free lanes —
+   done criterion #2 — and a class is per-fire); WHICH program attaches
+   is `dyn` (user PTIR, runtime-compiled — unenumerable by a trace,
+   the expert axis's peer); and the lowering is the PLANNER's
+   (`Prefix{fast_rows}`, derived per fire — criterion #4's territory).
+   What the declaration states is the SITES: `h.*` calls become
+   `HookSite{stage, layer}` ops whose content is the site's contract
+   (what it observes, what it may intervene on — the sideband types).
+   What it does not state: the program (sideband data) and `fast_rows`
+   (a runtime parameter of the generated code — plan.md Part 3
+   verbatim: "its fast-path conditions take a row count where they used
+   to take a boolean"; the fused decode-QKV arm's `fast_rows == R` gate
+   term becomes that row count). A site with no program attached is a
+   no-op by argument, not by branch — write_state's peer — which is
+   exactly the condition under which the fused kernel survives on the
+   hook-free prefix. Hooked fires stay on the hand-written path (where
+   stages 1/6 built all of this by hand) until the HookSite slice, which
+   follows rung 5 — it is the largest remaining expansion of the
+   declared gate, and it is where the declared world and the
+   polymorphic-batching machinery finally meet in one text.
+
+   **HookSite recon findings (2026-08-02, slice begun).** Three facts
+   sharpen the slice:
+   - The MODEL body has exactly TWO sites, not four: `OnAttnProj`
+     (observes q before attention, intervenes through the page-mask
+     sink — `invoke_stage_hook` at llama_like.cpp:1260, preceded by
+     `page_mask.begin_layer`) and `OnAttn` (post-attention, scores via
+     the LayerScoreCapture sideband, :1502). PTIR's Prologue and
+     Epilogue run DISPATCH-side around the logits — the post-logit
+     divergence plan.md measured as nearly free — so they are not trace
+     ops of the forward at all.
+   - The incremental parity target is the ALL-HOOKED fire
+     (fast_rows == 0): the hand-written path runs the general unfused
+     sequence for every row plus the stage rings — exactly a
+     `HookedDecode`/`HookedPrefill` class trace (general QKV arm + the
+     fused qk-norm+rope, which is hook-independent + HookSite ops). The
+     MIXED fire (0 < fast_rows < R) needs the `Peel` op — loop peeling
+     as vocabulary: two regions that BOTH run, over complementary row
+     ranges, `fast_rows` the runtime split — and is its own increment.
+   - Open recon before the driver wiring: the hooked decode's attention
+     kernel under a page-mask intervention (which dispatch consumes the
+     narrowed page list) — the hooked classes must state it.
+
+   **The frozen-verify amendment (decided while 4c-iv landed).** The 4b
+   geometry called `verify_frozen` a kernel parameter — true for
+   `write_state`, but the frozen service ALSO stash-writes (the memcpy
+   trio after the in-proj splits), which changes the op list, and by our
+   own rule that makes it a CLASS: `FireClass::FrozenVerify` (wire 4) =
+   the Prefill body + `verify_stash_store` per linear layer.
+   `write_state` remains the runtime argument it already is — the class
+   carries the op, not the flag. With it, every qwen3_5 body() fire has
+   a class, which is exactly rung 5's precondition. The legacy
+   slot-less parity-entry paths leave the declared executor entirely
+   (fall back to hand-written) — they were a harness convenience, and
+   the harness keeps the hand-written path anyway.
+
+   **The class-collapse amendment (the A-ladder; direction set in
+   review 2026-08-03).** The wiki review's sharpest finding: classes
+   MULTIPLY (mask × hook × service × family), which re-derives the
+   partition-and-batch enumeration this plan set out to beat.
+   Masked×2/Hooked×2 are whole-trace-granularity treatments of deltas
+   the vocabulary can express at op granularity. The mask-classes
+   decision is REVERSED: "a masked decode is not a decode" stays true
+   op-list-wise, but the delta is LOCAL (the attention site + the
+   fused-QKV arm), and a local op-list delta over a runtime input is
+   exactly Guard territory. The ladder:
+   - **A1 — DONE (2026-08-03)**: `GuardPred::HasCustomMask` (wire 4);
+     Decode/Prefill traces carry the mask arm as a guard chain at the
+     attention site — in the fused_post deployment the mask arm holds
+     the whole general QKV sequence, so its nested HasWriteDesc guard
+     makes guard NESTING part of the vocabulary (the walk keeps a skip
+     STACK, the emitter recurses; the aux wire encoding is unchanged —
+     a nested guard is just an op inside a region). Masked classes
+     deleted; wire values 5/6 answer InvalidArgument (append-only ABI
+     keeps the numbers). The rope-table hoist stays unconditional in
+     the fused deployment — a masked fire launches one table build it
+     never reads (outputs unaffected; the ops-count line shows it).
+   - **A2 — DONE (2026-08-03)**: same collapse for Hooked×2 via
+     `GuardPred::HasStageHooks` (wire 5). Better than the sketch: the
+     sites are not unconditional ops — they live INSIDE the hooked
+     arm's region, so an unhooked fire's walk never reaches them (the
+     per-fire launch-list truth is structural). The attention chain
+     per layer: [HasCustomMask → custom | HasStageHooks → sites +
+     side-effect WantsAttnScore guard | else → plain/fused]; the
+     fused arm moved to the chain's else. The generated static form
+     transliterates the hooked arm as an honest REFUSAL (throw at the
+     first HookSite/capture) and its dispatch keeps hooked fires on
+     the interpreter walk — extending the static form to the hook
+     sideband machinery is its own later increment. Nine classes are
+     five: Decode (788 ops), Prefill (619), CommitAdvance, StateOnly,
+     FrozenVerify. Parity: 3-leg token parity, sink A4 OFF/ON/GEN,
+     hook A/B 12/12 byte-identical (0 fallbacks — every hooked fire
+     walks the collapsed traces), forward 54+16+regen-clean, engine
+     394, metal 8/8.
+   - **A3 — DONE (2026-08-03)**: `OpKind::Peel` (wire 26; region
+     lengths in param0/param1, the split NEVER in the trace — it is
+     the fire's `fast_rows`, a runtime input). Better than the
+     sketch: the Peel does not live inside a hooks arm — it DISSOLVES
+     the HasStageHooks arm entirely. The one else-arm body serves
+     every hook composition: the packed GEMM full-N, the Peel
+     splitting its postprocess (fused epilogue over rows
+     `[0, fast_rows)`, general split/norm+rope/write over
+     `[fast_rows, N)` at absolute offsets — the hand-written mixed
+     fire launch for launch), then the sites (argument no-ops when
+     unhooked, early-out on null hooks) and the WantsAttnScore-guarded
+     attention, all full-N. `fast_rows == N` is the classic fused
+     fire, `0` the all-hooked one; the gate now admits MIXED fires
+     (only hooked+masked stays hand-written — the mask arm carries no
+     sites). GuardPred::HasStageHooks (wire 5) is retired vocabulary
+     after one rung of service — reserved, unstated. The interpreter
+     binds a row window (start/len) set by Peel region events; the
+     emitter derives `fast_rows` from the hooks argument and spells
+     both regions as `if (fast_rows > 0)` / `if (fast_rows < N)`
+     blocks with offset pointers. Decode 760 ops / Prefill 563.
+     Parity: 3-leg token parity; sink A4 OFF/ON/GEN; hook A/B 12/12
+     byte-identical; MIXED fires observed walking the declared Peel
+     live (`N=4 R=4 fast_rows=2/3` decode, `N=148 R=4 fast_rows=3`
+     prefill co-batches, ALL_OK liveness both gates — mixed
+     compositions are not batch-deterministic, so the mixed gate is
+     engagement + liveness + the solo byte-parities, the stage-2
+     discipline); engine 394; metal 8/8.
+   - **A4 — DONE (2026-08-03)**: qwen3_5's hooks are in scope —
+     narrower than the sketch, because recon narrowed the target:
+     qwen3_5's hand-written sites are OBSERVATION-only (all four
+     `invoke_stage_hook` calls pass no mask sink and no score
+     sideband: GDN layers observe the prep's fp32 q_pre, full-attn
+     layers the roped bf16 q), so no guard is needed at all — the
+     sites ride the lowered class bodies directly (argument no-ops,
+     null-hooks early-out), including the commit-advance replay
+     (which passes through both invokes before its early return).
+     The hooks fallback term is deleted from the qwen3_5 gate. And
+     custom masks turn out NOT to exist for qwen3_5: the hand-written
+     body IGNORES `mask_d` entirely (commented-out params — a masked
+     qwen3_5 fire runs unmasked today), so there is no semantics to
+     declare; the mask fallback term stays as the honest record of
+     that gap. Parity: qwen3.5-0.8B live A/B short+long
+     byte-identical across the gate (51 declared fires, 0 fallbacks);
+     llama 3-leg parity re-green; forward 54+16+regen; engine 394;
+     metal 8/8.
+   End state: `FireClass` = fire SHAPE × SERVICE only (Decode,
+   Prefill, CommitAdvance, StateOnly, FrozenVerify) — the axes that
+   change the pass wholesale; per-fire attachments (masks, hooks,
+   lora) are guards, sites, and channel data. This is also the
+   region vocabulary the future union pass (supergraph merge) emits
+   into, which is why the collapse precedes it.
+
+   **B — DONE (2026-08-03)**: the planner's first consumed lowering.
+   `Prefix{fast_rows}` converts to wire rows and crosses the ABI
+   (`planned_hook_free_prefix_rows`); the driver cross-checks it
+   against its compiled-plan derivation (refusing on drift) and
+   feeds the declared Peel's split. Live: planned=0 ×276
+   (all-hooked), planned=2/3 ×48 (mixed), 0 refusals.
+
+   **C — the fire census verdict (2026-08-03).** `PIE_FIRE_CENSUS=1`
+   prints one line per sealed step group (size, the head's solo
+   contract, join refusals by clause — `LaunchGrouping::refusal` and
+   `solo_reason` are the reason-carrying twins of the old booleans).
+   Measured over a realistic mix (mixed hooked fires, staggered
+   dense-masked lanes, solo hook alternation, k=3 perf A/B):
+   - ZERO solo-contract fires — the remaining `requires_solo` terms
+     (rs-buffer: stage-2 contract verdict; prebuilt-untracked:
+     harness; multirow-zero-tokens) never fire in real work.
+   - The ONLY join refusals are `mask-compose` (303 events): a
+     DENSE-masked lane vs device-resolved decode envelopes — the
+     residual of stage 2's item A, which relaxed exactly the
+     structured-mask subset. The relax path is a DRIVER capability
+     (per-lane wire-mask packing on the composed path), with this
+     census as its measured target; nothing scheduler-side remains
+     to loosen.
+   - Carrying a hooked lane in a mixed fire costs the plain lanes
+     NOTHING (naive slowdown 1.00×/0.96×/0.90× across reps — the
+     Peel + planner ordering did their job).
+   The supergraph-ladder implication, recorded honestly: the class
+   collapse has EATEN most of the union pass's original unblocked
+   payload — per-fire attachment divergence now co-batches inside
+   one fire, so D's remaining targets are the dense-mask compose
+   capability above and the externally-blocked structural axes
+   (multi-checkpoint serving, depth/MoD, vision). D stays
+   measurement-gated on a workload that actually carries one of
+   those.
 
 ## What this does not reopen
 
@@ -183,3 +402,193 @@ kernels); PTIR untouched; planner's divergence lowerings still chosen at
 fire time from candidates. The append-only ABI discipline holds — new op
 kinds append (21+), variant fields ride param slots serde-defaulted so
 every existing golden stays byte-identical.
+
+## Dense-mask compose — the pinned design (2026-08-03, pre-implementation)
+
+The census's one remaining scheduler refusal (`mask-compose`) and the
+masked+hooked arm's missing producer share one capability: let a
+wire-BRLE-masked lane ride a composed device-geometry batch. The seam
+is `frame.cpp`'s composed-path throw ("non-causal wire masks cannot
+ride..."), and the constraint that forces the shape of the fix is that
+a device-resolved lane's TRUE kv length under run-ahead lives in
+`kv_len_device` — device-resident — so host-side causal synthesis for
+those lanes is not generally exact. Therefore a HYBRID DEVICE-SIDE
+pack, extending item A's machinery (`pack_dense_mask.cu`):
+
+1. **Wire lanes**: host-decode their BRLE rows against their (exact,
+   wire) geometry — `brle::decode` restricted to the wire prefix —
+   and stage the bit-packed bytes per lane.
+2. **Device lanes**: structured `Causal` params (item A's vocabulary),
+   packed device-side against the resolved `klen`.
+3. **One `mask_indptr` over all lanes, computed DEVICE-side**: a small
+   prefix-sum kernel over per-lane byte sizes (wire lanes' sizes are
+   host constants passed in; device lanes' derive from klen), with the
+   packed buffer allocated to the page-capacity upper bound.
+4. **A scatter-copy kernel** placing the wire lanes' staged bytes at
+   their device-computed offsets; `launch_pack_structured_mask` (or a
+   variant taking the device indptr) fills the device lanes.
+5. The staged pair feeds the SAME custom dispatch the HasCustomMask
+   arm already states — no trace change, no new dispatch.
+6. **Scheduler relax, LAST** (after the driver path is live-proven on
+   a forced composition): drop `wire_mask_on_device_geometry` and the
+   `has_user_mask × device_geometry` crosses for WIRE-mask lanes;
+   dense DEVICE masks (no BRLE rows, device content) remain solo by
+   nature.
+Verification: the census workload (maskmix + h2o) should then show the
+mask-compose refusals gone and mask=1 hooked=1 fires walking the
+declared/generated paths; stage-2's 1.8–2.3× two-wave penalty is the
+measured stake.
+
+## Release-build A/B measurement — the walk overhead note (2026-08-03)
+
+Question: does the declared-forward host walk (interpreter) or the
+generated static form cost or save measurable wall-clock vs the
+hand-written path, in an OPTIMIZED build? All prior parity work ran
+debug builds, where host overhead is exaggerated and no perf claim is
+honest.
+
+Protocol: release build (`cargo build --release -p pie-bin --features
+driver-cuda`), Qwen3-0.6B on the L40S, `mixed_fire_perf.py` (4
+concurrent naive decode lanes × 48 tokens = pure; + hooked lane =
+mixed), 3 reps per leg, three legs: OFF (hand-written), ON
+(interpreter), GEN (generated .inc, digest-gated).
+
+Result: **indistinguishable within rep noise.** Pure walls span
+0.22–0.35 s across ALL legs with no leg-correlated ordering (each leg
+contains both the fastest and the slowest reps); the mixed-lane
+"naive slowdown" ratios scatter 0.74–1.31× with no leg trend.
+
+Reading, honestly bounded:
+- At this scale (0.6B, N≤5 rows, 48-token decode legs) kernel time
+  dominates; the per-fire host walk — even the interpreter's
+  guard-skip/window bookkeeping — is not the bottleneck, and the
+  generated form's compile-time fact resolution buys no measurable
+  wall-clock here.
+- Therefore the generated form's PROVEN value is structural (the
+  digest-gated static form, four caught fact-lies, the emitted code as
+  reviewable artifact), not throughput. Any "supergraph saves X%"
+  claim stays unearned until a workload where host walk shows up
+  (many small fires, large N with short legs) is measured.
+- What this DOES retire: the standing worry that the interpreter walk
+  taxes the hot path. In release, on this hardware, it doesn't.
+
+Follow-up (same day): the "workload where host walk shows up" was then
+built and measured — `walk_stress_perf.py`, single-lane 256-step decode
+(kernel-minimal fires, host-walk fraction maximal) and 16-lane 64-step
+co-batch, 3 reps per leg, same release build. Single-lane steps/s:
+OFF 210–218, ON 209–217, GEN 214–230 — rep ranges overlap; 16-lane
+scatter 137–182 across all legs, no leg trend. So even at the walk-
+heaviest point this engine reaches, the interpreter tax is unmeasurable
+and the generated form buys no wall-clock. The perf claim ledger
+closes: supergraph value on this hardware/scale is structural, and the
+stage-2 wave-count argument (fewer FIRES via co-batching, not cheaper
+walks) remains the only measured throughput stake.
+
+## Dense-mask compose — first live producer, and what it taught (2026-08-03)
+
+The compose relaxation finally met a producer. `naive-masked` grew
+`mask_mode="dense-prefill"`: the semantically-causal host mask moves to
+the PREFILL chunks (wire-geometry fires → wire BRLE rows — the exact
+lane shape the C-relax admits), decode runs unmasked. Live on the L40S:
+
+- **Semantics**: solo `none` vs `dense-prefill`, same seed → BYTE-
+  IDENTICAL text. The prefill mask is proven causal-equivalent.
+- **Compose**: 6 masked lanes raced against 2 decoding baselines —
+  census shows ZERO mask-compose refusals and repeated members=3
+  steps; the composed fire prints `[declared-forward-generated]
+  N=52 R=3 decode=0` (50 wire prefill rows + 2 envelope rows walking
+  the GENERATED path).
+- **BUT the assembly path is still unexercised**: `brle::is_pure_causal`
+  recognizes the causal wire rows and elides the mask before the
+  composed-assembly branch (`frame.cpp`'s else-if) is reached. The
+  composed batch runs the plain path — correct, and exactly what the
+  elision is for. A producer for the ASSEMBLY needs a genuinely
+  non-causal wire mask (e.g. a causal-minus-one-column "holed" mode):
+  the next rung of this thread.
+
+### The three-day-old trap this run sprang: cross-leg text A/B is
+### invalid under composition races
+
+The mixed workload's baseline texts differed OFF vs ON vs GEN —
+deterministic per leg, reproducible across boots. It looked like a
+parity breach in the composed prefill+envelope fire. It is not. The
+census member fingerprint (added this session: per-member
+`logical_fire_id × rows`) shows the legs compose DIFFERENT fires:
+ON's sequential-lane prefill lands at baseline fire ~91, GEN's at ~33
+and ~103 — the interpreter's slower host walk shifts WHEN the racing
+prefill joins the decode stream. Different composition → different
+reduction shapes → legitimate near-tie sampling flips. Solo masked
+lanes: ON == GEN byte-identical. All-lockstep compositions (the prior
+batteries' shape): ON == GEN byte-identical. The rule, recorded for
+every future battery: **a cross-leg byte-parity claim requires equal
+census fingerprints; when a workload races a sequential lane against
+a decode stream, compare fingerprints first and texts second.**
+
+Follow-up, same day — the ASSEMBLY got its producer too.
+`mask_mode="dense-prefill-hole"` knocks column 1 out of the causal
+envelope (rows p >= 2), so `is_pure_causal` cannot elide it and a
+composed batch is FORCED through frame.cpp's wire-mask assembly
+branch. Live, both legs:
+- Interpreter: `N=52 R=3 mask=1` (holed prefill + 2 envelopes) and
+  `N=150 R=3 mask=1` (THREE wire-masked prefills co-batched with each
+  other) — the custom dispatch engaged on composed batches.
+- Generated: 2× `N=52 R=3 decode=0` through the generated custom-mask
+  arm; solo holed tokens ON == GEN byte-identical.
+- Correctness oracle, composition-invariant by construction: every
+  raced lane's max_tokens=1 output depends only on its own prefill
+  logits, so SOLO token == MIXED token is the assembly-correctness
+  signal. All 6 lanes match, on both legs.
+The dense-mask compose design (the pinned section above) is now fully
+live-proven end to end: scheduler relax → composed assembly → custom
+dispatch, interpreter and generated. What remains honest: dense DEVICE
+masks stay solo by nature, and no REAL policy inferlet ships a
+non-causal wire mask yet — naive-masked is the measurement instrument
+standing in for one.
+
+Second follow-up — the holed producer swept the full deployment
+matrix (2026-08-03, same session). The composed wire-mask assembly +
+custom-dispatch proof is not a qwen3-0.6b artifact:
+- **OLMo-2-1B** (post-norm, unfused, GENERATED inc): solo == mixed
+  6/6 on interpreter AND generated legs, solo ON == GEN; composed
+  `N=52 R=3 mask=1` ×2 and the three-prefill `N=150 R=3 mask=1`. The
+  post-norm generated custom-mask arm had never run with a real
+  non-causal mask before this.
+- **Phi-3-mini** (interpreter): 6/6, `N=58 R=3 mask=1` ×4 + `N=168
+  R=3 mask=1`. **Mistral-7B** (interpreter): 6/6, `N=56 R=3 mask=1`
+  ×5 + `N=162 R=3 mask=1`. Zero errors anywhere.
+Also probed and closed a question: qwen3_5's recorded custom-mask gap
+(hand-written ignores `mask_d`) is UNREACHABLE today — naive-masked's
+attention shape fails recurrent-state binding on the hybrid model
+before any fire is built, so no current surface can deliver a custom
+mask to qwen3_5. The recorded-gap status (fallback reason + note, the
+same pattern as lora) is the honest state; a fail-loud would be dead
+code. Separately confirmed the two write-descriptor conventions in
+naive-baseline (`p / page_size`) and naive-masked (`pool_ids[...]`)
+are the SAME convention: `reserve()` returns LOGICAL per-working-set
+page indices (0..k for a fresh set), so `pool_ids[i] == i` — no trust
+gap in the parity workhorses.
+
+## HasStageHooks (wire 5) — the retirement disposition (2026-08-03)
+
+Question recurring on the hygiene list: the pred is retired vocabulary
+(A3 moved hooks to Peel row windows + sites), yet the emitter and the
+interpreter both still carry an arm for it. Keep or remove?
+
+**Keep, deliberately.** Both arms evaluate `hooks != nullptr` — the
+semantics a trace stating the pred would want are still exactly what
+the arms answer, so a resurrected or replayed old trace gets a CORRECT
+walk, not drift. Removal breaks wire compatibility for zero payload;
+converting the arms to throws would turn a correct answer into an
+error. The discriminant stays reserved, the arms stay correct, the
+comments already say "retired since A3". This closes the last item on
+the residual-hygiene list; the vocabulary is stable as documented.
+
+## Consolidated sweep at tip `5a17d4fac` (2026-08-03)
+
+Unit tier: forward lib 54, goldens 18, regen pins, engine 395,
+tokenizer, ABI layout — all green. Live tier (release build,
+Qwen3-0.6B): fresh OFF vs GEN short+long BYTE-IDENTICAL;
+trackb-snapkv + trackb-h2o hook workloads on GEN clean (28 layers
+observed per fire, zero NaN, page masses sane). Everything since the
+last consolidated stamp (census fingerprints, the two naive-masked
+producer modes, doc notes) holds together.

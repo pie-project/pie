@@ -8,11 +8,12 @@
 
 use super::arena::{self, view};
 use super::entry::{
-    PieForwardLlamaLikeCudaFacts, PieForwardLlamaLikeFacts, PieForwardQwen35FullAttnFacts,
-    PieForwardQwen35GdnFacts, PieForwardQwen35HybridFacts, PieForwardQwen35MoeMlpFacts,
-    PieForwardStatus, pie_forward_release, pie_forward_trace_llama_like,
-    pie_forward_trace_llama_like_cuda, pie_forward_trace_qwen3_5_full_attn,
-    pie_forward_trace_qwen3_5_gdn, pie_forward_trace_qwen3_5_hybrid,
+    PieForwardLlamaLikeCudaFacts, PieForwardLlamaLikeFacts, PieForwardQwen35CudaFacts,
+    PieForwardQwen35FullAttnFacts, PieForwardQwen35GdnFacts, PieForwardQwen35HybridFacts,
+    PieForwardQwen35MoeMlpFacts, PieForwardStatus, pie_forward_release,
+    pie_forward_trace_llama_like, pie_forward_trace_llama_like_cuda,
+    pie_forward_trace_qwen3_5_full_attn, pie_forward_trace_qwen3_5_gdn,
+    pie_forward_trace_qwen3_5_hybrid, pie_forward_trace_qwen3_5_hybrid_cuda,
     pie_forward_trace_qwen3_5_moe_mlp,
 };
 use super::types::*;
@@ -70,6 +71,8 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::SigmoidGateMul => PieForwardOpKind::SigmoidGateMul,
         OpKind::Launch { .. } => PieForwardOpKind::Launch,
         OpKind::Guard { .. } => PieForwardOpKind::Guard,
+        OpKind::HookSite { .. } => PieForwardOpKind::HookSite,
+        OpKind::Peel { .. } => PieForwardOpKind::Peel,
     }
 }
 
@@ -811,6 +814,239 @@ fn hybrid_entry_traces_and_validates() {
     );
 }
 
+/// The 0.8B hybrid facts, as a C caller would state them — shared by the
+/// lowered-trace round-trip tests.
+fn c_facts_hybrid_0_8b() -> PieForwardQwen35HybridFacts {
+    let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+    let gdn = &facts.gdn;
+    PieForwardQwen35HybridFacts {
+        layers: facts.layers,
+        full_attn_interval: facts.full_attn_interval,
+        vocab: facts.vocab,
+        tied_embeddings: u8::from(facts.tied_embeddings),
+        norm_variant: PieForwardNormVariant::from(facts.norm_variant) as u32,
+        attn: c_facts_full_attn(),
+        gdn: PieForwardQwen35GdnFacts {
+            hidden: gdn.hidden,
+            key_heads: gdn.key_heads,
+            value_heads: gdn.value_heads,
+            key_head_dim: gdn.key_head_dim,
+            value_head_dim: gdn.value_head_dim,
+            conv_kernel: gdn.conv_kernel,
+            fused_in_proj: u8::from(gdn.fused_in_proj),
+            norm_variant: PieForwardNormVariant::from(gdn.norm_variant) as u32,
+        },
+        mlp_is_moe: 0,
+        dense_intermediate: 3584,
+        moe: PieForwardQwen35MoeMlpFacts {
+            hidden: 0,
+            num_experts: 0,
+            top_k: 0,
+            moe_intermediate: 0,
+            shared_expert_intermediate: 0,
+            norm_variant: 0,
+        },
+    }
+}
+
+/// The synthetic 0.8B CUDA facts, as a C caller would state them.
+fn c_cuda_facts_synthetic() -> PieForwardQwen35CudaFacts {
+    PieForwardQwen35CudaFacts {
+        state_bf16: 1,
+        warp_tiled: 1,
+        warp_tiled_max: 64,
+        cached_max: 4096,
+        verify_stash: 1,
+    }
+}
+
+/// The lowered qwen3_5 decode trace crosses the boundary intact,
+/// `lowered_trace_round_trips_through_the_arena`-style: the GDN Launch
+/// wire form — kernel symbol in the weight slot, the conv weight in
+/// `aux_names`, the RecurrentState mark as param0=2 with the state layer
+/// in param1 — plus the full-attention layers' KV-write Guard and
+/// FlashInfer decode dispatch, with the semantic conv/recurrence/append/
+/// attention kinds absent. An out-of-range class (4) answers
+/// InvalidArgument.
+#[test]
+fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
+    let c_facts = c_facts_hybrid_0_8b();
+    let cuda = c_cuda_facts_synthetic();
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe {
+            pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, /*Decode=*/ 0, &mut out)
+        },
+        PieForwardStatus::Ok
+    );
+    assert_eq!(view::name(&out, out.family), "qwen3_5_hybrid.cuda.decode");
+    let ops = view::ops(&out);
+
+    // Layer 0 is GDN: the conv update Launch — kernel symbol in the
+    // weight slot, the conv weight name in aux_names, the RecurrentState
+    // mark as param0=2 with the state layer in param1.
+    let conv = ops
+        .iter()
+        .find(|op| {
+            op.layer == 0
+                && op.kind == PieForwardOpKind::Launch
+                && view::name(&out, op.weight_name) == "launch_causal_conv1d_update_batched_bf16"
+        })
+        .expect("decode class states the batched conv update");
+    let aux = view::ids(&out, conv.aux_names);
+    assert_eq!(aux.len(), 1);
+    assert_eq!(view::name(&out, aux[0]), "layer.0.conv");
+    assert_eq!(conv.param0, 2); // recurrent-state store...
+    assert_eq!(conv.param1, 0); // ...of layer 0
+
+    // The decode recurrence step (the fixture's gqa=false, state_bf16
+    // variant): five prep operands in, one core value out, same state
+    // mark, no weights.
+    let step = ops
+        .iter()
+        .find(|op| {
+            op.layer == 0
+                && op.kind == PieForwardOpKind::Launch
+                && view::name(&out, op.weight_name)
+                    == "launch_recurrent_gated_delta_step_batched_state_bf16"
+        })
+        .expect("decode class states the batched recurrence step");
+    assert_eq!(step.param0, 2);
+    assert_eq!(step.param1, 0);
+    assert_eq!(step.aux_names.len, 0);
+    assert_eq!(view::ids(&out, step.inputs).len(), 5);
+    assert_eq!(view::ids(&out, step.outputs).len(), 1);
+
+    // Layer 3 is full attention: the KV-write Guard (one HasWriteDesc
+    // arm of one op, one else op) and the FlashInfer decode dispatch
+    // marking the layer-3 KV cache (param0=1).
+    let guard = ops
+        .iter()
+        .find(|op| op.kind == PieForwardOpKind::Guard)
+        .expect("full-attention layers carry the KV-write guard");
+    assert_eq!(guard.param0, 1); // one arm
+    assert_eq!(view::ids(&out, guard.aux_names), &[0, 0, 1, 1]);
+    let write = ops
+        .iter()
+        .find(|op| {
+            op.layer == 3
+                && op.kind == PieForwardOpKind::Launch
+                && view::name(&out, op.weight_name) == "launch_write_kv_explicit_bf16"
+        })
+        .expect("the guard's then-region states the explicit write");
+    assert_eq!(write.param0, 1); // kv-cache state...
+    assert_eq!(write.param1, 3); // ...of layer 3
+    let attn = ops
+        .iter()
+        .find(|op| {
+            op.layer == 3
+                && op.kind == PieForwardOpKind::Launch
+                && view::name(&out, op.weight_name) == "dispatch_attention_flashinfer_decode"
+        })
+        .expect("decode class states the FlashInfer decode dispatch");
+    assert_eq!(attn.param0, 1);
+    assert_eq!(attn.param1, 3);
+
+    // No semantic leftovers where the class arms stated kernels.
+    assert!(!ops.iter().any(|op| matches!(
+        op.kind,
+        PieForwardOpKind::CausalConv1d
+            | PieForwardOpKind::GatedDelta
+            | PieForwardOpKind::KvAppend
+            | PieForwardOpKind::Attention
+    )));
+    unsafe { pie_forward_release(&mut out) };
+
+    // Past the last qwen3_5 class (FrozenVerify = 4 accepted since its
+    // slice; the mask classes 5/6 are llama_like's until the qwen3_5
+    // masked slice): malformed, not defaulted.
+    let mut out2 = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, 5, &mut out2) },
+        PieForwardStatus::InvalidArgument
+    );
+    assert!(out2.owner.is_null());
+}
+
+/// The service classes cross the boundary (rung 4c-iv). CommitAdvance
+/// (class 2): the stash PSEUDO-SYMBOL in the Launch's weight slot, no
+/// inputs, THREE outputs (qkv/a/b), the RecurrentState mark as param0=2
+/// with the state layer in param1 — and the 72-op shape (18 linear
+/// layers x 4, no embed, no lm_head, nothing on the full-attention
+/// layers). StateOnly (class 3): the prefill backbone that simply ends
+/// after the last layer — no LmHead, no layer-less final norm.
+#[test]
+fn service_class_traces_round_trip_through_the_arena() {
+    let c_facts = c_facts_hybrid_0_8b();
+    let cuda = c_cuda_facts_synthetic();
+
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe {
+            pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, /*CommitAdvance=*/ 2, &mut out)
+        },
+        PieForwardStatus::Ok
+    );
+    assert_eq!(
+        view::name(&out, out.family),
+        "qwen3_5_hybrid.cuda.commit_advance"
+    );
+    let ops = view::ops(&out);
+    // Per linear layer: stash load, conv, prep, recurrence + the two
+    // hook sites the hand-written replay passes through (A4).
+    assert_eq!(ops.len(), 18 * 6);
+    assert!(ops.iter().all(|op| op.kind == PieForwardOpKind::Launch
+        || op.kind == PieForwardOpKind::GdnPrep
+        || op.kind == PieForwardOpKind::HookSite));
+    // Nothing on the full-attention layers (3, 7, ... are skipped).
+    assert!(!ops.iter().any(|op| op.layer == 3));
+
+    // The stash load: pseudo-symbol in the weight slot, no inputs, three
+    // outputs, the layer-0 RecurrentState mark.
+    let load = ops
+        .iter()
+        .find(|op| {
+            op.layer == 0
+                && op.kind == PieForwardOpKind::Launch
+                && view::name(&out, op.weight_name) == "qwen35_verify_stash_load"
+        })
+        .expect("the stash-configured commit pass states the stash load");
+    assert_eq!(load.inputs.len, 0);
+    let load_outs = view::ids(&out, load.outputs);
+    assert_eq!(load_outs.len(), 3);
+    assert_eq!(load.param0, 2); // recurrent-state store...
+    assert_eq!(load.param1, 0); // ...of layer 0
+    // ...and gdn_prep consumes exactly that triple (dataflow complete).
+    let prep = ops
+        .iter()
+        .find(|op| op.layer == 0 && op.kind == PieForwardOpKind::GdnPrep)
+        .unwrap();
+    let prep_ins = view::ids(&out, prep.inputs);
+    assert_eq!(prep_ins[1], load_outs[1]); // a
+    assert_eq!(prep_ins[2], load_outs[2]); // b
+    // The GEMMs are skipped: no Matmul anywhere in the pass.
+    assert!(!ops.iter().any(|op| op.kind == PieForwardOpKind::Matmul));
+    unsafe { pie_forward_release(&mut out) };
+
+    // StateOnly: the backbone ends with the last layer — no LmHead, and
+    // every op carries a layer tag (the layer-less final norm is gone).
+    assert_eq!(
+        unsafe {
+            pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, /*StateOnly=*/ 3, &mut out)
+        },
+        PieForwardStatus::Ok
+    );
+    assert_eq!(
+        view::name(&out, out.family),
+        "qwen3_5_hybrid.cuda.state_only"
+    );
+    let ops = view::ops(&out);
+    assert!(!ops.iter().any(|op| op.kind == PieForwardOpKind::LmHead));
+    let last = ops.last().unwrap();
+    assert_eq!(last.layer, 23, "state_only must end inside the last layer");
+    unsafe { pie_forward_release(&mut out) };
+}
+
 /// The unfused binding crosses the boundary too: three per-layer projection
 /// matmuls and no SplitQkv, mirroring
 /// `family::tests::unfused_binding_traces_three_matmuls`.
@@ -837,8 +1073,11 @@ fn entry_honours_the_unfused_binding() {
 /// — kernel symbol in the weight slot, consumed weight names in
 /// `aux_names` (signature order), the state mark in the params — plus
 /// the fused decode shape itself: 28 fused posts, ONE table build
-/// consumed by all of them as an operand, and the general arm's
-/// SplitQkv/Rope/KvAppend absent.
+/// consumed by all of them as an operand. Since A1 (the class-collapse
+/// amendment) the Decode trace ALSO carries the HasCustomMask guard's
+/// mask arm per layer — the general QKV sequence (SplitQkv appears as a
+/// region op) and the custom-mask dispatch — beside the fused else-arm;
+/// the launch count pins both arms.
 #[test]
 fn lowered_trace_round_trips_through_the_arena() {
     let facts = c_facts_qwen3();
@@ -859,8 +1098,14 @@ fn lowered_trace_round_trips_through_the_arena() {
         .iter()
         .filter(|op| op.kind == PieForwardOpKind::Launch)
         .collect();
-    // 1 table build + 28 fused posts + 28 attentions.
-    assert_eq!(launches.len(), 57);
+    // 1 table build + per layer: the mask arm's 5 (fused qk-norm+rope,
+    // the lora correction, the write guard's two regions, the custom
+    // dispatch) + the lora arm's 5 (the general sequence + correction +
+    // XQA) + the else arm's 5 — the Peel's prefix (the fused-post
+    // region form) + tail (fused qk-norm+rope, the write guard's two
+    // regions) — plus the plain XQA launch (this fixture is XQA-on; no
+    // capture variant, so no WantsAttnScore guard) = 421.
+    assert_eq!(launches.len(), 421);
 
     let table = launches[0];
     assert_eq!(view::name(&out, table.weight_name), "launch_rope_standard_table");
@@ -894,11 +1139,43 @@ fn lowered_trace_round_trips_through_the_arena() {
         .expect("decode class states XQA");
     assert_eq!(attn.param0, 1);
 
-    // No general-arm leftovers in the fused decode class.
+    // The lowered general arm states its kernels: no semantic Rope or
+    // KvAppend anywhere (SplitQkv is legitimately present — the mask
+    // arm's region carries the general QKV sequence since A1).
     assert!(!ops.iter().any(|op| matches!(
         op.kind,
-        PieForwardOpKind::SplitQkv | PieForwardOpKind::Rope | PieForwardOpKind::KvAppend
+        PieForwardOpKind::Rope | PieForwardOpKind::KvAppend
     )));
+    assert!(ops.iter().any(|op| op.kind == PieForwardOpKind::SplitQkv));
+    // The per-layer guard chains: 28 outer HasCustomMask/HasLora
+    // chains (value-producing) + 28×3 nested HasWriteDesc (mask arm,
+    // lora arm, the Peel's tail) + 28×2 nested HasLora inside the two
+    // general-arm bodies (no WantsAttnScore under XQA).
+    let guards = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::Guard)
+        .count();
+    assert_eq!(guards, 168);
+    // The one body's sites (A3): two per layer — argument no-ops on an
+    // unhooked fire — and one Peel per layer splitting the fused prefix
+    // from the hook-visible tail at fast_rows.
+    // Sites in every arm that runs a body: the mask arm (masked+hooked
+    // composes), the lora arm, and the plain else — 2 × 3 per layer.
+    let sites = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::HookSite)
+        .count();
+    assert_eq!(sites, 168);
+    let peels: Vec<_> = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::Peel)
+        .collect();
+    assert_eq!(peels.len(), 28);
+    // Region lengths ride param0/param1: prefix = the fused region
+    // launch alone; tail = SplitQkv + fused qk-norm+rope + the write
+    // guard chain (guard op + two single-launch regions).
+    assert_eq!(peels[0].param0, 1);
+    assert_eq!(peels[0].param1, 5);
     unsafe { pie_forward_release(&mut out) };
 
     // An out-of-range class is a malformed request, not a default.

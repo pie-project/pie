@@ -114,22 +114,55 @@ pub enum PieForwardOpKind {
     /// resolves the symbol in its name→launcher registry and launches —
     /// adding a kernel never grows this enum again.
     Launch = 23,
-    /// The lowered branch over a per-fire RUNTIME input (`GuardPred` in
-    /// param0 as a wire value; then-region op count in param1; else-region
-    /// op count as a one-entry `aux_names` run). The `then_ops` ops after
-    /// this one run when the predicate holds, the `else_ops` after those
-    /// when it does not; regions are flat (no nesting) and produce no
-    /// values consumed outside. The ONLY branch a class trace carries.
+    /// The lowered branch CHAIN over per-fire RUNTIME inputs: arm count
+    /// in param0; the `aux_names` run is [pred kind, pred payload, region
+    /// len] per arm plus a trailing else-region length. Regions are flat,
+    /// consecutive, in arm order then else; the first arm whose predicate
+    /// holds runs. May produce values: the guard's outputs are the ONE
+    /// producer whichever region runs — region launches bind the same
+    /// output buffer and record no outputs of their own. The ONLY branch
+    /// a class trace carries.
     Guard = 24,
+    /// A model-body hook site (the HookSite slice): stage wire value in
+    /// param0 (0 = OnAttnProj, 1 = OnAttn), layer in param1. The
+    /// executor brackets the site's mechanics (page-mask begin/compact,
+    /// score sideband) and invokes the fire's attached programs; a fire
+    /// with nothing attached passes through by argument.
+    HookSite = 25,
+    /// Loop peeling (A3, the class-collapse amendment): two regions
+    /// that BOTH run over complementary row ranges — prefix `[0,
+    /// fast_rows)`, tail `[fast_rows, N)`. Prefix-region op count in
+    /// `param0`, tail-region count in `param1`; the split is the
+    /// fire's hook-free prefix row count, a runtime input.
+    Peel = 26,
 }
 
-/// Mirrors [`crate::trace::GuardPred`] — the values `Guard.param0`
-/// carries; same appended-only discriminant rule as [`PieForwardOpKind`].
+/// Mirrors [`crate::trace::GuardPred`]'s wire KINDS (each arm crosses as
+/// a (kind, payload) pair in the guard's aux run); same appended-only
+/// discriminant rule as [`PieForwardOpKind`].
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PieForwardGuardPred {
     /// The fire carries explicit KV-write descriptors (`has_write_desc`).
+    /// Payload unused.
     HasWriteDesc = 0,
+    /// `N <= payload` (token rows within a threshold).
+    TokensLE = 1,
+    /// `N > payload`.
+    TokensGT = 2,
+    /// The fire's programs read attention scores at OnAttn
+    /// (`StageHooks::wants_attn_score`). Payload unused.
+    WantsAttnScore = 3,
+    /// The fire carries a custom attention mask (`custom_mask_d !=
+    /// nullptr`) — A1, the class-collapse amendment. Payload unused.
+    HasCustomMask = 4,
+    /// The fire carries attached stage-hook programs (`stage_hooks !=
+    /// nullptr`) — A2, the class-collapse amendment. Payload unused.
+    /// Retired since A3 (reserved, unstated).
+    HasStageHooks = 5,
+    /// The fire carries usable lora lanes (the §5.1 correction).
+    /// Payload unused.
+    HasLora = 6,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as

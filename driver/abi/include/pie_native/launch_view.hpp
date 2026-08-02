@@ -103,6 +103,12 @@ struct LaunchView {
     Slice<std::uint64_t> channel_expected_head;
     Slice<std::uint64_t> channel_expected_tail;
     Slice<std::uint32_t> channel_ticket_indptr;
+    // The scheduler's planned hook-free prefix in WIRE request rows
+    // (fire_plan's qkv_postprocess site — the planner's first consumed
+    // lowering; B). PIE_HOOK_FREE_PREFIX_UNPLANNED = no plan sent, the
+    // dispatch derives the prefix alone.
+    std::uint32_t planned_hook_free_prefix_rows =
+        PIE_HOOK_FREE_PREFIX_UNPLANNED;
     // The batch carries a GUEST-supplied custom mask (vs engine-synthesized
     // causal BRLE rows, which accompany every wire prefill and are safely
     // dropped when a composed batch runs the standard causal path).

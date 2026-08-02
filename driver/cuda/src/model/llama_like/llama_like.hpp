@@ -14,6 +14,7 @@
 //   * Gemma-4 — KV sharing across layers, per-layer embeds.
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "distributed.hpp"
@@ -227,6 +228,45 @@ void llama_like_forward_paged(
     // `x(W+BA)^T = xW^T + (xA^T)B^T` at each lane's declared sites, scoped
     // to that lane's token rows.
     const LoraTable* lora = nullptr);
+
+// The fire-scoped lora staging (`LoraFireState` in llama_like.cpp — the
+// adapter cast + grouping built once per fire), behind an opaque handle so
+// the declared executor can run the SAME §5.1 correction the hand-written
+// body runs (the `pie_lora_qkv_correction` pseudo-symbol's launcher).
+// Constructor stages; `apply` lands one layer's delta on the materialized
+// q/v (the hand-written call, argument for argument).
+class LoraFireStateHandle {
+public:
+    LoraFireStateHandle(
+        const LoraTable& table,
+        const HfConfig& cfg,
+        int total_tokens,
+        int hidden,
+        int q_width,
+        int kv_width,
+        int intermediate,
+        int tp_size,
+        cudaStream_t stream);
+    ~LoraFireStateHandle();
+    LoraFireStateHandle(const LoraFireStateHandle&) = delete;
+    LoraFireStateHandle& operator=(const LoraFireStateHandle&) = delete;
+    void apply(
+        cublasHandle_t handle,
+        int layer,
+        const void* qkv_in,
+        int hidden,
+        int q_width,
+        int kv_width,
+        void* q_out,
+        void* v_out,
+        void* xa_scratch) const;
+    /// The one-line grouping description the hand-written fire trace
+    /// prints (`PIE_LORA_FIRE_TRACE`).
+    std::string grouping_desc() const;
+
+private:
+    void* impl_;
+};
 
 // Map HF's rope_scaling_kind enum onto the driver's RopeKind. Llama3-style
 // frequency scaling maps to YaRN; the "original_yarn" branch keeps

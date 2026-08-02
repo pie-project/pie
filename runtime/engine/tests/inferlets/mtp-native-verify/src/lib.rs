@@ -83,7 +83,7 @@ fn bind_single_sequence(
     )
 }
 
-fn bind_verify_rows(
+fn bind_verify_window(
     pass: &ForwardPass,
     ws: &WorkingSet,
     toks: &Channel,
@@ -92,34 +92,37 @@ fn bind_verify_rows(
     rows: u32,
     pool_pages: u32,
 ) -> Result<()> {
-    let embed_indptr = Channel::from((0u32..=rows).collect::<Vec<_>>()).named("embed_indptr");
-    let positions = Channel::from((seq_len..seq_len + rows).collect::<Vec<_>>()).named("positions");
-    let lengths: Vec<u32> = (1..=rows).map(|row| seq_len + row).collect();
-    let mut page_values = Vec::new();
-    let mut page_indptr_values = vec![0u32];
-    for length in &lengths {
-        page_values.extend(0..length.div_ceil(PAGE_T).min(pool_pages));
-        page_indptr_values.push(page_values.len() as u32);
-    }
-    let pages = Channel::from(page_values).named("pages");
-    let page_indptr = Channel::from(page_indptr_values).named("page_indptr");
+    // ONE request row spanning the k+1 window tokens (the prefill-shaped
+    // verify fire the driver expects), not k+1 single-token rows: the
+    // recurrent-state contract is one working set per REQUEST row, and
+    // the window is one sequence. Per-token explicit-write descriptors
+    // (B2: N cells from the N-entry WSlot/WOff) and a k+1-entry readout
+    // keep the epilogue's [k+1, vocab] logits view intact.
+    let n_final = seq_len + rows;
+    let pages_needed = n_final.div_ceil(PAGE_T).min(pool_pages);
+    let embed_indptr = Channel::from(vec![0u32, rows]).named("embed_indptr");
+    let positions = Channel::from((seq_len..n_final).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..pages_needed).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, pages_needed]).named("page_indptr");
     let w_slot = Channel::from(
-        (seq_len..seq_len + rows)
+        (seq_len..n_final)
             .map(|p| p / PAGE_T)
             .collect::<Vec<_>>(),
     )
     .named("w_slot");
     let w_off = Channel::from(
-        (seq_len..seq_len + rows)
+        (seq_len..n_final)
             .map(|p| p % PAGE_T)
             .collect::<Vec<_>>(),
     )
     .named("w_off");
+    let readout = Channel::from((0..rows).collect::<Vec<_>>()).named("readout");
     pass.embed(toks, &embed_indptr)?;
+    pass.readout(&readout)?;
     pass.attention(
         ws,
         ..,
-        (seq_len / PAGE_T)..,
+        ..,
         kv_len,
         &pages,
         &page_indptr,
@@ -203,9 +206,8 @@ async fn verify_window(
     let drafts_out = Channel::new([k], dtype::i32).named("v_drafts");
 
     let fwd = ForwardPass::new();
-    let kv_len =
-        Channel::from((1..=kp1).map(|row| seq_len + row).collect::<Vec<_>>()).named("v_kv_len");
-    bind_verify_rows(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages)?;
+    let kv_len = Channel::from(vec![seq_len + kp1]).named("v_kv_len");
+    bind_verify_window(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages)?;
     fwd.rs_working_sets(std::slice::from_ref(rs))?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded window (NOT a resubmitted draft

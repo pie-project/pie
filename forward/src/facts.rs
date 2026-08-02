@@ -595,6 +595,90 @@ pub struct Qwen35HybridFacts {
     pub mlp: Qwen35MlpKind,
 }
 
+/// CUDA backend facts for a LOWERED qwen3_5 hybrid trace
+/// (`family::qwen3_5_hybrid_cuda`; north-star-dsl.md rung 4c).
+///
+/// Everything here is load-time, [`LlamaLikeCudaFacts`]-style: env
+/// defaults and kernel-eligibility predicates the hand-written
+/// `linear_attn_layer_body` / `declared_forward.cpp` derive per fire
+/// today, hoisted to where a fact belongs. The N-thresholds are VALUES
+/// carried into [`crate::trace::GuardPred`]s — the one branch kind a
+/// lowered trace keeps — because only N varies per fire; the predicates
+/// AROUND them (env gates, head geometry) resolve here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Qwen35CudaFacts {
+    /// The recurrent-state store dtype is bf16 (vs fp32) — the
+    /// `state_bf16` parameter every GDN recurrence launcher family
+    /// suffixes (`launch_recurrent_gated_delta_step_batched[_state_bf16]`
+    /// and the chunked prefill families).
+    pub state_bf16: bool,
+    /// The warp-tiled prefill arm EXISTS at all: `K_d <= 256` && the
+    /// state-persist env gate
+    /// (`qwen35_gdn_warp_tiled_state_persist_enabled`,
+    /// `PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST`). The hand-written
+    /// predicate reads `!write_state || state_persist_enabled()` — but
+    /// for the normal-fire classes (Decode/Prefill) `write_state` is
+    /// always true, so the env term is the WHOLE eligibility here; the
+    /// verify-frozen service classes where `write_state` is false are
+    /// rung 4c-iv's, not this struct's. (`commit_lens == nullptr`, the
+    /// other hand-written term, is likewise a CLASS — CommitAdvance —
+    /// not a fact.)
+    pub warp_tiled: bool,
+    /// `qwen35_gdn_warp_tiled_max_tokens()`
+    /// (`PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS`, default 64) — an
+    /// env-tunable driver constant, resolved into the trace as the
+    /// warp-tiled arm's `TokensLE` payload the way every fact resolves.
+    pub warp_tiled_max: u32,
+    /// `qwen35_gdn_cached_prefill_max_tokens()`
+    /// (`PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS`, default 0 = the
+    /// cached family off) — the cached arm's `TokensLE` payload.
+    pub cached_max: u32,
+    /// The deployment configures the verify hidden stash
+    /// (`RecurrentStateCache::configure_verify_hidden_stash`): the
+    /// engine owns that configuration, so — like [`Self::state_bf16`],
+    /// whose dtype the engine likewise decides — the fact is stated here
+    /// and the driver cross-checks its own derivation per fire rather
+    /// than choosing. With the stash live, the CommitAdvance class
+    /// replays each linear layer's in-proj outputs from the stash
+    /// (`cuda::verify_stash_load`) and skips the GEMMs; without it, the
+    /// commit pass re-runs the in-projections against whatever the
+    /// workspace holds. Serde-defaulted so pre-4c-iv facts JSON reads
+    /// back unchanged (the append-only discipline).
+    #[serde(default)]
+    pub verify_stash: bool,
+}
+
+impl Qwen35CudaFacts {
+    /// SYNTHETIC fixture — NOT a measurement. These values (bf16 state,
+    /// warp-tiled arm live, thresholds 64 / 4096 — plausible defaults)
+    /// pin the GOLDEN FORM of the lowered qwen3_5 traces only: the live
+    /// derivation and its digest validation against the driver's own
+    /// booleans are rung 4c-iii. The precedent for refusing to call this
+    /// "measured" is [`LlamaLikeCudaFacts::qwen3_0_6b_l40s`]: its first
+    /// version guessed `xqa_decode: true` and called it measured, and the
+    /// rung-3 digest caught the lie on its first live run. This
+    /// constructor makes no such claim — every consumer of these goldens
+    /// must treat the arm structure as the artifact under review, not the
+    /// deployment's truth.
+    ///
+    /// And the digest DID catch this one too (its fourth catch): the
+    /// LIVE L40S default-env derivation is
+    /// `warp_tiled: false, cached_max: 0` (both env-gated off), which is
+    /// what the emission fact set in `bin/emit-cuda.rs` uses. This
+    /// fixture keeps the synthetic values deliberately: the goldens pin
+    /// the guard-chain STRUCTURE (a warp arm that exists, a cached arm
+    /// with a real threshold), which the live-default set would erase.
+    pub fn qwen3_5_0_8b_synthetic() -> Self {
+        Self {
+            state_bf16: true,
+            warp_tiled: true,
+            warp_tiled_max: 64,
+            cached_max: 4096,
+            verify_stash: true,
+        }
+    }
+}
+
 impl Qwen35HybridFacts {
     /// Whether layer `l` runs full attention —
     /// `driver/metal/src/model/qwen3_5/geometry.hpp::is_full_attn`.

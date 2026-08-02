@@ -1,5 +1,9 @@
 #include "model/qwen3_5/declared_facts.hpp"
 
+#include "model/qwen3_5/declared_forward.hpp"
+#include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "store/recurrent_state_cache.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
@@ -553,6 +557,83 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
     out.fused_gdn_in_proj = fused_gdn;
     out.fused_full_attn_qgkv = fused_qgkv;
     out.full_attn_interval = interval;
+
+    // Rung 4c-iii: the CUDA backend facts, derived ONCE from this
+    // deployment — the terms the executor's hoisted booleans compute per
+    // fire, computed here and handed to the declaration, whose class
+    // arms STATE the kernels. Term provenance per line.
+    pie_forward::PieForwardQwen35CudaFacts cuda{};
+    // The recurrent-state dtype: the cache is engine-owned and invisible
+    // at build, so the deployment DEFAULT stands in and the executor
+    // cross-checks the live cache per fire (declared_facts.hpp).
+    cuda.state_bf16 =
+        RecurrentStateCache::recurrent_state_bf16_default() ? 1 : 0;
+    // Warp-tiled prefill eligibility, normal-fire form: K_d <= 256 plus
+    // the state-persist env gate (write_state is always true outside the
+    // verify services — those are 4c-iv classes).
+    cuda.warp_tiled = (cfg.linear_key_head_dim <= 256 &&
+                       qwen35_gdn_warp_tiled_state_persist_enabled())
+                          ? 1
+                          : 0;
+    cuda.warp_tiled_max =
+        static_cast<std::uint32_t>(qwen35_gdn_warp_tiled_max_tokens());
+    cuda.cached_max =
+        static_cast<std::uint32_t>(qwen35_gdn_cached_prefill_max_tokens());
+    out.cuda_state_bf16 = cuda.state_bf16 != 0;
+
+    // The verify stash is engine-configured after model build (the MTP
+    // wiring calls configure_verify_hidden_stash), so the fact is the
+    // MTP deployment's normal shape — stash on — and the executor
+    // cross-checks per commit fire (declared_facts.hpp).
+    cuda.verify_stash = 1;
+    out.cuda_verify_stash = true;
+
+    // The digest naming what these traces were taken from — one format,
+    // two printers (this and `emit_qwen35::facts_digest`); the live
+    // static-form gate is what holds them together, llama's mechanism.
+    out.facts_digest =
+        "qwen3_5/l" + std::to_string(facts.layers) +
+        "/int" + std::to_string(facts.full_attn_interval) +
+        "/v" + std::to_string(facts.vocab) +
+        "/te" + std::to_string(facts.tied_embeddings) +
+        "/nv" + std::to_string(facts.norm_variant) +
+        "/ah" + std::to_string(facts.attn.hidden) +
+        "/aqh" + std::to_string(facts.attn.q_heads) +
+        "/akvh" + std::to_string(facts.attn.kv_heads) +
+        "/ahd" + std::to_string(facts.attn.head_dim) +
+        "/arot" + std::to_string(facts.attn.rotary_dim) +
+        "/afq" + std::to_string(facts.attn.fused_qkv) +
+        "/gkh" + std::to_string(facts.gdn.key_heads) +
+        "/gvh" + std::to_string(facts.gdn.value_heads) +
+        "/gkd" + std::to_string(facts.gdn.key_head_dim) +
+        "/gvd" + std::to_string(facts.gdn.value_head_dim) +
+        "/gck" + std::to_string(facts.gdn.conv_kernel) +
+        "/gfi" + std::to_string(facts.gdn.fused_in_proj) +
+        "/moe" + std::to_string(facts.mlp_is_moe) +
+        "/di" + std::to_string(facts.dense_intermediate) +
+        "/sb" + std::to_string(cuda.state_bf16) +
+        "/wt" + std::to_string(cuda.warp_tiled) +
+        "/wtm" + std::to_string(cuda.warp_tiled_max) +
+        "/cm" + std::to_string(cuda.cached_max) +
+        "/vs" + std::to_string(cuda.verify_stash);
+
+    out.decode = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::Decode);
+    out.prefill = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::Prefill);
+    out.commit_advance = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::CommitAdvance);
+    out.state_only = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::StateOnly);
+    out.frozen_verify = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::FrozenVerify);
+    // Drift between the declaration's stated kernels and the executor's
+    // registry fails at model load, not mid-fire.
+    qwen35_validate_stated_kernels(out.decode);
+    qwen35_validate_stated_kernels(out.prefill);
+    qwen35_validate_stated_kernels(out.commit_advance);
+    qwen35_validate_stated_kernels(out.state_only);
+    qwen35_validate_stated_kernels(out.frozen_verify);
     return out;
 }
 

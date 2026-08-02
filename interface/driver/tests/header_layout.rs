@@ -264,7 +264,9 @@ fn contract_source() -> String {
         logical_fire_ids,
         channel_expected_head,
         channel_expected_tail,
-        channel_ticket_indptr
+        channel_ticket_indptr,
+        planned_hook_free_prefix_rows,
+        reserved_step_tail0
     );
     contract!(out, PieStepDescSlice, ptr, len);
     contract!(

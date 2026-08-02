@@ -353,9 +353,25 @@ impl PendingRequest {
     }
 
     fn requires_solo_submission(&self) -> bool {
-        (self.prebuilt && self.pipeline_id.is_none())
-            || (self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0))
-            || self.touches_rs_buffer()
+        self.solo_reason().is_some()
+    }
+
+    /// Why this fire must go out alone, if it must — the fire census's
+    /// vocabulary (C, the class-collapse follow-up measurement): every
+    /// remaining solo term is either a harness path or a driver-contract
+    /// exclusion, and the census is what shows which ones a real workload
+    /// actually pays for.
+    pub(crate) fn solo_reason(&self) -> Option<&'static str> {
+        if self.prebuilt && self.pipeline_id.is_none() {
+            return Some("prebuilt-untracked");
+        }
+        if self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0) {
+            return Some("multirow-zero-tokens");
+        }
+        if self.touches_rs_buffer() {
+            return Some("rs-buffer");
+        }
+        None
     }
 
     /// A fire that buffers recurrent activations, or folds them back, picks
@@ -408,6 +424,17 @@ pub(crate) struct LaunchGrouping {
     has_device_geometry: bool,
     /// A member's program writes the `attn_page_mask` sink.
     has_page_mask: bool,
+    /// A member is a MASKED device-geometry fire (dense device mask, or
+    /// a wire-BRLE mask riding a device-geometry fire — the
+    /// resolved_custom_wire solo shape): nothing may join behind it, in
+    /// either direction, because its mask cannot be re-assembled against
+    /// a composed layout.
+    has_masked_device_geometry: bool,
+    /// A member carries a STRUCTURED device mask (item A's exempt shape).
+    /// Wire-BRLE-masked lanes must not share a fire with it: the frame
+    /// stages exactly one custom-mask source (the structured pack or the
+    /// wire assembly), and mixing the two would collide loudly there.
+    has_structured_mask: bool,
     /// A member carries a qo row spanning more than one token (chunk
     /// prefill / multi-token step).
     has_multi_token: bool,
@@ -438,8 +465,19 @@ impl LaunchGrouping {
         limits: SchedulerLimits,
         page_size: u32,
     ) -> bool {
+        self.refusal(request, limits, page_size).is_none()
+    }
+
+    /// [`Self::accepts`] with the WHY: `None` = admitted, `Some(reason)` =
+    /// the clause that refused — the fire census's join-refusal vocabulary.
+    pub(crate) fn refusal(
+        &self,
+        request: &PendingRequest,
+        limits: SchedulerLimits,
+        page_size: u32,
+    ) -> Option<&'static str> {
         if self.instances.contains(&request.instance_id) {
-            return false;
+            return Some("same-instance");
         }
         // Wire-geometry (chunk) and device-resolved (chained decode) fires
         // CO-BATCH as ordered sub-batches of one step (true sub-batches,
@@ -452,10 +490,10 @@ impl LaunchGrouping {
             .pipeline_id
             .is_some_and(|pid| self.pipelines.contains(&pid))
         {
-            return false;
+            return Some("same-pipeline");
         }
         if self.count != 0 && (request.requires_solo_submission() || self.has_solo_submission) {
-            return false;
+            return Some("solo-contract");
         }
         // Custom wire masks co-batch freely with other wire-geometry fires —
         // the wire layer emits a mask row per request (synthesized causal for
@@ -473,14 +511,27 @@ impl LaunchGrouping {
         let wire_mask_on_device_geometry = request.request.has_user_mask
             && !request.request.masks.is_empty()
             && request.request.device_resolved_geometry;
+        // Dense-mask compose: a wire-BRLE-masked WIRE lane co-batches
+        // with device-resolved decode envelopes now — the frame decodes
+        // the wire rows and fills causal for the envelope lanes
+        // host-side, feeding the same custom dispatch (frame.cpp's
+        // composed assembly). What still refuses: a genuinely dense
+        // DEVICE mask (its content is device-resident — nothing to
+        // assemble from), a wire mask ON a device-geometry fire (its
+        // BRLE indexes the placeholder layout composition replaces; the
+        // solo resolved_custom_wire path serves it), and a
+        // structured × wire mask MIX (one custom-mask source per fire).
+        let wire_masked = request.request.has_user_mask
+            && !request.request.masks.is_empty()
+            && !request.request.device_resolved_geometry;
         if self.count != 0
             && (masked_device_geometry
                 || wire_mask_on_device_geometry
-                || (self.has_user_mask && self.has_device_geometry)
-                || (mask_blocks_composition(&request.request) && self.has_device_geometry)
-                || (request.request.device_resolved_geometry && self.has_user_mask))
+                || self.has_masked_device_geometry
+                || (wire_masked && self.has_structured_mask)
+                || (request.request.structured_device_mask && self.has_user_mask))
         {
-            return false;
+            return Some("mask-compose");
         }
         // Invariant: a batch containing an `attn_page_mask`-writing program
         // is pure decode. The driver honours a written mask only on the
@@ -498,15 +549,18 @@ impl LaunchGrouping {
             && ((request.page_mask_program && self.has_multi_token)
                 || (request.has_multi_token_row() && self.has_page_mask))
         {
-            return false;
+            return Some("page-mask-multitoken");
         }
         if self.count == 0 {
-            return true;
+            return None;
         }
         let usage = batch::request_capacity_usage(request, page_size);
-        self.count.saturating_add(usage.forward_requests) <= limits.max_forward_requests
-            && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
-            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
+        let fits = self.count.saturating_add(usage.forward_requests)
+            <= limits.max_forward_requests
+            && self.forward_tokens.saturating_add(usage.forward_tokens)
+                <= limits.max_forward_tokens
+            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs;
+        if fits { None } else { Some("capacity") }
     }
 
     pub(crate) fn push(
@@ -531,6 +585,11 @@ impl LaunchGrouping {
         self.has_user_mask |= mask_blocks_composition(&request.request);
         self.has_device_geometry |= request.request.device_resolved_geometry;
         self.has_page_mask |= request.page_mask_program;
+        self.has_structured_mask |= request.request.structured_device_mask;
+        self.has_masked_device_geometry |= has_dense_device_mask(&request.request)
+            || (request.request.has_user_mask
+                && !request.request.masks.is_empty()
+                && request.request.device_resolved_geometry);
         self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
@@ -7600,6 +7659,73 @@ mod tests {
                  (host_lowered={host_lowered})"
             );
         }
+    }
+
+    /// Dense-mask compose: a wire-BRLE-masked WIRE lane co-batches with
+    /// device-resolved decode envelopes (the frame decodes the wire rows
+    /// and fills causal for the envelopes host-side); the structured ×
+    /// wire mix stays refused (one custom-mask source per fire), and
+    /// masked DEVICE-GEOMETRY fires stay out in both directions.
+    #[test]
+    fn launch_grouping_composes_wire_masked_with_envelopes() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        let wire_masked = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.has_user_mask = true;
+            request.request.masks =
+                vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+            request.request.mask_indptr = vec![0, 1];
+            request
+        };
+        let envelope = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.device_resolved_geometry = true;
+            request
+        };
+        let structured = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.has_user_mask = true;
+            request.request.structured_device_mask = true;
+            request.request.device_resolved_geometry = true;
+            request
+        };
+
+        // Wire-masked first: envelopes join now (the relax), in both
+        // admission orders.
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&wire_masked(1), limits, 16));
+        grouping.push(&wire_masked(1), limits, 16);
+        assert!(
+            grouping.accepts(&envelope(2), limits, 16),
+            "an envelope decode joins a wire-masked wire lane (the frame \
+             assembles wire rows + causal fill)"
+        );
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&envelope(3), limits, 16);
+        assert!(
+            grouping.accepts(&wire_masked(4), limits, 16),
+            "a wire-masked wire lane joins envelope decodes"
+        );
+
+        // The structured x wire mix stays refused, both orders.
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&structured(5), limits, 16);
+        assert_eq!(
+            grouping.refusal(&wire_masked(6), limits, 16),
+            Some("mask-compose"),
+            "wire mask must not join a structured-mask group"
+        );
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&wire_masked(7), limits, 16);
+        assert_eq!(
+            grouping.refusal(&structured(8), limits, 16),
+            Some("mask-compose"),
+            "a structured-mask fire must not join a wire-masked group"
+        );
     }
 
     /// Stage 2 item A: a pooled device-geometry fire whose device mask

@@ -265,6 +265,7 @@ struct LaunchScratch {
         view.kv_translation = pie_native::slice_from_u32(launch.kv_translation.ptr, launch.kv_translation.len);
         view.kv_translation_indptr = pie_native::slice_from_u32(launch.kv_translation_indptr.ptr, launch.kv_translation_indptr.len);
         view.ptir_program_row_indptr = pie_native::slice_from_u32(launch.ptir_program_row_indptr.ptr, launch.ptir_program_row_indptr.len);
+        view.planned_hook_free_prefix_rows = launch.planned_hook_free_prefix_rows;
         view.ptir_kv_write_lower_bounds = pie_native::slice_from_u64(
             launch.ptir_kv_write_lower_bounds.ptr,
             launch.ptir_kv_write_lower_bounds.len);
@@ -379,6 +380,7 @@ void expand_step(
     launch.kv_translation_indptr = {
         out->kv_translation_indptr.data(), out->kv_translation_indptr.size()};
     launch.ptir_program_row_indptr = step.ptir_program_row_indptr;
+    launch.planned_hook_free_prefix_rows = step.planned_hook_free_prefix_rows;
     launch.ptir_kv_write_lower_bounds = step.ptir_kv_write_lower_bounds;
     launch.ptir_kv_write_upper_bounds = step.ptir_kv_write_upper_bounds;
     launch.logical_fire_ids = step.logical_fire_ids;

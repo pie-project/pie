@@ -1739,4 +1739,43 @@ void apply_rope_config(LlamaLikeForwardCfg& fwd_cfg, const HfConfig& hf) {
     fwd_cfg.yarn_attention_factor      = hf.rope_attention_factor;
 }
 
+// ── LoraFireStateHandle: the opaque fire-scoped staging the declared
+// executor shares with this body (llama_like.hpp) ─────────────────────
+LoraFireStateHandle::LoraFireStateHandle(
+    const LoraTable& table,
+    const HfConfig& cfg,
+    int total_tokens,
+    int hidden,
+    int q_width,
+    int kv_width,
+    int intermediate,
+    int tp_size,
+    cudaStream_t stream)
+    : impl_(new LoraFireState(
+          table, cfg, total_tokens, hidden, q_width, kv_width,
+          intermediate, tp_size, stream)) {}
+
+LoraFireStateHandle::~LoraFireStateHandle() {
+    delete static_cast<LoraFireState*>(impl_);
+}
+
+void LoraFireStateHandle::apply(
+    cublasHandle_t handle,
+    int layer,
+    const void* qkv_in,
+    int hidden,
+    int q_width,
+    int kv_width,
+    void* q_out,
+    void* v_out,
+    void* xa_scratch) const {
+    static_cast<const LoraFireState*>(impl_)->apply(
+        handle, layer, qkv_in, hidden, q_width, kv_width,
+        q_out, v_out, xa_scratch);
+}
+
+std::string LoraFireStateHandle::grouping_desc() const {
+    return static_cast<const LoraFireState*>(impl_)->grouping_desc();
+}
+
 }  // namespace pie_cuda_driver::model

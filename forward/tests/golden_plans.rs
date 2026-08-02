@@ -23,11 +23,11 @@ use std::path::PathBuf;
 
 use pie_forward::family::{
     llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
-    qwen3_5_moe_mlp_block,
+    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block,
 };
 use pie_forward::{
-    FireClass, ForwardPlan, LlamaLikeCudaFacts, LlamaLikeFacts, Qwen35FullAttnFacts,
-    Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
+    FireClass, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
+    Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
 fn golden_path(name: &str) -> PathBuf {
@@ -184,15 +184,143 @@ fn qwen3_5_hybrid_0_8b() {
     );
 }
 
+/// The first LOWERED qwen3_5 goldens (north-star-dsl.md rung 4c-ii): the
+/// SAME hybrid text, traced with the SYNTHETIC CUDA backend facts
+/// ([`Qwen35CudaFacts::qwen3_5_0_8b_synthetic`] — these pin the golden
+/// FORM only; the live derivation + digest validation is 4c-iii) and a
+/// fire class in hand. Decode: every GDN layer states the conv update +
+/// decode recurrence step as Launches (no Guard — the decode step has no
+/// N-threshold), every full-attention layer the HasWriteDesc KV-write
+/// guard + the FlashInfer decode dispatch.
+#[test]
+fn qwen3_5_hybrid_0_8b_cuda_decode() {
+    check_plan(
+        "qwen3_5_hybrid_0_8b.cuda.decode",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_5_0_8b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+/// The prefill-class lowering of the same text: every GDN layer states
+/// the prefill conv walk and the recurrence three-way as the first
+/// VALUE-PRODUCING guard chain — TokensLE(64) warp-tiled, TokensLE(4096)
+/// cached, else FLA, the guard's output being the core the gated norm
+/// consumes — and every full-attention layer the KV-write guard + the
+/// dequant-less planned prefill dispatch (qwen3_5's cache is bf16-gated,
+/// unlike llama_like's dequant+dispatch pair).
+#[test]
+fn qwen3_5_hybrid_0_8b_cuda_prefill() {
+    check_plan(
+        "qwen3_5_hybrid_0_8b.cuda.prefill",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_5_0_8b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// The StateOnly service class (rung 4c-iv): the whole prefill-shaped
+/// backbone with the epilogue class-matched away — structurally the
+/// prefill trace minus EXACTLY the final-norm/lm_head pair (the pair the
+/// hand-written `if (num_logit_rows < 0) return` skips), everything else
+/// byte-identical, which the assertions below pin against the prefill
+/// trace before the golden pins the form itself.
+#[test]
+fn qwen3_5_hybrid_0_8b_cuda_state_only() {
+    let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+    let cuda = Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+    let plan = qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::StateOnly);
+    let prefill = qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::Prefill);
+
+    // Prefill minus 2 ops (final rmsnorm + lm_head), prefix-identical…
+    assert_eq!(plan.ops.len(), prefill.ops.len() - 2);
+    assert_eq!(plan.ops[..], prefill.ops[..prefill.ops.len() - 2]);
+    // …and minus their 2 output values, likewise prefix-identical.
+    assert_eq!(plan.values.len(), prefill.values.len() - 2);
+    assert_eq!(plan.values[..], prefill.values[..prefill.values.len() - 2]);
+    assert_eq!(plan.family, "qwen3_5_hybrid.cuda.state_only");
+
+    check_plan("qwen3_5_hybrid_0_8b.cuda.state_only", &plan);
+}
+
+/// The CommitAdvance service class (rung 4c-iv): a genuinely different
+/// pass — no embed (the root is a bare input placeholder), ONLY the 18
+/// linear layers, each exactly [verify-stash load (pseudo-symbol, 3
+/// outputs) → prefill conv walk → GdnPrep → FLA recurrence], nothing
+/// after the loop: 72 ops. The synthetic cuda facts configure the verify
+/// stash, so the in-proj GEMMs are skipped — no Matmul in the pass.
+#[test]
+fn qwen3_5_hybrid_0_8b_cuda_commit_advance() {
+    let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+    let cuda = Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+    let plan = qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::CommitAdvance);
+    assert_eq!(plan.family, "qwen3_5_hybrid.cuda.commit_advance");
+
+    // 18 linear layers x (4 ops + the two hook sites the hand-written
+    // replay passes through, A4); 1 input value + 18 x (3 + 1 + 5)
+    // fresh (sites produce nothing).
+    assert_eq!(plan.ops.len(), 18 * 6);
+    assert_eq!(plan.values.len(), 1 + 18 * 9);
+    // The root is a placeholder no op produces.
+    assert!(!plan.ops.iter().any(|op| op.outputs.contains(&0)));
+
+    for l in (0..facts.layers).filter(|&l| !facts.is_full_attn(l)) {
+        let names: Vec<&str> = plan
+            .layer_ops(l)
+            .map(|op| match &op.kind {
+                OpKind::Launch { kernel, .. } => kernel.as_str(),
+                OpKind::GdnPrep { .. } => "GdnPrep",
+                OpKind::HookSite { stage, .. } => match stage {
+                    HookStage::OnAttnProj => "HookSite(OnAttnProj)",
+                    HookStage::OnAttn => "HookSite(OnAttn)",
+                },
+                other => panic!("foreign op in the commit pass: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "qwen35_verify_stash_load",
+                "launch_causal_conv1d_prefill_batched_bf16",
+                "GdnPrep",
+                "HookSite(OnAttnProj)",
+                "launch_chunk_gated_delta_prefill_batched_state_bf16",
+                "HookSite(OnAttn)",
+            ],
+            "layer {l}"
+        );
+    }
+    // Full-attention layers do not exist in this pass, and neither does
+    // any GEMM (the stash replays the in-proj outputs).
+    for l in (0..facts.layers).filter(|&l| facts.is_full_attn(l)) {
+        assert_eq!(plan.layer_ops(l).count(), 0, "layer {l} must be skipped");
+    }
+    assert!(
+        !plan
+            .ops
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::Matmul { .. }))
+    );
+
+    check_plan("qwen3_5_hybrid_0_8b.cuda.commit_advance", &plan);
+}
+
 /// The first LOWERED goldens (north-star-dsl.md): the SAME llama_like
 /// text, traced with the CUDA backend facts and a fire class in hand, so
-/// the class arms run and the traced form states kernels. Decode: the
-/// fused-QKV arm replaces SplitQkv + RmsnormPerHead×2 + Rope + KvAppend
-/// with one `QkvDecodeFusedPost` per layer (layer 0 preceded by the
-/// once-per-fire `RopeTableBuild` — the hand-written runtime latch, made
-/// trace-time by the unrolled layer loop), and every Attention states
-/// `XqaDecode`. This golden IS the decode launch list — the thing rung 2's
-/// dumb interpreter walks and rung 3's emitter transliterates to C++.
+/// the class arms run and the traced form states kernels. Decode, since
+/// A1 (the class-collapse amendment): each layer is a value-producing
+/// HasCustomMask guard — the mask arm carries the whole general QKV
+/// sequence (split, fused qk-norm+rope, the NESTED HasWriteDesc write
+/// guard) ending in the custom-mask dispatch; the else-arm is the fused
+/// decode-QKV launch (consuming the once-per-fire rope-table value,
+/// hoisted unconditionally — a masked fire launches it unread) plus the
+/// plain decode attention. This golden IS the decode launch list — the
+/// thing rung 2's dumb interpreter walks (with a skip stack) and rung
+/// 3's emitter transliterates to nested `if`s.
 #[test]
 fn qwen3_0_6b_cuda_decode() {
     check_plan(
@@ -206,9 +334,10 @@ fn qwen3_0_6b_cuda_decode() {
 }
 
 /// The prefill-class lowering of the same text: the general arm
-/// throughout (no fused post — its predicate is decode-only), every
-/// Attention stating `PrefillPlanned`. Structurally the semantic trace
-/// plus kernel statements; the golden pins exactly that relationship.
+/// throughout (no fused post — its predicate is decode-only), then the
+/// per-layer HasCustomMask guard (A1): custom dispatch in the mask arm
+/// (no dequant — the custom dispatch takes the layer view whole),
+/// dequant + planned prefill in the else-arm.
 #[test]
 fn qwen3_0_6b_cuda_prefill() {
     check_plan(
@@ -216,6 +345,81 @@ fn qwen3_0_6b_cuda_prefill() {
         &llama_like_cuda(
             &LlamaLikeFacts::qwen3_0_6b(),
             &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+// (The masked-class goldens are gone with the classes themselves — A1,
+// the class-collapse amendment: the custom mask is a HasCustomMask
+// guard arm INSIDE the decode/prefill goldens above, which pin the
+// arm's op-list delta — the general QKV sequence in the fused
+// deployment's mask arm, the custom dispatch, no dequant.)
+
+/// The frozen-verify class (the rung-5 geometry amendment): the prefill
+/// body plus ONE stash store per linear layer — the cheap in-proj
+/// activations cached for the later commit-advance replay, at the
+/// hand-written launch position (after the splits, before the conv).
+/// `write_state=false` is a runtime argument of the stated kernels, not
+/// a trace difference, so the golden differs from prefill by exactly 18
+/// store launches.
+#[test]
+fn qwen3_5_hybrid_cuda_frozen_verify() {
+    check_plan(
+        "qwen3_5_hybrid_0_8b.cuda.frozen_verify",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_5_0_8b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::FrozenVerify,
+        ),
+    );
+}
+
+// (The hooked-class goldens are gone with the classes themselves — A2,
+// the class-collapse amendment: attached stage hooks are a
+// HasStageHooks guard arm INSIDE the decode/prefill goldens above —
+// the general body, the two per-layer HookSites and the
+// WantsAttnScore-guarded attention, all in the hooked arm's region.
+// Which PROGRAM runs never appears: sites state WHERE and WHAT IS
+// OBSERVABLE; programs are sideband data.)
+
+/// The Off-norm lowered goldens (mistral shape): the first LOWERED pin of
+/// a deployment whose general arm keeps the SEMANTIC rope (no per-head
+/// qk-norm) and whose decode has no fused post — the branch combination
+/// the 2026-08-03 hoist regression hid in (general QKV traced into the
+/// mask arm after `guarded_value` opened; every unmasked fire skipped
+/// QKV). The cuda facts are STRUCTURAL fixtures (xqa/fpp off): what
+/// these goldens pin is the region layout — QKV/rope/write BEFORE the
+/// attention chain's guard op, arms carrying attention only.
+#[test]
+fn mistral_7b_v03_cuda_decode() {
+    check_plan(
+        "mistral_7b_v03.cuda.decode",
+        &llama_like_cuda(
+            &LlamaLikeFacts::mistral_7b_v03(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+            },
+            FireClass::Decode,
+        ),
+    );
+}
+
+#[test]
+fn mistral_7b_v03_cuda_prefill() {
+    check_plan(
+        "mistral_7b_v03.cuda.prefill",
+        &llama_like_cuda(
+            &LlamaLikeFacts::mistral_7b_v03(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+            },
             FireClass::Prefill,
         ),
     );

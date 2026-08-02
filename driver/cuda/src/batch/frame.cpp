@@ -1416,13 +1416,104 @@ void prepare_step(
                     static_cast<int>(decoded.mask_indptr.size());
                 s.have_custom_mask = true;
             } else if (view.has_user_mask) {
-                // Composed multi-program batch carrying NON-causal wire
-                // rows: a wire-masked fire rode a device-geometry batch,
-                // which the composed path cannot honour (rationale above).
-                throw std::runtime_error(
-                    "ptir: non-causal wire masks cannot ride a composed "
-                    "device-geometry batch (scheduler must keep "
-                    "wire-masked fires out)");
+                // Dense-mask compose (north-star-dsl.md, the pinned
+                // design — simplified by item A's precedent: the
+                // composed klen is HOST-visible at this seam, exactly as
+                // the structured pack above it relies on): the wire
+                // lanes' BRLE masks decode against their wire geometry
+                // (unchanged by composition — wire lanes lead the
+                // composed layout), the device-resolved lanes fill
+                // causal host-side (an envelope row is single-query, so
+                // causal over its live span is all-ones with zeroed
+                // padding bits), and the assembly feeds the SAME custom
+                // dispatch the trace's HasCustomMask arm states. This is
+                // what retires the scheduler's wire-mask × device-
+                // geometry refusals (the census's mask-compose row).
+                const int lanes = static_cast<int>(qo_view.size()) - 1;
+                const std::size_t wire_lanes = causal_rows;
+                const std::uint32_t page =
+                    static_cast<std::uint32_t>(kv_cache.page_size());
+                std::vector<std::uint32_t> klen(
+                    static_cast<std::size_t>(lanes), 0);
+                std::vector<std::int32_t> mindptr(
+                    static_cast<std::size_t>(lanes) + 1, 0);
+                for (int lane = 0; lane < lanes; ++lane) {
+                    const std::uint32_t pages =
+                        kvpp_view[lane + 1] - kvpp_view[lane];
+                    klen[lane] = pages == 0
+                        ? 0
+                        : (pages - 1) * page + kvlpl_view[lane];
+                    const std::uint32_t queries =
+                        qo_view[lane + 1] - qo_view[lane];
+                    if (static_cast<std::size_t>(lane) >= wire_lanes &&
+                        queries > 1) {
+                        throw std::runtime_error(
+                            "ptir: multi-query device-resolved lane in a "
+                            "wire-masked composed batch (causal fill is "
+                            "single-query only)");
+                    }
+                    const std::uint64_t bits =
+                        static_cast<std::uint64_t>(queries) * klen[lane];
+                    if (bits > static_cast<std::uint64_t>(
+                                   std::numeric_limits<std::int32_t>::max()) *
+                            8 ||
+                        mindptr[lane] >
+                            std::numeric_limits<std::int32_t>::max() -
+                                static_cast<std::int64_t>((bits + 7) / 8)) {
+                        throw std::runtime_error(
+                            "composed wire mask exceeds packed ABI");
+                    }
+                    mindptr[lane + 1] = mindptr[lane] +
+                        static_cast<std::int32_t>((bits + 7) / 8);
+                }
+                auto decoded = pie_cuda_driver::brle::decode(
+                    fmask_view, mskptr_view,
+                    std::span<const std::uint32_t>(
+                        qo_view.data(), wire_lanes + 1),
+                    std::span<const std::uint32_t>(
+                        kvpp_view.data(), wire_lanes + 1),
+                    std::span<const std::uint32_t>(
+                        kvlpl_view.data(), wire_lanes),
+                    kv_cache.page_size());
+                std::vector<std::uint8_t> assembly(
+                    static_cast<std::size_t>(mindptr[lanes]), 0);
+                for (std::size_t w = 0; w < wire_lanes; ++w) {
+                    const std::size_t src_lo = static_cast<std::size_t>(
+                        decoded.mask_indptr[w]);
+                    const std::size_t src_hi = static_cast<std::size_t>(
+                        decoded.mask_indptr[w + 1]);
+                    const std::size_t dst_len = static_cast<std::size_t>(
+                        mindptr[w + 1] - mindptr[w]);
+                    if (src_hi - src_lo != dst_len) {
+                        throw std::runtime_error(
+                            "composed wire-mask assembly: a wire lane's "
+                            "decoded size disagrees with its composed "
+                            "geometry (layout drift)");
+                    }
+                    std::memcpy(assembly.data() + mindptr[w],
+                                decoded.packed.data() + src_lo, dst_len);
+                }
+                for (int lane = static_cast<int>(wire_lanes);
+                     lane < lanes; ++lane) {
+                    const std::size_t nbytes = static_cast<std::size_t>(
+                        mindptr[lane + 1] - mindptr[lane]);
+                    if (nbytes == 0) continue;
+                    std::memset(assembly.data() + mindptr[lane], 0xFF,
+                                nbytes);
+                    const std::uint32_t tail = klen[lane] % 8;
+                    if (tail != 0) {
+                        assembly[static_cast<std::size_t>(
+                            mindptr[lane + 1]) - 1] =
+                            static_cast<std::uint8_t>(0xFFu >> (8 - tail));
+                    }
+                }
+                s.up_custom_mask = pi.custom_mask.stage_from_host(
+                    std::span<const std::uint8_t>(assembly));
+                s.up_mask_indptr = pi.custom_mask_indptr.stage_from_host(
+                    std::span<const std::int32_t>(mindptr));
+                s.mask_bytes = static_cast<int>(assembly.size());
+                s.mask_indptr_count = lanes + 1;
+                s.have_custom_mask = true;
             }
         }
     }

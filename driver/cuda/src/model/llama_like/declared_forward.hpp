@@ -26,10 +26,14 @@
 //     two different kernels — IS expressed now: the declaration's
 //     `HasWriteDesc` Guard states both arms, the first live Guard;
 //     rung 4a.)
-// Everything the trace cannot express yet (hooks, custom masks, TP,
-// vision, quantized projections, non-standard rope, qkv bias)
-// falls back to `llama_like_forward_paged` — the caller gates, `build`
-// refuses. Post-norm placement (olmo2) and the global qk-norm convention
+// Everything the trace cannot express yet (mixed-hook fires, TP, vision,
+// quantized projections, non-standard rope, qkv bias) falls back to
+// `llama_like_forward_paged` — the caller gates, `build` refuses.
+// Custom masks ARE expressed — since A1 (the class-collapse amendment)
+// as the `HasCustomMask` guard arm INSIDE the decode/prefill traces: the
+// mask arm carries the general QKV sequence (with the nested
+// HasWriteDesc guard — the walk keeps a skip STACK) and states the
+// custom-mask prefill dispatch; the mask data rides as runtime args. Post-norm placement (olmo2) and the global qk-norm convention
 // ARE in scope: the trace states both as facts (the matmul(beta=0) →
 // rmsnorm → residual_add triplet; plain row Rmsnorm on q/k), and this
 // executor launches the hand-written post-norm / `rmsnorm_qk`-global
@@ -106,6 +110,13 @@ struct LlamaLikeDeclaredPlan {
     pie_forward::ForwardPlan plan;
     pie_forward::ForwardPlan decode;
     pie_forward::ForwardPlan prefill;
+    // (The masked and hooked traces are gone with their classes — A1/A2,
+    // the class-collapse amendment: a masked fire takes decode/prefill's
+    // HasCustomMask guard arm; an all-hooked fire takes their
+    // HasStageHooks arm — the general body, the two per-layer hook
+    // sites and the WantsAttnScore-guarded attention, all region ops.
+    // Mixed fires (0 < fast_rows < R) stay hand-written until the Peel
+    // op.)
     // What the class traces were taken from, in the format the generated
     // .inc embeds (`emit_cuda::facts_digest`); rung 3's dispatch runs the
     // static form only on exact match.
@@ -168,6 +179,17 @@ void llama_like_forward_declared(
     const std::uint32_t* w_off_d,
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
-    int runtime_window_left);
+    int runtime_window_left,
+    const std::uint8_t* custom_mask_d,
+    const std::int32_t* custom_mask_indptr_d,
+    // The fire's attached stage programs; null on unhooked fires. Sites
+    // and the score guard live in the shape traces (A3); the
+    // page-mask/score sidebands are this executor's bracket mechanics.
+    const StageHooks* stage_hooks,
+    // The fire's resolved lora configuration (null = none). Usable lanes
+    // take the HasLora guard arms — the general sequence plus the
+    // `pie_lora_qkv_correction` pseudo-symbol (LoraFireState::apply
+    // behind the registry, staged once per fire).
+    const LoraTable* lora);
 
 }  // namespace pie_cuda_driver::model

@@ -324,25 +324,54 @@ fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -
                 aux_names: aux,
             };
         }
-        // The lowered branch over a runtime input: predicate in param0,
-        // region lengths in param1/... — then-count in param1, else-count
-        // as a one-entry aux run (the flat id array holds plain u32s;
-        // what a range means is the kind's contract, as with Launch).
-        OpKind::Guard {
-            pred,
-            then_ops,
-            else_ops,
-        } => {
-            let aux = store_ids(arena, &[*else_ops]);
+        // The hook site: stage wire value in param0, layer in param1 (and
+        // the op's own layer field). Observes its input; nothing else
+        // crosses — sidebands are runtime data.
+        OpKind::HookSite { stage, layer } => (
+            PieForwardOpKind::HookSite,
+            PIE_FORWARD_NO_NAME,
+            match stage {
+                crate::trace::HookStage::OnAttnProj => 0,
+                crate::trace::HookStage::OnAttn => 1,
+            },
+            *layer,
+            PIE_FORWARD_NO_VALUE,
+        ),
+        // The lowered branch chain over runtime inputs: arm count in
+        // param0; the aux run is [kind0, payload0, len0, kind1, payload1,
+        // len1, ..., else_len] — three u32s per arm plus the trailing
+        // else-region length (the flat id array holds plain u32s; what a
+        // range means is the kind's contract, as with Launch).
+        OpKind::Guard { arms, else_ops } => {
+            let mut run: Vec<u32> = Vec::with_capacity(arms.len() * 3 + 1);
+            for arm in arms {
+                let (kind, payload) = arm.pred.wire();
+                run.extend([kind, payload, arm.ops]);
+            }
+            run.push(*else_ops);
+            let aux = store_ids(arena, &run);
             return OpParts {
                 kind: PieForwardOpKind::Guard,
                 weight_name: PIE_FORWARD_NO_NAME,
-                param0: *pred as u32,
-                param1: *then_ops,
+                param0: arms.len() as u32,
+                param1: 0,
                 selector: PIE_FORWARD_NO_VALUE,
                 aux_names: aux,
             };
         }
+        // Loop peeling (A3): prefix-region length in param0, tail-region
+        // length in param1; the row split (fast_rows) is a runtime input
+        // of the fire, so nothing else crosses.
+        OpKind::Peel {
+            prefix_ops,
+            tail_ops,
+        } => (
+            PieForwardOpKind::Peel,
+            PIE_FORWARD_NO_NAME,
+            *prefix_ops,
+            *tail_ops,
+            PIE_FORWARD_NO_VALUE,
+        ),
     })
 }
 
