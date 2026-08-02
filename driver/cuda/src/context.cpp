@@ -566,8 +566,10 @@ class Context::Impl {
             if (stream != nullptr) cudaStreamSynchronize(stream);
         }
         if (swap_pool_ != nullptr) {
-            cudaStream_t stream = swap_pool_->stream();
-            if (stream != nullptr) cudaStreamSynchronize(stream);
+            for (cudaStream_t stream :
+                 {swap_pool_->stream(), swap_pool_->restore_stream()}) {
+                if (stream != nullptr) cudaStreamSynchronize(stream);
+            }
         }
         if (media_stream_ != nullptr) cudaStreamSynchronize(media_stream_);
     }
@@ -2632,6 +2634,11 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
         const bool has_page_copies =
             copy.src_page_ids.len > 0 || copy.dst_page_ids.len > 0;
         cudaStream_t completion_stream = executor_->cublas.stream();
+        // Which swap stream this descriptor landed on. A restore (H2D) is
+        // issued on its own stream so it does not queue behind pending
+        // evictions, so the completion — and the mixed-descriptor join
+        // below — must follow the copy rather than assume `stream()`.
+        cudaStream_t swap_stream = swap_pool_ != nullptr ? swap_pool_->stream() : nullptr;
         std::vector<OwnedValue> keepalive;
         if (copy.src_page_ids.len > 0 || copy.dst_page_ids.len > 0) {
             const auto src = std::span<const std::uint32_t>(copy.src_page_ids.ptr, copy.src_page_ids.len);
@@ -2642,6 +2649,7 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
             } else if (copy.src_domain == PIE_MEMORY_DOMAIN_HOST_PINNED &&
                        copy.dst_domain == PIE_MEMORY_DOMAIN_CUDA_DEVICE) {
                 swap_pool_->copy_h2d_async(*kv_cache_, src, dst);
+                swap_stream = swap_pool_->restore_stream();
             } else if (copy.src_domain == PIE_MEMORY_DOMAIN_CUDA_DEVICE &&
                        copy.dst_domain == PIE_MEMORY_DOMAIN_CUDA_DEVICE) {
                 swap_pool_->copy_d2d_async(*kv_cache_, src, dst);
@@ -2690,7 +2698,7 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
             // them are posted only after the engine observes this
             // completion (ledger commit first) — host-side
             // happens-before covers the device.
-            enqueue_completion(swap_pool_->stream(), completion);
+            enqueue_completion(swap_stream, completion);
             return PIE_STATUS_OK;
         }
         if (has_page_copies) {
@@ -2699,7 +2707,7 @@ int Context::Impl::copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) 
             // copies — keep the join.
             cudaEvent_t swap_done = nullptr;
             CUDA_CHECK(cudaEventCreateWithFlags(&swap_done, cudaEventDisableTiming));
-            CUDA_CHECK(cudaEventRecord(swap_done, swap_pool_->stream()));
+            CUDA_CHECK(cudaEventRecord(swap_done, swap_stream));
             CUDA_CHECK(cudaStreamWaitEvent(completion_stream, swap_done, 0));
             CUDA_CHECK(cudaEventDestroy(swap_done));
         }
@@ -2765,13 +2773,18 @@ int Context::Impl::resize_pool(const PiePoolResizeDesc& resize, PieCompletion co
             }
             CUDA_CHECK(stream_status);
         }
-        if (swap_pool_ != nullptr && swap_pool_->stream() != nullptr) {
-            const cudaError_t stream_status =
-                cudaStreamQuery(swap_pool_->stream());
-            if (stream_status == cudaErrorNotReady) {
-                return PIE_STATUS_UNSUPPORTED;
+        if (swap_pool_ != nullptr) {
+            // BOTH swap streams must be idle: an in-flight restore is as
+            // much a reason to refuse a resize as an in-flight eviction.
+            for (cudaStream_t stream :
+                 {swap_pool_->stream(), swap_pool_->restore_stream()}) {
+                if (stream == nullptr) continue;
+                const cudaError_t stream_status = cudaStreamQuery(stream);
+                if (stream_status == cudaErrorNotReady) {
+                    return PIE_STATUS_UNSUPPORTED;
+                }
+                CUDA_CHECK(stream_status);
             }
-            CUDA_CHECK(stream_status);
         }
         // The quiescence gate above IS the horizon-empty condition (Venus
         // D6): with the stream drained no frame is in flight, so no

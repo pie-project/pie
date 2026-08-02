@@ -405,17 +405,20 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 // boots with `skip_tracing` and installs no subscriber, so
                 // a tracing event here would go nowhere.
                 println!(
-                    "[planner-trace] queue={} head_pages={} head_kind={} accum={} \
+                    "[planner-trace] queue={} unmet={} head_pages={} head_kind={} bypass={}/{} accum={} \
                      free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
-                     parks={} serves={} evictions={} \
+                     parks={} serves={} evictions={} lookahead={}/{} \
                      evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
                      hogs={} starved={} restarted={} salvaged={} swapfull={}/{} e6_relax={} \
                      d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
                      resident={} evicting={} evicted={} restoring={} admitted={} \
                      runners=[{}]",
                     d.queue.len(),
-                    d.queue.first().map_or(0, |w| w.pages),
-                    d.queue.first().map_or("-", |w| w.kind),
+                    d.unmet_queued,
+                    d.unmet_head_pages,
+                    d.unmet_head_kind,
+                    d.bypassable_entries,
+                    d.bypassable_pages,
                     d.accumulation,
                     d.device_pages_free,
                     d.device_pages_total,
@@ -427,6 +430,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.parks_total,
                     d.serves_total,
                     d.evictions_total,
+                    d.lookahead_rounds_total,
+                    d.lookahead_pages,
                     d.eviction_rollbacks_total,
                     d.restores_total,
                     d.restore_failures_total,
