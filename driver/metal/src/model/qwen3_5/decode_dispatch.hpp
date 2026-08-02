@@ -34,7 +34,10 @@ inline void qmv_dispatch(int N, Grid& g, Threadgroup& tg) {
 //   * QNorm: n_rows=n_q_heads(8), row_size=head_dim(256) → grid=(512,1,1) tg=(64,1,1)
 //   * KNorm: n_rows=n_kv_heads(2), row_size=head_dim(256) → grid=(128,1,1) tg=(64,1,1)
 inline void rms_dispatch(int row_size, int n_rows, Grid& g, Threadgroup& tg) {
-    const uint32_t t = uint32_t(row_size) / 4;  // N_READS = 4
+    // Rounded UP: `rms_single_row` guards its own tail, but a truncating
+    // thread count silently drops the last partial group of 4 for any row
+    // width that is not a multiple of N_READS.
+    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }
