@@ -154,16 +154,16 @@ private:
 }  // namespace
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
+// fire-geometry) now lives in pie::driver::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
+using namespace pie::driver::fire;
 
 // `store/kv_cache.hpp` (pulled in for the `envelope_dot` KV geometry) declares
 // its own `pie_cuda_driver::DType`, which sits closer in the lookup chain than
 // the using-directive above and would silently retarget every unqualified
 // `DType` in this file. Pin the PTIR one explicitly; the cache's own dtype is
 // spelled `pie_cuda_driver::DType` where it is needed.
-using DType = pie_native::launch::DType;
+using DType = pie::driver::launch::DType;
 
 struct CallbackFence {
     std::atomic<std::uint32_t> pending{0};
@@ -1474,7 +1474,7 @@ struct StagedLane {
 
 struct StagedLaunch::State {
     Dispatch::Impl* owner = nullptr;
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     cudaStream_t stream = nullptr;
     std::vector<std::unique_ptr<StagedLane>> lanes;
     std::vector<std::uint64_t> touched_instances;
@@ -2174,7 +2174,7 @@ class NotifyContextLease {
 // members could both pass on the last available entry/slot and the second
 // would die as a device-side poison instead of a synchronous rejection.
 std::vector<DeviceHostChannelTicket> build_channel_tickets(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::size_t program,
     BoundInstance& bound,
     DeviceChannelRegistry& channels) {
@@ -2260,7 +2260,7 @@ std::vector<DeviceHostChannelTicket> build_channel_tickets(
 // host head/tail to the wire-assigned sequence. Serial, in lane order —
 // byte-for-byte the order the fused builder produced (W6).
 void apply_lane_sequence_tickets(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::size_t program,
     BoundInstance& bound,
     DeviceChannelRegistry& channels) {
@@ -2540,7 +2540,7 @@ DispatchStats Dispatch::stats() const {
 }
 
 std::vector<std::uint32_t> Dispatch::mtp_draft_rows(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     std::vector<std::uint32_t> rows(view.ptir_program_hashes.size(), 0);
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
@@ -3447,7 +3447,7 @@ int Dispatch::close_channel(std::uint64_t channel_id, std::string* err) {
 }
 
 int Dispatch::validate_launch(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::string* err) {
     if (err) err->clear();
     const std::size_t count = view.ptir_program_hashes.size();
@@ -3496,7 +3496,7 @@ void Dispatch::set_attention_hook_coverage(
 }
 
 bool Dispatch::launch_has_attention_stages(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
          ++program) {
@@ -3516,7 +3516,7 @@ bool Dispatch::launch_has_attention_stages(
 }
 
 bool Dispatch::launch_wants_attn_score(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
          ++program) {
@@ -3534,7 +3534,7 @@ bool Dispatch::launch_wants_attn_score(
 }
 
 bool Dispatch::launch_epilogue_is_greedy_argmax(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::uint32_t vocab) const {
     bool saw_epilogue = false;
     // The verdict is a property of the program, and a launch is overwhelmingly
@@ -3595,7 +3595,7 @@ bool Dispatch::launch_epilogue_is_greedy_argmax(
 }
 
 bool Dispatch::launch_wants_page_mask(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     for (std::size_t program = 0;
          program < view.ptir_program_hashes.size();
          ++program) {
@@ -3618,7 +3618,7 @@ bool Dispatch::launch_wants_page_mask(
 }
 
 bool Dispatch::has_decode_envelopes(
-    const pie_native::LaunchView& view) const {
+    const pie::driver::fire::LaunchView& view) const {
     if (view.ptir_program_instances.size() !=
         view.ptir_program_hashes.size()) {
         return false;
@@ -3641,7 +3641,7 @@ bool Dispatch::has_decode_envelopes(
 }
 
 bool Dispatch::envelope_plan_page_bounds(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::span<const std::uint32_t> program_request_starts,
     std::span<const std::uint32_t> wire_kv_page_indptr,
     std::vector<std::uint32_t>& per_request_pages) const {
@@ -4506,7 +4506,7 @@ void execute_declared_phase(
 }  // namespace
 
 std::unique_ptr<StagedLaunch> Dispatch::begin_host(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     cudaStream_t stream) {
     drain_reaped_instances(*impl_);
     const bool prologue_timing = fire_timing::full();
@@ -4715,7 +4715,7 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
             "staged PTIR launch enqueued twice or after abort");
     }
     cudaStream_t stream = state.stream;
-    const pie_native::LaunchView& view = state.view;
+    const pie::driver::fire::LaunchView& view = state.view;
     const bool begin_timing = fire_timing::full();
     auto begin_mark = begin_timing ? fire_timing::Clock::now()
                                    : fire_timing::Clock::time_point{};
@@ -4815,7 +4815,7 @@ void Dispatch::begin_enqueue(StagedLaunch& launch) {
 }
 
 std::unique_ptr<StagedLaunch> Dispatch::begin(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     cudaStream_t stream) {
     auto launch = begin_host(view, stream);
     begin_enqueue(*launch);
@@ -4824,7 +4824,7 @@ std::unique_ptr<StagedLaunch> Dispatch::begin(
 
 void Dispatch::update_launch_geometry(
     StagedLaunch& launch,
-    const pie_native::LaunchView& resolved_view,
+    const pie::driver::fire::LaunchView& resolved_view,
     std::span<const std::uint32_t> program_token_starts) {
     StagedLaunch::State& state = *launch.state_;
     if (!state.active ||
@@ -4834,7 +4834,7 @@ void Dispatch::update_launch_geometry(
     }
     state.view = resolved_view;
     const std::size_t count = state.lanes.size();
-    auto extent = [&](const pie_native::Slice<std::uint32_t>& values,
+    auto extent = [&](const pie::driver::Slice<std::uint32_t>& values,
                       std::size_t program) {
         return values.size() == count
             ? values.data()[program]
@@ -4940,7 +4940,7 @@ void Dispatch::execute_attention_phase(
 
 bool Dispatch::finish(
     StagedLaunch& launch,
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     const void* logits,
     std::uint32_t vocab,
     cudaStream_t stream,
@@ -5421,7 +5421,7 @@ void Dispatch::abort(
 }
 
 bool Dispatch::run(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     const void* logits,
     std::uint32_t vocab,
     cudaStream_t stream,
@@ -5483,7 +5483,7 @@ bool Dispatch::run(
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>>
 Dispatch::settle_failed_launch(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     cudaStream_t execution_stream) {
     const cudaError_t execution_status =
         cudaStreamSynchronize(execution_stream);
@@ -5530,7 +5530,7 @@ Dispatch::settle_failed_launch(
 }
 
 bool Dispatch::stage_decode_envelopes(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::span<const std::uint32_t> program_token_starts,
     std::span<const std::uint32_t> program_request_starts,
     std::span<const std::uint32_t> template_kv_page_indptr,
@@ -5817,7 +5817,7 @@ bool Dispatch::enqueue_decode_envelopes(
 }
 
 bool Dispatch::stage_fixed_decode(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::uint32_t page_size,
     std::uint32_t device_pages,
     const FixedDecodeDeviceBuffers& buffers,
@@ -6391,7 +6391,7 @@ std::string describe_uncommitted_lane(
     return message;
 }
 
-bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
+bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
                                    std::uint32_t page_size,
                                    std::uint32_t device_pages,
                                    ResolvedPrograms& out,
@@ -6457,9 +6457,9 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        auto refuse = [&](const char* why) {
+        auto refuse = [&](const std::string& why) {
             if (trace_compose) {
-                std::fprintf(stderr, "[compose] refused: %s\n", why);
+                std::fprintf(stderr, "[compose] refused: %s\n", why.c_str());
                 std::fflush(stderr);
             }
             return false;
@@ -6514,7 +6514,9 @@ bool Dispatch::resolve_descriptors(const pie_native::LaunchView& view,
             view.kv_translation.size())
             return refuse("kv_translation_indptr tail");
         if (view.ptir_kv_write_lower_bounds.size() != n_prog)
-            return refuse("kv_write_lower_bounds size");
+            return refuse("kv_write_lower_bounds size " +
+                          std::to_string(view.ptir_kv_write_lower_bounds.size()) +
+                          " != n_prog " + std::to_string(n_prog));
         if (view.ptir_kv_write_upper_bounds.size() != n_prog)
             return refuse("kv_write_upper_bounds size");
         ResolvedPrograms candidate;

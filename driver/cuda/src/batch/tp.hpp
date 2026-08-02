@@ -35,6 +35,43 @@ struct TpFirePlanViews {
     std::size_t kv_page_indices_len = 0;
 };
 
+// ---------------------------------------------------------------------------
+// Rank liveness
+//
+// TP ranks are threads in one process and rank 0 has no handshake with them.
+// A follower that throws leaves its loop for good, and rank 0 -- which never
+// learns of it -- keeps publishing fires into a group that can no longer
+// complete: the driver hangs with every GPU pinned, and the exception that
+// actually caused it scrolls past in the log. That is how an undersized
+// attention workspace presented itself as a DeepSeek-V4 TP hang.
+//
+// So a rank that leaves unexpectedly says so, and rank 0 checks once per fire
+// and fails the frame with the dead rank's own message. The check is a relaxed
+// load of a global that is never written in steady state -- it costs a
+// predicted-taken branch on a line that stays shared-clean in every core's
+// cache, which is not measurable next to a fire.
+namespace detail {
+extern std::atomic<bool> g_tp_rank_failed;
+}  // namespace detail
+
+[[noreturn]] void tp_throw_rank_failure();
+
+inline void tp_check_ranks_alive() {
+    if (detail::g_tp_rank_failed.load(std::memory_order_relaxed))
+        [[unlikely]] {
+        tp_throw_rank_failure();
+    }
+}
+
+// Record that `rank` left its service loop without being asked to. Poisons the
+// group for `tp_check_ranks_alive`, stops the CPU gate so peers parked there
+// wake, and aborts every communicator in the process so peers already inside a
+// collective this rank will never join fail instead of spinning forever.
+// Idempotent; the first message wins.
+void tp_report_rank_failure(const std::string& cpu_gate_key,
+                            int rank,
+                            const std::string& what);
+
 // Publish the fire's host-known metadata (header + planner CSR views) into the
 // process-shared mailbox and wake the follower — WITHOUT touching the device.
 //

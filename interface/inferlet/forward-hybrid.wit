@@ -239,4 +239,29 @@ interface forward-hybrid {
         on: borrow<pipeline>,
         slots: list<option<borrow<forward-pass>>>,
     ) -> result<_, error>;
+
+    /// Leave the frame's wait-set on `on` until this pipeline submits again.
+    ///
+    /// A frame batches one slot per participating pipeline and does not
+    /// dispatch until every member has submitted, so membership is a promise
+    /// to keep submitting. A pipeline that stops — it is blocked on a user
+    /// turn, waiting on a peer, or simply idle — would otherwise hold the
+    /// frame, and `model.submit-deadline-us` bounds that promise: hold the
+    /// wait-set that long with nothing owed to you and the instance is
+    /// terminated for breach of contract. `park` is how a pipeline stops
+    /// WITHOUT breaking the promise — it states the intent the engine cannot
+    /// infer, leaves the wait-set, and stops that clock.
+    ///
+    /// Ordered against this pipeline's own submits, not against the call: it
+    /// takes effect once every frame submitted before it has sealed, so it is
+    /// legal — and expected — to park with fires still outstanding. Their
+    /// results are delivered as usual; the exit simply follows them. There is
+    /// no rejoin call, because a member that had joined but not yet submitted
+    /// would reopen exactly the gap this closes: the next `submit` rejoins
+    /// the wait-set atomically with the slot it contributes.
+    ///
+    /// Parking twice with no submit in between is a no-op, as is parking a
+    /// pipeline that never fired. Outside frame mode there is no wait-set and
+    /// this does nothing.
+    park: func(on: borrow<pipeline>);
 }

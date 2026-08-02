@@ -34,7 +34,7 @@
 #include "pipeline/channels.hpp"
 #include "pipeline/channel_registry.hpp"
 #include "pipeline/tier0/tier0_launch.hpp"
-#include "pie_native/launch/program.hpp"
+#include "pie/driver/launch/program.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
@@ -103,9 +103,9 @@ class BakedBufferPool {
 };
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
+// fire-geometry) now lives in pie::driver::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
+using namespace pie::driver::launch;
 
 // Per-fire inputs the runner binds into the trace (intrinsics + host tensors).
 struct FireInputs {

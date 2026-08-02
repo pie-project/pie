@@ -196,6 +196,14 @@ DsV4Workspace DsV4Workspace::allocate(
             {(3 * static_cast<int>(distinct_ratios.size()) + 1) * N});
     }
 
+    // `wo_a` is replicated, so this is deliberately NOT divided by tp_size.
+    if (cfg.dsv4_o_lora_rank > 0 && cfg.dsv4_o_groups > 0) {
+        const int per_group_dim =
+            cfg.num_attention_heads * cfg.head_dim / cfg.dsv4_o_groups;
+        ws.wo_a_dequant = DeviceTensor::allocate(
+            DType::BF16, {cfg.dsv4_o_lora_rank, per_group_dim});
+    }
+
     // Routed experts: weights are sharded on intermediate dim → moe_I / T.
     const int local_moe_I_ws = moe_I / std::max(1, tp_size);
     ws.expert_in     = DeviceTensor::allocate(DType::BF16,{N, H});
@@ -898,10 +906,17 @@ void dsv4_forward_paged(
                 Lw.wo_a->dtype() == DType::FP8_E4M3;
             const int elem_bytes_wo_a = wo_a_is_fp8 ? 1 : 2;
 
-            // Workspace for dequantised group slice when FP8.
-            // Reuse expert_gate_w ([moe_I, H] BF16) which is large
-            // enough for one [o_lora, per_group_dim] BF16 slice.
-            void* dequant_buf = ws.expert_gate_w.data();
+            // Workspace for the dequantised group slice when FP8. Sized for
+            // this weight rather than borrowed from the expert scratch, whose
+            // extent is a function of tp_size and so cannot be relied on to
+            // cover a replicated weight.
+            void* dequant_buf = ws.wo_a_dequant.data();
+            if (dequant_buf == nullptr ||
+                ws.wo_a_dequant.nbytes() <
+                    static_cast<std::size_t>(o_lora) * per_group_dim * 2) {
+                throw std::runtime_error(
+                    "deepseek_v4: wo_a dequant workspace too small");
+            }
 
             cublasSetStream(cublas.handle(), stream);
 

@@ -86,7 +86,16 @@ def main() -> None:
     import torch
 
     if _register_kimi_k3 is not None:
-        _register_kimi_k3()
+        try:
+            _register_kimi_k3()
+        except Exception as exc:  # noqa: BLE001
+            # The K3 shim needs config/modelling classes that only newer vLLM
+            # builds ship. Failing here would take down dumping for every OTHER
+            # model too, which is the opposite of what an optional
+            # registration should do -- so report it and carry on. A K3 run
+            # will then fail later, on its own, with vLLM's own message.
+            print(f"[act-dump] Kimi-K3 registration unavailable: {exc}",
+                  file=sys.stderr)
 
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt

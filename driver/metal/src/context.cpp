@@ -1,4 +1,4 @@
-#include <pie_native/step_launch.hpp>
+#include <pie/driver/fire/step.hpp>
 #include "context.hpp"
 
 #include <algorithm>
@@ -28,7 +28,7 @@
 #include <nlohmann/json.hpp>
 #include <toml++/toml.hpp>
 
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/fire/view.hpp"
 #include "loader/load_plan.hpp"
 #include "pipeline/interp.hpp"
 #include "pipeline/descriptor_resolve.hpp"
@@ -182,7 +182,7 @@ void publish_terminal(PieTerminalCell* cell, std::uint32_t outcome) {
 // `resolved` (Phase 2, C3): when non-null, the member's token/position/KV-
 // page/readout fields come from the descriptor-resolved `FireGeometry`
 // INSTEAD of the wire CSR slices — a device-geometry program's wire span is
-// an empty placeholder (`pie_native::LaunchView`'s own doc comment); the
+// an empty placeholder (`pie::driver::fire::LaunchView`'s own doc comment); the
 // channel-resolved geometry is the only truth for those fields. The
 // recurrent-state slot bookkeeping (rs_slot_id/rs_reset) is unrelated to
 // device-geometry classification and always comes from the wire.
@@ -908,7 +908,7 @@ class Context::Impl {
     // §4.4 publication (channel words → terminals → per-channel notifies → the
     // batch notify, exactly once) off the caller thread. Non-forward
     // (channel-plane C1) members settle the same way, just without a forward.
-    static LaunchDemand launch_demand(const pie_native::StepLaunch& launch) {
+    static LaunchDemand launch_demand(const pie::driver::fire::StepLaunch& launch) {
         LaunchDemand demand;
         demand.kv_pages = launch.required_kv_pages;
         auto include_pages = [&demand](PieU32Slice pages) {
@@ -994,7 +994,7 @@ class Context::Impl {
         std::vector<std::uint64_t> instance_ids;
         std::vector<std::uint32_t> kv_translation;
         std::vector<std::uint32_t> kv_translation_indptr;
-        pie_native::StepLaunch launch{};
+        pie::driver::fire::StepLaunch launch{};
     };
 
     static void expand_step(
@@ -1020,7 +1020,7 @@ class Context::Impl {
             out->kv_translation_indptr.push_back(
                 static_cast<std::uint32_t>(out->kv_translation.size()));
         }
-        pie_native::StepLaunch& launch = out->launch;
+        pie::driver::fire::StepLaunch& launch = out->launch;
         launch.instance_ids = {
             out->instance_ids.data(), out->instance_ids.size()};
         launch.terminal_cells = step.terminal_cells;
@@ -1080,7 +1080,7 @@ class Context::Impl {
     }
 
     int launch_impl(
-        const pie_native::StepLaunch& launch,
+        const pie::driver::fire::StepLaunch& launch,
         PieCompletion completion) {
         std::unique_lock<std::mutex> lock_holder(state_mutex_);
         std::vector<InstanceRecord*> members;
@@ -1250,7 +1250,7 @@ class Context::Impl {
 
         // ── Phase 0: execution-time ticket validation directly against the
         // authoritative Shared-storage channel rings. ──
-        const pie_native::LaunchView view = job->launch.view();
+        const pie::driver::fire::LaunchView view = job->launch.view();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             job->fwd_descs.clear();
@@ -2307,7 +2307,7 @@ class Context::Impl {
     // once by `forward_batch` (Phase 3, §7); this only prepares one member's
     // descriptor + arbitrates its device geometry.
     ForwardBuildResult build_forward_desc_for_member(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         std::size_t m,
         std::size_t member_count,
         InstanceRecord& member,
@@ -2316,7 +2316,7 @@ class Context::Impl {
         std::string& failure) {
         desc.sequence_id = member.instance_id;
 
-        pie_native::launch::FireGeometry resolved;
+        pie::driver::fire::FireGeometry resolved;
         // The runtime states the class at bind; trust it. The trace-shape
         // predicate stays as the fallback for a HOST-class instance whose
         // program nonetheless traces its geometry.
@@ -2370,7 +2370,7 @@ class Context::Impl {
             }
             const std::uint32_t device_pages =
                 effective_total_pages(cfg_, facts_.has_linear_attn);
-            if (!pie_native::launch::validate_fire_geometry(
+            if (!pie::driver::fire::validate_fire_geometry(
                     resolved, device_pages, cfg_.batching.kv_page_size, &failure)) {
                 return ForwardBuildResult::Failed;
             }

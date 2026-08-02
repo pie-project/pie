@@ -645,7 +645,7 @@ struct StepTiming {
 // pointers alias; the Impl is heap-held so those addresses are stable
 // under PreparedStep moves.
 struct PreparedStep::Impl {
-    const pie_native::LaunchView* view = nullptr;
+    const pie::driver::fire::LaunchView* view = nullptr;
     std::unique_ptr<pipeline::StagedLaunch> staged;
 
     // Resolution + composition.
@@ -655,7 +655,7 @@ struct PreparedStep::Impl {
     bool composed_ready = false;
     std::vector<std::uint32_t> prog_sample_csr;
     std::vector<std::uint32_t> program_token_starts;
-    pie_native::LaunchView dispatch_view{};
+    pie::driver::fire::LaunchView dispatch_view{};
 
     // Shape + mode flags.
     int R = 0;
@@ -836,7 +836,7 @@ bool plan_inputs_identical(
 
 void prepare_step(
     BatchEngine& engine,
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     PreparedStep& step,
     const PreparedStep* previous) {
     PreparedStep::Impl& s = *step.impl();
@@ -1029,7 +1029,7 @@ void prepare_step(
             : nullptr;
     bool use_structured_mask = false;
     bool pack_structured_mask = false;
-    std::vector<pie_native::launch::StructuredMaskDescriptor>
+    std::vector<pie::driver::fire::StructuredMaskDescriptor>
         effective_structured_masks = s.composed.structured_masks;
     const auto mask_coverage = pipeline::structured_mask_coverage(
         effective_structured_masks);
@@ -1078,45 +1078,45 @@ void prepare_step(
     }
     s.dispatch_view = view;
     if (s.composed_ready) {
-        s.dispatch_view.rs_slot_ids = pie_native::slice_from_u32(
+        s.dispatch_view.rs_slot_ids = pie::driver::slice_from_u32(
             s.composed.rs_slot_ids.data(), s.composed.rs_slot_ids.size());
-        s.dispatch_view.rs_slot_flags = pie_native::slice_from_u8(
+        s.dispatch_view.rs_slot_flags = pie::driver::slice_from_u8(
             s.composed.rs_slot_flags.data(),
             s.composed.rs_slot_flags.size());
-        s.dispatch_view.rs_fold_lens = pie_native::slice_from_u32(
+        s.dispatch_view.rs_fold_lens = pie::driver::slice_from_u32(
             s.composed.rs_fold_lens.data(), s.composed.rs_fold_lens.size());
-        s.dispatch_view.rs_buffer_slot_ids = pie_native::slice_from_u32(
+        s.dispatch_view.rs_buffer_slot_ids = pie::driver::slice_from_u32(
             s.composed.rs_buffer_slot_ids.data(),
             s.composed.rs_buffer_slot_ids.size());
-        s.dispatch_view.rs_buffer_slot_indptr = pie_native::slice_from_u32(
+        s.dispatch_view.rs_buffer_slot_indptr = pie::driver::slice_from_u32(
             s.composed.rs_buffer_slot_indptr.data(),
             s.composed.rs_buffer_slot_indptr.size());
-        s.dispatch_view.sampling_indices = pie_native::slice_from_u32(
+        s.dispatch_view.sampling_indices = pie::driver::slice_from_u32(
             sidx_view.data(), sidx_view.size());
-        s.dispatch_view.sampling_indptr = pie_native::slice_from_u32(
+        s.dispatch_view.sampling_indptr = pie::driver::slice_from_u32(
             s.prog_sample_csr.data(), s.prog_sample_csr.size());
-        s.dispatch_view.ptir_sample_starts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_sample_starts = pie::driver::slice_from_u32(
             s.composed.prog_sample_starts.data(),
             s.composed.prog_sample_starts.size());
-        s.dispatch_view.ptir_sample_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_sample_counts = pie::driver::slice_from_u32(
             s.composed.prog_sample_counts.data(),
             s.composed.prog_sample_counts.size());
-        s.dispatch_view.ptir_row_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_row_counts = pie::driver::slice_from_u32(
             s.composed.prog_row_counts.data(),
             s.composed.prog_row_counts.size());
-        s.dispatch_view.ptir_token_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_token_counts = pie::driver::slice_from_u32(
             s.composed.prog_token_counts.data(),
             s.composed.prog_token_counts.size());
-        s.dispatch_view.ptir_kv_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_kv_lens = pie::driver::slice_from_u32(
             s.composed.prog_kv_lens.data(),
             s.composed.prog_kv_lens.size());
-        s.dispatch_view.ptir_page_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_page_counts = pie::driver::slice_from_u32(
             s.composed.prog_page_counts.data(),
             s.composed.prog_page_counts.size());
-        s.dispatch_view.ptir_query_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_query_lens = pie::driver::slice_from_u32(
             s.composed.prog_query_lens.data(),
             s.composed.prog_query_lens.size());
-        s.dispatch_view.ptir_key_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_key_lens = pie::driver::slice_from_u32(
             s.composed.prog_key_lens.data(),
             s.composed.prog_key_lens.size());
     }

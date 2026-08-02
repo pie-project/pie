@@ -379,6 +379,24 @@ pub fn init_admission(max_concurrent: Option<usize>) {
         .expect("prewarm admission controller already initialized");
 }
 
+/// RAII membership in the execution-admission FIFO. The frame policy mirrors
+/// this queue so its successor earmark is a named process rather than a
+/// count; see [`FramePolicy::is_joining`].
+struct AdmissionQueued(ProcessId);
+
+impl AdmissionQueued {
+    fn enter(pid: ProcessId) -> Self {
+        crate::scheduler::worker::notify_admission_queued(pid);
+        Self(pid)
+    }
+}
+
+impl Drop for AdmissionQueued {
+    fn drop(&mut self) {
+        crate::scheduler::worker::notify_admission_dequeued(self.0);
+    }
+}
+
 pub(crate) fn execution_admission_is_capped() -> bool {
     ADMISSION.get().is_some_and(Option::is_some)
 }
@@ -528,6 +546,15 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     let started = Instant::now();
     let permit = match ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => {
+            // Announce the wait BEFORE blocking on it. `tokio::Semaphore` is
+            // FIFO-fair, so a process queued here is the identified taker of
+            // a slot that is free or about to be: the frame seal can name
+            // whom it is holding for instead of inferring it from "some slot
+            // is free" AND "some process is staged", which pairs nobody with
+            // nobody and is permanently true once the pool is oversubscribed.
+            // Dropped on cancellation too, so a process that goes away while
+            // queued stops being earmarked.
+            let _queued = AdmissionQueued::enter(ctx.id());
             let permit = Arc::clone(semaphore)
                 .acquire_owned()
                 .await

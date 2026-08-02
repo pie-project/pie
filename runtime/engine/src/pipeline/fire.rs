@@ -1588,6 +1588,29 @@ pub async fn submit_frame<C: FireContext>(
     Ok(Ok(()))
 }
 
+/// `forward.park()`: leave the frame wait-set on `this` until it submits
+/// again. Consumes a frame seq so the exit orders against this pipeline's own
+/// submits — every frame submitted before it must seal first, which is what
+/// makes it legal to park with fires still outstanding.
+///
+/// Silent no-op when there is no wait-set to leave: `k == 1` never batches
+/// across pipelines (`submit_frame` bypasses stamping entirely there), and a
+/// closed pipeline has already left. The WIT signature returns nothing for
+/// the same reason — parking is a statement about the future, and there is no
+/// state in which it can fail to be true.
+pub fn park_frame<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyhow<()> {
+    if crate::scheduler::configured_frame_size() == 1 {
+        return Ok(());
+    }
+    let pipeline = ctx.resources().get(&this)?;
+    if pipeline.scope.is_closed() {
+        return Ok(());
+    }
+    let (lane, seq) = (pipeline.scope.scheduler_id(), pipeline.next_frame_seq());
+    crate::scheduler::worker::notify_lane_park(lane, seq);
+    Ok(())
+}
+
 /// Section 5 structural frame validation (k > 1 only): fusability is a
 /// deterministic program property — decided from program structure and
 /// staged occupancy at submit, never timing.
@@ -2428,22 +2451,32 @@ async fn fire_device_geometry<C: FireContext>(
         .as_ref()
         .expect("fire_device_geometry on a non-device-geometry pass")
         .pooled;
-    let pooled_write_indexes: Vec<u64> = if pooled {
+    let writable_span: Option<std::ops::Range<u64>> = {
         let writable = ctx.resources().get(&fwd)?.kv_declaration.writable;
         let reserved = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv_store| {
             kv_store.page_len(ws.id)
         });
-        let span = reserved
+        match reserved
             .map_err(|error| error.to_string())
-            .and_then(|page_len| writable.resolve(page_len));
-        match span {
-            Ok(span) => span.collect(),
-            Err(error) => {
+            .and_then(|page_len| writable.resolve(page_len))
+        {
+            Ok(span) => Some(span),
+            Err(error) if pooled => {
                 return Ok(Err(format!(
                     "pipeline: pool-owned device geometry: {error}"
                 )));
             }
+            // Not pooled: the declaration is not needed to place writes, so a
+            // span that will not resolve is not fatal here — it only costs the
+            // containment bound below.
+            Err(_) => None,
         }
+    };
+    let pooled_write_indexes: Vec<u64> = if pooled {
+        writable_span
+            .clone()
+            .expect("a pooled pass returns above when its span will not resolve")
+            .collect()
     } else {
         Vec::new()
     };
@@ -2683,6 +2716,18 @@ async fn fire_device_geometry<C: FireContext>(
     req.qo_indptr = resolved_qo_indptr;
     req.kv_translation = kv_translation;
     req.kv_translation_version = kv_translation_version;
+    // The declared writable span is this pass's containment promise, and the
+    // host has to state it even though the device picks the exact cells: the
+    // driver's device-composed template — the ONLY resolver that can read a
+    // value the producing fire has not committed yet — refuses a batch whose
+    // bounds are absent, and falls back to a host readback that cannot see a
+    // loop-carried descriptor at all. Omitting them here is what made every
+    // device-carried decode fail with `descriptor channel N not ready`.
+    if let Some(span) = &writable_span {
+        let page_size = u64::from(page_size);
+        req.kv_write_lower_bounds = vec![span.start * page_size];
+        req.kv_write_upper_bounds = vec![span.end * page_size];
+    }
     rs_prepared.apply_to(&mut req);
     attn_mask.apply_to(&mut req);
     let ticket_reservation = TicketReservation::new(&cells, &accesses);

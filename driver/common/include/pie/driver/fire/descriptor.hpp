@@ -7,9 +7,9 @@
 
 #include <ptir_abi.h>
 
-#include "pie_native/launch/program.hpp"
+#include "pie/driver/launch/program.hpp"
 
-namespace pie_native::launch::descriptor {
+namespace pie::driver::fire::descriptor {
 
 // Derived from the generated header, not retyped. `ptir_abi.h` is emitted from
 // `pie_ir::registry`, which is the only place a port tag is decided; hand-copied
@@ -40,11 +40,11 @@ inline constexpr std::uint8_t kPortRsWOff = PTIR_PORT_RS_W_OFF;
 // path that count takes to the recurrence without a host round-trip.
 inline constexpr std::uint8_t kPortRsFoldLen = PTIR_PORT_RS_FOLD_LEN;
 
-inline bool is_device_geometry_trace(const Trace& trace) {
+inline bool is_device_geometry_trace(const launch::Trace& trace) {
     bool has_write_desc = false;
-    ChannelId pages_channel = 0;
+    launch::ChannelId pages_channel = 0;
     bool has_pages = false;
-    for (const PortBinding& binding : trace.ports) {
+    for (const launch::PortBinding& binding : trace.ports) {
         if (binding.is_const) continue;
         if (binding.port == kPortWSlot || binding.port == kPortWOff) {
             has_write_desc = true;
@@ -62,9 +62,9 @@ inline bool is_device_geometry_trace(const Trace& trace) {
     return dims.size() == 2 && dims[1] > 1;
 }
 
-inline bool stage_puts_channel(const Trace& trace, ChannelId channel) {
-    for (const Stage& stage : trace.stages) {
-        for (const ChannelPut& put : stage.puts) {
+inline bool stage_puts_channel(const launch::Trace& trace, launch::ChannelId channel) {
+    for (const launch::Stage& stage : trace.stages) {
+        for (const launch::ChannelPut& put : stage.puts) {
             if (put.channel == channel) return true;
         }
     }
@@ -72,10 +72,10 @@ inline bool stage_puts_channel(const Trace& trace, ChannelId channel) {
 }
 
 inline bool const_u32_port(
-    const PortBinding& binding,
+    const launch::PortBinding& binding,
     std::span<const std::uint32_t> expected = {}) {
     if (!binding.is_const ||
-        binding.const_type.dtype != DType::U32 ||
+        binding.const_type.dtype != launch::DType::U32 ||
         binding.const_type.shape.dims.size() != 1) {
         return false;
     }
@@ -103,7 +103,7 @@ inline bool const_u32_port(
 // the beam page-lease protocol. Once every required descriptor channel is
 // re-published by the program, later fires must resolve the live/pending cells
 // instead of replaying the host-side seed geometry.
-inline bool is_loop_carried_explicit_geometry_trace(const Trace& trace) {
+inline bool is_loop_carried_explicit_geometry_trace(const launch::Trace& trace) {
     constexpr std::uint8_t required[] = {
         kPortEmbedTokens,
         kPortPositions,
@@ -115,7 +115,7 @@ inline bool is_loop_carried_explicit_geometry_trace(const Trace& trace) {
     };
     for (const std::uint8_t port : required) {
         bool produced = false;
-        for (const PortBinding& binding : trace.ports) {
+        for (const launch::PortBinding& binding : trace.ports) {
             if (binding.port != port || binding.is_const) continue;
             produced = stage_puts_channel(trace, binding.channel);
             break;
@@ -131,17 +131,17 @@ inline bool is_loop_carried_explicit_geometry_trace(const Trace& trace) {
 // semantics) is the runtime's job, done once; the driver only checks that
 // it can run the claimed class safely. The golden trace parity corpus pins
 // the two sides together.
-inline bool is_decode_envelope_trace(const Trace& trace) {
-    const PortBinding* token = nullptr;
-    const PortBinding* kv_len = nullptr;
-    const PortBinding* positions = nullptr;
-    const PortBinding* embed_indptr = nullptr;
-    const PortBinding* readout = nullptr;
-    const PortBinding* pages = nullptr;
-    const PortBinding* page_indptr = nullptr;
-    const PortBinding* w_slot = nullptr;
-    const PortBinding* w_off = nullptr;
-    for (const PortBinding& binding : trace.ports) {
+inline bool is_decode_envelope_trace(const launch::Trace& trace) {
+    const launch::PortBinding* token = nullptr;
+    const launch::PortBinding* kv_len = nullptr;
+    const launch::PortBinding* positions = nullptr;
+    const launch::PortBinding* embed_indptr = nullptr;
+    const launch::PortBinding* readout = nullptr;
+    const launch::PortBinding* pages = nullptr;
+    const launch::PortBinding* page_indptr = nullptr;
+    const launch::PortBinding* w_slot = nullptr;
+    const launch::PortBinding* w_off = nullptr;
+    for (const launch::PortBinding& binding : trace.ports) {
         switch (binding.port) {
             case kPortEmbedTokens:
                 if (binding.is_const || token != nullptr) return false;
@@ -207,8 +207,8 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
     }
     const auto& token_type = trace.channels[token->channel].type;
     const auto& kv_len_type = trace.channels[kv_len->channel].type;
-    if ((token_type.dtype != DType::I32 &&
-         token_type.dtype != DType::U32) ||
+    if ((token_type.dtype != launch::DType::I32 &&
+         token_type.dtype != launch::DType::U32) ||
         token_type.shape.dims.size() != 1 ||
         token_type.shape.dims[0] == 0) {
         return false;
@@ -243,7 +243,7 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
         if (embed_indptr->channel >= trace.channels.size()) return false;
         const auto& indptr_type =
             trace.channels[embed_indptr->channel].type;
-        if (indptr_type.dtype != DType::U32 ||
+        if (indptr_type.dtype != launch::DType::U32 ||
             indptr_type.shape.dims !=
                 std::vector<std::uint32_t>{token_count + 1}) {
             return false;
@@ -253,7 +253,7 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
         return false;
     }
     if (
-        kv_len_type.dtype != DType::U32 ||
+        kv_len_type.dtype != launch::DType::U32 ||
         kv_len_type.shape.dims.size() != 1 ||
         kv_len_type.shape.dims[0] != lane_count) {
         return false;
@@ -262,7 +262,7 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
         if (positions->channel >= trace.channels.size()) return false;
         const auto& position_type =
             trace.channels[positions->channel].type;
-        if (position_type.dtype != DType::U32 ||
+        if (position_type.dtype != launch::DType::U32 ||
             position_type.shape.dims.size() != 1 ||
             position_type.shape.dims[0] != token_count) {
             return false;
@@ -272,17 +272,17 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
     // assumptions — hold for EVERY envelope, independent of how positions
     // are sourced.
     {
-        auto channel_type = [&](const PortBinding* binding)
-            -> const TensorType* {
+        auto channel_type = [&](const launch::PortBinding* binding)
+            -> const launch::TensorType* {
             return binding != nullptr && !binding->is_const &&
                     binding->channel < trace.channels.size()
                 ? &trace.channels[binding->channel].type
                 : nullptr;
         };
-        const TensorType* pages_type = channel_type(pages);
-        const TensorType* page_indptr_type = channel_type(page_indptr);
-        const TensorType* w_slot_type = channel_type(w_slot);
-        const TensorType* w_off_type = channel_type(w_off);
+        const launch::TensorType* pages_type = channel_type(pages);
+        const launch::TensorType* page_indptr_type = channel_type(page_indptr);
+        const launch::TensorType* w_slot_type = channel_type(w_slot);
+        const launch::TensorType* w_off_type = channel_type(w_off);
         const bool pages_shape_valid =
             pages_type != nullptr &&
             ((lane_count == 1 &&
@@ -293,12 +293,12 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
               pages_type->shape.dims[1] > 0));
         if (pages_type == nullptr ||
             w_slot_type == nullptr || w_off_type == nullptr ||
-            pages_type->dtype != DType::U32 ||
+            pages_type->dtype != launch::DType::U32 ||
             !pages_shape_valid ||
-            w_slot_type->dtype != DType::U32 ||
+            w_slot_type->dtype != launch::DType::U32 ||
             w_slot_type->shape.dims !=
                 std::vector<std::uint32_t>{token_count} ||
-            w_off_type->dtype != DType::U32 ||
+            w_off_type->dtype != launch::DType::U32 ||
             w_off_type->shape.dims !=
                 std::vector<std::uint32_t>{token_count}) {
             return false;
@@ -306,7 +306,7 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
         // page_indptr is either a trace-const CSR (wire template) or a
         // [lanes+1] u32 device channel.
         if (page_indptr_type != nullptr &&
-            (page_indptr_type->dtype != DType::U32 ||
+            (page_indptr_type->dtype != launch::DType::U32 ||
              page_indptr_type->shape.dims !=
                  std::vector<std::uint32_t>{lane_count + 1})) {
             return false;
@@ -315,13 +315,13 @@ inline bool is_decode_envelope_trace(const Trace& trace) {
     // Const positions/read-out payloads travel on the wire; execution never
     // dereferences them here — no value checks (runtime classification owns
     // value semantics).
-    for (const Channel& channel : trace.channels) {
+    for (const launch::Channel& channel : trace.channels) {
         if (channel.extern_dir >= 0) return false;
     }
     return true;
 }
 
-inline bool requires_descriptor_resolution(const Trace& trace) {
+inline bool requires_descriptor_resolution(const launch::Trace& trace) {
     return is_device_geometry_trace(trace) ||
            is_loop_carried_explicit_geometry_trace(trace);
 }
@@ -334,4 +334,4 @@ inline std::uint32_t last_page_len(
                : ((length - 1) % page_size) + 1;
 }
 
-}  // namespace pie_native::launch::descriptor
+}  // namespace pie::driver::fire::descriptor

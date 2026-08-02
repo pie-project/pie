@@ -495,8 +495,10 @@ void tp_publish_fire(const std::string& cpu_gate_key,
                      int rs_buffer_ids_count,
                      int rs_buffer_read_ids_count) {
     if (cpu_gate_key.empty()) return;
+    // Before anything is written into the mailbox: a fire published to a group
+    // that has lost a rank can never complete.
+    tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
-    TpStallWatchdog::instance().start();
     TpStallWatchdog::instance().start();
     tp_mailbox_reserve_slot(*box, cpu_gate_key);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
@@ -566,6 +568,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
             "TP root custom mask metadata exceeds persistent capacity");
     }
     TpStageTimer root_timer(TpProfile::kRootBroadcast);
+    tp_check_ranks_alive();
     const TpFireHeader header{
         TP_FIRE_MAGIC, N, R, is_pure_decode ? 1 : 0,
         kv_indices_count, required_kv_pages, mask_bytes, mask_indptr_count,
@@ -741,6 +744,7 @@ void tp_publish_mtp(const std::string& cpu_gate_key,
                     int draft_step,
                     int max_global_tokens) {
     if (cpu_gate_key.empty()) return;
+    tp_check_ranks_alive();
     auto box = tp_mailbox_for(cpu_gate_key);
     tp_mailbox_reserve_slot(*box, cpu_gate_key);
     TpFireSlot& fire = box->slots[box->fire_seq % kTpMailboxRing];
@@ -768,6 +772,9 @@ void tp_broadcast_mtp_step(
     int draft_step,
     int max_global_tokens,
     cudaStream_t stream) {
+    // Gate-off configurations never touch the mailbox, so this is their only
+    // liveness check before the collectives below.
+    tp_check_ranks_alive();
     if (cpu_gate_key.empty()) {
         // Gate off: the follower is parked inside the header broadcast.
         auto* device_header = tp_hdr_dev_buf();
@@ -829,6 +836,53 @@ void tp_cpu_gate_request_stop(const std::string& key) {
     gate->request_stop();
 }
 
+namespace detail {
+std::atomic<bool> g_tp_rank_failed{false};
+}  // namespace detail
+
+namespace {
+std::mutex g_tp_rank_failure_mu;
+std::string g_tp_rank_failure_msg;
+}  // namespace
+
+void tp_throw_rank_failure() {
+    std::string msg;
+    {
+        std::lock_guard<std::mutex> lk(g_tp_rank_failure_mu);
+        msg = g_tp_rank_failure_msg;
+    }
+    throw std::runtime_error(
+        msg.empty() ? std::string("tp: a rank left the group") : msg);
+}
+
+void tp_report_rank_failure(const std::string& cpu_gate_key,
+                            int rank,
+                            const std::string& what) {
+    bool first = false;
+    {
+        std::lock_guard<std::mutex> lk(g_tp_rank_failure_mu);
+        if (g_tp_rank_failure_msg.empty()) {
+            g_tp_rank_failure_msg =
+                "tp rank " + std::to_string(rank) +
+                " left the group and every later fire would hang: " + what;
+            first = true;
+        }
+    }
+    // Release: the message above must be visible to whoever observes the flag.
+    detail::g_tp_rank_failed.store(true, std::memory_order_release);
+    if (!first) return;
+    std::cerr << "[pie-driver-cuda] tp rank " << rank
+              << " left the group: " << what
+              << " — failing the TP group\n";
+    // Peers parked on the gate wake and see a stopped gate.
+    tp_cpu_gate_request_stop(cpu_gate_key);
+    // Peers already inside a collective this rank will never join are waiting
+    // on the device, where no flag can reach them. Aborting the communicators
+    // makes those waits return an error, which is the difference between a
+    // reported failure and a hang.
+    nccl_abort_all_comms();
+}
+
 // ============================================================================
 // TP follower service loop
 // ============================================================================
@@ -846,8 +900,7 @@ void tp_cpu_gate_request_stop(const std::string& key) {
 // matching broadcast in `tp_broadcast_inputs`.
 void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
     if (engine.tp_comm == nullptr) {
-        std::cerr << "[pie-driver-cuda] tp_follower_serve: no tp_comm\n";
-        return;
+        throw std::runtime_error("tp_follower_serve: no tp_comm");
     }
     auto& pi      = engine.inputs;
     auto& comm    = *engine.tp_comm;
@@ -928,6 +981,15 @@ void tp_follower_serve(BatchEngine& engine, std::atomic<bool>& stop) {
                 hdr.mask_bytes, hdr.mask_indptr_count, hdr.has_slot_ids,
                 hdr.logit_rows, hdr.rs_mode,
                 (unsigned long long)fire_slot);
+        }
+        {
+            static const std::uint64_t kill_at = [] {
+                const char* v = std::getenv("PIE_TP_TEST_KILL_FOLLOWER_AT_FIRE");
+                return v ? std::strtoull(v, nullptr, 10) : 0ull;
+            }();
+            if (kill_at != 0 && cpu_gate_seq == kill_at) {
+                throw std::runtime_error("injected follower fault");
+            }
         }
         if (hdr.magic == TP_STOP_MAGIC) break;
         if (hdr.magic == TP_MTP_MAGIC) {

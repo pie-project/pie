@@ -31,7 +31,7 @@ struct HostEmittedKernel {
 struct ProgramRecord {
     std::uint64_t program_id = 0;
     std::uint64_t program_hash = 0;
-    std::vector<pie_native::launch::Channel> channels;
+    std::vector<pie::driver::launch::Channel> channels;
     ExecPlan plan;
     std::vector<HostEmittedKernel> emitted_kernels;
     std::shared_ptr<M1ProgramExecutable> m1_executable;

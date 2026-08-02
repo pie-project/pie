@@ -10,7 +10,7 @@
 //
 // The structs are the driver's own execution state (the same status as
 // `fire/descriptor.hpp` and `fire/fire_geometry.hpp`), which is why they live
-// under `driver/abi/` rather than being shared with the compiler.
+// under `driver/common/` rather than being shared with the compiler.
 //
 // This is a value -> value graph over trace-known shapes; nothing here touches
 // memory. The only stateful construct is the Channel: a bounded queue of cells
@@ -22,9 +22,9 @@
 
 #include <pie_driver_abi.h>
 
-#include "pie_native/launch/op_table.hpp"
+#include "pie/driver/launch/op_table.hpp"
 
-namespace pie_native::launch {
+namespace pie::driver::launch {
 
 using ValueId   = std::uint32_t;   // SSA value id, unique within a program
 using ChannelId = std::uint32_t;   // channel index within a program
@@ -356,4 +356,4 @@ inline Trace adopt(const PieLaunchPackage& package) {
     return trace;
 }
 
-}  // namespace pie_native::launch
+}  // namespace pie::driver::launch

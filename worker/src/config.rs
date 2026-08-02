@@ -425,12 +425,34 @@ impl ModelConfig {
 pub struct SchedulerConfig {
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// How long a pipeline that is HARD-BLOCKING a frame's seal may go
+    /// without submitting before the engine terminates it for breach of
+    /// contract, in microseconds.
+    ///
+    /// Small (50ms) because it measures a much narrower interval than its size
+    /// suggests. The clock runs only while the lane is an awaited member with
+    /// nothing submitted — it is stopped by run-ahead (a lane with a queued
+    /// frame is not blocking), by an unretired dispatch (the engine owes it a
+    /// result, so the whole GPU wave is free), by a bind in flight, and by
+    /// `forward.park()`. The host resubmit turnaround already has its own
+    /// headroom in `HOST_TURNAROUND_WAVES`; what is left here is a member
+    /// that is blocking the fleet with nothing owed to it and no stated
+    /// intent to leave, which is precisely the case that never resolves.
+    ///
+    /// This is therefore not a latency budget but the fleet's exposure to one
+    /// contract violation — paid once, since the breacher is removed rather
+    /// than skipped for the frame. Exposed to guests verbatim as
+    /// `model.submit-deadline-us()`, and static for that reason: a number
+    /// that can kill must not move.
+    #[serde(default = "default_submit_deadline_us")]
+    pub submit_deadline_us: u64,
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_request_timeout_secs(),
+            submit_deadline_us: default_submit_deadline_us(),
         }
     }
 }
@@ -441,12 +463,20 @@ impl SchedulerConfig {
             self.request_timeout_secs > 0,
             "scheduler.request_timeout_secs must be > 0"
         );
+        ensure!(
+            self.submit_deadline_us > 0,
+            "scheduler.submit_deadline_us must be > 0"
+        );
         Ok(())
     }
 }
 
 fn default_request_timeout_secs() -> u64 {
     120
+}
+
+fn default_submit_deadline_us() -> u64 {
+    50_000
 }
 
 // -----------------------------------------------------------------------------

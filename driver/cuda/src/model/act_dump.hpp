@@ -50,7 +50,11 @@ inline int act_dump_device() {
 }
 
 inline int& act_dump_step() {
-    static int step = -1;
+    // Per-thread, because the embedded TP launcher runs every rank as a thread
+    // in ONE process. A process-wide counter would be advanced once per rank
+    // per forward, so `PIE_ACT_DUMP_STEPS=1` would stop dumping partway through
+    // the very first prefill at tp=8.
+    static thread_local int step = -1;
     return step;
 }
 

@@ -620,7 +620,16 @@ bool forward_graph_replay_eligible(
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
          engine.inputs.custom_mask_indptr.data() != nullptr);
-    return engine.graph_cache != nullptr &&
+    // A kill switch for the decode graphs alone. `PIE_CUDA_PREFILL_DECODE_
+    // NOGRAPHS` reshapes the whole plan, so it cannot answer "is this bug in
+    // the graph or in the kernels the graph records?" -- the question every
+    // hang inside a replay asks first.
+    static const bool graphs_disabled = [] {
+        const char* v = std::getenv("PIE_CUDA_DISABLE_DECODE_GRAPHS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return !graphs_disabled &&
+        engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
         is_pure_decode &&
         mask_pointers_stable &&

@@ -42,14 +42,15 @@
 #include <string>
 #include <vector>
 
-#include "pie_native/fire/descriptor.hpp"
-#include "pie_native/fire/fire_geometry.hpp"
-#include "pie_native/launch/trace_query.hpp"
+#include "pie/driver/fire/descriptor.hpp"
+#include "pie/driver/fire/geometry.hpp"
+#include "pie/driver/launch/query.hpp"
 #include "pipeline/interp.hpp"
 
 namespace pie::metal::pipeline {
 
-using namespace pie_native::launch::descriptor;
+namespace fire = pie::driver::fire;
+using namespace pie::driver::fire::descriptor;
 
 enum class GeometryResolveStatus { Ready, NotReady, Failed };
 
@@ -149,9 +150,9 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     const std::vector<ConstPortValue>& const_ports,
     InterpInstance& inst,
     std::uint32_t page_size,
-    launch::FireGeometry& out,
+    fire::FireGeometry& out,
     std::string* err) {
-    out = launch::FireGeometry{};
+    out = fire::FireGeometry{};
     launch::ChannelId ch[10] = {0};
     bool has[10] = {false};
     bool channel_bound[10] = {false};
@@ -345,7 +346,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     const Trace& trace,
     InterpInstance& inst,
     std::uint32_t page_size,
-    launch::FireGeometry& out,
+    fire::FireGeometry& out,
     std::string* err) {
     return resolve_fire_geometry_typed(
         trace, {}, inst, page_size, out, err);
@@ -355,7 +356,7 @@ inline bool resolve_fire_geometry(
     const Trace& trace,
     InterpInstance& inst,
     std::uint32_t page_size,
-    launch::FireGeometry& out,
+    fire::FireGeometry& out,
     std::string* err) {
     return resolve_fire_geometry_typed(
                trace, {}, inst, page_size, out, err).status ==
@@ -366,7 +367,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
     const ExecPlan& plan,
     InterpInstance& inst,
     std::uint32_t page_size,
-    launch::FireGeometry& out,
+    fire::FireGeometry& out,
     std::string* err) {
     return resolve_fire_geometry_typed(
         plan.trace,
@@ -388,7 +389,7 @@ inline GeometryResolveResult resolve_fire_geometry_typed(
 // Callers must skip calling this entirely for an EMPTY segment (that is the
 // legacy/pass-through case — ids already physical, not relative).
 inline void translate_kv_pages(const std::uint32_t* tr, std::size_t tr_len,
-                               launch::FireGeometry& fg) {
+                               fire::FireGeometry& fg) {
     auto translate = [&](std::vector<std::uint32_t>& ids) {
         for (std::uint32_t& v : ids) v = v < tr_len ? tr[v] : 0u;
     };

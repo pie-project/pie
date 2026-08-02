@@ -10,10 +10,10 @@
 
 #include <cstddef>
 
-#include "pie_native/fire/fire_geometry.hpp"
-#include "pie_native/launch/program.hpp"
+#include "pie/driver/fire/geometry.hpp"
+#include "pie/driver/launch/program.hpp"
 
-namespace pie_native::launch {
+namespace pie::driver::launch {
 
 // The op that defines `value`, or null if it is a root (const / intrinsic /
 // channel take-read). Ops define a contiguous run of `result_count` ids
@@ -34,7 +34,7 @@ inline const Op* producer(const Trace& trace, ValueId value) {
 // lets the forward use the attention kernel's own mask instead of materializing
 // one; anything unrecognized returns an empty descriptor, which is the safe
 // answer (the caller falls back to the dense path).
-inline StructuredMaskDescriptor structured_mask_descriptor(const Trace& trace,
+inline fire::StructuredMaskDescriptor structured_mask_descriptor(const Trace& trace,
                                                            ChannelId mask_channel) {
     const ChannelPut* selected = nullptr;
     for (const Stage& stage : trace.stages) {
@@ -54,19 +54,19 @@ inline StructuredMaskDescriptor structured_mask_descriptor(const Trace& trace,
             value = op->args[0];
             continue;
         }
-        StructuredMaskDescriptor descriptor;
+        fire::StructuredMaskDescriptor descriptor;
         switch (op->code) {
             case OpCode::CausalMask:
-                descriptor.kind = StructuredMaskKind::Causal;
+                descriptor.kind = fire::StructuredMaskKind::Causal;
                 descriptor.key_len = op->imm;
                 return descriptor;
             case OpCode::SlidingWindowMask:
-                descriptor.kind = StructuredMaskKind::SlidingWindow;
+                descriptor.kind = fire::StructuredMaskKind::SlidingWindow;
                 descriptor.key_len = op->imm;
                 descriptor.window = op->imm2;
                 return descriptor;
             case OpCode::SinkWindowMask:
-                descriptor.kind = StructuredMaskKind::SinkWindow;
+                descriptor.kind = fire::StructuredMaskKind::SinkWindow;
                 descriptor.key_len = op->imm;
                 descriptor.sink = op->imm2;
                 descriptor.window = op->imm3;
@@ -78,4 +78,4 @@ inline StructuredMaskDescriptor structured_mask_descriptor(const Trace& trace,
     return {};
 }
 
-}  // namespace pie_native::launch
+}  // namespace pie::driver::launch

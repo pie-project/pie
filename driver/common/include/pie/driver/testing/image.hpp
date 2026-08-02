@@ -18,9 +18,9 @@
 
 #include <pie_driver_abi.h>
 
-#include "pie_native/abi_validation.hpp"
+#include "pie/driver/validate.hpp"
 
-namespace pie_native::launch {
+namespace pie::driver::testing {
 
 class PackageImage {
   public:
@@ -91,7 +91,7 @@ class PackageImage {
         // The same validator the driver runs on a wire package. A relocation
         // the encoder failed to record shows up here as a null pointer with a
         // nonzero length, instead of as a fault deep inside `adopt`.
-        if (abi::validate_launch_package(package_) != PIE_STATUS_OK) {
+        if (validate::launch_package(package_) != PIE_STATUS_OK) {
             package_ = PieLaunchPackage{};
             return fail("launch image does not satisfy the launch-package ABI");
         }
@@ -105,4 +105,4 @@ class PackageImage {
     PieLaunchPackage package_{};
 };
 
-}  // namespace pie_native::launch
+}  // namespace pie::driver::testing

@@ -44,11 +44,11 @@
 #include <string>
 #include <vector>
 
-#include "pie_native/launch/image.hpp"
+#include "pie/driver/testing/image.hpp"
 #include "pipeline/interp.hpp"
 
 using namespace pie::metal::pipeline;
-namespace launch = pie_native::launch;
+namespace launch = pie::driver::launch;
 
 namespace {
 
@@ -77,7 +77,7 @@ const char* const kPrograms[] = {
 };
 
 struct Loaded {
-    launch::PackageImage image;
+    pie::driver::testing::PackageImage image;
     ExecPlan plan;
 };
 

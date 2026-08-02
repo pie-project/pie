@@ -26,7 +26,7 @@ parse_deps = false
 # The tile-map masks in particular are the *loader's* opinion of what each
 # backend can do; a driver declares its own capability in
 # `PieLoaderTargetSpec::tile_map_mask` rather than importing that opinion, and
-# the C++ side defines its own in `pie_native/load_plan.hpp`.
+# the C++ side defines its own in `driver/{cuda,metal}/src/loader/load_plan.hpp`.
 #
 # cbindgen matches by item name with no notion of the module path, so a wanted
 # constant must never share a name with an excluded one.

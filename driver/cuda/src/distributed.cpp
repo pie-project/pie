@@ -2,6 +2,7 @@
 
 #include "batch/tp.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -9,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "cuda_check.hpp"
 #include "kernels/custom_all_reduce.hpp"
@@ -195,6 +197,43 @@ void nccl_check_async(ncclResult_t result,
     }
 }
 
+namespace {
+
+// Every communicator alive in this process. TP ranks are threads, so one
+// rank's failure handler needs a way to reach its peers' communicators; this
+// is that list. Touched only at communicator construction/destruction and on
+// the failure path, never per collective.
+std::mutex g_live_comms_mu;
+std::vector<NcclComm*> g_live_comms;
+
+void register_live_comm(NcclComm* comm) {
+    std::lock_guard<std::mutex> lk(g_live_comms_mu);
+    g_live_comms.push_back(comm);
+}
+
+void unregister_live_comm(NcclComm* comm) {
+    std::lock_guard<std::mutex> lk(g_live_comms_mu);
+    g_live_comms.erase(
+        std::remove(g_live_comms.begin(), g_live_comms.end(), comm),
+        g_live_comms.end());
+}
+
+void replace_live_comm(NcclComm* from, NcclComm* to) {
+    std::lock_guard<std::mutex> lk(g_live_comms_mu);
+    for (auto*& entry : g_live_comms) {
+        if (entry == from) entry = to;
+    }
+}
+
+}  // namespace
+
+void nccl_abort_all_comms() noexcept {
+    std::lock_guard<std::mutex> lk(g_live_comms_mu);
+    for (auto* comm : g_live_comms) {
+        if (comm != nullptr) comm->abort();
+    }
+}
+
 NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     : world_size_(world_size), rank_(rank) {
     static std::once_flag env_once;
@@ -230,9 +269,14 @@ NcclComm::NcclComm(int world_size, int rank, const ncclUniqueId& uid)
     NCCL_CHECK_ASYNC(
         ncclCommInitRankConfig(&comm_, world_size, uid, rank, &config),
         comm_);
+    register_live_comm(this);
 }
 
 NcclComm::~NcclComm() {
+    // Unregister BEFORE aborting, and under the same lock `nccl_abort_all_comms`
+    // takes: that is what makes the two paths exclusive, so neither can abort a
+    // handle the other has already released.
+    unregister_live_comm(this);
     if (comm_ != nullptr) {
         // NOT `ncclCommDestroy`: that finalizes collectively, so every rank
         // has to be inside it at the same time. Both TP ranks live in this
@@ -248,10 +292,16 @@ NcclComm::~NcclComm() {
 
 NcclComm& NcclComm::operator=(NcclComm&& o) noexcept {
     if (this != &o) {
-        if (comm_) ncclCommAbort(comm_);
+        if (comm_) {
+            unregister_live_comm(this);
+            ncclCommAbort(comm_);
+        }
         comm_ = o.comm_;             o.comm_ = nullptr;
         world_size_ = o.world_size_; o.world_size_ = 1;
         rank_ = o.rank_;             o.rank_ = 0;
+        // The handle moved, so the registry entry has to follow it or the
+        // failure path would abort through a dangling object.
+        replace_live_comm(&o, this);
     }
     return *this;
 }
