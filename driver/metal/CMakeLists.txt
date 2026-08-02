@@ -548,6 +548,16 @@ if(APPLE)
     target_compile_definitions(gptoss_forward_test PRIVATE
       PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   endif()
+  # A stopwatch that checks its own work. Under ctest it SKIPs (no checkpoint
+  # path), so the suite stays green on a machine without an 1.1 GB download;
+  # given one it asserts the greedy continuation against mlx-lm's and prints
+  # throughput. The timings are printed, never asserted -- a number that depends
+  # on what else the machine is doing must not be able to fail a build.
+  add_metal_linked_test(llama_bench tests/llama_bench.cpp NEEDS_LOADER)
+  if(TARGET llama_bench)
+    target_compile_definitions(llama_bench PRIVATE
+      PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  endif()
   add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
   if(TARGET simple_family_executor_test)
     target_compile_definitions(simple_family_executor_test PRIVATE
