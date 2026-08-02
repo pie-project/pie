@@ -2401,13 +2401,7 @@ M1ExecuteOutcome M1Runtime::finish_m2_command(
 }
 
 // `PIE_METAL_M3_GPU_TIMESTAMPS=1` re-enables the per-fire GPU counter sampling.
-static bool m3_gpu_timestamps_enabled() {
-    static const bool on = [] {
-        const char* e = std::getenv("PIE_METAL_M3_GPU_TIMESTAMPS");
-        return e != nullptr && e[0] != '\0' && e[0] != '0';
-    }();
-    return on;
-}
+static constexpr bool m3_gpu_timestamps_enabled() { return false; }
 
 bool M1Runtime::prepare_m3_group(
     const std::vector<M3LaneCandidate>& candidates,

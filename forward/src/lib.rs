@@ -53,12 +53,14 @@ pub mod dsl;
 pub mod emit_cuda;
 pub mod emit_qwen35;
 pub mod facts;
+pub mod kernels;
+pub mod lower;
 pub mod family;
 pub mod ffi;
 pub mod trace;
 
 pub use facts::{
-    LlamaLikeCudaFacts, LlamaLikeFacts, Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts,
+    LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts,
     Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 pub use trace::{

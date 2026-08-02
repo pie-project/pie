@@ -210,6 +210,11 @@ void copy_extent(
 /// weights, and "the load is slow" is not a statement anyone can act on: the
 /// question is always whether the time is in the arithmetic, in the file, or in
 /// the allocator. This answers it without a profiler.
+///
+/// One switch, four reports: this breakdown, the `setup:` marks in
+/// `forward.cpp`, and the two `load:` lines below. They are read together --
+/// `forward.cpp` points at this one by name -- so arming three of them and not
+/// the fourth answers the question with its middle term missing.
 struct LoadTrace {
     bool on = std::getenv("PIE_METAL_LOAD_TRACE") != nullptr;
     double scratch_alloc_ms = 0, scratch_free_ms = 0;
@@ -1003,11 +1008,9 @@ StagedWeights stage_plan_weights(
         const auto layout = pie_loader::stream_pack_layout(std::move(entries));
         for (const auto& e : layout.entries) pack_offset[e.id] = e.offset;
 
-        const char* dir = std::getenv("PIE_METAL_STREAM_DIR");
         std::error_code ec;
         const std::filesystem::path root =
-            dir != nullptr ? std::filesystem::path(dir)
-                           : std::filesystem::temp_directory_path() / "pie-metal-stream";
+            std::filesystem::temp_directory_path() / "pie-metal-stream";
         std::filesystem::create_directories(root, ec);
         const std::string key = pie_loader::bytes_to_string(load_plan.cache_key);
         auto pack = std::make_shared<pie_loader::StreamPack>(

@@ -180,9 +180,17 @@ bool run_shape(BatchEngine& engine,
 
 }  // namespace
 
-bool planner_calibration_requested() {
-    const char* v = std::getenv("PIE_CUDA_PLANNER_CALIBRATE");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+namespace {
+// Set once by `load_config`, read by the planner and by the boot path. A plain
+// bool rather than an atomic: the write happens during config load, before any
+// thread that reads it exists.
+bool g_calibration_requested = false;
+}  // namespace
+
+bool planner_calibration_requested() { return g_calibration_requested; }
+
+void set_planner_calibration_requested(bool requested) {
+    g_calibration_requested = requested;
 }
 
 std::size_t calibrate_memory_planner(BatchEngine& engine,
@@ -324,10 +332,62 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
         return nullptr;
     };
 
+    // Each budget carries the noise of the sample that decided its score, so
+    // the step-down below can weigh the two budgets it is actually comparing.
+    struct BudgetScore {
+        int budget;
+        double score;
+        // Relative sigma of THIS budget's worst-case sample. Deliberately not
+        // combined with the sigma of the best-rate sample that normalised it:
+        // at the shortest prompt length every budget resolves to the same
+        // shape and therefore reads the SAME sample, so folding the normaliser
+        // in combined a measurement's noise with its own and inflated the
+        // tolerance by sqrt(2) exactly where it did the most damage.
+        double sigma;
+    };
+    // A prompt length where every budget funds the same shape reads the SAME
+    // sample for all of them, so its ratio is identically 1.0 and it can never
+    // separate two budgets. It can still set the tolerance, though: a budget
+    // that is best everywhere has no argmin, so the seeded `max()` records the
+    // FIRST prompt length, and on this data that is exactly one of these. The
+    // result was that a rung carrying no information decided how much slower a
+    // smaller budget was allowed to be -- 14% sigma there stepped down to a
+    // budget measuring 18.5% slower where it mattered.
+    //
+    // Drop them from the scoring pass. They are not bad measurements; they just
+    // answer a question nobody asked.
+    const auto discriminates = [&](int L) {
+        const PlannerShapeSample* first = nullptr;
+        for (int budget : budgets) {
+            const PlannerShapeSample* s = rate_at(budget, L);
+            if (s == nullptr) continue;
+            if (first == nullptr) {
+                first = s;
+            } else if (s != first) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<int> scoring_lens;
+    for (int L : prompt_lens) {
+        if (discriminates(L)) scoring_lens.push_back(L);
+    }
+    if (scoring_lens.empty()) {
+        return refuse("no prompt length separates the budgets");
+    }
+    if (scoring_lens.size() != prompt_lens.size() && engine.verbose) {
+        std::cerr << "[pie-driver-cuda] planner calibration: "
+                  << (prompt_lens.size() - scoring_lens.size())
+                  << " of " << prompt_lens.size()
+                  << " prompt lengths fund one shape for every budget and "
+                  << "cannot separate them; scoring on the rest\n";
+    }
+
     int chosen_budget = 0;
     double chosen_score = -1.0;
-    double chosen_tolerance = 0.0;
-    std::vector<std::pair<int, double>> budget_scores;
+    double chosen_sigma = 0.0;
+    std::vector<BudgetScore> budget_scores;
     for (int budget : budgets) {
         // Seeded above 1.0 so the argmin is recorded even when the budget is
         // best at EVERY prompt length. Leaving it at 1.0 meant a dominant
@@ -337,20 +397,17 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
         double worst = std::numeric_limits<double>::max();
         double worst_rel_sigma = 0.0;
         bool complete = true;
-        for (int L : prompt_lens) {
+        for (int L : scoring_lens) {
             const PlannerShapeSample* here = rate_at(budget, L);
             if (here == nullptr || here->tokens_per_s <= 0.0) {
                 complete = false;
                 break;
             }
             double best_rate = 0.0;
-            double best_rel_sigma = 0.0;
             for (int other : budgets) {
                 const PlannerShapeSample* s = rate_at(other, L);
                 if (s != nullptr && s->tokens_per_s > best_rate) {
                     best_rate = s->tokens_per_s;
-                    best_rel_sigma =
-                        s->step_ms > 0.0 ? s->step_ms_stddev / s->step_ms : 0.0;
                 }
             }
             if (best_rate <= 0.0) {
@@ -360,31 +417,41 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
             const double rel = here->tokens_per_s / best_rate;
             if (rel < worst) {
                 worst = rel;
-                const double here_rel_sigma =
+                worst_rel_sigma =
                     here->step_ms > 0.0 ? here->step_ms_stddev / here->step_ms
                                         : 0.0;
-                worst_rel_sigma = std::sqrt(
-                    here_rel_sigma * here_rel_sigma +
-                    best_rel_sigma * best_rel_sigma);
             }
         }
         if (!complete) continue;
-        budget_scores.emplace_back(budget, worst);
+        budget_scores.push_back({budget, worst, worst_rel_sigma});
         if (worst > chosen_score) {
             chosen_score = worst;
             chosen_budget = budget;
-            chosen_tolerance = worst_rel_sigma;
+            chosen_sigma = worst_rel_sigma;
         }
     }
     if (chosen_budget == 0) return refuse("no budget was measured at every prompt length");
 
     // Prefer the smallest budget that is indistinguishable from the winner:
     // extra budget that buys no rate costs arena bytes that would hold KV.
-    // The tolerance is the measured run-to-run noise, not a tuned constant.
-    for (const auto& [budget, score] : budget_scores) {
-        if (budget >= chosen_budget) break;
-        if (score + chosen_tolerance >= chosen_score) {
-            chosen_budget = budget;
+    //
+    // "Indistinguishable" is decided by the noise of the TWO budgets being
+    // compared, in quadrature. It used to be a single tolerance captured from
+    // the winner alone, which made the whole selection turn on one rung: a
+    // budget that is best at every prompt length has its argmin recorded at the
+    // shortest one (nothing beats a ratio of 1.0), so the winner's tolerance
+    // was whatever noise the L=1 measurement happened to carry. Two runs of the
+    // same sweep on the same machine and model then disagreed -- 14% sigma on
+    // that rung stepped down to a budget measuring 18.5% slower at L=256, 1%
+    // sigma did not.
+    double chosen_reported_score = chosen_score;
+    for (const auto& candidate : budget_scores) {
+        if (candidate.budget >= chosen_budget) break;
+        const double tolerance = std::sqrt(candidate.sigma * candidate.sigma +
+                                           chosen_sigma * chosen_sigma);
+        if (candidate.score + tolerance >= chosen_score) {
+            chosen_budget = candidate.budget;
+            chosen_reported_score = candidate.score;
             break;
         }
     }
@@ -395,6 +462,11 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
     // subject of the measurement, and writing it here would silently clamp the
     // planner's request cap to whichever row happened to win.
     shape.max_forward_tokens = chosen_budget;
+    // What the sweep ran inside, so a later boot can tell that it no longer
+    // does. The key pins the device and the model and would happily match a
+    // machine with 9 GB less to give -- which is exactly the state a leaked
+    // process leaves, and exactly the state that changed the planner's pick.
+    shape.budget_bytes = planner_budget_bytes();
 
     const auto key = make_planner_profile_key(
         prop, engine.loaded_model.hf_config(), tp_size, engine.kv_cache.format());
@@ -409,7 +481,10 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
               << measured.size() << " shapes across " << prompt_lens.size()
               << " prompt lengths, selected max_forward_tokens="
               << shape.max_forward_tokens
-              << " (worst-case rate " << chosen_score
+              // The SELECTED budget's score. Printing `chosen_score` here named
+              // the pre-step-down winner, so a line reading "selected 1024
+              // (worst-case rate 1 of best)" was quoting 2048's number.
+              << " (worst-case rate " << chosen_reported_score
               << " of best; request cap and page size left to the planner, "
               << "which built this process at page_size " << kv_page_size
               << "), wrote " << planner_profile_cache_path().string() << "\n";

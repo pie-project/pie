@@ -17,7 +17,7 @@
 
 #if defined(__APPLE__)
 #include "batch_schedule.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
@@ -538,6 +538,8 @@ struct MetalExecutor::Impl {
     // The prefill's uniform scratch row pitch, in elements, for the batched
     // projection (`affine_qmm_t_strided` reads it at buffer 8).
     SlotHandle prefill_row_stride_{};
+    SlotHandle prefill_rows_{};
+    SlotHandle prefill_fp16_input_{};
     // One scan-length buffer per prompt row.  A grouped prefill carries several
     // requests, each with its own scan length, and the row's argument table is
     // what selects the segment -- so the length has to be per row too.
@@ -1040,16 +1042,30 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
 
     // ── Compile the kernel PSOs. ──
     std::string load_err;
-    if (!load_decode_psos(*ctx_, kernels_dir, psos_, g_.quant, /*with_argmax=*/false, &load_err,
-                          fuse_residual_, gdn_prep_, g_.is_moe(),
-                          /*untied=*/!g_.tied_embeddings)) {
+    if (!load_decode_psos(
+            *ctx_, kernels_dir, psos_, g_.quant, &load_err,
+            DecodePsoFeatures{
+                .residual_qmv = fuse_residual_,
+                .gdn = gdn_prep_,
+                .gated_attention = true,
+                .sdpa_d256 = true,
+                .routed = g_.is_moe(),
+                .untied = !g_.tied_embeddings})) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
     }
     if (g_.paged_kv_enabled &&
-        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, g_.quant, /*with_d512=*/false,
-                              &load_err, g_.is_moe())) {
+        !load_multibatch_psos(
+            *ctx_, kernels_dir, mb_psos_, g_.quant, &load_err,
+            MultiBatchPsoFeatures{
+                .sdpa_d256 = true,
+                .gdn = true,
+                .residual = fuse_residual_,
+                .routed = g_.is_moe(),
+                .strided = true,
+                .fp16_strided = !g_.is_moe() &&
+                    g_.quant.bits == 4 && g_.quant.group == 64})) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -1062,9 +1078,20 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         ctx_->create_standalone_buffer(
             sizeof(PtirLogitsCopyParams) * kPtirLogitsCopyMaxRows);
     prefill_row_stride_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
+    prefill_rows_ = ctx_->create_standalone_buffer(sizeof(std::int32_t));
     if (prefill_row_stride_.valid()) {
         *static_cast<std::int32_t*>(prefill_row_stride_.contents()) =
             static_cast<std::int32_t>(scratch_widest_elems(g_));
+    }
+    if (!g_.is_moe() && g_.quant.bits == 4 && g_.quant.group == 64) {
+        prefill_fp16_input_ = ctx_->heap_alloc(
+            std::size_t(std::max(1, g_.max_tokens)) *
+            std::size_t(scratch_widest_elems(g_)) * sizeof(std::uint16_t));
+        if (!prefill_fp16_input_.valid()) {
+            if (err) *err = "allocating Qwen prefill FP16 input staging";
+            ctx_.reset();
+            return false;
+        }
     }
     prefill_scan_rows_.clear();
     if (!ptir_logits_copy_pso_.valid() ||
@@ -1500,6 +1527,10 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
                 for (const Dispatch& d : prefill_dags_[0]) {
                     if (qmv_out_size(d.kind, g_) != 0) {
                         ctx_->arg_bind_ordinal(d.ordinal, 8, prefill_row_stride_);
+                        if (prefill_rows_.valid())
+                            ctx_->arg_bind_ordinal(d.ordinal, 9, prefill_rows_);
+                        if (prefill_fp16_input_.valid())
+                            ctx_->arg_bind_ordinal(d.ordinal, 12, prefill_fp16_input_);
                         continue;
                     }
                     // The row-blocked elementwise/norm kernels take the same pitch,
@@ -1991,23 +2022,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     copy_to(IoSlot::SeqLen, seq_len);
 
     const auto step_t0 = std::chrono::steady_clock::now();
-    if (!schedule.is_pure_decode) {
-        if (std::getenv("PIE_METAL_PREFILL_TRACE") == nullptr)
-            return run_prefill_step(schedule, in, err, ptir);
-        // Whether prompts are spread out in time or arriving together and just
-        // not being grouped is the difference between a scheduler problem and a
-        // budget one, and only the arrival pattern separates them.
-        using clock = std::chrono::steady_clock;
-        static const auto t_origin = clock::now();
-        const auto t0 = clock::now();
-        const bool ok = run_prefill_step(schedule, in, err, ptir);
-        const auto t1 = clock::now();
-        std::fprintf(
-            stderr, "[pf] at=%.1f ms N=%d R=%d took=%.1f ms\n",
-            std::chrono::duration<double, std::milli>(t0 - t_origin).count(), schedule.N,
-            schedule.R, std::chrono::duration<double, std::milli>(t1 - t0).count());
-        return ok;
-    }
+    if (!schedule.is_pure_decode) return run_prefill_step(schedule, in, err, ptir);
 
     std::vector<uint32_t> active_slots;
     active_slots.reserve(size_t(schedule.R));
@@ -2083,7 +2098,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     // driver's per-step CPU with nothing else folded in.  It reads 0.013ms at 32
     // lanes, which is how the search for a throughput gap was steered away from
     // the driver and into the engine.
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double sum[2][33] = {};
         static double wall[33] = {};
         static double enc[33] = {};
@@ -2200,6 +2215,8 @@ bool MetalExecutor::Impl::run_prefill_step(
     // Alternate the arms fire by fire so both see the same machine, exactly as
     // the decode step does -- prefill fires are few, so without interleaving a
     // single contended window decides the answer.
+    if (prefill_rows_.valid())
+        *static_cast<std::int32_t*>(prefill_rows_.contents()) = schedule.N;
     static bool prefill_ab_flip = false;
     if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
     // The staging copy rides this command buffer, exactly as it rides the
@@ -2230,13 +2247,13 @@ bool MetalExecutor::Impl::run_prefill_step(
     if (stage_failed) return fail(stage_err);
     // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
     // compares across arms -- a raw total confuses "faster" with "shorter prompt".
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double ms[2] = {};
         static double rows[2] = {};
         static double enc[2] = {};
         static int n[2] = {};
         const int arm = ab_enabled() && ab_arm() ? 1 : 0;
-        ms[arm] += timing.gpu_exec_ms;
+        ms[arm] += timing.gpu_ms > 0.0 ? timing.gpu_ms : timing.gpu_exec_ms;
         enc[arm] += timing.encode_ms;
         rows[arm] += double(schedule.N);
         ++n[arm];
@@ -2413,8 +2430,33 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
                 : cfg.llama.tied_embeddings;
         contract_facts.quant_bits = cfg.quant_bits;
         contract_facts.quant_group_size = cfg.quant_group_size;
-        load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type,
-                                      contract_facts);
+        // Gemma4's KV sharing, which the author asks for and this path was
+        // sending as zeros. A layer past `n_layers - num_kv_shared_layers`
+        // attends the KV an earlier layer wrote, so the author declines to
+        // declare its k/v/k_norm.
+        //
+        // Measured, so the change is not mistaken for a saving: the MLX
+        // conversions we gate already ship only the KV-OWNING layers' k/v
+        // (e2b has `self_attn.k_proj` for layers 0-14 and nothing for 15-34),
+        // so the authored plan is byte-identical either way -- 1096 tensors
+        // with the truthful 35/20 and with 0/0 -- and resident weights stay
+        // 2.43 GiB. What this fixes is the request, not the plan: a conversion
+        // that does ship the dead tensors would have them staged and never
+        // bound, because the skip branch it is asking about was unreachable.
+        if (model::model_family_of(cfg.model_type) == model::ModelFamily::Gemma4) {
+            contract_facts.num_hidden_layers = std::uint32_t(cfg.gemma4.n_layers);
+            contract_facts.num_kv_shared_layers =
+                std::uint32_t(cfg.gemma4.num_kv_shared_layers);
+        }
+        // A serving boot forwards the document it was handed; a test harness
+        // that set up `SetupConfig` by hand states the facts its family needs
+        // and gets a synthesized one. The branch is on which of the two this
+        // is, and nothing else.
+        load_plan = compile_load_plan(
+            cfg.snapshot_dir, metal_device_target(),
+            cfg.descriptor_json.empty()
+                ? descriptor_for_testing(cfg.model_type, contract_facts)
+                : cfg.descriptor_json);
     } catch (const std::exception& error) {
         if (err != nullptr) {
             *err = std::string("LoadPlan compile failed: ") + error.what();
@@ -2452,26 +2494,9 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // the config, before any of this is built.
 
         // Whether the head is its own tensor is decided ONCE, by the contract,
-        // and read back here rather than decided a second time. The contract's
-        // rule is that a shipped `lm_head` beats whatever the config says --
-        // and the config can say nothing at all: Qwen3.5-35B-A3B is a
-        // multimodal wrapper that spells `tie_word_embeddings` at the TOP
-        // level, outside the `text_config` this family parses, so the facts
-        // defaulted to tied. The contract staged `embed_tokens` and `lm_head`;
-        // the DAG asked for `shared_embedding`; the load stopped on "unstaged
-        // weight shared_embedding.weight" -- two opinions about one fact. The
-        // plan's own tensor list is the only opinion that can be wrong in a
-        // way the binding survives, so it is the one the DAG follows.
-        const auto plan_view = load_plan.view();
-        bool plan_ties = false;
-        for (std::size_t i = 0; i < plan_view.tensors.len; ++i) {
-            if (pie_loader::bytes_to_string(plan_view.tensors.ptr[i].name) ==
-                "shared_embedding.weight") {
-                plan_ties = true;
-                break;
-            }
-        }
-        geom.tied_embeddings = plan_ties;
+        // and read back here rather than decided a second time -- see
+        // `plan_ties_embeddings`.
+        geom.tied_embeddings = plan_ties_embeddings(load_plan);
     }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes
@@ -3568,7 +3593,7 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
     // Without it a question like "what bounds gpt-oss in a batch" can only be
     // answered from the outside, where the driver's time and the engine's are
     // added together.
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double gpu[33] = {};
         static double rep[33] = {};
         static double enc[33] = {};

@@ -27,7 +27,7 @@
 #include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
 #include "pie_loader/checkpoint_source.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gemma4/bind.hpp"
 #include "model/gemma4/decode_consts.hpp"
 #include "model/gemma4/decode_step.hpp"
@@ -272,8 +272,10 @@ int main(int argc, char** argv) {
     pie_loader::LoadPlan plan;
     try {
         pie::metal::model::ContractFacts facts;
-        facts.first_kv_shared_layer = g.first_kv_shared();
-        plan = compile_load_plan(ckpt, metal_device_target(), "gemma4", facts);
+        facts.num_hidden_layers = g.n_layers;
+        facts.num_kv_shared_layers = g.num_kv_shared_layers;
+        plan = compile_load_plan(ckpt, metal_device_target(),
+                                 descriptor_for_testing("gemma4", facts));
     } catch (const std::exception& e) {
         std::printf("  FAIL  compile_load_plan: %s\n", e.what());
         return 1;
@@ -410,8 +412,10 @@ int main(int argc, char** argv) {
     DecodeStepPsos base;
     MultiBatchPsos mb;
     if (!build_gemma4_psos(*ctx, kernels_dir, g, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, g.quant, /*with_argmax=*/false, &err) ||
-        !load_multibatch_psos(*ctx, kernels_dir, mb, g.quant, /*with_d512=*/true, &err)) {
+        !load_decode_psos(*ctx, kernels_dir, base, g.quant, &err) ||
+        !load_multibatch_psos(
+            *ctx, kernels_dir, mb, g.quant, &err,
+            MultiBatchPsoFeatures{.d512 = true, .sdpa_d256 = true})) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

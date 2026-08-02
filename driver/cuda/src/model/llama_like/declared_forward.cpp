@@ -14,6 +14,10 @@
 
 #include <cuda_runtime.h>
 
+#include "model/declared/depth_window.hpp"
+#include "model/declared/value_arena.hpp"
+#include "model/declared/arms.hpp"
+#include "model/declared/weights.hpp"
 #include "batch/supergraph.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/embed.hpp"
@@ -44,37 +48,131 @@ using pie_forward::PieForwardOpKind;
 using pie_forward::PieForwardQkNorm;
 using pie_forward::PieForwardRopeKind;
 
-// A plan weight name split into its layer index and field: "layer.3.qkv" →
-// {3, "qkv"}; prologue/epilogue names ("embed", "final_norm") keep layer -1.
-// The vocabulary is `forward/src/family.rs`'s and nothing else; anything the
-// parse cannot place throws, loudly, because a name the resolver does not
-// know means the trace and this executor have drifted.
-struct ParsedWeightName {
-    int layer = -1;
-    std::string_view field;
-};
+// The name grammar is `model/declared/weights.hpp`'s — it was identical in
+// every family executor, which is the first thing that says these executors
+// wanted to be one.
+using declared::ParsedWeightName;
+using declared::parse_weight_name;
+using declared::throw_unknown_weight;
 
-[[noreturn]] void throw_unknown_weight(std::string_view name) {
-    throw std::runtime_error(
-        "declared forward: unknown weight name '" + std::string(name) +
-        "' (trace vocabulary is forward/src/family.rs's)");
-}
-
-ParsedWeightName parse_weight_name(std::string_view name) {
-    constexpr std::string_view prefix = "layer.";
-    if (name.substr(0, prefix.size()) != prefix) {
-        return ParsedWeightName{-1, name};
-    }
-    const std::size_t dot = name.find('.', prefix.size());
-    if (dot == std::string_view::npos) throw_unknown_weight(name);
-    int layer = -1;
-    const char* first = name.data() + prefix.size();
-    const char* last = name.data() + dot;
-    const auto [ptr, ec] = std::from_chars(first, last, layer);
-    if (ec != std::errc() || ptr != last || layer < 0) {
+// This family's half of `declared::WeightBinder`: a traced name against
+// Qwen3Weights. Every arm goes through it, so no arm names a struct field —
+// which is what lets an arm be shared with a family whose field is spelled
+// differently (qwen3_5's `attn_norm_pre` is this family's `attn_norm`).
+const DeviceTensor* bind_llama_like_weight(
+    const void* ctx, const ParsedWeightName& nm, std::string_view name)
+{
+    const auto& w = *static_cast<const Qwen3Weights*>(ctx);
+    if (nm.layer < 0) {
+        if (nm.field == "embed") return w.embed;
+        if (nm.field == "final_norm") return w.final_norm;
+        if (nm.field == "lm_head") return w.lm_head;
         throw_unknown_weight(name);
     }
-    return ParsedWeightName{layer, name.substr(dot + 1)};
+    if (nm.layer >= static_cast<int>(w.layers.size())) {
+        throw_unknown_weight(name);
+    }
+    const Qwen3LayerWeights& l = w.layers[static_cast<std::size_t>(nm.layer)];
+    // The vocabulary is the TRACE's (`forward/src/dsl.rs`'s `Layer`), which
+    // is why this table is the family's whole contribution: `gate_up` is one
+    // traced name whether or not the checkpoint bound a fused bank, and the
+    // arm asks for the split halves by field when it did not.
+    if (nm.field == "attn_norm") return l.attn_norm;
+    if (nm.field == "mlp_norm") return l.mlp_norm;
+    if (nm.field == "q_norm") return l.q_norm;
+    if (nm.field == "k_norm") return l.k_norm;
+    if (nm.field == "qkv") return l.qkv_proj_fused;
+    if (nm.field == "q_proj") return l.q_proj;
+    if (nm.field == "k_proj") return l.k_proj;
+    if (nm.field == "v_proj") return l.v_proj;
+    if (nm.field == "o_proj") return l.o_proj;
+    if (nm.field == "q_bias") return l.q_bias;
+    if (nm.field == "k_bias") return l.k_bias;
+    if (nm.field == "v_bias") return l.v_bias;
+    if (nm.field == "gate_up") return l.gate_up_proj_fused;
+    if (nm.field == "gate_proj") return l.gate_proj;
+    if (nm.field == "up_proj") return l.up_proj;
+    if (nm.field == "down") return l.down_proj;
+    throw_unknown_weight(name);
+}
+
+// This family's PIN PASS: which traced values live in a buffer the rest
+// of the driver reaches BY NAME. Stated once, over the plan, instead of
+// once per arm — LoRA captures the normed activation's pointer at fire
+// setup, the fused decode launch reads the qkv bank, hook sites observe
+// the query, the sampler reads the logits. An arm then just asks the
+// arena by value id and never learns whose convention it is serving.
+void pin_llama_like_values(const pie_forward::ForwardPlan& plan,
+                           Workspace& ws,
+                           bool post_norm,
+                           declared::ValueArena& values)
+{
+    const std::size_t ops = plan.op_count();
+    for (std::size_t i = 0; i < ops; ++i) {
+        const PieForwardOp& op = plan.op(i);
+        const auto outs = plan.outputs(op);
+        if (outs.size == 0) continue;
+        switch (op.kind) {
+        case PieForwardOpKind::Embed:
+        case PieForwardOpKind::ResidualAdd:
+            // The residual stream.
+            values.pin(outs[0], ws.y.data());
+            break;
+        case PieForwardOpKind::Rmsnorm: {
+            const ParsedWeightName nm = parse_weight_name(plan.weight_name(op));
+            if (nm.field == "attn_norm") {
+                // LoRA's `qkv_in`, captured at fire setup.
+                values.pin(outs[0], post_norm ? ws.norm_y.data()
+                                              : ws.norm_x.data());
+            } else if (nm.field == "final_norm") {
+                values.pin(outs[0], ws.norm_y.data());
+            }
+            // `mlp_norm`'s output is read only by the gate/up matmul, so
+            // it stays an arena value (converted island).
+            break;
+        }
+        case PieForwardOpKind::Matmul: {
+            const ParsedWeightName nm = parse_weight_name(plan.weight_name(op));
+            if (nm.field == "qkv") {
+                values.pin(outs[0], ws.qkv_fused.data());
+            } else if (nm.field == "q_proj") {
+                values.pin(outs[0], ws.q.data());
+            } else if (nm.field == "k_proj") {
+                values.pin(outs[0], ws.k.data());
+            } else if (nm.field == "v_proj") {
+                values.pin(outs[0], ws.v.data());
+            } else if (nm.field == "o_proj" || nm.field == "down") {
+                values.pin(outs[0], post_norm ? ws.norm_x.data()
+                                              : ws.y.data());
+                if (nm.field == "o_proj") {
+                    // Pinned by CONSUMER, not producer: a lowered trace
+                    // may state its attention as a stated-kernel Launch
+                    // rather than the semantic `Attention` op, and the
+                    // value it produces still lives in `ws.attn_out`.
+                    // Saying it here covers both spellings.
+                    const auto ins = plan.inputs(op);
+                    if (ins.size > 0) values.pin(ins[0], ws.attn_out.data());
+                }
+            }
+            break;
+        }
+        case PieForwardOpKind::SplitQkv:
+            if (outs.size >= 3) {
+                values.pin(outs[0], ws.q.data());
+                values.pin(outs[1], ws.k.data());
+                values.pin(outs[2], ws.v.data());
+            }
+            break;
+        case PieForwardOpKind::Attention:
+            values.pin(outs[0], ws.attn_out.data());
+            break;
+        case PieForwardOpKind::LmHead:
+            values.pin(outs[0], ws.logits.data());
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 const Qwen3LayerWeights& layer_of(
@@ -427,6 +525,9 @@ void llama_like_forward_declared(
     std::uint32_t declared_max_layers,
     std::uint32_t declared_full_depth_rows)
 {
+    // Every weight an arm reads goes through the binder (see its header):
+    // the arms name what the TRACE names, never a struct field.
+    const declared::WeightBinder wb{&bind_llama_like_weight, &w};
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
     // below — the parity gate's third leg proves it — with every choice
@@ -558,6 +659,25 @@ void llama_like_forward_declared(
         }
     }
     int depth_band_index = -1;
+    // The SSA value arena (`model/declared/value_arena.hpp`): values an arm
+    // asks for by id, over a workspace block. Reset once per fire; the ask
+    // order is the op order, so a value keeps its address across fires of
+    // the same plan — what a captured graph replays against.
+    declared::ValueArena values;
+    values.reset(ws.declared_values.data(), ws.declared_values.nbytes(),
+                 plan, N_fire, R_fire);
+    declared::DepthWindow depth(
+        declared::DepthFacts{
+            .stated = depth_stated,
+            .k = depth_k,
+            .union_fire = depth_union,
+            .split = depth_split,
+            .band_count = depth_banded
+                ? static_cast<std::uint32_t>(band_count) : 0u,
+            .band_k = plan_state.depth_band_k.data(),
+            .band_rows = plan_state.depth_band_rows.data(),
+        },
+        N_fire, R_fire);
     // The Peel split (A3): the hook-free prefix row count — the
     // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
     // the stated Peel op, not a choice: with no hooks every row is the
@@ -596,6 +716,8 @@ void llama_like_forward_declared(
     // reads/writes and how the block norms route — the same buffer walk as
     // the hand-written `post_norm` branches, stated once here.
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
+    // This family's conventions, stated once over the plan (see the pass).
+    pin_llama_like_values(plan, ws, post_norm, values);
     // Inherit cublas's stream so every launch lands on the captured graph,
     // for the reason llama_like_forward_paged states at its stream setup.
     cudaStream_t stream = cublas.stream();
@@ -753,6 +875,7 @@ void llama_like_forward_declared(
         }
         if (i >= op_count) break;
         const PieForwardOp& op = plan.op(i);
+        values.begin_op(i);
         // STRUCTURAL S-4: the depth window, per op, keyed on the op's
         // OWN layer tag (the declaration's stated axis — the trace is
         // layer-unrolled while k is a runtime input, so the window is a
@@ -760,47 +883,21 @@ void llama_like_forward_declared(
         // tail-layer ops are SKIPPED (the unchanged epilogue, layer -1,
         // is the logit-lens head). Union fire: tail-layer ops run over
         // the full-depth prefix rows.
-        if (depth_banded) {
-            depth_band_index = -1;
-            int live = N_fire;
-            if (op.depth_role != 0) {
-                // Deepest-first: the first band whose k the layer has
-                // reached is the deepest containing interval.
-                for (int j = 0; j < band_count; ++j) {
-                    if (op.layer >= static_cast<std::int32_t>(
-                                        plan_state.depth_band_k
-                                            [static_cast<std::size_t>(j)])) {
-                        live = static_cast<int>(
-                            plan_state.depth_band_rows
-                                [static_cast<std::size_t>(j)]);
-                        depth_band_index = j;
-                        break;
-                    }
-                }
-            }
-            if (live == 0) continue;
-            N = live;
-            R = live;
-            if (depth_band_index >= 0 && live == N_fire) {
-                depth_band_index = -1;  // degenerate: every row lives
-            }
-        } else if (depth_k >= 0) {
-            // PROMOTED: membership comes from the op's STATED role
-            // (depth_role != 0), not a re-derived layer-tag rule — the
-            // one function all walkers share is now the trace itself.
-            const bool tail_op = op.depth_role != 0 &&
-                op.layer >= depth_k;
-            if (tail_op && !depth_union) continue;
-            depth_tail_active = depth_union && tail_op;
-            N = depth_tail_active ? depth_split : N_fire;
-            R = depth_tail_active ? depth_split : R_fire;
-        }
+        // The window is `model/declared/depth_window.hpp`'s — it reads the
+        // op's STATED role and the prepare's bands, so it is the same
+        // component for every family (this one carried it because the
+        // depth axis landed here first).
+        if (!depth.enter(op)) continue;
+        N = depth.n();
+        R = depth.r();
+        depth_band_index = depth.band_index();
+        depth_tail_active = depth.tail_active();
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
             if (name != "embed") throw_unknown_weight(name);
             kernels::launch_embed_bf16(
-                token_ids, require(w.embed, name)->data(), ws.y.data(),
+                token_ids, wb.require(name).data(), ws.y.data(),
                 N, H, V, stream);
             break;
         }
@@ -815,29 +912,37 @@ void llama_like_forward_declared(
             const ParsedWeightName nm = parse_weight_name(name);
             if (nm.field == "attn_norm") {
                 const auto& layer = layer_of(w, nm, name);
-                if (post_norm) {
-                    // Post-norm: the o_proj OUTPUT (in norm_x, the
-                    // hand-written scratch) is normed into norm_y; the
-                    // following ResidualAdd lands it on the stream.
-                    kernels::launch_rmsnorm_bf16(
-                        ws.norm_x.data(), require(layer.attn_norm, name)->data(),
-                        ws.norm_y.data(), N, H, eps, stream);
-                } else {
-                    kernels::launch_rmsnorm_bf16(
-                        ws.y.data(), require(layer.attn_norm, name)->data(),
-                        ws.norm_x.data(), N, H, eps, stream);
-                }
+                // ISLAND (pinned value): the normed activation is a traced
+                // VALUE whose buffer the pin pass states, because LoRA
+                // reaches it by name outside the walk.
+                void* const attn_norm_out =
+                    values.slot(plan.outputs(op)[0],
+                                plan.value(plan.outputs(op)[0]));
+                kernels::launch_rmsnorm_bf16(
+                    // Post-norm norms the o_proj OUTPUT (the pinned
+                    // scratch), pre-norm the residual stream.
+                    post_norm ? ws.norm_x.data() : ws.y.data(),
+                    wb.require(name).data(),
+                    attn_norm_out, N, H, eps, stream);
             } else if (nm.field == "mlp_norm") {
                 const auto& layer = layer_of(w, nm, name);
                 if (post_norm) {
                     // Post-norm: the down_proj OUTPUT (in norm_x) → norm_y.
                     kernels::launch_rmsnorm_bf16(
-                        ws.norm_x.data(), require(layer.mlp_norm, name)->data(),
+                        ws.norm_x.data(), wb.require(name).data(),
                         ws.norm_y.data(), N, H, eps, stream);
                 } else {
+                    // ISLAND (value arena): the normed activation is a
+                    // TRACED VALUE, not "ws.norm_y" — that name is this
+                    // family's convention, and qwen3_5 spells the same
+                    // role `ws.norm_x`. Producer and consumer move
+                    // together; the post-norm arm above keeps its
+                    // convention until its own island moves.
                     kernels::launch_rmsnorm_bf16(
-                        ws.y.data(), require(layer.mlp_norm, name)->data(),
-                        ws.norm_y.data(), N, H, eps, stream);
+                        ws.y.data(), wb.require(name).data(),
+                        values.slot(plan.outputs(op)[0],
+                                    plan.value(plan.outputs(op)[0])),
+                        N, H, eps, stream);
                 }
             } else if (nm.field == "q_norm") {
                 // Global qk-norm (olmo2): ONE row RMSNorm over the
@@ -845,19 +950,19 @@ void llama_like_forward_declared(
                 // the hand-written `rmsnorm_qk` global branch, verbatim.
                 const auto& layer = layer_of(w, nm, name);
                 kernels::launch_rmsnorm_bf16(
-                    ws.q.data(), require(layer.q_norm, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     ws.q.data(), N, Hq, eps, stream);
             } else if (nm.field == "k_norm") {
                 const auto& layer = layer_of(w, nm, name);
                 kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), require(layer.k_norm, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     ws.k.data(), N, Hk, eps, stream);
             } else if (nm.layer < 0 && nm.field == "final_norm") {
                 // Deferred to LmHead: the hand-written epilogue interleaves
                 // the final norm with the logit-row gather (norm is row-wise,
                 // so gather-then-norm equals norm-then-gather), and copying
                 // that block whole is what keeps the two paths bit-identical.
-                require(w.final_norm, name);
+                &wb.require(name);
             } else {
                 throw_unknown_weight(name);
             }
@@ -874,15 +979,15 @@ void llama_like_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             if (nm.field == "q_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.q.data(), require(layer.q_bias, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     N, Hq, stream);
             } else if (nm.field == "k_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.k.data(), require(layer.k_bias, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     N, Hk, stream);
             } else if (nm.field == "v_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.v.data(), require(layer.v_bias, name)->data(),
+                    ws.v.data(), wb.require(name).data(),
                     N, Hk, stream);
             } else {
                 throw_unknown_weight(name);
@@ -898,8 +1003,21 @@ void llama_like_forward_declared(
             // normed copies (norm_x for QKV, norm_y for gate/up), post-norm
             // reads the residual stream raw — the hand-written `qkv_in` /
             // `mlp_in` indirections.
+            // Every projection writes its VALUE (all of them pinned by
+            // the pass, so this is the same memory the conventions named).
+            const auto out_slot = [&](std::size_t i) {
+                return values.slot(plan.outputs(op)[i],
+                                   plan.value(plan.outputs(op)[i]));
+            };
+            // The island's consumers: the projection reads the value the
+            // attn_norm arm produced (pinned, so LoRA's captured pointer
+            // and this slot are the same bytes).
             const void* const qkv_in =
-                post_norm ? ws.y.data() : ws.norm_x.data();
+                plan.inputs(op).size > 0
+                    ? static_cast<const void*>(
+                          values.slot(plan.inputs(op)[0],
+                                      plan.value(plan.inputs(op)[0])))
+                    : (post_norm ? ws.y.data() : ws.norm_x.data());
             const void* const mlp_in =
                 post_norm ? ws.y.data() : ws.norm_y.data();
             if (nm.field == "qkv") {
@@ -910,26 +1028,26 @@ void llama_like_forward_declared(
                 // it here is deleted (rung 2, north-star-dsl.md).
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    ops::WeightView(*require(layer.qkv_proj_fused, name)),
-                    ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+                    ops::WeightView(wb.require(name)),
+                    out_slot(0), N, Hq + 2 * Hk, H);
             } else if (nm.field == "q_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.q_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.q_proj_quant),
-                    ws.q.data(), N, Hq, H);
+                    out_slot(0), N, Hq, H);
             } else if (nm.field == "k_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.k_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.k_proj_quant),
-                    ws.k.data(), N, Hk, H);
+                    out_slot(0), N, Hk, H);
             } else if (nm.field == "v_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.v_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.v_proj_quant),
-                    ws.v.data(), N, Hk, H);
+                    out_slot(0), N, Hk, H);
             } else if (nm.field == "o_proj") {
                 if (post_norm) {
                     // Post-norm: o_proj lands in the norm_x scratch (the
@@ -937,21 +1055,37 @@ void llama_like_forward_declared(
                     // ResidualAdd land it on the stream — the hand-written
                     // post-norm block, same buffers, same order.
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.attn_out.data(),
-                        make_weight_view(require(layer.o_proj, name),
+                        // The trace's operand order, from the builder:
+                        // `matmul_inner(x, ...)` records the activation
+                        // FIRST and `matmul_add` appends the residual, so
+                        // inputs[0] is the activation on both forms.
+                        values.slot(plan.inputs(op)[0],
+                                    plan.value(plan.inputs(op)[0])),
+                        make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
-                        ws.norm_x.data(), N, H, Hq, beta);
+                        out_slot(0), N, H, Hq, beta);
                 } else {
                     // Residual accumulate folded into the GEMM (beta from
                     // the trace's beta_one), exactly the hand-written T==1
                     // branch.
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.attn_out.data(),
-                        make_weight_view(require(layer.o_proj, name),
+                        // The trace's operand order, from the builder:
+                        // `matmul_inner(x, ...)` records the activation
+                        // FIRST and `matmul_add` appends the residual, so
+                        // inputs[0] is the activation on both forms.
+                        values.slot(plan.inputs(op)[0],
+                                    plan.value(plan.inputs(op)[0])),
+                        make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
-                        ws.y.data(), N, H, Hq, beta);
+                        out_slot(0), N, H, Hq, beta);
                 }
             } else if (nm.field == "gate_up") {
+                // The island's consumer: the same traced value the
+                // mlp_norm arm produced (pre-norm only — see there).
+                const void* const gate_up_in =
+                    post_norm ? mlp_in
+                              : values.slot(plan.inputs(op)[0],
+                                            plan.value(plan.inputs(op)[0]));
                 // The trace declares one packed matmul either way; whether
                 // the binding materialised it fused is this emitter's call,
                 // the same dispatch the hand-written `use_fused_gu` makes.
@@ -960,34 +1094,40 @@ void llama_like_forward_declared(
                     !ws.gate_up_fused.empty();
                 if (gate_up_used_fused) {
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
+                        gate_up_in,
                         ops::WeightView(*layer.gate_up_proj_fused),
                         ws.gate_up_fused.data(), N, 2 * I, H);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
-                        make_weight_view(require(layer.gate_proj, name),
-                                         layer.gate_proj_quant),
+                        gate_up_in,
+                        make_weight_view(
+                            &wb.require_field(nm.layer, "gate_proj", name),
+                            layer.gate_proj_quant),
                         ws.gate.data(), N, I, H);
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
-                        make_weight_view(require(layer.up_proj, name),
-                                         layer.up_proj_quant),
+                        gate_up_in,
+                        make_weight_view(
+                            &wb.require_field(nm.layer, "up_proj", name),
+                            layer.up_proj_quant),
                         ws.up.data(), N, I, H);
                 }
             } else if (nm.field == "down") {
+                // The island's consumer.
+                const void* const down_in =
+                    values.slot(plan.inputs(op)[0],
+                                plan.value(plan.inputs(op)[0]));
                 if (post_norm) {
                     // Post-norm: down_proj → norm_x scratch (beta 0), then
                     // Rmsnorm(mlp_norm) + ResidualAdd — as o_proj above.
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.gate.data(),
-                        make_weight_view(require(layer.down_proj, name),
+                        down_in,
+                        make_weight_view(&wb.require(name),
                                          layer.down_proj_quant),
                         ws.norm_x.data(), N, H, I, beta);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.gate.data(),
-                        make_weight_view(require(layer.down_proj, name),
+                        down_in,
+                        make_weight_view(&wb.require(name),
                                          layer.down_proj_quant),
                         ws.y.data(), N, H, I, beta);
                 }
@@ -1029,11 +1169,11 @@ void llama_like_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             if (nm.field == "q_norm") {
                 kernels::launch_rmsnorm_bf16(
-                    ws.q.data(), require(layer.q_norm, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     ws.q.data(), N * num_q_heads, d, eps, stream);
             } else if (nm.field == "k_norm") {
                 kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), require(layer.k_norm, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     ws.k.data(), N * num_kv_heads, d, eps, stream);
             } else {
                 throw_unknown_weight(name);
@@ -1900,14 +2040,13 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::Swiglu: {
-            if (gate_up_used_fused) {
-                kernels::launch_chunked_swiglu_bf16(
-                    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-            } else {
-                kernels::launch_swiglu_bf16(
-                    ws.gate.data(), ws.up.data(), ws.gate.data(),
-                    N * I, stream);
-            }
+            // ISLAND (value arena): the activated MLP hidden is a traced
+            // VALUE; `ws.gate` was this family's convention for it.
+            declared::arm_swiglu(
+                ws, gate_up_used_fused,
+                values.slot(plan.outputs(op)[0],
+                            plan.value(plan.outputs(op)[0])),
+                N, I, stream);
             break;
         }
         case PieForwardOpKind::ResidualAdd: {
@@ -1927,8 +2066,8 @@ void llama_like_forward_declared(
             // Tied embeddings trace the lm head as "embed"; either way the
             // binding already aliased `w.lm_head` accordingly.
             const DeviceTensor* lm_head =
-                name == "embed" ? require(w.embed, name)
-                : name == "lm_head" ? require(w.lm_head, name)
+                name == "embed" ? &wb.require(name)
+                : name == "lm_head" ? &wb.require(name)
                 : nullptr;
             if (lm_head == nullptr) throw_unknown_weight(name);
             // The hand-written epilogue, copied whole (T==1, no fused-AR

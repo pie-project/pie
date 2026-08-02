@@ -1153,6 +1153,26 @@ generated_compact_argmax_value(
     return argmax_value;
 }
 
+// Eligibility probe for the fused LM-head argmax (§20.37): true iff this
+// epilogue is exactly the compact pattern `logits → argmax → chan_put`
+// that `generated_compact_argmax_value` recognises — the same verdict the
+// stage runner itself uses to route the presampled token, so eligibility
+// and execution cannot disagree.
+inline bool generated_stage_is_compact_argmax(
+    const plan::StagePlan& stage,
+    const FusedStageExecutable& executable) {
+    if (executable.region_analysis.empty()) return false;
+    std::vector<std::uint32_t> bases(stage.ops.size());
+    std::uint32_t planned_values = 0;
+    for (std::size_t node = 0; node < stage.ops.size(); ++node) {
+        bases[node] = planned_values;
+        planned_values += stage.ops[node].op.results;
+    }
+    return generated_compact_argmax_value(
+               stage, bases, executable.region_analysis.front())
+        .has_value();
+}
+
 // ---------------------------------------------------------------------------
 // The prepare/body split (stage6-plan.md increment 1).
 //
@@ -1870,7 +1890,30 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
     std::vector<std::uint32_t> bf16_row_offsets(lane_count, UINT32_MAX);
     std::vector<std::uint64_t> host_mtp_rows;
     std::vector<std::uint32_t> mtp_row_offsets(lane_count, UINT32_MAX);
+    std::vector<std::uint64_t> host_presampled_rows;
+    std::vector<std::uint32_t> presampled_row_offsets(lane_count, UINT32_MAX);
+    // Loop-invariant: the verdict is a property of the stage, not the lane,
+    // and at high concurrency this loop runs hundreds of times per fire.
+    // Evaluated lazily so a launch with no presampled lane never pays for it.
+    std::optional<bool> stage_takes_presampled;
     for (std::uint32_t lane = 0; lane < lane_count; ++lane) {
+        if (lanes[lane].presampled_token_rows != nullptr) {
+            if (!stage_takes_presampled.has_value()) {
+                stage_takes_presampled =
+                    generated_stage_is_compact_argmax(stage, executable);
+            }
+            if (!*stage_takes_presampled) {
+                throw std::runtime_error(
+                    "presampled tokens bound to a stage that reads logits for "
+                    "more than a greedy argmax");
+            }
+            presampled_row_offsets[lane] =
+                static_cast<std::uint32_t>(host_presampled_rows.size());
+            host_presampled_rows.insert(
+                host_presampled_rows.end(),
+                lanes[lane].presampled_token_rows->begin(),
+                lanes[lane].presampled_token_rows->end());
+        }
         if (lanes[lane].logits_bf16_rows != nullptr) {
             bf16_row_offsets[lane] =
                 static_cast<std::uint32_t>(host_bf16_rows.size());
@@ -1890,6 +1933,13 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
     }
     std::uint64_t* device_bf16_rows = nullptr;
     std::uint64_t* device_mtp_rows = nullptr;
+    std::uint64_t* device_presampled_rows = nullptr;
+    if (!host_presampled_rows.empty()) {
+        device_presampled_rows =
+            allocations.allocate<std::uint64_t>(host_presampled_rows.size());
+        detail::upload_generated(
+            device_presampled_rows, host_presampled_rows, stream);
+    }
     if (!host_bf16_rows.empty()) {
         device_bf16_rows =
             allocations.allocate<std::uint64_t>(host_bf16_rows.size());
@@ -1923,7 +1973,18 @@ inline std::unique_ptr<GeneratedStagePrepared> prepare_generated_stage(
             host_intrinsic_widths[index] =
                 descriptor.last;
             if (op.intr == PTIR_INTR_LOGITS) {
-                if (bf16_row_offsets[lane] != UINT32_MAX) {
+                if (presampled_row_offsets[lane] != UINT32_MAX) {
+                    // Mode 3: already-reduced token ids. Same row-pointer table
+                    // shape as mode 2, but each row holds a single i32 token
+                    // rather than a vocabulary, so the per-row element count is
+                    // 1 where mode 2 carries `vocab`.
+                    host_intrinsic_bases[index] =
+                        reinterpret_cast<std::uint64_t>(
+                            device_presampled_rows +
+                            presampled_row_offsets[lane]);
+                    host_intrinsic_modes[index] = 3;
+                    host_intrinsic_strides[index] = 1;
+                } else if (bf16_row_offsets[lane] != UINT32_MAX) {
                     host_intrinsic_bases[index] =
                         reinterpret_cast<std::uint64_t>(
                             device_bf16_rows + bf16_row_offsets[lane]);
@@ -3036,15 +3097,5 @@ inline GroupedLaunchResult run_generated_stage_ring(
     return launch_generated_stage(*prepared);
 }
 
-
-// ── Merge stub (2026-08-04): upstream's fused LM-head argmax for the
-// generated path is NOT taken this era (tart's stage6 machinery owns
-// this file; the upstream feature returns with its re-port). The
-// eligibility probe upstream call sites compiled against always says
-// no, so the epilogue keeps materialising logits.
-template <class StageT, class ExecT>
-inline bool generated_stage_is_compact_argmax(const StageT&, const ExecT&) {
-    return false;
-}
 
 }  // namespace pie_cuda_driver::pipeline::generated

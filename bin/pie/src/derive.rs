@@ -19,9 +19,7 @@ pub fn read_config_file(path: &std::path::Path) -> Result<String> {
 /// ops that need worker-domain settings (registry, drivers) without booting the
 /// cluster. Replaces the old worker-only `Config::from_toml_file`.
 pub fn load_worker_config(path: &std::path::Path) -> Result<pie_worker::Config> {
-    let combined = read_config_file(path)?;
-    pie_worker::Config::parse(&extract_section(&combined, "worker")?)
-        .context("parsing [worker] section of the standalone config")
+    pie_worker::Config::parse(&read_config_file(path)?).context("parsing config")
 }
 
 /// Extract one top-level `[section]` from the combined standalone config as a
@@ -53,12 +51,15 @@ pub fn derive_standalone(
     pie_gateway::Config,
     pie_worker::Config,
 )> {
-    let controller = pie_controller::Config::parse(&extract_section(combined, "controller")?)
-        .context("parsing [controller] section")?;
-    let gateway = pie_gateway::Config::parse(&extract_section(combined, "gateway")?)
-        .context("parsing [gateway] section")?;
-    let worker = pie_worker::Config::parse(&extract_section(combined, "worker")?)
-        .context("parsing [worker] section")?;
+    // The file IS the worker config now. `[controller]` and `[gateway]` are
+    // gone from it -- they were empty in every single-node config and existed
+    // only because three role libs each parse their own section, which is
+    // Seam 4 showing through the user interface. Both roles take their own
+    // defaults here; `compose` then wires the addresses, and `[server]
+    // host:port` is what the client edge binds.
+    let worker = pie_worker::Config::parse(combined).context("parsing config")?;
+    let controller = pie_controller::Config::parse("").context("controller defaults")?;
+    let gateway = pie_gateway::Config::parse("").context("gateway defaults")?;
     Ok((controller, gateway, worker))
 }
 

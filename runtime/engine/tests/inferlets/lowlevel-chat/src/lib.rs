@@ -45,7 +45,7 @@
 //! per fire AND per pass instance, so the two streams need not be equal:
 //! the mock smoke (`lowlevel_chat_mock`) asserts only that the loops run to
 //! completion with the full `n=max_tokens` budget and a well-formed report.
-//! Token identity is the 4090 gate (`bin/pie/tests/cuda_lowlevel_chat.rs`).
+//! Token identity is the 4090 gate (`tests/gpu/tests/cuda_lowlevel_chat.rs`).
 //! The mock run passes `no-rollback-probe`, which skips the deep + forced-stop
 //! device paths exactly like the classic version did.
 //!
@@ -364,7 +364,8 @@ async fn generate(prompt: &[u32], max_tokens: usize, stop: &[u32], mode: Mode) -
 async fn main(input: String) -> Result<String> {
     // Input: "<max_tokens> [depth=<k>] [no-rollback-probe]". `depth` is the
     // deep carrier's pre-submission window; align it to the scheduler cap
-    // (`PIE_SCHED_MAX_IN_FLIGHT=k`) so the co-verify is turnkey (default 4).
+    // (`[model.scheduler] frame_dispatch_depth = k`) so the co-verify is
+    // turnkey (default 3, the engine's own default being 2).
     let max_tokens: usize = input
         .split_whitespace()
         .next()

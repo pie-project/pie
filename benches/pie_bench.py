@@ -216,7 +216,7 @@ def build_config(args: argparse.Namespace):
     if args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
-            "ready_timeout_s": float(args.server_startup_timeout),
+            "ready_timeout": f"{int(args.server_startup_timeout)}s",
         }
         if args.memory_profile != "auto":
             driver_options["memory_profile"] = args.memory_profile
@@ -461,9 +461,10 @@ async def cli_pie_client(args: argparse.Namespace):
 
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
+        feature = "driver-metal" if args.driver == "metal" else "driver-cuda"
         raise FileNotFoundError(
-            f"missing {pie_bin}; build with: cargo build -p pie-worker --release "
-            "--no-default-features --features driver-cuda"
+            f"missing {pie_bin}; build with: cargo build --release -p pie-bin "
+            f"--no-default-features --features {feature}"
         )
 
     proc = await asyncio.create_subprocess_exec(
@@ -1254,7 +1255,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--memory-profile",
             default="auto",
-            choices=["auto", "latency", "balanced", "throughput", "capacity"],
+            choices=["auto", "latency", "throughput"],
         )
         sp.add_argument(
             "--kv-pages", type=int, default=2048,

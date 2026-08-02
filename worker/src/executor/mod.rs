@@ -4516,11 +4516,29 @@ mod tests {
 
         let error = rpc(&client, request()).await.unwrap_err();
         assert_eq!(error.kind, RemoteErrorKind::ResourceExhausted);
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert!(matches!(
-            rpc(&client, request()).await.unwrap(),
-            ExecutorResponse::Embeddings(_)
-        ));
+        // Held is asserted above, on the very next call; what is left to show
+        // is that the hold ends. Retirement is driven by a cancelled fetch's
+        // connection erroring out through reqwest, which has no deadline this
+        // test controls, so a fixed sleep asserts a schedule rather than the
+        // invariant -- 250ms was right about two times in three here. Polling
+        // says the same thing without the guess: never released is still a
+        // failure, it just takes the timeout to prove it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = None;
+        let released = loop {
+            match rpc(&client, request()).await {
+                Ok(ExecutorResponse::Embeddings(_)) => break true,
+                other => last = Some(format!("{other:?}")),
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert!(
+            released,
+            "cancelled encodes never released their admission; last answer was {last:?}"
+        );
         server.shutdown().await;
     }
 }

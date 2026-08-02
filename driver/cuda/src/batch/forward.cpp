@@ -61,6 +61,7 @@ void ForwardFn::attach_model(model::IModel* m) {
     supports_hook_graph_capture   = caps.supports_hook_graph_capture;
     supports_supergraph           = caps.supports_supergraph;
     supports_fused_lm_head_argmax = caps.supports_fused_lm_head_argmax;
+    upfront_capture_safe          = caps.upfront_capture_safe;
 }
 
 void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
@@ -211,22 +212,10 @@ class CudaStreamOwner {
         bool active_ = true;
 };
 
-bool step_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_STEP_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool step_profile_enabled() { return false; }
 
-std::uint64_t step_profile_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_STEP_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{32};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
+constexpr std::uint64_t step_profile_limit() {
+    return std::uint64_t{32};
 }
 
 std::vector<int> forward_graph_request_lattice(int max_requests) {
@@ -494,6 +483,51 @@ cudaGraphExec_t capture_forward_graph_exec(
             ", node_types:" + histogram + ", pending_before=" +
             cudaGetErrorName(pending) + ")");
     }
+    // PIE_GRAPH_NODE_TRACE: per-capture node census — the discriminating
+    // probe for "does a slow bucket's graph CONTAIN more work or just
+    // slower kernels".
+    static const bool node_trace = [] {
+        const char* v = std::getenv("PIE_GRAPH_NODE_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    // PIE_GRAPH_DOT_DIR: dump every captured graph's full topology (node
+    // kinds, event edges, kernel names) as DOT — the tool that names which
+    // subsystem's event-record/wait pairs ended up inside a bucket graph.
+    static const char* dot_dir = std::getenv("PIE_GRAPH_DOT_DIR");
+    if (dot_dir != nullptr && dot_dir[0] != '\0') {
+        static std::atomic<int> dot_seq{0};
+        const int seq = dot_seq.fetch_add(1);
+        const std::string path = std::string(dot_dir) + "/graph_R" +
+            std::to_string(R) + "_N" + std::to_string(N) + "_" +
+            std::to_string(seq) + ".dot";
+        cudaGraphDebugDotPrint(graph.get(), path.c_str(),
+                               cudaGraphDebugDotFlagsVerbose);
+        cudaGetLastError();
+    }
+    if (node_trace) {
+        std::size_t nodes = 0;
+        cudaGraphGetNodes(graph.get(), nullptr, &nodes);
+        std::string histogram;
+        std::vector<cudaGraphNode_t> node_list(nodes);
+        if (nodes > 0 &&
+            cudaGraphGetNodes(graph.get(), node_list.data(), &nodes) ==
+                cudaSuccess) {
+            std::map<int, int> by_type;
+            for (cudaGraphNode_t node : node_list) {
+                cudaGraphNodeType type{};
+                if (cudaGraphNodeGetType(node, &type) == cudaSuccess) {
+                    ++by_type[static_cast<int>(type)];
+                }
+            }
+            for (const auto& [type, count] : by_type) {
+                histogram += " t" + std::to_string(type) + "=" +
+                             std::to_string(count);
+            }
+        }
+        std::fprintf(stderr,
+                     "[graph-nodes] N=%d R=%d nodes=%zu%s\n",
+                     N, R, nodes, histogram.c_str());
+    }
     CUDA_CHECK(cudaGraphUpload(exec.get(), nullptr));
     return exec.release();
 }
@@ -527,10 +561,11 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         return skip_upfront_capture(
             "nemotron_h recurrent state requires first-use capture");
     }
-    const char* disable_upfront = std::getenv("PIE_CUDA_DISABLE_UPFRONT_GRAPHS");
-    if (disable_upfront != nullptr && disable_upfront[0] != '\0' &&
-        disable_upfront[0] != '0') {
-        return skip_upfront_capture("PIE_CUDA_DISABLE_UPFRONT_GRAPHS is set");
+    if (!engine.forward_fn.upfront_capture_safe) {
+        return skip_upfront_capture(
+            "model declares synthetic upfront capture unsafe (plan-free "
+            "force_prefill attention bakes capture-shape launch config); "
+            "buckets capture on first use with real geometry");
     }
     const int max_requests =
         std::min(engine.max_forward_requests, engine.max_workspace_tokens);
@@ -764,16 +799,7 @@ bool forward_graph_replay_eligible(
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
          engine.inputs.custom_mask_indptr.data() != nullptr);
-    // A kill switch for the decode graphs alone. `PIE_CUDA_PREFILL_DECODE_
-    // NOGRAPHS` reshapes the whole plan, so it cannot answer "is this bug in
-    // the graph or in the kernels the graph records?" -- the question every
-    // hang inside a replay asks first.
-    static const bool graphs_disabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DISABLE_DECODE_GRAPHS");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return !graphs_disabled &&
-        engine.graph_cache != nullptr &&
+    return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
         is_pure_decode &&
         mask_pointers_stable &&

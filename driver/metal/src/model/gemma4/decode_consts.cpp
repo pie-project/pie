@@ -39,7 +39,8 @@ inline void bind_const(RawMetalContext& ctx, int ord, std::uint8_t idx, const V&
 /// an earlier Gemma's, and applying it here is an ~80% error per norm that the
 /// residual stream compounds.
 RmsParams rms_params(const Gemma4Geometry& g, int axis) {
-    return RmsParams{g.eps, std::uint32_t(axis), 1u, g.norm_plus_one ? 1u : 0u};
+    return RmsParams{
+        g.eps, std::uint32_t(axis), 1u, g.norm_plus_one ? 1u : 0u, 1.0f};
 }
 
 /// The KV cache is [n_kv_heads, max_ctx, head_dim] per owning layer, so the head
@@ -330,8 +331,6 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             }
             // The one add this family does not fuse into a norm.
             case Kind::BranchAdd:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width,
-                                         std::int32_t(R * std::uint32_t(g.hidden)), &count);
                 break;
 
             // ── elementwise ──

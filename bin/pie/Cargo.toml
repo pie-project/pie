@@ -50,7 +50,13 @@ pie-tokenizer = { path = "../../runtime/tokenizer" }
 # The HF `config.json` normalizer — `pie model convert` runs it once and
 # writes the result as the `pie.model/1` descriptor, so the runtime and the
 # driver stop re-deriving it from HF quirks at every boot.
-pie-model-config = { path = "../../runtime/model-config" }
+pie-model-config = { path = "../../model/config" }
+# Client edge for `pie config tune`: the sweep generates load through
+# the same websocket path a deployment is reached by, because measuring an
+# in-process shortcut would measure something nobody runs.
+pie-client = { path = "../../client/rust" }
+pie-model = { path = "../../model", features = ["contract"] }
+pie-model-common = { path = "../../model/common", features = ["contract"] }
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
@@ -73,14 +79,19 @@ hf-hub = "1.0.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "stream"] }
 tar = "0.4"
 xz2 = "0.1"
+toml_edit = "0.25.13"
 
+# What this crate's OWN tests need, which is now what is here. The engine's
+# on-device suite moved to `tests/gpu` (`pie-gpu-tests`) and took `pie-engine`
+# and `tracing-subscriber` with it — they were dev-deps of this crate because
+# thirty GPU test binaries lived in its `tests/`, not because anything about
+# the CLI needs them.
 [dev-dependencies]
 tempfile = "3"
-# The runtime lib (`pie`) — read `inference::get_stats()` in-process to observe
-# the scheduler's fire probes (the thrust-2 bubble/quorum gate) after a decode.
-pie-engine = { path = "../../runtime/engine" }
-# Client edge for the 4090 capability harness (programmable_sampler_4090): the
-# in-process submit path (connect → add_program → launch → wait_for_return).
+# `boot_smoke` drives the one public composition seam (`run_standalone`) the
+# way a client does; that is the reason this crate has a `[lib]` at all.
 pie-client = { path = "../../client/rust" }
-# Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# SIGPIPE disposition — see `die_quietly_on_closed_pipe` in main.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

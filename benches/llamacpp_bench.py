@@ -83,6 +83,14 @@ async def run(args: argparse.Namespace):
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
     )
+    # `--concurrency` has to mean the same thing it means to the harnesses it is
+    # compared against, and here it meant nothing: the client gathered every
+    # request at once and only the server's `--parallel` bounded the batch. A
+    # row labelled "concurrency 1" was therefore eight-way concurrent for
+    # llama.cpp and serial for the other two -- the engines were not being asked
+    # the same question. 0 keeps the old behaviour, which is "no cap".
+    gate = asyncio.Semaphore(args.concurrency) if getattr(args, "concurrency", 0) else None
+
     async with maybe_server(args) as base_url:
         endpoint = base_url.rstrip("/") + "/v1/completions"
 
@@ -97,6 +105,12 @@ async def run(args: argparse.Namespace):
                 "stream": False,
                 "stream_options": {"include_usage": True},
             }
+            if gate is not None:
+                async with gate:
+                    return await send(payload, prompt_count)
+            return await send(payload, prompt_count)
+
+        async def send(payload: dict[str, Any], prompt_count: int) -> RequestResult:
             start = time.perf_counter()
             try:
                 obj = await asyncio.to_thread(http_json, endpoint, payload, args.request_timeout)

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use pie_bin::derive::derive_standalone;
-use pie_bin::{Mode, run_standalone};
+use pie_bin::run_standalone;
 
 /// The same standalone TOML `boot_smoke` uses, pointed at an artifact.
 ///
@@ -37,24 +37,16 @@ use pie_bin::{Mode, run_standalone};
 /// depend on `PIE_HOME`; the store lookup is covered by `weights`' own tests.
 fn standalone_toml(artifact: &str) -> String {
     format!(
-        "[controller]\n\
+        "[server]\n\
+         port = 0\n\
          \n\
-         [gateway]\n\
-         listen = \"127.0.0.1:0\"\n\
-         \n\
-         [worker]\n\
-         [worker.auth]\n\
-         enabled = false\n\
-         \n\
-         [worker.model]\n\
+         [model]\n\
          name = \"artifact-smoke\"\n\
          model = \"{artifact}\"\n\
          \n\
-         [worker.model.driver]\n\
+         [driver]\n\
          type = \"dummy\"\n\
          device = [\"cpu\"]\n\
-         \n\
-         [worker.model.driver.options]\n\
          vocab_size = 256\n\
          arch_name = \"qwen3\"\n"
     )
@@ -90,7 +82,7 @@ fn fixture_artifact() -> String {
         // artifact and not the files it was made from.
         let store = tempfile::tempdir().expect("create artifact dir");
         let artifact = store.path().join("smoke.zt");
-        pie_bin::ops::convert::run(pie_bin::ops::convert::ConvertArgs {
+        pie_bin::ops::model::import::run(pie_bin::ops::model::import::ImportArgs {
             source: staging.path().to_string_lossy().into_owned(),
             out: Some(artifact.clone()),
             dry_run: false,
@@ -122,7 +114,7 @@ fn assert_only_the_artifact(dir: &Path, artifact: &Path) {
 
 async fn boot() -> Result<pie_bin::StandaloneHandle> {
     let (controller, gateway, worker) = derive_standalone(&standalone_toml(&fixture_artifact()))?;
-    run_standalone(controller, gateway, worker, Mode::Local).await
+    run_standalone(controller, gateway, worker).await
 }
 
 /// THE GATE — converts, boots once from the artifact alone, round-trips a ping

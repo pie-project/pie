@@ -93,21 +93,12 @@ pub(super) fn run_passes(plan: &mut LoadPlan, passes: &[Pass]) -> Result<Vec<Pas
             Stage::Rewrite => {}
         }
         let before = plan.instrs.len();
-        let started = std::time::Instant::now();
         let rewrites = (pass.run)(plan)?;
         if pass.stage == Stage::Check && rewrites != 0 {
             return Err(crate::error::Error::Internal(format!(
                 "pass '{}' is a validator but reports {rewrites} rewrites",
                 pass.name
             )));
-        }
-        if crate::planner_debug_enabled() {
-            eprintln!(
-                "[pie-loader] pass {:<34} {:>6} ms  {before} -> {} instrs, {rewrites} rewrites",
-                pass.name,
-                started.elapsed().as_millis(),
-                plan.instrs.len()
-            );
         }
         stats.push(PassStats {
             pass: pass.name.to_string(),

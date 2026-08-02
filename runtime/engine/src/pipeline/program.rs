@@ -238,12 +238,6 @@ impl Registry {
         let channel_accesses = Self::channel_accesses(&decoded);
         let bound = bind(decoded, profile.clone()).map_err(RegisterError::Bind)?;
         let compiled_stages = pie_plan::compile_bound(&bound);
-        if std::env::var_os("PIE_PTIR_DUMP_PLAN").is_some() {
-            for stage in &compiled_stages {
-                eprintln!("{}", pie_plan::debug_stage_plan(stage));
-                eprintln!("  metrics={:?}", stage.metrics());
-            }
-        }
         let launch = std::sync::OnceLock::new();
         let entry = Arc::new(RegisteredProgram {
             bytes,
@@ -365,7 +359,7 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
 /// page-size + layer caps; model-gated intrinsics + second-party kernels default
 /// conservative until the model surfaces them).
 pub fn model_profile() -> ModelProfile {
-    let m = pie_model::model();
+    let m = crate::model::model();
     profile_from(
         m.vocab_size(),
         crate::store::registry::get(0, 0).kv_page_size,
@@ -380,7 +374,7 @@ fn profile_from(
     vocab: u32,
     page_size: u32,
     num_layers: u32,
-    ptir: pie_model::PtirCaps,
+    ptir: crate::model::PtirCaps,
 ) -> ModelProfile {
     ModelProfile {
         vocab,
@@ -544,7 +538,7 @@ mod tests {
 
     #[test]
     fn quest_tap_binds_only_against_a_backend_with_kv_envelopes() {
-        let caps = |has: bool| pie_model::PtirCaps {
+        let caps = |has: bool| crate::model::PtirCaps {
             has_lora: false,
             has_mtp_logits: false,
             has_mtp_drafts: false,
@@ -641,7 +635,7 @@ mod tests {
 
     #[test]
     fn kv_envelope_capability_gates_the_envelope_dot_kernel() {
-        let caps = |has: bool| pie_model::PtirCaps {
+        let caps = |has: bool| crate::model::PtirCaps {
             has_lora: false,
             has_mtp_logits: false,
             has_mtp_drafts: false,

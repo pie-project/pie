@@ -7,7 +7,7 @@
 //! programs differ, not the way two runtime paths do.
 
 use crate::facts::{
-    LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
+    LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::dsl::{
@@ -20,14 +20,16 @@ use crate::trace::{
     DType, Dim, FireClass, ForwardPlan, GuardPred, NormVariant, RopeKind, Shape,
 };
 
-/// The lowering a qwen3_5 body traces under, threaded by value: the CUDA
-/// backend facts and the fire class the class arms match on. `None` is
-/// the semantic form.
-type Qwen35Lower<'a> = Option<(&'a Qwen35CudaFacts, FireClass)>;
-
 /// The llama_like body — SEMANTIC form: no structural divergence, one
-/// trace serves every fire shape, kernel choice stays with the consumer.
-/// [`llama_like_cuda`] is the same text with the class arms live.
+/// trace serves every fire shape, kernel choice stays with the consumer
+/// (Metal, the engine's site table, `declared_dag`).
+///
+/// This is its OWN text. It was until recently the `lower: None` reading
+/// of a single text shared with [`llama_like_cuda`], with eight
+/// `m.lowering()` tests deciding which of two programs the reader was
+/// looking at. `.wiki/tart/dsl.md` ③ says a model file is written for one
+/// backend, so the two readings are now two texts and neither asks "am I
+/// lowered?". The goldens pin that the split changed no traced byte.
 ///
 /// Mirrors `driver/cuda/src/model/llama_like/llama_like.cpp`
 /// (`llama_like_forward_paged`) op for op; the golden test pins that
@@ -44,7 +46,76 @@ type Qwen35Lower<'a> = Option<(&'a Qwen35CudaFacts, FireClass)>;
 ///   a separate `ResidualAdd` lands it — the hand-written post-norm walk's
 ///   gemm → `launch_rmsnorm_bf16` → `launch_residual_add_bf16` triplet.
 pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
-    llama_like_text(facts, None)
+    dsl::trace_semantic(facts, |m| {
+        dsl::seam(m.trace(), &dsl::seam::IN, &[], None);
+        let f = m.facts().clone();
+        let q_w = f.q_width();
+        let kv_w = f.kv_width();
+        let post_norm = f.norm_placement == NormPlacement::Post;
+
+        let mut y = m.embed();
+
+        for l in 0..f.layers {
+            let w = m.layer(l);
+
+            // Attention block: (pre-norm) -> qkv -> (q/k norms) -> rope
+            // -> append -> attention -> o_proj landed on the residual.
+            let x = if post_norm {
+                y.clone()
+            } else {
+                rmsnorm(&y, &w.attn_norm)
+            };
+
+            let (q, k, v) = if f.fused_qkv {
+                split_qkv(&matmul(&x, &w.qkv), q_w, kv_w)
+            } else {
+                (
+                    matmul(&x, &w.q_proj),
+                    matmul(&x, &w.k_proj),
+                    matmul(&x, &w.v_proj),
+                )
+            };
+            // Qwen-2 family qkv biases: on the raw projections, before
+            // norms and rope.
+            let (q, k, v) = if f.qkv_bias {
+                (
+                    add_bias(&q, &w.q_bias),
+                    add_bias(&k, &w.k_bias),
+                    add_bias(&v, &w.v_bias),
+                )
+            } else {
+                (q, k, v)
+            };
+            // The q/k norm convention is the weight handle's ("the weight
+            // knows"); the semantic text states norm and rope separately
+            // because their kernels are 1:1.
+            let (q, k) = if f.qk_norm == QkNorm::Off {
+                (q, k)
+            } else {
+                (rmsnorm(&q, &w.q_norm), rmsnorm(&k, &w.k_norm))
+            };
+            let (q, k) = rope(&q, &k, f.rope);
+            w.kv.append(&k, &v);
+            let a = attention(&q, &w.kv, q_w);
+
+            if post_norm {
+                // Post-norm: o_proj to scratch, norm the OUTPUT, then the
+                // separate residual landing (`+=` of a non-matmul records
+                // the explicit ResidualAdd launch).
+                y += rmsnorm(&matmul(&a, &w.o_proj), &w.attn_norm);
+                let mlp = matmul(&swiglu(&matmul(&y, &w.gate_up), f.intermediate), &w.down);
+                y += rmsnorm(&mlp, &w.mlp_norm);
+            } else {
+                // Pre-norm: `+=` of a fresh matmul IS the beta=1 fold.
+                y += matmul(&a, &w.o_proj);
+                let x = rmsnorm(&y, &w.mlp_norm);
+                y += matmul(&swiglu(&matmul(&x, &w.gate_up), f.intermediate), &w.down);
+            }
+        }
+
+        let logits = m.logits(&rmsnorm(&y, &m.final_norm()));
+        dsl::seam(m.trace(), &dsl::seam::OUT, &[&logits], None);
+    })
 }
 
 /// The LOWERED llama_like: the SAME text as [`llama_like`], traced with
@@ -57,31 +128,172 @@ pub fn llama_like_cuda(
     cuda: &LlamaLikeCudaFacts,
     class: FireClass,
 ) -> ForwardPlan {
-    llama_like_text(facts, Some((cuda, class)))
+    llama_like_cuda_text(facts, cuda, class)
 }
 
-/// THE one llama_like text (north-star-dsl.md): computation and kernel
-/// choice together, on the dsl surface. With `lower: None` this is the
-/// semantic trace — the general arm everywhere, no kernel stated,
-/// byte-identical to what `llama_like` always produced (the goldens pin
-/// it). With a lowering, the class arms run as ordinary trace-time
-/// matches beside the fact arms, and what they choose is exactly what
-/// `declared_forward.cpp` chooses at fire time today — the migration
-/// deletes the C++ copy of these matches, not this one.
-fn llama_like_text(
+/// The llama_like METAL text (`.wiki/tart/dsl.md` ③) — the second
+/// backend's own model file, stating Metal's kernels.
+///
+/// ★ UNVERIFIED, AND DELIBERATELY SO (2026-08-05). Nothing has executed
+/// this. The Metal driver cannot build on the machine we have —
+/// `xcrun --find metal` fails, because the shader compiler ships with
+/// full Xcode and only CommandLineTools is installed — so this text is
+/// written against the driver's SOURCE, not against a running
+/// deployment. It is boilerplate, requested as such, and it is here so
+/// the shape exists to be corrected rather than invented under time
+/// pressure later. `.wiki/tart/macos.md` rung 3 states the proof it
+/// owes: the descriptors `driver/metal/src/model/llama_like/declared_dag.hpp`
+/// emits must come out unchanged.
+///
+/// WHAT IT IS FOR. Metal today consumes the SEMANTIC trace and chooses
+/// its kernels in C++ (`decode_psos.cpp`), which is the same "the driver
+/// decides" shape the CUDA side is being cured of, approached from the
+/// other end. A backend with a text of its own can be read: this file
+/// says what runs.
+///
+/// WHAT IS ALMOST CERTAINLY WRONG, so a reader does not mistake
+/// plausibility for correctness:
+///
+/// * the M>1 (Prefill) lane is a guess. The driver's `MultiBatchPsos`
+///   carries split-k, fp16-precast, strided and bias variants and a
+///   `kQmmMinBatch` gate; this text states one GEMM and one paged
+///   attention.
+/// * `sdpa_*_d_256` pins head_dim 256. The driver compiles other widths
+///   (`d_512` for gemma4); which one a deployment needs is a fact this
+///   text does not yet take.
+/// * no seams. The adapter, the two observation taps and the boundaries
+///   are stated by the CUDA text and absent here, because none of the
+///   machinery behind them exists on this backend yet.
+/// * qk-norm and bias are stated as ordinary norms and are untested
+///   against `declared_dag.hpp`'s expectations.
+fn llama_like_metal_text(
     facts: &LlamaLikeFacts,
-    lower: Option<(&LlamaLikeCudaFacts, FireClass)>,
+    metal: &LlamaLikeMetalFacts,
+    class: FireClass,
 ) -> ForwardPlan {
-    dsl::trace(facts, lower, |m| {
+    // The two lanes the Metal driver actually has: M=1 (the per-token
+    // decode step) and M>1 (the multi-batch lane). `FireClass` is the
+    // same instantiation index it is on CUDA.
+    let multi_batch = class != FireClass::Decode;
+    dsl::trace_metal(facts, class, |m| {
         let f = m.facts().clone();
         let q_w = f.q_width();
         let kv_w = f.kv_width();
         let post_norm = f.norm_placement == NormPlacement::Post;
-        let cuda_of = |class_want: FireClass| {
-            m.lowering()
-                .filter(|(_, class)| *class == class_want)
-                .map(|(c, _)| c)
+
+        // The projection arm this deployment takes, chosen once: GEMV on
+        // the M=1 lane, MLX's steel GEMM above the batch gate.
+        let gemm = |x: &Val, w: &MatW| {
+            if multi_batch && metal.qmm_multi_batch {
+                dsl::metal::qmm(x, w)
+            } else {
+                dsl::metal::qmv(x, w)
+            }
         };
+        // A `beta_one` matmul: the epilogue fold when the deployment has
+        // it, the projection plus an explicit landing when it does not.
+        let gemm_add = |x: &Val, w: &MatW, residual: &Val| {
+            if metal.fuse_residual_gemv {
+                if multi_batch && metal.qmm_multi_batch {
+                    dsl::metal::qmm_residual(x, w, residual)
+                } else {
+                    dsl::metal::qmv_residual(x, w, residual)
+                }
+            } else {
+                dsl::metal::residual_add(&gemm(x, w), residual)
+            }
+        };
+        let paged = multi_batch && metal.paged_multi_batch;
+
+        let mut y = dsl::metal::embed_gather(m.trace(), "embed", f.hidden, multi_batch);
+
+        for l in 0..f.layers {
+            let w = m.layer(l);
+
+            let x = if post_norm {
+                y.clone()
+            } else {
+                dsl::metal::rms_norm(&y, &w.attn_norm)
+            };
+
+            let (q, k, v) = if f.fused_qkv {
+                split_qkv(&gemm(&x, &w.qkv), q_w, kv_w)
+            } else {
+                (
+                    gemm(&x, &w.q_proj),
+                    gemm(&x, &w.k_proj),
+                    gemm(&x, &w.v_proj),
+                )
+            };
+            let (q, k) = if f.qk_norm == QkNorm::Off {
+                (q, k)
+            } else {
+                (
+                    dsl::metal::rms_norm(&q, &w.q_norm),
+                    dsl::metal::rms_norm(&k, &w.k_norm),
+                )
+            };
+            // One dispatch for q and k together, as `declared_dag.hpp`'s
+            // `Kind::Rope` states it.
+            let (q, k) = dsl::metal::rope(&q, &k, multi_batch);
+            dsl::metal::kv_append(&k, &v, &w.kv, paged);
+            let a = dsl::metal::sdpa(&q, &w.kv, q_w, paged)
+                .expect("a plain attention statement produces its value");
+
+            if post_norm {
+                let o = dsl::metal::rms_norm(&gemm(&a, &w.o_proj), &w.attn_norm);
+                y = dsl::metal::residual_add(&o, &y);
+                let h = dsl::metal::silu_mul(&gemm(&y, &w.gate_up), f.intermediate);
+                let d = dsl::metal::rms_norm(&gemm(&h, &w.down), &w.mlp_norm);
+                y = dsl::metal::residual_add(&d, &y);
+            } else {
+                y = gemm_add(&a, &w.o_proj, &y);
+                let x = dsl::metal::rms_norm(&y, &w.mlp_norm);
+                let h = dsl::metal::silu_mul(&gemm(&x, &w.gate_up), f.intermediate);
+                y = gemm_add(&h, &w.down, &y);
+            }
+        }
+
+        let normed = dsl::metal::rms_norm(&y, &m.final_norm());
+        let head = if f.tied_embeddings { "embed" } else { "lm_head" };
+        dsl::metal::lm_head(&normed, head, f.vocab);
+    })
+}
+
+/// Trace the llama_like METAL text for one [`FireClass`]. See
+/// [`llama_like_metal_text`] for what is and is not verified about it.
+pub fn llama_like_metal(
+    facts: &LlamaLikeFacts,
+    metal: &LlamaLikeMetalFacts,
+    class: FireClass,
+) -> ForwardPlan {
+    llama_like_metal_text(facts, metal, class)
+}
+
+/// The llama_like CUDA text (`.wiki/tart/dsl.md` ③): computation and
+/// kernel choice together, on the dsl surface, for ONE backend. The
+/// semantic text is [`llama_like`] — a separate text, because a model
+/// file is written for a backend and "am I lowered?" is not a question a
+/// body asks. The class arms run as ordinary trace-time matches beside
+/// the fact arms, and what they choose is exactly what
+/// `declared_forward.cpp` chooses at fire time today — the migration
+/// deletes the C++ copy of these matches, not this one.
+fn llama_like_cuda_text(
+    facts: &LlamaLikeFacts,
+    cuda: &LlamaLikeCudaFacts,
+    class: FireClass,
+) -> ForwardPlan {
+    dsl::trace_cuda(facts, class, |m| {
+        dsl::seam(m.trace(), &dsl::seam::IN, &[], None);
+        let f = m.facts().clone();
+        let q_w = f.q_width();
+        let kv_w = f.kv_width();
+        let post_norm = f.norm_placement == NormPlacement::Post;
+        // The backend facts, readable only under the class this text is
+        // being traced for — the `FireClass` match, spelled as a filter
+        // so the arms below read as they did when the lowering arrived
+        // through the context.
+        let cuda_of = |class_want: FireClass| (class == class_want).then_some(cuda);
 
         // STRUCTURAL S-3, stated IN THE BODY (V2 rung ②; formerly the
         // post-trace paint-over the review named): the lowered Decode
@@ -140,7 +352,7 @@ fn llama_like_text(
                         matmul(&x, &w.v_proj),
                     )
                 };
-                if m.lowering().is_some() {
+                {
                     // The adapter value seam (§5.1): attachments land on
                     // the just-materialized RAW q/v projections, BEFORE
                     // anything consumes them — bias, norms, rope, the KV
@@ -149,7 +361,7 @@ fn llama_like_text(
                     // bug the first live A/B caught). Rung-① lowering is
                     // the HasLora guard with an EMPTY else: a fire with
                     // no usable lanes launches nothing.
-                    dsl::seam_adapter_qv(m, &q, &v, l);
+                    dsl::seam(m.trace(), &dsl::seam::ATTN_QV, &[&q, &v], Some(l));
                 }
                 // Qwen-2 family qkv biases: on the raw projections, after
                 // the lora correction and before norms/rope — the
@@ -165,15 +377,14 @@ fn llama_like_text(
                 } else {
                     (q, k, v)
                 };
-                // A lowered arm with the per-head convention and Standard
-                // rope states the fused norm+rope kernel (the hand-written
+                // The per-head convention with Standard rope states the
+                // fused norm+rope kernel (the hand-written
                 // `fuse_qk_norm_rope` branch — bf16 rounds differently
                 // from the triple, so parity requires the same launch);
-                // the Global and Off conventions keep the semantic ops,
-                // whose kernels are 1:1.
-                let per_head_fused = m.lowering().is_some()
-                    && f.qk_norm == QkNorm::PerHead
-                    && f.rope == RopeKind::Standard;
+                // the Global and Off conventions state the separate
+                // kernels, whose semantic ops are 1:1.
+                let per_head_fused =
+                    f.qk_norm == QkNorm::PerHead && f.rope == RopeKind::Standard;
                 let (q, k) = if per_head_fused {
                     cuda::qk_rmsnorm_rope(&q, &k, &w.q_norm, &w.k_norm)
                 } else {
@@ -184,21 +395,17 @@ fn llama_like_text(
                     };
                     rope(&q, &k, f.rope)
                 };
-                if m.lowering().is_some() {
-                    // The KV-write mechanism is a per-fire runtime input
-                    // (explicit descriptors when the fire steers a graph
-                    // replay, page-derived otherwise). Under the fused
-                    // deployment's mask arm this guard NESTS inside the
-                    // HasCustomMask guard (A1 — the walk keeps a stack).
-                    dsl::guard(
-                        m,
-                        GuardPred::HasWriteDesc,
-                        || cuda::write_kv_explicit(&k, &v, &w.kv),
-                        || cuda::write_kv_to_pages(&k, &v, &w.kv),
-                    );
-                } else {
-                    w.kv.append(&k, &v);
-                }
+                // The KV-write mechanism is a per-fire runtime input
+                // (explicit descriptors when the fire steers a graph
+                // replay, page-derived otherwise). Under the fused
+                // deployment's mask arm this guard NESTS inside the
+                // HasCustomMask guard (A1 — the walk keeps a stack).
+                dsl::guard(
+                    m,
+                    GuardPred::HasWriteDesc,
+                    || cuda::write_kv_explicit(&k, &v, &w.kv),
+                    || cuda::write_kv_to_pages(&k, &v, &w.kv),
+                );
                 q
             };
             let attn_out_shape = (
@@ -206,11 +413,7 @@ fn llama_like_text(
                 DType::BF16,
             );
 
-            let a = match m.lowering() {
-                None => {
-                    let q = general_qkv();
-                    attention(&q, &w.kv, q_w)
-                }
+            let a = match class {
                 // A1–A3 (the class-collapse amendment): per-fire
                 // attachments are guard arms and ROW WINDOWS of the
                 // shape classes, not classes. The chain per layer:
@@ -239,7 +442,8 @@ fn llama_like_text(
                 // structurally one body already (the goldens pin the
                 // collapse is byte-identical); rung ③ makes the window
                 // class a PER-ROW operand and this match a region table.
-                Some((c, class @ (FireClass::Decode | FireClass::Prefill))) => {
+                FireClass::Decode | FireClass::Prefill => {
+                    let c = cuda;
                     let window_one = class == FireClass::Decode;
                     // ORDER IS LOAD-BEARING: `guarded_value` OPENS the
                     // chain, and every op recorded after it counts into
@@ -273,12 +477,10 @@ fn llama_like_text(
                     // to plan.
                     let masked_attention = |q: &Val| {
                         if c.head_dim_padded || (window_one && c.xqa_decode) {
-                            cuda::attention_flashinfer_prefill_custom_region(q, &w.kv);
+                            cuda::attention_flashinfer_prefill_custom(q, &w.kv);
                         } else {
-                            dsl::peel_masked(
-                                m.trace(),
-                                Some(l),
-                                || {
+                            dsl::by_rows(m.trace(), Some(l), None, |r| {
+                                r.arm(dsl::RowPred::Unmasked, || {
                                     // The prefix states THE DEPLOYMENT'S
                                     // causal form: the planned decode
                                     // dispatch on window-one fires —
@@ -291,52 +493,50 @@ fn llama_like_text(
                                     // fires: any mix of prefill and
                                     // plain-decode requests, ragged qo.
                                     if window_one && !c.force_prefill_path {
-                                        cuda::attention_flashinfer_decode_region(
+                                        cuda::attention_flashinfer_decode(
                                             q, &w.kv,
                                         );
                                     } else {
                                         cuda::dequant_only(&w.kv);
-                                        cuda::attention_flashinfer_prefill_region(
+                                        cuda::attention_flashinfer_prefill(
                                             q, &w.kv,
                                         );
                                     }
-                                },
-                                || {
-                                    cuda::attention_flashinfer_prefill_custom_region(
-                                        q, &w.kv,
-                                    )
-                                },
-                            );
+                                });
+                                r.rest(|| {
+                                    cuda::attention_flashinfer_prefill_custom(q, &w.kv);
+                                });
+                            });
                         }
                     };
                     let attn_with_sites = |q: &Val| {
-                        dsl::seam_observe(&dsl::seam::ATTN_Q, q, l);
+                        dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[q], Some(l));
                         if !window_one {
                             // Ragged fires are row-uniform: dequant,
                             // then the score-guarded causal dispatch.
                             cuda::dequant_only(&w.kv);
                             dsl::guarded(m)
                                 .arm(GuardPred::WantsAttnScore, || {
-                                    cuda::attention_flashinfer_prefill_capture(q, &w.kv)
+                                    cuda::attention_flashinfer_prefill_capture(q, &w.kv);
                                 })
                                 .otherwise(|| {
-                                    cuda::attention_flashinfer_prefill_region(q, &w.kv)
+                                    cuda::attention_flashinfer_prefill(q, &w.kv);
                                 });
                         } else if c.xqa_decode {
-                            cuda::attention_xqa_decode_region(q, &w.kv);
+                            cuda::attention_xqa_decode(q, &w.kv);
                         } else if c.force_prefill_path {
                             cuda::dequant_only(&w.kv);
-                            cuda::attention_flashinfer_prefill_region(q, &w.kv);
+                            cuda::attention_flashinfer_prefill(q, &w.kv);
                         } else {
                             dsl::guarded(m)
                                 .arm(GuardPred::WantsAttnScore, || {
-                                    cuda::attention_flashinfer_decode_capture(q, &w.kv)
+                                    cuda::attention_flashinfer_decode_capture(q, &w.kv);
                                 })
                                 .otherwise(|| {
-                                    cuda::attention_flashinfer_decode_region(q, &w.kv)
+                                    cuda::attention_flashinfer_decode(q, &w.kv);
                                 });
                         }
-                        dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
+                        dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[q], Some(l));
                     };
                     if fused_post {
                         g.arm(GuardPred::HasCustomMask, || {
@@ -349,9 +549,9 @@ fn llama_like_text(
                             // the programs a null scores pointer (the
                             // publish-gated contract).
                             let q = general_qkv();
-                            dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
+                            dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
                             masked_attention(&q);
-                            dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
+                            dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
                         })
                         // The lora arm: the fused epilogue writes V
                         // straight to the paged cache — nothing exists to
@@ -374,49 +574,49 @@ fn llama_like_text(
                             // tail — the hand-written mixed fire,
                             // launch for launch.
                             let packed = matmul(&x, &w.qkv);
-                            let q = dsl::peel(
+                            let q = dsl::by_rows(
                                 m.trace(),
                                 Some(l),
-                                attn_out_shape.clone(),
-                                || {
-                                    cuda::qkv_decode_qk_norm_rope_write_kv_region(
-                                        &packed,
-                                        &w.q_norm,
-                                        &w.k_norm,
-                                        &w.kv,
-                                        table.as_ref(),
-                                    );
+                                Some(attn_out_shape.clone()),
+                                |r| {
+                                    r.arm(dsl::RowPred::HookFree, || {
+                                        cuda::qkv_decode_qk_norm_rope_write_kv_region(
+                                            &packed,
+                                            &w.q_norm,
+                                            &w.k_norm,
+                                            &w.kv,
+                                            table.as_ref(),
+                                        );
+                                    });
+                                    r.rest(|| {
+                                        let (qt, kt, vt) = split_qkv(&packed, q_w, kv_w);
+                                        let (_qt, kt) =
+                                            cuda::qk_rmsnorm_rope(&qt, &kt, &w.q_norm, &w.k_norm);
+                                        dsl::guard(
+                                            m,
+                                            GuardPred::HasWriteDesc,
+                                            || cuda::write_kv_explicit(&kt, &vt, &w.kv),
+                                            || cuda::write_kv_to_pages(&kt, &vt, &w.kv),
+                                        );
+                                    });
                                 },
-                                || {
-                                    let (qt, kt, vt) = split_qkv(&packed, q_w, kv_w);
-                                    let (_qt, kt) =
-                                        cuda::qk_rmsnorm_rope(&qt, &kt, &w.q_norm, &w.k_norm);
-                                    dsl::guard(
-                                        m,
-                                        GuardPred::HasWriteDesc,
-                                        || cuda::write_kv_explicit(&kt, &vt, &w.kv),
-                                        || cuda::write_kv_to_pages(&kt, &vt, &w.kv),
-                                    );
-                                },
-                            );
+                            )
+                            .expect("a value-producing row partition produces its value");
                             attn_with_sites(&q);
                         });
                     } else {
                         let q = hoisted_q.as_ref().expect("hoisted for the non-fused arms");
                         g.arm(GuardPred::HasCustomMask, || {
                             // Masked+hooked (the fused arm's comment).
-                            dsl::seam_observe(&dsl::seam::ATTN_Q, q, l);
+                            dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[q], Some(l));
                             masked_attention(q);
-                            dsl::seam_observe(&dsl::seam::ATTN_OUT, q, l);
+                            dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[q], Some(l));
                         })
                         .otherwise(|| attn_with_sites(q));
                     }
                     a
                 }
-                Some((
-                    _,
-                    FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify,
-                )) => {
+                FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify => {
                     unreachable!("llama_like refuses the service classes at trace start")
                 }
             };
@@ -435,7 +635,8 @@ fn llama_like_text(
             }
         }
 
-        m.logits(&rmsnorm(&y, &m.final_norm()));
+        let logits = m.logits(&rmsnorm(&y, &m.final_norm()));
+        dsl::seam(m.trace(), &dsl::seam::OUT, &[&logits], None);
     })
 }
 
@@ -610,7 +811,7 @@ pub fn qwen3_5_gdn_block(facts: &Qwen35GdnFacts) -> ForwardPlan {
     dsl::trace_named("qwen3_5_gdn_block", |t| {
         // The fragment's parameter: the residual stream entering the block.
         let y = dsl::input(t, facts.hidden);
-        gdn_attn_body(t, 0, facts, &y, None);
+        gdn_attn_body(t, 0, facts, &y);
     })
 }
 
@@ -714,12 +915,48 @@ fn gdn_in_proj(x: &Val, w: &GdnLayerW, facts: &Qwen35GdnFacts) -> (Val, Val, Val
     }
 }
 
-fn gdn_attn_body(
+fn gdn_attn_body(t: &Trace, l: u32, facts: &Qwen35GdnFacts, y: &Val) -> Val {
+    let w = GdnLayerW::new(t, l, facts);
+    let mut y = y.clone();
+
+    let x = rmsnorm(&y, &w.attn_norm);
+
+    let (qkv, z, a, b) = gdn_in_proj(&x, &w, facts);
+
+    // Conv → prep → recurrence: the GDN core, against the layer's
+    // per-request conv/recurrent state. Both stay opaque here — the
+    // consumer owns kernel choice.
+    let qkv = causal_conv1d(&qkv, &w.conv);
+    let (q, k, v, g, beta) = gdn_prep(
+        &qkv,
+        &a,
+        &b,
+        &w.prep,
+        facts.key_heads,
+        facts.key_head_dim,
+        facts.value_heads,
+        facts.value_head_dim,
+    );
+    let core = gated_delta(&w.rs, &q, &k, &v, &g, &beta);
+
+    // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
+    // the residual (`+=` of a fresh matmul IS the beta=1 fold).
+    let o = rmsnorm_gated(&core, &z, &w.gate_norm);
+    y += matmul(&o, &w.o_proj);
+    y
+}
+
+/// The GDN block's CUDA text — [`gdn_attn_body`]'s kernel-stating
+/// counterpart, one per non-CommitAdvance [`FireClass`]. Only the conv
+/// and the recurrence differ by class; everything else states the same
+/// 1:1-kernel ops the semantic text does.
+fn gdn_attn_body_cuda(
     t: &Trace,
     l: u32,
     facts: &Qwen35GdnFacts,
     y: &Val,
-    lower: Qwen35Lower<'_>,
+    c: &Qwen35CudaFacts,
+    class: FireClass,
 ) -> Val {
     let w = GdnLayerW::new(t, l, facts);
     let mut y = y.clone();
@@ -735,27 +972,23 @@ fn gdn_attn_body(
     // engine-owned fact the load consumes); everything else in this body
     // rides the Prefill arms, and write_state=false is a runtime ARG of
     // the stated kernels, not a trace difference.
-    if let Some((c, FireClass::FrozenVerify)) = lower {
-        if c.verify_stash {
-            cuda::verify_stash_store(&qkv, &a, &b, &w.rs);
-        }
+    if class == FireClass::FrozenVerify && c.verify_stash {
+        cuda::verify_stash_store(&qkv, &a, &b, &w.rs);
     }
 
     // Conv → prep → recurrence: the GDN core, against the layer's
-    // per-request conv/recurrent state. A class arm states the conv
-    // kernel; the semantic form keeps the opaque op.
+    // per-request conv/recurrent state.
     // StateOnly is prefill-shaped throughout the backbone — it takes the
     // Prefill arm in every kernel choice here; only the model epilogue
-    // differs, and that class match lives in `qwen3_5_hybrid_text`.
+    // differs, and that class match lives in `qwen3_5_hybrid_cuda_text`.
     // CommitAdvance never enters this body at all: it is its own pass
     // ([`commit_advance_body`]), not a variant of the layer loop.
-    let qkv = match lower {
-        None => causal_conv1d(&qkv, &w.conv),
-        Some((_, FireClass::Decode)) => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs),
-        Some((_, FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify)) => {
+    let qkv = match class {
+        FireClass::Decode => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs),
+        FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify => {
             cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs)
         }
-        Some((_, FireClass::CommitAdvance)) => {
+        FireClass::CommitAdvance => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
@@ -776,21 +1009,15 @@ fn gdn_attn_body(
     // (The hand-written invoke sits after the cached family's GQA
     // repeats; the repeats read q_pre and never write it, so observing
     // before the recurrence guard sees the same bytes.)
-    if lower.is_some() {
-        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
-    }
+    dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
     // GQA (value heads sharing fewer key heads) picks the `_gqa` decode
     // step; the prefill kernels state their own layout handling.
     let gqa = facts.value_heads != facts.key_heads;
-    let core = match lower {
-        None => gated_delta(&w.rs, &q, &k, &v, &g, &beta),
-        Some((c, FireClass::Decode)) => {
+    let core = match class {
+        FireClass::Decode => {
             cuda::gdn_step_batched(&q, &k, &v, &g, &beta, &w.rs, gqa, c.state_bf16)
         }
-        Some((
-            c,
-            FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify,
-        )) => {
+        FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify => {
             // The prefill recurrence three-way, as the first
             // VALUE-PRODUCING guard chain (north-star-dsl.md 4b): the
             // guard's output is the recurrence core — the same
@@ -828,15 +1055,13 @@ fn gdn_attn_body(
                 .otherwise(|| cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16));
             core
         }
-        Some((_, FireClass::CommitAdvance)) => {
+        FireClass::CommitAdvance => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
     // The OnAttn site: after the recurrence core, before the gated norm
     // — the hand-written invoke's position (observing q_pre again).
-    if lower.is_some() {
-        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
-    }
+    dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
 
     // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
     // the residual (`+=` of a fresh matmul IS the beta=1 fold).
@@ -891,7 +1116,7 @@ pub fn qwen3_5_full_attn_block(facts: &Qwen35FullAttnFacts) -> ForwardPlan {
     dsl::trace_named("qwen3_5_full_attn_block", |t| {
         // The fragment's parameter: the residual stream entering the block.
         let y = dsl::input(t, facts.hidden);
-        full_attn_body(t, 0, facts, &y, None);
+        full_attn_body(t, 0, facts, &y);
     })
 }
 
@@ -968,13 +1193,7 @@ impl FullAttnLayerW {
 /// per-head pair), the projections and splits, the partial rope, the
 /// sigmoid output gate, the o_proj fold — is a 1:1-kernel semantic op
 /// and stays semantic in every form.
-fn full_attn_body(
-    t: &Trace,
-    l: u32,
-    facts: &Qwen35FullAttnFacts,
-    y: &Val,
-    lower: Qwen35Lower<'_>,
-) -> Val {
+fn full_attn_body(t: &Trace, l: u32, facts: &Qwen35FullAttnFacts, y: &Val) -> Val {
     let w = FullAttnLayerW::new(t, l, facts);
     let mut y = y.clone();
 
@@ -1000,52 +1219,90 @@ fn full_attn_body(
     let q = rmsnorm(&q, &w.q_norm);
     let k = rmsnorm(&k, &w.k_norm);
     let (q, k) = rope_partial(&q, &k, RopeKind::Standard, facts.rotary_dim);
+    w.kv.append(&k, &v);
+
+    // Attention stays opaque — the backend owns plan choice — then the
+    // multiply-only output gate and the o_proj accumulate (`+=` of a
+    // fresh matmul IS the beta=1 fold).
+    let attn = attention(&q, &w.kv, facts.q_width());
+    let gated = sigmoid_gate_mul(&attn, &gate);
+    y += matmul(&gated, &w.o_proj);
+    y
+}
+
+/// The full-attention block's CUDA text — [`full_attn_body`]'s
+/// kernel-stating counterpart, one per non-CommitAdvance [`FireClass`].
+///
+/// ONLY the kernel CHOICES differ from the semantic text: the KV write
+/// (the per-fire `HasWriteDesc` guard, both arms stated — llama_like's 4a
+/// form) and the attention kernel (FlashInfer decode vs the planned
+/// prefill dispatch). Everything else — the norms (incl. the Gemma
+/// per-head pair), the projections and splits, the partial rope, the
+/// sigmoid output gate, the o_proj fold — is a 1:1-kernel op stated the
+/// same way in both texts.
+fn full_attn_body_cuda(
+    t: &Trace,
+    l: u32,
+    facts: &Qwen35FullAttnFacts,
+    y: &Val,
+    class: FireClass,
+) -> Val {
+    let w = FullAttnLayerW::new(t, l, facts);
+    let mut y = y.clone();
+
+    let x = rmsnorm(&y, &w.attn_norm);
+
+    let (qg, k, v) = if facts.fused_qkv {
+        split_qkv(&matmul(&x, &w.qgkv), 2 * facts.q_width(), facts.kv_width())
+    } else {
+        (
+            matmul(&x, &w.q_proj),
+            matmul(&x, &w.k_proj),
+            matmul(&x, &w.v_proj),
+        )
+    };
+    let (q, gate) = split_q_gate(&qg, facts.q_heads, facts.head_dim);
+
+    let q = rmsnorm(&q, &w.q_norm);
+    let k = rmsnorm(&k, &w.k_norm);
+    let (q, k) = rope_partial(&q, &k, RopeKind::Standard, facts.rotary_dim);
     // The OnAttnProj site (A4): post-rope, pre-KV-write — the
     // hand-written full-attn invoke's position, observing the roped q
     // (bf16). Observation-only, like the GDN sites.
-    if lower.is_some() {
-        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
-    }
+    dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
 
-    // KV write. Lowered: the mechanism is a per-fire runtime input
-    // (explicit descriptors when the fire steers a graph replay,
-    // page-derived otherwise) — the same HasWriteDesc guard llama_like's
-    // lowered arm carries, both arms stated.
-    if lower.is_some() {
-        dsl::guard_on(
-            t,
-            GuardPred::HasWriteDesc,
-            || cuda::write_kv_explicit(&k, &v, &w.kv),
-            || cuda::write_kv_to_pages(&k, &v, &w.kv),
-        );
-    } else {
-        w.kv.append(&k, &v);
-    }
+    // The KV-write mechanism is a per-fire runtime input (explicit
+    // descriptors when the fire steers a graph replay, page-derived
+    // otherwise) — the same HasWriteDesc guard llama_like's CUDA text
+    // carries, both arms stated.
+    dsl::guard_on(
+        t,
+        GuardPred::HasWriteDesc,
+        || cuda::write_kv_explicit(&k, &v, &w.kv),
+        || cuda::write_kv_to_pages(&k, &v, &w.kv),
+    );
 
-    // Attention (semantic: opaque, the backend owns plan choice; a class
-    // arm states its kernel — qwen3_5's cache is bf16-gated, so the
-    // prefill arm is the dequant-less planned dispatch), then the
-    // multiply-only output gate and the o_proj accumulate (`+=` of a
-    // fresh matmul IS the beta=1 fold).
+    // qwen3_5's cache is bf16-gated, so the prefill arm is the
+    // dequant-less planned dispatch.
     // StateOnly runs the full backbone, prefill-shaped — the Prefill arm;
     // CommitAdvance skips full-attention layers entirely and never enters
     // this body ([`commit_advance_body`]).
-    let attn = match lower {
-        None => attention(&q, &w.kv, facts.q_width()),
-        Some((_, FireClass::Decode)) => cuda::attention_flashinfer_decode(&q, &w.kv, facts.q_width()),
-        Some((_, FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify)) => {
-            cuda::attention_flashinfer_prefill_planned(&q, &w.kv, facts.q_width())
+    let attn = match class {
+        FireClass::Decode => cuda::attention_flashinfer_decode(&q, &w.kv),
+        FireClass::Prefill | FireClass::StateOnly | FireClass::FrozenVerify => {
+            // No dequant statement beside it: qwen3_5's full-attention
+            // path gates on a native-bf16 cache.
+            cuda::attention_flashinfer_prefill(&q, &w.kv)
         }
-        Some((_, FireClass::CommitAdvance)) => {
+        FireClass::CommitAdvance => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
+    let attn = attn.expect("a plain attention statement produces its value");
     let gated = sigmoid_gate_mul(&attn, &gate);
     // The OnAttn site: after the output gate, before the o_proj — the
     // hand-written invoke's position (observing q).
-    if lower.is_some() {
-        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
-    }
+    dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
     y += matmul(&gated, &w.o_proj);
     y
 }
@@ -1120,12 +1377,32 @@ fn dense_mlp_body(
 /// commit-advance fires, MTP and the verify/rs-buffer services are
 /// per-fire services around this one pass, not ops of it.
 pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts) -> ForwardPlan {
-    qwen3_5_hybrid_text(facts, None)
+    let hidden = hybrid_hidden(facts);
+    dsl::trace_named("qwen3_5_hybrid", |t| {
+        dsl::seam(t, &dsl::seam::IN, &[], None);
+        let mut y = dsl::embed_with(t, "embed", hidden);
+
+        for l in 0..facts.layers {
+            let y_attn = if facts.is_full_attn(l) {
+                full_attn_body(t, l, &facts.attn, &y)
+            } else {
+                gdn_attn_body(t, l, &facts.gdn, &y)
+            };
+            y = match &facts.mlp {
+                Qwen35MlpKind::Dense { intermediate } => {
+                    dense_mlp_body(l, hidden, *intermediate, facts.norm_variant, &y_attn)
+                }
+                Qwen35MlpKind::Moe(moe) => moe_mlp_body(l, moe, &y_attn),
+            };
+        }
+
+        hybrid_epilogue(t, facts, &y);
+    })
 }
 
-/// The LOWERED qwen3_5 hybrid: the SAME text as [`qwen3_5_hybrid`],
-/// traced with the CUDA backend facts and a fire class in hand, so the
-/// class arms run and the traced form states its kernels as raw
+/// The qwen3_5 hybrid's CUDA text — [`qwen3_5_hybrid`]'s kernel-stating
+/// counterpart, traced with the CUDA backend facts and a fire class, so
+/// the traced form states its kernels as raw
 /// signatures ([`crate::dsl::cuda`]; north-star-dsl.md rung 4c). One
 /// trace per [`FireClass`] the deployment fires; family names
 /// `qwen3_5_hybrid.cuda.decode` / `.prefill` — the [`llama_like_cuda`]
@@ -1138,50 +1415,26 @@ pub fn qwen3_5_hybrid_cuda(
     cuda: &Qwen35CudaFacts,
     class: FireClass,
 ) -> ForwardPlan {
-    qwen3_5_hybrid_text(facts, Some((cuda, class)))
-}
-
-/// THE one qwen3_5 hybrid text (north-star-dsl.md): computation and
-/// kernel choice together. With `lower: None` this is the semantic
-/// trace, byte-identical to what [`qwen3_5_hybrid`] always produced (the
-/// `qwen3_5_hybrid_0_8b` golden is the gate). With a lowering, the class
-/// arms inside the two attention bodies run as ordinary trace-time
-/// matches; the MLP bodies take no lowering because they hold no kernel
-/// choice — every op of theirs is 1:1.
-fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> ForwardPlan {
-    let hidden = facts.hidden();
-    assert_eq!(
-        facts.gdn.hidden, hidden,
-        "hybrid sub-facts disagree on hidden (gdn)"
+    let hidden = hybrid_hidden(facts);
+    let family = format!(
+        "qwen3_5_hybrid.cuda.{}",
+        match class {
+            FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
+            FireClass::CommitAdvance => "commit_advance",
+            FireClass::StateOnly => "state_only",
+            FireClass::FrozenVerify => "frozen_verify",
+        }
     );
-    if let Qwen35MlpKind::Moe(moe) = &facts.mlp {
-        assert_eq!(
-            moe.hidden, hidden,
-            "hybrid sub-facts disagree on hidden (moe)"
-        );
-    }
-
-    let family = match &lower {
-        None => "qwen3_5_hybrid".to_string(),
-        Some((_, class)) => format!(
-            "qwen3_5_hybrid.cuda.{}",
-            match class {
-                FireClass::Decode => "decode",
-                FireClass::Prefill => "prefill",
-                FireClass::CommitAdvance => "commit_advance",
-                FireClass::StateOnly => "state_only",
-                FireClass::FrozenVerify => "frozen_verify",
-            }
-        ),
-    };
     dsl::trace_named(&family, |t| {
+        dsl::seam(t, &dsl::seam::IN, &[], None);
         // CommitAdvance changes WHICH OPS RUN so radically — only the
         // linear layers' conv+prep+recurrence, no embed/attention/MLP,
         // nothing after — that it is not a variant of the walk below but
         // its own pass, stated as its own body (north-star-dsl.md 4b:
         // "a genuinely different pass, so a genuinely different trace").
-        if let Some((c, FireClass::CommitAdvance)) = lower {
-            commit_advance_body(t, facts, c);
+        if class == FireClass::CommitAdvance {
+            commit_advance_body(t, facts, cuda);
             return;
         }
 
@@ -1189,9 +1442,9 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
 
         for l in 0..facts.layers {
             let y_attn = if facts.is_full_attn(l) {
-                full_attn_body(t, l, &facts.attn, &y, lower)
+                full_attn_body_cuda(t, l, &facts.attn, &y, class)
             } else {
-                gdn_attn_body(t, l, &facts.gdn, &y, lower)
+                gdn_attn_body_cuda(t, l, &facts.gdn, &y, cuda, class)
             };
             y = match &facts.mlp {
                 Qwen35MlpKind::Dense { intermediate } => {
@@ -1205,18 +1458,44 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
         // the trace simply ends after the last layer, exactly the pair
         // the hand-written pass's `if (num_logit_rows < 0) return` skips
         // (final-norm rmsnorm + lm_head, nothing else).
-        if matches!(lower, Some((_, FireClass::StateOnly))) {
+        if class == FireClass::StateOnly {
             return;
         }
-        let final_norm = NormW {
-            name: "final_norm".to_string(),
-            variant: facts.norm_variant,
-            per_head: None,
-            layer: None,
-        };
-        let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
-        dsl::lm_head_at(t, &rmsnorm(&y, &final_norm), lm_head, facts.vocab);
+        hybrid_epilogue(t, facts, &y);
     })
+}
+
+/// The hybrid's cross-facts check, shared by the two texts: the sub-facts
+/// are separate structs, so a deployment that disagrees with itself about
+/// `hidden` is caught before any op is recorded.
+fn hybrid_hidden(facts: &Qwen35HybridFacts) -> u32 {
+    let hidden = facts.hidden();
+    assert_eq!(
+        facts.gdn.hidden, hidden,
+        "hybrid sub-facts disagree on hidden (gdn)"
+    );
+    if let Qwen35MlpKind::Moe(moe) = &facts.mlp {
+        assert_eq!(
+            moe.hidden, hidden,
+            "hybrid sub-facts disagree on hidden (moe)"
+        );
+    }
+    hidden
+}
+
+/// Final norm → lm_head, resolving the tied-embedding fact. No kernel
+/// choice lives here (both ops are 1:1), so both texts state it the same
+/// way and it is written once.
+fn hybrid_epilogue(t: &Trace, facts: &Qwen35HybridFacts, y: &Val) {
+    let final_norm = NormW {
+        name: "final_norm".to_string(),
+        variant: facts.norm_variant,
+        per_head: None,
+        layer: None,
+    };
+    let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
+    let logits = dsl::lm_head_at(t, &rmsnorm(y, &final_norm), lm_head, facts.vocab);
+    dsl::seam(t, &dsl::seam::OUT, &[&logits], None);
 }
 
 /// The CommitAdvance pass (north-star-dsl.md 4b, rung 4c-iv): the
@@ -1275,9 +1554,9 @@ fn commit_advance_body(t: &Trace, facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFa
         // invokes (they precede its early return), so the commit trace
         // mirrors them (A4) — argument no-ops on every commit fire
         // today, stated because the contract is the body's.
-        dsl::seam_observe(&dsl::seam::ATTN_Q, &q, l);
+        dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
         cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, cuda.state_bf16);
-        dsl::seam_observe(&dsl::seam::ATTN_OUT, &q, l);
+        dsl::seam(q.trace(), &dsl::seam::ATTN_OUT, &[&q], Some(l));
     }
     // Nothing after the loop: no final norm, no lm_head — the pass ends
     // with the last linear layer's recurrence.
@@ -2614,5 +2893,92 @@ mod tests {
                 assert!(!dense.contains(token), "{token} leaked into a pre-GDN plan");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod metal_tests {
+    use super::*;
+    use crate::facts::LlamaLikeMetalFacts;
+    use crate::trace::OpKind;
+
+    /// The Metal text TRACES, and every kernel it states is declared in
+    /// Metal's table.
+    ///
+    /// This is not a claim that the text is RIGHT — nothing has executed
+    /// it, and `llama_like_metal_text`'s comment lists what is probably
+    /// wrong. What it does check is the one thing that can be checked
+    /// without a device: the text and the ② table agree, which is the
+    /// discipline the empty table was put there to force.
+    #[test]
+    fn the_metal_text_states_only_declared_kernels() {
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            // Tracing runs `kernels::check_plan` from `finish`, so an
+            // undeclared symbol would have panicked before we get here.
+            let plan = llama_like_metal(
+                &LlamaLikeFacts::qwen3_0_6b(),
+                &LlamaLikeMetalFacts::synthetic(),
+                class,
+            );
+            assert_eq!(
+                crate::kernels::Backend::of_family(&plan.family),
+                Some(crate::kernels::Backend::Metal)
+            );
+            assert!(crate::kernels::check_plan(&plan).is_empty());
+
+            let launches = plan
+                .ops
+                .iter()
+                .filter(|op| matches!(op.kind, OpKind::Launch { .. }))
+                .count();
+            // Every op of this text is a stated kernel except the
+            // SplitQkv the fused binding traces.
+            assert_eq!(launches + 28, plan.ops.len(), "one split per layer");
+        }
+    }
+
+    /// The deployment facts BRANCH the text, and the branches vanish —
+    /// the load-time-condition rule (`.wiki/tart/dsl.md`: "resolves once,
+    /// vanishes"). A deployment without the epilogue fold states an
+    /// explicit residual landing per block instead.
+    #[test]
+    fn the_metal_facts_resolve_at_trace_time() {
+        let facts = LlamaLikeFacts::qwen3_0_6b();
+        let fold = llama_like_metal(
+            &facts,
+            &LlamaLikeMetalFacts::synthetic(),
+            FireClass::Decode,
+        );
+        let no_fold = llama_like_metal(
+            &facts,
+            &LlamaLikeMetalFacts {
+                fuse_residual_gemv: false,
+                ..LlamaLikeMetalFacts::synthetic()
+            },
+            FireClass::Decode,
+        );
+        let count = |p: &ForwardPlan, sym: &str| {
+            p.ops
+                .iter()
+                .filter(|op| matches!(&op.kind, OpKind::Launch { kernel, .. } if kernel == sym))
+                .count()
+        };
+        assert_eq!(count(&fold, "residual_add_bfloat16"), 0);
+        // Two folds per block (o_proj and down), landed explicitly.
+        assert_eq!(
+            count(&no_fold, "residual_add_bfloat16"),
+            2 * facts.layers as usize
+        );
+
+        // And the M>1 lane takes the GEMM where M=1 takes the GEMV.
+        let mb = llama_like_metal(
+            &facts,
+            &LlamaLikeMetalFacts::synthetic(),
+            FireClass::Prefill,
+        );
+        assert_eq!(count(&mb, "affine_qmv_fast"), 1, "the readout only");
+        assert!(count(&mb, "affine_qmm_t_residual") > 0);
+        assert!(count(&mb, "sdpa_paged_decode_bfloat16_d_256") > 0);
+        assert!(count(&fold, "sdpa_vector_decode_bfloat16_d_256") > 0);
     }
 }

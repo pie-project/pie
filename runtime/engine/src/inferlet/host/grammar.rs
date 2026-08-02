@@ -34,7 +34,7 @@ impl std::fmt::Debug for Grammar {
 
 pub(crate) fn grammar_compiler() -> &'static GrammarCompiler {
     static COMPILER: OnceLock<GrammarCompiler> = OnceLock::new();
-    COMPILER.get_or_init(|| GrammarCompiler::new(pie_model::model().tokenizer().clone()))
+    COMPILER.get_or_init(|| GrammarCompiler::new(crate::model::model().tokenizer().clone()))
 }
 
 impl pie::inferlet::grammar::HostGrammar for ProcessCtx {
@@ -109,7 +109,7 @@ impl std::fmt::Debug for Matcher {
 
 impl pie::inferlet::grammar::HostMatcher for ProcessCtx {
     async fn new(&mut self, grammar: Resource<Grammar>) -> Result<Resource<Matcher>> {
-        let model = pie_model::model();
+        let model = crate::model::model();
         let stop_tokens = model.instruct().seal();
         let compiled = self.ctx().table.get(&grammar)?.compiled.clone();
         // Rollback history depth. Deep enough for the draft lengths that

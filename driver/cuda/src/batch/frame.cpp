@@ -1,4 +1,5 @@
 #include "batch/frame.hpp"
+#include "pie/driver/region_plans.hpp"
 
 #include <algorithm>
 #include <array>
@@ -97,40 +98,37 @@ struct TpFireCommit {
 // Bounded TP fire pipeline.
 //
 // Rank 0 may NOT run arbitrarily far ahead of the follower: `pi.*` and the
-// NCCL communicator are one shared set, and with `PIE_FRAME_SIZE` > 1 a frame's
+// NCCL communicator are one shared set, and with k > 1 a frame's
 // steps are enqueued back to back with no rendezvous, so rank 0 would post fire
 // N+1's payload group while the follower is still inside fire N's forward on
 // that same communicator. That deadlocked the pair (the follower's decode
 // attention kernel never retired).
 //
-// Debug lever, disabled by default. Before posting fire N's collectives, wait
-// for fire N-D to have retired; D=0 means no bound. This existed to work around
-// a TP hang at `PIE_FRAME_SIZE` > 1 that turned out to be the follower skipping
-// the attention plan-staging protocol — fixed there instead. Retained because
-// forcing D=1 collapses a whole class of cross-rank overlap bug into a clean
-// yes/no answer, which is how that one was isolated.
-int tp_fire_runahead_depth() {
-    static const int depth = [] {
-        if (const char* v = std::getenv("PIE_TP_RUNAHEAD_DEPTH")) {
-            const int parsed = std::atoi(v);
-            if (parsed >= 0 && parsed <= 8) return parsed;
-        }
-        // Depth 1 (one TP fire in flight on the device).
-        //
-        // The follower's missing attention plan-staging slot was ONE cause of
-        // the k>1 TP deadlock and is fixed at its source, but it was not the
-        // only one: with bind-time projection packing enabled the hang comes
-        // back at k=1 and k=2 (and not at k=4), which is the signature of a
-        // second overlap hazard that packing's different timing exposes. Until
-        // that one is found too, keep the bound.
-        //
-        // Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4),
-        // small because rank 0 is the rank with slack — the follower is
-        // reactive and already waits inside the payload broadcast.
-        return 1;
-    }();
-    return depth;
-}
+// ONE TP fire in flight on the device: before posting fire N's collectives,
+// wait for fire N-1 to have retired.
+//
+// This is NOT a debug lever, whatever its history says. It is a live
+// workaround for a deadlock nobody has found yet. The follower's missing
+// attention plan-staging slot was ONE cause of the k>1 TP hang and is fixed at
+// its source, but it was not the only one: with bind-time projection packing
+// enabled the hang comes back at k=1 and k=2 — and not at k=4 — which is the
+// signature of a second overlap hazard that packing's different timing
+// exposes. Until that one is found too, the bound stays.
+//
+// Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4), small
+// because rank 0 is the rank with slack: the follower is reactive and already
+// waits inside the payload broadcast.
+//
+// A constant rather than `PIE_TP_RUNAHEAD_DEPTH`, because 0 meant "no bound"
+// and no bound is the hang. A value that hangs the engine must not be a
+// supported input — the same rule that retired `PIE_FRAME_REBIND_ESCAPE`,
+// whose mode 0 was the pre-fix behaviour that wedged. Raising it when the
+// second hazard is found is a code change, and should be: it needs the
+// measurement that justifies it.
+//
+// The ring below is left generic (`kMaxDepth` slots) so that change is a
+// one-line edit here rather than a rewrite.
+constexpr int tp_fire_runahead_depth() { return 1; }
 
 // Two halves: WAIT before this fire's collectives are posted, RECORD after its
 // forward has been enqueued. Waiting on the event `depth` fires back means rank
@@ -178,13 +176,7 @@ void record_slot(cudaStream_t stream) {
 
 }  // namespace tp_runahead
 
-bool tp_device_compose_disabled() {
-    static const bool off = [] {
-        const char* v = std::getenv("PIE_TP_DISABLE_DEVICE_COMPOSE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return off;
-}
+constexpr bool tp_device_compose_disabled() { return false; }
 
 MtpDraftPlan preflight_mtp_draft_logits(
     BatchEngine& engine,
@@ -2404,7 +2396,6 @@ void prepare_step(
     // already covers this one — mark the hook skippable.
     if (previous != nullptr) {
         s.skip_plan = plan_inputs_identical(s, *previous->impl());
-        if (std::getenv("PIE_DISABLE_SKIP_PLAN")) s.skip_plan = false;
     }
 
     if (dbg_fire) s.timing.prepare_end = fire_timing::Clock::now();
@@ -2425,21 +2416,8 @@ struct EnqProfile {
     // rotation) that swamp the per-step averages and made `enq.attn_plan`
     // read as a 2.5ms steady cost when its steady value is ~2us.
     std::uint64_t steps = 0;
-    static std::uint64_t warmup() {
-        static const std::uint64_t n = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE_WARMUP");
-            return (v != nullptr && v[0] != '\0')
-                ? std::strtoull(v, nullptr, 10) : 32ull;
-        }();
-        return n;
-    }
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
+    static constexpr std::uint64_t warmup() { return 32ull; }
+    static constexpr bool enabled() { return false; }
     static EnqProfile& instance() { static EnqProfile p; return p; }
     ~EnqProfile() {
         if (!enabled()) return;
@@ -2699,7 +2677,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         // One TP fire in flight on the device at a time.
         //
         // The persistent input buffers (`pi.*`) and the NCCL communicator are
-        // a SINGLE set shared by every fire. With `PIE_FRAME_SIZE` > 1 a frame
+        // a SINGLE set shared by every fire. With k > 1 a frame
         // holds several steps and `launch` enqueues them back to back with no
         // rendezvous between them, so rank 0 would post fire N+1's payload
         // group while the follower is still executing fire N's forward — whose
@@ -2748,36 +2726,65 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         const auto& ind = s.dispatch_view.region_row_indptr;
         if (bands_on && s.is_pure_decode && !s.have_custom_mask &&
             !ind.empty()) {
-            const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
-            const std::uint32_t* rk = s.dispatch_view.region_k.data();
-            const std::size_t nreg = ind.size() - 1;
-            bool ok = true;
-            bool seen_trunc = false;
-            for (std::size_t r = 0; r < nreg && ok; ++r) {
-                if (rsig[r] &
-                    (PIE_REGION_SIG_HOOK | PIE_REGION_SIG_MASK |
-                     PIE_REGION_SIG_MULTI_TOKEN)) {
-                    ok = false;
-                } else if (rsig[r] & PIE_REGION_SIG_TRUNCATED) {
-                    if (rsig[r] & PIE_REGION_SIG_LORA) { ok = false; break; }
-                    if (seen_trunc &&
-                        rk[r] >= s.depth_band_k.back()) { ok = false; break; }
-                    seen_trunc = true;
-                    s.depth_band_k.push_back(rk[r]);
-                    s.depth_band_rows.push_back(ind.data()[r]);
-                } else if (seen_trunc) {
-                    ok = false;  // a full-depth region after a band
+            // ④/Act 3: SINGLE SOURCE — the same derivation that
+            // suppresses the split/uniform stamps for banded fires
+            // (region_plans.hpp derive_depth_bands) produces the band
+            // arrays here; the gate and the planned words can no longer
+            // disagree.
+            std::uint32_t bk[3];
+            std::uint32_t brows[3];
+            const std::uint32_t m = pie::driver::fire::derive_depth_bands(
+                s.dispatch_view, bk, brows);
+            for (std::uint32_t j = 0; j < m; ++j) {
+                s.depth_band_k.push_back(bk[j]);
+                s.depth_band_rows.push_back(brows[j]);
+            }
+            // Tier-1 contract backstop: a hooked fire with two or more
+            // distinct truncations has exactly one correct server — the
+            // banded walk. The engine's admission gate (worker.rs, hook x
+            // depth) only groups such fires in band-servable shapes, so an
+            // unarmed arrival here is an admission bug; the fallback paths
+            // would demote a lane's k silently, so refuse loudly instead.
+            {
+                const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
+                const std::uint32_t* rk2 = s.dispatch_view.region_k.data();
+                const std::size_t nreg = ind.size() - 1;
+                bool seen_hook = false;
+                // DISTINCT truncations, not truncated regions: a hooked
+                // and a plain region at the SAME k (sigs differ, depth
+                // agrees) is the uniform-stamp shape, served without
+                // bands — the region count would misfire on it (caught
+                // by the extended soak: wire hook@k8 + devgeo k8).
+                std::uint32_t k_seen[3] = {0, 0, 0};
+                std::size_t distinct_k = 0;
+                for (std::size_t r = 0; r < nreg; ++r) {
+                    if (rsig[r] & PIE_REGION_SIG_HOOK) seen_hook = true;
+                    if (rsig[r] & PIE_REGION_SIG_TRUNCATED) {
+                        bool known = false;
+                        for (std::size_t q = 0; q < distinct_k; ++q) {
+                            if (k_seen[q] == rk2[r]) known = true;
+                        }
+                        if (!known && distinct_k < 3) {
+                            k_seen[distinct_k++] = rk2[r];
+                        }
+                    }
+                }
+                if (seen_hook && distinct_k >= 2 &&
+                    s.depth_band_k.empty()) {
+                    throw std::runtime_error(
+                        "hooked multi-depth fire reached the driver without "
+                        "armed bands (" + std::to_string(distinct_k) +
+                        " distinct truncations) — the admission gate should "
+                        "have split it");
                 }
             }
-            if (!ok || s.depth_band_k.size() < 2 ||
-                s.depth_band_k.size() > 3) {
-                s.depth_band_k.clear();
-                s.depth_band_rows.clear();
-            }
             if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+                const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
+                const std::uint32_t* rk = s.dispatch_view.region_k.data();
+                const std::size_t nreg = ind.size() - 1;
                 std::fprintf(stderr,
-                             "[band-gate] ok=%d nreg=%zu bands=%zu",
-                             ok ? 1 : 0, nreg, s.depth_band_k.size());
+                             "[band-gate] bands=%zu",
+                             s.depth_band_k.size());
                 for (std::size_t r = 0; r < nreg; ++r) {
                     std::fprintf(stderr, " sig%zu=%u k=%u", r, rsig[r],
                                  rk[r]);
@@ -2857,8 +2864,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         std::cerr.flush();
     }
     auto dump_rs = [&](const char* tag) {
-        if (!std::getenv("PIE_RS_TRACE") || engine.rs_cache == nullptr ||
-            !s.use_slots || s.R < 1) return;
+        return;
         const int slot = static_cast<int>(s.rs_slot_view[0]);
         std::uint32_t rw[4] = {0, 0, 0, 0}, cw[4] = {0, 0, 0, 0};
         cudaMemcpy(rw, engine.rs_cache->recurrent_state_raw(0, slot),
@@ -2932,9 +2938,14 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         // ledger. The 0-prefix case burned once: [trunc-k, hook-tail]
         // planned full_depth_rows=0, the tail's hooks invoked at
         // layers [k, L), and a k-sized ledger threw at entry k.
-        s.dispatch_view.planned_full_depth_rows != 0xffffffffu
-            ? 0xffffffffu
-            : s.dispatch_view.planned_max_layers,
+        // Tier 2 bound: a truncated hook region caps its own ledger at
+        // its k regardless of the fire-wide plan (a banded fire carries
+        // FULL planned words; the hook rows still stop at their band).
+        std::min(
+            s.dispatch_view.planned_full_depth_rows != 0xffffffffu
+                ? 0xffffffffu
+                : s.dispatch_view.planned_max_layers,
+            pie::driver::fire::hook_region_k(s.dispatch_view)),
     };
     const model::StageHooks stage_hooks{
         .context = &stage_hook_context,
@@ -2945,6 +2956,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             engine.dispatch->launch_wants_page_mask(s.dispatch_view),
         .hook_free_prefix_rows =
             engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
+        .hook_rows_k = pie::driver::fire::hook_region_k(s.dispatch_view),
         .sideband_arena = engine.sideband_arena,
         .execute = [](
             void* opaque,

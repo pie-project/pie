@@ -61,8 +61,6 @@ fn mm_cuda_toml(snapshot_path: &str) -> String {
          [runtime]\n\
          allow_fs = true\n\
          fs_scratch_dir = \"{scratch}\"\n\n\
-         [auth]\n\
-         enabled = false\n\n\
          [model]\n\
          name = \"default\"\n\
          model = \"{snapshot}\"\n\n\

@@ -247,9 +247,8 @@ inline constexpr int kMoeAlignedBlockMax = 64;
 
 inline int moe_aligned_block(int routes, int num_experts) {
     static const int forced = [] {
-        const char* e = std::getenv("PIE_MOE_ALIGNED_BLOCK");
-        if (e == nullptr || e[0] == '\0') return 0;
-        const int parsed = std::atoi(e);
+        return 0;
+        const int parsed = 0;
         return (parsed >= 8 && parsed <= 256 && (parsed & (parsed - 1)) == 0)
                    ? parsed
                    : 0;

@@ -81,6 +81,12 @@ struct Workspace {
     DeviceTensor v;          // [max_tokens, h_kv * head_dim]   — packed
     DeviceTensor attn_out;   // [max_tokens, h_q  * head_dim]   — packed
     DeviceTensor norm_y;     // [max_tokens, hidden]
+    // The declared executor's SSA VALUE ARENA block
+    // (`model/declared/value_arena.hpp`): buffers for traced values, so an
+    // arm asks by value id instead of naming a family's convention. Sized
+    // for the values converted so far and allocated HERE — outside capture
+    // — because a decode body may not allocate.
+    DeviceTensor declared_values;
     DeviceTensor gate_up_fused; // [max_tokens, 2*I] — fused gate+up output, empty
                                 // when unfused
     DeviceTensor mtp_concat;    // [max_tokens, 2*hidden] — Qwen3.6 MTP fc input

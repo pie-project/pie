@@ -296,12 +296,12 @@ void run_qwen3vl_vision(cublasHandle_t blas,const QwenVisRawWeights& w,
 
     // Optional phase timing (PIE_VIS_TIMING=1): patch / per-layer attention /
     // layers-total / merger, computed after the final sync so it doesn't perturb.
-    const bool VTIM = std::getenv("PIE_VIS_TIMING")!=nullptr;
+    constexpr bool VTIM = false;
     // Ablation knob (PIE_VIS_GEMM_ONLY=1): skip the per-layer elementwise launches
     // (norm/split/rope/gelu/bias) so VTIM's `rest` measures GEMM-only time —
     // isolates tensor-core MFU from the memory-bound elementwise stalls between
     // GEMMs. Output is garbage under this flag; timing only.
-    static const bool GEMM_ONLY = std::getenv("PIE_VIS_GEMM_ONLY")!=nullptr;
+    constexpr bool GEMM_ONLY = false;
     const int NL=(int)w.blocks.size();
     cudaEvent_t e_p0=0,e_p1=0,e_le=0,e_me=0;
     std::vector<cudaEvent_t> aS,aE;
@@ -480,7 +480,7 @@ void scatter_qwen3vl_vision(const Qwen3VLVisionInputs& vin, bf* hidden,
     const QwenVisRawWeights& w=*vin.weights;
     const int Hd=w.hidden, MERGE=w.spatial_merge_size, U=MERGE*MERGE, OUT=out_hidden;
     const int PATCH_DIM=w.in_channels*w.temporal_patch_size*w.patch_size*w.patch_size;
-    const bool VTIM = std::getenv("PIE_VIS_TIMING")!=nullptr;
+    constexpr bool VTIM = false;
     using clk=std::chrono::steady_clock;
     auto MS=[](clk::time_point a,clk::time_point b){return std::chrono::duration<double,std::milli>(b-a).count();};
 
@@ -538,18 +538,9 @@ void scatter_qwen3vl_vision(const Qwen3VLVisionInputs& vin, bf* hidden,
     // them in ONE batched tower pass (bigger GEMMs, per-image block-diag attention).
     // OFF by default: measured ~6% SLOWER here — the per-image vision GEMMs are
     // already compute-efficient at M=n_patch, so batching to M=Σn_patch gives no
-    // GEMM win while the multi-seq attention + larger buffers add overhead. Kept
-    // (env-gated) since it's correct and could help many-tiny-image batches.
-    bool uniform = (vin.num_images > 1) && std::getenv("PIE_VIS_BATCH_IMAGES") != nullptr;
-    int g0t=0,g0h=0,g0w=0,np0=0;
-    if(uniform){
-        g0t=(int)vin.grids_h[0]; g0h=(int)vin.grids_h[1]; g0w=(int)vin.grids_h[2];
-        np0=g0t*g0h*g0w;
-        if(np0%PS!=0) uniform=false;
-        for(int im=0; im<vin.num_images && uniform; ++im)
-            if((int)vin.grids_h[3*im]!=g0t||(int)vin.grids_h[3*im+1]!=g0h||(int)vin.grids_h[3*im+2]!=g0w)
-                uniform=false;
-    }
+    // GEMM win while the multi-seq attention + larger buffers add overhead.
+    constexpr bool uniform = false;
+    const int g0t=0,g0h=0,g0w=0,np0=0;
 
     if(uniform){
         const int num_img=vin.num_images, n_patch=np0, n_token=n_patch/U;

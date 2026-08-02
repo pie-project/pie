@@ -147,14 +147,7 @@ inline const void* bf16_row(const void* base, int row, int width)
            static_cast<std::ptrdiff_t>(row) * width;
 }
 
-bool decode_full_attention_variant_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DECODE_FULL_ATTENTION");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+bool decode_full_attention_variant_enabled() { return true; }
 
 // PIE_LORA_GROUPED: same-shape lora lanes share one grouped-GEMM launch
 // per correction GEMM instead of per-lane pairs. Default ON.
@@ -1243,6 +1236,26 @@ void prepare_llama_like_decode_plan(
         state.use_xqa_decode = true;
         state.xqa_max_pages_per_seq =
             ops::xqa_decode_page_bucket(max_pages);
+        // ④ envelope banding: this deployment's band walk is PLAN-FREE
+        // (the XQA arm reads the fire's staged device CSRs and takes the
+        // row count as a parameter), so stamping k/rows is ALL the
+        // prepare owes — no flashinfer band plans. Without this stamp
+        // the early return demoted every XQA deployment (14B) to the
+        // full-depth walk with neither [depth-bands] nor DECLINE.
+        state.depth_band_count = 0;
+        if (depth_band_count >= 1 && depth_band_count <= 3 &&
+            !have_custom_mask) {
+            for (std::uint32_t j = 0; j < depth_band_count; ++j) {
+                state.depth_band_k[j] = depth_band_k[j];
+                state.depth_band_rows[j] = depth_band_rows[j];
+            }
+            state.depth_band_count = depth_band_count;
+        }
+        if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[band-prep] xqa-branch in=%u stamped=%u\n",
+                         depth_band_count, state.depth_band_count);
+        }
         return;
     }
     if (!is_pure_decode) {
@@ -1294,6 +1307,26 @@ void prepare_llama_like_decode_plan(
     if (fwd_cfg.force_prefill_path) {
         state.use_prefill_plan = false;
         state.use_prefill_decode_plan = false;
+        // ④ envelope banding, force_prefill deployment (14B-class: the
+        // GQA ratio keeps the decode kernel out, decode runs the
+        // PLAN-FREE prefill dispatch): a band is the prefix call
+        // N = R = rows on that same dispatch — the spatial split's
+        // prefix already runs exactly this shape. k/rows is all the
+        // prepare owes; there are no plans on this deployment at all.
+        state.depth_band_count = 0;
+        if (depth_band_count >= 1 && depth_band_count <= 3 &&
+            is_pure_decode && !have_custom_mask) {
+            for (std::uint32_t j = 0; j < depth_band_count; ++j) {
+                state.depth_band_k[j] = depth_band_k[j];
+                state.depth_band_rows[j] = depth_band_rows[j];
+            }
+            state.depth_band_count = depth_band_count;
+        }
+        if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[band-prep] force-prefill-branch in=%u stamped=%u\n",
+                         depth_band_count, state.depth_band_count);
+        }
         return;
     }
     const int min_prefill_decode_pages =
@@ -1348,7 +1381,7 @@ void prepare_llama_like_decode_plan(
         // dispatch on this deployment is the planned causal prefill —
         // one plan per boundary, identity-qo prefix restriction, each
         // in its OWN workspace (the per-band isolation rule).
-        if (depth_band_count >= 2 && depth_band_count <= 3 &&
+        if (depth_band_count >= 1 && depth_band_count <= 3 &&
             is_pure_decode && !have_custom_mask) {
             for (std::uint32_t j = 0; j < depth_band_count; ++j) {
                 const std::uint32_t rows = depth_band_rows[j];
@@ -1426,13 +1459,21 @@ void prepare_llama_like_decode_plan(
     // whose start row is 0 needs no plan — nothing lives past it and
     // the body stops walking layers there.
     state.depth_band_count = 0;
-    if (depth_band_count >= 2 && depth_band_count <= 3 &&
+    if (depth_band_count >= 1 && depth_band_count <= 3 &&
         is_pure_decode && !have_custom_mask) {
         for (std::uint32_t j = 0; j < depth_band_count; ++j) {
             const std::uint32_t rows = depth_band_rows[j];
             state.depth_band_k[j] = depth_band_k[j];
             state.depth_band_rows[j] = rows;
             if (rows == 0) continue;
+            // ④ envelope banding: the XQA deployment is PLAN-FREE — its
+            // kernels read the (compose-written) device CSRs directly and
+            // take the row count as a parameter, so a band is just the
+            // prefix call R = rows. No flashinfer band plans are built
+            // (the host CSRs are 1-page placeholders on the composed
+            // path and would plan garbage); the band walk dispatches XQA
+            // against the fire's own staged workspace instead.
+            if (state.use_xqa_decode) continue;
             if (!state.depth_band_plans[j]) {
                 state.depth_band_plans[j] = ops::make_decode_plan();
             }
@@ -1750,6 +1791,17 @@ void llama_like_forward_paged(
                                AttentionWorkspace& attn_ws,
                                const ops::PrefillPlanCache*
                                    prefill_plan_override = nullptr) {
+        // Tier 2: hook stages fire only while the hook rows are live —
+        // a truncated hook region's rows freeze past its k in the banded
+        // walk, and an invocation there would observe garbage rows. The
+        // same bound caps both ledgers (frame prep planned_layers,
+        // dispatch finish expected_layers) via hook_region_k, so the
+        // three agree by construction.
+        const model::StageHooks* layer_hooks =
+            (hooks != nullptr &&
+             static_cast<std::uint32_t>(L) < hooks->hook_rows_k)
+                ? hooks
+                : nullptr;
         const auto& layer = w.layers[L];
 
         // Pre-norm: norm(y) → norm_x; QKV reads from norm_x.
@@ -1785,9 +1837,9 @@ void llama_like_forward_paged(
         // fire. Pure decode (a predicate condition below) maps request rows
         // onto token rows 1:1, which is what lets one row count partition
         // both the QKV postprocess and the KV write.
-        const int fast_rows = hooks == nullptr
+        const int fast_rows = layer_hooks == nullptr
             ? R
-            : std::min(static_cast<int>(hooks->hook_free_prefix_rows), R);
+            : std::min(static_cast<int>(layer_hooks->hook_free_prefix_rows), R);
         const bool fused_decode_qkv_post =
             use_fused_qkv &&
             // Device-window capture (peel_window_d): the branch must not
@@ -1816,7 +1868,7 @@ void llama_like_forward_paged(
         // all-fused fire; N on the classic all-unfused one. Pure decode has
         // N == R, so the same count serves token- and request-indexed calls.
         const int unfused_tail_rows = fused_decode_qkv_post ? N - fast_rows : N;
-        if (L == 0 && hooks != nullptr && std::getenv("PIE_HOOK_PREFIX_TRACE")) {
+        if (L == 0 && layer_hooks != nullptr && std::getenv("PIE_HOOK_PREFIX_TRACE")) {
             std::fprintf(stderr,
                          "[hook-prefix] R=%d fast_rows=%d fused=%d\n",
                          R, fast_rows, fused_decode_qkv_post ? 1 : 0);
@@ -2031,7 +2083,7 @@ void llama_like_forward_paged(
         page_mask.begin_layer(stream);
 
         invoke_stage_hook(
-            hooks,
+            layer_hooks,
             StageHookPoint::OnAttnProj,
             ws.q.data(),
             static_cast<std::uint32_t>(N),
@@ -2197,13 +2249,13 @@ void llama_like_forward_paged(
         const bool prefill_capture_eligible =
             use_prefill_score_path && layer_window_left < 0;
         model::LayerScoreCapture score_capture(
-            hooks,
+            layer_hooks,
             static_cast<std::uint32_t>(L),
             static_cast<std::uint32_t>(num_q_heads_local),
             /*capturable=*/layer_window_left < 0 && !prefill_capture_eligible,
             stream);
         model::LayerPrefillScoreCapture prefill_score_capture(
-            hooks,
+            layer_hooks,
             static_cast<std::uint32_t>(L),
             static_cast<std::uint32_t>(num_q_heads_local),
             plan_state.prefill_score_window,
@@ -2564,7 +2616,7 @@ void llama_like_forward_paged(
                 /*logits_soft_cap=*/0.f, sm_scale_override);
         }
         invoke_stage_hook(
-            hooks,
+            layer_hooks,
             StageHookPoint::OnAttn,
             ws.q.data(),
             static_cast<std::uint32_t>(N),
@@ -2730,12 +2782,24 @@ void llama_like_forward_paged(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
         }
     };
+    // ④ tier 1 (Act-2 order): hook fires band. The frame gate arms bands
+    // only when every hooked region is FULL-DEPTH in the plain prefix —
+    // inside [0, band_rows[j]) at every banded layer — so the per-layer
+    // hook invocations inside run_layer cover exactly the hook rows'
+    // planned depth, and the score capture rides each band's own plan.
     const bool bands_runnable =
-        plan_state.depth_band_count >= 2 && is_pure_decode &&
-        !has_custom_mask && hooks == nullptr && !use_xqa_decode_path &&
-        (use_decode_path || use_prefill_decode_path) &&
+        plan_state.depth_band_count >= 1 && is_pure_decode &&
+        !has_custom_mask &&
+        // A page-mask-writing hook substitutes the fire's page table at
+        // full R on the paged decode path; the banded layers run attention
+        // at live<R rows, and the compaction and the fire then disagree on
+        // request count (caught by the soak's h2o lane). Observation-only
+        // hooks band; Track-B hooks keep the pre-band servers.
+        (hooks == nullptr || !hooks->wants_page_mask) &&
+        (use_decode_path || use_prefill_decode_path ||
+         fwd_cfg.force_prefill_path) &&
         layer_bound == cfg.num_hidden_layers;
-    if (plan_state.depth_band_count >= 2 && !bands_runnable &&
+    if (plan_state.depth_band_count >= 1 && !bands_runnable &&
         std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
         // Degrade loudly-quietly: the fire runs full depth (today's
         // demotion) rather than dying — deployments the banded walk
@@ -2785,14 +2849,28 @@ void llama_like_forward_paged(
                 plan_state
                     .depth_band_prefill_plans[static_cast<std::size_t>(j)]
                     .get();
-            if (use_prefill_decode_path ? band_prefill == nullptr
-                                        : band_plan == nullptr) {
+            // ④ envelope banding: the XQA arm is PLAN-FREE — it reads
+            // the fire's staged device CSRs and takes the row count as
+            // a parameter, so the band's prefix call needs neither a
+            // band plan nor a separate workspace (the per-band
+            // workspace isolation exists for flashinfer plan state; the
+            // XQA staging in the fire's own workspace is read-only to
+            // the launches and the band call must see it).
+            // Plan-free deployments (XQA, and force_prefill's plan-free
+            // prefill dispatch) band by the prefix row count alone.
+            const bool plan_free_bands =
+                use_xqa_decode_path ||
+                (fwd_cfg.force_prefill_path && !use_prefill_decode_path);
+            if (!plan_free_bands &&
+                (use_prefill_decode_path ? band_prefill == nullptr
+                                         : band_plan == nullptr)) {
                 throw std::runtime_error(
                     "depth bands: band active but prepare built no "
                     "plan for it");
             }
             for (int L = from; L < to; ++L) {
-                run_layer(L, live, live, band_plan, depth_band_ws(j),
+                run_layer(L, live, live, band_plan,
+                          plan_free_bands ? attn_ws : depth_band_ws(j),
                           band_prefill);
             }
         }
@@ -2954,9 +3032,54 @@ void llama_like_forward_paged(
                 N, H, eps, stream);
             lm_head_input = ws.norm_y.data();
         }
-        ops::gemm_act_x_w(cublas.handle(),
-            lm_head_input, *w.lm_head, ws.logits.data(),
-            lm_head_rows, V, H);
+        // Fused LM head + greedy argmax: the vocabulary is reduced slab by
+        // slab as it is produced, so the [rows, vocab] logits never exist
+        // (§20.37). The slab scratch is carved out of `ws.logits` -- by
+        // construction the buffer this path is not filling -- so the fused
+        // route allocates nothing.
+        //
+        // There is deliberately no quiet fallback. By the time the forward
+        // runs, `prepare_step` has already put `kGvFusedArgmax` in the graph
+        // key and `settle_step` will hand the epilogue `ws.sampled_tokens`
+        // whatever happens here; materializing logits instead would leave the
+        // epilogue publishing uninitialised memory as token ids. Every
+        // condition below is established before the fire is admitted
+        // (`ModelCapabilities::supports_fused_lm_head_argmax` for the weight,
+        // and `lm_head_rows <= workspace_logits_rows` for the shapes), so this
+        // is an assertion, not a branch.
+        const int chunk = fwd_cfg.logits_argmax_chunk_tokens;
+        if (chunk > 0) {
+            const auto rows = static_cast<std::size_t>(lm_head_rows);
+            const std::size_t accum = rows * kernels::kArgmaxAccumSlots;
+            if (ws.sampled_tokens.numel() < rows ||
+                ws.argmax_acc_val.numel() < accum ||
+                ws.argmax_acc_idx.numel() < accum) {
+                throw std::runtime_error(
+                    "fused lm_head argmax: workspace holds fewer rows than "
+                    "this fire samples");
+            }
+            if (ops::lm_head_argmax_slab_bytes(lm_head_rows, V, chunk) >
+                ws.logits.nbytes()) {
+                throw std::runtime_error(
+                    "fused lm_head argmax: vocabulary slab does not fit the "
+                    "logits arena");
+            }
+            if (!ops::lm_head_argmax_chunked(
+                    cublas.handle(), lm_head_input, *w.lm_head,
+                    static_cast<std::int32_t*>(ws.sampled_tokens.data()),
+                    ws.logits.data(),
+                    static_cast<float*>(ws.argmax_acc_val.data()),
+                    static_cast<std::int32_t*>(ws.argmax_acc_idx.data()),
+                    lm_head_rows, V, H, chunk)) {
+                throw std::runtime_error(
+                    "fused lm_head argmax: lm_head weight is not dense BF16, "
+                    "yet the model advertised the capability");
+            }
+        } else {
+            ops::gemm_act_x_w(cublas.handle(),
+                lm_head_input, *w.lm_head, ws.logits.data(),
+                lm_head_rows, V, H);
+        }
     }
 }
 

@@ -36,6 +36,10 @@ struct Input {
     /// output must differ from the maskless run.
     #[serde(default)]
     blind: Option<u32>,
+    /// WIRE-ROUTE LoRA rank override (default 8) — plan.md done-criterion
+    /// 3's probe: two adapters of DIFFERENT rank in one fire.
+    #[serde(default)]
+    lora_rank: Option<u32>,
     /// WIRE-ROUTE LoRA: attach a Q-site adapter (rank 8) through
     /// `Pass::adapter` at this amplitude. Wire fires then carry the LORA
     /// region signature — the axis rides the same co-batchable class as
@@ -75,9 +79,9 @@ fn lora_pattern(i: u32, salt: u32, amp: f32) -> f32 {
     ((h % 10_000) as f32 / 10_000.0 - 0.5) * 2.0 * amp
 }
 
-fn make_lora_channels(scale: f32, layers: u32, d_in: u32, d_out: u32) -> (Channel, Channel) {
-    let a_len = (layers * LORA_RANK * d_in) as usize;
-    let b_len = (layers * d_out * LORA_RANK) as usize;
+fn make_lora_channels(scale: f32, rank: u32, layers: u32, d_in: u32, d_out: u32) -> (Channel, Channel) {
+    let a_len = (layers * rank * d_in) as usize;
+    let b_len = (layers * d_out * rank) as usize;
     let a_host: Vec<f32> = (0..a_len as u32)
         .map(|i| lora_pattern(i, 0x0a0a_a0a0, 0.05))
         .collect();
@@ -85,8 +89,8 @@ fn make_lora_channels(scale: f32, layers: u32, d_in: u32, d_out: u32) -> (Channe
         .map(|i| lora_pattern(i, 0x0c0c_c0c0, 0.5) * scale)
         .collect();
     (
-        Channel::from_shaped([layers, LORA_RANK, d_in], a_host).named("lora_a"),
-        Channel::from_shaped([layers, d_out, LORA_RANK], b_host).named("lora_b"),
+        Channel::from_shaped([layers, rank, d_in], a_host).named("lora_a"),
+        Channel::from_shaped([layers, d_out, rank], b_host).named("lora_b"),
     )
 }
 
@@ -153,7 +157,7 @@ async fn main(input: Input) -> Result<String> {
         prefill.set_max_layers(k)?;
     }
     if let Some(scale) = input.adapter_scale {
-        let (a, b) = make_lora_channels(scale, input.lora_layers, input.lora_d_in, input.lora_d_out);
+        let (a, b) = make_lora_channels(scale, input.lora_rank.unwrap_or(LORA_RANK), input.lora_layers, input.lora_d_in, input.lora_d_out);
         use inferlet::ptir::adapter::{mm, Site};
         prefill.adapter(Site::Q, |x, y| y + mm(&b, mm(&a, x)))?;
     }
@@ -221,7 +225,7 @@ async fn main(input: Input) -> Result<String> {
         decode.set_max_layers(k)?;
     }
     if let Some(scale) = input.adapter_scale {
-        let (a, b) = make_lora_channels(scale, input.lora_layers, input.lora_d_in, input.lora_d_out);
+        let (a, b) = make_lora_channels(scale, input.lora_rank.unwrap_or(LORA_RANK), input.lora_layers, input.lora_d_in, input.lora_d_out);
         use inferlet::ptir::adapter::{mm, Site};
         decode.adapter(Site::Q, |x, y| y + mm(&b, mm(&a, x)))?;
     }

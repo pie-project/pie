@@ -195,7 +195,7 @@ mod tests {
             ..StorageTarget::default()
         };
         let plan = crate::plan::compile(&metadata, &materialization.contract, target).unwrap();
-        let storage = crate::testkit::host_executor::execute_plan(&plan, &dir).unwrap();
+        let storage = crate::executor::host::execute_plan(&plan, &dir).unwrap();
 
         let mut expected_w = Vec::new();
         for _ in 0..32 {
@@ -250,7 +250,7 @@ mod tests {
             ..StorageTarget::default()
         };
         let plan = crate::plan::compile(&metadata, &materialization.contract, target).unwrap();
-        let storage = crate::testkit::host_executor::execute_plan(&plan, &dir).unwrap();
+        let storage = crate::executor::host::execute_plan(&plan, &dir).unwrap();
 
         let expected: Vec<u8> = [1.0f32, -2.0, 0.5, 384.0]
             .iter()

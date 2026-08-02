@@ -49,7 +49,7 @@
 //!
 //! bos/eos/`chat_template` are also absent, because they are not part of a
 //! tokenizer here — they live as per-architecture Rust under
-//! `runtime/model/src/instruct/`. Serializing them would create fields nothing
+//! `model/src/instruct/`. Serializing them would create fields nothing
 //! reads until that code is refactored, and a schema commitment bought for
 //! nothing is the one kind this format cannot take back.
 
@@ -297,7 +297,7 @@ impl Tokenizer {
         ensure!(
             descriptor.version == VERSION,
             "this artifact's tokenizer is {:?}, and this build reads {VERSION}; \
-             regenerate it with `pie model convert --force`",
+             regenerate it with `pie model import --force`",
             descriptor.version
         );
 

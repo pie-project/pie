@@ -17,22 +17,9 @@ namespace pie_cuda_driver::fire_timing {
 
 using Clock = std::chrono::steady_clock;
 
-inline bool full() {
-    static const bool value = [] {
-        const char* setting = std::getenv("PIE_FIRE_TIMING");
-        return setting != nullptr && setting[0] != '\0' && setting[0] != '0';
-    }();
-    return value;
-}
+constexpr bool full() { return false; }
 
-inline bool enabled() {
-    static const bool value = [] {
-        if (full()) return true;
-        const char* setting = std::getenv("PIE_LEDGER_TIMING");
-        return setting != nullptr && setting[0] != '\0' && setting[0] != '0';
-    }();
-    return value;
-}
+constexpr bool enabled() { return false; }
 
 inline std::uint64_t duration_us(
     Clock::time_point start,

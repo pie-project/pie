@@ -37,7 +37,7 @@
 #include <string>
 #include <vector>
 
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/imodel.hpp"
 
 namespace pie_cuda_driver {
@@ -250,14 +250,6 @@ struct ArchEntry {
     // *program* half of `plan = compile(source_facts, program, target)`. The
     // implementation lives in the family's own directory next to its forward
     // pass, and the loader type-checks it against what the files actually
-    // contain (`model/contract.hpp`).
-    //
-    // It belongs on the same row as `bind` because the two are one statement
-    // said twice — the contract names the tensors, `bind` reads them, and a row
-    // whose halves disagree fails at bind time with a missing weight instead of
-    // at compile time with a message. It used to be a second `model_type` table
-    // in `driver/common/`, and the two had drifted by six strings.
-    std::function<void(ContractBuilder&)> author_contract;
 };
 
 // The single arch table, one row per supported `model_type` string.

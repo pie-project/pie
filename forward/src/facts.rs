@@ -318,6 +318,47 @@ pub struct LlamaLikeCudaFacts {
     pub head_dim_padded: bool,
 }
 
+/// The METAL backend's load-time facts — what the Metal deployment
+/// resolved before any fire, the way [`LlamaLikeCudaFacts`] carries
+/// CUDA's.
+///
+/// UNVERIFIED (2026-08-05): no Metal deployment has produced these yet.
+/// The Metal driver cannot even build on the box we have (`xcrun --find
+/// metal` fails — the shader compiler ships with full Xcode), so every
+/// field here is read off the driver's SOURCE
+/// (`driver/metal/src/kernels/decode_psos.cpp`, `model/qwen3_5/decode_step.hpp`)
+/// rather than measured. `.wiki/tart/macos.md` records the ladder; the
+/// precedent for refusing to call an unmeasured fact set measured is
+/// [`Qwen35CudaFacts::qwen3_5_0_8b_synthetic`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlamaLikeMetalFacts {
+    /// The projection GEMV folds the block residual in its epilogue
+    /// (`affine_qmv_fast_residual`, `Dispatch::fuse_residual`,
+    /// `PIE_FUSE_RESIDUAL`), so a `beta_one` matmul states one launch
+    /// instead of a projection plus a `residual_add`.
+    pub fuse_residual_gemv: bool,
+    /// The M>1 lane addresses the KV cache through a page table
+    /// (`sdpa_paged_decode` + `kv_append_paged`) rather than the M=1
+    /// contiguous pair (`sdpa_vector_decode` + `kv_append`).
+    pub paged_multi_batch: bool,
+    /// The M>1 projections take MLX's steel quantized GEMM
+    /// (`affine_qmm_t`) instead of the GEMV — the driver's
+    /// `kQmmMinBatch` gate, as a load-time fact of the deployment.
+    pub qmm_multi_batch: bool,
+}
+
+impl LlamaLikeMetalFacts {
+    /// A SYNTHETIC fixture, not a measurement — see the struct comment.
+    /// These are the driver's own defaults as its source reads them.
+    pub fn synthetic() -> Self {
+        Self {
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+        }
+    }
+}
+
 impl LlamaLikeCudaFacts {
     /// Qwen3-0.6B on L40S, default env — MEASURED 2026-08-02 against the
     /// driver's own derivation via the rung-3 digest print

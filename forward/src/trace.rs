@@ -265,6 +265,28 @@ pub struct GuardArm {
     pub ops: u32,
 }
 
+/// ONE SEAM STATEMENT the model text made, in text order
+/// (`.wiki/tart/dsl.md` ①, migration step 4).
+///
+/// Three of the five seams lower to ops today (two `HookSite`s and the
+/// adapter's `HasLora` guard); the two BOUNDARY seams lower to nothing
+/// at all, which is why prologue and epilogue live in a different world
+/// from the rest — the traced form does not record that the text has
+/// them. This list records every seam the text stated, whichever way it
+/// lowered, so "what does this declaration expose?" has one answer.
+///
+/// `op` is the index of the op carrying the seam when one does. A
+/// boundary seam has none: it is a statement about the trace, not a
+/// point inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeamStatement {
+    pub seam: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<u32>,
+}
+
 /// One operation of the traced form.
 ///
 /// Weights are referenced by name; `layer` tags the ops that address
@@ -617,29 +639,6 @@ pub struct Op {
     pub outputs: Vec<ValueId>,
     /// The layer this op belongs to, or `None` for prologue/epilogue.
     pub layer: Option<u32>,
-    /// STRUCTURAL S-3, promoted (the review's depth-IR gap): this op's
-    /// role under the DEPTH axis, stated as VOCABULARY the goldens pin
-    /// rather than a membership rule three walkers re-derive from the
-    /// layer tag. `None` = outside the axis (prologue/epilogue — the
-    /// unchanged tail is the logit-lens head by construction).
-    /// The split point `k` remains a runtime input; the role says WHAT
-    /// this op does when its layer falls in the truncated range.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub depth_role: Option<DepthRole>,
-}
-
-/// An op's behavior under the depth axis ([`Op::depth_role`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DepthRole {
-    /// Skipped on a uniform truncated fire when `layer >= k`; runs over
-    /// the full-depth prefix rows on a union fire.
-    Windowed,
-    /// `Windowed`, and additionally the attention dispatch pairs the
-    /// depth PREFIX plan with the dedicated workspace on union tail
-    /// layers (the plan/workspace pairing rule) instead of the fire's
-    /// decode plan.
-    PrefixPlanSwap,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -676,6 +675,9 @@ pub struct ForwardPlan {
     /// (XQA-deployment, padded head dims, prefill shapes).
     #[serde(default, skip_serializing_if = "is_false")]
     pub depth_window: bool,
+    /// Every seam the text stated ([`SeamStatement`]), in text order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seams: Vec<SeamStatement>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -683,6 +685,42 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl ForwardPlan {
+    /// DEPTH HAS NO SYNTAX (`.wiki/tart/dsl.md` ③, migration step 5).
+    ///
+    /// Every statement tagged with a layer is implicitly `rows(depth >
+    /// l)`: it is skipped on a uniform truncated fire once its layer
+    /// reaches `k`, and runs over the full-depth prefix rows on a union
+    /// fire. The author writes nothing, and the IR carries no word —
+    /// membership is the LAYER TAG plus the declaration's axis, which
+    /// is what an `Op` already has.
+    ///
+    /// This replaces a per-op `DepthRole` enum whose `Windowed` variant
+    /// was exactly this predicate, restated on every layer-tagged op of
+    /// every trace.
+    pub fn depth_windowed(&self, op: &Op) -> bool {
+        self.depth_window && op.layer.is_some()
+    }
+
+    /// Does this op's kernel pair the depth PREFIX plan (and its
+    /// dedicated workspace) on union tail layers, instead of the fire's
+    /// own decode plan?
+    ///
+    /// The other half of the retired `DepthRole`, and it was never a
+    /// property of the OP: it is a property of the KERNEL, so it lives
+    /// in the kernel table beside `whole` and `needs`
+    /// ([`crate::kernels::KernelSig::depth_prefix_plan`]).
+    pub fn depth_prefix_plan(&self, op: &Op) -> bool {
+        if !self.depth_windowed(op) {
+            return false;
+        }
+        let OpKind::Launch { kernel, .. } = &op.kind else {
+            return false;
+        };
+        crate::kernels::Backend::of_family(&self.family)
+            .and_then(|b| crate::kernels::sig_in(b, kernel))
+            .is_some_and(|k| k.depth_prefix_plan)
+    }
+
     /// Ops belonging to layer `l`, in execution order.
     pub fn layer_ops(&self, l: u32) -> impl Iterator<Item = &Op> {
         self.ops.iter().filter(move |op| op.layer == Some(l))
@@ -697,12 +735,25 @@ pub struct TraceBuilder {
     values: Vec<ValueInfo>,
     ops: Vec<Op>,
     layer: Option<u32>,
+    /// Seam statements in text order ([`SeamStatement`]).
+    seams: Vec<SeamStatement>,
     /// Open [`Self::open_guard`] depth. Nesting is part of the
     /// vocabulary since A1 (north-star-dsl.md, the class-collapse
     /// amendment): a nested guard is an ordinary op inside a region —
     /// region lengths count it and its regions, the aux wire encoding
     /// is unchanged, the walk keeps a skip stack, the emitter recurses.
     guard_depth: u32,
+    /// Open VALUE-PRODUCING regions ([`Self::open_guard`] /
+    /// [`Self::open_peel`] with output shapes). A launch recorded while
+    /// this is non-zero is a LOWERING of the enclosing construct's
+    /// output — it binds that buffer and records no SSA output of its
+    /// own — and a launch recorded at zero produces its own value.
+    ///
+    /// That is a property of WHERE THE STATEMENT IS, not of the kernel,
+    /// and encoding it in the wrapper name is why `dsl::cuda` grew ten
+    /// wrappers over five kernels (`.wiki/tart/dsl.md` ②, migration
+    /// step 2). Tracking it here lets one wrapper serve both positions.
+    value_region_depth: u32,
     /// V2 rung ②: the depth axis, DECLARED BY THE BODY
     /// ([`Self::declare_depth_window`]) instead of painted on after the
     /// trace (the review's smell — family.rs:64-91). While set, every
@@ -719,7 +770,9 @@ impl TraceBuilder {
             values: Vec::new(),
             ops: Vec::new(),
             layer: None,
+            seams: Vec::new(),
             guard_depth: 0,
+            value_region_depth: 0,
             depth_axis: false,
         }
     }
@@ -765,6 +818,9 @@ impl TraceBuilder {
     /// enclosing arm's length simply counts them.
     pub(crate) fn open_guard(&mut self, out_shapes: Vec<(Shape, DType)>) -> (usize, Vec<ValueId>) {
         self.guard_depth += 1;
+        if !out_shapes.is_empty() {
+            self.value_region_depth += 1;
+        }
         let outs = self.push(
             OpKind::Guard {
                 arms: Vec::new(),
@@ -778,6 +834,12 @@ impl TraceBuilder {
 
     pub(crate) fn op_count_now(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Is the statement being recorded a LOWERING of an enclosing
+    /// construct's output rather than a producer of its own value?
+    pub(crate) fn inside_value_region(&self) -> bool {
+        self.value_region_depth > 0
     }
 
     /// Open an [`OpKind::Peel`]: records the op with empty region
@@ -799,6 +861,9 @@ impl TraceBuilder {
             vec![],
             out_shapes,
         );
+        if !outs.is_empty() {
+            self.value_region_depth += 1;
+        }
         (self.ops.len() - 1, outs)
     }
 
@@ -813,10 +878,33 @@ impl TraceBuilder {
         };
         *prefix_ops = prefix;
         *tail_ops = tail;
+        if !self.ops[peel_idx].outputs.is_empty() {
+            self.value_region_depth -= 1;
+        }
+    }
+
+    /// Patch a peel's AXIS after its arms have run — the axis is a
+    /// consequence of the arm's row predicate ([`crate::dsl::RowPred`]),
+    /// which is only known once the arm is written.
+    pub(crate) fn set_peel_window(&mut self, peel_idx: usize, w: PeelWindow) {
+        let OpKind::Peel { window, .. } = &mut self.ops[peel_idx].kind else {
+            panic!("set_peel_window: not a peel at {peel_idx}");
+        };
+        *window = w;
     }
 
     pub(crate) fn push_hook_site(&mut self, stage: HookStage, layer: u32, q: ValueId) {
         self.push(OpKind::HookSite { stage, layer }, vec![q], vec![]);
+    }
+
+    /// Record that the text stated a seam, with the index of the op
+    /// carrying it when one does.
+    pub(crate) fn push_seam(&mut self, seam: &str, layer: Option<u32>, op: Option<u32>) {
+        self.seams.push(SeamStatement {
+            seam: seam.to_string(),
+            layer,
+            op,
+        });
     }
 
     pub(crate) fn close_guard(&mut self, guard_idx: usize, arms: Vec<GuardArm>, else_ops: u32) {
@@ -831,6 +919,9 @@ impl TraceBuilder {
         *e = else_ops;
         assert!(self.guard_depth > 0, "close_guard without open_guard");
         self.guard_depth -= 1;
+        if !self.ops[guard_idx].outputs.is_empty() {
+            self.value_region_depth -= 1;
+        }
     }
 
     /// The `+=` fold ([`crate::dsl`]): if `rhs` is the output of the op
@@ -894,24 +985,11 @@ impl TraceBuilder {
             .into_iter()
             .map(|(shape, dtype)| self.value(shape, dtype))
             .collect();
-        let depth_role = if self.depth_axis && self.layer.is_some() {
-            Some(match &kind {
-                OpKind::Launch { kernel, .. }
-                    if kernel == "dispatch_attention_flashinfer_decode" =>
-                {
-                    DepthRole::PrefixPlanSwap
-                }
-                _ => DepthRole::Windowed,
-            })
-        } else {
-            None
-        };
         self.ops.push(Op {
             kind,
             inputs,
             outputs: outputs.clone(),
             layer: self.layer,
-            depth_role,
         });
         outputs
     }
@@ -1400,11 +1478,25 @@ impl TraceBuilder {
     }
 
     pub fn finish(self) -> ForwardPlan {
-        ForwardPlan {
+        let plan = ForwardPlan {
             family: self.family,
             values: self.values,
             ops: self.ops,
             depth_window: self.depth_axis,
-        }
+            seams: self.seams,
+        };
+        // ② The kernel signatures, checked (`.wiki/tart/dsl.md` ②,
+        // migration step 3). A declaration is traced when the model
+        // LOADS, so this is the load-time check the design asks for:
+        // `whole` and the table's own coverage stop being rules a
+        // reader has to know and become rules a build cannot violate.
+        let mut problems = crate::kernels::check_plan(&plan);
+        problems.extend(crate::dsl::seam::check_plan(&plan));
+        assert!(
+            problems.is_empty(),
+            "signature violations in this declaration:\n  {}",
+            problems.join("\n  ")
+        );
+        plan
     }
 }

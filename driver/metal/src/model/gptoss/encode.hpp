@@ -43,6 +43,9 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
 /// How many rows the activation pool must hold for `max_rows` to be paddable to
 /// a whole GEMM tile.
 int gptoss_qmm_pool_rows(int max_rows);
+int gptoss_moe_pairs(const GptOssGeometry& g, int rows);
+int gptoss_moe_tile_rows(const GptOssGeometry& g, int rows);
+int gptoss_moe_sorted_rows(const GptOssGeometry& g, int rows);
 void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid& grid,
                      Threadgroup& tg, int head_rows = 0);
 /// `[begin, end)` walks a SLICE of the step. The default is the whole DAG; a
@@ -56,8 +59,8 @@ void encode_gptoss_step_mb(StepEncoder& se, const std::vector<Dispatch>& dag,
                            int ordinal_base = 0, int head_rows = 0, std::size_t begin = 0,
                            std::size_t end = 0);
 
-/// Encode the step against paged KV. One row -- gpt-oss has no M>1 path -- but
-/// the row's history is a page list, so several sequences coexist.
+/// Encode a single-row step against paged KV. Wider fires use
+/// `encode_gptoss_step_mb`, including the sorted routed GEMM.
 void encode_gptoss_step_paged(StepEncoder& se, const std::vector<Dispatch>& dag,
                               const GptOssGeometry& g, const DecodeStepPsos& base,
                               const MultiBatchPsos& mb, const GptOssPsos& go,

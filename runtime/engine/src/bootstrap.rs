@@ -12,7 +12,7 @@ use crate::inferlet::sandbox::{FsPolicy, NetworkPolicy};
 use crate::inferlet::{linker, process, program, python};
 use crate::server;
 use crate::telemetry;
-use pie_model as model;
+use crate::model;
 
 static RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -57,7 +57,6 @@ impl RuntimeShutdown {
         for driver_id in self.driver_ids {
             let _ = driver::backend::unregister_driver(driver_id);
         }
-        crate::store::registry::dump_kv_lock_trace()?;
         scheduler_result
     }
 }
@@ -140,16 +139,18 @@ pub struct ModelConfig {
     pub kv_page_size: usize,
     /// The tokenizer file, for a model served from a HuggingFace snapshot.
     ///
-    /// Only consulted when `artifact` is `None`. A served `.zt` carries its
-    /// tokenizer compiled, so there is no file to point at — this then holds
-    /// the artifact's own path, which is what the diagnostics want anyway.
+    /// Only consulted when `metadata.tokenizer` is `None`. A served `.zt`
+    /// carries its tokenizer compiled, so there is no file to point at — this
+    /// then holds the artifact's own path, which is what the diagnostics want
+    /// anyway.
     pub tokenizer_path: PathBuf,
-    /// Compiled metadata lifted out of a `.zt` artifact.
+    /// The served model's compiled metadata, lifted once by the worker.
     ///
-    /// Present means the runtime reads the tokenizer and the model facts from
-    /// here instead of parsing `tokenizer.json` and probing `config.json` at
-    /// every boot — which is the whole point of the artifact.
-    pub artifact: Option<pie_model::ArtifactMetadata>,
+    /// Not optional: the descriptor inside it is where the runtime's model
+    /// facts come from, for a `.zt` and for a snapshot alike. The runtime used
+    /// to probe `config.json` itself when this was absent — two hand-written
+    /// key walks that had to agree with the driver's parser by coincidence.
+    pub metadata: pie_model::ModelMetadata,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
@@ -187,6 +188,14 @@ pub struct SchedulerConfig {
     /// How long a lane may stay silent in total before its process is
     /// terminated. See `crate::scheduler::configured_silence_timeout`.
     pub silence_timeout_secs: u64,
+    /// Waves per frame (k). See `crate::scheduler::configured_frame_size`.
+    pub frame_size: u32,
+    /// Frames a guest keeps submitted into the engine. See
+    /// `crate::scheduler::configured_submit_depth`.
+    pub frame_submit_depth: u32,
+    /// Frames the engine keeps posted to the driver. See
+    /// `crate::scheduler::frame::configured_dispatch_depth`.
+    pub frame_dispatch_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -226,9 +235,6 @@ pub async fn bootstrap_with_listener(
 }
 
 async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
-    // The bootstrap edge is the ONLY place planner knobs leave the
-    // environment; everything downstream receives this value explicitly.
-    let planner_config = crate::planner::PlannerConfig::from_env();
     verify_config(&config)?;
     let mut active_guard = ActiveRuntimeGuard::acquire()?;
 
@@ -276,7 +282,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         arch_name,
         kv_page_size,
         tokenizer_path,
-        artifact,
+        metadata,
         drivers: driver_configs,
         scheduler,
     } = config.model;
@@ -338,7 +344,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         rs_caps,
         ptir_caps,
         tokenizer_path.clone(),
-        artifact,
+        &metadata,
     )?;
 
     let arena_kv_pages: Vec<usize> = driver_configs.iter().map(|d| d.total_pages).collect();
@@ -408,7 +414,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 0,
                 kv_swap_capable,
             )),
-            planner_config,
         ),
     );
     // Opt-in stall sampler: `PIE_CONTENTION_TRACE_MS=500` emits one line
@@ -496,6 +501,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
         scheduler.silence_timeout_secs,
     ));
+    // Both are read once into a `OnceLock` and are guest-visible through
+    // `model.frame-size()` / `model.channel-capacity()`, so they must be
+    // installed before anything touches the scheduler.
+    crate::scheduler::set_frame_size(scheduler.frame_size as usize);
+    crate::scheduler::set_submit_depth(scheduler.frame_submit_depth as usize);
+    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(
         &drivers,
         kv_page_size as u32,
@@ -614,9 +625,10 @@ fn verify_config(config: &Config) -> Result<()> {
     let model = &config.model;
     // An artifact carries its tokenizer inside it, so there is no file to
     // check for — the artifact itself was already opened to lift the metadata
-    // out.
+    // out. Only the tokenizer half is asked about: the descriptor is present
+    // for either input form, and its absence is not a shape this type admits.
     ensure!(
-        model.artifact.is_some() || model.tokenizer_path.exists(),
+        model.metadata.tokenizer.is_some() || model.tokenizer_path.exists(),
         "Model {:?}: tokenizer not found at {:?}",
         model.name,
         model.tokenizer_path

@@ -27,7 +27,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::facts::{LlamaLikeCudaFacts, LlamaLikeFacts, QkNorm};
+use crate::facts::{LlamaLikeFacts, QkNorm};
 use crate::trace::{
     DType, Dim, FireClass, ForwardPlan, NormVariant, RopeKind, Shape, StateRef, StateStore,
     TraceBuilder,
@@ -157,12 +157,25 @@ pub struct Layer {
     pub kv: Kv,
 }
 
-/// The model context a declaration runs against: facts, the optional
-/// lowering (backend facts + fire class), and the tape.
+/// The model context a declaration runs against: the facts and the tape.
+///
+/// It carries NO lowering. A model text is written for one backend
+/// (`.wiki/tart/dsl.md` ③: the model file is
+/// `families/<family>/<backend>.rs`), so "am I lowered?" is not a
+/// question a body can ask — the semantic text and the CUDA text are two
+/// texts, and each states its own kernels unconditionally. What used to
+/// be `m.lowering()` is now the CUDA text's own parameters.
 pub struct M {
     t: Trace,
     f: LlamaLikeFacts,
-    lower: Option<(LlamaLikeCudaFacts, FireClass)>,
+}
+
+impl Val {
+    /// The tape this value was recorded on — what a seam statement
+    /// needs when the text has no [`M`] or bare [`Trace`] in hand.
+    pub fn trace(&self) -> &Trace {
+        &self.t
+    }
 }
 
 impl M {
@@ -174,12 +187,6 @@ impl M {
     /// need it directly.
     pub fn trace(&self) -> &Trace {
         &self.t
-    }
-
-    /// The lowering in hand, if this is a lowered trace: the backend
-    /// facts and the fire class the declaration's class arms match on.
-    pub fn lowering(&self) -> Option<(&LlamaLikeCudaFacts, FireClass)> {
-        self.lower.as_ref().map(|(c, class)| (c, *class))
     }
 
     /// V2 rung ②: the body STATES the depth axis (with its deployment
@@ -258,50 +265,84 @@ impl M {
     }
 
     /// The epilogue: gather the sampled rows and project to logits
-    /// (`OpKind::LmHead`, resolving the tied-embedding fact).
-    pub fn logits(&self, x: &Val) {
+    /// (`OpKind::LmHead`, resolving the tied-embedding fact). Returns
+    /// the logits — what the `out` seam sees.
+    pub fn logits(&self, x: &Val) -> Val {
         let name = if self.f.tied_embeddings {
             "embed"
         } else {
             "lm_head"
         };
-        self.t.with(None, |b| b.lm_head(x.id, name, self.f.vocab));
+        let id = self.t.with(None, |b| b.lm_head(x.id, name, self.f.vocab));
+        Val {
+            t: self.t.clone(),
+            id,
+            layer: None,
+        }
     }
 }
 
-/// Run a declaration and return its traced form. `lower: None` is the
-/// semantic trace; with a lowering the class arms run and the family
-/// name records which class this launch form serves.
-pub fn trace(
+/// Run the SEMANTIC llama_like declaration: no kernel is stated, and the
+/// consumer (Metal, the site table, `declared_dag`) chooses.
+pub fn trace_semantic(facts: &LlamaLikeFacts, body: impl FnOnce(&mut M)) -> ForwardPlan {
+    run("llama_like".to_string(), facts, body)
+}
+
+/// Run a LOWERED llama_like declaration — one per [`FireClass`], the
+/// family name recording which launch form this trace serves. The body
+/// takes the backend facts as its own parameter; nothing about the
+/// lowering reaches it through [`M`].
+pub fn trace_cuda(
     facts: &LlamaLikeFacts,
-    lower: Option<(&LlamaLikeCudaFacts, FireClass)>,
+    class: FireClass,
     body: impl FnOnce(&mut M),
 ) -> ForwardPlan {
-    let family = match &lower {
-        None => "llama_like".to_string(),
-        Some((_, class)) => format!(
-            "llama_like.cuda.{}",
-            match class {
-                FireClass::Decode => "decode",
-                FireClass::Prefill => "prefill",
-                // The service classes are qwen3_5's; llama_like has no
-                // spec-decode repair pass. The ffi entry rejects them
-                // before tracing; this is the same statement for direct
-                // Rust callers.
-                FireClass::CommitAdvance
-                | FireClass::StateOnly
-                | FireClass::FrozenVerify => {
-                    panic!("llama_like has no MTP service classes")
-                }
-            }
-        ),
-    };
+    run(format!("llama_like.cuda.{}", class_word(class)), facts, body)
+}
+
+/// Run a LOWERED llama_like declaration for METAL.
+///
+/// The counterpart of [`trace_cuda`], and the reason the backend is a
+/// first-class axis rather than a CUDA assumption: a model text is
+/// written for one backend, so Metal gets its own text stating Metal's
+/// kernels, checked against Metal's table
+/// ([`crate::kernels::KERNELS_METAL`]).
+///
+/// Metal has NO such text yet — it consumes the semantic trace and
+/// re-derives its dispatch selection in C++
+/// (`driver/metal/src/model/llama_like/declared_dag.hpp`), which is the
+/// same "the driver decides" shape the CUDA side is being cured of.
+/// This entry is the seam that text will be written against; until it
+/// is, nothing calls it, and the empty Metal kernel table means the
+/// first thing that does must declare its kernels.
+pub fn trace_metal(
+    facts: &LlamaLikeFacts,
+    class: FireClass,
+    body: impl FnOnce(&mut M),
+) -> ForwardPlan {
+    run(format!("llama_like.metal.{}", class_word(class)), facts, body)
+}
+
+fn class_word(class: FireClass) -> &'static str {
+    match class {
+        FireClass::Decode => "decode",
+        FireClass::Prefill => "prefill",
+        // The service classes are qwen3_5's; llama_like has no
+        // spec-decode repair pass. The ffi entry rejects them
+        // before tracing; this is the same statement for direct
+        // Rust callers.
+        FireClass::CommitAdvance | FireClass::StateOnly | FireClass::FrozenVerify => {
+            panic!("llama_like has no MTP service classes")
+        }
+    }
+}
+
+fn run(family: String, facts: &LlamaLikeFacts, body: impl FnOnce(&mut M)) -> ForwardPlan {
     let mut m = M {
         t: Trace {
             inner: Rc::new(RefCell::new(TraceBuilder::new(family))),
         },
         f: facts.clone(),
-        lower: lower.map(|(c, class)| (c.clone(), class)),
     };
     body(&mut m);
     Rc::try_unwrap(m.t.inner)
@@ -356,10 +397,13 @@ pub fn embed_with(t: &Trace, weight: &str, hidden: u32) -> Val {
 /// The epilogue under an explicit weight name — [`M::logits`] for traces
 /// that run without an [`M`] (the caller resolves the tied-embedding
 /// fact to a name).
-pub fn lm_head_at(t: &Trace, x: &Val, weight: &str, vocab: u32) {
-    t.with(None, |b| {
-        b.lm_head(x.id, weight, vocab);
-    });
+pub fn lm_head_at(t: &Trace, x: &Val, weight: &str, vocab: u32) -> Val {
+    let id = t.with(None, |b| b.lm_head(x.id, weight, vocab));
+    Val {
+        t: t.clone(),
+        id,
+        layer: None,
+    }
 }
 
 // ── The semantic vocabulary, as free functions ─────────────────────────
@@ -721,71 +765,127 @@ pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f
     guarded(m).arm(pred, then_f).otherwise(else_f);
 }
 
-/// Record an [`OpKind::Peel`] (A3): BOTH region closures run at trace
-/// time — the prefix over rows `[0, fast_rows)` at fire time, the tail
-/// over `[fast_rows, N)`, the split a runtime input. The returned [`Val`]s
-/// are the peel's outputs, jointly lowered: both regions' ops bind
-/// disjoint row windows of the same buffers and their own values stay
-/// region-internal.
-pub fn peel(
-    t: &Trace,
-    layer: Option<u32>,
-    shape: (Shape, DType),
-    prefix_f: impl FnOnce(),
-    tail_f: impl FnOnce(),
-) -> Val {
-    let (idx, outs) = {
-        let mut b = t.inner.borrow_mut();
-        b.set_layer(layer);
-        b.open_peel(vec![shape], crate::trace::PeelWindow::HookFreePrefix)
-    };
-    prefix_f();
-    let prefix = {
-        let b = t.inner.borrow();
-        (b.op_count_now() - idx - 1) as u32
-    };
-    tail_f();
-    let (total, _) = {
-        let b = t.inner.borrow();
-        ((b.op_count_now() - idx - 1) as u32, ())
-    };
-    t.inner.borrow_mut().close_peel(idx, prefix, total - prefix);
-    Val {
-        t: t.clone(),
-        id: outs[0],
-        layer,
+// ── The row partition ──────────────────────────────────────────────────
+
+/// WHICH ROWS of the fire an arm's statements cover
+/// (`.wiki/tart/dsl.md` ③'s `rows!(..)`).
+///
+/// A row predicate is not a deployment condition: it does not resolve at
+/// trace time and vanish, it PARTITIONS the fire. Today's tree writes
+/// both kinds as plain Rust `if`, which is why a reader cannot tell
+/// which one disappears — naming the row kind is the first half of
+/// fixing that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowPred {
+    /// Rows with nothing attached at a seam — the hook-free prefix.
+    HookFree,
+    /// Rows carrying no custom mask.
+    Unmasked,
+}
+
+impl RowPred {
+    /// The axis word today's IR carries. It is DERIVED here rather than
+    /// passed: the arm's predicate already says which rows it covers, so
+    /// stating the axis beside it was the same fact twice.
+    fn window(self) -> crate::trace::PeelWindow {
+        match self {
+            RowPred::HookFree => crate::trace::PeelWindow::HookFreePrefix,
+            RowPred::Unmasked => crate::trace::PeelWindow::UnmaskedPrefix,
+        }
     }
 }
 
-/// Record an [`OpKind::Peel`] on the UNMASKED-PREFIX axis (the spatial
-/// mask split, NS-2/NS-4): the prefix region serves the plain decode
-/// rows `[0, unmasked_prefix_rows)`, the tail the masked suffix — both
-/// run, the split a runtime input, UNPLANNED collapsing to the tail
-/// full-N (the fire-level custom dispatch as the peel's endpoint).
-/// Output-less: the peel sits inside the mask Guard arm, whose value is
-/// the attention output the regions' launches jointly bind.
-pub fn peel_masked(
+/// The arms of a [`by_rows`] partition.
+///
+/// Each arm's statements record as the arm is written — the construct is
+/// already open — and the axis word the IR carries is patched in at
+/// close from the arm's predicate.
+#[must_use = "a row partition must be closed with .rest(..)"]
+pub struct RowsCtx<'t> {
+    t: &'t Trace,
+    idx: usize,
+    prefix: Option<u32>,
+    pred: Option<RowPred>,
+}
+
+impl RowsCtx<'_> {
+    /// The rows `pred` names, and what runs over them.
+    pub fn arm(&mut self, pred: RowPred, f: impl FnOnce()) {
+        assert!(
+            self.pred.is_none(),
+            "by_rows takes one arm and a rest today — the IR's Peel is a \
+             two-region op (`.wiki/tart/dsl.md` migration step 6 flattens it)"
+        );
+        f();
+        let b = self.t.inner.borrow();
+        self.prefix = Some((b.op_count_now() - self.idx - 1) as u32);
+        drop(b);
+        self.pred = Some(pred);
+    }
+
+    /// Every other row.
+    pub fn rest(&mut self, f: impl FnOnce()) {
+        let prefix = self
+            .prefix
+            .expect("a row partition states its arm before its rest");
+        f();
+        let mut b = self.t.inner.borrow_mut();
+        let total = (b.op_count_now() - self.idx - 1) as u32;
+        b.close_peel(self.idx, prefix, total - prefix);
+        b.set_peel_window(
+            self.idx,
+            self.pred.expect("an arm was stated").window(),
+        );
+    }
+}
+
+/// THE row-partition construct (`.wiki/tart/dsl.md` ③'s `t.by_rows`):
+/// the arms' statements each cover their own rows and ALL of them run,
+/// which is what separates this from the fire-level [`GuardCtx`] chain
+/// (first matching arm wins, whole fire).
+///
+/// `shape` present makes the partition value-producing: the [`Val`] is
+/// the construct's, and each region's launches bind disjoint row windows
+/// of it, recording no SSA outputs of their own.
+///
+/// It lowers to today's [`OpKind::Peel`] — one axis word, two regions —
+/// so the goldens pin that this surface changed no traced byte. What it
+/// removes is the axis word from the call site: `peel` and `peel_masked`
+/// were two functions naming the same mechanism over two axes, and the
+/// axis is now read off the arm's predicate.
+///
+/// [`OpKind::Peel`]: crate::trace::OpKind::Peel
+pub fn by_rows(
     t: &Trace,
     layer: Option<u32>,
-    prefix_f: impl FnOnce(),
-    tail_f: impl FnOnce(),
-) {
-    let (idx, _outs) = {
+    shape: Option<(Shape, DType)>,
+    build: impl FnOnce(&mut RowsCtx<'_>),
+) -> Option<Val> {
+    let (idx, outs) = {
         let mut b = t.inner.borrow_mut();
         b.set_layer(layer);
-        b.open_peel(vec![], crate::trace::PeelWindow::UnmaskedPrefix)
+        // The axis is patched at close, once the arm has named it.
+        b.open_peel(
+            shape.into_iter().collect(),
+            crate::trace::PeelWindow::HookFreePrefix,
+        )
     };
-    prefix_f();
-    let prefix = {
-        let b = t.inner.borrow();
-        (b.op_count_now() - idx - 1) as u32
+    let mut ctx = RowsCtx {
+        t,
+        idx,
+        prefix: None,
+        pred: None,
     };
-    tail_f();
-    let total = {
-        let b = t.inner.borrow();
-        (b.op_count_now() - idx - 1) as u32
-    };
-    t.inner.borrow_mut().close_peel(idx, prefix, total - prefix);
+    build(&mut ctx);
+    assert!(
+        ctx.pred.is_some(),
+        "a row partition must state an arm and a rest"
+    );
+    outs.first().map(|&id| Val {
+        t: t.clone(),
+        id,
+        layer,
+    })
 }
 
 /// [`guard`] for declarations that carry no [`M`] (the qwen3_5 bodies
@@ -851,11 +951,37 @@ pub mod seam {
         Emit,
     }
 
-    /// A seam's definition: the stable NAME the request surface keys on
-    /// (`fwd.adapter("attn.qv", ..)`, `fwd.attach(..)`) and its caps.
+    /// A seam's SIGNATURE (`.wiki/tart/dsl.md` ①): the stable NAME the
+    /// request surface keys on (`fwd.adapter("attn.qv", ..)`,
+    /// `fwd.attach(..)`), what an attachment SEES, what it MAY do, and —
+    /// for the seams that have one — where it sits and where its output
+    /// lands.
+    ///
+    /// `after` / `before` and `sink` are the two lines the doc singles
+    /// out as carrying what is today only a comment. They are not
+    /// documentation here: [`check_plan`] reads `after` / `before`.
     pub struct Def {
         pub name: &'static str,
+        /// The value roles an attachment observes or rewrites, in
+        /// operand order.
+        pub sees: &'static [&'static str],
         pub caps: &'static [Cap],
+        /// The seam's POSITION rule, for seams whose arithmetic depends
+        /// on it. `after` names the op kinds that must have produced the
+        /// values it sees; `before` names the op kinds that must not yet
+        /// have consumed them.
+        pub position: Option<Position>,
+        /// Where a sink-writing attachment's output lands.
+        pub sink: Option<&'static str>,
+    }
+
+    /// A seam's position rule, stated as op-kind names
+    /// ([`crate::trace::OpKind`]'s discriminants, plus `"Launch:<symbol>"`
+    /// for stated kernels).
+    #[derive(Debug, Clone, Copy)]
+    pub struct Position {
+        pub after: &'static [&'static str],
+        pub before: &'static [&'static str],
     }
 
     /// Pre-attention observation seam: sees the just-projected q; a
@@ -864,7 +990,13 @@ pub mod seam {
     /// `OnAttnProj`).
     pub const ATTN_Q: Def = Def {
         name: "attn.q",
+        sees: &["q"],
         caps: &[Cap::Observe, Cap::PageMaskSink],
+        position: None,
+        // Where Quest's `attn_page_mask` lands. Hardcoded in
+        // `emit_cuda::emit_masked_pages_bracket` today; declared here,
+        // consumed when the launch ABI flattens (migration step 6).
+        sink: Some("attention.pages"),
     };
 
     /// Post-attention observation seam: sees the scores the (possibly
@@ -872,15 +1004,28 @@ pub mod seam {
     /// `OnAttn`).
     pub const ATTN_OUT: Def = Def {
         name: "attn.out",
+        sees: &["a"],
         caps: &[Cap::Observe, Cap::Scores],
+        position: None,
+        sink: None,
     };
 
     /// The adapter value seam over the raw q/v projections — pure
     /// expressions of `(x, y)`, `fwd.adapter`'s site family (today's
     /// `HasLora` guard arm).
+    /// THE POSITION RULE IS THE POINT: the correction lands on the raw
+    /// projections, before bias, norms, rope and the KV append. Applying
+    /// it after rope is DIFFERENT ARITHMETIC — the bug the first live
+    /// A/B caught. It was a comment until now.
     pub const ATTN_QV: Def = Def {
         name: "attn.qv",
+        sees: &["q", "v"],
         caps: &[Cap::Transform],
+        position: Some(Position {
+            after: &["Matmul", "SplitQkv"],
+            before: &["AddBias", "Rmsnorm", "Rope", "KvAppend", "Launch"],
+        }),
+        sink: None,
     };
 
     /// Entry boundary seam (prologue's home). Boundary attachments
@@ -888,41 +1033,441 @@ pub mod seam {
     /// why their dispatch-side lowering needs no trace op at any rung.
     pub const IN: Def = Def {
         name: "in",
+        sees: &[],
         caps: &[Cap::Put, Cap::Emit],
+        position: None,
+        sink: None,
     };
 
     /// Exit boundary seam (epilogue's home).
     pub const OUT: Def = Def {
         name: "out",
+        sees: &["logits"],
         caps: &[Cap::Observe, Cap::Sample, Cap::Put, Cap::Emit],
+        position: None,
+        sink: None,
     };
+
+    /// LOAD-TIME check of the seams a text stated.
+    ///
+    /// One rule today, and it is the one whose violation is silent:
+    /// [`ATTN_QV`]'s position. The adapter's delta must land on the base
+    /// projection, not on base + bias, and not after rope — so between
+    /// the ops that PRODUCE the values the seam sees and the seam's own
+    /// statement, nothing may consume them. A live A/B caught exactly
+    /// this once; the rule stops being a comment here.
+    pub fn check_plan(plan: &crate::trace::ForwardPlan) -> Vec<String> {
+        let mut problems = Vec::new();
+        for stmt in &plan.seams {
+            let Some(def) = by_name(&stmt.seam) else {
+                problems.push(format!(
+                    "{}: states seam `{}`, which no seam! signature declares",
+                    plan.family, stmt.seam
+                ));
+                continue;
+            };
+            let (Some(pos), Some(at)) = (def.position, stmt.op) else {
+                continue;
+            };
+            let at = at as usize;
+            // The values this statement sees are the inputs of the op
+            // it carries (the adapter's guard opens at `at`; its
+            // correction launch is the next op and names q and v).
+            let Some(seen) = plan.ops.get(at + 1).map(|op| op.inputs.clone()) else {
+                continue;
+            };
+            for &v in &seen {
+                let produced_at = plan
+                    .ops
+                    .iter()
+                    .position(|op| op.outputs.contains(&v));
+                match produced_at {
+                    None => problems.push(format!(
+                        "{}: seam `{}` sees value {v}, which no op produces",
+                        plan.family, def.name
+                    )),
+                    Some(from) => {
+                        let producer = kind_name(&plan.ops[from].kind);
+                        if !pos.after.contains(&producer) {
+                            problems.push(format!(
+                                "{}: seam `{}` must sit after {:?}, but value {v} \
+                                 comes from {producer}",
+                                plan.family, def.name, pos.after
+                            ));
+                        }
+                        for (i, op) in plan.ops.iter().enumerate().take(at).skip(from + 1) {
+                            if !op.inputs.contains(&v) {
+                                continue;
+                            }
+                            let consumer = kind_name(&op.kind);
+                            if pos.before.contains(&consumer) {
+                                problems.push(format!(
+                                    "{}: seam `{}` must sit before {consumer}, but op \
+                                     {i} consumes value {v} first — different \
+                                     arithmetic, not a reordering",
+                                    plan.family, def.name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        problems
+    }
+
+    /// Every seam a model text may state.
+    pub const ALL: &[&Def] = &[&IN, &ATTN_QV, &ATTN_Q, &ATTN_OUT, &OUT];
+
+    pub fn by_name(name: &str) -> Option<&'static Def> {
+        ALL.iter().copied().find(|d| d.name == name)
+    }
+
+    fn kind_name(kind: &crate::trace::OpKind) -> &'static str {
+        use crate::trace::OpKind as K;
+        match kind {
+            K::Embed { .. } => "Embed",
+            K::Matmul { .. } => "Matmul",
+            K::SplitQkv { .. } => "SplitQkv",
+            K::Rope { .. } => "Rope",
+            K::Rmsnorm { .. } => "Rmsnorm",
+            K::AddBias { .. } => "AddBias",
+            K::KvAppend { .. } => "KvAppend",
+            K::Launch { .. } => "Launch",
+            K::Guard { .. } => "Guard",
+            K::Peel { .. } => "Peel",
+            K::HookSite { .. } => "HookSite",
+            _ => "other",
+        }
+    }
 }
 
-/// An observation seam at `def`, watching `v` at `layer` — rung-①
-/// lowering: exactly the [`OpKind::HookSite`] op the pre-seam text
-/// recorded, so the traced form is byte-identical.
+/// THE SEAM STATEMENT — one construct for all five extension points
+/// (`.wiki/tart/dsl.md` ①, migration step 4).
+///
+/// Until now three of the five lowered to ops through two different
+/// functions and the other two lowered to NOTHING: the traced form did
+/// not record that a text has a prologue or an epilogue at all, which is
+/// what put those two stages in a different world from the rest. Every
+/// seam is stated the same way here, and every statement is recorded
+/// ([`crate::trace::SeamStatement`]) whichever way it lowers.
+///
+/// The LOWERINGS are unchanged, which is what keeps the goldens'
+/// op streams byte-identical:
+///
+/// * `attn.q` / `attn.out` — one [`OpKind::HookSite`];
+/// * `attn.qv` — the `HasLora` guard with the correction arm and an
+///   EMPTY else (a fire with no usable lanes launches nothing);
+/// * `in` / `out` — no op. A boundary attachment causes no divergence,
+///   so it enters no row signature; what it needed was a DECLARATION,
+///   and that is what the statement list now carries.
 ///
 /// [`OpKind::HookSite`]: crate::trace::OpKind::HookSite
-pub fn seam_observe(def: &seam::Def, v: &Val, layer: u32) {
-    let stage = match def.name {
-        "attn.q" => crate::trace::HookStage::OnAttnProj,
-        "attn.out" => crate::trace::HookStage::OnAttn,
-        other => unreachable!("no observation seam named {other}"),
-    };
-    hook_site(stage, v, layer);
+pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {
+    assert_eq!(
+        sees.len(),
+        def.sees.len(),
+        "seam `{}` sees {:?}",
+        def.name,
+        def.sees
+    );
+    match def.name {
+        "attn.q" | "attn.out" => {
+            let stage = if def.name == "attn.q" {
+                crate::trace::HookStage::OnAttnProj
+            } else {
+                crate::trace::HookStage::OnAttn
+            };
+            let l = layer.expect("a body seam states its layer");
+            hook_site(stage, sees[0], l);
+            let at = t.inner.borrow().op_count_now() - 1;
+            t.inner
+                .borrow_mut()
+                .push_seam(def.name, layer, Some(at as u32));
+        }
+        "attn.qv" => {
+            let l = layer.expect("a body seam states its layer");
+            // The index the guard is about to take, captured before it
+            // opens: the statement points at the CONSTRUCT, and the
+            // position check reads the correction's operands from
+            // inside it.
+            let at = t.inner.borrow().op_count_now() as u32;
+            guard_on(
+                t,
+                crate::trace::GuardPred::HasLora,
+                || cuda::lora_qkv_correction(sees[0], sees[1], l),
+                || {},
+            );
+            t.inner.borrow_mut().push_seam(def.name, layer, Some(at));
+        }
+        "in" | "out" => {
+            t.inner.borrow_mut().push_seam(def.name, layer, None);
+        }
+        other => unreachable!("no seam named {other}"),
+    }
 }
 
-/// The adapter value seam ([`seam::ATTN_QV`]) over the raw q/v
-/// projections — rung-① lowering: exactly the `HasLora` guard with the
-/// span-grouped correction arm and the EMPTY else (a fire with no
-/// usable lanes launches nothing), byte-identical to the pre-seam text.
-pub fn seam_adapter_qv(m: &M, q: &Val, v: &Val, layer: u32) {
-    guard(
-        m,
-        crate::trace::GuardPred::HasLora,
-        || cuda::lora_qkv_correction(q, v, layer),
-        || {},
-    );
+// ── Metal kernel signatures ────────────────────────────────────────────
+
+/// The METAL launchers a lowered declaration may state — the `dsl::cuda`
+/// of the second backend (`.wiki/tart/dsl.md` ②).
+///
+/// UNVERIFIED (2026-08-05). Every symbol here is an MSL entrypoint read
+/// off the driver's source (`driver/metal/src/kernels/decode_psos.cpp`'s
+/// `PsoSpec` table and `model/qwen3_5/decode_step.hpp`'s `Kernel` kinds),
+/// not something a running deployment produced: the Metal driver cannot
+/// build on the machine we have, because `xcrun --find metal` fails —
+/// the shader compiler ships with full Xcode. Nothing consumes this yet.
+/// `.wiki/tart/macos.md` rung 3 is where it gets proven, by showing
+/// `declared_dag.hpp`'s emitted descriptors come out unchanged.
+///
+/// ONE DECISION worth stating, because it will look like an omission:
+/// the quantized entrypoints are spelled by their BASE name
+/// (`affine_qmv_fast`), not with the checkpoint's affine suffix
+/// (`..._bfloat16_gs_64_b_4`, `AffineFormat::kernel_suffix()`). The
+/// suffix is the driver's binding of a checkpoint fact, in the same
+/// class as the stream and the workspace scratch — it selects no
+/// different arithmetic and no different arm. What the text chooses is
+/// the kernel FAMILY.
+pub mod metal {
+    use super::*;
+
+    fn record(
+        t: &Trace,
+        layer: Option<u32>,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        inputs: Vec<crate::trace::ValueId>,
+        out: Option<(Shape, DType)>,
+    ) -> Option<Val> {
+        let ids = t.with(layer, |b| {
+            b.launch(kernel, weights, state, inputs, out.into_iter().collect())
+        });
+        ids.first().map(|&id| Val {
+            t: t.clone(),
+            id,
+            layer,
+        })
+    }
+
+    fn kv_state(kv: &Kv) -> Option<StateRef> {
+        Some(StateRef {
+            store: StateStore::KvCache,
+            layer: kv.l,
+        })
+    }
+
+    fn same_shape(v: &Val) -> (Shape, DType) {
+        (v.t.inner.borrow().value_shape(v.id), DType::BF16)
+    }
+
+    /// `embed_gather.metal::embed_gather_4bit` (M=1) /
+    /// `embed_gather_mb_4bit` (M>1).
+    pub fn embed_gather(t: &Trace, weight: &str, hidden: u32, multi_batch: bool) -> Val {
+        let kernel = if multi_batch {
+            "embed_gather_mb_4bit"
+        } else {
+            "embed_gather_4bit"
+        };
+        record(
+            t,
+            None,
+            kernel,
+            vec![weight.to_string()],
+            None,
+            vec![],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
+        )
+        .expect("embed produces the residual stream")
+    }
+
+    /// `rms_norm.metal::rms_single_row_bfloat16` — ONE entrypoint for
+    /// every norm this family states (attn_norm, mlp_norm, q_norm,
+    /// k_norm, final_norm; the driver fans five `Kernel` kinds onto it).
+    pub fn rms_norm(x: &Val, w: &NormW) -> Val {
+        let out = same_shape(x);
+        record(
+            &x.t,
+            w.layer,
+            "rms_single_row_bfloat16",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            Some(out),
+        )
+        .expect("a norm produces its value")
+    }
+
+    /// `quantized_qmv.metal::affine_qmv_fast` — the projection GEMV,
+    /// M=1. The driver fans every projection kind onto it.
+    pub fn qmv(x: &Val, w: &MatW) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "affine_qmv_fast",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a projection produces its value")
+    }
+
+    /// `quantized_qmv.metal::affine_qmv_fast_residual` — the same GEMV
+    /// with the block residual folded into its epilogue, which is what a
+    /// `beta_one` matmul is on this backend.
+    pub fn qmv_residual(x: &Val, w: &MatW, residual: &Val) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "affine_qmv_fast_residual",
+            vec![w.name.clone()],
+            None,
+            vec![x.id, residual.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a folded projection produces its value")
+    }
+
+    /// `quantized_qmm_t.metal::affine_qmm_t` — MLX's steel quantized
+    /// GEMM, the M>1 projection.
+    pub fn qmm(x: &Val, w: &MatW) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "affine_qmm_t",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a projection produces its value")
+    }
+
+    /// `quantized_qmm_t.metal::affine_qmm_t_residual`.
+    pub fn qmm_residual(x: &Val, w: &MatW, residual: &Val) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "affine_qmm_t_residual",
+            vec![w.name.clone()],
+            None,
+            vec![x.id, residual.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+        )
+        .expect("a folded projection produces its value")
+    }
+
+    /// `residual_add.metal::residual_add_bfloat16` — the explicit
+    /// landing, for the deployments and positions where no epilogue fold
+    /// exists.
+    pub fn residual_add(x: &Val, residual: &Val) -> Val {
+        let out = same_shape(x);
+        record(
+            &x.t,
+            x.layer,
+            "residual_add_bfloat16",
+            vec![],
+            None,
+            vec![x.id, residual.id],
+            Some(out),
+        )
+        .expect("the residual landing produces its value")
+    }
+
+    /// `rope.metal::rope_neox_decode_bfloat16` (M=1) /
+    /// `rope_neox_mb_bfloat16` (M>1). One dispatch for q and k together,
+    /// as the plan states it (`declared_dag.hpp`'s `Kind::Rope`).
+    pub fn rope(q: &Val, k: &Val, multi_batch: bool) -> (Val, Val) {
+        let kernel = if multi_batch {
+            "rope_neox_mb_bfloat16"
+        } else {
+            "rope_neox_decode_bfloat16"
+        };
+        let q_sh = same_shape(q);
+        let k_sh = same_shape(k);
+        let ids = q.t.with(q.layer, |b| {
+            b.launch(kernel, vec![], None, vec![q.id, k.id], vec![q_sh, k_sh])
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kv_append.metal::kv_append_bfloat16` (contiguous) /
+    /// `kv_append_paged.metal::kv_append_paged_bfloat16` (page table).
+    pub fn kv_append(k: &Val, v: &Val, kv: &Kv, paged: bool) {
+        let kernel = if paged {
+            "kv_append_paged_bfloat16"
+        } else {
+            "kv_append_bfloat16"
+        };
+        record(
+            &kv.t,
+            Some(kv.l),
+            kernel,
+            vec![],
+            kv_state(kv),
+            vec![k.id, v.id],
+            None,
+        );
+    }
+
+    /// `sdpa_vector.metal::sdpa_vector_decode_bfloat16_d_256` (M=1) /
+    /// `sdpa_paged.metal::sdpa_paged_decode_bfloat16_d_256` (M>1).
+    pub fn sdpa(q: &Val, kv: &Kv, q_width: u32, paged: bool) -> Option<Val> {
+        let kernel = if paged {
+            "sdpa_paged_decode_bfloat16_d_256"
+        } else {
+            "sdpa_vector_decode_bfloat16_d_256"
+        };
+        record(
+            &q.t,
+            Some(kv.l),
+            kernel,
+            vec![],
+            kv_state(kv),
+            vec![q.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
+        )
+    }
+
+    /// `silu_mul.metal::silu_mul_bfloat16` — the SwiGLU activation over
+    /// the packed gate/up bank.
+    pub fn silu_mul(x: &Val, intermediate: u32) -> Val {
+        record(
+            &x.t,
+            x.layer,
+            "silu_mul_bfloat16",
+            vec![],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `quantized_qmv.metal::affine_qmv_fast` against the lm head — the
+    /// readout, `[Requests, vocab]` f32 like every family's.
+    pub fn lm_head(x: &Val, weight: &str, vocab: u32) -> Val {
+        record(
+            &x.t,
+            None,
+            "affine_qmv_fast",
+            vec![weight.to_string()],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::F32)),
+        )
+        .expect("the readout produces the logits")
+    }
 }
 
 // ── Raw kernel signatures ──────────────────────────────────────────────
@@ -1053,42 +1598,30 @@ pub mod cuda {
     }
 
     /// `ops::launch_attention_xqa_decode_bf16_prepared` (whose contract
-    /// includes the fire-wide XQA prepare).
-    pub fn attention_xqa_decode(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        attn(q, kv, q_width, "launch_attention_xqa_decode_bf16_prepared")
+    /// includes the fire-wide XQA prepare — and which is therefore
+    /// declared `whole`; see [`crate::kernels`]).
+    pub fn attention_xqa_decode(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "launch_attention_xqa_decode_bf16_prepared")
     }
 
     /// `ops::dispatch_attention_flashinfer_decode` against the decode
     /// plan its contract obligates.
-    pub fn attention_flashinfer_decode(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_decode")
+    pub fn attention_flashinfer_decode(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_decode")
     }
 
-    /// The decode-shaped fallback for GQA ratios outside the decode
-    /// kernel set (`force_prefill_path`): the exact pair the hand-written
-    /// arm launches — `kernels::launch_dequant_kv_cache_layer_to_bf16_active`
-    /// then `ops::dispatch_attention_flashinfer_prefill_bf16`.
-    pub fn attention_prefill_dequant(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        dequant(kv);
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
-    }
-
-    /// The planned prefill every prefill-shaped fire runs: the same
-    /// dequant + `ops::dispatch_attention_flashinfer_prefill_bf16` pair.
-    pub fn attention_flashinfer_prefill(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        dequant(kv);
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
-    }
-
-    /// `ops::dispatch_attention_flashinfer_prefill_bf16` ALONE — no
-    /// dequant launch. The llama_like pair above is llama-specific: its
-    /// cache may be quantized, so the hand-written prefill path dequants
-    /// the layer first. qwen3_5's full-attention path gates on a
-    /// native-bf16 cache and launches only the dispatch
-    /// (`qwen3_5_forward.cpp::full_attn_layer_body`), so its lowered arm
-    /// states exactly one launch.
-    pub fn attention_flashinfer_prefill_planned(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
+    /// `ops::dispatch_attention_flashinfer_prefill_bf16` — the dispatch
+    /// ALONE.
+    ///
+    /// Three wrappers used to differ here only by whether they also
+    /// launched the dequant staging: llama_like's cache may be
+    /// quantized, so its prefill-shaped arms dequant the layer first,
+    /// while qwen3_5's full-attention path gates on a native-bf16 cache
+    /// and launches only the dispatch. That is not a property of this
+    /// kernel — it is a second STATEMENT the text either makes or does
+    /// not, so the text makes it ([`dequant_only`] beside this call).
+    pub fn attention_flashinfer_prefill(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_prefill_bf16")
     }
 
     /// `kernels::launch_write_kv_explicit_bf16`: the explicit-descriptor
@@ -1361,45 +1894,14 @@ pub mod cuda {
     /// its contract includes the capture publish against the possibly
     /// page-mask-compacted CSR). Region launch of the WantsAttnScore
     /// guard — output-less; the guard owns the attention output.
-    pub fn attention_flashinfer_decode_capture(q: &Val, kv: &Kv) {
-        record(
-            &q.t,
-            Some(kv.l),
-            "dispatch_attention_flashinfer_decode_capture",
-            vec![],
-            kv_state(kv),
-            vec![q.id],
-            None,
-        );
+    pub fn attention_flashinfer_decode_capture(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_decode_capture")
     }
 
     /// `ops::dispatch_attention_flashinfer_prefill_capture_bf16` — the
     /// prefill counterpart, same guard-region contract.
-    pub fn attention_flashinfer_prefill_capture(q: &Val, kv: &Kv) {
-        record(
-            &q.t,
-            Some(kv.l),
-            "dispatch_attention_flashinfer_prefill_capture_bf16",
-            vec![],
-            kv_state(kv),
-            vec![q.id],
-            None,
-        );
-    }
-
-    /// Output-less plain-dispatch forms for guard regions (the guard owns
-    /// the output; these bind it).
-    pub fn attention_flashinfer_decode_region(q: &Val, kv: &Kv) {
-        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_decode",
-               vec![], kv_state(kv), vec![q.id], None);
-    }
-    pub fn attention_flashinfer_prefill_region(q: &Val, kv: &Kv) {
-        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_bf16",
-               vec![], kv_state(kv), vec![q.id], None);
-    }
-    pub fn attention_xqa_decode_region(q: &Val, kv: &Kv) {
-        record(&q.t, Some(kv.l), "launch_attention_xqa_decode_bf16_prepared",
-               vec![], kv_state(kv), vec![q.id], None);
+    pub fn attention_flashinfer_prefill_capture(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_prefill_capture_bf16")
     }
 
     /// Output-less [`qkv_decode_qk_norm_rope_write_kv`] for the Peel's
@@ -1432,15 +1934,9 @@ pub mod cuda {
     /// no pseudo-symbol is needed. The mask data (BRLE bytes + indptr)
     /// crosses as runtime args of the stated kernel, commit_lens's peer.
     /// Since A1 (the class-collapse amendment) it is stated inside the
-    /// `HasCustomMask` guard arm of the Decode/Prefill traces — the
-    /// output-less region form below is what the arm records; this
-    /// value-producing form remains for consumers outside a guard.
-    pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv, q_width: u32) -> Val {
-        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_custom")
-    }
-    pub fn attention_flashinfer_prefill_custom_region(q: &Val, kv: &Kv) {
-        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_custom",
-               vec![], kv_state(kv), vec![q.id], None);
+    /// `HasCustomMask` guard arm of the Decode/Prefill traces.
+    pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "dispatch_attention_flashinfer_prefill_custom")
     }
 
     /// `"pie_lora_qkv_correction"`: the §5.1 adapter correction — every
@@ -1464,14 +1960,12 @@ pub mod cuda {
         );
     }
 
-    /// The standalone dequant staging launch, for arms whose attention
-    /// lives inside a guard (the dequant is common to both regions, so
-    /// it precedes the guard).
+    /// `kernels::launch_dequant_kv_cache_layer_to_bf16_active`: the
+    /// staging launch a quantized cache needs before a prefill-shaped
+    /// dispatch. Its OWN statement — see
+    /// [`attention_flashinfer_prefill`] for why it is not folded into
+    /// any attention wrapper.
     pub fn dequant_only(kv: &Kv) {
-        dequant(kv);
-    }
-
-    fn dequant(kv: &Kv) {
         record(
             &kv.t,
             Some(kv.l),
@@ -1483,7 +1977,23 @@ pub mod cuda {
         );
     }
 
-    fn attn(q: &Val, kv: &Kv, q_width: u32, kernel: &str) -> Val {
+    /// ONE attention statement, whatever position it is written in
+    /// (`.wiki/tart/dsl.md` ②, migration step 2).
+    ///
+    /// A dispatch inside a value-producing guard or peel region binds
+    /// that construct's output and records no SSA output of its own; the
+    /// same dispatch written as a plain statement produces its own
+    /// value. That is a property of the STATEMENT'S POSITION, which the
+    /// tape knows ([`crate::trace::TraceBuilder::inside_value_region`]),
+    /// so it stops being spelled in the wrapper's name — the `_region`
+    /// half of every attention wrapper is deleted by this one function.
+    ///
+    /// The output shape is q's own: these kernels are width-preserving
+    /// on the query, which is what the retired `q_width` parameter was
+    /// re-stating at each call site.
+    fn attn_at(q: &Val, kv: &Kv, kernel: &str) -> Option<Val> {
+        let out = q.t.inner.borrow().inside_value_region();
+        let shape = (!out).then(|| q.t.inner.borrow().value_shape(q.id));
         record(
             &q.t,
             Some(kv.l),
@@ -1491,8 +2001,126 @@ pub mod cuda {
             vec![],
             kv_state(kv),
             vec![q.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
+            shape.map(|s| (s, DType::BF16)),
         )
-        .expect("attention produces a value")
+    }
+
+}
+
+#[cfg(test)]
+mod seam_tests {
+    use super::seam;
+    use crate::trace::{ForwardPlan, GuardArm, GuardPred, Op, OpKind, SeamStatement};
+
+    fn op(kind: OpKind, inputs: Vec<u32>, outputs: Vec<u32>) -> Op {
+        Op {
+            kind,
+            inputs,
+            outputs,
+            layer: Some(0),
+        }
+    }
+
+    fn matmul() -> OpKind {
+        OpKind::Matmul {
+            weight: "layer.0.q_proj".to_string(),
+            beta_one: false,
+            selector: None,
+        }
+    }
+
+    fn lora() -> OpKind {
+        OpKind::Launch {
+            kernel: "pie_lora_qkv_correction".to_string(),
+            weights: vec![],
+            state: None,
+        }
+    }
+
+    fn guard() -> OpKind {
+        OpKind::Guard {
+            arms: vec![GuardArm {
+                pred: GuardPred::HasLora,
+                ops: 1,
+            }],
+            else_ops: 0,
+        }
+    }
+
+    /// `q` and `v` from projections, seam immediately after: the shape
+    /// every live text has.
+    fn well_placed() -> Vec<Op> {
+        vec![
+            op(matmul(), vec![], vec![1]),
+            op(matmul(), vec![], vec![2]),
+            op(guard(), vec![], vec![]),
+            op(lora(), vec![1, 2], vec![]),
+        ]
+    }
+
+    fn plan(ops: Vec<Op>) -> ForwardPlan {
+        ForwardPlan {
+            family: "test".to_string(),
+            values: vec![],
+            ops,
+            depth_window: false,
+            seams: vec![SeamStatement {
+                seam: "attn.qv".to_string(),
+                layer: Some(0),
+                op: Some(2),
+            }],
+        }
+    }
+
+    /// The adapter's position rule FIRES. Without this the live traces'
+    /// clean check proves only that the walk found nothing to look at.
+    #[test]
+    fn the_adapter_position_rule_is_not_vacuous() {
+        assert!(seam::check_plan(&plan(well_placed())).is_empty());
+
+        // A bias consuming q BEFORE the seam: the delta would land on
+        // base + bias. This is the shape the live A/B caught.
+        let mut ops = well_placed();
+        ops.insert(
+            2,
+            op(
+                OpKind::AddBias {
+                    weight: "layer.0.q_bias".to_string(),
+                },
+                vec![1],
+                vec![3],
+            ),
+        );
+        let mut p = plan(ops);
+        p.seams[0].op = Some(3);
+        let problems = seam::check_plan(&p);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("AddBias"), "{}", problems[0]);
+
+        // A seam placed after rope: different arithmetic, and the
+        // producer is no longer a projection.
+        let ops = vec![
+            op(matmul(), vec![], vec![1]),
+            op(matmul(), vec![], vec![2]),
+            op(OpKind::Rope { kind: crate::trace::RopeKind::Standard, partial: None }, vec![1], vec![3]),
+            op(guard(), vec![], vec![]),
+            op(lora(), vec![3, 2], vec![]),
+        ];
+        let mut p = plan(ops);
+        p.seams[0].op = Some(3);
+        let problems = seam::check_plan(&p);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("Rope"), "{}", problems[0]);
+    }
+
+    /// Every seam a text may state is declared, and its `sees` arity is
+    /// what the statement passes.
+    #[test]
+    fn the_seam_table_is_complete() {
+        for d in seam::ALL {
+            assert_eq!(seam::by_name(d.name).map(|x| x.name), Some(d.name));
+        }
+        assert_eq!(seam::ATTN_QV.sees, &["q", "v"]);
+        assert!(seam::ATTN_Q.sink.is_some(), "the page-mask sink is declared");
     }
 }

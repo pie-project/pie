@@ -34,6 +34,7 @@
 #include <cuda_bf16.h>
 
 #include "cuda_check.hpp"
+#include "pie/driver/region_plans.hpp"
 #include "runahead.hpp"
 #include "batch/fire_timing.hpp"
 #include "batch/forward_graph.hpp"
@@ -198,13 +199,6 @@ class LaneWorkPool {
 
     static std::size_t worker_count() {
         static const std::size_t count = [] {
-            if (const char* raw = std::getenv("PIE_CUDA_LANE_WORKERS")) {
-                char* end = nullptr;
-                const long parsed = std::strtol(raw, &end, 10);
-                if (end != raw && parsed >= 0 && parsed <= 64) {
-                    return static_cast<std::size_t>(parsed);
-                }
-            }
             // Derivation: the per-lane tasks are short and memory-bound, so
             // wake latency (~10 us/worker) must stay well under the serial
             // pool being split (~0.7 ms at 256 lanes). A quarter of the
@@ -345,11 +339,7 @@ struct NotifyContext;
 
 namespace {
 
-// PIE_DEBUG_PULL_VALIDATE=1 makes the pull-validate kernel name the ticket
-// that vetoed a fire, which is otherwise reported only as the generic
-// "ptir prologue or channel readiness did not commit".
-const std::uint32_t kDiagnosePullValidate =
-    std::getenv("PIE_DEBUG_PULL_VALIDATE") != nullptr ? 1u : 0u;
+constexpr std::uint32_t kDiagnosePullValidate = 0u;
 
 constexpr std::uint64_t kNoDescriptorReadyOffset =
     std::numeric_limits<std::uint64_t>::max();
@@ -1457,6 +1447,12 @@ struct Dispatch::Impl {
     cudaStream_t signature_streams[kSignatureStreamCount] = {};
     bool attention_hook_coverage = false;
     std::uint32_t model_layers = 0;
+    // forward-hybrid.wit: the attention taps fire on attention layers
+    // only — these are their MODEL layer ids, in walk order (identity
+    // 0..L-1 on attention-only families; the full-attention indices on
+    // the qwen3.5 hybrids). The ledger entries, the layer intrinsic
+    // table, and the coverage checks all read the same list.
+    std::vector<std::uint32_t> hook_layer_ids;
     bool kv_envelopes_available = false;
     bool attn_page_mask_available = false;
     bool lora_available = false;
@@ -2924,8 +2920,7 @@ void refill_commit_snapshot_pool(Dispatch::Impl& owner) {
             static_cast<void>(cudaGetLastError());
             return false;
         }
-        return properties.canMapHostMemory != 0 &&
-               std::getenv("PIE_CUDA_DISABLE_MAPPED_COMMITS") == nullptr;
+        return properties.canMapHostMemory != 0;
     }();
 
     void* host_slab = nullptr;
@@ -3700,9 +3695,12 @@ model::LoraTable Dispatch::launch_lora_table(
 
 void Dispatch::set_attention_hook_coverage(
     bool supported,
-    std::uint32_t model_layers) {
+    std::vector<std::uint32_t> hook_layer_ids) {
     impl_->attention_hook_coverage = supported;
-    impl_->model_layers = supported ? model_layers : 0;
+    impl_->hook_layer_ids =
+        supported ? std::move(hook_layer_ids) : std::vector<std::uint32_t>{};
+    impl_->model_layers =
+        static_cast<std::uint32_t>(impl_->hook_layer_ids.size());
 }
 
 bool Dispatch::launch_has_attention_stages(
@@ -5759,9 +5757,15 @@ std::uint64_t Dispatch::prepare_attention_phases(
     if (in.observation == nullptr || !in.observation->usable()) {
         return veto("no usable observation");
     }
-    const std::uint32_t layers = in.planned_layers == 0xffffffffu
-        ? impl_->model_layers
-        : std::min(impl_->model_layers, in.planned_layers);
+    // The hook layers are MODEL layer ids in walk order; a planned
+    // truncation keeps the ids BELOW the bound (identity families reduce
+    // this to the old min()).
+    std::uint32_t layers = 0;
+    for (const std::uint32_t id : impl_->hook_layer_ids) {
+        if (in.planned_layers == 0xffffffffu || id < in.planned_layers) {
+            ++layers;
+        }
+    }
     if (layers == 0 || !impl_->attention_hook_coverage) {
         return veto("no attention hook coverage");
     }
@@ -6017,10 +6021,11 @@ std::uint64_t Dispatch::prepare_attention_phases(
 
     // ── Layer table (device-resident layer intrinsic; see Impl comment). ──
     if (impl_->hook_layer_table_len < layers) {
-        std::vector<std::uint32_t> iota(layers);
-        for (std::uint32_t layer = 0; layer < layers; ++layer) {
-            iota[layer] = layer;
-        }
+        // The layer intrinsic reads MODEL layer ids (a hybrid's guest sees
+        // 3, 7, 11, ... — the layers its tap actually fired on).
+        std::vector<std::uint32_t> iota(
+            impl_->hook_layer_ids.begin(),
+            impl_->hook_layer_ids.begin() + layers);
         std::uint32_t* table = nullptr;
         CUDA_CHECK(cudaMalloc(
             reinterpret_cast<void**>(&table),
@@ -6090,7 +6095,8 @@ std::uint64_t Dispatch::prepare_attention_phases(
     state.prepared_attn[1].clear();
     state.prepared_cursor = {0, 0};
     try {
-        for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        for (std::uint32_t ordinal = 0; ordinal < layers; ++ordinal) {
+            const std::uint32_t layer = impl_->hook_layer_ids[ordinal];
             for (const std::uint8_t phase : kPhases) {
                 HookPreparedInvocation invocation;
                 invocation.layer = layer;
@@ -6134,7 +6140,7 @@ std::uint64_t Dispatch::prepare_attention_phases(
                                 &stage - lane.plans->data());
                         GroupedLaneBinding binding = make_staged_binding(
                             lane, stage, nullptr, 0, nullptr, 0,
-                            impl_->hook_layer_table + layer);
+                            impl_->hook_layer_table + ordinal);
                         const HookScorePadLaunch* pad = nullptr;
                         if (phase == PTIR_STAGE_ON_ATTN &&
                             stage_uses_intrinsic(
@@ -6578,11 +6584,21 @@ bool Dispatch::finish(
     // its attention phases at only the planned layers. A DEPTH-SPLIT
     // launch (full-depth rows present, truncated suffix) still walks the
     // full model — the split narrows rows, not the layer walk.
-    const std::uint32_t expected_layers =
+    // Coverage in MODEL layer ids: the plan's depth bound and the hook
+    // region's own k (tier 2) cap which ids invoke; the expectation is
+    // the count of hook layers below both (identity families reduce this
+    // to the old min()).
+    const std::uint32_t plan_bound =
         view.planned_max_layers == 0xffffffffu ||
                 view.planned_full_depth_rows != 0xffffffffu
-            ? impl_->model_layers
-            : std::min(impl_->model_layers, view.planned_max_layers);
+            ? 0xffffffffu
+            : view.planned_max_layers;
+    const std::uint32_t bound =
+        std::min(plan_bound, pie::driver::fire::hook_region_k(view));
+    std::uint32_t expected_layers = 0;
+    for (const std::uint32_t id : impl_->hook_layer_ids) {
+        if (bound == 0xffffffffu || id < bound) ++expected_layers;
+    }
     for (std::uint8_t phase :
          {std::uint8_t{PTIR_STAGE_ON_ATTN_PROJ},
           std::uint8_t{PTIR_STAGE_ON_ATTN}}) {
@@ -7919,12 +7935,7 @@ bool Dispatch::enqueue_fixed_decode(
     // NOT taken, which no assertion downstream can see. If the RS guard above
     // is ever re-tightened, this is what says so.
     //
-    // The env read is a function-local static, not a per-batch `getenv`: this
-    // runs once per decode step on the latency path, and reading the
-    // environment there measurably costs (~1.5% of single-request tok/s).
-    static const bool trace_template =
-        std::getenv("PIE_FIXED_DECODE_TRACE") != nullptr;
-    if (trace_template) {
+    if constexpr (false) {
         static std::once_flag once;
         std::call_once(once, [&] {
             std::cerr << "[pie-driver-cuda] fixed-decode template active: "
@@ -8145,10 +8156,7 @@ bool Dispatch::resolve_descriptors(const pie::driver::fire::LaunchView& view,
         // resolve a chained descriptor: the host readback fallback cannot see a
         // value the producing fire has not committed yet, so a decode step that
         // reads the prefill's sampled token never became ready.
-        const bool trace_compose = [] {
-            const char* v = std::getenv("PIE_TRACE_DEVICE_COMPOSE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
+        constexpr bool trace_compose = false;
         auto refuse = [&](const std::string& why) {
             if (trace_compose) {
                 std::fprintf(stderr, "[compose] refused: %s\n", why.c_str());

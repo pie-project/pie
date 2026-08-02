@@ -101,14 +101,18 @@ pie-loader = { path = "../loader", default-features = false }
 # reach it over its C ABI — so the dependency exists to put the rlib in the
 # link and to order the build-script include handoff.
 pie-forward = { path = "../forward" }
+# The loader's C ABI. Depended on for two build-time reasons: the entry-point
+# anchor in `embedded_driver.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
+# `links = "pie_loader"` metadata — which `build.rs` hands to the C++ drivers.
+pie-loader-capi = { path = "../loader/capi", default-features = false }
 # The artifact's compiled metadata is lifted here and handed to the runtime
 # whole: `pie-model` owns the shape it arrives in, `pie-tokenizer` names the
 # objects that make up a `pie.tokenizer/1`.
-pie-model = { path = "../runtime/model" }
+pie-model = { path = "../model" }
 pie-tokenizer = { path = "../runtime/tokenizer" }
 # Names `pie.model/1` and the object it lives in, so the worker reads the
 # descriptor under the same name `convert` writes it under.
-pie-model-config = { path = "../runtime/model-config" }
+pie-model-config = { path = "../model/config" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example
@@ -121,3 +125,8 @@ pie-ir = { path = "../compiler/ir" }
 
 [build-dependencies]
 cmake = "0.1"
+
+# `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a
+# signal. Unix-only; the sweep is a no-op elsewhere.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

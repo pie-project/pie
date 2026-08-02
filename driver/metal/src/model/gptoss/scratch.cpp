@@ -6,11 +6,10 @@
 // reused; naming the values is the family's, and gpt-oss's differ in one way
 // that matters:
 //
-//   **The MoE's operands are a k-wide stack.** `ExpertGate`/`ExpertUp`/
-//   `ExpertDown` each write `experts_per_token` rows -- one per selected expert
-//   -- into a single value, and `ExpertCombine` reduces the stack to one row.
-//   So the widths in the pool are not all `hidden`: the expert stack is
-//   `k * intermediate`, which is what sizes the pool.
+//   **The MoE's operands are expert-sorted rows.** The sort pads every touched
+//   expert's run to a tile at M>1 and uses one row per selected expert at M=1.
+//   Gate/up/down therefore live at `sorted_rows * width`, and the inverse
+//   permutation is what lets `ExpertCombine` return to token order.
 //
 // Everything else is the plainest of the three families: one norm before
 // attention, one before the MLP, a residual add after each, and no per-layer
@@ -36,6 +35,11 @@ constexpr std::uint8_t TopkLogits = 0, TopkIds = 1, TopkWeights = 2;
 constexpr std::uint8_t SwiGate = 0, SwiUp = 1, SwiOut = 2;
 constexpr std::uint8_t CombineY = 0, CombineW = 1, CombineOut = 2;
 constexpr std::uint8_t QmvExpertIds = 8;
+constexpr std::uint8_t QmvTileExpert = 12;
+constexpr std::uint8_t SortIds = 0, SortPerm = 1, SortRowExpert = 2,
+                       SortTileExpert = 3, SortInv = 5;
+constexpr std::uint8_t RowsIn = 0, RowsOut = 1, RowsPerm = 2;
+constexpr std::uint8_t CombineInv = 4;
 }  // namespace bi
 
 ScratchPlan build_gptoss_scratch(const std::vector<Dispatch>& dag, const GptOssGeometry& g) {
@@ -48,9 +52,10 @@ ScratchPlan build_gptoss_scratch(const std::vector<Dispatch>& dag, const GptOssG
     int resid = -1;   // the residual stream
     int normed = -1;  // the norm output currently feeding projections
     int q = -1, kk = -1, vv = -1, attn = -1, block = -1;
-    // The routing decision, and the k-wide expert stack it drives.
+    // The routing decision, its expert-major permutation, and the sorted stack.
     int router_logits = -1, expert_ids = -1, expert_w = -1;
-    int gate = -1, up = -1, act = -1, expert_out = -1;
+    int perm = -1, row_expert = -1, tile_expert = -1, inv = -1;
+    int sorted_x = -1, gate = -1, up = -1, act = -1, expert_out = -1;
 
     for (std::size_t di = 0; di < dag.size(); ++di) {
         const Dispatch& d = dag[di];
@@ -134,16 +139,35 @@ ScratchPlan build_gptoss_scratch(const std::vector<Dispatch>& dag, const GptOssG
                 wr(o, bi::TopkIds, expert_ids);
                 wr(o, bi::TopkWeights, expert_w);
                 break;
+            case Kind::ExpertSort:
+                perm = fresh();
+                row_expert = fresh();
+                tile_expert = fresh();
+                inv = fresh();
+                rd(o, bi::SortIds, expert_ids);
+                wr(o, bi::SortPerm, perm);
+                wr(o, bi::SortRowExpert, row_expert);
+                wr(o, bi::SortTileExpert, tile_expert);
+                wr(o, bi::SortInv, inv);
+                break;
+            case Kind::ExpertGather:
+                sorted_x = fresh();
+                rd(o, bi::RowsIn, normed);
+                wr(o, bi::RowsOut, sorted_x);
+                rd(o, bi::RowsPerm, perm);
+                break;
             case Kind::ExpertGate:
                 gate = fresh();
-                rd(o, bi::QmvX, normed);
-                rd(o, bi::QmvExpertIds, expert_ids);
+                rd(o, bi::QmvX, sorted_x);
+                rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert);
                 wr(o, bi::QmvOut, gate);
                 break;
             case Kind::ExpertUp:
                 up = fresh();
-                rd(o, bi::QmvX, normed);
-                rd(o, bi::QmvExpertIds, expert_ids);
+                rd(o, bi::QmvX, sorted_x);
+                rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert);
                 wr(o, bi::QmvOut, up);
                 break;
             case Kind::ExpertSwiGlu:
@@ -155,13 +179,15 @@ ScratchPlan build_gptoss_scratch(const std::vector<Dispatch>& dag, const GptOssG
             case Kind::ExpertDown:
                 expert_out = fresh();
                 rd(o, bi::QmvX, act);
-                rd(o, bi::QmvExpertIds, expert_ids);
+                rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert);
                 wr(o, bi::QmvOut, expert_out);
                 break;
             case Kind::ExpertCombine:
                 block = fresh();
                 rd(o, bi::CombineY, expert_out);
                 rd(o, bi::CombineW, expert_w);
+                rd(o, bi::CombineInv, inv);
                 wr(o, bi::CombineOut, block);
                 break;
             case Kind::FfnResidual: {

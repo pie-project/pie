@@ -11,9 +11,10 @@
 //     stores — unlike CUDA's, which are stream-async and need a flush before
 //     the fill.
 //
-// No shipping contract pads, so nothing reached the arm. This file reaches it:
-// it writes a checkpoint, authors a contract that pads, compiles it with the
-// real loader, and stages the result into a real Metal heap.
+// No shipping contract pads, so nothing reaches the arm; what this file pins
+// are the two platform facts the arm's reasoning rests on. (It used to reach
+// the arm end to end through a hand-authored padded contract; that author was
+// the retired contract entry -- see part 3, below.)
 //
 // One thing measured here decides how the checks below are written. A placement
 // buffer cut from a fresh `MTLHeap` arrives **zeroed** — always, on this
@@ -34,21 +35,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "pie_loader.h"
-#include "pie_loader/checkpoint_source.hpp"
-#include "pie_loader/model_contract.hpp"
-#include "pie_loader/plan.hpp"
-#include "pie_loader/request.hpp"
-#include "pie_loader/source_checkpoint.hpp"
 
 #include "heap_bind_metal.hpp"
-#include "loader/load_plan.hpp"
 #include "loader/transcode.hpp"
 #include "model/qwen3_5/geometry.hpp"
 #include "mtl4_context.hpp"
@@ -153,162 +145,17 @@ bool the_heap_arrives_zeroed() {
     return true;
 }
 
-// -- part 3: a contract that pads, end to end --------------------------------
-
-/// A one-tensor safetensors checkpoint whose bytes are recognisable.
-///
-/// BF16 `[kRows, kCols]`, element `(r, c)` = `0x0100 + r * kCols + c`. Any byte
-/// the plan moves is therefore identifiable by position, which is what lets the
-/// check below tell "copied to the right place" from "copied at all".
-constexpr std::int64_t kRows = 4;
-constexpr std::int64_t kCols = 8;
-constexpr std::int64_t kPadBefore = 2;
-constexpr std::int64_t kPadAfter = 2;
-
-std::uint16_t source_element(std::int64_t r, std::int64_t c) {
-    return static_cast<std::uint16_t>(0x0100 + r * kCols + c);
-}
-
-std::filesystem::path write_checkpoint() {
-    const auto dir = std::filesystem::temp_directory_path() /
-                     ("pie_metal_fill_" + std::to_string(::getpid()));
-    std::filesystem::create_directories(dir);
-
-    std::vector<std::uint16_t> data(static_cast<std::size_t>(kRows * kCols));
-    for (std::int64_t r = 0; r < kRows; ++r) {
-        for (std::int64_t c = 0; c < kCols; ++c) {
-            data[static_cast<std::size_t>(r * kCols + c)] = source_element(r, c);
-        }
-    }
-    const std::size_t payload = data.size() * sizeof(std::uint16_t);
-    const std::string header = "{\"w\":{\"dtype\":\"BF16\",\"shape\":[" + std::to_string(kRows) +
-                               "," + std::to_string(kCols) + "],\"data_offsets\":[0," +
-                               std::to_string(payload) + "]}}";
-
-    const auto path = dir / "model.safetensors";
-    std::ofstream out(path, std::ios::binary);
-    const std::uint64_t len = header.size();
-    out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-    out.write(header.data(), static_cast<std::streamsize>(header.size()));
-    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(payload));
-    out.close();
-    return dir;
-}
-
-bool a_padded_contract_stages_zeros_where_no_source_reaches() {
-    const auto dir = write_checkpoint();
-
-    std::string open_error;
-    pie_loader::Checkpoint checkpoint = pie_loader::Checkpoint::open(dir.string(), &open_error);
-    if (!expect(static_cast<bool>(checkpoint), "the fixture checkpoint opens: " + open_error)) {
-        return false;
-    }
-
-    // The contract no shipping family authors yet: rows of zeros above and below
-    // the tensor that is actually on disk.
-    const auto target = pie::metal::metal_device_target();
-    pie_loader::ModelContract contract;
-    contract.align(target.preferred_alignment);
-    const auto bf16 = pie_loader::raw(pie_loader::PieLoaderDType::BF16);
-    contract.define("padded",
-                    contract.concat({contract.fill(0.0f, {kPadBefore, kCols}, bf16),
-                                     contract.src("w"),
-                                     contract.fill(0.0f, {kPadAfter, kCols}, bf16)},
-                                    0),
-                    bf16)
-        .expect({kRows + kPadBefore + kPadAfter, kCols});
-
-    const auto request =
-        pie_loader::build_contract_request(checkpoint, target, contract.view());
-    pie_loader::LoadPlan plan;
-    try {
-        plan = pie_loader::LoadPlan::compile(request);
-        plan.verify(request);
-    } catch (const std::exception& error) {
-        expect(false, std::string("compiling the padded contract: ") + error.what());
-        return false;
-    }
-
-    const auto view = plan.view();
-    std::size_t fills = 0, fill_step = 0, first_write_step = view.schedule.len;
-    for (std::size_t step = 0; step < view.schedule.len; ++step) {
-        const auto& instr = view.instrs.ptr[view.schedule.ptr[step]];
-        using Tag = pie_loader::PieLoaderStorageOp::Tag;
-        if (instr.op.tag == Tag::Fill) {
-            ++fills;
-            fill_step = step;
-        }
-        if ((instr.op.tag == Tag::ExtentWrite ||
-             instr.op.tag == Tag::BulkExtentWrite) &&
-            step < first_write_step) {
-            first_write_step = step;
-        }
-    }
-    if (!expect(fills == 1, "a padding contract compiles to exactly one Fill")) return false;
-    // The Rust side calls this `validate-fill-order`. `heap_bind.cpp` relies on
-    // it rather than re-deriving it, so this is where the reliance is checked.
-    expect(fill_step < first_write_step, "the Fill precedes every write to the buffer");
-
-    // Stage it. `n_layers = 0` keeps the KV/GDN loops empty — the point here is
-    // the storage schedule, not the model.
-    pie::metal::DecodeGeometry geometry;
-    geometry.n_layers = 0;
-    geometry.vocab = 64;
-    geometry.max_tokens = 1;
-    geometry.paged_kv_enabled = false;
-
-    pie::metal::HeapPlan heap_plan;
-    heap_plan.weights_bytes = view.memory.persistent_bytes;
-    heap_plan.scratch_slot_bytes = 4096;
-
-    auto ctx = RawMetalContext::create(16u << 20, 64u << 20);
-    if (!expect(ctx != nullptr, "RawMetalContext::create succeeds")) return false;
-
-    auto source = std::make_shared<pie_loader::CheckpointSource>(view);
-    pie::metal::BoundDecode bound;
-    try {
-        bound = pie::metal::stage_decode_storage(*ctx, std::move(source), plan, geometry,
-                                                 heap_plan);
-    } catch (const std::exception& error) {
-        expect(false, std::string("staging the padded plan: ") + error.what());
-        return false;
-    }
-
-    const auto found = bound.weights.find("padded");
-    if (!expect(found != bound.weights.end(), "the staged tensor is published under its name")) {
-        return false;
-    }
-    const SlotHandle& slot = found->second;
-    const std::int64_t rows = kRows + kPadBefore + kPadAfter;
-    if (!expect(slot.contents() != nullptr && slot.size >= static_cast<std::size_t>(rows * kCols * 2),
-                "the staged tensor is host-readable and large enough")) {
-        return false;
-    }
-
-    const auto* got = static_cast<const std::uint16_t*>(slot.contents());
-    bool pad_is_zero = true, body_survived = true;
-    for (std::int64_t r = 0; r < rows; ++r) {
-        for (std::int64_t c = 0; c < kCols; ++c) {
-            const std::uint16_t value = got[r * kCols + c];
-            if (r < kPadBefore || r >= kPadBefore + kRows) {
-                pad_is_zero = pad_is_zero && value == 0;
-            } else {
-                body_survived =
-                    body_survived && value == source_element(r - kPadBefore, c);
-            }
-        }
-    }
-    expect(pad_is_zero, "the padded rows come back zero");
-    // The decisive one. A `Fill` that ran after the copies — the hazard CUDA
-    // answers with `copy_engine_.flush()` and this driver answers with nothing
-    // but program order — would leave zeros here too, and every other check in
-    // this file would still pass.
-    expect(body_survived, "the copied rows survive the Fill");
-
-    std::error_code ignored;
-    std::filesystem::remove_all(dir, ignored);
-    return true;
-}
+// -- part 3, retired with the contract entry ---------------------------------
+//
+// This file used to end by hand-authoring a contract that pads -- rows of
+// zeros above and below a real tensor -- and staging the resulting `Fill`
+// through a real heap. That author was the C++ `ModelContract` builder, and
+// it died with the contract entry (`plan/model-in-rust.md` §8-5): a driver
+// states facts now, and no shipping family's author pads, so no request can
+// produce a `Fill` plan to stage. The two platform facts above are what the
+// arm's correctness rests on and they stay pinned; the day an author first
+// pads, the end-to-end half belongs here again, driven through
+// `compile_load_plan` with that family's real facts.
 
 /// The encoder either reproduces `mx.quantize` or it does not.
 ///
@@ -494,7 +341,6 @@ int main() {
     the_encoder_reproduces_mlx_quantize_exactly();
     heap_storage_is_host_visible_and_slices_are_exact();
     the_heap_arrives_zeroed();
-    a_padded_contract_stages_zeros_where_no_source_reaches();
     std::printf("\n==== loader_fill_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

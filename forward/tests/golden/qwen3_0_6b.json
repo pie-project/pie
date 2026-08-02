@@ -9339,5 +9339,13 @@
       ],
       "layer": null
     }
+  ],
+  "seams": [
+    {
+      "seam": "in"
+    },
+    {
+      "seam": "out"
+    }
   ]
 }

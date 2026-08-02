@@ -3,8 +3,7 @@
 //! The worker never downloads and never converts (R3). What it resolves is a
 //! name or a path to something already on disk, and under this plan that
 //! something is one `.zt` artifact: weights, compiled tokenizer and compiled
-//! model descriptor together, written by `pie model download` or
-//! `pie model convert`.
+//! model descriptor together, written by `pie model import`.
 //!
 //! Two forms, told apart by shape rather than by what happens to exist:
 //!
@@ -24,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 /// What the worker was pointed at.
 ///
@@ -48,44 +47,97 @@ impl Model {
         }
     }
 
-    /// Everything the runtime and the drivers need out of the artifact, lifted
-    /// in **one** open.
+    /// Everything the runtime and the drivers need, lifted in **one** open.
     ///
-    /// `Ok(None)` for a snapshot, and for an artifact carrying only part of it
-    /// — the runtime wants all or nothing, since half the metadata compiled
-    /// and half probed from files beside a directory is exactly the skew the
-    /// artifact removes.
-    pub fn metadata(&self) -> Result<Option<pie_model::ArtifactMetadata>> {
+    /// The descriptor is always produced: an artifact carries it compiled, and
+    /// a snapshot's `config.json` is normalized here by the same
+    /// `pie-model-config` the artifact was written with. That is what lets
+    /// everything downstream — both drivers and the runtime's model service —
+    /// read one document instead of keeping a second path that parses the
+    /// files beside a snapshot.
+    ///
+    /// The tokenizer half stays optional, and all-or-nothing: half the
+    /// tokenizer compiled and half probed from files is the skew the artifact
+    /// removes, so a partial one is treated as absent and the files win.
+    pub fn metadata(&self) -> Result<pie_model::ModelMetadata> {
         let Model::Artifact(path) = self else {
-            return Ok(None);
+            return Ok(pie_model::ModelMetadata {
+                tokenizer: None,
+                descriptor: normalize_snapshot_descriptor(self.path())?,
+            });
         };
         // One parse. For a sharded artifact the manifest read opens and
         // validates every shard, so doing it per consumer is not free.
         let checkpoint = pie_loader::checkpoint::read::parse_checkpoint_metadata(path)
-            .map_err(|err| anyhow::anyhow!("cannot read {}: {err}", path.display()))?;
+            .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
 
-        let Some(descriptor) = pie_loader::checkpoint::read::read_meta(
+        let descriptor = pie_loader::checkpoint::read::read_meta(
             &checkpoint,
             pie_model_config::DESCRIPTOR_OBJECT,
         )?
-        else {
-            return Ok(None);
-        };
+        .ok_or_else(|| {
+            anyhow!(
+                "artifact {} carries no {} descriptor; re-import it with \
+                 `pie model import`",
+                path.display(),
+                pie_model_config::DESCRIPTOR_OBJECT,
+            )
+        })?;
+
         let mut tokenizer = Vec::with_capacity(pie_tokenizer::canonical::OBJECTS.len());
         for name in pie_tokenizer::canonical::OBJECTS {
             let Some(bytes) = pie_loader::checkpoint::read::read_meta(&checkpoint, name)? else {
-                return Ok(None);
+                tokenizer.clear();
+                break;
             };
             tokenizer.push((name.to_string(), bytes));
         }
-        Ok(Some(pie_model::ArtifactMetadata {
-            tokenizer,
+        Ok(pie_model::ModelMetadata {
+            tokenizer: (!tokenizer.is_empty()).then_some(tokenizer),
             descriptor,
-        }))
+        })
     }
 }
 
-/// `$PIE_HOME/models/` — the store `pie model download` writes into.
+/// Normalize a snapshot's `config.json` into a `pie.model/1` descriptor.
+///
+/// The same call `pie model convert` makes (`bin/pie/src/ops/convert.rs`), so
+/// serving a snapshot and serving the artifact converted from it hand the
+/// driver byte-identical documents.
+///
+/// A missing or unreadable `config.json` is an error here, not a fallback. It
+/// used to be one: the driver would find nothing and parse the file itself.
+/// That branch is what this function exists to delete, so restoring it as an
+/// error path would restore the thing being removed.
+fn normalize_snapshot_descriptor(path: &Path) -> Result<Vec<u8>> {
+    // A snapshot may be the directory or a lone checkpoint file inside it.
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().ok_or_else(|| {
+            anyhow!(
+                "checkpoint {} has no directory to read config.json from",
+                path.display()
+            )
+        })?
+    };
+    let config = dir.join("config.json");
+    let raw = std::fs::read_to_string(&config).map_err(|err| {
+        anyhow!(
+            "cannot read {}: {err}; a snapshot must carry the config.json its \
+             model descriptor is normalized from (`pie model import` writes an \
+             artifact that carries it already)",
+            config.display(),
+        )
+    })?;
+    let root: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| anyhow!("cannot parse {}: {err}", config.display()))?;
+    let descriptor = pie_model_config::descriptor(&root, &config.display().to_string())
+        .map_err(|err| anyhow!("cannot normalize {}: {err:#}", config.display()))?;
+    Ok(serde_json::to_vec(&descriptor)?)
+}
+
+/// `$PIE_HOME/models/` — the store `pie model import` writes into.
 fn store_dir() -> PathBuf {
     crate::paths::pie_home().join("models")
 }
@@ -121,7 +173,7 @@ pub fn resolve(model: &str) -> Result<Model> {
         return Ok(Model::Artifact(by_repo_id));
     }
     bail!(
-        "no model {model:?} in {}; `pie model download {model}` fetches and converts one, \
+        "no model {model:?} in {}; `pie model import {model}` fetches and converts one, \
          and `pie model list` shows what is there",
         store_dir().display()
     )
@@ -211,7 +263,7 @@ mod tests {
     #[test]
     fn a_missing_name_says_how_to_get_one() {
         let err = resolve("definitely-not-a-model").unwrap_err().to_string();
-        assert!(err.contains("pie model download"), "{err}");
+        assert!(err.contains("pie model import"), "{err}");
         let err = resolve("./nowhere.zt").unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
         assert!(resolve("").is_err());
@@ -258,22 +310,16 @@ mod tests {
     fn an_artifact_hands_over_its_compiled_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let descriptor = br#"{"version":"pie.model/1","vocab_size":7,"num_hidden_layers":4}"#;
-        let lifted = artifact(dir.path(), descriptor, true)
-            .metadata()
-            .unwrap()
-            .expect("no metadata");
+        let lifted = artifact(dir.path(), descriptor, true).metadata().unwrap();
 
-        assert_eq!(
-            lifted.tokenizer.len(),
-            pie_tokenizer::canonical::OBJECTS.len()
-        );
+        let objects = lifted.tokenizer.as_ref().expect("no compiled tokenizer");
+        assert_eq!(objects.len(), pie_tokenizer::canonical::OBJECTS.len());
         assert_eq!(lifted.descriptor, descriptor);
 
         // The runtime's own reconstruction, exercised here so a break shows up
         // as a worker test rather than only at serve time.
         let rebuilt = pie_tokenizer::canonical::CanonicalTokenizer::from_objects(|name| {
-            lifted
-                .tokenizer
+            objects
                 .iter()
                 .find(|(have, _)| have == name)
                 .map(|(_, bytes)| bytes.clone())
@@ -283,26 +329,76 @@ mod tests {
         assert_eq!(rebuilt.vocab_size(), 2);
     }
 
-    /// All of the metadata or none of it: half compiled and half probed from
+    /// All of the tokenizer or none of it: half compiled and half probed from
     /// files beside a snapshot is the skew the artifact removes.
+    ///
+    /// The descriptor is unaffected — it is a different object with a
+    /// different completeness question, and an artifact that carries one but
+    /// not a whole tokenizer still has a model config worth reading.
     #[test]
-    fn an_artifact_missing_part_of_its_metadata_hands_over_nothing() {
+    fn an_artifact_missing_part_of_its_tokenizer_hands_over_none_of_it() {
         let dir = tempfile::tempdir().unwrap();
-        let partial = artifact(dir.path(), br#"{"version":"pie.model/1"}"#, false);
-        assert!(partial.metadata().unwrap().is_none());
+        let descriptor = br#"{"version":"pie.model/1","vocab_size":7}"#;
+        let lifted = artifact(dir.path(), descriptor, false).metadata().unwrap();
+        assert!(lifted.tokenizer.is_none());
+        assert_eq!(lifted.descriptor, descriptor);
     }
 
-    /// A legacy snapshot has no metadata, and saying so is not an error — it
-    /// is what selects the driver's fallback. Answered without opening
-    /// anything.
+    /// **Both input forms produce a descriptor.**
+    ///
+    /// This is the property that let the second and third normalizers go — the
+    /// drivers' `config.json` parsers and the runtime's own key probes — so it
+    /// is pinned rather than left implied. If a snapshot ever again reaches
+    /// them without a descriptor, there is nothing left to fall back to.
     #[test]
-    fn a_snapshot_carries_no_metadata() {
+    fn every_model_form_produces_a_descriptor() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(
-            Model::Snapshot(dir.path().to_path_buf())
-                .metadata()
-                .unwrap()
-                .is_none()
+
+        // The artifact form: the compiled bytes, read back rather than derived
+        // from a `config.json` it does not have.
+        let compiled = br#"{"version":"pie.model/1","vocab_size":7,"num_hidden_layers":4}"#;
+        let model = artifact(dir.path(), compiled, true);
+        assert_eq!(model.metadata().unwrap().descriptor, compiled);
+
+        // The snapshot form: normalized here, from `config.json`, and with no
+        // compiled tokenizer to hand over.
+        let snap = dir.path().join("snapshot");
+        std::fs::create_dir(&snap).unwrap();
+        std::fs::write(
+            snap.join("config.json"),
+            br#"{"architectures":["LlamaForCausalLM"],"model_type":"llama",
+                 "hidden_size":64,"num_hidden_layers":2,
+                 "num_attention_heads":4,"num_key_value_heads":4,
+                 "intermediate_size":128,"vocab_size":32,"max_position_embeddings":128,
+                 "rms_norm_eps":1e-5,"rope_theta":10000.0}"#,
+        )
+        .unwrap();
+        let lifted = Model::Snapshot(snap.clone()).metadata().unwrap();
+        assert!(lifted.tokenizer.is_none());
+        let doc: serde_json::Value = serde_json::from_slice(&lifted.descriptor).unwrap();
+        assert_eq!(doc["version"], pie_model_config::VERSION);
+        assert_eq!(doc["num_hidden_layers"], 2);
+        // The two fields the runtime reads out of it, so a schema change that
+        // dropped either shows up here rather than at boot.
+        assert_eq!(doc["vocab_size"], 32);
+
+        // A checkpoint file inside the snapshot reads the config beside it.
+        let gguf = snap.join("model.gguf");
+        std::fs::write(&gguf, b"x").unwrap();
+        assert_eq!(
+            Model::Snapshot(gguf).metadata().unwrap().descriptor,
+            lifted.descriptor
         );
+    }
+
+    /// A snapshot without a `config.json` is an error, not a silent fallback.
+    #[test]
+    fn a_snapshot_without_a_config_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = Model::Snapshot(dir.path().to_path_buf())
+            .metadata()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config.json"), "{err}");
     }
 }

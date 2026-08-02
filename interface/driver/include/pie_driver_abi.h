@@ -448,6 +448,15 @@
 #define PIE_REGION_SIG_LORA (1 << 4)
 
 /**
+ * `region_sig[r]` bit: the region's hook programs write the
+ * `attn_page_mask` sink (Track B page substitution). Such a hook needs
+ * the full-R paged decode path, so the banded-depth derivation excludes
+ * it (observation-only hooks band; Track-B hooks keep the pre-band
+ * servers).
+ */
+#define PIE_REGION_SIG_HOOK_PAGE_MASK (1 << 5)
+
+/**
  * [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
  * sentinel. Not zero: zero is a legitimate planned value ("no fast
  * prefix" — an all-hooked step).

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+
 #include <cstdint>
 #include <vector>
 
@@ -66,5 +68,21 @@ struct NemotronHWeights {
 };
 
 NemotronHWeights bind_nemotron_h(const LoadedModel& engine);
+
+/// Whether this rank splits the Mamba mixer, rather than replicating it.
+///
+/// Read by the contract, by bind and by the forward, which have to agree: the
+/// contract decides what shape the weights arrive in, and the forward's head
+/// and group counts are derived from the same answer. The environment variable
+/// is a kill switch for bisecting a numerical regression; because it changes
+/// the contract, and the cache key is the contract's, flipping it re-plans
+/// rather than reusing a cached plan for the other layout.
+inline bool nemotron_h_tp_mamba_sharding_enabled(int tp_size) {
+    if (tp_size <= 1) {
+        return false;
+    }
+    const char* disabled = std::getenv("PIE_NEMOTRON_DISABLE_TP_MAMBA_SHARD");
+    return disabled == nullptr || disabled[0] == '\0' || disabled[0] == '0';
+}
 
 }  // namespace pie_cuda_driver::model

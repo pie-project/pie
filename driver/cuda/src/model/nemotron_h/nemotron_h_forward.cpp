@@ -1,5 +1,5 @@
 #include "model/nemotron_h/nemotron_h_forward.hpp"
-#include "model/nemotron_h/nemotron_h_contract.hpp"
+#include "model/nemotron_h/nemotron_h.hpp"
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
@@ -38,157 +38,15 @@ namespace {
 
 constexpr int kMambaIntermediate = 4096;
 
-bool nemotron_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_decode_conv_update_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_DISABLE_DECODE_CONV_UPDATE");
-        return v == nullptr || v[0] == '\0' || v[0] == '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_grouped_moe_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_ENABLE_GROUPED_MOE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_flashinfer_moe_decode_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_FLASHINFER_MOE_DECODE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_decode_dt_precompute_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_PRECOMPUTE_DECODE_DT");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_fused_ar_norm_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_FUSED_AR_NORM");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_exact_decode_moe_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_DISABLE_EXACT_DECODE_MOE");
-        return v == nullptr || v[0] == '\0' || v[0] == '0';
-    }();
-    return enabled;
-}
-
-int nemotron_exact_prefill_moe_max_tokens() {
-    static const int max_tokens = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_EXACT_PREFILL_MOE_MAX_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_tokens;
-}
-
-bool nemotron_aligned_prefill_moe_enabled() {
-    static const bool enabled = [] {
-        const char* disabled =
-            std::getenv("PIE_NEMOTRON_DISABLE_ALIGNED_PREFILL_MOE");
-        if (disabled != nullptr && disabled[0] != '\0' &&
-            disabled[0] != '0') {
-            return false;
-        }
-        const char* enabled =
-            std::getenv("PIE_NEMOTRON_ENABLE_ALIGNED_PREFILL_MOE");
-        return enabled == nullptr || enabled[0] == '\0' || enabled[0] != '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_aligned_decode_moe_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_ENABLE_ALIGNED_DECODE_MOE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_route_batched_decode_moe_enabled() {
-    static const bool enabled = [] {
-        const char* v =
-            std::getenv("PIE_NEMOTRON_ENABLE_ROUTE_BATCHED_DECODE_MOE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool nemotron_grouped_down_exact_moe_enabled() {
-    static const bool enabled = [] {
-        const char* v =
-            std::getenv("PIE_NEMOTRON_ENABLE_GROUPED_DOWN_EXACT_MOE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-int nemotron_aligned_moe_block_size() {
-    static const int block_size = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_ALIGNED_MOE_BLOCK_SIZE");
-        if (v == nullptr || v[0] == '\0') return 64;
-        return std::max(1, std::atoi(v));
-    }();
-    return block_size;
-}
+constexpr int kNemotronAlignedMoeBlockSize = 64;
 
 std::size_t nemotron_moe_aligned_rows_capacity(
     std::size_t routes,
     std::size_t num_experts)
 {
-    if (!nemotron_aligned_prefill_moe_enabled()) return routes;
     const std::size_t block =
-        static_cast<std::size_t>(nemotron_aligned_moe_block_size());
+        static_cast<std::size_t>(kNemotronAlignedMoeBlockSize);
     return routes + num_experts * (block - 1);
-}
-
-std::uint64_t nemotron_profile_print_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{16};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
-}
-
-std::uint64_t nemotron_profile_skip() {
-    static const std::uint64_t skip = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_PROFILE_SKIP");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{0};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return skip;
-}
-
-bool nemotron_profile_all_ranks() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_NEMOTRON_PROFILE_ALL_RANKS");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
 }
 
 struct NemotronForwardProfile {
@@ -238,8 +96,8 @@ struct NemotronForwardProfile {
     }
 
     void begin(int n, int r, bool decode, int rank, cudaStream_t stream) {
-        enabled = nemotron_profile_enabled();
-        if (!enabled) return;
+        enabled = false;
+        return;
         ensure_events();
         tp_rank = rank;
         N = n;
@@ -284,54 +142,7 @@ void profile_cuda_stage(
     *dst += static_cast<double>(ms);
 }
 
-void maybe_print_profile(const NemotronForwardProfile& p) {
-    if (!p.enabled) return;
-    if (p.tp_rank != 0 && !nemotron_profile_all_ranks()) return;
-    static std::uint64_t seq = 0;
-    ++seq;
-    if (seq <= nemotron_profile_skip()) return;
-    const std::uint64_t limit = nemotron_profile_print_limit();
-    if (limit == 0 || seq > nemotron_profile_skip() + limit) return;
-
-    const double mamba_ms =
-        p.mamba_inproj_ms + p.mamba_split_ms + p.mamba_conv_ms +
-        p.mamba_ssm_ms + p.mamba_norm_ms + p.mamba_outproj_ms;
-    const double moe_ms =
-        p.moe_router_ms + p.moe_routed_ms + p.moe_shared_ms +
-        p.moe_allreduce_ms;
-    const double named =
-        p.embed_ms + p.norm_ms + p.attn_ms + mamba_ms + moe_ms +
-        p.lm_head_ms;
-    const double other = p.forward_ms > named ? p.forward_ms - named : 0.0;
-    std::cerr
-        << "[pie-nemotron-profile] seq=" << seq
-        << " rank=" << p.tp_rank
-        << " N=" << p.N
-        << " R=" << p.R
-        << " decode=" << (p.pure_decode ? 1 : 0)
-        << " layers_mamba=" << p.mamba_layers
-        << " layers_attn=" << p.attn_layers
-        << " layers_moe=" << p.moe_layers
-        << " total_ms=" << p.forward_ms
-        << " embed_ms=" << p.embed_ms
-        << " norm_ms=" << p.norm_ms
-        << " attn_ms=" << p.attn_ms
-        << " mamba_ms=" << mamba_ms
-        << " mamba_inproj_ms=" << p.mamba_inproj_ms
-        << " mamba_split_ms=" << p.mamba_split_ms
-        << " mamba_conv_ms=" << p.mamba_conv_ms
-        << " mamba_ssm_ms=" << p.mamba_ssm_ms
-        << " mamba_norm_ms=" << p.mamba_norm_ms
-        << " mamba_outproj_ms=" << p.mamba_outproj_ms
-        << " moe_ms=" << moe_ms
-        << " moe_router_ms=" << p.moe_router_ms
-        << " moe_routed_ms=" << p.moe_routed_ms
-        << " moe_shared_ms=" << p.moe_shared_ms
-        << " moe_allreduce_ms=" << p.moe_allreduce_ms
-        << " lm_head_ms=" << p.lm_head_ms
-        << " other_ms=" << other
-        << "\n";
-}
+void maybe_print_profile(const NemotronForwardProfile&) {}
 
 struct ExpertRouting {
     std::vector<std::vector<std::int32_t>> route_ids;
@@ -570,7 +381,7 @@ void mamba_layer(
 
     profile_cuda_stage(profile, profile ? &profile->mamba_conv_ms : nullptr,
         stream, [&] {
-        if (is_pure_decode && nemotron_decode_conv_update_enabled()) {
+        if (is_pure_decode) {
             if (slot_ids_d != nullptr) {
                 kernels::launch_causal_conv1d_update_batched_bf16(
                     nem_ws.mamba_conv_in.data(),
@@ -610,7 +421,7 @@ void mamba_layer(
         stream, [&] {
         const float* dt_precomputed = nullptr;
         const float* dA_precomputed = nullptr;
-        if (!is_pure_decode || nemotron_decode_dt_precompute_enabled()) {
+        if (!is_pure_decode) {
             kernels::launch_nemotron_prepare_mamba_dt_da(
                 nem_ws.mamba_dt.data(),
                 Lw.mamba_A.data(),
@@ -748,7 +559,7 @@ void moe_layer(
         stream, [&] {
         const int routes = N * K;
         if (ops::flashinfer_cutlass_moe_enabled() &&
-            (!is_pure_decode || nemotron_flashinfer_moe_decode_enabled()) &&
+            !is_pure_decode &&
             Lw.expert_up_packed != nullptr &&
             Lw.expert_down_packed != nullptr &&
             !nem_ws.flashinfer_moe_workspace.empty() &&
@@ -767,8 +578,7 @@ void moe_layer(
                 N, H, I, E, K, T, tp_rank, stream);
             if (ran) return;
         }
-        if (is_pure_decode &&
-            (N == 1 || nemotron_route_batched_decode_moe_enabled())) {
+        if (is_pure_decode && N == 1) {
             kernels::launch_build_nemotron_moe_ptrs_decode_batched_bf16(
                 nem_ws.topk_idx.data(),
                 nem_ws.topk_weights.data(),
@@ -804,12 +614,7 @@ void moe_layer(
                 ws.norm_y.data(), nem_ws.expert_out.data(),
                 nem_ws.route_weights.data(), N, K, H, stream);
         } else {
-            const bool use_aligned_decode =
-                is_pure_decode && N > 1 &&
-                nemotron_aligned_decode_moe_enabled();
-            if ((is_pure_decode && !use_aligned_decode &&
-                 nemotron_exact_decode_moe_enabled()) ||
-                (!is_pure_decode && N <= nemotron_exact_prefill_moe_max_tokens())) {
+            if (is_pure_decode || N <= 0) {
                 std::int32_t* sorted_route_ids = nem_ws.expert_idx.data();
                 std::int32_t* route_to_sorted_row =
                     sorted_route_ids + routes;
@@ -904,40 +709,17 @@ void moe_layer(
                         nem_ws.expert_up.data(), nem_ws.expert_act.data(),
                         offset * I, stream);
 
-                    if (nemotron_grouped_down_exact_moe_enabled()) {
-                        nem_ws.b_down_ptrs.copy_from_host(
-                            std::span<const std::uint16_t* const>(
-                                down_act_ptrs.data(), down_act_ptrs.size()));
-                        nem_ws.a_down_ptrs.copy_from_host(
-                            std::span<const std::uint16_t* const>(
-                                down_weight_ptrs.data(),
-                                down_weight_ptrs.size()));
-                        nem_ws.c_down_ptrs.copy_from_host(
-                            std::span<std::uint16_t* const>(
-                                down_out_ptrs.data(), down_out_ptrs.size()));
-                        ops::gemm_grouped_act_x_wt_bf16(
-                            cublas.handle(),
-                            reinterpret_cast<const void* const*>(
-                                nem_ws.b_down_ptrs.data()),
-                            reinterpret_cast<const void* const*>(
-                                nem_ws.a_down_ptrs.data()),
-                            reinterpret_cast<void* const*>(
-                                nem_ws.c_down_ptrs.data()),
-                            rows_per_expert.data(),
-                            static_cast<int>(rows_per_expert.size()), H, I);
-                    } else {
-                        for (std::size_t i = 0; i < active_experts.size(); ++i) {
-                            const int e = active_experts[i];
-                            const int row_offset = row_offsets[i];
-                            const int Ne = rows_per_expert[i];
-                            ops::gemm_act_x_wt_bf16(cublas.handle(),
-                                nem_ws.expert_act.data() +
-                                    static_cast<long long>(row_offset) * I,
-                                Lw.expert_down[static_cast<std::size_t>(e)]->data(),
-                                nem_ws.expert_out.data() +
-                                    static_cast<long long>(row_offset) * H,
-                                Ne, H, I);
-                        }
+                    for (std::size_t i = 0; i < active_experts.size(); ++i) {
+                        const int e = active_experts[i];
+                        const int row_offset = row_offsets[i];
+                        const int Ne = rows_per_expert[i];
+                        ops::gemm_act_x_wt_bf16(cublas.handle(),
+                            nem_ws.expert_act.data() +
+                                static_cast<long long>(row_offset) * I,
+                            Lw.expert_down[static_cast<std::size_t>(e)]->data(),
+                            nem_ws.expert_out.data() +
+                                static_cast<long long>(row_offset) * H,
+                            Ne, H, I);
                     }
 
                     kernels::launch_token_batched_weighted_sum_aligned_bf16(
@@ -948,9 +730,8 @@ void moe_layer(
                 return;
             }
 
-            if (use_aligned_decode ||
-                (!is_pure_decode && nemotron_aligned_prefill_moe_enabled())) {
-                const int block_size = nemotron_aligned_moe_block_size();
+            if (!is_pure_decode) {
+                const int block_size = kNemotronAlignedMoeBlockSize;
                 const int max_blocks =
                     (routes + E * (block_size - 1) + block_size - 1) /
                     block_size;
@@ -1014,171 +795,65 @@ void moe_layer(
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
             const auto routing = build_routing(topk_idx_h, topk_w_h, N, K, E);
-            if (nemotron_grouped_moe_enabled()) {
-                std::vector<std::int32_t> sorted_route_ids;
-                std::vector<const std::uint16_t*> act_ptrs;
-                std::vector<const std::uint16_t*> weight_ptrs;
-                std::vector<std::uint16_t*> out_ptrs;
-                std::vector<int> rows_per_expert;
-                std::vector<int> active_experts;
-                std::vector<int> row_offsets;
-                std::vector<std::int32_t> route_to_sorted_row(
-                    static_cast<std::size_t>(N) * K);
-                sorted_route_ids.reserve(static_cast<std::size_t>(N) * K);
-                act_ptrs.reserve(static_cast<std::size_t>(E));
-                weight_ptrs.reserve(static_cast<std::size_t>(E));
-                out_ptrs.reserve(static_cast<std::size_t>(E));
-                rows_per_expert.reserve(static_cast<std::size_t>(E));
-                active_experts.reserve(static_cast<std::size_t>(E));
-                row_offsets.reserve(static_cast<std::size_t>(E));
+            std::vector<std::int32_t> packed_token_idx;
+            std::vector<float> packed_weights;
+            std::vector<int> expert_offsets(static_cast<std::size_t>(E) + 1, 0);
+            packed_token_idx.reserve(static_cast<std::size_t>(N) * K);
+            packed_weights.reserve(static_cast<std::size_t>(N) * K);
 
-                for (int e = 0; e < E; ++e) {
-                    const auto& route_ids =
-                        routing.route_ids[static_cast<std::size_t>(e)];
-                    const int Ne = static_cast<int>(route_ids.size());
-                    if (Ne == 0) continue;
-                    const std::size_t offset = sorted_route_ids.size();
-                    for (std::size_t j = 0; j < route_ids.size(); ++j) {
-                        const int route = route_ids[j];
-                        route_to_sorted_row[static_cast<std::size_t>(route)] =
-                            static_cast<std::int32_t>(
-                                offset + j);
-                    }
-                    sorted_route_ids.insert(
-                        sorted_route_ids.end(), route_ids.begin(), route_ids.end());
-                    active_experts.push_back(e);
-                    row_offsets.push_back(static_cast<int>(offset));
-                    rows_per_expert.push_back(Ne);
-                    act_ptrs.push_back(
-                        nem_ws.expert_in.data() + static_cast<long long>(offset) * H);
-                    weight_ptrs.push_back(
-                        static_cast<const std::uint16_t*>(
-                            Lw.expert_up[static_cast<std::size_t>(e)]->data()));
-                    out_ptrs.push_back(
-                        nem_ws.expert_up.data() + static_cast<long long>(offset) * I);
-                }
-
-                const int routed_rows = static_cast<int>(sorted_route_ids.size());
-                if (routed_rows > 0) {
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        nem_ws.expert_idx.data(), sorted_route_ids.data(),
-                        sorted_route_ids.size() * sizeof(std::int32_t),
-                        cudaMemcpyHostToDevice, stream));
-                    std::int32_t* route_to_sorted_row_d =
-                        nem_ws.expert_idx.data() + routed_rows;
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        route_to_sorted_row_d, route_to_sorted_row.data(),
-                        route_to_sorted_row.size() * sizeof(std::int32_t),
-                        cudaMemcpyHostToDevice, stream));
-                    kernels::launch_gather_moe_aligned_inputs_bf16(
-                        ws.norm_x.data(), nem_ws.expert_idx.data(),
-                        nem_ws.expert_in.data(), N * K, routed_rows,
-                        K, H, /*shared_row_begin=*/-1,
-                        /*num_tokens=*/0, stream);
-                    nem_ws.b_up_ptrs.copy_from_host(
-                        std::span<const std::uint16_t* const>(
-                            act_ptrs.data(), act_ptrs.size()));
-                    nem_ws.a_up_ptrs.copy_from_host(
-                        std::span<const std::uint16_t* const>(
-                            weight_ptrs.data(), weight_ptrs.size()));
-                    nem_ws.c_up_ptrs.copy_from_host(
-                        std::span<std::uint16_t* const>(
-                            out_ptrs.data(), out_ptrs.size()));
-
-                    ops::gemm_grouped_act_x_wt_bf16(
-                        cublas.handle(),
-                        reinterpret_cast<const void* const*>(
-                            nem_ws.b_up_ptrs.data()),
-                        reinterpret_cast<const void* const*>(
-                            nem_ws.a_up_ptrs.data()),
-                        reinterpret_cast<void* const*>(
-                            nem_ws.c_up_ptrs.data()),
-                        rows_per_expert.data(),
-                        static_cast<int>(rows_per_expert.size()), I, H);
-
-                    kernels::launch_relu2_bf16(
-                        nem_ws.expert_up.data(), nem_ws.expert_act.data(),
-                        routed_rows * I, stream);
-
-                    for (std::size_t i = 0; i < active_experts.size(); ++i) {
-                        const int e = active_experts[i];
-                        const int offset = row_offsets[i];
-                        const int Ne = rows_per_expert[i];
-                        ops::gemm_act_x_wt_bf16(cublas.handle(),
-                            nem_ws.expert_act.data() +
-                                static_cast<long long>(offset) * I,
-                            Lw.expert_down[static_cast<std::size_t>(e)]->data(),
-                            nem_ws.expert_out.data() +
-                                static_cast<long long>(offset) * H,
-                            Ne, H, I);
-                    }
-
-                    kernels::launch_token_batched_weighted_sum_aligned_bf16(
-                        ws.norm_y.data(), nem_ws.expert_out.data(),
-                        nem_ws.topk_weights.data(), route_to_sorted_row_d,
-                        N, K, H, stream);
-                }
-            } else {
-                std::vector<std::int32_t> packed_token_idx;
-                std::vector<float> packed_weights;
-                std::vector<int> expert_offsets(static_cast<std::size_t>(E) + 1, 0);
-                packed_token_idx.reserve(static_cast<std::size_t>(N) * K);
-                packed_weights.reserve(static_cast<std::size_t>(N) * K);
-
-                for (int e = 0; e < E; ++e) {
-                    expert_offsets[static_cast<std::size_t>(e)] =
-                        static_cast<int>(packed_token_idx.size());
-                    const auto& tok_idx =
-                        routing.token_idx[static_cast<std::size_t>(e)];
-                    const auto& wts =
-                        routing.weights[static_cast<std::size_t>(e)];
-                    packed_token_idx.insert(
-                        packed_token_idx.end(), tok_idx.begin(), tok_idx.end());
-                    packed_weights.insert(
-                        packed_weights.end(), wts.begin(), wts.end());
-                }
-                expert_offsets[static_cast<std::size_t>(E)] =
+            for (int e = 0; e < E; ++e) {
+                expert_offsets[static_cast<std::size_t>(e)] =
                     static_cast<int>(packed_token_idx.size());
-                if (!packed_token_idx.empty()) {
-                    nem_ws.expert_idx.copy_from_host(
-                        std::span<const std::int32_t>(
-                            packed_token_idx.data(), packed_token_idx.size()));
-                    nem_ws.expert_w.copy_from_host(
-                        std::span<const float>(
-                            packed_weights.data(), packed_weights.size()));
-                }
+                const auto& tok_idx =
+                    routing.token_idx[static_cast<std::size_t>(e)];
+                const auto& wts =
+                    routing.weights[static_cast<std::size_t>(e)];
+                packed_token_idx.insert(
+                    packed_token_idx.end(), tok_idx.begin(), tok_idx.end());
+                packed_weights.insert(
+                    packed_weights.end(), wts.begin(), wts.end());
+            }
+            expert_offsets[static_cast<std::size_t>(E)] =
+                static_cast<int>(packed_token_idx.size());
+            if (!packed_token_idx.empty()) {
+                nem_ws.expert_idx.copy_from_host(
+                    std::span<const std::int32_t>(
+                        packed_token_idx.data(), packed_token_idx.size()));
+                nem_ws.expert_w.copy_from_host(
+                    std::span<const float>(
+                        packed_weights.data(), packed_weights.size()));
+            }
 
-                CUDA_CHECK(cudaMemsetAsync(ws.norm_y.data(), 0,
-                    static_cast<std::size_t>(N) * H * sizeof(std::uint16_t), stream));
-                for (int e = 0; e < E; ++e) {
-                    const int offset = expert_offsets[static_cast<std::size_t>(e)];
-                    const int Ne =
-                        expert_offsets[static_cast<std::size_t>(e) + 1] - offset;
-                    if (Ne == 0) continue;
-                    const std::int32_t* expert_idx_d =
-                        nem_ws.expert_idx.data() + offset;
-                    const float* expert_w_d =
-                        nem_ws.expert_w.data() + offset;
-                    kernels::launch_gather_bf16_rows(
-                        static_cast<const std::uint16_t*>(ws.norm_x.data()),
-                        expert_idx_d,
-                        nem_ws.expert_in.data(), Ne, H, stream);
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        nem_ws.expert_in.data(),
-                        Lw.expert_up[static_cast<std::size_t>(e)]->data(),
-                        nem_ws.expert_up.data(), Ne, I, H);
-                    kernels::launch_relu2_bf16(
-                        nem_ws.expert_up.data(), nem_ws.expert_act.data(),
-                        Ne * I, stream);
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        nem_ws.expert_act.data(),
-                        Lw.expert_down[static_cast<std::size_t>(e)]->data(),
-                        nem_ws.expert_out.data(), Ne, H, I);
-                    kernels::launch_scatter_add_weighted_bf16(
-                        ws.norm_y.data(), nem_ws.expert_out.data(),
-                        expert_idx_d, expert_w_d,
-                        Ne, H, stream);
-                }
+            CUDA_CHECK(cudaMemsetAsync(ws.norm_y.data(), 0,
+                static_cast<std::size_t>(N) * H * sizeof(std::uint16_t), stream));
+            for (int e = 0; e < E; ++e) {
+                const int offset = expert_offsets[static_cast<std::size_t>(e)];
+                const int Ne =
+                    expert_offsets[static_cast<std::size_t>(e) + 1] - offset;
+                if (Ne == 0) continue;
+                const std::int32_t* expert_idx_d =
+                    nem_ws.expert_idx.data() + offset;
+                const float* expert_w_d =
+                    nem_ws.expert_w.data() + offset;
+                kernels::launch_gather_bf16_rows(
+                    static_cast<const std::uint16_t*>(ws.norm_x.data()),
+                    expert_idx_d,
+                    nem_ws.expert_in.data(), Ne, H, stream);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    nem_ws.expert_in.data(),
+                    Lw.expert_up[static_cast<std::size_t>(e)]->data(),
+                    nem_ws.expert_up.data(), Ne, I, H);
+                kernels::launch_relu2_bf16(
+                    nem_ws.expert_up.data(), nem_ws.expert_act.data(),
+                    Ne * I, stream);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    nem_ws.expert_act.data(),
+                    Lw.expert_down[static_cast<std::size_t>(e)]->data(),
+                    nem_ws.expert_out.data(), Ne, H, I);
+                kernels::launch_scatter_add_weighted_bf16(
+                    ws.norm_y.data(), nem_ws.expert_out.data(),
+                    expert_idx_d, expert_w_d,
+                    Ne, H, stream);
             }
         }
     });
@@ -1270,8 +945,8 @@ NemotronHWorkspace NemotronHWorkspace::allocate(
     const std::size_t moe_rows = nemotron_moe_aligned_rows_capacity(routes, E);
     const std::size_t moe_blocks =
         (moe_rows + static_cast<std::size_t>(
-                        std::max(1, nemotron_aligned_moe_block_size())) - 1) /
-        static_cast<std::size_t>(std::max(1, nemotron_aligned_moe_block_size()));
+                        kNemotronAlignedMoeBlockSize) - 1) /
+        static_cast<std::size_t>(kNemotronAlignedMoeBlockSize);
     const std::size_t I =
         static_cast<std::size_t>(cfg.moe_intermediate_size / T);
     const std::size_t Is =
@@ -1332,7 +1007,7 @@ std::size_t nemotron_h_workspace_bytes(
     const std::size_t routes = N * K;
     const std::size_t moe_rows = nemotron_moe_aligned_rows_capacity(routes, E);
     const std::size_t block =
-        static_cast<std::size_t>(std::max(1, nemotron_aligned_moe_block_size()));
+        static_cast<std::size_t>(kNemotronAlignedMoeBlockSize);
     const std::size_t moe_blocks = (moe_rows + block - 1) / block;
     const std::size_t I =
         static_cast<std::size_t>(cfg.moe_intermediate_size / T);
@@ -1456,11 +1131,7 @@ void nemotron_h_forward_paged(
             });
         }
 
-        const bool try_fused_next_norm =
-            nemotron_fused_ar_norm_enabled() && li + 1 < w.layers.size();
-        const void* next_norm_w = try_fused_next_norm
-            ? w.layers[li + 1].norm->data()
-            : nullptr;
+        const void* next_norm_w = nullptr;
         bool produced_next_norm = false;
 
         if (Lw.kind == NemotronHLayerWeights::Kind::Mamba) {

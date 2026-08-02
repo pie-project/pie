@@ -55,13 +55,10 @@ use grant::{DevicePageReservation, RsSlotReservation};
 
 use crate::store::kv::page_table::ReclaimQuote;
 
-/// Process identity the planner tracks (FCFS clock key, residency key).
-pub type ProcessId = uuid::Uuid;
-
 /// Opt-in event markers (`PIE_CONTENTION_TRACE_EVENTS=1`): `println!`, not
 /// `tracing` — the embedded (pyo3) server installs no subscriber. The
-/// timestamp shares the fire-timing monotonic clock so planner events
-/// correlate with `PIE_FIRE_TIMING` wave records in one benchmark log.
+/// timestamp shares the fire-timing monotonic clock, which is what lets these
+/// markers be read against the scheduler's own timing records.
 ///
 /// **This is a separate switch from the periodic stall sampler**
 /// (`PIE_CONTENTION_TRACE_MS`) on purpose. The markers fire per planner
@@ -93,55 +90,10 @@ macro_rules! ptrace {
     };
 }
 
-/// The one owner of the pid-tagged marker format —
-/// `[<scope> t_us=<µs>] pid=<pid> <msg>` — used by every probe site outside
-/// this module (`planner-exec` steps, `build` hp/dg markers, forward-path
-/// rx markers). Same flag, same monotonic clock, so all contention events
-/// correlate in one benchmark log.
-macro_rules! trace_mark {
-    ($scope:expr, $pid:expr, $($arg:tt)*) => {
-        if $crate::planner::trace_enabled() {
-            println!(
-                "[{} t_us={}] pid={} {}",
-                $scope,
-                $crate::scheduler::fire_timing_now_us(),
-                $pid,
-                format_args!($($arg)*)
-            );
-        }
-    };
-}
-pub(crate) use trace_mark;
+/// Process identity the planner tracks (FCFS clock key, residency key).
+pub type ProcessId = uuid::Uuid;
 
-/// The planner's whole configuration, parsed from the environment exactly
-/// once at the bootstrap edge and injected explicitly. The only quantity is
-/// the transport retry bound — every other number in the design is a ledger
-/// value or exact arithmetic.
-#[derive(Clone, Copy, Debug)]
-pub struct PlannerConfig {
-    /// Restore attempts per evictee before the process is failed loud (the
-    /// irreducible transport retry — H3).
-    pub restore_retries: u32,
-}
 
-impl Default for PlannerConfig {
-    fn default() -> Self {
-        Self { restore_retries: 3 }
-    }
-}
-
-impl PlannerConfig {
-    /// Parse the operator-facing environment (`PIE_KV_RESTORE_RETRIES`).
-    pub fn from_env() -> Self {
-        let defaults = Self::default();
-        Self {
-            restore_retries: std::env::var("PIE_KV_RESTORE_RETRIES")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(defaults.restore_retries),
-        }
-    }
-}
 
 /// Minimal physical port the planner drives — pool stats, rung-0 idle
 /// reclaim, and concrete reservations. The planner owns ALL policy; this
@@ -599,8 +551,10 @@ struct Proc {
     /// Spawn-order clock — the single, authoritative FCFS key.
     seq: u64,
     state: Residency,
-    /// Bounded transport retries consumed by failed restores.
-    restore_attempts: u32,
+    /// Whether this process has already spent its one restore retry. Cleared
+    /// on every successful restore, so the allowance is per episode and not
+    /// per lifetime.
+    restore_retried: bool,
     /// E6 — progress before re-eviction. `false` from restore commit until
     /// this process's next `acquire` call (any outcome — every fire passes
     /// through `acquire`, and a restored guest always re-asks: it was parked
@@ -633,7 +587,7 @@ impl Proc {
         Self {
             seq,
             state: Residency::Resident,
-            restore_attempts: 0,
+            restore_retried: false,
             progressed: true,
             admitted: false,
             signal: Arc::new(Notify::new()),
@@ -944,7 +898,6 @@ pub struct ResidencyPlanner {
     idle_reclaim_exhausted: std::sync::atomic::AtomicBool,
     port: Arc<dyn PoolPort>,
     stats: PlannerStats,
-    config: PlannerConfig,
 }
 
 /// Removes a parked allocation entry when its `acquire` future is dropped
@@ -971,7 +924,7 @@ impl Drop for WaitRegistration<'_> {
 }
 
 impl ResidencyPlanner {
-    pub fn new(port: Arc<dyn PoolPort>, config: PlannerConfig) -> Self {
+    pub fn new(port: Arc<dyn PoolPort>) -> Self {
         Self {
             inner: parking_lot::Mutex::new(Inner::default()),
             waiters: AtomicUsize::new(0),
@@ -980,7 +933,6 @@ impl ResidencyPlanner {
             idle_reclaim_exhausted: std::sync::atomic::AtomicBool::new(false),
             port,
             stats: PlannerStats::default(),
-            config,
         }
     }
 
@@ -1524,7 +1476,6 @@ impl ResidencyPlanner {
                     match outcome {
                         ServeOutcome::Served(notify) => {
                             self.stats.serves.fetch_add(1, Ordering::Relaxed);
-                            ptrace!("serve key={:?} kv={}", key, demand.kv_pages);
                             notify.notify_waiters();
                             // CASCADE: the served head no longer competes
                             // (`is_unmet` skips it), so keep draining — the
@@ -1579,7 +1530,6 @@ impl ResidencyPlanner {
                     });
                     match boarded {
                         Board::Go(pages) => {
-                            ptrace!("restore-serve pid={} pages={}", pid, pages.len());
                             exec::spawn_restore(self.clone(), pid, pages);
                             continue;
                         }
@@ -1988,7 +1938,7 @@ impl ResidencyPlanner {
             crate::inferlet::process::residency::kv_working_sets_for(&pids, model, driver);
 
         // One atomic decision: store lock outside, planner lock inside.
-        let (head, deficit, picks) =
+        let (head, _deficit, picks) =
             crate::store::registry::with_kv_lock(&stores.kv, "planner-endgame", |kv| {
                 self.with_inner(|inner| {
                     let Some((head, waiter)) = inner.unmet_head() else {
@@ -2052,17 +2002,10 @@ impl ResidencyPlanner {
         let (Some(head), false) = (head, picks.is_empty()) else {
             return false;
         };
-        let n = picks.len();
         if !self.commit_evictions(head, picks, true) {
             return false;
         }
         self.stats.e6_relaxations.fetch_add(1, Ordering::Relaxed);
-        ptrace!(
-            "last-resort-evict head_seq={} deficit={} picked={}",
-            head.0,
-            deficit,
-            n
-        );
         true
     }
 
@@ -2193,7 +2136,6 @@ impl ResidencyPlanner {
             ServeOutcome::Served(notify) => {
                 self.stats.serves.fetch_add(1, Ordering::Relaxed);
                 self.stats.hoard_bypasses.fetch_add(1, Ordering::Relaxed);
-                ptrace!("hoard-bypass serve key={:?} kv={}", key, demand.kv_pages);
                 notify.notify_waiters();
                 self.poke();
                 true
@@ -2306,55 +2248,6 @@ impl ResidencyPlanner {
         // would otherwise return `Starved`.
         if self.serve_from_hoard() {
             return;
-        }
-        // Trace-gated post-mortem: the exact state that reached destruction.
-        // Every field here was needed to tell the two wedge classes apart
-        // (E6 hysteresis vs a genuinely unreclaimable holder) — see §18.7/§18.9.
-        if trace_enabled() {
-            let (pids, dump) = self.with_inner(|inner| {
-                let q: Vec<String> = inner
-                    .queue
-                    .iter()
-                    .map(|((seq, _), w)| {
-                        let kind = match &w.kind {
-                            WaitKind::Allocation {
-                                outcome, yielded, ..
-                            } => format!("alloc:served={}:yielded={}", outcome.is_some(), yielded),
-                            WaitKind::Restore { .. } => "restore".to_string(),
-                        };
-                        format!("{seq}:{kind}:need={}", w.kv_need())
-                    })
-                    .collect();
-                let p: Vec<String> = inner
-                    .procs
-                    .values()
-                    .map(|proc| format!("{}:{:?}:prog={}", proc.seq, proc.state, proc.progressed))
-                    .collect();
-                let pids: Vec<(ProcessId, u64)> = inner
-                    .procs
-                    .iter()
-                    .map(|(id, proc)| (*id, proc.seq))
-                    .collect();
-                (
-                    pids,
-                    format!("queue=[{}] procs=[{}]", q.join(","), p.join(",")),
-                )
-            });
-            let (model, driver) = self.port.locus();
-            let ids: Vec<ProcessId> = pids.iter().map(|(id, _)| *id).collect();
-            let quotes =
-                crate::inferlet::process::residency::kv_reclaim_quotes(&ids, model, driver);
-            let q: Vec<String> = pids
-                .iter()
-                .zip(quotes)
-                .map(|((_, seq), quote)| format!("{seq}:{quote:?}"))
-                .collect();
-            ptrace!(
-                "WEDGE-KILL cause={:?} {} quotes=[{}]",
-                cause,
-                dump,
-                q.join(",")
-            );
         }
         let (free, total) = self.port.device_stats();
         // A destruction already ordered has not been paid out yet: gate the
@@ -2699,7 +2592,7 @@ impl ResidencyPlanner {
             let proc = inner.procs.get_mut(&pid)?;
             debug_assert_eq!(proc.state, Residency::Restoring);
             proc.state = Residency::Resident;
-            proc.restore_attempts = 0;
+            proc.restore_retried = false;
             // E6: not re-evictable until its next `acquire`.
             proc.progressed = false;
             Some(proc.signal.clone())
@@ -2717,41 +2610,81 @@ impl ResidencyPlanner {
         self.poke();
     }
 
-    /// A restore attempt failed. Bounded transport retries: the process
-    /// re-queues as evicted at its spawn position; past the bound it is
-    /// failed loud through the runtime abort path.
+    /// A restore broke somewhere that says nothing about what the transfer
+    /// left behind — a committed page table, or an executor that died
+    /// mid-sequence. There is no clean evicted state to return to, so the
+    /// process is failed loud through the runtime abort path.
     fn restore_failed(self: &Arc<Self>, pid: ProcessId, reason: &str) {
-        let exhausted = self.with_inner(|inner| {
+        let live = self.with_inner(|inner| {
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return false;
             };
             if proc.state != Residency::Restoring {
                 return false;
             }
-            proc.restore_attempts += 1;
             proc.state = Residency::Evicted;
-            let attempts_exhausted = proc.restore_attempts >= self.config.restore_retries.max(1);
-            if !attempts_exhausted {
-                let key = (proc.seq, inner.next_id);
-                inner.next_id += 1;
-                inner.queue.insert(
-                    key,
-                    Waiter {
-                        pid,
-                        kind: WaitKind::Restore { demand: 0 },
-                    },
-                );
-            }
-            attempts_exhausted
+            true
         });
         self.stats.restore_failures.fetch_add(1, Ordering::Relaxed);
-        if exhausted {
-            let reason = format!("KV restore failed after bounded retries: {reason}");
-            tracing::error!(pid = %pid, %reason, "planner: failing evicted process loud");
-            crate::inferlet::process::terminate(pid, Err(reason));
+        if live {
+            self.fail_restore_loud(pid, reason);
         } else {
-            self.poke();
+            self.poke(); // stale report: the process already moved on.
         }
+    }
+
+    /// A restore broke before anything was committed: it either never
+    /// started, or `abort_now` rolled it back. Either way the process is
+    /// exactly where it was — evicted, holding nothing — so it goes back in
+    /// line at its spawn position rather than dying for it.
+    ///
+    /// Once per episode, and deliberately not a tunable. The re-serve
+    /// rebuilds the ask from what is swapped *now* (`Step::ServeRestore`), so
+    /// a short grant cannot be short twice; anything that breaks again breaks
+    /// for a reason a third attempt would not fix.
+    fn restore_deferred(self: &Arc<Self>, pid: ProcessId, reason: &str) {
+        enum Outcome {
+            /// The report no longer applies — the process terminated, or
+            /// another path already moved it out of `Restoring`.
+            Stale,
+            Requeued,
+            /// The one re-queue was already spent this episode.
+            Spent,
+        }
+        let outcome = self.with_inner(|inner| {
+            let Some(proc) = inner.procs.get_mut(&pid) else {
+                return Outcome::Stale;
+            };
+            if proc.state != Residency::Restoring {
+                return Outcome::Stale;
+            }
+            proc.state = Residency::Evicted;
+            if proc.restore_retried {
+                return Outcome::Spent;
+            }
+            proc.restore_retried = true;
+            let key = (proc.seq, inner.next_id);
+            inner.next_id += 1;
+            inner.queue.insert(
+                key,
+                Waiter {
+                    pid,
+                    kind: WaitKind::Restore { demand: 0 },
+                },
+            );
+            Outcome::Requeued
+        });
+        self.stats.restore_failures.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            Outcome::Stale | Outcome::Requeued => self.poke(),
+            Outcome::Spent => self.fail_restore_loud(pid, reason),
+        }
+    }
+
+    fn fail_restore_loud(self: &Arc<Self>, pid: ProcessId, reason: &str) {
+        let reason = format!("KV restore failed: {reason}");
+        tracing::error!(pid = %pid, %reason, "planner: failing evicted process loud");
+        crate::inferlet::process::terminate(pid, Err(reason));
     }
 
     pub fn record_host_swap_exhaustion(&self) {
@@ -3383,10 +3316,7 @@ mod starvation_race_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn starvation_rung_does_not_kill_while_the_pool_can_fund_the_head() {
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         // A running process owns the whole pool. While it is registered and
         // unparked the wedge predicate is false, so the two asks below park
@@ -3472,10 +3402,7 @@ mod starvation_race_tests {
         // Total 4, free 0: the victim owns the pool, so the head's ask is
         // fundable in principle (not `Impossible`) but parks.
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         // A younger admitted resident is the only legal victim for the head.
         let head = ProcessId::new_v4();
@@ -3550,10 +3477,7 @@ mod starvation_race_tests {
     #[test]
     fn a_restart_inherits_its_fcfs_position() {
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone() as Arc<dyn PoolPort>,
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone() as Arc<dyn PoolPort>));
 
         let victim = ProcessId::new_v4();
         let younger = ProcessId::new_v4();
@@ -3605,10 +3529,7 @@ mod starvation_race_tests {
         // Non-zero capacity with an empty free list: an ask bigger than the
         // pool is failed loud instead of parking.
         let pool = Arc::new(RacePool::with_swap(4, 64));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         // An unparked admitted runner: relief is still on its way, so the
         // fleet is not wedged.
@@ -3716,10 +3637,7 @@ mod starvation_race_tests {
             // `NoSwapRoom` arm is a different gate and must not be what
             // fires here.
             let pool = Arc::new(RacePool::with_host_pressure(4, host_free, 128));
-            let planner = Arc::new(ResidencyPlanner::new(
-                pool.clone(),
-                PlannerConfig::default(),
-            ));
+            let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
             // An unparked admitted runner: the fleet is live, so the head's
             // ask parks instead of being destroyed on arrival.
@@ -3788,10 +3706,7 @@ mod starvation_race_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn an_ordered_kill_stops_counting_once_the_victim_dies_or_re_contends() {
         let pool = Arc::new(RacePool::new(4));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
+        let planner = Arc::new(ResidencyPlanner::new(pool.clone()));
 
         // A running holder keeps the wedge predicate false throughout, so
         // the rung under test is never entered for real.
