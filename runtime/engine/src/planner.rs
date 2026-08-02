@@ -203,11 +203,15 @@ impl RegistryPool {
 
 impl PoolPort for RegistryPool {
     fn device_stats(&self) -> (u32, u32) {
-        self.with_kv_tagged("planner-device-stats", |kv| (kv.available_pages() as u32, kv.capacity_pages()))
+        self.with_kv_tagged("planner-device-stats", |kv| {
+            (kv.available_pages() as u32, kv.capacity_pages())
+        })
     }
 
     fn host_stats(&self) -> (u32, u32) {
-        self.with_kv_tagged("planner-host-stats", |kv| (kv.host_swap_available() as u32, kv.host_swap_capacity()))
+        self.with_kv_tagged("planner-host-stats", |kv| {
+            (kv.host_swap_available() as u32, kv.host_swap_capacity())
+        })
     }
 
     fn rs_stats(&self) -> (u32, u32) {
@@ -237,7 +241,9 @@ impl PoolPort for RegistryPool {
         &self,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
-        self.with_kv_tagged("planner-reserve", |kv| kv.reserve_device_pages(count as usize))
+        self.with_kv_tagged("planner-reserve", |kv| {
+            kv.reserve_device_pages(count as usize)
+        })
     }
 
     fn reserve_device_up_to(
@@ -378,16 +384,12 @@ pub struct PlannerStats {
     pub parks: AtomicU64,
     /// Parked asks served out of the accumulation.
     pub serves: AtomicU64,
-    /// Device pages handed to parked asks out of the accumulation. `serves`
-    /// counts entries; this counts the resource, which is what the eviction
-    /// lookahead differences (see [`Inner::lookahead_pages`]).
-    pub served_pages: AtomicU64,
     /// Eviction attempts spawned.
     pub evictions_started: AtomicU64,
-    /// Eviction rounds started by the lookahead path — i.e. while the pool
-    /// still had stock, off the head's critical path. Zero means the
-    /// planner never ran ahead of demand.
-    pub lookahead_rounds: AtomicU64,
+    /// Shortages that did NOT trigger an eviction because the fleet was
+    /// still making progress — the load-control rung. Every one of these is
+    /// a fence/quiesce/D2H/H2D round trip not paid.
+    pub eviction_deferrals: AtomicU64,
     /// Evictions that committed (working sets moved to host swap).
     pub evictions: AtomicU64,
     /// Evictions abandoned before commit (nothing reclaimable, non-detachable
@@ -475,8 +477,9 @@ pub struct PlannerDiagnostics {
     pub parks_total: u64,
     pub serves_total: u64,
     pub evictions_total: u64,
-    /// Eviction rounds started ahead of demand.
-    pub lookahead_rounds_total: u64,
+    /// Shortages that did not trigger an eviction because the fleet could
+    /// still make progress on its own (load control).
+    pub eviction_deferrals_total: u64,
     /// The entry the drain is blocked on, and how many entries still
     /// compete for pages at all (a served-but-uncollected grant does not).
     pub unmet_head_pages: u32,
@@ -487,8 +490,6 @@ pub struct PlannerDiagnostics {
     /// the resource to serve them exists — the head-of-line cost.
     pub bypassable_entries: u32,
     pub bypassable_pages: u32,
-    /// The measured run-ahead depth (pages) the lookahead path is using.
-    pub lookahead_pages: u32,
     pub eviction_rollbacks_total: u64,
     pub restores_total: u64,
     pub restore_failures_total: u64,
@@ -669,10 +670,6 @@ type EntryKey = (u64, u64);
 struct EvictionMark {
     /// Pages this victim is expected to free when it lands.
     pages: u32,
-    /// The cumulative served-page count at the instant it was spawned.
-    /// Differencing it at landing yields how much demand arrived while the
-    /// victim was moving — see [`Inner::lookahead_pages`].
-    served_at_spawn: u64,
 }
 
 #[derive(Default)]
@@ -685,23 +682,9 @@ struct Inner {
     /// toward the current head's demand. Planner-level (not per-entry), so a
     /// head change strands nothing; released only when the queue empties.
     accum: DevicePageReservation,
-    /// Evictions in flight → what each is expected to free, plus the drain
-    /// mark it was spawned at. Subtracted from the deficit so concurrent
-    /// plans never over-evict.
+    /// Evictions in flight → what each is expected to free. Subtracted from
+    /// the deficit so concurrent plans never over-evict.
     evicting: HashMap<ProcessId, EvictionMark>,
-    /// How many pages the fleet consumed while the last eviction was in
-    /// flight — the measured cost of putting eviction ON the head's
-    /// critical path, and therefore exactly the depth an eviction round
-    /// must run ahead of demand to stay OFF it.
-    ///
-    /// It is an observation, not a tuning knob: nothing here picks a
-    /// reserve size, a watermark or a rate. A fleet that consumes nothing
-    /// while a victim moves reports 0 and the planner reverts to the
-    /// original demand-exact behaviour; a fleet that burns 200 pages
-    /// reports 200 and the next round frees 200 more than the head asked
-    /// for, so the following 200 asks are served out of stock instead of
-    /// stalling behind another fence → quiesce → D2H cycle.
-    lookahead_pages: u32,
     /// Victims whose last eviction rolled back on `HostSwapFull`. Re-picking
     /// one before host room changes is pure spin: victim selection is
     /// deterministic, so the retry re-runs the whole fence → suspend →
@@ -1312,11 +1295,6 @@ impl ResidencyPlanner {
                     if !pages.is_empty() {
                         let reservation = DevicePageReservation::new(pages, self.port.clone());
                         self.with_inner(|inner| inner.accum.absorb(reservation));
-                        // The absorb succeeded, so nothing is blocked yet —
-                        // which is precisely the moment to fund the NEXT
-                        // round. Doing it only after the pool runs dry is
-                        // what leaves the fleet waiting on the transfer.
-                        self.plan_lookahead_eviction();
                         continue;
                     }
                     // Rung 0, latched: the cache-lease scan runs at most once
@@ -1377,9 +1355,6 @@ impl ResidencyPlanner {
                     match outcome {
                         ServeOutcome::Served(notify) => {
                             self.stats.serves.fetch_add(1, Ordering::Relaxed);
-                            self.stats
-                                .served_pages
-                                .fetch_add(u64::from(demand.kv_pages), Ordering::Relaxed);
                             ptrace!("serve key={:?} kv={}", key, demand.kv_pages);
                             notify.notify_waiters();
                             // CASCADE: the served head no longer competes
@@ -1517,6 +1492,35 @@ impl ResidencyPlanner {
             self.check_starvation(StarveCause::NoSwapRoom);
             return;
         }
+        // LOAD CONTROL. Eviction is a LIVENESS rung, not a demand rung.
+        //
+        // A shortage is not by itself a reason to move KV bytes. While any
+        // admitted process is still running, its pages are already on their
+        // way back to the pool: it will retire, free, and poke the drain.
+        // Evicting to serve the head sooner only trades that free for a
+        // fence → lane-leave → lease-quiesce → D2H → H2D round trip, and
+        // then owes an H2D to put the victim back — for a pool that was
+        // going to turn over anyway.
+        //
+        // Measured, X-shape at 3.1x oversubscription (1024 req, conc 512,
+        // 8192 pages): demand-triggered eviction ran 982 times in 36 s to
+        // avoid the 9 starvation restarts the same shape takes with no swap
+        // at all, at p50 246 ms per victim (135 ms of it just waiting out
+        // the victim's in-flight lease) and 77 MB moved each way. Batch
+        // width was never the limit — p90 was 352 of a 366 request cap — so
+        // the extra residency bought nothing.
+        //
+        // The wedge predicate is exactly "no completion can ever arrive on
+        // its own", and it is the same one the starvation rung uses, so the
+        // two can never disagree about when waiting is still an option.
+        // Under it, host swap does what it is for: a wedged fleet PARKS to
+        // host DRAM instead of having a request destroyed.
+        if !self.is_wedged() {
+            self.stats
+                .eviction_deferrals
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(victims) = self.victim_set() else {
             return;
         };
@@ -1538,60 +1542,6 @@ impl ResidencyPlanner {
         self.commit_evictions(victims.head, picks, false);
     }
 
-    /// Start the next eviction round WHILE STOCK REMAINS.
-    ///
-    /// [`Self::plan_eviction`] is reached only from a failed absorb, i.e.
-    /// once the pool is already dry and the head is already blocked. The
-    /// whole fence → lane-leave → drain → lease-quiesce → D2H → commit
-    /// chain then runs with the fleet waiting on it: measured at X/c512
-    /// that is a p50 of 9 ms but a p90 of 129 ms, 122 times in a 43 s run,
-    /// and GPU utilisation falls from 68% to 30% even though the copies
-    /// themselves account for under 2 s.
-    ///
-    /// This runs the same round one step earlier, off that critical path.
-    /// Nothing here is a rung: it never fails a request, never consults the
-    /// hog or starvation predicates, and gives up silently whenever the
-    /// demand path would have had something to say. It is pure lookahead,
-    /// and every quantity it uses is measured:
-    ///
-    /// - it does nothing at all until an eviction has landed and reported
-    ///   how much demand arrived during its own latency, so an unpressured
-    ///   fleet — and every shape that fits in the pool — is untouched;
-    /// - it fires only while that much stock is NOT on hand;
-    /// - it is inert while a round is in flight, which also bounds the
-    ///   `quote_and_pick` KV-lock hold to once per round rather than once
-    ///   per absorb (the convoy in §16).
-    fn plan_lookahead_eviction(self: &Arc<Self>) {
-        let lookahead = self.with_inner(|inner| {
-            if inner.evicting.is_empty() {
-                inner.lookahead_pages
-            } else {
-                0
-            }
-        });
-        if lookahead == 0 {
-            return;
-        }
-        let (free_now, _) = self.port.device_stats();
-        if free_now >= lookahead {
-            return;
-        }
-        let (host_free, _) = self.port.host_stats();
-        if !self.port.suspend_capable() || host_free == 0 {
-            return;
-        }
-        let Some(victims) = self.victim_set_with_stock(free_now) else {
-            return;
-        };
-        let (model, driver) = self.port.locus();
-        let picks = self.quote_and_pick(victims.preferred(), victims.deficit, model, driver);
-        if picks.is_empty() {
-            return;
-        }
-        self.stats.lookahead_rounds.fetch_add(1, Ordering::Relaxed);
-        self.commit_evictions(victims.head, picks, false);
-    }
-
     /// Snapshot every process FCFS permits evicting for the current head.
     ///
     /// **This is the liveness-bearing fact.** Membership is exactly the
@@ -1605,37 +1555,13 @@ impl ResidencyPlanner {
     /// enough to re-take at every decision point — callers are expected to
     /// build a FRESH one rather than carry one across a lock release.
     fn victim_set(&self) -> Option<VictimSet> {
-        // The demand path is entered only from a failed absorb, so the free
-        // list is empty by construction: no stock offsets the deficit.
-        self.victim_set_with_stock(0)
-    }
-
-    /// [`Self::victim_set`] over an arbitrary free-list stock.
-    ///
-    /// `free_now` is what the pool can still hand out without any eviction
-    /// at all. The demand path passes 0 (it ran dry to get here); the
-    /// lookahead path passes the real count, which is what lets a round
-    /// start while pages remain.
-    fn victim_set_with_stock(&self, free_now: u32) -> Option<VictimSet> {
         self.with_inner(|inner| {
             let (head, waiter) = inner.unmet_head()?;
             let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
             // Evictions already in flight fund the head when they land;
             // never over-evict for pages that are already on their way.
             let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
-            // Run ahead by exactly what the fleet burned during the last
-            // eviction's own latency. Demand-exact eviction is what puts the
-            // chain on the critical path: it frees the head's pages and not
-            // one more, so the very next ask stalls behind another fence →
-            // quiesce → D2H. Adding the MEASURED overrun (never a chosen
-            // reserve) makes the round cover the asks that would otherwise
-            // arrive mid-flight. It is 0 until an eviction has actually
-            // landed, so the first round and every unpressured fleet behave
-            // exactly as before.
-            let deficit = missing
-                .saturating_add(inner.lookahead_pages)
-                .saturating_sub(expected)
-                .saturating_sub(free_now);
+            let deficit = missing.saturating_sub(expected);
             if deficit == 0 {
                 return None;
             }
@@ -1691,7 +1617,6 @@ impl ResidencyPlanner {
     ) -> bool {
         let mut spawned = Vec::new();
         let mut wake = Vec::new();
-        let served_now = self.stats.served_pages.load(Ordering::Relaxed);
         self.with_inner(|inner| {
             let head_seq = match inner.unmet_head() {
                 Some((key, _)) if key == head_key => key.0,
@@ -1708,13 +1633,7 @@ impl ResidencyPlanner {
                     continue;
                 }
                 proc.state = Residency::Evicting;
-                inner.evicting.insert(
-                    pid,
-                    EvictionMark {
-                        pages: expected,
-                        served_at_spawn: served_now,
-                    },
-                );
+                inner.evicting.insert(pid, EvictionMark { pages: expected });
                 spawned.push(pid);
                 for waiter in inner.queue.values_mut().filter(|w| w.pid == pid) {
                     if let WaitKind::Allocation {
@@ -2045,9 +1964,6 @@ impl ResidencyPlanner {
         match outcome {
             ServeOutcome::Served(notify) => {
                 self.stats.serves.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .served_pages
-                    .fetch_add(u64::from(demand.kv_pages), Ordering::Relaxed);
                 self.stats.hoard_bypasses.fetch_add(1, Ordering::Relaxed);
                 ptrace!("hoard-bypass serve key={:?} kv={}", key, demand.kv_pages);
                 notify.notify_waiters();
@@ -2339,7 +2255,8 @@ impl ResidencyPlanner {
                 continue;
             }
             let pids: Vec<ProcessId> = selected.iter().map(|(_, pid)| *pid).collect();
-            let quotes = crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
+            let quotes =
+                crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
             for ((key, _), quote) in selected.iter().zip(quotes) {
                 if let Some(ReclaimQuote::Pages(pages)) = quote
                     && pages > 0
@@ -2416,15 +2333,8 @@ impl ResidencyPlanner {
     /// D2H committed: `pid` is out of the set, its restore entry queues at
     /// its spawn position, and its freed pages drain to the head.
     fn report_evicted(self: &Arc<Self>, pid: ProcessId, freed: u32) {
-        let served_now = self.stats.served_pages.load(Ordering::Relaxed);
         self.with_inner(|inner| {
-            if let Some(mark) = inner.evicting.remove(&pid) {
-                // What the fleet consumed while this victim was moving. That
-                // demand was met one stall at a time, behind this very
-                // eviction; freeing it up front next round is what takes the
-                // fence → quiesce → D2H chain off the head's critical path.
-                inner.lookahead_pages = served_now.saturating_sub(mark.served_at_spawn) as u32;
-            }
+            inner.evicting.remove(&pid);
             let Some(proc) = inner.procs.get_mut(&pid) else {
                 return;
             };
@@ -2716,7 +2626,6 @@ impl ResidencyPlanner {
             admitted_procs += u32::from(proc.admitted);
         }
         let accumulation = inner.accum.len() as u32;
-        let lookahead_pages = inner.lookahead_pages;
         drop(inner);
         // Outside the planner lock: `held_page_count` takes RESIDENCIES and
         // the KV store, both of which order BEFORE `inner`.
@@ -2741,13 +2650,12 @@ impl ResidencyPlanner {
             parks_total: self.stats.parks.load(Relaxed),
             serves_total: self.stats.serves.load(Relaxed),
             evictions_total: self.stats.evictions.load(Relaxed),
-            lookahead_rounds_total: self.stats.lookahead_rounds.load(Relaxed),
+            eviction_deferrals_total: self.stats.eviction_deferrals.load(Relaxed),
             unmet_head_pages,
             unmet_head_kind,
             unmet_queued,
             bypassable_entries,
             bypassable_pages,
-            lookahead_pages,
             eviction_rollbacks_total: self.stats.eviction_rollbacks.load(Relaxed),
             restores_total: self.stats.restores.load(Relaxed),
             restore_failures_total: self.stats.restore_failures.load(Relaxed),
@@ -2914,6 +2822,10 @@ mod starvation_race_tests {
         free: parking_lot::Mutex<Vec<PhysicalKvPageId>>,
         total: u32,
         stall: AtomicU32,
+        /// Host swap room. Zero (the default) keeps `plan_eviction` on its
+        /// `NoSwapRoom` short-circuit, which is what every starvation-rung
+        /// test wants; non-zero lets a test reach the load-control gate.
+        host: u32,
     }
 
     impl RacePool {
@@ -2922,6 +2834,16 @@ mod starvation_race_tests {
                 free: parking_lot::Mutex::new(Vec::new()),
                 total,
                 stall: AtomicU32::new(0),
+                host: 0,
+            }
+        }
+
+        /// A pool that CAN swap, so `plan_eviction` runs past its
+        /// no-transport short-circuit and reaches the load-control gate.
+        fn with_swap(total: u32, host: u32) -> Self {
+            Self {
+                host,
+                ..Self::new(total)
             }
         }
 
@@ -2941,7 +2863,7 @@ mod starvation_race_tests {
             (self.free.lock().len() as u32, self.total)
         }
         fn host_stats(&self) -> (u32, u32) {
-            (0, 0)
+            (self.host, self.host)
         }
         fn rs_stats(&self) -> (u32, u32) {
             (0, 0)
@@ -2950,11 +2872,11 @@ mod starvation_race_tests {
             0
         }
         fn suspend_capable(&self) -> bool {
-            // No swap transport: `plan_eviction` goes straight to
-            // `check_starvation(NoSwapRoom)`, which is the shortest path to
-            // the rung under test and skips `last_resort_evict` (it needs
-            // the real residency tables).
-            false
+            // Without host room: no swap transport, so `plan_eviction` goes
+            // straight to `check_starvation(NoSwapRoom)` — the shortest path
+            // to the starvation rung, and it skips `last_resort_evict`
+            // (which needs the real residency tables).
+            self.host > 0
         }
         fn locus(&self) -> (usize, usize) {
             (0, 0)
@@ -3207,26 +3129,26 @@ mod starvation_race_tests {
         );
     }
 
-    /// The eviction lookahead is measured, additive, and offset by stock.
+    /// Load control: a shortage alone must NOT move KV bytes.
     ///
-    /// Demand-exact eviction is what pins the fence → quiesce → D2H chain to
-    /// the head's critical path: it frees the head's pages and not one
-    /// more, so the next ask stalls behind a fresh round. The deficit must
-    /// therefore carry the observed mid-flight demand, and must subtract
-    /// pages the pool can already hand out — otherwise the lookahead path
-    /// would evict against stock it does not need.
+    /// While any admitted process is still running, its pages are already on
+    /// their way back to the pool — evicting only trades that free for a
+    /// fence → lease-quiesce → D2H → H2D round trip and an owed restore.
+    /// Eviction is therefore gated on the same wedge predicate the
+    /// starvation rung uses, so the two can never disagree about whether
+    /// waiting is still an option.
     #[tokio::test(flavor = "current_thread")]
-    async fn eviction_deficit_carries_the_measured_lookahead_and_nets_off_stock() {
+    async fn a_shortage_alone_defers_eviction_while_the_fleet_still_runs() {
         // Non-zero capacity with an empty free list: an ask bigger than the
         // pool is failed loud instead of parking.
-        let pool = Arc::new(RacePool::new(4));
+        let pool = Arc::new(RacePool::with_swap(4, 64));
         let planner = Arc::new(ResidencyPlanner::new(
             pool.clone(),
             PlannerConfig::default(),
         ));
 
-        // An unparked admitted runner keeps the wedge predicate false, so
-        // the ask below parks instead of being destroyed on arrival.
+        // An unparked admitted runner: relief is still on its way, so the
+        // fleet is not wedged.
         let holder = ProcessId::new_v4();
         planner.register(holder);
         planner.note_admitted(holder);
@@ -3235,7 +3157,7 @@ mod starvation_race_tests {
         planner.register(head);
         planner.note_admitted(head);
         // Younger, resident, admitted: legal victims under the anti-thrash
-        // rule, so the set is non-empty and the deficit is what is asserted.
+        // rule, so a set exists and only the gate can hold the round back.
         for _ in 0..3 {
             let pid = ProcessId::new_v4();
             planner.register(pid);
@@ -3265,81 +3187,28 @@ mod starvation_race_tests {
             d.device_pages_total
         );
 
-        // Nothing has been evicted yet, so there is nothing to run ahead of:
-        // the deficit is exactly the head's need, as before this existed.
+        // The victim set is non-empty and the deficit is exactly the head's
+        // need: nothing about the shortage has changed.
         let set = planner.victim_set().expect("an unmet head yields a set");
-        assert_eq!(
-            set.deficit, 1,
-            "with no observation the round is demand-exact"
-        );
+        assert_eq!(set.deficit, 1, "the round is demand-exact");
         assert!(
             !set.members.is_empty(),
             "younger residents are legal victims"
         );
 
-        // One eviction landed having watched 10 pages go out during its own
-        // latency. That is the depth the next round must add.
-        planner.with_inner(|inner| inner.lookahead_pages = 10);
+        // ...yet the drain must not have spawned one, because `holder` is
+        // still running and will free on its own.
+        assert!(!planner.is_wedged(), "a running holder is not a wedge");
+        let d = planner.diagnostics();
         assert_eq!(
-            planner.victim_set().expect("still unmet").deficit,
-            11,
-            "the round must cover the head plus the measured overrun"
-        );
-
-        // Pages the pool can already hand out are not worth evicting for.
-        assert_eq!(
-            planner
-                .victim_set_with_stock(4)
-                .expect("still short")
-                .deficit,
-            7,
-            "stock on hand must net off the deficit"
+            d.evictions_total, 0,
+            "a shortage alone must not move KV bytes"
         );
         assert!(
-            planner.victim_set_with_stock(11).is_none(),
-            "no round while the run-ahead depth is already in stock"
+            d.eviction_deferrals_total > 0,
+            "the load-control rung must record the deferral it made"
         );
 
         parked.abort();
-    }
-
-    /// The run-ahead depth is an observation, not a constant: it is exactly
-    /// the number of pages the fleet consumed while the victim was moving.
-    #[tokio::test(flavor = "current_thread")]
-    async fn landing_an_eviction_records_the_demand_that_arrived_during_it() {
-        let pool = Arc::new(RacePool::new(0));
-        let planner = Arc::new(ResidencyPlanner::new(
-            pool.clone(),
-            PlannerConfig::default(),
-        ));
-        assert_eq!(
-            planner.diagnostics().lookahead_pages,
-            0,
-            "nothing is assumed before anything is measured"
-        );
-
-        let victim = ProcessId::new_v4();
-        planner.register(victim);
-        planner.note_admitted(victim);
-        planner.with_inner(|inner| {
-            inner.procs.get_mut(&victim).expect("registered").state = Residency::Evicting;
-            inner.evicting.insert(
-                victim,
-                EvictionMark {
-                    pages: 7,
-                    served_at_spawn: 5,
-                },
-            );
-        });
-        // Twelve pages went out to parked asks while the victim moved; seven
-        // of them were the ones this eviction was spawned for.
-        planner.stats.served_pages.store(17, Ordering::Relaxed);
-
-        planner.report_evicted(victim, 7);
-        assert_eq!(
-            planner.diagnostics().lookahead_pages,
-            12,
-            "the depth is the served-page delta across the eviction, nothing else"
-        );
     }
 }
