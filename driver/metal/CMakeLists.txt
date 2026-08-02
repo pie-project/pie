@@ -16,6 +16,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# This driver is Metal 4 only: MTL4* command queues, argument tables, explicit
+# barriers, residency sets and placement-sparse heaps have no pre-macOS-26
+# equivalent here, and the kernels are compiled as MSL 4.0. Pinning the
+# deployment target makes that a build-time contract rather than a runtime
+# surprise, and lets the @available-free source compile without warnings.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING
+      "Minimum macOS version (Metal 4 floor)" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_OBJCXX_STANDARD 20)
@@ -245,7 +255,7 @@ if(PIE_METAL_BUILD_METALLIB)
     set(air_file ${CMAKE_BINARY_DIR}/metal/${shader_name}.air)
     add_custom_command(
       OUTPUT ${air_file}
-      COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -c ${shader} -o ${air_file}
+      COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -std=metal4.0 -c ${shader} -o ${air_file}
       DEPENDS ${shader}
       COMMENT "Compiling Metal shader ${shader_name}.metal")
     list(APPEND PIE_METAL_AIR_FILES ${air_file})
@@ -473,6 +483,13 @@ add_test(NAME executor_worker_test COMMAND executor_worker_test)
 if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
+  add_metal_linked_test(commit_batch_feedback_test tests/commit_batch_feedback_test.cpp)
+  add_metal_linked_test(argtable_capacity_test tests/argtable_capacity_test.cpp)
+  # Reads a .metal source to exercise archive invalidation, so it needs the
+  # source tree rather than the build directory.
+  add_metal_linked_test(pso_archive_test tests/pso_archive_test.mm)
+  set_tests_properties(pso_archive_test PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
   # The six gemma4 kernels that shipped with no PSO entry and no binder.
   add_metal_linked_test(host_buffer_bind_test tests/host_buffer_bind_test.cpp)
   target_compile_definitions(host_buffer_bind_test PRIVATE

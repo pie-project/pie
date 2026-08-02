@@ -78,11 +78,30 @@ enum class BarrierVisibility : uint8_t { ExecutionOnly = 0, Device = 1 };
 // Per-step timing split (manager wants BOTH reported separately).
 struct StepTiming {
     double encode_ms   = 0.0;  // begin_step -> end_step (CPU command-buffer build)
-    double gpu_exec_ms = 0.0;  // commit -> event wait (GPU execution)
+    double gpu_exec_ms = 0.0;  // commit -> event wait (GPU execution, host-observed)
+    // GPU-reported execution time for the commit, from the Metal 4 commit
+    // feedback handler (GPUEndTime - GPUStartTime). Unlike `gpu_exec_ms` this
+    // excludes host wake-up latency. Zero when the feedback had not landed by
+    // the time the step returned -- it is delivered asynchronously.
+    double gpu_ms      = 0.0;
     bool completed = false;    // event fence reached; command resources may be released
     bool timed_out = false;    // the initial bounded wait expired before the fence
+    bool gpu_error = false;    // commit feedback reported a GPU-side error
     double total_ms()  const { return encode_ms + gpu_exec_ms; }
-    bool succeeded() const { return completed; }
+    bool succeeded() const { return completed && !gpu_error; }
+};
+
+// Asynchronous per-commit report from Metal 4's commit feedback handler. The
+// driver keeps the most recent one; `event_value` identifies which point on the
+// queue timeline it describes.
+struct GpuCommitFeedback {
+    uint64_t event_value = 0;
+    double gpu_start_s = 0.0;
+    double gpu_end_s = 0.0;
+    double gpu_ms = 0.0;
+    bool had_error = false;
+    std::string error;
+    bool valid() const { return event_value != 0; }
 };
 
 struct TransientBufferPoolStats {
@@ -265,6 +284,35 @@ class RawMetalContext {
                     std::string* error = nullptr);
     Pso compile_pso_from_file(const std::string& metal_path, const std::string& fn_name,
                               std::string* error = nullptr);
+    // One entrypoint to build out of one source file.
+    struct PsoFileRequest {
+        std::string path;
+        std::string function;
+    };
+    // Build many pipelines in one batch. Each distinct source file is read and
+    // turned into an MTLLibrary once even when several entrypoints share it,
+    // and, when `archive_path` names a Metal 4 pipeline archive, the compiled
+    // binaries are looked up there instead of being rebuilt: pipeline creation,
+    // not source parsing, is where a cold start spends its time. The archive is
+    // written on the first run that misses it.
+    //
+    // Compilation is deliberately serial. Metal funnels compiles through its own
+    // service, so extra threads measured no faster, and the MTL4Compiler's
+    // completion-handler API overruns the stack of Metal's scheduler threads on
+    // batches this size.
+    //
+    // Returns one Pso per request, positionally; a failed entry is invalid and
+    // its reason lands in `errors` (sized to match) when provided.
+    std::vector<Pso> compile_psos_from_files(
+        const std::vector<PsoFileRequest>& requests,
+        std::vector<std::string>* errors = nullptr,
+        bool use_archive_cache = true);
+
+    // Directory holding the pipeline archives written by
+    // `compile_psos_from_files`. Defaults to a per-user cache directory;
+    // PIE_METAL_PSO_CACHE overrides it, and setting that to an empty value
+    // turns archive caching off.
+    static std::string pso_archive_dir();
     // PTIR semantics require strict NaN/tie behavior. This path always passes
     // explicit safe-math options (MTLMathModeSafe, or fastMathEnabled=NO on
     // older SDKs).
@@ -306,6 +354,16 @@ class RawMetalContext {
     // Uses the double-buffered allocator (ab = 0/1) so the harness can overlap
     // encode(N+1) with GPU(N). Returns the encode/GPU split for THIS step.
     StepTiming run_step(const std::function<void(StepEncoder&)>& encode_fn, int ab = 0);
+    // Encode N independent command buffers and submit them in ONE
+    // `commit:count:options:` call. The command buffers execute without ordering
+    // guarantees relative to each other, so `encode_fns` must be mutually
+    // hazard-free; a single event signal fences the whole batch. Use this when a
+    // pass splits into parallel chunks that would otherwise pay N submits.
+    StepTiming run_steps(const std::vector<std::function<void(StepEncoder&)>>& encode_fns,
+                         int ab = 0);
+    // Most recent Metal 4 commit feedback (GPU-measured timing, GPU-side error).
+    // Delivered asynchronously, so it may lag the last committed step.
+    GpuCommitFeedback last_commit_feedback() const;
     void force_next_wait_timeout_for_test();
 
     // ── Pipelined async commit (downclock-ceiling prototype) ──
