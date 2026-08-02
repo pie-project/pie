@@ -275,6 +275,13 @@ std::uint32_t llama_like_decode_graph_layout(
 // paths must fuse, or not, together.
 bool decode_fused_post_enabled();
 
+// True when the fire the prepare hook just planned carries a PREFILL the
+// executor may capture: the FA2 causal path planned in graph mode, which is
+// exactly what `PrefillPlanCache::graph_capturable` records. A pure-decode
+// fire answers false here -- it is admitted by the pure-decode rules instead,
+// and conflating the two would hide which rule let a wave through.
+bool llama_like_prefill_graph_capturable(const LlamaLikePlanState& state);
+
 // Wire-driven forward body, plus a `cfg` knob block and an
 // externally-owned `LlamaLikePlanState`. The body never plans — it only
 // reads `state.decode_plan` (already populated by the prepare hook) which
@@ -418,5 +425,18 @@ RopeKind rope_kind_from_hf_config(const HfConfig& hf);
 // HF config in one place — every arch that builds an LlamaLikeForwardCfg
 // in context.cpp pulls in the same eight fields.
 void apply_rope_config(LlamaLikeForwardCfg& fwd_cfg, const HfConfig& hf);
+
+// The rope launch this cfg's `rope_kind` selects — YaRN, original YaRN,
+// or plain. Exported because MIXTRAL SHARES THIS CFG: it is handed the
+// same `LlamaLikeForwardCfg`, so the scaling its checkpoint asks for is
+// already resolved there, and a family that spells its own
+// `launch_rope_bf16` silently drops it. gpt-oss did exactly that.
+void apply_rope(
+    const LlamaLikeForwardCfg& fwd_cfg,
+    const HfConfig& cfg,
+    void* q, void* k,
+    const std::int32_t* positions,
+    int N, int num_q_heads, int num_kv_heads, int head_dim,
+    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::model

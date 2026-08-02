@@ -451,4 +451,8 @@ bool LlamaLikeModel::supergraph_body(Workspace& ws,
         sg);
 }
 
+bool LlamaLikeModel::prefill_graph_capturable() const {
+    return llama_like_prefill_graph_capturable(plan_);
+}
+
 }  // namespace pie_cuda_driver::model

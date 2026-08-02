@@ -20,7 +20,7 @@
 //! glue is bypassed entirely, the table's clone is the only reference left
 //! and ITS `Drop` performs the release — the process-teardown fallback.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::page_table::WorkingSetId;
@@ -218,6 +218,10 @@ pub struct KvWorkingSet {
     pub id: WorkingSetId,
     /// Tokens per KV page (cached from the store registry at construction).
     pub page_size: u32,
+    /// Lock-free mirror of this WorkingSet's logical page extent. Read it
+    /// through [`Self::page_len`]; see `WorkingSetEntry::page_len_mirror`
+    /// for why the locked read was worth removing.
+    page_len: Arc<AtomicU64>,
     translation: Arc<crate::store::kv::KvTranslation>,
     lifecycle: Arc<KvLifecycle>,
 }
@@ -238,16 +242,21 @@ impl KvWorkingSet {
         pipeline_scope: Option<crate::store::PipelineScope>,
     ) -> Self {
         let stores = crate::store::registry::get(model, driver as usize);
-        let translation =
+        let (translation, page_len) =
             crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-                kv.translation(id)
-                    .expect("new working set has a translation state")
+                (
+                    kv.translation(id)
+                        .expect("new working set has a translation state"),
+                    kv.page_len_mirror(id)
+                        .expect("new working set has a page-length mirror"),
+                )
             });
         KvWorkingSet {
             model,
             driver,
             id,
             page_size,
+            page_len,
             translation,
             lifecycle: Arc::new(KvLifecycle {
                 released: AtomicBool::new(false),
@@ -260,6 +269,21 @@ impl KvWorkingSet {
                 id,
                 pipeline_scope: Mutex::new(pipeline_scope),
             }),
+        }
+    }
+
+    /// This WorkingSet's logical page extent, read WITHOUT the global KV
+    /// mutex.
+    ///
+    /// The extent moves only under this process's own `reserve`, adoption,
+    /// and `drop`/`discard` — the residency planner relocates physical
+    /// backings and leaves it alone — so the reader never races its own
+    /// writer and an `Acquire` load pairs with the `Release` store made
+    /// under the mutex the writer just left.
+    pub fn page_len(&self) -> Result<u64, crate::store::kv::KvTableError> {
+        match self.page_len.load(Ordering::Acquire) {
+            u64::MAX => Err(crate::store::kv::KvTableError::UnknownWorkingSet),
+            page_len => Ok(page_len),
         }
     }
 
@@ -369,8 +393,7 @@ mod tests {
             })
             .collect();
         let (seq, intents) = kv.publish_prepared(prepared, &commits).unwrap();
-        kv.settle(intents, true);
-        kv.retire_through(seq);
+        kv.settle(seq, intents, true);
     }
 
     #[test]

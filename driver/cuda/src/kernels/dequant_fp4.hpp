@@ -44,6 +44,24 @@ void launch_dequant_mxfp4_to_bf16(
 // `gate_up` rows are interleaved as HF ships them: row 2i is gate row i,
 // row 2i+1 is up row i (see `deinterleave_rows_bf16_kernel`).
 
+// Expert-grouped gate/up decode: one block per (expert, row slab), walking the
+// expert's own routes so its weight slab is streamed once for up to four
+// tokens instead of once per route. `sorted_route_ids` / `counts` come from
+// `launch_moe_bucket_exact`. Output layout is identical to the per-route
+// kernel (indexed by original route id), so the consumers are unchanged.
+void launch_mxfp4_moe_gate_up_decode_grouped_bf16(
+    const void* act_fp16,
+    const std::int32_t* sorted_route_ids,
+    const std::int32_t* counts,
+    const std::uint8_t* const* gate_up_packed,
+    const std::uint8_t* const* gate_up_scales,
+    const void* const* gate_bias,
+    const void* const* up_bias,
+    void* gate_out_bf16,
+    void* up_out_bf16,
+    int num_experts, int top_k, int hidden, int intermediate,
+    cudaStream_t stream);
+
 void launch_mxfp4_moe_gate_up_decode_bf16(
     const void*          act_fp16,      // [num_tokens, hidden] fp16
     const std::int32_t*  topk_idx,      // [num_tokens * top_k]

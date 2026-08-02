@@ -75,6 +75,10 @@ pub struct Shape(pub Vec<Dim>);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DType {
     BF16,
+    /// Half. Only gpt-oss's MXFP4 routed GEMVs consume it: their
+    /// activation operand is cast from bf16 first, and typing that cast's
+    /// output BF16 would say the cast did nothing.
+    F16,
     F32,
     I32,
 }

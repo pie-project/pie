@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import tomllib
@@ -82,6 +83,14 @@ def reconstruct_token_arrivals(
 
 
 PIE_BENCH_DEFAULT_DEVICE = "cuda:0"
+
+# Metal's driver takes these two unconditionally: its planner has no lattice
+# to collapse, so a value is always wanted. The CUDA driver documents the
+# opposite -- "Omit to let the memory planner choose ... A guess here is worse
+# than absence" (`worker/src/config.rs`) -- so cuda_native forwards them only
+# when the caller moved them off these defaults.
+PIE_MAX_FORWARD_TOKENS_DEFAULT = 10240
+PIE_MAX_FORWARD_REQUESTS_DEFAULT = 512
 
 
 def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
@@ -195,7 +204,6 @@ def measured_average(
 
 def build_config(args: argparse.Namespace):
     from pie.config import (
-        AuthConfig,
         Config,
         DriverConfig,
         ModelConfig,
@@ -238,10 +246,23 @@ def build_config(args: argparse.Namespace):
             driver_options["enable_system_speculation"] = True
         # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
         # budget; the runtime is free to exceed it, so it cannot create KV
-        # pressure. `total_pages` is the one binding cap, and `swap_pool_size`
-        # is what arms the suspend/restore rung (it defaults to 0, i.e. off).
+        # pressure. `max_total_pages` is the one binding cap, and
+        # `swap_pool_size` is what arms the suspend/restore rung (it defaults
+        # to 0, i.e. off). The knob is named `max_total_pages` here and
+        # `total_pages` on Metal because they are not the same quantity: there
+        # the value IS the pool, here it is a ceiling over a number derived
+        # from `gpu_mem_utilization` (worker/src/config.rs).
         if getattr(args, "total_pages", 0):
-            driver_options["total_pages"] = args.total_pages
+            driver_options["max_total_pages"] = args.total_pages
+        # Pin the forward layout only on explicit request: an unasked-for pin
+        # collapses the planner's lattice to a guess. Needed when the planner
+        # reports "no viable forward/KV layout fits budget", which a large
+        # dense checkpoint can provoke by leaving too little room for the
+        # prefill width the planner would otherwise pick.
+        if args.max_forward_tokens != PIE_MAX_FORWARD_TOKENS_DEFAULT:
+            driver_options["max_forward_tokens"] = args.max_forward_tokens
+        if args.max_forward_requests != PIE_MAX_FORWARD_REQUESTS_DEFAULT:
+            driver_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "swap_pool_size", 0):
             driver_options["swap_pool_size"] = args.swap_pool_size
     elif args.driver == "metal":
@@ -254,12 +275,28 @@ def build_config(args: argparse.Namespace):
         # an operator makes about a model, not a backend detail.
         if getattr(args, "stream_routed_experts", False):
             driver_options["stream_routed_experts"] = True
+        # The bounded form of the same trade, and the only one that can admit a
+        # checkpoint bigger than the machine: streaming maps the bank and every
+        # mapped page is wired, so it moves bytes off the heap without capping
+        # them, while a slab caps them and pays a submit-and-wait per layer.
+        if getattr(args, "expert_slab_mb", 0):
+            driver_options["expert_slab_bytes"] = int(args.expert_slab_mb) * 1024 * 1024
         if getattr(args, "max_forward_tokens", 0):
             driver_options["max_forward_tokens"] = args.max_forward_tokens
         if getattr(args, "max_forward_requests", 0):
             driver_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "total_pages", 0):
             driver_options["total_pages"] = args.total_pages
+        # `--max-model-len` is the cross-engine context knob (llama.cpp takes
+        # it as `--ctx-size`, vLLM as `max_model_len`), and on every other
+        # engine it means ONE REQUEST's context. The Metal driver's knob is
+        # the whole fleet's ring -- it is one shared linear ring, not a
+        # per-request allocation -- so the fair translation multiplies by the
+        # fleet the client will actually offer. Sending the per-request number
+        # straight through would hand a 16-way run 128 tokens per request and
+        # measure a starved engine against unstarved ones.
+        fleet = max(1, args.concurrency) if args.mode != "latency" else 1
+        driver_options["max_model_len"] = args.max_model_len * fleet
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -353,6 +390,16 @@ def build_config(args: argparse.Namespace):
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
+        # Frame geometry, absent unless asked for. `None` is dropped by the
+        # config serializer, so not passing these is exactly the engine's own
+        # default rather than a second spelling of it.
+        "frame_size": args.frame_size,
+        "frame_submit_depth": args.frame_submit_depth,
+        "frame_dispatch_depth": args.frame_dispatch_depth,
+        "submit_deadline": args.submit_deadline,
+    }
+    requested_scheduler_kwargs = {
+        k: v for k, v in requested_scheduler_kwargs.items() if v is not None
     }
     scheduler_parameters = inspect.signature(SchedulerConfig).parameters
     scheduler_kwargs = {
@@ -371,7 +418,6 @@ def build_config(args: argparse.Namespace):
             verbose=True,
             max_concurrent_processes=max_concurrent_processes,
         ),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
             # A pooling slot costs ~4 GiB of VIRTUAL address space (wasmtime
@@ -1279,6 +1325,29 @@ def build_parser() -> argparse.ArgumentParser:
                  ">0 to arm the suspend/restore rung; 0 leaves the residency "
                  "planner with pool-only reclaim.",
         )
+        sp.add_argument(
+            "--frame-size", type=int, default=None,
+            help="Waves per frame (pie scheduler `frame_size`). Omit for the "
+                 "engine default (2).",
+        )
+        sp.add_argument(
+            "--frame-submit-depth", type=int, default=None,
+            help="Frames a guest keeps queued in the engine. Omit for the "
+                 "engine default (3). This is the guest running ahead of the "
+                 "engine; too few collapses the pipeline to lockstep.",
+        )
+        sp.add_argument(
+            "--frame-dispatch-depth", type=int, default=None,
+            help="Frames the engine keeps posted to the driver. Omit for the "
+                 "engine default (2). The worker's config notes this is a "
+                 "two-sided trade-off that a fully batched fleet can lose.",
+        )
+        sp.add_argument(
+            "--submit-deadline", default=None,
+            help="How long a wave waits on a straggler lane before sealing "
+                 "without it, with unit (e.g. '50ms'). Omit for the engine "
+                 "default.",
+        )
         sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
         sp.add_argument(
             "--stream-routed-experts",
@@ -1289,8 +1358,20 @@ def build_parser() -> argparse.ArgumentParser:
                  "it differs (cuda stages through a cache, Metal demand-faults "
                  "a page-aligned pack).",
         )
-        sp.add_argument("--max-forward-tokens", type=int, default=10240)
-        sp.add_argument("--max-forward-requests", type=int, default=512)
+        sp.add_argument(
+            "--expert-slab-mb",
+            type=int,
+            default=0,
+            help="Metal only. Cap the routed experts at this many MiB of device "
+                 "memory and page them through a slab, instead of keeping the "
+                 "whole bank resident. 0 leaves the bank resident. This is what "
+                 "runs a checkpoint that does not fit; it is not a faster "
+                 "--stream-routed-experts.",
+        )
+        sp.add_argument("--max-forward-tokens", type=int,
+                        default=PIE_MAX_FORWARD_TOKENS_DEFAULT)
+        sp.add_argument("--max-forward-requests", type=int,
+                        default=PIE_MAX_FORWARD_REQUESTS_DEFAULT)
         sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
         sp.add_argument(
             "--mxfp4-moe",
@@ -1306,6 +1387,36 @@ def build_parser() -> argparse.ArgumentParser:
                  "0 disables speculation; 1 is piggyback (default). Forwards "
                  "to scheduler.speculation_depth in the generated toml.",
         )
+        # `choices.values()` can yield the same parser under an alias, and
+        # `common.py` registers some of these already; a duplicate
+        # add_argument raises. Guard EACH flag by its own option string --
+        # guarding a block by one member silently drops the rest, which is how
+        # the frame-geometry flags were added and then never appeared.
+        for flag, dest, helptext in (
+            ("--frame-size", "frame_size",
+             "Waves per frame (k). Default: the engine's."),
+            ("--frame-submit-depth", "frame_submit_depth",
+             "Frames a guest keeps submitted. Default: the engine's."),
+            ("--frame-dispatch-depth", "frame_dispatch_depth",
+             "Frames the engine keeps posted to the driver. "
+             "Default: the engine's."),
+        ):
+            if not any(flag in a.option_strings for a in sp._actions):
+                sp.add_argument(flag, dest=dest, type=int, default=None,
+                                help=helptext)
+        if not any(
+            "--run-ahead-frames" in a.option_strings for a in sp._actions
+        ):
+            sp.add_argument(
+                "--run-ahead-frames",
+                dest="run_ahead_frames",
+                type=int,
+                default=None,
+                help="Override the inferlet's run-ahead window depth, in "
+                     "frames (forwarded as the bench input's "
+                     "run_ahead_frames; the ring grows to match). "
+                     "Default: the inferlet's own sizing.",
+            )
         sp.add_argument(
             "--dump-first-text",
             action="store_true",
@@ -1513,8 +1624,53 @@ def run_data_parallel(args):
     return summary, merged
 
 
+def refuse_if_a_wedged_pie_is_still_dying() -> None:
+    """Abort rather than launch alongside a `pie` the kernel cannot reap.
+
+    When the Metal driver gives up waiting on an event it abandons the
+    context, because the command buffers may still be executing and
+    releasing their heaps would be unsafe. The process then blocks in the
+    kernel on GPU work forever: it shows up in state `?E`, RSS 0,
+    reparented to launchd, and `kill -9` will not touch it. Its memory is
+    never returned.
+
+    That makes a retry actively harmful. The dead run still holds its
+    share of a unified-memory machine, so the next run starts with less
+    than the last one, wedges sooner, and leaves a second corpse. Three
+    attempts can take a 48 GB box down to single-digit gigabytes. Free
+    memory reads healthy right up until it doesn't, because the pages a
+    wedged context holds are not accounted to any live process.
+
+    So we do not wait, and we do not retry — neither can work. We say
+    what is wrong and that only a reboot fixes it.
+    """
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("PIE_BENCH_ALLOW_WEDGED") == "1":
+        # The driver now refuses on host memory too, so a run on a wedged box
+        # ends in a sentence rather than a hang. This exists to exercise that
+        # refusal, which is otherwise only reachable on a machine already in
+        # the state we are trying to prevent.
+        return
+    try:
+        out = subprocess.run(["ps", "-eo", "pid,stat,comm"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return
+    wedged = [line.split()[0] for line in out.splitlines()[1:]
+              if "(pie)" in line and "E" in line.split()[1]]
+    if wedged:
+        raise SystemExit(
+            f"pie_bench: refusing to start — {len(wedged)} wedged pie "
+            f"process(es) still hold GPU memory: {', '.join(wedged)}.\n"
+            "They are blocked in the kernel awaiting GPU work and cannot be "
+            "killed; their memory is unreclaimable. Retrying will only add "
+            "another. Reboot the machine.")
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    refuse_if_a_wedged_pie_is_still_dying()
     if args.dp_size > 1:
         summary, results = run_data_parallel(args)
     else:

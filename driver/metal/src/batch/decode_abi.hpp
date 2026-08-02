@@ -602,7 +602,16 @@ enum class Kernel : uint8_t {
     G4MoeSort,
     G4MoeGather,
     G4ExpertCombine,
-    G4BranchAdd          // h1 + h2, the two branches meeting
+    G4BranchAdd,         // h1 + h2, the two branches meeting
+    // Not a kind: how many there are. Every table indexed by `Kernel` is sized
+    // from here, so a kind appended above is covered by construction. It used
+    // to be `G4PleResidual + 1`, which stopped forty kinds short of the end --
+    // `psos[LmHeadUntied]` then wrote and read PAST the array, into whatever
+    // the enclosing object held next. The untied head's dispatch got the
+    // multi-batch table's GDN pipeline, ran it over the head's argument table,
+    // and left the logits buffer exactly as it found it: every logit zero,
+    // every token 0, and not one error anywhere.
+    KindCount
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

@@ -181,12 +181,14 @@ pub enum PieForwardDType {
     BF16 = 0,
     F32 = 1,
     I32 = 2,
+    F16 = 3,
 }
 
 impl From<DType> for PieForwardDType {
     fn from(value: DType) -> Self {
         match value {
             DType::BF16 => Self::BF16,
+            DType::F16 => Self::F16,
             DType::F32 => Self::F32,
             DType::I32 => Self::I32,
         }

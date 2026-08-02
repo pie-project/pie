@@ -475,6 +475,17 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         // (The dense forward assumes the gate unconditionally, so no gate
         // check on the dense side — trace and hand-written path agree.)
         if (!cfg.attn_output_gate) return refuse("attn_output_gate disabled");
+        // The MoE block HAS a declaration — `moe_mlp_body_cuda` states the
+        // fused CUTLASS leg — but this executor has no arms for it: its
+        // launcher registry knows none of the MoE symbols, and
+        // `qwen35_validate_stated_kernels` turns an unknown symbol into a
+        // model-LOAD failure. So a plan built here would not fall back to
+        // the hand-written pass, it would refuse to boot the model.
+        //
+        // Refusing at build is the difference between "the declaration is
+        // ahead of the executor" and "this checkpoint does not run".
+        // Delete this line in the commit that registers the MoE kernels.
+        return refuse("the MoE block's declaration has no executor arms yet");
         if (cfg.num_experts <= 0 || cfg.num_experts_per_tok <= 0 ||
             cfg.moe_intermediate_size <= 0) {
             return refuse("moe dims unset");
@@ -615,6 +626,18 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
     cuda.verify_stash = 1;
     out.cuda_verify_stash = true;
 
+    // The dense MLP's gate_up BINDING — llama_like's reasoning verbatim
+    // (declared_forward.cpp: the executor re-derived this per layer as
+    // `gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty()`, and
+    // the second term is dead because the workspace is allocated
+    // unconditionally). Layer 0 speaks for the deployment: the loader's
+    // join contract accepts or declines a GROUP uniformly.
+    if constexpr (!kMoe) {
+        cuda.gate_up_fused =
+            (!w.layers.empty() && w.layers[0].gate_up_proj_fused != nullptr) ? 1
+                                                                            : 0;
+    }
+
     // The MoE block's terms. Only the fused CUTLASS leg is stated, so
     // these say whether that leg exists and what row bound it carries;
     // the trace refuses the block outright when any of them says no,
@@ -742,9 +765,13 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
 // env to label its run must know which family it is testing
 // (`cuda_gdn_site_summary_parity` reads it for this one).
 bool qwen35_declared_forward_enabled() {
+    // DEFAULT ON, llama_like's polarity verbatim — one env var meaning
+    // the same thing in both families, which it did not while this one
+    // was opt-in. `PIE_DECLARED_FORWARD=0` disarms onto the hand-written
+    // pass.
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_DECLARED_FORWARD");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return enabled;
 }

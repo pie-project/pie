@@ -7,7 +7,7 @@
 //! programs differ, not the way two runtime paths do.
 
 use crate::facts::{
-    LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
+    Gemma4CudaFacts, Gemma4Facts, GptOssCudaFacts, GptOssFacts, LlamaLikeCudaFacts, LlamaLikeFacts, LlamaLikeMetalFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::dsl::{
@@ -1195,7 +1195,7 @@ fn gdn_attn_body_cuda(
             let (mut guard, core) = dsl::guarded_value(t, Some(l), out_shape);
             if c.warp_tiled {
                 guard = guard.arm(GuardPred::TokensLE(c.warp_tiled_max), || {
-                    cuda::gdn_prefill_warp_tiled(&q, &k, &v, &g, &beta, &w.rs, gqa, c.state_bf16)
+                    cuda::gdn_prefill_warp_tiled(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16)
                 });
             }
             guard
@@ -1498,6 +1498,47 @@ fn dense_mlp_body(
     y
 }
 
+/// The dense MLP block's CUDA reading — [`dense_mlp_body`]'s peer,
+/// differing in exactly one statement: the activation names its kernel.
+///
+/// `packed` is [`Qwen35CudaFacts::gate_up_fused`], and the reasoning is
+/// llama_like's verbatim — a checkpoint that bound the packed gate‖up
+/// bank lands the projection in one buffer and takes the CHUNKED kernel,
+/// one that did not lands two and takes the pair form. The trace
+/// declares ONE packed matmul either way, because whether the binding
+/// materialised it as one buffer or two is a BUFFER question.
+fn dense_mlp_body_cuda(
+    l: u32,
+    hidden: u32,
+    intermediate: u32,
+    variant: NormVariant,
+    y: &Val,
+    packed: bool,
+) -> Val {
+    let w = |name: &str| format!("layer.{l}.{name}");
+    let mlp_norm = NormW {
+        name: w("mlp_norm"),
+        variant,
+        per_head: None,
+        layer: Some(l),
+    };
+    let gate_up = MatW {
+        name: w("gate_up"),
+        width: 2 * intermediate,
+        layer: Some(l),
+    };
+    let down = MatW {
+        name: w("down"),
+        width: hidden,
+        layer: Some(l),
+    };
+    let mut y = y.clone();
+    let m = rmsnorm(&y, &mlp_norm);
+    let act = dsl::cuda::swiglu(&matmul(&m, &gate_up), intermediate, packed);
+    y += matmul(&act, &down);
+    y
+}
+
 /// The full qwen3_5 HYBRID declaration — the first whole-model trace beyond
 /// llama_like, composing the three fragment bodies exactly as plan.md Part
 /// 1 sketches:
@@ -1601,9 +1642,14 @@ pub fn qwen3_5_hybrid_cuda(
                 gdn_attn_body_cuda(t, l, &facts.gdn, &y, cuda, class)
             };
             y = match &facts.mlp {
-                Qwen35MlpKind::Dense { intermediate } => {
-                    dense_mlp_body(l, hidden, *intermediate, facts.norm_variant, &y_attn)
-                }
+                Qwen35MlpKind::Dense { intermediate } => dense_mlp_body_cuda(
+                    l,
+                    hidden,
+                    *intermediate,
+                    facts.norm_variant,
+                    &y_attn,
+                    cuda.gate_up_fused,
+                ),
                 Qwen35MlpKind::Moe(moe) => moe_mlp_body_cuda(l, moe, cuda, &y_attn, class),
             };
         }
@@ -3135,4 +3181,574 @@ mod metal_tests {
         assert!(count(&mb, "sdpa_paged_decode_bfloat16_d_256") > 0);
         assert!(count(&fold, "sdpa_vector_decode_bfloat16_d_256") > 0);
     }
+}
+
+// ── gemma-4 ──────────────────────────────────────────────────────────
+
+/// One gemma-4 layer's weight namespace, named after the driver's own
+/// fields (`Gemma4LayerWeights`) so the executor's binder is a straight
+/// map rather than a translation.
+struct Gemma4LayerW {
+    attn_norm: NormW,
+    post_attn_norm: NormW,
+    pre_ffw_norm: NormW,
+    post_ffw_norm: NormW,
+    qkv: MatW,
+    q_proj: MatW,
+    k_proj: MatW,
+    v_proj: MatW,
+    o_proj: MatW,
+    q_norm: NormW,
+    k_norm: NormW,
+    gate_up: MatW,
+    gate_proj: MatW,
+    up_proj: MatW,
+    down: MatW,
+    ple_gate: MatW,
+    ple_proj: MatW,
+    ple_norm: NormW,
+}
+
+impl Gemma4LayerW {
+    fn new(l: u32, f: &Gemma4Facts) -> Self {
+        let w = |name: &str| format!("layer.{l}.{name}");
+        let d = f.head_dim_of(l);
+        let mat = |name: &str, width: u32| MatW {
+            name: w(name),
+            width,
+            layer: Some(l),
+        };
+        // PLAIN, despite the family name: `gemma4.cpp` fires
+        // `launch_rmsnorm_bf16` at all fourteen of its norm sites and
+        // `launch_rmsnorm_gemma_bf16` at none. The `(1 + w)` fold is
+        // done to the tensors at LOAD for this family, so a declaration
+        // that stated Gemma would be stating a second fold.
+        let norm = |name: &str| NormW {
+            name: w(name),
+            variant: NormVariant::Plain,
+            per_head: None,
+            layer: Some(l),
+        };
+        let head_norm = |name: &str| NormW {
+            name: w(name),
+            variant: NormVariant::Plain,
+            per_head: Some(d),
+            layer: Some(l),
+        };
+        Gemma4LayerW {
+            attn_norm: norm("attn_norm"),
+            post_attn_norm: norm("post_attn_norm"),
+            pre_ffw_norm: norm("pre_ffw_norm"),
+            post_ffw_norm: norm("post_ffw_norm"),
+            qkv: mat("qkv", (f.q_heads + 2 * f.kv_heads) * d),
+            q_proj: mat("q_proj", f.q_heads * d),
+            k_proj: mat("k_proj", f.kv_heads * d),
+            v_proj: mat("v_proj", f.kv_heads * d),
+            o_proj: mat("o_proj", f.hidden),
+            q_norm: head_norm("q_norm"),
+            k_norm: head_norm("k_norm"),
+            // The double-wide variant widens exactly the KV-shared
+            // layers, so the width is per-layer and erases here.
+            gate_up: mat("gate_up", 2 * f.intermediate_of(l)),
+            gate_proj: mat("gate_proj", f.intermediate_of(l)),
+            up_proj: mat("up_proj", f.intermediate_of(l)),
+            down: mat("down", f.hidden),
+            ple_gate: mat("ple_gate", f.ple_dim),
+            ple_proj: mat("ple_proj", f.hidden),
+            ple_norm: norm("ple_norm"),
+        }
+    }
+}
+
+/// The gemma-4 model's CUDA reading — `gemma4.cpp`'s decode path as a
+/// list of stated kernels.
+///
+/// # The three things a reader should look for
+///
+/// **The input norm is missing from every layer but the first.** That is
+/// not an omission: layer `l`'s PLE epilogue fires
+/// `launch_rmsnorm_residual_add_scale_rmsnorm_bf16`, whose FOURTH
+/// statement is layer `l+1`'s `attn_norm`. The fusion crosses the layer
+/// boundary, so the declaration does too — `gemma4.cpp:1999` produces
+/// it and `:1529` is the guard that skips re-computing it.
+///
+/// **A KV-shared layer's statements are ABSENT, not skipped.** The
+/// trailing [`Gemma4Facts::kv_shared_layers`] layers project no k/v,
+/// norm neither, rope no k and write no cache; their attention names
+/// the SOURCE layer's cache handle. Nothing here tests a flag per fire,
+/// because there is nothing per fire about it — the binding decided at
+/// load, and a fact is a trace-time `match`.
+///
+/// **The two layer kinds differ by WIDTH, not by function.** Sliding
+/// layers rope fully at `head_dim`; full layers rope partially at
+/// `global_head_dim`. That is why the full layers cannot take the fused
+/// packed post (its predicate reads `!partial`) and fall to the
+/// separate norm/rope statements instead.
+///
+/// Prefill and the service classes are not stated yet: this is the
+/// decode reading, and the class parameter is here so the next rung adds
+/// them where llama_like's does.
+pub fn gemma4_cuda(
+    facts: &Gemma4Facts,
+    cuda: &Gemma4CudaFacts,
+    class: FireClass,
+) -> ForwardPlan {
+    let family = format!(
+        "gemma4.cuda.{}",
+        match class {
+            FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
+            other => panic!("gemma4 states no {other:?} class yet"),
+        }
+    );
+    let hidden = facts.hidden;
+    dsl::trace_named(&family, |t| {
+        // ── Prologue ────────────────────────────────────────────────
+        // The token embedding, scaled by sqrt(hidden).
+        let mut y = dsl::cuda::scalar_mul(&dsl::embed_with(t, "embed", hidden), "sqrt_hidden");
+
+        // PLE: a SECOND embedding table, projected to the whole stack's
+        // per-layer width, normed, scaled and relaid so each layer reads
+        // a contiguous slice. Once per fire, not per layer — which is
+        // the entire reason for the relay.
+        let ple_total = facts.layers * facts.ple_dim;
+        let table = dsl::cuda::scalar_mul(
+            &dsl::embed_with(t, "embed_per_layer", ple_total),
+            "sqrt_ple_dim",
+        );
+        // The projection consumes the MAIN embedding, not the table:
+        // `per_layer_proj = inputs_embeds @ ple_model_proj.T`. The table
+        // is the other addend of the residual below. Reading the call
+        // site is what settled it — the body had the projection eating
+        // its own table, which is a plausible pipeline and not this one.
+        let ple = matmul(
+            &y,
+            &MatW {
+                name: "ple_model_proj".into(),
+                width: ple_total,
+                layer: None,
+            },
+        );
+        let scaled = dsl::cuda::scalar_mul(&ple, "rsqrt_hidden");
+        let normed_ple = rmsnorm(
+            &scaled,
+            &NormW {
+                name: "ple_model_norm".into(),
+                variant: NormVariant::Plain,
+                per_head: Some(facts.ple_dim),
+                layer: None,
+            },
+        );
+        // The projection lands back on the SCALED TABLE, not on nothing:
+        // `(proj + table) / sqrt(2)`. The residual add was missing from
+        // this prologue until an executor arm went looking for the value
+        // its scale consumes and found two producers where the trace had
+        // one.
+        let ple = dsl::cuda::residual_add(&normed_ple, &table, ple_total);
+        let ple = dsl::cuda::scalar_mul(&ple, "rsqrt_2");
+        let ple_table = dsl::cuda::transpose_nld_to_lnd(&ple, facts.layers, facts.ple_dim);
+
+        // ── Layers ──────────────────────────────────────────────────
+        // Layer 0 norms the stream itself; every other layer received
+        // its input norm from the layer before (see the doc above).
+        let mut normed = rmsnorm(&y, &Gemma4LayerW::new(0, facts).attn_norm);
+
+        for l in 0..facts.layers {
+            let w = Gemma4LayerW::new(l, facts);
+            let full = facts.is_full_attn(l);
+            let d = facts.head_dim_of(l);
+            let shared = facts.is_kv_shared(l);
+            // A shared layer attends through the pages of the last
+            // earlier layer of its own kind. The handle IS the sharing.
+            let kv = dsl::Kv::at(t, facts.kv_source(l).unwrap_or(l));
+
+            // The fused post writes k/v to the pages itself, so it is
+            // unavailable to a layer that writes none — and to the full
+            // layers, whose partial rope it does not implement.
+            let fused_post = cuda.fused_qkv
+                && cuda.kv_native_bf16
+                && !full
+                && !shared
+                && class == FireClass::Decode;
+
+            let attn_in = if fused_post {
+                let packed = matmul(&normed, &w.qkv);
+                dsl::cuda::qkv_packed_post(&packed, &w.q_norm, &w.k_norm, &kv, facts.q_heads * d)
+            } else if shared {
+                // A shared layer takes only the Q leg: no k/v
+                // projection, no k/v norm, no rope on k, no write. Which
+                // KERNEL rotates q still follows the layer kind, because
+                // the driver reaches both by passing `num_kv_heads = 0`
+                // to the launcher the un-shared layer of that kind would
+                // have used — NOT by falling back to a generic rope.
+                let q = matmul(&normed, &w.q_proj);
+                if full {
+                    let q = rmsnorm(&q, &w.q_norm);
+                    dsl::cuda::rope_partial_q_only(&q)
+                } else {
+                    dsl::cuda::qk_rmsnorm_rope_rounded_q_only(&q, &w.q_norm)
+                }
+            } else {
+                let (q, k, v) = if cuda.fused_qkv {
+                    let packed = matmul(&normed, &w.qkv);
+                    dsl::split_qkv(&packed, facts.q_heads * d, facts.kv_heads * d)
+                } else {
+                    (
+                        matmul(&normed, &w.q_proj),
+                        matmul(&normed, &w.k_proj),
+                        matmul(&normed, &w.v_proj),
+                    )
+                };
+                let v = dsl::cuda::rmsnorm_no_scale(&v);
+                let (q, k) = if full {
+                    // Partial rope has no fused pair, so the norms are
+                    // their own statements — `can_fuse_qk_norm_rope`
+                    // reads `!partial`.
+                    let q = rmsnorm(&q, &w.q_norm);
+                    let k = rmsnorm(&k, &w.k_norm);
+                    dsl::rope_partial(&q, &k, RopeKind::Standard, facts.global_rotary_dim)
+                } else {
+                    dsl::cuda::qk_rmsnorm_rope_rounded(&q, &k, &w.q_norm, &w.k_norm)
+                };
+                dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+                q
+            };
+
+            // The dispatch is the one place the two classes diverge, and
+            // the PREFILL side diverges again per layer — on the HEAD
+            // DIM, not on the layer kind. flashinfer 0.6.x refuses to
+            // instantiate its TC prefill template at head_dim 512
+            // ("NUM_MMA_D_QK=32"), so gemma-4's full-attention layers
+            // take a naive paged kernel there while decode at 512 is
+            // fine. Reading the driver's own test (`d == 512`) is what
+            // this states; `is_full_attn` happens to agree on E4B and is
+            // not the question asked.
+            let a = match class {
+                FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&attn_in, &kv),
+                FireClass::Prefill if d == 512 => {
+                    dsl::cuda::attention_naive_paged(&attn_in, &kv)
+                }
+                FireClass::Prefill => {
+                    dsl::cuda::attention_flashinfer_prefill_planless(&attn_in, &kv)
+                }
+                other => unreachable!("gemma4 refuses {other:?} at trace start"),
+            }
+            .expect("the class states its attention");
+            let attn_out = matmul(&a, &w.o_proj);
+
+            // Post-attention norm, land on the stream, scale, and norm
+            // for the MLP — four statements, one launch.
+            let (landed, mlp_in) = dsl::cuda::norm_residual_scale_norm(
+                &attn_out,
+                &w.post_attn_norm,
+                &w.pre_ffw_norm,
+                hidden,
+            );
+            y = landed;
+
+            // The projection follows the BINDING, not just the
+            // activation: a deployment without the packed bank (E2B —
+            // the fuse is gated on E4B's exact dims) runs two gemms and
+            // the PAIR activation. Stating only the fused shape made the
+            // trace name a `gate_up` weight E2B never binds, which the
+            // executor caught at LOAD.
+            let inter = facts.intermediate_of(l);
+            let act = if cuda.gate_up_fused {
+                dsl::cuda::geglu_tanh(&matmul(&mlp_in, &w.gate_up), inter, true)
+            } else {
+                let gate = matmul(&mlp_in, &w.gate_proj);
+                let up = matmul(&mlp_in, &w.up_proj);
+                dsl::cuda::geglu_tanh_pair(&gate, &up, inter)
+            };
+            let mlp_out = matmul(&act, &w.down);
+            y = dsl::cuda::norm_residual_add(&mlp_out, &w.post_ffw_norm, hidden);
+
+            // ── The PLE epilogue ────────────────────────────────────
+            // Gate this layer's slice of the per-layer table into the
+            // stream, then land it — and, for every layer but the last,
+            // produce the NEXT layer's input norm in the same launch.
+            let gate = matmul(&y, &w.ple_gate);
+            let gated = dsl::cuda::geglu_tanh_pair(&gate, &ple_table, facts.ple_dim);
+            let ple_out = matmul(&gated, &w.ple_proj);
+            if l + 1 < facts.layers {
+                let next = Gemma4LayerW::new(l + 1, facts);
+                let (landed, next_norm) = dsl::cuda::norm_residual_scale_norm(
+                    &ple_out,
+                    &w.ple_norm,
+                    &next.attn_norm,
+                    hidden,
+                );
+                y = landed;
+                normed = next_norm;
+            } else {
+                // The last layer has no next input norm to fuse, so it
+                // lands unfused and the epilogue norms for itself —
+                // `gemma4.cpp`'s :2010 arm.
+                y = dsl::cuda::norm_residual_add(&ple_out, &w.ple_norm, hidden);
+            }
+        }
+
+        // ── Epilogue ────────────────────────────────────────────────
+        let normed = rmsnorm(
+            &y,
+            &NormW {
+                name: "final_norm".into(),
+                variant: NormVariant::Plain,
+                per_head: None,
+                layer: None,
+            },
+        );
+        let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
+        let logits = dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
+        if facts.logit_softcap > 0.0 {
+            dsl::cuda::logit_softcap(&logits, facts.vocab);
+        }
+    })
+}
+
+// ── gpt-oss ────────────────────────────────────────────────────────────
+
+/// One gpt-oss layer's weight handles. The family rides `mixtral.cpp`,
+/// so these are that file's names.
+struct GptOssLayerW {
+    attn_norm: NormW,
+    q_proj: MatW,
+    k_proj: MatW,
+    v_proj: MatW,
+    q_bias: MatW,
+    k_bias: MatW,
+    v_bias: MatW,
+    o_proj: MatW,
+    o_bias: MatW,
+    sinks: MatW,
+    mlp_norm: NormW,
+    router: MatW,
+    router_bias: MatW,
+    expert_gate_up: MatW,
+    expert_down: MatW,
+}
+
+impl GptOssLayerW {
+    fn new(l: u32, f: &GptOssFacts) -> Self {
+        // `layer.{l}.{field}` — the tree-wide convention every executor's
+        // `parse_name` reads. Naming them bare made the drive's first live
+        // fire throw on the very first weight it looked up.
+        let w = |name: &str| format!("layer.{l}.{name}");
+        let m = |name: &str, width: u32| MatW {
+            name: w(name),
+            width,
+            layer: Some(l),
+        };
+        let d = f.head_dim;
+        Self {
+            attn_norm: NormW {
+                name: w("attn_norm"),
+                variant: NormVariant::Plain,
+                per_head: None,
+                layer: Some(l),
+            },
+            q_proj: m("q_proj", f.q_heads * d),
+            k_proj: m("k_proj", f.kv_heads * d),
+            v_proj: m("v_proj", f.kv_heads * d),
+            q_bias: m("q_bias", f.q_heads * d),
+            k_bias: m("k_bias", f.kv_heads * d),
+            v_bias: m("v_bias", f.kv_heads * d),
+            o_proj: m("o_proj", f.hidden),
+            o_bias: m("o_bias", f.hidden),
+            sinks: m("attn_sinks", f.q_heads),
+            mlp_norm: NormW {
+                name: w("mlp_norm"),
+                variant: NormVariant::Plain,
+                per_head: None,
+                layer: Some(l),
+            },
+            router: m("router", f.experts),
+            router_bias: m("router_bias", f.experts),
+            expert_gate_up: m("expert_gate_up_bank", f.intermediate),
+            expert_down: m("expert_down_bank", f.hidden),
+        }
+    }
+}
+
+/// gpt-oss's CUDA text — the DECODE class, and the first family whose
+/// MoE block is stated end to end.
+///
+/// Mirrors `mixtral.cpp::mixtral_forward_paged` at `tp_size == 1`, which
+/// is what `bind_gpt_oss` returns weights for: gpt-oss has no forward of
+/// its own, only a binder.
+///
+/// Three things here exist in no other family's text.
+///
+/// **The sink.** gpt-oss learns a per-head logit that joins the softmax
+/// denominator without contributing a value. flashinfer's
+/// DefaultAttention will not emit it, so the driver asks the dispatch
+/// for its LSE and rescales the output by `sigmoid(lse - sink)`. The
+/// declaration says this by having the attention statement produce TWO
+/// values on a sink-carrying layer — the `lse_out` argument is the whole
+/// difference, and the symbol does not change.
+///
+/// **The MXFP4 routed leg.** The expert weights are never materialized:
+/// two GEMVs read the packed nibbles out of HBM and index the experts
+/// through a device pointer array. That leg is SEVEN rectangles and no
+/// host sync. The alternative — a serial per-expert walk whose launch
+/// count depends on what the router picked, behind a D2H that drains the
+/// stream — is refused by name below, not stated.
+///
+/// **The clamped GLU.** `swiglu_limit` is a config constant, so gpt-oss
+/// states a different activation kernel rather than passing a limit.
+///
+/// Yarn was NOT stated here at first, and deliberately: the config asked
+/// for it while `mixtral.cpp` passed a plain `rope_theta`, so declaring
+/// it would have made this text disagree with the pass it mirrors. The
+/// fix went to that line instead, and the fact followed it — which is the
+/// order that keeps a declaration honest about a driver bug rather than
+/// laundering one.
+pub fn gpt_oss_cuda(
+    facts: &GptOssFacts,
+    cuda: &GptOssCudaFacts,
+    class: FireClass,
+) -> ForwardPlan {
+    assert!(
+        cuda.mxfp4_decode_gemv,
+        "gpt_oss states the fused MXFP4 decode leg; a deployment without \
+         the per-expert pointer arrays reaches the experts by a host walk \
+         this declaration refuses"
+    );
+    assert!(
+        !cuda.streamed_experts,
+        "gpt_oss states the resident bank; a streamed one reaches the same \
+         kernels only after a host round-trip that decides what to page in"
+    );
+    let family = format!(
+        "gpt_oss.cuda.{}",
+        match class {
+            FireClass::Decode => "decode",
+            FireClass::Prefill => "prefill",
+            other => panic!("gpt_oss states no {other:?} class yet"),
+        }
+    );
+    let hidden = facts.hidden;
+    dsl::trace_named(&family, |t| {
+        let mut y = dsl::embed_with(t, "embed", hidden);
+
+        for l in 0..facts.layers {
+            let w = GptOssLayerW::new(l, facts);
+            let kv = dsl::Kv::at(t, l);
+            let normed = rmsnorm(&y, &w.attn_norm);
+
+            // The q/k/v biases FOLD INTO the projection's epilogue
+            // (`gemm_act_x_wt_bias_bf16`): at decode these route to the
+            // warp-per-row GEMV, which absorbs the bias for free. Stating
+            // them as separate AddBias ops — which this text did until a
+            // census of its own golden was read against the driver — is
+            // three extra launches per layer and a different accumulation
+            // order, and nothing that only asks whether the trace LOWERS
+            // would have said so.
+            let proj = |x: &Val, w: &MatW, b: &MatW| {
+                if facts.attention_bias {
+                    dsl::cuda::gemm_bias(x, w, b)
+                } else {
+                    matmul(x, w)
+                }
+            };
+            let q = proj(&normed, &w.q_proj, &w.q_bias);
+            let k = proj(&normed, &w.k_proj, &w.k_bias);
+            let v = proj(&normed, &w.v_proj, &w.v_bias);
+
+            // gpt-oss scales, and the driver had to be TAUGHT to: this
+            // family shares llama_like's cfg, where `apply_rope_config`
+            // had already resolved the scaling, and `mixtral.cpp` spelled
+            // a plain `launch_rope_bf16` anyway. The declaration states
+            // the kernel the fixed pass fires.
+            let (q, k) = if facts.rope_yarn_original {
+                dsl::cuda::rope_yarn_original(&q, &k)
+            } else {
+                dsl::rope(&q, &k, RopeKind::Standard)
+            };
+            dsl::cuda::write_kv_to_pages(&k, &v, &kv);
+
+            // The dispatch is the ONLY thing the two classes disagree
+            // about. The MoE leg below is admitted by ROUTES
+            // (`N * top_k <= max_routes`), not by class, so a prefill
+            // under the cap takes the same fused GEMVs — which is why
+            // this family has a prefill class at all.
+            //
+            // The sink layers ask for the LSE; a layer without sinks
+            // takes the one-value dispatch and saves the write.
+            let a = if facts.attn_sinks {
+                let (o, lse) = match class {
+                    FireClass::Decode => {
+                        dsl::cuda::attention_flashinfer_decode_lse(&q, &kv, facts.q_heads)
+                    }
+                    _ => dsl::cuda::attention_flashinfer_prefill_lse(&q, &kv, facts.q_heads),
+                };
+                dsl::cuda::attention_sink_rescale(&o, &lse, &w.sinks)
+            } else {
+                match class {
+                    FireClass::Decode => dsl::cuda::attention_flashinfer_decode(&q, &kv),
+                    _ => dsl::cuda::attention_flashinfer_prefill_planless(&q, &kv),
+                }
+                .expect("the class states its attention")
+            };
+
+            // o_proj folds the RESIDUAL (beta=1) and not its bias: the
+            // hand-written tp=1 arm calls the plain gemm and then
+            // `launch_add_bias_bf16`. The one place in this layer where
+            // the split spelling is the truthful one.
+            y += matmul(&a, &w.o_proj);
+            if facts.attention_bias {
+                y = dsl::add_bias(&y, &w.o_bias);
+            }
+
+            // ── The MoE block ───────────────────────────────────────
+            let mlp_in = rmsnorm(&y, &w.mlp_norm);
+            let logits = proj(&mlp_in, &w.router, &w.router_bias);
+            let (experts, weights) = dsl::cuda::topk(&logits, facts.top_k);
+
+            let act = dsl::cuda::bf16_to_fp16(&mlp_in);
+            let (gate, up) = dsl::cuda::mxfp4_moe_gate_up_decode(
+                &act,
+                &experts,
+                &w.expert_gate_up,
+                facts.top_k,
+                facts.intermediate,
+            );
+            // The clamp is the whole fork, and a checkpoint without one
+            // takes `launch_swiglu_bf16`'s PAIR form — a spelling no
+            // statement carries yet. Refused by name rather than guessed:
+            // every gpt-oss release so far clamps, so an unclamped one
+            // would be the first thing this text had never seen.
+            assert!(
+                facts.swiglu_limit > 0.0,
+                "gpt_oss without a swiglu limit states no activation yet"
+            );
+            let routed =
+                dsl::cuda::gpt_oss_glu(&gate, &up, facts.top_k, facts.intermediate);
+            let routed = dsl::cuda::bf16_to_fp16(&routed);
+            let out = dsl::cuda::mxfp4_moe_down_decode(
+                &routed,
+                &experts,
+                &w.expert_down,
+                facts.top_k,
+                hidden,
+            );
+            // The combine writes to scratch and the landing is its own
+            // launch — mixtral's tp=1 shape. (The `_add` fused form
+            // exists, and this pass does not take it.)
+            let combined = dsl::cuda::weighted_sum(&weights, &out, hidden, None);
+            y = dsl::cuda::residual_add(&combined, &y, hidden);
+        }
+
+        let normed = rmsnorm(
+            &y,
+            &NormW {
+                name: "final_norm".into(),
+                variant: NormVariant::Plain,
+                per_head: None,
+                layer: None,
+            },
+        );
+        let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
+        dsl::lm_head_at(t, &normed, lm_head, facts.vocab);
+    })
 }

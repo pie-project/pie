@@ -35,16 +35,6 @@ class ServerConfig:
 
 
 # ---------------------------------------------------------------------------
-# [auth]
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AuthConfig:
-    enabled: Optional[bool] = None
-    authorized_users_dir: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
 # [telemetry]
 # ---------------------------------------------------------------------------
 
@@ -92,6 +82,17 @@ class DriverConfig:
 class SchedulerConfig:
     request_timeout_secs: Optional[int] = None
     speculation_depth: Optional[int] = None
+    # Frame geometry. Absent means the engine's own defaults, which is what
+    # every ordinary run wants; these exist so a measurement can hold the
+    # geometry fixed while something else varies. `pie config tune` moves the
+    # same three through `scheduler::reconfigure`, but only inside its own
+    # sweep -- without these there is no way to ask the QUESTION of a bench
+    # shape, and the sweep's synthetic fleet is not every shape.
+    frame_size: Optional[int] = None
+    frame_submit_depth: Optional[int] = None
+    frame_dispatch_depth: Optional[int] = None
+    # Durations are written with their unit ("50ms", "120s").
+    submit_deadline: Optional[str] = None
 
 
 @dataclass
@@ -109,7 +110,6 @@ class ModelConfig:
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
-    auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -122,7 +122,6 @@ class Config:
         emitters from drifting apart again.
         """
         _emit_table(buf, f"{prefix}server", _block(self.server))
-        _emit_table(buf, f"{prefix}auth", _block(self.auth))
         _emit_table(buf, f"{prefix}telemetry", _block(self.telemetry))
         _emit_table(buf, f"{prefix}runtime", _block(self.runtime))
         m = self.model
@@ -171,8 +170,10 @@ class Config:
         tables the way `to_engine_toml` does: the embedded engine deserializes
         the INTERNAL spelling, and only this method speaks the file's.
 
-        `[auth]` is not emitted: the section no longer exists in the file, and
-        the embedded server is always single-node and unauthenticated.
+        `[auth]` has no counterpart here or in `to_engine_toml`: the section
+        was retired on the Rust side, which now rejects a config carrying it
+        (`worker/src/config.rs::rejects_legacy_auth_section`), so emitting it
+        made every embedded-engine boot fail with "unknown field `auth`".
         """
         server: dict = {}
         runtime: dict = {}

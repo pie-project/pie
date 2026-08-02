@@ -539,8 +539,10 @@ bool run_dense_tactic(cublasHandle_t handle, const DenseTactic& t,
     switch (static_cast<GemmKind>(t.kind)) {
         case GemmKind::Gemv: {
             cudaStream_t stream = nullptr;
-            return beta == 0.f && M == 1 && cublas_stream(handle, stream) &&
-                   kernels::launch_gemv_bf16(W, act, bias, y, N, K, stream);
+            return (beta == 0.f || beta == 1.f) && M == 1 &&
+                   cublas_stream(handle, stream) &&
+                   kernels::launch_gemv_bf16(W, act, bias, y, N, K, stream,
+                                             beta);
         }
         case GemmKind::Lt: {
             if (plan == nullptr ||
@@ -697,7 +699,11 @@ std::vector<DenseTactic> dense_candidates(const Bf16LtPlan* plan, int M, int N,
     std::vector<DenseTactic> out;
     // Ordered by what the shape would have used without tuning, because ties
     // resolve to the first entry.
-    if (M == 1 && beta == 0.f) {
+    // beta = 1 too: the GEMV folds the accumulate into its epilogue, and
+    // excluding it meant every projection that adds into a residual -- o_proj
+    // on every model here -- was decided without its fastest candidate on the
+    // ballot.
+    if (M == 1 && (beta == 0.f || beta == 1.f)) {
         out.push_back({static_cast<int>(GemmKind::Gemv), 0});
     }
     out.push_back({static_cast<int>(GemmKind::GemmEx), 0});
@@ -779,6 +785,22 @@ DenseTactic tune_dense(cublasHandle_t caller, const Bf16LtPlan* plan,
         timings.emplace_back(i, ms);
         if (fastest < 0.0f || ms < fastest) fastest = ms;
     }
+    // PIE_GEMM_TUNE_LOG also dumps every candidate's measured time, not just
+    // the winner: knowing that the GEMV lost is not the same as knowing by how
+    // much, and the gap is what says whether a better kernel is worth writing.
+    static const bool tune_log = std::getenv("PIE_GEMM_TUNE_LOG") != nullptr;
+    if (tune_log) {
+        for (const auto& [i, ms] : timings) {
+            const int kind = candidates[i].kind;
+            std::fprintf(stderr,
+                "[gemm-cand] M=%d N=%d K=%d %s(algo=%d) %.1f us\n",
+                M, N, K,
+                kind == static_cast<int>(GemmKind::Gemv)   ? "gemv"
+              : kind == static_cast<int>(GemmKind::Lt)     ? "lt"
+                                                           : "gemmex",
+                candidates[i].algo, ms * 1000.0f);
+        }
+    }
     if (fastest <= 0.0f) return best;
 
     const float cutoff = fastest / kGemmTacticMargin;
@@ -843,6 +865,19 @@ bool dense_tactic_for(cublasHandle_t caller, const void* W, int M, int N,
         tuner.disk.store(key, tactic.kind, tactic.algo);
     }
     tuner.chosen.emplace(key, tactic);
+    // PIE_GEMM_TUNE_LOG: which kernel a shape ended up on. Logged HERE rather
+    // than inside the tuner because the choice is cached on disk, so on any
+    // machine that has run the model once the tuner never executes again and a
+    // log inside it prints nothing.
+    static const bool tune_log = std::getenv("PIE_GEMM_TUNE_LOG") != nullptr;
+    if (tune_log) {
+        const char* kind =
+            tactic.kind == static_cast<int>(GemmKind::Gemv) ? "gemv"
+          : tactic.kind == static_cast<int>(GemmKind::Lt)   ? "lt"
+                                                            : "gemmex";
+        std::fprintf(stderr, "[gemm-tune] M=%d N=%d K=%d -> %s(algo=%d)\n",
+                     M, N, K, kind, tactic.algo);
+    }
     *out = tactic;
     return true;
 }
@@ -2307,6 +2342,20 @@ void gemm_act_x_wt_bf16_cublas(
     int M, int N, int K,
     float beta)
 {
+    // The reason callers pin this entry is that cuBLASLt's heuristic loses on
+    // their *batched* shapes -- the note beside each of them names an N in the
+    // hundreds. None of that reasoning reaches M=1: a single activation row
+    // has no reuse for any tiled GEMM to exploit, Lt or classic, and the
+    // warp-per-row GEMV roughly doubles the bandwidth either of them reach
+    // (see `launch_gemv_bf16`). Without this, enabling gemma-4's fused
+    // gate/up bank moved its decode MLP onto a kernel tiled for an M it does
+    // not have -- 1.28 ms/token against 0.32 ms of weights.
+    cudaStream_t gemv_stream = nullptr;
+    if (M == 1 && beta == 0.f &&
+        cublas_stream(handle, gemv_stream) &&
+        kernels::launch_gemv_bf16(W, act, nullptr, y, N, K, gemv_stream)) {
+        return;
+    }
     gemm_bf16_cublas_impl(handle, act, W, y, M, N, K, beta);
 }
 
@@ -2314,7 +2363,8 @@ void gemm_act_x_wt_bias_bf16(
     cublasHandle_t handle,
     const void* act, const void* W, const void* bias, void* y,
     int M, int N, int K,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    float beta)
 {
     // Ask the tuner the same question `gemm_bf16_impl` would, rather than
     // peeking at what it has already decided: a shape is seen for the first
@@ -2330,15 +2380,15 @@ void gemm_act_x_wt_bias_bf16(
         // GEMV just to save a launch -- it falls through below.
         if (cublas_stream(handle, s) &&
             cudaStreamIsCapturing(s, &capturing) == cudaSuccess &&
-            dense_tactic_for(handle, W, M, N, K, /*beta=*/0.f, capturing,
+            dense_tactic_for(handle, W, M, N, K, beta, capturing,
                              &plan, &tactic) &&
             run_dense_tactic(handle, tactic, plan, act, W, y, M, N, K,
-                             /*beta=*/0.f, nullptr, 0, bias)) {
+                             beta, nullptr, 0, bias)) {
             return;
         }
         cudaGetLastError();
     }
-    gemm_bf16_impl(handle, act, W, y, M, N, K, /*beta=*/0.f);
+    gemm_bf16_impl(handle, act, W, y, M, N, K, beta);
     if (bias != nullptr) {
         kernels::launch_add_bias_bf16(y, bias, M, N, stream);
     }

@@ -1,4 +1,5 @@
 #include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "model/act_dump.hpp"
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
@@ -901,7 +902,18 @@ void linear_attn_layer_body(
     // prefill that is neither warp-tiled (N small) nor cached (env-gated, off
     // by default), i.e. exactly the c≥64 spec path. The branches are mutually
     // exclusive and chosen globally from N, so skipping is safe.
+    // Same STOPGAP as use_warp_tiled_recurrent above, for the same reason:
+    // this kernel is that one's GQA twin -- the identical single-block scan,
+    // differing only in deriving qk_h itself instead of reading a materialised
+    // repeat -- so it under-folds the persisted state in exactly the same way.
+    // The original fix gated only the non-GQA arm, which left every GQA model
+    // (V_h != K_h is this path's own entry condition) still routed into the
+    // bug. Qwen3.6-27B decoded pure punctuation from the first token; sending
+    // its state-persisting prefills down the proven chunk path fixes it at a
+    // cost of 0.1 tok/s. Frozen verify (write_state=false) persists nothing,
+    // so the fold cannot manifest there and keeps the faster kernel.
     const bool use_batched_fla_gqa =
+        !write_state &&
         !linear_decode &&
         slot_ids_d != nullptr &&
         qo_indptr_d != nullptr &&
@@ -933,6 +945,11 @@ void linear_attn_layer_body(
         (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
     const float* k_recur_full =
         (V_h == K_h) ? la.k_pre.data() : la.k_norm.data();
+    // The GQA kernels do their own repeat: they index q/k at the COMPACT
+    // K_h stride and derive the head themselves (qk_h = h / repeat). They
+    // must therefore be handed the compact buffers, never the *_full pair.
+    const float* q_recur_compact = la.q_pre.data();
+    const float* k_recur_compact = la.k_pre.data();
 
     // ── PIE_GDN_PREP_TRACE: FLA-fold probe ───────────────────────────
     // Dumps the recurrence INPUTS per prefill token (g_log = gating log-decay,
@@ -1034,84 +1051,10 @@ void linear_attn_layer_body(
                     }
                 }
             } else {
-                if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                    auto fla_pass = [&](int R, const std::int32_t* slot_ids_d,
-                                        const std::uint32_t* qo_indptr_d,
-                                        bool write_state,
-                                        const std::uint8_t* rs_write_state_mask) {
-                    if (use_warp_tiled_recurrent && V_h != K_h) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        }
-                    } else if (use_warp_tiled_recurrent) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        }
-                    }
-                    };
-                    if (fold_split != nullptr) {
-                        // The head writes the state AT the boundary; the tail
-                        // reads it back as its own initial state and produces
-                        // the outputs past it without moving it again.
-                        fla_pass(fold_split->segments, fold_split->slot_head_d,
-                                 fold_split->qo_d, /*write_state=*/true,
-                                 fold_split->mask_head_d);
-                        fla_pass(fold_split->segments, fold_split->slot_tail_d,
-                                 fold_split->qo_d, /*write_state=*/false,
-                                 nullptr);
-                    } else {
-                        fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
-                                 rs_write_state_mask);
-                    }
-                } else {
+                // The non-warp-tiled chunk path, per request. Named because
+                // two callers need it: the unslotted branch below, and the
+                // slotted branch when the warp-tiled kernel is gated off.
+                auto chunk_prefill_per_request = [&] {
                     for (int r = 0; r < R; ++r) {
                         const int t0 = static_cast<int>(qo_indptr_h[r]);
                         const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
@@ -1143,6 +1086,134 @@ void linear_attn_layer_body(
                                 Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
                         }
                     }
+                };
+                if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                    auto fla_pass = [&](int R, const std::int32_t* slot_ids_d,
+                                        const std::uint32_t* qo_indptr_d,
+                                        bool write_state,
+                                        const std::uint8_t* rs_write_state_mask) {
+                    // One arm per state dtype, and nothing else to choose.
+                    //
+                    // This was four arms: GQA and non-GQA, each with an fp32
+                    // and a bf16 state. The two kernels behind them differed
+                    // only in how they index q/k -- with `K_h == V_h` the GQA
+                    // kernel's `repeat` is 1, `qk_h` is `h`, and its index
+                    // reduces to the other's exactly -- so the non-GQA pair
+                    // was a second copy of the same arithmetic, and the
+                    // `V_h != K_h` test picked between identical results.
+                    //
+                    // Feed it the compact buffers. `q_recur_full` happens to
+                    // BE compact when the heads are equal, which is why it read
+                    // as a safe argument here, but that is the degenerate case:
+                    // when the heads differ it is the V_h-expanded buffer, and
+                    // these paths skip the repeat_interleave that fills it. The
+                    // kernel then walked stale memory at a K_h stride, which is
+                    // what made Qwen3.6-27B (repeat 3) emit pure punctuation.
+                    if (use_warp_tiled_recurrent) {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, rs_write_state_mask);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, rs_write_state_mask);
+                        }
+                    } else {
+                        // The hole upstream documents, filled — with the
+                        // BATCHED kernel, not the per-request one its note
+                        // rules out.
+                        //
+                        // Both of that note's objections are to
+                        // `chunk_prefill_per_request` standing in here: it
+                        // walks the fire's own `qo_indptr_h`, so on a fold
+                        // pass it folds the wrong ranges into the wrong
+                        // slots, and it cannot express the tail pass's
+                        // `write_state=false`. Neither is true of this
+                        // kernel: it takes `slot_ids` and `qo_indptr` as
+                        // ARGUMENTS — the fold's own, whichever pass is
+                        // calling — and it takes `write_state`. So the fold
+                        // head and tail get a real recurrence instead of
+                        // nothing.
+                        //
+                        // Compact buffers, for the reason the comment above
+                        // gives: `q_recur_full` is the V_h-expanded one when
+                        // the heads differ, and this path skips the
+                        // repeat_interleave that fills it.
+                        //
+                        // Measured on `cuda_gdn_foldcommit`, one test per
+                        // process (`pie_engine::bootstrap` is single-use).
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        }
+                    }
+                    };
+                    if (fold_split != nullptr) {
+                        // The head writes the state AT the boundary; the tail
+                        // reads it back as its own initial state and produces
+                        // the outputs past it without moving it again.
+                        fla_pass(fold_split->segments, fold_split->slot_head_d,
+                                 fold_split->qo_d, /*write_state=*/true,
+                                 fold_split->mask_head_d);
+                        fla_pass(fold_split->segments, fold_split->slot_tail_d,
+                                 fold_split->qo_d, /*write_state=*/false,
+                                 nullptr);
+                    } else if (use_warp_tiled_recurrent) {
+                        fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
+                                 rs_write_state_mask);
+                    } else {
+                        // The route the state-persist stopgap says it takes
+                        // and never wired: with the warp-tiled kernel gated
+                        // off, a plain slotted prefill goes to the proven
+                        // per-request chunk path.
+                        chunk_prefill_per_request();
+                    }
+                } else {
+                    chunk_prefill_per_request();
                 }
             }
         }
@@ -1785,12 +1856,14 @@ void qwen3_5_forward_paged(
             : nullptr;
 
     // 1. Embed.
+    act_dump_step_begin(stream);
     if (!commit_advance) {
         profile_forward_stage(profile, profile.embed_ms, stream, [&] {
             kernels::launch_embed_bf16(
                 token_ids, w.embed->data(), ws.y.data(),
                 N, H, cfg.vocab_size, stream);
         });
+        act_dump_bf16("embed", ws.y.data(), N, H, stream);
     }
 
     // 2. Per-layer.
@@ -1882,6 +1955,10 @@ void qwen3_5_forward_paged(
         profile_forward_stage(profile, profile.mlp_ms, stream, [&] {
             qwen35_dense_mlp_block(Lw, cfg, fwd_cfg, ws, cublas, N, stream);
         });
+        act_dump_bf16(
+            act_dump_layer_tag(is_linear ? "out_linear" : "out_full",
+                               static_cast<int>(L)).c_str(),
+            ws.y.data(), N, H, stream);
     }
 
     // 3. Final norm.
@@ -1901,6 +1978,7 @@ void qwen3_5_forward_paged(
             ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
     });
+    act_dump_bf16("final_norm", ws.norm_x.data(), N, H, stream);
 
     // 4. lm_head. For prompt/prefill-style fires the runtime may need
     // logits for only a small sampler subset. Keep the full hidden stream in

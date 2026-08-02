@@ -1076,65 +1076,10 @@ void linear_attn_body(
                     }
                 }
             } else {
-                if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                    if (use_warp_tiled_recurrent && V_h != K_h) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        }
-                    } else if (use_warp_tiled_recurrent) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state, rs_write_state_mask);
-                        }
-                    }
-                } else {
+                // The per-request non-warp-tiled chunk path. Named because two
+                // callers need it: the unslotted branch below, and the slotted
+                // branch when the warp-tiled kernel is gated off.
+                auto chunk_prefill_per_request = [&] {
                     for (int r = 0; r < R; ++r) {
                         const int t0 = static_cast<int>(qo_indptr_h[r]);
                         const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
@@ -1166,6 +1111,54 @@ void linear_attn_body(
                                 Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
                         }
                     }
+                };
+                if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                    // One arm per state dtype. This was four: the non-GQA pair
+                    // indexed q/k identically to the GQA one whenever
+                    // `K_h == V_h` -- `repeat` is 1 and `qk_h` is `h`, so the two
+                    // expressions reduce to each other -- which made the
+                    // `V_h != K_h` test a choice between two spellings of one
+                    // arithmetic. See qwen3_5_forward.cpp for the argument.
+                    if (use_warp_tiled_recurrent) {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
+                                la.q_pre.data(),
+                                la.k_pre.data(),
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, rs_write_state_mask);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
+                                la.q_pre.data(),
+                                la.k_pre.data(),
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, rs_write_state_mask);
+                        }
+                    } else {
+                        // The `else` this dispatch did not have. The warp-tiled
+                        // kernel declines any prefill past
+                        // `kQwen35GdnWarpTiledMaxTokens` (64), so a MoE Qwen3.5
+                        // answering a longer prompt launched no recurrence kernel
+                        // at all: `core_out` kept its zero-initialised contents
+                        // and every GDN layer contributed nothing. Zero is a
+                        // value, so it read as an answer.
+                        chunk_prefill_per_request();
+                    }
+                } else {
+                    chunk_prefill_per_request();
                 }
             }
         });
@@ -1553,7 +1546,7 @@ bool moe_block(
                                 moe_ws.aligned_route_ids.data(),
                                 moe_ws.aligned_expert_ids.data(),
                                 /*route_to_aligned_row=*/nullptr,
-                                routes, E, block, routed_blocks, stream);
+                                routes, E, block, routed_blocks, /*num_tokens_past_padded=*/nullptr, stream);
                                 });
                             profile_cuda_detail_stage(
                                 profile, profile ? &profile->moe_gather_ms : nullptr,

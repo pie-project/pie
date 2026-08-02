@@ -735,7 +735,13 @@ struct LoraFireState {
     }
 };
 
-inline void apply_rope(
+
+}  // namespace
+
+// EXPORTED (llama_like.hpp) rather than file-local: mixtral shares this
+// family's `LlamaLikeForwardCfg`, and duplicating the dispatch there is
+// how gpt-oss came to run without the yarn its config asks for.
+void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,
     const HfConfig& cfg,
     void* q, void* k,
@@ -771,8 +777,6 @@ inline void apply_rope(
             cfg.rope_theta, stream);
     }
 }
-
-}  // namespace
 
 // Bug#2 A/B: the fused decode QKV+qk-norm+rope+KV-write kernel
 // (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
@@ -1563,6 +1567,18 @@ std::uint32_t llama_like_supergraph_graph_layout(
     std::uint32_t h = decode_side + 0x9e3779b9u;
     h ^= mask_side + 0x85ebca6bu + (h << 6) + (h >> 2);
     return h;
+}
+
+bool llama_like_prefill_graph_capturable(const LlamaLikePlanState& state)
+{
+    // `prefill_decode_plan` is the decode-shaped prefill plan (qo_len 1 per
+    // request routed through the prefill kernel); it is already reachable
+    // through the pure-decode rules, so only the true prefill plan is
+    // reported here.
+    if (state.use_prefill_plan && state.prefill_plan) {
+        return ops::prefill_plan_graph_capturable(*state.prefill_plan);
+    }
+    return false;
 }
 
 void llama_like_forward_paged(

@@ -4233,7 +4233,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 0
@@ -4366,8 +4366,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -4553,7 +4553,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 1
@@ -4686,8 +4686,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -4873,7 +4873,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 2
@@ -5006,8 +5006,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5312,8 +5312,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5499,7 +5499,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 4
@@ -5632,8 +5632,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5819,7 +5819,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 5
@@ -5952,8 +5952,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6139,7 +6139,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 6
@@ -6272,8 +6272,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6578,8 +6578,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6765,7 +6765,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 8
@@ -6898,8 +6898,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7085,7 +7085,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 9
@@ -7218,8 +7218,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7405,7 +7405,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 10
@@ -7538,8 +7538,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7844,8 +7844,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8031,7 +8031,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 12
@@ -8164,8 +8164,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8351,7 +8351,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 13
@@ -8484,8 +8484,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8671,7 +8671,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 14
@@ -8804,8 +8804,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9110,8 +9110,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9297,7 +9297,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 16
@@ -9430,8 +9430,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9617,7 +9617,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 17
@@ -9750,8 +9750,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9937,7 +9937,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 18
@@ -10070,8 +10070,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10376,8 +10376,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10563,7 +10563,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 20
@@ -10696,8 +10696,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10883,7 +10883,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 21
@@ -11016,8 +11016,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11203,7 +11203,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 22
@@ -11336,8 +11336,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11642,8 +11642,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [

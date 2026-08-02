@@ -48,6 +48,12 @@ inline KN qmv_kn(Kind k, const Gemma4Geometry& g, int layer) {
     }
 }
 
+/// Bind the FP16 staging buffer and its element count to every projection whose
+/// GEMM reads a staged input. Returns how many were bound.
+int bind_gemma4_fp16_qmm(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                         const Gemma4Geometry& g, int rows, int head_rows,
+                         const SlotHandle& staging, std::vector<SlotHandle>& keep);
+
 /// Bind every constant the DAG's dispatches read. Returns how many were bound,
 /// which is the number a test can pin.
 ///

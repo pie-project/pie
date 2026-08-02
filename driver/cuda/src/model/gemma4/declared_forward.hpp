@@ -1,0 +1,83 @@
+#pragma once
+
+// gemma-4's DECLARED forward: the plan built at load, and the executor
+// that drives its flat launch list.
+//
+// The third family on tart. Unlike llama_like and qwen3_5 this one was
+// never a walk — it is a lowered drive from its first line, because the
+// declaration was complete before any executor existed (the trace lowers
+// with an empty residue; `lower.rs::the_gemma4_residue_ledger`).
+
+#include <string>
+
+#include "model/config.hpp"
+#include "model/gemma4/gemma4.hpp"
+#include "pie_forward/plan.hpp"
+
+namespace pie_cuda_driver::model {
+
+// The plan a deployment holds, or an empty one with the reason it
+// declined. Mirrors `Qwen35DeclaredPlan`'s contract: refusal is a
+// FALLBACK, not an error — the hand-written pass is untouched either
+// way.
+struct Gemma4DeclaredPlan {
+    pie_forward::ForwardPlan decode;
+    pie_forward::ForwardPlan prefill;
+    std::string facts_digest;
+    bool usable = false;
+};
+
+// `PIE_DECLARED_FORWARD`, llama_like's polarity: default ON, `=0`
+// disarms onto the hand-written pass.
+bool gemma4_declared_forward_enabled();
+
+// `PIE_DECLARED_FORWARD_GEMMA4` — whether the drive EXECUTES. Opt-in
+// while the arms are being finished; see the definition.
+bool gemma4_declared_drive_enabled();
+
+// Derive this deployment's facts and trace both classes.
+Gemma4DeclaredPlan build_gemma4_declared_plan(
+    const HfConfig& cfg, const Gemma4Weights& w, int tp_size);
+
+// Drive this fire's class — decode or prefill, picked by the same test
+// the hand-written pass makes. Returns false when the fire is outside
+// what the declaration states, leaving that pass to run it: the
+// eligibility answer, not an error.
+bool gemma4_forward_declared(
+    const Gemma4DeclaredPlan& declared,
+    const Gemma4Weights& w,
+    const HfConfig& cfg,
+    const Gemma4ForwardCfg& fwd_cfg,
+    Workspace& ws,
+    Gemma4MoeMlpWorkspace& moe_ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    bool is_pure_decode,
+    const std::uint8_t* row_valid_d,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows);
+
+// Every kernel the plan states must be in this executor's registry. A
+// symbol outside it means the trace and the driver drifted, and saying
+// so at LOAD is what keeps a drift from becoming a wrong number.
+void gemma4_validate_stated_kernels(const pie_forward::ForwardPlan& plan);
+
+// Every weight the plan NAMES must resolve against the bound set. Returns
+// an empty string when it does, else the reason — a plan that fails this
+// declines, where an unbound weight found at the first fire would fail
+// the model load instead.
+std::string gemma4_validate_stated_weights(
+    const pie_forward::ForwardPlan& plan, const Gemma4Weights& w);
+
+}  // namespace pie_cuda_driver::model

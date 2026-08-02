@@ -122,6 +122,7 @@ fn committed_incs_are_regeneration_clean() {
                 moe_shared_gate_dot: false,
                 moe_streamed_experts: false,
                 moe_force_general: false,
+                gate_up_fused: true,
             },
             "qwen3_5_0_8b",
         ),

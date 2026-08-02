@@ -349,7 +349,11 @@ void gemm_act_x_wt_bias_bf16(
     cublasHandle_t handle,
     const void* act, const void* W, const void* bias, void* y,
     int M, int N, int K,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    // `beta = 1` accumulates into `y`, which is what a projection writing
+    // straight into a residual wants. The GEMV epilogue folds it next to the
+    // bias, so asking for both costs no more launches than asking for either.
+    float beta = 0.f);
 
 // Same math as `gemm_act_x_wt_bf16`, but bypasses the cuBLASLt BF16
 // dispatcher. This is useful for a few skinny-M packed projections where

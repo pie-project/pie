@@ -365,10 +365,18 @@ fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
         .and_then(|a| a.first())
         .and_then(|a| a.as_str())
         .ok_or_else(|| anyhow!("`architectures[0]` missing from {path:?}"))?;
-    // "Qwen3ForCausalLM" → "qwen3" — same heuristic the Python wrapper used.
+    // "Qwen3ForCausalLM" → "qwen3" — same heuristic the Python wrapper used,
+    // and the same one `driver/metal`'s `arch_stem` applies. The task suffix
+    // is what comes off: a multimodal release is named
+    // `<Stem>ForConditionalGeneration`, and leaving that whole misses every
+    // registry keyed on the stem.
+    //
+    // The list is explicit rather than "cut at the first `for`" because
+    // `ReformerForCausalLM` has one inside its own stem.
     let raw_arch_lower = raw_arch.to_lowercase();
     let arch_name = raw_arch_lower
-        .strip_suffix("forcausallm")
+        .strip_suffix("forconditionalgeneration")
+        .or_else(|| raw_arch_lower.strip_suffix("forcausallm"))
         .unwrap_or(&raw_arch_lower)
         .to_string();
 
@@ -411,6 +419,14 @@ pub fn write_metal_startup_toml(
         "stream_routed_experts",
         options.stream_routed_experts,
     );
+    // Omitted when unset rather than written as 0: the driver reads an absent
+    // key as "the whole bank stays resident", which is the same statement.
+    if let Some(bytes) = options.expert_slab_bytes {
+        model.insert(
+            "expert_slab_bytes".into(),
+            toml::Value::Integer(bytes as i64),
+        );
+    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -432,6 +448,12 @@ pub fn write_metal_startup_toml(
         "kv_cache_dtype",
         options.kv_cache_dtype.clone(),
     );
+    // Omitted when unset rather than written as 0: the driver reads absent and
+    // zero the same way, and a config that does not mention the knob is the
+    // honest record of a run that did not use it.
+    if let Some(len) = options.max_model_len {
+        insert_int(&mut batching, "max_model_len", len);
+    }
     insert_table(&mut doc, "batching", batching);
 
     let mut runtime = toml::Table::new();
@@ -1343,6 +1365,45 @@ calibrate_planner = true
             val["model"]["stream_routed_experts"].as_bool().unwrap(),
             true,
             "the operator asked for streaming and the driver never heard about it"
+        );
+    }
+
+    /// The bounded form of the same trade has to reach the driver too, and it
+    /// is the one whose absence is hardest to notice: `expert_slab_bytes` is
+    /// the only setting under which a checkpoint larger than the machine can
+    /// be admitted, the C++ has read it since the slab landed, and no operator
+    /// could say it -- it was reachable only from a test binary's environment.
+    /// A model that does not fit then refuses to load with a message about
+    /// arithmetic rather than about the switch that would have helped.
+    ///
+    /// Omitted and not zeroed when unset, because the driver already reads an
+    /// absent key as "keep the whole bank resident".
+    #[test]
+    fn metal_startup_toml_carries_expert_slab_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("snap");
+
+        let mut off = MetalDriverOptions::default();
+        off.device = "metal:0".to_string();
+        let out_off = tmp.path().join("off.toml");
+        write_metal_startup_toml(&out_off, &off, &snap, 0, DESCRIPTOR).unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_off).unwrap()).unwrap();
+        assert!(
+            val["model"].get("expert_slab_bytes").is_none(),
+            "an unset budget is an absent key, not a zero: the driver's own \
+             default is already the derivation"
+        );
+
+        let mut on = MetalDriverOptions::default();
+        on.device = "metal:0".to_string();
+        on.expert_slab_bytes = Some(2048 * 1024 * 1024);
+        let out_on = tmp.path().join("on.toml");
+        write_metal_startup_toml(&out_on, &on, &snap, 0, DESCRIPTOR).unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out_on).unwrap()).unwrap();
+        assert_eq!(
+            val["model"]["expert_slab_bytes"].as_integer().unwrap(),
+            2048 * 1024 * 1024,
+            "the operator capped the expert bank and the driver never heard about it"
         );
     }
 

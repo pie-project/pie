@@ -23,7 +23,14 @@ pub fn author_gemma4(b: &mut Builder<'_>) -> Result<(), Error> {
     // The dense tail, stated rather than bundled: a family's contract is
     // its pass sequence, and hiding three of them behind a helper meant
     // six families' contracts could not be read where they live.
-    b.fused_moe_gate_up_tp_slices(false)?;
+    //
+    // The MoE decode runs through flashinfer's CUTLASS grouped GEMM, which
+    // reads fc1's output as [linear|gate]; the checkpoint stores [gate|up].
+    // `gemma4_moe_gate_up_swapped()` on the forward side is this same
+    // constant, and the two have to agree -- flipping one alone swaps gate
+    // and up inside every expert, silently and without a shape error.
+    const GATE_SECOND: bool = true;
+    b.fused_moe_gate_up_tp_slices(GATE_SECOND)?;
     b.dense_fused_projection_joins()?;
     b.publish_remaining()
 }

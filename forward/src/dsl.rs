@@ -1569,6 +1569,323 @@ pub mod cuda {
         .expect("fused post produces q")
     }
 
+    // ── gemma-4 ────────────────────────────────────────────────────
+    //
+    // The vocabulary the third family needs and the first two did not.
+    // Every one of these is a kernel the hand-written `gemma4.cpp`
+    // already fires; what is new is that a declaration can name it.
+
+    /// `kernels::launch_{chunked_,}geglu_tanh_bf16`: gemma-4's MLP
+    /// activation. `gelu_pytorch_tanh` on the gate, not SiLU — a
+    /// different function, so a different kernel, and NOT a variant of
+    /// [`swiglu`].
+    ///
+    /// `packed` splits the same way swiglu's does: a bound gate‖up bank
+    /// lands one buffer and takes the chunked form. gemma-4 states the
+    /// binding as a fact for the same reason llama_like does.
+    pub fn geglu_tanh(x: &Val, intermediate: u32, packed: bool) -> Val {
+        record(
+            &x.t,
+            x.layer,
+            if packed {
+                "launch_chunked_geglu_tanh_bf16"
+            } else {
+                "launch_geglu_tanh_bf16"
+            },
+            vec![],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `kernels::launch_geglu_tanh_bf16` in its PAIR form: the gate and
+    /// the up operand are two buffers, not one packed bank.
+    ///
+    /// gemma-4's PLE epilogue needs it even on a checkpoint that bound a
+    /// packed MLP bank, because the "up" operand there is the layer's
+    /// slice of the per-layer table — a buffer that was never going to
+    /// be adjacent to the gate. Same kernel as [`geglu_tanh`]'s unpacked
+    /// arm; a different statement because the OPERANDS differ, which is
+    /// what a reader needs to see.
+    pub fn geglu_tanh_pair(gate: &Val, up: &Val, width: u32) -> Val {
+        record(
+            &gate.t,
+            gate.layer,
+            "launch_geglu_tanh_bf16",
+            vec![],
+            None,
+            vec![gate.id, up.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
+        )
+        .expect("the activation produces its value")
+    }
+
+    /// `kernels::launch_rope_partial_bf16` rotating Q ALONE.
+    ///
+    /// A KV-shared layer's K was rotated at its SOURCE layer, where it
+    /// was written to the cache, so rotating it again here would be
+    /// wrong twice over — the value is not even in this layer's
+    /// registers. The driver says that with `num_kv_heads = 0`; the
+    /// trace says it by the statement having ONE operand.
+    ///
+    /// The semantic [`super::rope`] cannot: its shape is a (q, k) pair,
+    /// and a pair with an empty slot is a different statement, not a
+    /// degenerate one.
+    pub fn rope_partial_q_only(q: &Val) -> Val {
+        let out = (q.t.inner.borrow().value_shape(q.id), DType::BF16);
+        record(
+            &q.t,
+            q.layer,
+            "launch_rope_partial_bf16",
+            vec![],
+            None,
+            vec![q.id],
+            Some(out),
+        )
+        .expect("the rotation produces its value")
+    }
+
+    /// [`qk_rmsnorm_rope_rounded`] with K absent — the SHARED sliding
+    /// layer's form.
+    ///
+    /// Same symbol, and that is the point: the driver reaches this by
+    /// passing `k_norm = nullptr` and `num_kv_heads = 0` to the very
+    /// same launcher, so a declaration that spelled it as a rope plus a
+    /// separate norm would be naming a pair of kernels the pass never
+    /// fires. One operand, one weight, one launch.
+    pub fn qk_rmsnorm_rope_rounded_q_only(q: &Val, q_norm: &NormW) -> Val {
+        let out = (q.t.inner.borrow().value_shape(q.id), DType::BF16);
+        record(
+            &q.t,
+            q_norm.layer,
+            "launch_qk_rmsnorm_rope_bf16_rounded",
+            vec![q_norm.name.clone()],
+            None,
+            vec![q.id],
+            Some(out),
+        )
+        .expect("the fused pair produces q")
+    }
+
+    /// `kernels::launch_rmsnorm_no_scale_bf16`: `v / rms(v)` per head,
+    /// with NO learnable weight — gemma-4's V-norm.
+    ///
+    /// Weightless, so it takes no [`NormW`]: a norm handle contributes a
+    /// name and a layer, and this kernel reads neither. That is also why
+    /// it cannot be the semantic `Rmsnorm` with a variant — there is no
+    /// gamma for a variant to describe.
+    pub fn rmsnorm_no_scale(x: &Val) -> Val {
+        let out = (x.t.inner.borrow().value_shape(x.id), DType::BF16);
+        record(
+            &x.t,
+            x.layer,
+            "launch_rmsnorm_no_scale_bf16",
+            vec![],
+            None,
+            vec![x.id],
+            Some(out),
+        )
+        .expect("the norm produces its value")
+    }
+
+    /// `kernels::launch_rmsnorm_residual_add_scale_rmsnorm_bf16`: FOUR
+    /// statements in one launch — norm `x`, add it to the stream, scale
+    /// the result, then norm THAT with the next weight.
+    ///
+    /// The last of those four is the next block's input norm, which is
+    /// why gemma-4's per-layer body appears to be missing one: the fused
+    /// kernel already produced it. A declaration that named the four
+    /// separately would be naming a shape the driver does not run.
+    ///
+    /// Returns `(hidden, norm_out)` — the landed residual and the norm
+    /// the next block consumes.
+    pub fn norm_residual_scale_norm(
+        x: &Val,
+        w: &NormW,
+        next: &NormW,
+        hidden: u32,
+    ) -> (Val, Val) {
+        let shape = (Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16);
+        let ids = x.t.with(w.layer, |b| {
+            b.launch(
+                "launch_rmsnorm_residual_add_scale_rmsnorm_bf16",
+                vec![w.name.clone(), next.name.clone()],
+                None,
+                vec![x.id],
+                vec![shape.clone(), shape],
+            )
+        });
+        let mk = |id| Val {
+            t: x.t.clone(),
+            id,
+            layer: w.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kernels::launch_rmsnorm_residual_add_bf16`: the two-statement
+    /// form — norm, then land on the stream. gemma-4's
+    /// post-feedforward norm, where no next-block norm follows to fuse.
+    pub fn norm_residual_add(x: &Val, w: &NormW, hidden: u32) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "launch_rmsnorm_residual_add_bf16",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
+        )
+        .expect("the fused norm+residual produces its value")
+    }
+
+    /// `kernels::launch_scalar_mul_bf16`: multiply by a load-time
+    /// constant, NAMED.
+    ///
+    /// gemma-4 fires this four times per fire with four different
+    /// constants — `sqrt(hidden)` on the embedding, then
+    /// `sqrt(ple_dim)`, `1/sqrt(hidden)` and `1/sqrt(2)` through the PLE
+    /// prologue. All four are derived from dims, so none is an operand;
+    /// but a statement that did not say WHICH would leave an executor
+    /// with four identical launches and no way to tell them apart. This
+    /// was written without the name first, and writing the arm is what
+    /// found it.
+    ///
+    /// The name rides the weight slot because that is what a name slot
+    /// is: `scale.` marks it as a constant rather than a tensor, so a
+    /// binder never looks for it.
+    pub fn scalar_mul(x: &Val, scale: &str) -> Val {
+        let out = (x.t.inner.borrow().value_shape(x.id), DType::BF16);
+        record(
+            &x.t,
+            x.layer,
+            "launch_scalar_mul_bf16",
+            vec![format!("scale.{scale}")],
+            None,
+            vec![x.id],
+            Some(out),
+        )
+        .expect("the scale produces its value")
+    }
+
+    /// `kernels::launch_logit_softcap_bf16`: `cap * tanh(x / cap)` over
+    /// the logits. A load-time fact decides whether it runs at all
+    /// (`final_logit_softcapping`), so its presence is a trace-time
+    /// match, not a branch.
+    pub fn logit_softcap(x: &Val, vocab: u32) -> Val {
+        record(
+            &x.t,
+            None,
+            "launch_logit_softcap_bf16",
+            vec![],
+            None,
+            vec![x.id],
+            Some((Shape(vec![Dim::Requests, Dim::Const(vocab)]), DType::BF16)),
+        )
+        .expect("the softcap produces its value")
+    }
+
+    /// `kernels::launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16`:
+    /// gemma-4's decode post — split the packed projection, norm q and
+    /// k, rope them, norm v, and write k/v straight to the pages. One
+    /// launch, six statements, and the only value that survives it is q.
+    ///
+    /// Its eligibility is a per-FIRE question in the hand-written pass
+    /// (`hooks == nullptr && !partial && !dump && native bf16 && a
+    /// decode path`), and the terms split cleanly: `partial` and the
+    /// cache format are load-time, hooks and the fire class are the
+    /// declaration's own class/guard vocabulary. So a class trace states
+    /// it or does not, and nothing reads a workspace to decide.
+    ///
+    /// Writes through the KV pages, so it carries the layer's cache
+    /// state the way every write-side statement here does.
+    pub fn qkv_packed_post(
+        packed: &Val,
+        q_norm: &NormW,
+        k_norm: &NormW,
+        kv: &Kv,
+        q_width: u32,
+    ) -> Val {
+        record(
+            &packed.t,
+            q_norm.layer,
+            "launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16",
+            vec![q_norm.name.clone(), k_norm.name.clone()],
+            kv_state(kv),
+            vec![packed.id],
+            Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
+        )
+        .expect("the fused post produces q")
+    }
+
+    /// `kernels::launch_qk_rmsnorm_rope_bf16_rounded`: the per-head q/k
+    /// norm + rope pair, in the ROUNDED form.
+    ///
+    /// gemma-4 rounds where qwen3_5 does not, and bf16 rounding is not
+    /// an implementation detail between two kernels that compute the
+    /// same function — it is which numbers come out. So the symbol is
+    /// the statement, and a family states the one its hand-written pass
+    /// fires. In place on q and k; SSA-wise two fresh values.
+    pub fn qk_rmsnorm_rope_rounded(
+        q: &Val,
+        k: &Val,
+        q_norm: &NormW,
+        k_norm: &NormW,
+    ) -> (Val, Val) {
+        let shapes = {
+            let b = q.t.inner.borrow();
+            vec![
+                (b.value_shape(q.id), DType::BF16),
+                (b.value_shape(k.id), DType::BF16),
+            ]
+        };
+        let ids = q.t.with(q_norm.layer, |b| {
+            b.launch(
+                "launch_qk_rmsnorm_rope_bf16_rounded",
+                vec![q_norm.name.clone(), k_norm.name.clone()],
+                None,
+                vec![q.id, k.id],
+                shapes,
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q_norm.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kernels::launch_transpose_bf16_nld_to_lnd`: relay the PLE table
+    /// from `[N, L, D]` to `[L, N, D]` so each layer reads a CONTIGUOUS
+    /// slice.
+    ///
+    /// The whole point of the statement is addressing, not arithmetic —
+    /// it replaces a per-layer slice-pack kernel with one relay per
+    /// fire, which is the driver's own comment at the call site. The
+    /// output's leading dim is the LAYER count, a load-time constant, so
+    /// the shape is `[Const(layers), Tokens, Const(dim)]`.
+    pub fn transpose_nld_to_lnd(x: &Val, layers: u32, dim: u32) -> Val {
+        record(
+            &x.t,
+            None,
+            "launch_transpose_bf16_nld_to_lnd",
+            vec![],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Const(layers), Dim::Tokens, Dim::Const(dim)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the relay produces its value")
+    }
+
     /// `kernels::launch_topk_softmax_bf16`: the router's top-k + softmax +
     /// renormalize, one launch, two results — expert indices
     /// (`[Tokens, k]` i32, the `dyn` value every expert-indexed statement
@@ -1878,6 +2195,303 @@ pub mod cuda {
         attn_at(q, kv, "dispatch_attention_flashinfer_prefill_bf16")
     }
 
+    /// `ops::launch_attention_flashinfer_prefill` — the PLAN-FREE
+    /// prefill wrapper, which builds its own R-shaped plan from the host
+    /// indptrs on the way in.
+    ///
+    /// A DIFFERENT statement from [`attention_flashinfer_prefill`], not
+    /// a spelling of it: that one names the dispatch alone and its
+    /// caller owes it a plan, while this one owes nothing and cannot be
+    /// given a row window (the plan it builds spans all R requests).
+    /// gemma-4's prefill fires this; llama_like's fires the other. The
+    /// two are one call apart in C++ and a whole contract apart here,
+    /// which is why the table carries both.
+    pub fn attention_flashinfer_prefill_planless(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "ops::launch_attention_flashinfer_prefill")
+    }
+
+    /// `ops::dispatch_attention_flashinfer_decode` asked for its LSE.
+    ///
+    /// The SAME symbol as [`attention_flashinfer_decode`] and a
+    /// different call: `lse_out` is the last positional argument of
+    /// every flashinfer entry point, and the driver passes it only on
+    /// layers that carry attention sinks (`layer.attn_sinks != nullptr`,
+    /// a load-time per-layer answer). Supplying it costs a per-layer
+    /// write, which is why plain Mixtral layers do not — so whether this
+    /// statement or the one-value one runs is a FACT, not a branch.
+    ///
+    /// Produces `(o, lse)`. The LSE is fp32 `[Tokens, q_heads]`, and it
+    /// exists so [`attention_sink_rescale`] can apply the
+    /// softmax-denominator extension flashinfer's DefaultAttention does
+    /// not emit natively.
+    pub fn attention_flashinfer_decode_lse(q: &Val, kv: &Kv, q_heads: u32) -> (Val, Val) {
+        let shape = q.t.inner.borrow().value_shape(q.id);
+        let ids = q.t.with(Some(kv.l), |b| {
+            b.launch(
+                "dispatch_attention_flashinfer_decode",
+                vec![],
+                kv_state(kv),
+                vec![q.id],
+                vec![
+                    (shape, DType::BF16),
+                    (Shape(vec![Dim::Tokens, Dim::Const(q_heads)]), DType::F32),
+                ],
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kernels::launch_rope_yarn_original_bf16`: the YaRN-paper rope —
+    /// a dim-index ramp between interpolated and extrapolated
+    /// frequencies, plus an `attention_factor` magnitude scale.
+    ///
+    /// A different KERNEL from the plain rope, not a parameterisation:
+    /// which one a deployment fires is decided by its config at load and
+    /// erases here. The semantic [`super::rope`] carries a `RopeKind`
+    /// the lowering refuses for anything but Standard, so a family that
+    /// scales says so by naming the launcher.
+    pub fn rope_yarn_original(q: &Val, k: &Val) -> (Val, Val) {
+        let (q_sh, k_sh) = {
+            let b = q.t.inner.borrow();
+            (b.value_shape(q.id), b.value_shape(k.id))
+        };
+        let ids = q.t.with(q.layer, |b| {
+            b.launch(
+                "launch_rope_yarn_original_bf16",
+                vec![],
+                None,
+                vec![q.id, k.id],
+                vec![(q_sh, DType::BF16), (k_sh, DType::BF16)],
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `ops::gemm_act_x_wt_bias_bf16`: a projection whose BIAS RIDES IN
+    /// THE EPILOGUE.
+    ///
+    /// Not a `matmul` plus an [`super::add_bias`]. At decode this routes
+    /// to the warp-per-row GEMV, whose epilogue absorbs the bias for
+    /// free — so the folded form is one launch where the split form is
+    /// two, and the two do not accumulate in the same order. A family
+    /// whose driver folds must say so: mixtral folds q/k/v and the
+    /// router, and adds `o_bias` separately, which is why gpt-oss's text
+    /// uses both spellings and neither by default.
+    pub fn gemm_bias(x: &Val, w: &MatW, bias: &MatW) -> Val {
+        record(
+            &x.t,
+            w.layer,
+            "ops::gemm_act_x_wt_bias_bf16",
+            vec![w.name.clone(), bias.name.clone()],
+            None,
+            vec![x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(w.width)]),
+                DType::BF16,
+            )),
+        )
+        .expect("a biased projection produces its value")
+    }
+
+    /// `ops::launch_attention_flashinfer_prefill` asked for its LSE —
+    /// the prefill twin of [`attention_flashinfer_decode_lse`], and the
+    /// same argument makes the difference.
+    pub fn attention_flashinfer_prefill_lse(q: &Val, kv: &Kv, q_heads: u32) -> (Val, Val) {
+        let shape = q.t.inner.borrow().value_shape(q.id);
+        let ids = q.t.with(Some(kv.l), |b| {
+            b.launch(
+                "ops::launch_attention_flashinfer_prefill",
+                vec![],
+                kv_state(kv),
+                vec![q.id],
+                vec![
+                    (shape, DType::BF16),
+                    (Shape(vec![Dim::Tokens, Dim::Const(q_heads)]), DType::F32),
+                ],
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kernels::launch_attention_sink_rescale_bf16`: `o *= sigmoid(lse
+    /// - sink_h)`, in place, per (token, head).
+    ///
+    /// gpt-oss learns a per-head SINK logit that participates in the
+    /// softmax denominator without contributing a value — so the whole
+    /// effect is a rescale of the attention output by how much
+    /// probability mass the sink would have taken. The sink weight is
+    /// `[q_heads]`, which is why it rides in the weight slot.
+    pub fn attention_sink_rescale(o: &Val, lse: &Val, sinks: &MatW) -> Val {
+        let shape = o.t.inner.borrow().value_shape(o.id);
+        record(
+            &o.t,
+            sinks.layer,
+            "launch_attention_sink_rescale_bf16",
+            vec![sinks.name.clone()],
+            None,
+            vec![o.id, lse.id],
+            Some((shape, DType::BF16)),
+        )
+        .expect("the sink rescale produces its value")
+    }
+
+    /// `kernels::launch_bf16_to_fp16`: the activation cast the MXFP4
+    /// routed GEMVs want on their input.
+    ///
+    /// A statement rather than an implementation detail of the GEMV
+    /// because it is its own launch over its own extent — and because
+    /// the routed leg casts TWICE, once on the block input and once on
+    /// the post-activation routes, over different extents.
+    pub fn bf16_to_fp16(x: &Val) -> Val {
+        let shape = x.t.inner.borrow().value_shape(x.id);
+        record(
+            &x.t,
+            x.layer,
+            "launch_bf16_to_fp16",
+            vec![],
+            None,
+            vec![x.id],
+            Some((shape, DType::F16)),
+        )
+        .expect("the cast produces its value")
+    }
+
+    /// `kernels::launch_mxfp4_moe_gate_up_decode_bf16`: BOTH routed
+    /// projections of gpt-oss's fused decode leg, in one launch,
+    /// reading the packed 4-bit nibbles straight out of HBM.
+    ///
+    /// The weight slot names the layer's per-expert POINTER BANK, not a
+    /// tensor: the kernel indexes experts through a device array of
+    /// pointers plus a parallel scale array. That indirection is a
+    /// BINDING — the executor resolves the name to whatever the layer
+    /// holds, exactly as [`moe_fused_cutlass`] resolves its two banks —
+    /// so it is not the obstacle it looks like. What would be an
+    /// obstacle is the host-routed walk this leg replaces: its launch
+    /// count depends on which experts the router picked, and no
+    /// rectangle spells that.
+    ///
+    /// Produces `(gate, up)`, each `[Tokens, k, intermediate]` — the
+    /// routed extent as a third dim, [`moe_gate_up_gemv`]'s convention.
+    pub fn mxfp4_moe_gate_up_decode(
+        x: &Val,
+        experts: &Val,
+        bank: &MatW,
+        top_k: u32,
+        intermediate: u32,
+    ) -> (Val, Val) {
+        let shape = || {
+            (
+                Shape(vec![
+                    Dim::Tokens,
+                    Dim::Const(top_k),
+                    Dim::Const(intermediate),
+                ]),
+                DType::BF16,
+            )
+        };
+        let ids = x.t.with(bank.layer, |b| {
+            b.launch(
+                "launch_mxfp4_moe_gate_up_decode_bf16",
+                vec![bank.name.clone()],
+                None,
+                vec![experts.id, x.id],
+                vec![shape(), shape()],
+            )
+        });
+        let mk = |id| Val {
+            t: x.t.clone(),
+            id,
+            layer: bank.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
+    /// `kernels::launch_mxfp4_moe_down_decode_bf16`: the routed down
+    /// projection, the same bank convention as
+    /// [`mxfp4_moe_gate_up_decode`].
+    pub fn mxfp4_moe_down_decode(
+        x: &Val,
+        experts: &Val,
+        bank: &MatW,
+        top_k: u32,
+        hidden: u32,
+    ) -> Val {
+        record(
+            &x.t,
+            bank.layer,
+            "launch_mxfp4_moe_down_decode_bf16",
+            vec![bank.name.clone()],
+            None,
+            vec![experts.id, x.id],
+            Some((
+                Shape(vec![Dim::Tokens, Dim::Const(top_k), Dim::Const(hidden)]),
+                DType::BF16,
+            )),
+        )
+        .expect("the routed down projection produces its value")
+    }
+
+    /// `kernels::launch_gpt_oss_glu_bf16`: SwiGLU with gpt-oss's CLAMP.
+    ///
+    /// A different kernel from [`swiglu`], not a parameterisation of it:
+    /// `swiglu_limit` is a config constant, so which of the two runs is
+    /// decided at load and erases here. Reading it as a runtime scalar
+    /// would put a branch in every fire for an answer that never
+    /// changes.
+    /// Its extent is the ROUTED one — `[Tokens, k, intermediate]`, the
+    /// shape of the operands it consumes, not `[Tokens, intermediate]`.
+    /// Declaring the collapsed shape made the two `bf16_to_fp16` sites
+    /// indistinguishable to anything reading the trace, and the second
+    /// one re-cast the block input while the routed activations were
+    /// never written — a live defect the ledger, the golden and the
+    /// registry all passed.
+    pub fn gpt_oss_glu(gate: &Val, up: &Val, top_k: u32, intermediate: u32) -> Val {
+        record(
+            &gate.t,
+            gate.layer,
+            "launch_gpt_oss_glu_bf16",
+            vec![],
+            None,
+            vec![gate.id, up.id],
+            Some((
+                Shape(vec![
+                    Dim::Tokens,
+                    Dim::Const(top_k),
+                    Dim::Const(intermediate),
+                ]),
+                DType::BF16,
+            )),
+        )
+        .expect("the clamped GLU produces its value")
+    }
+
+    /// `ops::launch_attention_naive_paged` — the fallback prefill for a
+    /// head dim flashinfer's TC prefill template rejects.
+    ///
+    /// gemma-4's FULL-attention layers run at head_dim 512, and
+    /// flashinfer 0.6.x refuses to instantiate a prefill at
+    /// `NUM_MMA_D_QK=32`. So the deployment states a naive paged kernel
+    /// on exactly those layers — a per-layer HEAD DIM fact, erased at
+    /// trace time, not a runtime fallback the executor discovers.
+    pub fn attention_naive_paged(q: &Val, kv: &Kv) -> Option<Val> {
+        attn_at(q, kv, "ops::launch_attention_naive_paged")
+    }
+
     /// `kernels::launch_write_kv_explicit_bf16`: the explicit-descriptor
     /// KV write (graph-replay steering; N cells, one per query token).
     /// Stated inside the `HasWriteDesc` guard's then-region.
@@ -1981,7 +2595,7 @@ pub mod cuda {
         }
     }
 
-    /// `kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled[_gqa][_state_bf16]`:
+    /// `kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa[_state_bf16]`:
     /// the warp-tiled small-N prefill recurrence. NOT a value producer:
     /// the three prefill recurrence signatures record launches with NO
     /// outputs, because each runs inside a value-producing guard chain
@@ -1996,14 +2610,18 @@ pub mod cuda {
         g: &Val,
         beta: &Val,
         rs: &Rs,
-        gqa: bool,
         state_bf16: bool,
     ) {
-        let kernel = match (gqa, state_bf16) {
-            (true, true) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
-            (true, false) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa",
-            (false, true) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
-            (false, false) => "launch_chunk_gated_delta_prefill_batched_warp_tiled",
+        // ONE arm per state dtype, and nothing else to choose. The GQA
+        // kernel's `repeat` is 1 when `K_h == V_h`, its `qk_h` is `h`, and
+        // its index reduces to the non-GQA one exactly — so that pair was
+        // a second copy of the same arithmetic and upstream deleted it.
+        // Keeping a statement for a symbol the driver no longer exports
+        // would be a declaration that cannot load.
+        let kernel = if state_bf16 {
+            "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16"
+        } else {
+            "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa"
         };
         gdn_prefill(q, k, v, g, beta, rs, kernel);
     }

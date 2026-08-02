@@ -213,15 +213,29 @@ inline constexpr std::uint64_t kRsSlotBudgetBytes = 1536ull << 20;
 /// the whole point. Kept beside the slot count it feeds.
 std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g);
 
+/// The recurrent-state budget for THIS device: the constant above, or a tenth
+/// of the device's recommended working set, whichever is larger.
+///
+/// A fleet constant chosen on a 32 GiB M1 Max buys nine slots of Qwen3.6-27B's
+/// 170 MiB state, and the slot count is a hard concurrency ceiling -- the tenth
+/// request fails the planner with "every RS folded slot is held" rather than
+/// queueing. A 48 GiB M4 Pro has the memory for twenty-two and no way to say
+/// so. A tenth of the recommended working set leaves the M1 Max where the
+/// constant put it and gives the M4 Pro 3.74 GiB.
+std::uint64_t rs_slot_budget_bytes();
+
 /// How many slots to reserve: as many as the budget buys, never more than
-/// `kPhase1bRsSlots` and never fewer than `floor_slots`.
+/// `kPhase1bRsSlots`, and never more than `requested_slots`.
+///
+/// `requested_slots` is a CEILING. It used to be a floor, which made
+/// `budget_bytes` decorative -- see the definition for what that cost.
 ///
 /// ONE function, called by the capabilities pass and by setup, because a
 /// capability advertising more slots than setup allocates is a request the
 /// driver accepts and cannot hold -- the same rule, and the same reason, as
 /// `simple_family_max_forward_tokens`.
 std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
-                                  std::uint32_t floor_slots);
+                                  std::uint32_t requested_slots);
 
 // Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
 // linear ring, not a per-request allocation, so the whole fleet shares it. At
@@ -514,6 +528,16 @@ struct SetupConfig {
         int mlp_only_layer_count = 0;
         float eps = 1e-6f;
         bool tied_embeddings = true;
+        /// `norm_topk_prob`, defaulting to renormalized-over-the-selected.
+        ///
+        /// mlx-lm's `qwen3_next.ModelArgs` declares `norm_topk_prob: bool =
+        /// False`, which reads like this default is wrong for a checkpoint --
+        /// Qwen3.6-35B-A3B -- whose config omits the field. It is not: the
+        /// model mlx-lm actually loads for that checkpoint comes back with
+        /// `norm_topk_prob True` on every layer, and the taps agree. Flipping
+        /// the default here moved the last layer's residual from cosine 0.982
+        /// to 0.862 against mlx-lm and was reverted. Left written down because
+        /// the declaration is genuinely misleading.
         bool norm_topk_prob = true;
         bool present() const { return n_layers > 0 && hidden > 0; }
     } qwen35;
@@ -742,6 +766,11 @@ class MetalExecutor {
     // recurrent state per GDN layer (heap_layout.hpp `plan_heap`); caps
     // reports exactly this value, never a larger, unsupported one.
     std::uint32_t rs_slots() const;
+    /// The widest fire this setup will accept.  A caller with a longer prompt
+    /// must split it, the way the scheduler does: the paged families cap a
+    /// forward at `kPagedMaxForwardTokensCeiling` regardless of what the
+    /// config asked for, and hitting that cap is a refusal, not a queue.
+    std::uint32_t max_forward_tokens() const;
     std::uint64_t rs_slot_bytes() const;
     std::uint64_t elastic_page_bytes() const;
     std::uint64_t elastic_budget_pages() const;

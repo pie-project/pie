@@ -222,7 +222,26 @@ inline bool current_device_supports_pdl() {
     return current_device_major() >= 9;
 }
 
-constexpr bool force_split_kv_small_enabled() { return false; }
+// Whether to let FlashInfer's own work estimator decide split-kv at the small
+// batch sizes the override below otherwise forces to non-split.
+//
+// Off, and the measurement says it has to stay off: the override is what makes
+// the decode schedule independent of KV length, which is what lets
+// `can_use_static_nonsplit_decode_plan` reuse one plan for every fire. Turn it
+// on and the full FlashInfer planner runs per decoded token -- gemma-4-26B-A4B
+// at 1k context goes from 22 s for 256 tokens to over 2400 s, a hundredfold,
+// because the host planning dwarfs whatever the split buys the kernel.
+//
+// This is not an argument that non-split is optimal. At R=1 the unsplit grid
+// is batch_size * num_kv_heads = 8 CTAs on 132 SMs, and gemma-4's decode
+// attention measures ~50x off its KV-bandwidth roofline because of it. The
+// argument is that the fix has to keep the plan static -- a precomputed split
+// factor folded into the cached plan -- not hand planning back to the caller.
+inline bool force_split_kv_small_enabled() {
+    static const bool on =
+        std::getenv("PIE_CUDA_FORCE_SPLIT_KV_SMALL") != nullptr;
+    return on;
+}
 
 constexpr bool static_nonsplit_decode_plan_enabled() { return true; }
 
@@ -308,6 +327,13 @@ struct DecodePlanCache {
     // attention without a replan. Under any other plan the arrays ARE derived
     // from page counts, and substituting a shorter list is silently wrong.
     bool page_count_independent = false;
+    // Byte offset of this plan's descriptor inside the SHARED int workspace.
+    // Every planner otherwise carves from offset 0, which is safe only while
+    // the live plans hold identical bytes -- and two plans over different
+    // REQUEST COUNTS never do, because the field offsets are derived from that
+    // count. A caller holding two plans at once sets this to keep them apart,
+    // the way the sm90 wrapper takes `int_base_bytes`.
+    std::size_t int_base_bytes = 0;
     int static_nonsplit_num_requests = 0;
     std::vector<IdType> static_request_indices;
     std::vector<IdType> static_kv_tile_indices;
@@ -373,7 +399,8 @@ struct AttnHd {
         int window_left,
         float logits_soft_cap,
         float sm_scale,
-        float* lse_out);
+        float* lse_out,
+        bool broadcast_q = false);
 
     /// Score-observing decode. Same kernel, same plan, plus a
     /// `[num_qo_heads, kv_len]` per-request score row written through the
@@ -440,7 +467,10 @@ private:
         float logits_soft_cap,
         float sm_scale,
         float* lse_out,
-        const DecodeScoreSink* sink = nullptr);
+        const DecodeScoreSink* sink = nullptr,
+        // Every request reads the same Q row: the KV split issues one query
+        // against several page slices, so only the input is shared.
+        bool broadcast_q = false);
 };
 
 // ── AttnHd definitions ─────────────────────────────────────────────────────
@@ -514,7 +544,8 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
     float logits_soft_cap,
     float sm_scale,
     float* lse_out,
-    const DecodeScoreSink* sink)
+    const DecodeScoreSink* sink,
+    bool broadcast_q)
 {
     ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
         static_cast<uint32_t>(cache.num_kv_heads),
@@ -536,7 +567,9 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
     params.lse = lse_out;
     params.maybe_alibi_slopes = nullptr;
     params.num_qo_heads = static_cast<uint32_t>(cache.num_q_heads);
-    params.q_stride_n = static_cast<IdType>(cache.num_q_heads * cache.head_dim);
+    params.q_stride_n = broadcast_q
+        ? IdType{0}
+        : static_cast<IdType>(cache.num_q_heads * cache.head_dim);
     params.q_stride_h = static_cast<IdType>(cache.head_dim);
     params.window_left = window_left;
     params.logits_soft_cap = logits_soft_cap;
@@ -563,7 +596,8 @@ cudaError_t AttnHd<HEAD_DIM>::run_decode(
         params.score_indptr = sink->indptr;
     }
 
-    void* int_buf = workspace.int_buffer();
+    void* int_buf = static_cast<std::uint8_t*>(workspace.int_buffer()) +
+                    cache.int_base_bytes;
     void* float_buf = workspace.float_buffer();
     params.request_indices    = offset_ptr<IdType>(int_buf, cache.plan_info.request_indices_offset);
     params.kv_tile_indices    = offset_ptr<IdType>(int_buf, cache.plan_info.kv_tile_indices_offset);
@@ -629,24 +663,28 @@ cudaError_t AttnHd<HEAD_DIM>::dispatch_decode(
     int window_left,
     float logits_soft_cap,
     float sm_scale,
-    float* lse_out)
+    float* lse_out,
+    bool broadcast_q)
 {
     if (cache.full_attention_variant && window_left < 0 && logits_soft_cap <= 0.f) {
-        return run_decode<AttnVariantFull>(
+        return run_decode<AttnVariantFull, DecodeParams>(
             cache, q, k_pages, v_pages, o,
             kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
+            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out,
+            /*sink=*/nullptr, broadcast_q);
     }
     if (logits_soft_cap > 0.f) {
-        return run_decode<AttnVariantSoftcap>(
+        return run_decode<AttnVariantSoftcap, DecodeParams>(
             cache, q, k_pages, v_pages, o,
             kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out);
+            workspace, stream, window_left, logits_soft_cap, sm_scale, lse_out,
+            /*sink=*/nullptr, broadcast_q);
     }
-    return run_decode<AttnVariant>(
+    return run_decode<AttnVariant, DecodeParams>(
         cache, q, k_pages, v_pages, o,
         kv_page_indices_d, kv_page_indptr_d, kv_last_page_lens_d,
-        workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale, lse_out);
+        workspace, stream, window_left, /*soft_cap=*/0.f, sm_scale, lse_out,
+        /*sink=*/nullptr, broadcast_q);
 }
 
 template <uint32_t HEAD_DIM>

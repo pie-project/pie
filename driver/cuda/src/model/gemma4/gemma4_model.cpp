@@ -33,11 +33,31 @@ Gemma4Model::Gemma4Model(
         has_audio_ = true;
     }
     caps_.supports_media_encode = has_vision_ || has_audio_;
-    caps_.graph_safe = kv_cache_.format().is_native_bf16();
+    // The MoE branch reads its routing table back to the host and loops the
+    // experts on the CPU for prefill, which cannot run inside a graph capture
+    // (`cudaErrorStreamCaptureUnsupported`). Pure decode -- the only shape the
+    // executor captures -- takes the on-device GEMV dispatch instead, so
+    // capture stays available; `gemma4_moe_block` is handed `is_pure_decode`
+    // and treats it as a hard requirement rather than a hint, which is what
+    // makes that claim true instead of hopeful.
+    const bool kv_capture_ok = kv_cache_.format().is_native_bf16();
+    caps_.graph_safe = kv_capture_ok;
     caps_.graph_padding_kv_write_safe = true;
     caps_.supports_compact_logits = true;
+    // Small-prefill capture would put the host-dispatched branch inside a
+    // capture, so it stays off for the MoE variants.
     caps_.supports_small_prefill_graph =
-        kv_cache_.format().is_native_bf16() && small_spec_graph_tokens > 0;
+        kv_capture_ok && !hf_config_.gemma4_enable_moe &&
+        small_spec_graph_tokens > 0;
+
+    // Trace and VALIDATE the declaration at load: a drift against the
+    // launcher registry, or a weight this checkpoint does not bind,
+    // becomes a load-time DECLINE rather than a wrong number. The
+    // drive is default-on now, so the decline has to be graceful.
+    if (gemma4_declared_forward_enabled()) {
+        declared_ = build_gemma4_declared_plan(hf_config_, weights_,
+                                               fwd_cfg_.tp_size);
+    }
 }
 
 void Gemma4Model::prepare(AttentionWorkspace& attn_ws,
@@ -84,6 +104,48 @@ void Gemma4Model::body(Workspace& ws,
         audio_in.n_mel                 = audio_raw_.n_mel;
         audio_in.num_clips             = in.num_clips;
         audio_in_ptr = &audio_in;
+    }
+    // A ragged fire whose every request is a SHORT block goes to the
+    // hand-written pass's row-decode path — speculative verification,
+    // which the declaration does not state. One request longer than the
+    // qmax is what makes `prepare_row_decode_kv_table` refuse, so it is
+    // what makes the plain prefill class the truthful reading of this
+    // fire. Any other reason that prepare refuses leaves us declining a
+    // fire the hand pass would have prefilled: a fallback, never a wrong
+    // number.
+    const bool row_decode_shaped = [&] {
+        if (in.is_pure_decode) return false;
+        if (in.qo_indptr_h == nullptr) return false;
+        const int qmax = gemma4_row_decode_qmax();
+        for (int r = 0; r < in.num_requests; ++r) {
+            const std::uint32_t len = in.qo_indptr_h[r + 1] - in.qo_indptr_h[r];
+            if (len > static_cast<std::uint32_t>(qmax)) return false;
+        }
+        return true;
+    }();
+
+    // The declared drive gets the fire first. It answers false for
+    // anything outside what the two classes state — a masked or hooked
+    // fire, a multimodal one, a row-decode-shaped one, a deployment
+    // whose PLE buffers or cache format do not match — and the
+    // hand-written pass runs it unchanged. Eligibility is an ANSWER, not
+    // an error.
+    const bool declared_eligible =
+        gemma4_declared_drive_enabled() && declared_.usable &&
+        !row_decode_shaped &&
+        in.custom_mask_d == nullptr && in.stage_hooks == nullptr &&
+        in.num_images == 0 && in.num_clips == 0 &&
+        in.precomputed_embeddings.num_blocks == 0 &&
+        fwd_cfg_.tp_size == 1;
+    if (declared_eligible &&
+        gemma4_forward_declared(
+            declared_, weights_, hf_config_, fwd_cfg_, ws, moe_ws_, kv,
+            attn_ws, cublas, in.token_ids, in.positions, in.qo_indptr_d,
+            in.kv_page_indices_d, in.kv_page_indptr_d, in.kv_last_page_lens_d,
+            in.qo_indptr_h, in.kv_page_indptr_h,
+            in.total_tokens, in.num_requests, in.is_pure_decode,
+            in.row_valid_d, in.logit_row_indices_d, in.num_logit_rows)) {
+        return;
     }
     gemma4_forward_paged(
         weights_, hf_config_, fwd_cfg_,

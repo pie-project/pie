@@ -47,7 +47,7 @@ struct GptOssPsos {
     Pso qmv_tail{};
     Pso qmv_tail_bias{};
     Pso qmv_routed_bias{};
-    Pso qmm_routed_bias[3]{};
+    Pso qmm_routed_bias[3][3]{};  // [tile width][bn]
     /// The router's matvec, at whatever width the checkpoint quantized it to.
     /// `mlx_lm`'s predicate usually keeps it at 8 bits while everything else
     /// goes to 4, but a uniformly-quantized checkpoint ships a 4-bit one. Same
@@ -65,6 +65,10 @@ struct GptOssPsos {
     /// The same attention against page-addressed KV, which is what lets several
     /// sequences be resident at once.
     Pso sdpa_sink_paged{};
+    /// The same attention again, a simdgroup per query row instead of a
+    /// threadgroup, with the keys staged once per thirty-two rows. Earned by
+    /// row count and request count together -- see `sdpa_should_tile`.
+    Pso sdpa_sink_paged_tiled{};
     /// YaRN, as a frequency table the host computed once.
     Pso rope_freqs{};
     /// The M>1 counterparts: the two kernels whose ROW indexing differs, rather

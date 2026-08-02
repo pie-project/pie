@@ -23,10 +23,10 @@ use std::path::PathBuf;
 
 use pie_forward::family::{
     llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
-    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
+    gemma4_cuda, gpt_oss_cuda, qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
 };
 use pie_forward::{
-    FireClass, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
+    FireClass, Gemma4CudaFacts, Gemma4Facts, ForwardPlan, GptOssCudaFacts, GptOssFacts, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
@@ -575,6 +575,78 @@ fn mistral_7b_v03_cuda_prefill() {
                 head_dim_padded: false,
                 gate_up_fused: true,
             },
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// gemma-4-E4B's decode reading — the third family's first golden.
+///
+/// Worth reading for three shapes no earlier golden has: the input norm
+/// appears ONCE (layer 0's; every other layer's arrives fused into the
+/// previous layer's PLE landing), the trailing 18 layers carry no k/v
+/// projection or cache write at all, and the two layer kinds differ by
+/// head WIDTH rather than by which statements run.
+#[test]
+fn gemma_4_e4b_cuda_decode() {
+    check_plan(
+        "gemma_4_e4b_cuda_decode",
+        &gemma4_cuda(
+            &Gemma4Facts::gemma_4_e4b(),
+            &Gemma4CudaFacts::gemma_4_e4b_synthetic(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+/// gemma-4-E4B's PREFILL reading. Identical to the decode golden save
+/// for the dispatch line, which is where the whole class difference
+/// lives: the fused qkv epilogue is decode-only (so every layer takes
+/// the unfused five), and the dispatch itself splits again on head
+/// WIDTH — the 512-wide full layers take a naive paged kernel that
+/// flashinfer's prefill template cannot be instantiated for.
+#[test]
+fn gemma_4_e4b_cuda_prefill() {
+    check_plan(
+        "gemma_4_e4b_cuda_prefill",
+        &gemma4_cuda(
+            &Gemma4Facts::gemma_4_e4b(),
+            &Gemma4CudaFacts::gemma_4_e4b_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// gpt-oss-20b's decode reading — the fourth family's first golden, and
+/// the first whose MoE block is stated end to end.
+///
+/// Worth reading for the sink pair (the attention statement produces two
+/// values, and the second is fp32 `[Tokens, q_heads]`) and for the
+/// routed leg's seven rectangles, whose two GEMVs carry the expert axis
+/// as a third dim rather than as a launch count.
+#[test]
+fn gpt_oss_20b_cuda_decode() {
+    check_plan(
+        "gpt_oss_20b_cuda_decode",
+        &gpt_oss_cuda(
+            &GptOssFacts::gpt_oss_20b(),
+            &GptOssCudaFacts::gpt_oss_20b_synthetic(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+/// gpt-oss's PREFILL reading. One statement apart from the decode golden
+/// — the dispatch — because the fused MXFP4 leg is admitted by ROUTES
+/// (`N * top_k <= max_routes`) and not by class, so a prefill under the
+/// cap runs the same seven rectangles the decode class does.
+#[test]
+fn gpt_oss_20b_cuda_prefill() {
+    check_plan(
+        "gpt_oss_20b_cuda_prefill",
+        &gpt_oss_cuda(
+            &GptOssFacts::gpt_oss_20b(),
+            &GptOssCudaFacts::gpt_oss_20b_synthetic(),
             FireClass::Prefill,
         ),
     );

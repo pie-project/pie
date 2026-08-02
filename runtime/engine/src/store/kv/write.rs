@@ -68,7 +68,8 @@ pub struct KvPreparedWrite {
     /// Start of the rebased tail region, when any committed page is CoW'd.
     pub(crate) cow_start: Option<u64>,
     /// Submission sequence stamped at prepare; fires complete in FIFO order,
-    /// so the finalizer may `retire_through(seq)` after commit/abort.
+    /// so the finalizer hands this back to `KvStore::settle` after
+    /// commit/abort and every recycle epoch it was gating retires.
     pub(crate) seq: u64,
 }
 

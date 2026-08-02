@@ -24,6 +24,13 @@ pub struct FleetRun {
     pub lane_latencies: Vec<Duration>,
     /// Wall time for the whole fleet, which is what throughput divides by.
     pub elapsed: Duration,
+    /// Why the failed lanes failed, in lane order, deduplicated by the caller.
+    ///
+    /// A count alone sends the reader to the wrong place. `pie config tune`
+    /// reported "64 of 64 lanes failed during warmup; is it in `pie inferlet
+    /// list`?" for a program that WAS in the list, because every step of a
+    /// lane discarded its error with `.ok()?` and only the count survived.
+    pub failures: Vec<String>,
 }
 
 impl FleetRun {
@@ -63,16 +70,28 @@ impl FleetRun {
 /// incidental — `scheduler::reconfigure` refuses while any guest is live,
 /// because `model.frame-size()` is cached for the life of a program. Rounds
 /// that reused guests could not change the knobs they exist to compare.
-async fn run_one(addr: &str, program: &str, input: &str) -> Option<Vec<i64>> {
+async fn run_one(addr: &str, program: &str, input: &str) -> Result<Vec<i64>, String> {
     let client = Client::connect_with_identity(&format!("ws://{addr}/v1/ws"), "pie-sweep")
         .await
-        .ok()?;
-    client.authenticate("pie-sweep", &None).await.ok()?;
+        .map_err(|e| format!("connect ws://{addr}/v1/ws: {e}"))?;
+    client
+        .authenticate("pie-sweep", &None)
+        .await
+        .map_err(|e| format!("authenticate: {e}"))?;
     let mut process = client
         .launch_process(program.to_string(), input.to_string(), true)
         .await
-        .ok()?;
-    parse_tokens(&process.wait_for_return().await.ok()?)
+        .map_err(|e| format!("launch {program}: {e}"))?;
+    let returned = process
+        .wait_for_return()
+        .await
+        .map_err(|e| format!("{program} returned an error: {e}"))?;
+    parse_tokens(&returned).ok_or_else(|| {
+        // The guest ran and answered; its answer just has no token array. Show
+        // what it said instead of calling it a missing program.
+        let head: String = returned.chars().take(200).collect();
+        format!("{program} returned no tokens: {head}")
+    })
 }
 
 /// Pull the token array out of an inferlet's JSON return.
@@ -108,15 +127,25 @@ pub async fn run(addr: &str, program: &str, inputs: &[String]) -> FleetRun {
     }
     let mut outputs = Vec::with_capacity(lanes.len());
     let mut lane_latencies = Vec::with_capacity(lanes.len());
+    let mut failures = Vec::new();
     for lane in lanes {
-        let (output, latency) = lane.await.unwrap_or((None, Duration::ZERO));
-        outputs.push(output);
+        let (result, latency) = lane
+            .await
+            .unwrap_or_else(|e| (Err(format!("lane task: {e}")), Duration::ZERO));
+        match result {
+            Ok(tokens) => outputs.push(Some(tokens)),
+            Err(reason) => {
+                outputs.push(None);
+                failures.push(reason);
+            }
+        }
         lane_latencies.push(latency);
     }
     FleetRun {
         outputs,
         lane_latencies,
         elapsed: started.elapsed(),
+        failures,
     }
 }
 
@@ -135,6 +164,11 @@ mod tests {
                 .map(|&us| Duration::from_micros(us))
                 .collect(),
             elapsed: Duration::from_micros(elapsed_us),
+            failures: tokens
+                .iter()
+                .filter(|&&n| n == 0)
+                .map(|_| "synthetic lane failure".to_string())
+                .collect(),
         }
     }
 

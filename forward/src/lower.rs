@@ -700,6 +700,20 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         AddBias { .. } => Semantic::Kernels(&["launch_add_bias_bf16"]),
         ResidualAdd => Semantic::Kernels(&["launch_residual_add_bf16"]),
 
+        // The GDN and full-attention kinds. Each is ONE kernel with no
+        // branch — no fact to read, no variant to dispatch on, nothing
+        // chosen per fire. They were residue only because the rule was
+        // never written: the qwen3_5 executor walks, so nothing ever
+        // asked the lowering what they were.
+        //
+        // Their operand plumbing (the per-layer `la.*` scratch, the fp32
+        // parameter banks) is the EMITTER's, exactly as it is for the
+        // kinds above — naming the symbol is what the lowering owes.
+        GdnPrep { .. } => Semantic::Kernels(&["launch_qwen_gdn_post_conv_prep_bf16"]),
+        RmsnormGated { .. } => Semantic::Kernels(&["launch_rmsnorm_gated_fp32_in_bf16"]),
+        SplitQGate { .. } => Semantic::Kernels(&["launch_split_q_gate_bf16"]),
+        SigmoidGateMul => Semantic::Kernels(&["launch_sigmoid_gate_inplace_bf16"]),
+
         // Gemma folds `(1 + w)` — different arithmetic, so a different
         // kernel, but the same signature and the same row space. The
         // variant is already on the wire (`param0`), so naming the
@@ -728,13 +742,18 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
             &["launch_split_qkv_bf16"]
         }),
 
+        // Partial rope IS a different kernel, and the trace already says
+        // which: the rotary width crosses as `param1`, zero for the full
+        // rotation. So the lowering names the pair the same way it names
+        // the norm's, and the width the executor needs is the width the
+        // declaration already carried.
         Rope { kind, partial } => {
-            if partial.is_some() {
-                Semantic::Unlowered("partial rope is a different kernel")
-            } else if matches!(kind, crate::trace::RopeKind::Standard) {
-                Semantic::Kernels(&["launch_rope_bf16"])
-            } else {
+            if !matches!(kind, crate::trace::RopeKind::Standard) {
                 Semantic::Unlowered("only standard rope is emitted")
+            } else if partial.is_some() {
+                Semantic::Kernels(&["launch_rope_partial_bf16"])
+            } else {
+                Semantic::Kernels(&["launch_rope_bf16"])
             }
         }
 
@@ -1020,7 +1039,7 @@ fn value_bytes(plan: &ForwardPlan, v: ValueId, n_tokens: usize, n_requests: usiz
     }
     elements
         * match info.dtype {
-            DType::BF16 => 2,
+            DType::BF16 | DType::F16 => 2,
             DType::F32 | DType::I32 => 4,
         }
 }
@@ -1127,48 +1146,173 @@ mod tests {
 
     /// The ledger's current contents — see [`the_qwen3_5_residue_ledger`].
     /// One entry per (kind, reason), counted per DECODE fire.
-    const LEDGER_QWEN35_DECODE: &[&str] = &[
-        "  18  GdnPrep: no lowering rule for this kind",
-        "  18  RmsnormGated: no lowering rule for this kind",
-        "   6  Rope: partial rope is a different kernel",
-        "   6  SigmoidGateMul: no lowering rule for this kind",
-        "   6  SplitQGate: no lowering rule for this kind",
-        "  24  Swiglu: the fused-gate_up binding fact is not in the facts",
-    ];
+    const LEDGER_QWEN35_DECODE: &[&str] = &[];
 
-    /// Qwen3.6-27B owes NOTHING that Qwen3.5-0.8B does not already owe.
+    /// THE QWEN3_5 CUTOVER GATE, in the shape llama_like's takes: every
+    /// statement a live fire executes is a rectangle in the flat list,
+    /// on both geometries and in both classes.
     ///
-    /// The qwen3_5 family's flat list does not cover itself yet — its
-    /// executor still walks, and both geometries carry the same large
-    /// residue (the Gemma norms, the GDN prep/gated-norm pair, the
-    /// swiglu binding fact). So the claim worth pinning is not coverage
-    /// but CONTAINMENT: the 27B checkpoint needs its dims and no new
-    /// vocabulary, which is exactly "its residue is a subset of the one
-    /// already being worked".
+    /// This was a CONTAINMENT test while the ledger was non-empty — 27B
+    /// owes nothing 0.8B does not — because asserting coverage would
+    /// have asserted something false about 0.8B too. With the ledger
+    /// empty the stronger claim is available, so it is the one made.
     ///
-    /// It is the first geometry whose GDN half is GQA (48 value heads
-    /// over 16 key heads), so a NEW `why` here would most likely be the
-    /// head-repeat or the `_gqa` recurrence — something 0.8B cannot
-    /// prove either way. That is the case this test exists to catch.
+    /// 27B earns its own row: it is the first geometry whose GDN half is
+    /// GQA (48 value heads over 16 key heads), which 0.8B cannot prove
+    /// either way.
     #[test]
-    fn qwen3_6_27b_owes_nothing_new() {
+    fn the_qwen3_5_flat_list_covers_every_statement() {
         let cuda = crate::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
-        let whys = |facts: &crate::facts::Qwen35HybridFacts, class| {
-            let plan = family::qwen3_5_hybrid_cuda(facts, &cuda, class);
+        let geometries = [
+            ("0.8b", crate::facts::Qwen35HybridFacts::qwen3_5_0_8b()),
+            ("27b", crate::facts::Qwen35HybridFacts::qwen3_6_27b()),
+        ];
+        for (name, facts) in geometries {
+            for class in [FireClass::Decode, FireClass::Prefill] {
+                let plan = family::qwen3_5_hybrid_cuda(&facts, &cuda, class);
+                for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
+                    let out = lower(&plan, &rows, Fire::default())
+                        .unwrap_or_else(|e| panic!("{name}/{class:?}/{shape}: {e:?}"));
+                    assert!(
+                        out.residue.is_empty(),
+                        "{name}/{class:?}/{shape}: {} statements still owe a \
+                         declaration: {:#?}",
+                        out.residue.len(),
+                        out.residue
+                    );
+                    assert_eq!(out.coverage(), 1.0, "{name}/{class:?}/{shape}");
+                    assert!(
+                        !out.launches.is_empty(),
+                        "{name}/{class:?}/{shape}: a fire that executes nothing \
+                         is not a fire"
+                    );
+                }
+            }
+        }
+    }
+
+    /// gemma-4's residue LEDGER — the third family's, opened the way
+    /// qwen3_5's was and for the same reason: a rung is legible when it
+    /// is a line leaving this list.
+    ///
+    /// Empty means the body is a list of rectangles. It does NOT mean the
+    /// numbers are right: five of the six defects the executor found were
+    /// in a declaration whose ledger was already empty. This gate asks
+    /// whether statements are WELL FORMED; only a live fire asks whether
+    /// each one consumes what the pass produces.
+    #[test]
+    fn the_gemma4_residue_ledger() {
+        let facts = crate::facts::Gemma4Facts::gemma_4_e4b();
+        let cuda = crate::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
+        for (class, expected) in [
+            (FireClass::Decode, LEDGER_GEMMA4_DECODE),
+            (FireClass::Prefill, LEDGER_GEMMA4_PREFILL),
+        ] {
+            let plan = family::gemma4_cuda(&facts, &cuda, class);
             let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
-            out.residue
-                .into_iter()
-                .map(|u| format!("{}: {}", u.kind, u.why))
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        for class in [FireClass::Decode, FireClass::Prefill] {
-            let known = whys(&crate::facts::Qwen35HybridFacts::qwen3_5_0_8b(), class);
-            let fresh = whys(&crate::facts::Qwen35HybridFacts::qwen3_6_27b(), class);
-            let novel: Vec<_> = fresh.difference(&known).collect();
+            let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
+            for u in &out.residue {
+                *ledger
+                    .entry(format!("{}: {}", u.kind, u.why))
+                    .or_default() += 1;
+            }
+            let seen: Vec<String> = ledger
+                .iter()
+                .map(|(k, n)| format!("{n:>4}  {k}"))
+                .collect();
+            let want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+            assert_eq!(seen, want, "the gemma-4 {class:?} residue ledger moved");
             assert!(
-                novel.is_empty(),
-                "{class:?}: Qwen3.6-27B owes something 0.8B does not: {novel:#?}"
+                !out.launches.is_empty(),
+                "a fire that executes nothing is not a fire"
             );
+        }
+    }
+
+    /// See [`the_gemma4_residue_ledger`]. One entry per (kind, reason).
+    const LEDGER_GEMMA4_DECODE: &[&str] = &[];
+
+    /// The prefill class's, which differs from the decode ledger only in
+    /// the dispatch — and states two kernels of its own, so an empty
+    /// ledger here is a claim about those two as much as about the body.
+    const LEDGER_GEMMA4_PREFILL: &[&str] = &[];
+
+    /// gpt-oss's residue LEDGER — the fourth family's, opened the day the
+    /// text was written and before any executor exists.
+    ///
+    /// gpt-oss is the first family whose MoE block is stated end to end,
+    /// which is the whole reason to open this list here: the decode leg
+    /// is seven rectangles because two GEMVs carry the expert axis
+    /// INSIDE the value, and if any of that were wrong it would show up
+    /// as a line below rather than as a wrong number later.
+    #[test]
+    fn the_gpt_oss_residue_ledger() {
+        let facts = crate::facts::GptOssFacts::gpt_oss_20b();
+        let cuda = crate::facts::GptOssCudaFacts::gpt_oss_20b_synthetic();
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            let plan = family::gpt_oss_cuda(&facts, &cuda, class);
+            let out = lower(&plan, &sampled(4), Fire::default()).expect("lowers");
+            assert!(
+                out.residue.is_empty() && out.coverage() == 1.0,
+                "gpt-oss {class:?}: {:#?}",
+                out.residue
+            );
+        }
+        let plan = family::gpt_oss_cuda(&facts, &cuda, FireClass::Decode);
+        let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
+        let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
+        for u in &out.residue {
+            *ledger
+                .entry(format!("{}: {}", u.kind, u.why))
+                .or_default() += 1;
+        }
+        let seen: Vec<String> = ledger
+            .iter()
+            .map(|(k, n)| format!("{n:>4}  {k}"))
+            .collect();
+        let expected: Vec<String> = LEDGER_GPT_OSS_DECODE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            seen, expected,
+            "the gpt-oss residue ledger moved.\n\
+             Every line here is a statement the flat list does not carry."
+        );
+        assert!(
+            !out.launches.is_empty(),
+            "a fire that executes nothing is not a fire"
+        );
+    }
+
+    /// See [`the_gpt_oss_residue_ledger`]. One entry per (kind, reason).
+    const LEDGER_GPT_OSS_DECODE: &[&str] = &[];
+
+    /// THE GEMMA-4 CUTOVER GATE, in the shape the other two families'
+    /// take: every statement a live fire executes is a rectangle in the
+    /// flat list, in both classes and both logit shapes.
+    ///
+    /// One geometry only, and honestly so: E4B is the sole gemma-4 fact
+    /// set anything has been read against. A second (E2B, the 31B) would
+    /// earn its own row the way 27B earned qwen3_5's.
+    #[test]
+    fn the_gemma4_flat_list_covers_every_statement() {
+        let facts = crate::facts::Gemma4Facts::gemma_4_e4b();
+        let cuda = crate::facts::Gemma4CudaFacts::gemma_4_e4b_synthetic();
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            let plan = family::gemma4_cuda(&facts, &cuda, class);
+            for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
+                let out = lower(&plan, &rows, Fire::default())
+                    .unwrap_or_else(|e| panic!("{class:?}/{shape}: {e:?}"));
+                assert!(
+                    out.residue.is_empty(),
+                    "{class:?}/{shape}: {} statements still owe a declaration: {:#?}",
+                    out.residue.len(),
+                    out.residue
+                );
+                assert_eq!(out.coverage(), 1.0, "{class:?}/{shape}");
+                assert!(
+                    !out.launches.is_empty(),
+                    "{class:?}/{shape}: a fire that executes nothing is not a fire"
+                );
+            }
         }
     }
 

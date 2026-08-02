@@ -30,7 +30,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use rustc_hash::FxHashSet;
 use smallvec::{SmallVec, smallvec};
 
 use super::hash::{self, Hash256};
@@ -173,7 +176,30 @@ struct KvTrieNode {
 struct WorkingSetEntry {
     terminal: Option<NodeId>,
     /// Logical extent including pending (reserved, unpublished) space.
+    ///
+    /// Written only through [`WorkingSetEntry::set_page_len`], which keeps
+    /// `page_len_mirror` in step.
     page_len: u64,
+    /// Lock-free copy of `page_len` for readers OUTSIDE the global KV mutex.
+    ///
+    /// Reading one integer was costing an exclusive acquisition of the mutex
+    /// every fire needs to compute its own page demand. Measured on D/512
+    /// after the census fix: the two `page_len` readers
+    /// (`inferlet/host/kv_working_set.rs` and `pipeline/fire.rs`) accounted
+    /// for 64744 of 117653 acquisitions (55%) and 4.2 s of the remaining
+    /// 6.8 s of aggregate wait, against 19 ms of combined HOLD — a pure
+    /// queue convoy in front of a load of a `u64`.
+    ///
+    /// Sound as a plain release/acquire pair because `page_len` moves only
+    /// under this process's OWN operations — `reserve`, adoption, and
+    /// `drop`/`discard` — never under the residency planner, which relocates
+    /// physical backings and leaves the logical extent alone. A reader
+    /// therefore never races its own writer, and every write it must observe
+    /// was released by the mutex it just left.
+    ///
+    /// [`Self::TORN_DOWN`] once the WorkingSet is gone, so a stale handle
+    /// still reports the error the locked path would have.
+    page_len_mirror: Arc<AtomicU64>,
     /// Exclusive end of the published mapping; the lookup anchor.
     ///
     /// kv_refact.md anchors lookup at `page_len`; with purely logical
@@ -189,6 +215,33 @@ struct WorkingSetEntry {
     chain_state: Option<Hash256>,
     // The device-shared flattened table handle attaches here with the
     // KvStore/driver integration; the pure flatten lives in `flatten()`.
+}
+
+impl WorkingSetEntry {
+    /// Mirror value for a WorkingSet that no longer exists. `u64::MAX` is
+    /// unreachable as a real extent — the index space is bounded by the page
+    /// pool — so it needs no extra flag to disambiguate.
+    const TORN_DOWN: u64 = u64::MAX;
+
+    fn new(
+        terminal: Option<NodeId>,
+        page_len: u64,
+        mapped_len: u64,
+        chain_state: Option<Hash256>,
+    ) -> Self {
+        Self {
+            terminal,
+            page_len,
+            page_len_mirror: Arc::new(AtomicU64::new(page_len)),
+            mapped_len,
+            chain_state,
+        }
+    }
+
+    fn set_page_len(&mut self, page_len: u64) {
+        self.page_len = page_len;
+        self.page_len_mirror.store(page_len, Ordering::Release);
+    }
 }
 
 /// Opaque-index snapshot of one fully mapped WorkingSet entry. The index owns
@@ -282,12 +335,8 @@ impl KvPageTable {
     // ------------------------------------------------------------------
 
     pub fn create_working_set(&mut self) -> WorkingSetId {
-        self.working_sets.insert(WorkingSetEntry {
-            terminal: None,
-            page_len: 0,
-            mapped_len: 0,
-            chain_state: None,
-        })
+        self.working_sets
+            .insert(WorkingSetEntry::new(None, 0, 0, None))
     }
 
     /// `fork`: O(1) child over the complete logical address space. Parent and
@@ -300,12 +349,12 @@ impl KvPageTable {
             entry.mapped_len,
             entry.chain_state,
         );
-        let child = self.working_sets.insert(WorkingSetEntry {
+        let child = self.working_sets.insert(WorkingSetEntry::new(
             terminal,
             page_len,
             mapped_len,
             chain_state,
-        });
+        ));
         if let Some(terminal) = terminal {
             self.add_anchor(terminal);
         }
@@ -336,12 +385,12 @@ impl KvPageTable {
 
     /// Create a fresh WorkingSet terminal from an opaque-index snapshot.
     pub(super) fn from_index_snapshot(&mut self, snapshot: IndexedWorkingSet) -> WorkingSetId {
-        let ws = self.working_sets.insert(WorkingSetEntry {
-            terminal: snapshot.terminal,
-            page_len: snapshot.page_len,
-            mapped_len: snapshot.mapped_len,
-            chain_state: snapshot.chain_state,
-        });
+        let ws = self.working_sets.insert(WorkingSetEntry::new(
+            snapshot.terminal,
+            snapshot.page_len,
+            snapshot.mapped_len,
+            snapshot.chain_state,
+        ));
         if let Some(terminal) = snapshot.terminal {
             self.add_anchor(terminal);
         }
@@ -373,14 +422,11 @@ impl KvPageTable {
             let segs = self.segments(terminal, mapped_len);
             Some(self.boundary_terminal(&segs, range.end))
         };
-        let child = self.working_sets.insert(WorkingSetEntry {
-            terminal: child_terminal,
-            page_len: len,
-            mapped_len: len,
-            // The caller (`KvStore::slice`) derives the child's chain state:
-            // inherit on a full-range slice, recompute otherwise.
-            chain_state: None,
-        });
+        // The caller (`KvStore::slice`) derives the child's chain state:
+        // inherit on a full-range slice, recompute otherwise.
+        let child = self
+            .working_sets
+            .insert(WorkingSetEntry::new(child_terminal, len, len, None));
         if let Some(terminal) = child_terminal {
             self.add_anchor(terminal);
         }
@@ -391,7 +437,7 @@ impl KvPageTable {
     pub fn reserve(&mut self, ws: WorkingSetId, pages: u64) -> Result<Range<u64>, KvTableError> {
         let entry = self.entry_mut(ws)?;
         let start = entry.page_len;
-        entry.page_len += pages;
+        entry.set_page_len(entry.page_len + pages);
         Ok(start..entry.page_len)
     }
 
@@ -651,6 +697,11 @@ impl KvPageTable {
         let Some(entry) = self.working_sets.remove(ws) else {
             return Vec::new();
         };
+        // Tombstone the mirror so a handle that outlives the WorkingSet gets
+        // the same error the locked read would have raised.
+        entry
+            .page_len_mirror
+            .store(WorkingSetEntry::TORN_DOWN, Ordering::Release);
         entry
             .terminal
             .map_or_else(Vec::new, |terminal| self.remove_anchor(terminal))
@@ -869,7 +920,7 @@ impl KvPageTable {
         let freed = self.move_terminal(ws, Some(terminal))?;
         debug_assert!(freed.is_empty(), "adoption starts without an old terminal");
         let entry = self.entry_mut(ws)?;
-        entry.page_len = reserved_len.max(end);
+        entry.set_page_len(reserved_len.max(end));
         entry.mapped_len = end;
         Ok(end)
     }
@@ -997,7 +1048,19 @@ impl KvPageTable {
     }
 
     pub fn page_len(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
-        Ok(self.entry(ws)?.page_len)
+        let entry = self.entry(ws)?;
+        debug_assert_eq!(
+            entry.page_len_mirror.load(Ordering::Relaxed),
+            entry.page_len,
+            "page_len mirror drifted: a write bypassed set_page_len"
+        );
+        Ok(entry.page_len)
+    }
+
+    /// The lock-free `page_len` mirror for `ws`, to be read outside the
+    /// global KV mutex. See [`WorkingSetEntry::page_len_mirror`].
+    pub fn page_len_mirror(&self, ws: WorkingSetId) -> Result<Arc<AtomicU64>, KvTableError> {
+        Ok(Arc::clone(&self.entry(ws)?.page_len_mirror))
     }
 
     pub fn mapped_len(&self, ws: WorkingSetId) -> Result<u64, KvTableError> {
@@ -1475,7 +1538,8 @@ impl KvPageTable {
         let page_reduction = r.end - r.start;
 
         if r.start >= mapped_len {
-            self.entry_mut(ws)?.page_len -= page_reduction;
+            let entry = self.entry_mut(ws)?;
+            entry.set_page_len(entry.page_len - page_reduction);
             return Ok(());
         }
         let m = r.start..r.end.min(mapped_len);
@@ -1502,7 +1566,7 @@ impl KvPageTable {
             self.invalidate_subtree(shallowest);
             let entry = self.entry_mut(ws)?;
             entry.mapped_len -= m_len;
-            entry.page_len -= page_reduction;
+            entry.set_page_len(entry.page_len - page_reduction);
         } else if (m.start as i64) >= segs[0].start {
             // Within the terminal node's contribution: replace the terminal
             // with a selection excluding the range.
@@ -1513,7 +1577,7 @@ impl KvPageTable {
             freed.extend(self.move_terminal(ws, Some(selection))?);
             let entry = self.entry_mut(ws)?;
             entry.mapped_len -= m_len;
-            entry.page_len -= page_reduction;
+            entry.set_page_len(entry.page_len - page_reduction);
         } else if m.end == mapped_len {
             // Tail-reaching above the terminal: move the terminal up.
             let new_terminal = if m.start == 0 {
@@ -1524,13 +1588,13 @@ impl KvPageTable {
             freed.extend(self.move_terminal(ws, new_terminal)?);
             let entry = self.entry_mut(ws)?;
             entry.mapped_len = m.start;
-            entry.page_len -= page_reduction;
+            entry.set_page_len(entry.page_len - page_reduction);
         } else if m.start == 0 {
             // Front-reaching: pure truncation; the anchor shift re-bases all
             // surviving indexes. Excluded pages stay on the ancestor path.
             let entry = self.entry_mut(ws)?;
             entry.mapped_len -= m_len;
-            entry.page_len -= page_reduction;
+            entry.set_page_len(entry.page_len - page_reduction);
         } else {
             debug_assert!(false, "discard apply diverged from legality pre-pass");
             return Err(KvTableError::SharedInteriorDiscard);
@@ -1588,7 +1652,8 @@ impl KvPageTable {
         (dropped.len(), freed)
     }
 
-    /// Batched [`ReclaimQuote`] over several candidate groups.
+    /// Batched [`ReclaimQuote`] over several candidate groups, in the caller's
+    /// preference order, stopping once the quoted pages reach `budget`.
     ///
     /// The shared exclusions — how many WorkingSets reach each location, which
     /// locations a cache root anchors, which an in-flight pin holds — are
@@ -1596,65 +1661,102 @@ impl KvPageTable {
     /// candidate would recompute the union of every other WorkingSet each
     /// time, which is quadratic in the fleet.
     ///
+    /// `budget` truncates the RESULT, never the census: the returned vector
+    /// may be shorter than `groups`, and a caller that needs an opinion on
+    /// every group passes `u32::MAX`. Quoting is not free — each group costs
+    /// another walk of its own locations plus three lookups per location —
+    /// and the eviction picker consumes the list in order until the deficit
+    /// is covered, so quoting the whole fleet to use the first two entries
+    /// was pure lock hold. Measured at 512-way oversubscription: the quote
+    /// held the global KV mutex 3.8 ms per call, 558 calls, while every
+    /// fire's `host_kv_demand` waited behind it on the same mutex.
+    ///
     /// Advisory by design: a WorkingSet that has vanished contributes no
     /// locations rather than failing the batch. The authoritative decision is
     /// still `private_resident_pages` at suspend time.
-    pub fn reclaim_quotes(&self, groups: &[HashSet<WorkingSetId>]) -> Vec<ReclaimQuote> {
-        // How many distinct WorkingSets reach each location. A location whose
-        // owner count exceeds the group's own references is shared outward.
-        let mut owners: HashMap<TriePageLocation, u32> = HashMap::new();
-        for (ws, _) in self.working_sets.iter() {
-            for location in self.working_set_locations(ws).unwrap_or_default() {
-                *owners.entry(location).or_insert(0) += 1;
+    pub fn reclaim_quotes(
+        &self,
+        groups: &[HashSet<WorkingSetId>],
+        budget: u32,
+    ) -> Vec<ReclaimQuote> {
+        let mut quotes = Vec::with_capacity(groups.len());
+        let mut covered = 0u32;
+        // The group's OWN locations, deduplicated: a chain that walks both a
+        // selection and the parent it selects from yields the same location
+        // twice, and the set collapses that without a counting pass.
+        let mut mine: FxHashSet<TriePageLocation> = FxHashSet::default();
+        for group in groups {
+            if covered >= budget {
+                break;
+            }
+            mine.clear();
+            for &ws in group {
+                let _ = self.visit_working_set_locations(ws, |location| {
+                    mine.insert(location);
+                });
+            }
+            let quote = self.quote_group(group, &mine);
+            if let ReclaimQuote::Pages(pages) = quote {
+                covered = covered.saturating_add(pages);
+            }
+            quotes.push(quote);
+        }
+        quotes
+    }
+
+    /// One group's quote.
+    ///
+    /// Every question is asked AGAINST THE GROUP'S OWN LOCATIONS, never by
+    /// materializing a fleet-wide census first. The census form —
+    /// `owners[location]` over every WorkingSet, plus full `cache_held` and
+    /// `pinned` unions — is O(fleet × depth) and was paid in full even when
+    /// the budget stopped after the first group: measured on D/512, 876
+    /// quotes × 958 µs = 0.84 s of EXCLUSIVE hold on the global KV mutex,
+    /// which every fire needs to compute its own page demand. The bounded
+    /// form asks the same questions of the same walks but records only hits
+    /// inside `mine` and stops as soon as every one of them is accounted
+    /// for.
+    ///
+    /// `owners[l] > mine[l]` and "some WorkingSet outside the group reaches
+    /// `l`" are the same predicate — the count form just spelled it by
+    /// subtraction — so the answers are identical, not approximations.
+    fn quote_group(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+        mine: &FxHashSet<TriePageLocation>,
+    ) -> ReclaimQuote {
+        if mine.is_empty() {
+            return ReclaimQuote::Nothing(NoReclaim::HoldsNothing);
+        }
+        if !self.locations_held_by_pins(mine).is_empty() {
+            return ReclaimQuote::Nothing(NoReclaim::Pinned);
+        }
+        let shared_ws = match self.locations_shared_outward(working_sets, mine) {
+            Ok(shared) => shared,
+            // Unreachable: the walk only visits WorkingSets it enumerated
+            // from this same table. Should it ever fire, "assume shared" is
+            // the safe answer — a quote must never promise pages the suspend
+            // path would then refuse to move.
+            Err(_) => return ReclaimQuote::Nothing(NoReclaim::AllShared),
+        };
+        let cache_held = self.locations_held_by_cache_roots(mine);
+        let (mut pages, mut shared, mut swapped) = (0u32, 0usize, 0usize);
+        for location in mine {
+            if cache_held.contains(location) || shared_ws.contains(location) {
+                shared += 1;
+                continue;
+            }
+            match self.backing_at(location) {
+                Ok(KvPageBacking::Resident(_)) => pages += 1,
+                _ => swapped += 1,
             }
         }
-        let mut cache_held: HashSet<TriePageLocation> = HashSet::new();
-        for &terminal in self.cache_roots.keys() {
-            cache_held.extend(self.anchor_locations(terminal));
+        match (pages, shared, swapped) {
+            (0, 0, 0) => ReclaimQuote::Nothing(NoReclaim::HoldsNothing),
+            (0, shared, _) if shared > 0 => ReclaimQuote::Nothing(NoReclaim::AllShared),
+            (0, _, _) => ReclaimQuote::Nothing(NoReclaim::AllSwapped),
+            (pages, _, _) => ReclaimQuote::Pages(pages),
         }
-        let mut pinned: HashSet<TriePageLocation> = HashSet::new();
-        for &terminal in self.pins.keys() {
-            pinned.extend(self.anchor_locations(terminal));
-        }
-
-        groups
-            .iter()
-            .map(|group| {
-                // Sharing WITHIN the group is not sharing outward, so count
-                // the group's own references per location and compare.
-                let mut mine: HashMap<TriePageLocation, u32> = HashMap::new();
-                for &ws in group {
-                    for location in self.working_set_locations(ws).unwrap_or_default() {
-                        *mine.entry(location).or_insert(0) += 1;
-                    }
-                }
-                if mine.is_empty() {
-                    return ReclaimQuote::Nothing(NoReclaim::HoldsNothing);
-                }
-                if mine.keys().any(|location| pinned.contains(location)) {
-                    return ReclaimQuote::Nothing(NoReclaim::Pinned);
-                }
-                let (mut pages, mut shared, mut swapped) = (0u32, 0usize, 0usize);
-                for (location, held) in &mine {
-                    if cache_held.contains(location)
-                        || owners.get(location).copied().unwrap_or(0) > *held
-                    {
-                        shared += 1;
-                        continue;
-                    }
-                    match self.backing_at(location) {
-                        Ok(KvPageBacking::Resident(_)) => pages += 1,
-                        _ => swapped += 1,
-                    }
-                }
-                match (pages, shared, swapped) {
-                    (0, 0, 0) => ReclaimQuote::Nothing(NoReclaim::HoldsNothing),
-                    (0, shared, _) if shared > 0 => ReclaimQuote::Nothing(NoReclaim::AllShared),
-                    (0, _, _) => ReclaimQuote::Nothing(NoReclaim::AllSwapped),
-                    (pages, _, _) => ReclaimQuote::Pages(pages),
-                }
-            })
-            .collect()
     }
 
     /// Exact private resident pages reachable by `working_sets`. Sharing
@@ -1667,32 +1769,23 @@ impl KvPageTable {
         &self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<(Vec<(TriePageLocation, PhysicalKvPageId)>, bool), KvTableError> {
-        let mut target = HashSet::new();
+        let mut target = FxHashSet::default();
         for &ws in working_sets {
-            target.extend(self.working_set_locations(ws)?);
+            self.visit_working_set_locations(ws, |location| {
+                target.insert(location);
+            })?;
         }
 
-        let mut pinned = HashSet::new();
-        for &terminal in self.pins.keys() {
-            pinned.extend(self.anchor_locations(terminal));
-        }
-        if target.iter().any(|location| pinned.contains(location)) {
+        if !self.locations_held_by_pins(&target).is_empty() {
             return Ok((Vec::new(), true));
         }
 
-        let mut external = HashSet::new();
-        for (ws, _) in self.working_sets.iter() {
-            if !working_sets.contains(&ws) {
-                external.extend(self.working_set_locations(ws)?);
-            }
-        }
-        for &terminal in self.cache_roots.keys() {
-            external.extend(self.anchor_locations(terminal));
-        }
+        let shared_ws_set = self.locations_shared_outward(working_sets, &target)?;
+        let cache_only = self.locations_held_by_cache_roots(&target);
 
         let pages: Vec<_> = target
             .into_iter()
-            .filter(|location| !external.contains(location))
+            .filter(|location| !shared_ws_set.contains(location) && !cache_only.contains(location))
             .filter_map(|location| match self.backing_at(&location).ok()? {
                 KvPageBacking::Resident(id) => Some((location, id)),
                 KvPageBacking::Swapped(_) => None,
@@ -1707,27 +1800,102 @@ impl KvPageTable {
         &self,
         working_sets: &HashSet<WorkingSetId>,
     ) -> Result<Vec<(TriePageLocation, PhysicalKvPageId)>, KvTableError> {
-        let mut target = HashSet::new();
+        let mut target = FxHashSet::default();
         for &ws in working_sets {
-            target.extend(self.working_set_locations(ws)?);
+            self.visit_working_set_locations(ws, |location| {
+                target.insert(location);
+            })?;
         }
-        let mut external = HashSet::new();
-        for (ws, _) in self.working_sets.iter() {
-            if !working_sets.contains(&ws) {
-                external.extend(self.working_set_locations(ws)?);
-            }
-        }
-        for &terminal in self.cache_roots.keys() {
-            external.extend(self.anchor_locations(terminal));
-        }
+        let shared_ws_set = self.locations_shared_outward(working_sets, &target)?;
+        let cache_only = self.locations_held_by_cache_roots(&target);
         Ok(target
             .into_iter()
-            .filter(|location| !external.contains(location))
+            .filter(|location| !shared_ws_set.contains(location) && !cache_only.contains(location))
             .filter_map(|location| match self.backing_at(&location).ok()? {
                 KvPageBacking::Resident(id) => Some((location, id)),
                 KvPageBacking::Swapped(_) => None,
             })
             .collect())
+    }
+
+    /// Which of `target`'s locations some WorkingSet outside `working_sets`
+    /// also reaches.
+    ///
+    /// Answering "is this location shared" by building the union of every
+    /// other WorkingSet's locations materializes the whole fleet's residency
+    /// — tens of thousands of entries — to test a few dozen. This walks the
+    /// same WorkingSets but only records the target's own locations, so the
+    /// result is bounded by `target` and the walk stops as soon as every
+    /// target location is already known to be shared.
+    fn locations_shared_outward(
+        &self,
+        working_sets: &HashSet<WorkingSetId>,
+        target: &FxHashSet<TriePageLocation>,
+    ) -> Result<FxHashSet<TriePageLocation>, KvTableError> {
+        let mut shared = FxHashSet::default();
+        if target.is_empty() {
+            return Ok(shared);
+        }
+        for (ws, _) in self.working_sets.iter() {
+            if shared.len() == target.len() {
+                break;
+            }
+            if working_sets.contains(&ws) {
+                continue;
+            }
+            self.visit_working_set_locations(ws, |location| {
+                if target.contains(&location) {
+                    shared.insert(location);
+                }
+            })?;
+        }
+        Ok(shared)
+    }
+
+    /// [`Self::locations_shared_outward`] for cache roots, which retain pages
+    /// independently of any WorkingSet.
+    fn locations_held_by_cache_roots(
+        &self,
+        target: &FxHashSet<TriePageLocation>,
+    ) -> FxHashSet<TriePageLocation> {
+        let mut held = FxHashSet::default();
+        if target.is_empty() {
+            return held;
+        }
+        for &terminal in self.cache_roots.keys() {
+            if held.len() == target.len() {
+                break;
+            }
+            self.visit_anchor_locations(terminal, |location| {
+                if target.contains(&location) {
+                    held.insert(location);
+                }
+            });
+        }
+        held
+    }
+
+    /// [`Self::locations_shared_outward`] for in-flight pins, which hold a
+    /// page against any suspend until the owning fire drains.
+    fn locations_held_by_pins(
+        &self,
+        target: &FxHashSet<TriePageLocation>,
+    ) -> FxHashSet<TriePageLocation> {
+        let mut held = FxHashSet::default();
+        if target.is_empty() {
+            return held;
+        }
+        for &terminal in self.pins.keys() {
+            if held.len() == target.len() {
+                break;
+            }
+            self.visit_anchor_locations(terminal, |location| {
+                if target.contains(&location) {
+                    held.insert(location);
+                }
+            });
+        }
+        held
     }
 
     pub fn swapped_pages(
@@ -1888,41 +2056,74 @@ impl KvPageTable {
         &self,
         ws: WorkingSetId,
     ) -> Result<HashSet<TriePageLocation>, KvTableError> {
-        let entry = self.entry(ws)?;
         let mut locations = HashSet::new();
+        self.visit_working_set_locations(ws, |location| {
+            locations.insert(location);
+        })?;
+        Ok(locations)
+    }
+
+    /// Feed `visit` every published location of `ws`, WITHOUT materializing a
+    /// set for it.
+    ///
+    /// The fleet-wide censuses (`reclaim_quotes`, `private_resident_pages`)
+    /// call this once per WorkingSet while holding the global KV mutex — the
+    /// same mutex every fire needs to compute its page demand. A per-call
+    /// `HashSet` there is one allocation and one extra hash per location for
+    /// several hundred WorkingSets, paid inside the critical section that
+    /// convoys the whole fleet's fire path.
+    ///
+    /// Locations are NOT deduplicated: a chain that walks both a
+    /// `ParentSelection` and the parent it selects from yields the parent's
+    /// location twice. Callers that count owners must dedupe per WorkingSet;
+    /// callers that only test membership need not.
+    fn visit_working_set_locations(
+        &self,
+        ws: WorkingSetId,
+        mut visit: impl FnMut(TriePageLocation),
+    ) -> Result<(), KvTableError> {
+        let entry = self.entry(ws)?;
         for segment in self.segments(entry.terminal, entry.mapped_len).iter().rev() {
             let from = (-segment.start).max(0) as u64;
             for local in from..segment.len {
-                locations.insert(self.resolve_location(segment.node, local));
+                visit(self.resolve_location(segment.node, local));
             }
         }
-        Ok(locations)
+        Ok(())
     }
 
     fn anchor_locations(&self, terminal: NodeId) -> HashSet<TriePageLocation> {
         let mut locations = HashSet::new();
+        self.visit_anchor_locations(terminal, |location| {
+            locations.insert(location);
+        });
+        locations
+    }
+
+    /// [`Self::visit_working_set_locations`] for a retention anchor (a cache
+    /// root or an in-flight pin). Same rationale, same no-dedup contract.
+    fn visit_anchor_locations(&self, terminal: NodeId, mut visit: impl FnMut(TriePageLocation)) {
         let mut cursor = Some(terminal);
         while let Some(node) = cursor {
             let trie_node = self.nodes.get(node).expect("live anchor");
             match &trie_node.pages {
                 Pages::Owned { backings, .. } => {
-                    locations.extend(
-                        (0..backings.len() as u64).map(|local| TriePageLocation { node, local }),
-                    );
+                    for local in 0..backings.len() as u64 {
+                        visit(TriePageLocation { node, local });
+                    }
                 }
                 Pages::ParentSelection { runs } => {
                     let owner = trie_node.parent.expect("selection has owner");
-                    locations.extend(runs.iter().flat_map(|run| run.clone()).map(|local| {
-                        TriePageLocation {
+                    for local in runs.iter().flat_map(|run| run.clone()) {
+                        visit(TriePageLocation {
                             node: owner,
                             local: u64::from(local),
-                        }
-                    }));
+                        });
+                    }
                 }
             }
             cursor = self.predecessor(node);
         }
-        locations
     }
 
     fn compact_owner(&mut self, owner: NodeId) -> Vec<KvPageBacking> {

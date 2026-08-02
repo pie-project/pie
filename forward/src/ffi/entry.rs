@@ -20,7 +20,7 @@
 //!   answer.
 
 use crate::facts::{
-    LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
+    Gemma4CudaFacts, Gemma4Facts, GptOssCudaFacts, GptOssFacts, LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::trace::{FireClass, NormVariant, RopeKind};
@@ -428,6 +428,8 @@ pub struct PieForwardQwen35CudaFacts {
     pub moe_streamed_experts: u8,
     /// `qwen35_moe_force_general_path()`.
     pub moe_force_general: u8,
+    /// The dense MLP bound a packed gate_up bank.
+    pub gate_up_fused: u8,
 }
 
 fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts {
@@ -442,6 +444,7 @@ fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts 
         moe_shared_gate_dot: facts.moe_shared_gate_dot != 0,
         moe_streamed_experts: facts.moe_streamed_experts != 0,
         moe_force_general: facts.moe_force_general != 0,
+        gate_up_fused: facts.gate_up_fused != 0,
     }
 }
 
@@ -714,6 +717,228 @@ pub unsafe extern "C" fn pie_forward_trace_qwen3_5_hybrid(
 /// family `qwen3_5_hybrid.cuda.commit_advance`) and StateOnly (3 —
 /// `...state_only`) alongside Decode/Prefill. They remain qwen3_5's:
 /// the llama_like entry keeps refusing them.
+/// The gemma-4 facts, as C states them. Mirrors
+/// [`crate::facts::Gemma4Facts`] field for field; same input-side rules
+/// as every struct here (bools are `uint8_t`, non-zero is true).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieForwardGemma4Facts {
+    pub hidden: u32,
+    pub layers: u32,
+    /// Full attention every `interval`-th layer (`l % interval ==
+    /// interval - 1`).
+    pub full_attn_interval: u32,
+    pub q_heads: u32,
+    pub kv_heads: u32,
+    /// The SLIDING layers' head dim.
+    pub head_dim: u32,
+    /// The FULL layers' head dim — different from `head_dim` on E4B,
+    /// which is the per-layer axis this family exists for.
+    pub global_head_dim: u32,
+    /// Partial-rotary width on the FULL layers.
+    pub global_rotary_dim: u32,
+    pub intermediate: u32,
+    pub vocab: u32,
+    pub tied_embeddings: u8,
+    pub _pad: [u8; 3],
+    /// Count of TRAILING layers that reuse an earlier layer's pages.
+    pub kv_shared_layers: u32,
+    /// `hidden_size_per_layer_input`.
+    pub ple_dim: u32,
+    /// `use_double_wide_mlp`: the KV-shared layers' MLP is `2 *
+    /// intermediate`.
+    pub double_wide_shared: u8,
+    pub _pad2: [u8; 3],
+    /// `final_logit_softcapping`; 0 means no cap.
+    pub logit_softcap: f32,
+}
+
+/// gemma-4's CUDA backend facts — three binding questions.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieForwardGemma4CudaFacts {
+    /// A packed `[Hq + 2*Hk, hidden]` projection is bound.
+    pub fused_qkv: u8,
+    /// A packed gate‖up bank is bound.
+    pub gate_up_fused: u8,
+    /// The KV cache is native bf16, so the fused decode post may write
+    /// pages directly.
+    pub kv_native_bf16: u8,
+}
+
+fn read_gemma4_facts(facts: &PieForwardGemma4Facts) -> Gemma4Facts {
+    Gemma4Facts {
+        hidden: facts.hidden,
+        layers: facts.layers,
+        full_attn_interval: facts.full_attn_interval,
+        q_heads: facts.q_heads,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        global_head_dim: facts.global_head_dim,
+        global_rotary_dim: facts.global_rotary_dim,
+        intermediate: facts.intermediate,
+        vocab: facts.vocab,
+        tied_embeddings: facts.tied_embeddings != 0,
+        kv_shared_layers: facts.kv_shared_layers,
+        ple_dim: facts.ple_dim,
+        double_wide_shared: facts.double_wide_shared != 0,
+        logit_softcap: facts.logit_softcap,
+    }
+}
+
+/// Trace one gemma-4 CLASS — the third family's entry point.
+///
+/// Only the normal fire classes exist here today: gemma-4 has no
+/// recurrent state, so it has none of qwen3_5's service classes, and
+/// `class` outside {Decode, Prefill} is an argument error rather than a
+/// panic.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_forward_trace_gemma4_cuda(
+    facts: *const PieForwardGemma4Facts,
+    cuda: *const PieForwardGemma4CudaFacts,
+    class: u32,
+    out_plan: *mut PieForwardPlan,
+) -> PieForwardStatus {
+    abort_on_panic(|| {
+        if out_plan.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        unsafe { *out_plan = PieForwardPlan::default() };
+        if facts.is_null() || cuda.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        let f = read_gemma4_facts(unsafe { &*facts });
+        let c = unsafe { &*cuda };
+        let cuda = Gemma4CudaFacts {
+            fused_qkv: c.fused_qkv != 0,
+            gate_up_fused: c.gate_up_fused != 0,
+            kv_native_bf16: c.kv_native_bf16 != 0,
+        };
+        let class = match class {
+            0 => FireClass::Decode,
+            1 => FireClass::Prefill,
+            _ => return PieForwardStatus::InvalidArgument,
+        };
+        let plan = crate::family::gemma4_cuda(&f, &cuda, class);
+        unsafe { *out_plan = arena::build(&plan) };
+        PieForwardStatus::Ok
+    })
+}
+
+/// gpt-oss's shape, as C states it. Mirrors [`crate::facts::GptOssFacts`]
+/// field for field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieForwardGptOssFacts {
+    pub hidden: u32,
+    pub layers: u32,
+    pub q_heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    /// One expert's MLP width.
+    pub intermediate: u32,
+    pub experts: u32,
+    pub top_k: u32,
+    pub vocab: u32,
+    pub tied_embeddings: u8,
+    /// The checkpoint biases q/k/v/o and the router.
+    pub attention_bias: u8,
+    /// The deployment's rope is the YaRN-paper one.
+    pub rope_yarn_original: u8,
+    /// Every layer carries `attn_sinks`, so attention is asked for its
+    /// LSE and produces two values.
+    pub attn_sinks: u8,
+    /// `swiglu_limit`; 0 means the unclamped SwiGLU, which this family
+    /// does not state.
+    pub swiglu_limit: f32,
+}
+
+/// gpt-oss's CUDA backend facts — the MXFP4 leg's three answers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieForwardGptOssCudaFacts {
+    /// The layer bank carries the per-expert POINTER ARRAYS the fused
+    /// decode GEMV indexes.
+    pub mxfp4_decode_gemv: u8,
+    /// The experts are streamed through a slab cache — a host
+    /// round-trip this declaration does not state.
+    pub streamed_experts: u8,
+    pub _pad: [u8; 2],
+    /// `mxfp4_decode_max_routes`: the fused leg's admission threshold in
+    /// ROUTES (`N * top_k`).
+    pub mxfp4_decode_max_routes: u32,
+}
+
+fn read_gpt_oss_facts(facts: &PieForwardGptOssFacts) -> GptOssFacts {
+    GptOssFacts {
+        hidden: facts.hidden,
+        layers: facts.layers,
+        q_heads: facts.q_heads,
+        kv_heads: facts.kv_heads,
+        head_dim: facts.head_dim,
+        intermediate: facts.intermediate,
+        experts: facts.experts,
+        top_k: facts.top_k,
+        vocab: facts.vocab,
+        tied_embeddings: facts.tied_embeddings != 0,
+        swiglu_limit: facts.swiglu_limit,
+        attention_bias: facts.attention_bias != 0,
+        rope_yarn_original: facts.rope_yarn_original != 0,
+        attn_sinks: facts.attn_sinks != 0,
+    }
+}
+
+/// Trace one gpt-oss CLASS — the fourth family's entry point.
+///
+/// Decode only today: the prefill path materializes its experts through
+/// a host-routed walk, and the text refuses that leg by name rather than
+/// stating it.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardGptOssFacts`] / [`PieForwardGptOssCudaFacts`]; `out_plan`
+/// is null or a writable slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_forward_trace_gpt_oss_cuda(
+    facts: *const PieForwardGptOssFacts,
+    cuda: *const PieForwardGptOssCudaFacts,
+    class: u32,
+    out_plan: *mut PieForwardPlan,
+) -> PieForwardStatus {
+    abort_on_panic(|| {
+        if out_plan.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        unsafe { *out_plan = PieForwardPlan::default() };
+        if facts.is_null() || cuda.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        let f = read_gpt_oss_facts(unsafe { &*facts });
+        let c = unsafe { &*cuda };
+        let cuda = GptOssCudaFacts {
+            mxfp4_decode_gemv: c.mxfp4_decode_gemv != 0,
+            mxfp4_decode_max_routes: c.mxfp4_decode_max_routes,
+            streamed_experts: c.streamed_experts != 0,
+        };
+        // The text ASSERTS both of these, and an assert that fires here
+        // is a panic across the ABI. Answer them as an argument error
+        // instead: a deployment outside the fused leg is a refusal the
+        // caller reads, not a crash.
+        if !cuda.mxfp4_decode_gemv || cuda.streamed_experts {
+            return PieForwardStatus::InvalidArgument;
+        }
+        let class = match class {
+            0 => FireClass::Decode,
+            1 => FireClass::Prefill,
+            _ => return PieForwardStatus::InvalidArgument,
+        };
+        let plan = crate::family::gpt_oss_cuda(&f, &cuda, class);
+        unsafe { *out_plan = arena::build(&plan) };
+        PieForwardStatus::Ok
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_forward_trace_qwen3_5_hybrid_cuda(
     facts: *const PieForwardQwen35HybridFacts,
@@ -783,7 +1008,7 @@ unsafe impl Sync for EntryAddr {}
 /// (`loader/src/ffi/entry.rs:637-652`, `loader/architecture.md` §3.4).
 /// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
-static KEEP_ALIVE: [EntryAddr; 8] = [
+static KEEP_ALIVE: [EntryAddr; 10] = [
     EntryAddr(pie_forward_trace_llama_like as *const ()),
     EntryAddr(pie_forward_trace_llama_like_cuda as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_moe_mlp as *const ()),
@@ -791,6 +1016,8 @@ static KEEP_ALIVE: [EntryAddr; 8] = [
     EntryAddr(pie_forward_trace_qwen3_5_full_attn as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_hybrid as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_hybrid_cuda as *const ()),
+    EntryAddr(pie_forward_trace_gemma4_cuda as *const ()),
+    EntryAddr(pie_forward_trace_gpt_oss_cuda as *const ()),
     EntryAddr(pie_forward_release as *const ()),
 ];
 

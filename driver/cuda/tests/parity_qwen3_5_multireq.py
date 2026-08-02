@@ -109,7 +109,7 @@ async def collect_one(client, inferlet_name, prompt: str, max_tokens: int) -> st
 async def run_test(args) -> int:
     from pie.server import Server
     from pie.config import (
-        Config, ModelConfig, DriverConfig, AuthConfig, RuntimeConfig,
+        Config, ModelConfig, DriverConfig, RuntimeConfig,
         ServerConfig, TelemetryConfig,
     )
 
@@ -125,7 +125,6 @@ async def run_test(args) -> int:
 
     cfg = Config(
         server=ServerConfig(port=0, verbose=args.server_verbose),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(wasm_max_instances=4096),
         model=ModelConfig(

@@ -4,6 +4,7 @@
 // has qo_len == 1). Phase 2 will add the prefill path. Same call signature
 // as `attention_paged.hpp` so the forward pass can dispatch on a flag.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -45,6 +46,13 @@ PrefillPlanCachePtr make_prefill_plan();
 std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache);
 std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
 
+// Whether the plan ran in graph mode, i.e. whether its launch geometry is a
+// pure function of (total_tokens, num_requests) rather than of the KV content
+// it was planned against. Reads `PrefillPlanCache::graph_capturable`, which
+// only the `.cuh` defining the struct can see -- the callers that need the
+// answer are plain `.cpp` translation units.
+bool prefill_plan_graph_capturable(const PrefillPlanCache& cache);
+
 // Whether this plan's schedule is independent of the page counts it was
 // planned against, and therefore whether the launch may be handed a different
 // (compacted) page list than the plan saw. Only the static non-split decode
@@ -53,6 +61,13 @@ bool decode_plan_is_page_count_independent(const DecodePlanCache& cache);
 
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
+// Place this plan's descriptor `bytes` into the shared int workspace. Callers
+// holding two plans at once need it: the planners otherwise all carve from
+// offset 0, and two plans over different request counts do not agree on where
+// their fields sit. Declared here because `DecodePlanCache` is opaque to the
+// model translation units.
+void set_decode_plan_int_base(DecodePlanCache& cache, std::size_t bytes);
+
 void plan_attention_flashinfer_decode_bf16(
     DecodePlanCache& cache,
     const std::uint32_t* kv_page_indptr_h,
@@ -151,7 +166,10 @@ void dispatch_attention_flashinfer_decode_bf16(
     int window_left = -1,
     float logits_soft_cap = 0.f,
     float sm_scale = -1.f,
-    float* lse_out = nullptr);
+    float* lse_out = nullptr,
+    // Every request reads the same Q row -- the KV split issues one query
+    // against several page slices, so only the input is shared.
+    bool broadcast_q = false);
 
 // Score-observing decode (design doc §3): identical attention output, plus
 // `p[head, kv_idx]` written to `score_out` for every request in the batch.

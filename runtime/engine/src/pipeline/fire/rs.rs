@@ -464,10 +464,11 @@ fn prepare_many_impl(
     // ALREADY committed this fire's mapping and taken an in-flight hold, and
     // two obligations outlive any error below: the deferred fold must be
     // applied (dropping it would leave the boundary where no one expects it)
-    // and the hold must be settled (`retire_idle` gates ALL pool retirement
-    // on `in_flight == 0`, so leaking one wedges slot recycling for the rest
-    // of the process). `#[must_use]` does not help here -- the value is bound
-    // to a local, and the lint only catches a discarded temporary.
+    // and the hold must be settled (an unsettled sequence stays in the store's
+    // outstanding set forever, pinning the retirement watermark below it and
+    // wedging slot recycling for the rest of the process). `#[must_use]` does
+    // not help here -- the value is bound to a local, and the lint only
+    // catches a discarded temporary.
     let read_side = (|out: &mut PreparedRs| -> Result<(), String> {
         // Built AFTER the publish, so it reflects the pages this fire just
         // materialized or privatized rather than the mapping the guest saw.
