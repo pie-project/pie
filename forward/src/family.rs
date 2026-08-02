@@ -11,7 +11,7 @@ use crate::facts::{
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::dsl::{
-    self, attention, causal_conv1d, cuda, gated_delta, gdn_prep, matmul, matmul_per_token,
+    self, add_bias, attention, causal_conv1d, cuda, gated_delta, gdn_prep, matmul, matmul_per_token,
     rmsnorm, rmsnorm_gated, rope, rope_partial, sigmoid_gate_add, sigmoid_gate_mul, split_gdn,
     split_q_gate, split_qkv, swiglu, topk, weighted_sum, ConvW, GdnPrepW, Kv, MatW, NormW, Rs,
     Trace, Val,
@@ -90,7 +90,11 @@ fn llama_like_text(
         let fused_post = cuda_of(FireClass::Decode).is_some_and(|c| c.decode_fused_post)
             && f.fused_qkv
             && f.qk_norm == QkNorm::PerHead
-            && f.rope == RopeKind::Standard;
+            && f.rope == RopeKind::Standard
+            // The fused epilogue has no bias step (the hand-written
+            // predicate's `!use_qkv_bias` term, stated here since the
+            // build gate no longer excludes bias deployments).
+            && !f.qkv_bias;
 
         let mut y = m.embed();
 
@@ -141,6 +145,20 @@ fn llama_like_text(
                         || {},
                     );
                 }
+                // Qwen-2 family qkv biases: on the raw projections, after
+                // the lora correction and before norms/rope — the
+                // hand-written `maybe_add_bias` position (bias order vs
+                // the correction matters: the adapter delta lands on the
+                // base projection, not on base + bias).
+                let (q, k, v) = if f.qkv_bias {
+                    (
+                        add_bias(&q, &w.q_bias),
+                        add_bias(&k, &w.k_bias),
+                        add_bias(&v, &w.v_bias),
+                    )
+                } else {
+                    (q, k, v)
+                };
                 // A lowered arm with the per-head convention and Standard
                 // rope states the fused norm+rope kernel (the hand-written
                 // `fuse_qk_norm_rope` branch — bf16 rounds differently
@@ -2261,6 +2279,7 @@ mod tests {
             | OpKind::RmsnormPerHead { weight, .. }
             | OpKind::CausalConv1d { weight, .. }
             | OpKind::RmsnormGated { weight }
+            | OpKind::AddBias { weight }
             | OpKind::Embed { weight }
             | OpKind::LmHead { weight } => *weight = re(weight),
             OpKind::GdnPrep { a_log, dt_bias } => {

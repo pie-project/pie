@@ -1,5 +1,7 @@
 #include "batch/persistent_inputs.hpp"
 
+#include "batch/supergraph.hpp"
+
 #include <algorithm>
 #include <limits>
 
@@ -45,6 +47,9 @@ PersistentInputs PersistentInputs::allocate(
     p.kv_last_page_lens  = DeviceBuffer<std::uint32_t>::alloc(max_requests);
     p.kv_page_indices    = DeviceBuffer<std::uint32_t>::alloc(max_kv_pages);
     p.custom_mask        = DeviceBuffer<std::uint8_t >::alloc(max_custom_mask_bytes);
+    p.supergraph_preds   = DeviceBuffer<std::uint8_t >::alloc(
+        batch::kSupergraphPredSlots);
+    p.peel_window        = DeviceBuffer<std::uint32_t>::alloc(2);
     p.custom_mask_indptr = DeviceBuffer<std::int32_t >::alloc(static_cast<std::size_t>(max_requests) + 1);
     p.dense_mask         = DeviceBuffer<std::uint8_t >::alloc(
         dense_mask_staging_bytes(max_custom_mask_bytes));

@@ -33,7 +33,19 @@ public:
               const ForwardFn::ForwardInputs& in) override;
 
     ModelCapabilities capabilities() const override { return caps_; }
+
+    bool supergraph_body(Workspace& ws,
+                         KvCache& kv,
+                         AttentionWorkspace& attn_ws,
+                         ops::CublasHandle& cublas,
+                         const ForwardFn::ForwardInputs& in,
+                         batch::SupergraphBuilder& sg) override;
     std::uint32_t graph_layout() override;
+    std::uint32_t supergraph_graph_layout() override;
+    std::uint64_t lora_stage(Workspace& ws,
+                             const LoraTable* lora,
+                             int total_tokens,
+                             cudaStream_t stream) override;
 
     // The validated declared plan (empty → nullptr), for the load-time
     // capability site summary (imodel.hpp).

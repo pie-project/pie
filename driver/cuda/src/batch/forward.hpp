@@ -28,6 +28,10 @@
 
 #include "model/precomputed_embedding_inputs.hpp"
 
+namespace pie_cuda_driver::batch {
+class SupergraphBuilder;
+}  // namespace pie_cuda_driver::batch
+
 namespace pie_cuda_driver {
 
 class LoadedModel;
@@ -91,6 +95,7 @@ struct ForwardFn {
     bool supports_runtime_window = false;
     // See ModelCapabilities::supports_hook_graph_capture (stage 6 inc 4).
     bool supports_hook_graph_capture = false;
+    bool supports_supergraph = false;
 
     // All metadata needed to execute one forward body call. Bundled as a
     // struct so adding a new field is a one-site addition rather than a
@@ -217,6 +222,14 @@ struct ForwardFn {
         // its projection GEMMs; a body that cannot must not advertise
         // `has_lora`, and the bind gate then refuses the program instead.
         const model::LoraTable* lora = nullptr;
+
+        // The Peel device window word (pi.peel_window: {tail_start,
+        // tail_len} over token rows), non-null ONLY on hook-graph
+        // captures. The body then emits BOTH Peel regions through the
+        // device-window kernel forms, so the captured exec replays across
+        // row splits and the hook fingerprint can drop the split. Null
+        // everywhere else — eager fires keep the host windows.
+        const std::uint32_t* peel_window_d = nullptr;
     };
 
     struct PrepareInputs {
@@ -258,7 +271,18 @@ struct ForwardFn {
                      AttentionWorkspace& aws,
                      ops::CublasHandle& cublas,
                      const ForwardInputs& in);
+    std::uint64_t invoke_lora_stage(model::Workspace& ws,
+                                    const model::LoraTable* lora,
+                                    int total_tokens,
+                                    cudaStream_t stream);
+    bool invoke_supergraph_body(model::Workspace& ws,
+                                KvCache& kv,
+                                AttentionWorkspace& aws,
+                                ops::CublasHandle& cublas,
+                                const ForwardInputs& in,
+                                batch::SupergraphBuilder& sg);
     std::uint32_t invoke_graph_layout();
+    std::uint32_t invoke_supergraph_graph_layout();
 };
 
 struct NativeSystemCommitInputs {
@@ -439,6 +463,12 @@ struct BatchEngine {
     // bounded under adversarial program churn.
     std::unordered_map<ForwardGraphKey, HookGraphKeyState,
                        ForwardGraphKeyHash> hook_graph_states;
+    // Lora campaign step 3b: lora-carrying captures, partitioned by the
+    // stage pass's fingerprint exactly as hook execs are partitioned by
+    // program-set hash (same struct, same churn discipline: a stale
+    // fingerprint recaptures, consecutive churn bans the entry).
+    std::unordered_map<ForwardGraphKey, HookGraphKeyState,
+                       ForwardGraphKeyHash> lora_graph_states;
 };
 
 // Whether a fire that carries stage hooks must stay OFF the graph path.
@@ -491,7 +521,16 @@ cudaGraphExec_t capture_forward_graph_exec(
     // against state the fire's `prepare_replay` pass staged. The caller
     // must have run that pass on this fire first. TP followers and the
     // upfront lattice always pass nullptr.
-    const model::StageHooks* stage_hooks = nullptr);
+    const model::StageHooks* stage_hooks = nullptr,
+    // The unionized supergraph (S3): capture via the model's
+    // SupergraphBuilder body instead of the plain body — guards become
+    // conditional nodes over `pi.supergraph_preds`, so ONE exec serves
+    // every eligible attachment combination at this (R, N).
+    bool use_supergraph = false,
+    // Lora campaign step 3b: non-null captures a LORA-carrying body —
+    // the launches read the ENGINE-staged state (the caller must have
+    // staged this fire), and the exec lives in the fingerprint store.
+    const model::LoraTable* lora = nullptr);
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
 // (not private to batch/forward.cpp) because `enqueue_step` in

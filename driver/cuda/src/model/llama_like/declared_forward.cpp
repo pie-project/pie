@@ -14,6 +14,8 @@
 
 #include <cuda_runtime.h>
 
+#include "batch/supergraph.hpp"
+#include "kernels/add_bias.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/head_dim_pad.hpp"
@@ -193,6 +195,9 @@ inline const void* bf16_row(const void* base, int row, int width) {
 // in `llama_like_forward_declared` runs it only on exact match.
 #include "model/llama_like/generated/qwen3_0_6b.inc"
 #include "model/llama_like/generated/olmo2_1b.inc"
+#include "model/llama_like/generated/qwen2_5_1_5b.inc"
+#include "model/llama_like/generated/mistral_7b_v03.inc"
+#include "model/llama_like/generated/phi3_mini.inc"
 
 // PIE_DECLARED_FORWARD_GENERATED=1 routes digest-matched fires through
 // the generated static form instead of the interpreter walk — the third
@@ -222,7 +227,11 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // Post-norm placement (olmo2/olmo3) is admitted: the trace carries the
     // matmul(beta=0) → rmsnorm → residual_add triplet and the executor
     // launches the hand-written post-norm block's kernels.
-    if (fwd_cfg.use_qkv_bias) return out;                      // Qwen-2 bias
+    // Qwen-2 bias is admitted (OpKind::AddBias since the qwen2_5 rung):
+    // the trace states the three broadcast adds after the lora guard and
+    // before norms/rope, the executor launches the hand-written
+    // `maybe_add_bias` kernels. Guarded below on the tensors actually
+    // being bound.
     if (fwd_cfg.tp_size > 1) return out;                       // all-reduces
     // Padded head_dim (Phi-3-mini, 96 → 128) is admitted: the pad/strip
     // launches around KV-write/attention are emitter knowledge (the trace
@@ -243,6 +252,14 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
             return out;
         }
         if ((layer.qkv_proj_fused != nullptr) != fused_qkv) return out;
+        // A bias config whose tensors did not bind would make the traced
+        // AddBias ops unlaunchable; a bias-less config with stray bias
+        // tensors would mean the fact lies the other way.
+        if (fwd_cfg.use_qkv_bias &&
+            (layer.q_bias == nullptr || layer.k_bias == nullptr ||
+             layer.v_bias == nullptr)) {
+            return out;
+        }
     }
     // q/k-norm convention, from the bound tensor shape — the same evidence
     // the hand-written `rmsnorm_qk` dispatches on, resolved once here
@@ -292,6 +309,7 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
             : PieForwardNormPlacement::Pre);
     facts.qk_norm = static_cast<std::uint32_t>(qk_norm);
     facts.fused_qkv = fused_qkv ? 1 : 0;
+    facts.qkv_bias = fwd_cfg.use_qkv_bias ? 1 : 0;
     // A binding fact, like fused_qkv: bind_llama_like aliases lm_head to
     // embed when the checkpoint ties them, so pointer equality is the truth.
     facts.tied_embeddings = (w.lm_head == w.embed) ? 1 : 0;
@@ -319,13 +337,20 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // qk_norm was resolved from the bound shapes right here).
     cuda.decode_fused_post = (decode_fused_post_enabled() &&
                               cache.format().is_native_bf16() &&
-                              cfg.head_dim == cfg.head_dim_kernel)
+                              cfg.head_dim == cfg.head_dim_kernel &&
+                              // The fused epilogue has no bias step —
+                              // the hand-written predicate's term, here
+                              // since the build gate admits bias now.
+                              !fwd_cfg.use_qkv_bias)
                                  ? 1
                                  : 0;
     // workspace.cpp:33 allocates ws.rope_table unconditionally; the
     // executor still checks emptiness loudly at the table launch.
     cuda.rope_table = 1;
     cuda.force_prefill_path = fwd_cfg.force_prefill_path ? 1 : 0;
+    // Load-time: the kernel head dim the attention runs at vs the logical
+    // one (Phi-3-mini pads 96 -> 128; llama_like.cpp's head_dim_padded).
+    cuda.head_dim_padded = (cfg.head_dim != cfg.head_dim_kernel) ? 1 : 0;
 
     out.decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
@@ -354,10 +379,12 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         "/qk" + std::to_string(facts.qk_norm) +
         "/fq" + std::to_string(facts.fused_qkv) +
         "/te" + std::to_string(facts.tied_embeddings) +
+        "/qb" + std::to_string(facts.qkv_bias) +
         "/xqa" + std::to_string(cuda.xqa_decode) +
         "/dfp" + std::to_string(cuda.decode_fused_post) +
         "/rt" + std::to_string(cuda.rope_table) +
-        "/fpp" + std::to_string(cuda.force_prefill_path);
+        "/fpp" + std::to_string(cuda.force_prefill_path) +
+        "/pad" + std::to_string(cuda.head_dim_padded);
     return out;
 }
 
@@ -392,7 +419,8 @@ void llama_like_forward_declared(
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
     const StageHooks* stage_hooks,
-    const LoraTable* lora)
+    const LoraTable* lora,
+    const std::uint32_t* peel_window_d)
 {
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
@@ -401,6 +429,9 @@ void llama_like_forward_declared(
     if (generated_forward_enabled() &&
         declared.facts_digest != kGeneratedDigest_qwen3_0_6b &&
         declared.facts_digest != kGeneratedDigest_olmo2_1b &&
+        declared.facts_digest != kGeneratedDigest_qwen2_5_1_5b &&
+        declared.facts_digest != kGeneratedDigest_mistral_7b_v03 &&
+        declared.facts_digest != kGeneratedDigest_phi3_mini &&
         std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
         // Silent non-engagement is this path's failure mode; say why.
         std::fprintf(stderr,
@@ -409,6 +440,12 @@ void llama_like_forward_declared(
                      declared.facts_digest.c_str(),
                      kGeneratedDigest_qwen3_0_6b,
                      kGeneratedDigest_olmo2_1b);
+        std::fprintf(stderr, "  emitted: %s\n",
+                     kGeneratedDigest_qwen2_5_1_5b);
+        std::fprintf(stderr, "  emitted: %s\n",
+                     kGeneratedDigest_mistral_7b_v03);
+        std::fprintf(stderr, "  emitted: %s\n",
+                     kGeneratedDigest_phi3_mini);
     }
     // A1 (the class-collapse amendment): a custom mask no longer picks a
     // class — the decode/prefill traces carry it as their HasCustomMask
@@ -429,7 +466,7 @@ void llama_like_forward_declared(
                 logit_row_indices_d, num_logit_rows,
                 w_page_d, w_off_d, row_valid_d, has_write_desc,
                 custom_mask_d, custom_mask_indptr_d,
-                stage_hooks, lora);
+                stage_hooks, lora, peel_window_d);
         };
         if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
             run(generated_llama_like_decode_qwen3_0_6b,
@@ -439,6 +476,21 @@ void llama_like_forward_declared(
         if (declared.facts_digest == kGeneratedDigest_olmo2_1b) {
             run(generated_llama_like_decode_olmo2_1b,
                 generated_llama_like_prefill_olmo2_1b);
+            return;
+        }
+        if (declared.facts_digest == kGeneratedDigest_qwen2_5_1_5b) {
+            run(generated_llama_like_decode_qwen2_5_1_5b,
+                generated_llama_like_prefill_qwen2_5_1_5b);
+            return;
+        }
+        if (declared.facts_digest == kGeneratedDigest_mistral_7b_v03) {
+            run(generated_llama_like_decode_mistral_7b_v03,
+                generated_llama_like_prefill_mistral_7b_v03);
+            return;
+        }
+        if (declared.facts_digest == kGeneratedDigest_phi3_mini) {
+            run(generated_llama_like_decode_phi3_mini,
+                generated_llama_like_prefill_phi3_mini);
             return;
         }
     }
@@ -494,14 +546,29 @@ void llama_like_forward_declared(
     // (the hand-written `lora_state`), consumed by the HasLora guard's
     // correction launches. Constructed only when the predicate holds.
     const bool has_lora = lora != nullptr && lora->usable();
+    // Campaign step 3a: prefer the ENGINE-staged state (outside any
+    // capture region); local staging is the fallback.
+    const LoraFireStateHandle* lora_staged =
+        (has_lora && plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get()
+            : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
-    if (has_lora) {
-        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, /*tp=*/1, stream);
-        if (std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
-            std::fprintf(stderr,
-                         "[lora-fire] declared R=%d lanes=%u grouping=%s\n",
-                         R, lora->count, lora_state->grouping_desc().c_str());
-        }
+    if (has_lora && lora_staged == nullptr) {
+        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, /*tp=*/1, stream,
+                           ws,
+                           post_norm ? static_cast<const void*>(ws.y.data())
+                                     : static_cast<const void*>(
+                                           ws.norm_x.data()),
+                           ws.q.data(), ws.v.data(), ws.gate.data());
+    }
+    if (has_lora && std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[lora-fire] declared R=%d lanes=%u grouping=%s%s\n",
+                     R, lora->count,
+                     lora_staged != nullptr
+                         ? lora_staged->grouping_desc().c_str()
+                         : lora_state->grouping_desc().c_str(),
+                     lora_staged != nullptr ? " (engine-staged)" : "");
     }
 
     // With padding the attention kernel runs at `dk` but the softmax must
@@ -577,10 +644,19 @@ void llama_like_forward_declared(
     // it (offset zero + full length is the identity).
     int win_start = 0;
     int win_len = N;
+    // Device-window mode (peel_window_d != nullptr, hook captures only):
+    // the walk emits BOTH Peel regions at full-N grids and the windowed
+    // call forms read the split from the device word — so the captured
+    // launches are split-independent and the hook fingerprint can drop
+    // the row split. The region marker tells each windowed site which
+    // face of the word it consumes (prefix = [0, w0), tail = {w0, w1}).
+    enum class WinRegion { Full, Prefix, Tail };
+    WinRegion win_region = WinRegion::Full;
     struct WinEvent {
         std::size_t at;
         int start;
         int len;
+        WinRegion region = WinRegion::Full;
     };
     std::vector<WinEvent> win_events;
     for (std::size_t i = 0; i < op_count; ++i) {
@@ -593,6 +669,7 @@ void llama_like_forward_declared(
             if (!win_events.empty() && i == win_events.back().at) {
                 win_start = win_events.back().start;
                 win_len = win_events.back().len;
+                win_region = win_events.back().region;
                 win_events.pop_back();
                 continue;
             }
@@ -663,6 +740,32 @@ void llama_like_forward_declared(
                 // so gather-then-norm equals norm-then-gather), and copying
                 // that block whole is what keeps the two paths bit-identical.
                 require(w.final_norm, name);
+            } else {
+                throw_unknown_weight(name);
+            }
+            break;
+        }
+        case PieForwardOpKind::AddBias: {
+            // Qwen-2 family qkv biases: broadcast add onto the raw
+            // projection, the hand-written `maybe_add_bias` calls
+            // (llama_like.cpp) argument for argument. The trace states
+            // the op after the lora guard and before norms/rope, which
+            // is exactly where the hand-written block sits.
+            const std::string_view name = plan.weight_name(op);
+            const ParsedWeightName nm = parse_weight_name(name);
+            const auto& layer = layer_of(w, nm, name);
+            if (nm.field == "q_bias") {
+                kernels::launch_add_bias_bf16(
+                    ws.q.data(), require(layer.q_bias, name)->data(),
+                    N, Hq, stream);
+            } else if (nm.field == "k_bias") {
+                kernels::launch_add_bias_bf16(
+                    ws.k.data(), require(layer.k_bias, name)->data(),
+                    N, Hk, stream);
+            } else if (nm.field == "v_bias") {
+                kernels::launch_add_bias_bf16(
+                    ws.v.data(), require(layer.v_bias, name)->data(),
+                    N, Hk, stream);
             } else {
                 throw_unknown_weight(name);
             }
@@ -781,6 +884,13 @@ void llama_like_forward_declared(
             // full-N consumers (hooks, attention) see one contiguous
             // buffer — the hand-written tail split verbatim. Offset 0 +
             // full length is the plain full-N split.
+            if (peel_window_d != nullptr && win_region == WinRegion::Tail) {
+                kernels::launch_split_qkv_bf16_devwin(
+                    ws.qkv_fused.data(),
+                    ws.q.data(), ws.k.data(), ws.v.data(),
+                    peel_window_d, N, Hq, Hk, stream);
+                break;
+            }
             kernels::launch_split_qkv_bf16(
                 bf16_row(ws.qkv_fused.data(), win_start, Hq + 2 * Hk),
                 bf16_row(ws.q.data(), win_start, Hq),
@@ -911,6 +1021,27 @@ void llama_like_forward_declared(
                     plan.inputs(op).size >= 2 && !ws.rope_table.empty()
                         ? static_cast<const float*>(ws.rope_table.data())
                         : nullptr;
+                if (peel_window_d != nullptr) {
+                    // Device-window capture: the prefix form — the word's
+                    // START is this kernel's row count.
+                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+                        ws.qkv_fused.data(),
+                        ws.q.data(),
+                        cache.k(q_nm.layer), cache.v(q_nm.layer),
+                        require(layer.q_norm, q_name)->data(),
+                        require(layer.k_norm, k_name)->data(),
+                        positions,
+                        table,
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        has_write_desc ? w_page_d : nullptr,
+                        has_write_desc ? w_off_d : nullptr,
+                        row_valid_d,
+                        peel_window_d,
+                        N, num_q_heads, num_kv_heads, d,
+                        cache.page_size(), cache.hnd_layout(),
+                        cfg.rope_theta, eps, stream);
+                    break;
+                }
                 kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                     ws.qkv_fused.data(),
                     ws.q.data(),
@@ -948,6 +1079,18 @@ void llama_like_forward_declared(
                 // hook-visible rows at their absolute offsets (the
                 // hand-written tail call); offset 0 + full length is
                 // the plain full-N form.
+                if (peel_window_d != nullptr &&
+                    win_region == WinRegion::Tail) {
+                    kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                        ws.q.data(), ws.k.data(),
+                        require(layer.q_norm, q_name)->data(),
+                        require(layer.k_norm, k_name)->data(),
+                        positions,
+                        peel_window_d, N,
+                        num_q_heads, num_kv_heads, d,
+                        cfg.rope_theta, eps, stream);
+                    break;
+                }
                 kernels::launch_qk_rmsnorm_rope_bf16(
                     bf16_row(ws.q.data(), win_start, Hq),
                     bf16_row(ws.k.data(), win_start, Hk),
@@ -1060,18 +1203,26 @@ void llama_like_forward_declared(
                 break;
             }
             case LaunchKernel::AttentionFlashinferPrefillCustom: {
+                // Masked PURE-DECODE fires dispatch against their
+                // dedicated plan slot (the supergraph axiom): see
+                // LlamaLikePlanState::mask_decode_plan.
                 // The hand-written custom-mask branch, minus the choosing
                 // (llama_like.cpp:1457): the custom dispatch takes the
                 // layer view whole (no dequant) and the mask data rides
                 // as runtime args of the stated kernel.
-                if (prefill_plan == nullptr) {
+                const ops::PrefillPlanCache* mask_plan = is_pure_decode
+                    ? (plan_state.mask_decode_plan
+                           ? plan_state.mask_decode_plan.get()
+                           : nullptr)
+                    : prefill_plan;
+                if (mask_plan == nullptr) {
                     throw std::runtime_error(
                         "declared forward: trace states the custom-mask "
                         "prefill kernel but prepare built no plan");
                 }
                 auto kv_view = cache.layer_view(L);
                 ops::dispatch_attention_flashinfer_prefill_custom(
-                    *prefill_plan,
+                    *mask_plan,
                     attn_q, kv_view, attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -1097,6 +1248,14 @@ void llama_like_forward_declared(
                 // Windowed (A3): the tail rows' cells only, from their
                 // slice of the descriptors — the hand-written tail
                 // write; offset 0 + full length is the plain form.
+                if (peel_window_d != nullptr &&
+                    win_region == WinRegion::Tail) {
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, attn_k, attn_v,
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
+                    break;
+                }
                 kernels::launch_write_kv_explicit_bf16(
                     kv_view,
                     bf16_row(attn_k, win_start, Hk),
@@ -1117,7 +1276,7 @@ void llama_like_forward_declared(
                 // param1 rests at 0 — reading it applied layer 0's
                 // adapter slice everywhere, the bug the first live A/B
                 // caught).
-                if (!lora_state) {
+                if (lora_staged == nullptr && !lora_state) {
                     throw std::runtime_error(
                         "declared forward: lora correction stated but no "
                         "usable lora table (guard/pred drift)");
@@ -1129,9 +1288,9 @@ void llama_like_forward_declared(
                 }
                 const void* const qkv_in =
                     post_norm ? ws.y.data() : ws.norm_x.data();
-                lora_state->apply(
-                    cublas.handle(), op.layer, qkv_in, H, Hq, Hk,
-                    ws.q.data(), ws.v.data(), ws.gate.data());
+                (lora_staged != nullptr ? *lora_staged : *lora_state)
+                    .apply(cublas.handle(), op.layer, qkv_in, H, Hq, Hk,
+                           ws.q.data(), ws.v.data(), ws.gate.data());
                 break;
             }
             case LaunchKernel::WriteKvToPages: {
@@ -1149,6 +1308,15 @@ void llama_like_forward_declared(
                 // the fused-prefix rows the peel's other region already
                 // wrote — the hand-written tail call verbatim (0 is the
                 // plain form's default).
+                if (peel_window_d != nullptr &&
+                    win_region == WinRegion::Tail) {
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
+                        kv_view, attn_k, attn_v,
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        peel_window_d, N, R, stream, row_valid_d);
+                    break;
+                }
                 kernels::launch_write_kv_to_pages(
                     kv_view, attn_k, attn_v,
                     qo_indptr, kv_page_indices, kv_page_indptr,
@@ -1162,14 +1330,37 @@ void llama_like_forward_declared(
                 // `prefill_plan` for prefill-shaped fires and
                 // `prefill_decode_plan` for the decode-shaped
                 // force_prefill fallback — the fire's shape names which
-                // one this stated kernel runs against.
+                // one this stated kernel runs against. Under
+                // force_prefill_path prepare deliberately builds NO plan
+                // (llama_like.cpp's early return) and the hand-written
+                // body's final else runs the PLAN-LESS prefill launcher;
+                // mirror it launcher for launcher (qwen2_5, the first
+                // force-prefill deployment through the walk).
                 const ops::PrefillPlanCache* pp =
                     is_pure_decode ? prefill_decode_plan : prefill_plan;
                 if (pp == nullptr) {
-                    throw std::runtime_error(
-                        "declared forward: trace states the flashinfer "
-                        "prefill kernel but prepare built no plan for "
-                        "this fire shape");
+                    if (!fwd_cfg.force_prefill_path) {
+                        throw std::runtime_error(
+                            "declared forward: trace states the "
+                            "flashinfer prefill kernel but prepare built "
+                            "no plan for this fire shape");
+                    }
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    auto kv_view = cache.layer_view(L);
+                    ops::launch_attention_flashinfer_prefill(
+                        attn_q, kv_view, attn_out_buf,
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        qo_indptr_h, kv_page_indptr_h,
+                        N, R, num_q_heads, attn_ws, stream,
+                        layer_window_left,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    break;
                 }
                 auto kv_view = cache.layer_view(L);
                 ops::dispatch_attention_flashinfer_prefill_bf16(
@@ -1216,13 +1407,24 @@ void llama_like_forward_declared(
             const std::size_t tail_len = op.param1;
             const std::size_t tail_start = i + 1 + prefix_len;
             const std::size_t end = tail_start + tail_len;
+            if (peel_window_d != nullptr) {
+                // Device-window capture: BOTH regions are emitted — an
+                // empty region's kernels launch and early-out on the
+                // device word, so the captured exec replays across
+                // splits. No host skips, no host windows.
+                win_events.push_back({end, 0, N, WinRegion::Full});
+                win_events.push_back({tail_start, 0, N, WinRegion::Tail});
+                win_region = WinRegion::Prefix;
+                break;
+            }
             const int tail_rows = N - fast_rows;
-            win_events.push_back({end, 0, N});
+            win_events.push_back({end, 0, N, WinRegion::Full});
             if (fast_rows > 0) {
                 win_start = 0;
                 win_len = fast_rows;
                 if (tail_rows > 0) {
-                    win_events.push_back({tail_start, fast_rows, tail_rows});
+                    win_events.push_back(
+                        {tail_start, fast_rows, tail_rows, WinRegion::Full});
                 } else {
                     guard_skips.emplace_back(tail_start, tail_len);
                 }
@@ -1436,6 +1638,80 @@ void llama_like_forward_declared(
                 " has no emission rule");
         }
     }
+}
+
+
+bool llama_like_supergraph_supported(const LlamaLikeDeclaredPlan& declared) {
+    if (!generated_forward_enabled()) return false;
+    return declared.facts_digest == kGeneratedDigest_qwen3_0_6b ||
+           declared.facts_digest == kGeneratedDigest_olmo2_1b ||
+           declared.facts_digest == kGeneratedDigest_qwen2_5_1_5b ||
+           declared.facts_digest == kGeneratedDigest_mistral_7b_v03 ||
+           declared.facts_digest == kGeneratedDigest_phi3_mini;
+}
+
+bool llama_like_forward_supergraph_build(
+    const LlamaLikeDeclaredPlan& declared,
+    const Qwen3Weights& w,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    const LlamaLikePlanState& plan_state,
+    Workspace& ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    const std::uint8_t* row_valid_d,
+    bool has_write_desc,
+    const std::uint8_t* custom_mask_d,
+    const std::int32_t* custom_mask_indptr_d,
+    batch::SupergraphBuilder& sg) {
+    if (!llama_like_supergraph_supported(declared)) return false;
+    const auto run = [&](auto build_fn) {
+        build_fn(w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
+                 token_ids, positions, qo_indptr, kv_page_indices,
+                 kv_page_indptr, kv_last_page_lens, qo_indptr_h,
+                 kv_page_indptr_h, total_tokens, num_requests,
+                 logit_row_indices_d, num_logit_rows, w_page_d, w_off_d,
+                 row_valid_d, has_write_desc, custom_mask_d,
+                 custom_mask_indptr_d,
+                 /*hooks=*/nullptr, /*lora=*/nullptr,
+                 /*peel_window_d=*/nullptr, sg);
+    };
+    if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
+        run(generated_llama_like_decode_qwen3_0_6b_supergraph_build);
+        return true;
+    }
+    if (declared.facts_digest == kGeneratedDigest_olmo2_1b) {
+        run(generated_llama_like_decode_olmo2_1b_supergraph_build);
+        return true;
+    }
+    if (declared.facts_digest == kGeneratedDigest_qwen2_5_1_5b) {
+        run(generated_llama_like_decode_qwen2_5_1_5b_supergraph_build);
+        return true;
+    }
+    if (declared.facts_digest == kGeneratedDigest_mistral_7b_v03) {
+        run(generated_llama_like_decode_mistral_7b_v03_supergraph_build);
+        return true;
+    }
+    if (declared.facts_digest == kGeneratedDigest_phi3_mini) {
+        run(generated_llama_like_decode_phi3_mini_supergraph_build);
+        return true;
+    }
+    return false;
 }
 
 }  // namespace pie_cuda_driver::model

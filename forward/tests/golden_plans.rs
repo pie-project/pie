@@ -106,6 +106,100 @@ fn olmo2_1b() {
     check("olmo2_1b", &LlamaLikeFacts::olmo2_1b());
 }
 
+/// The fifth declared configuration (Qwen2.5-1.5B-Instruct), and the
+/// first with attention biases: three AddBias ops per layer land on the
+/// raw q/k/v after the (lowered-only) lora guard and before rope — the
+/// hand-written `maybe_add_bias` position. Fused QKV binding (the dense
+/// join fuses WEIGHTS; biases stay separate tensors, added after the
+/// split), no qk-norm, tied embeddings.
+#[test]
+fn qwen2_5_1_5b() {
+    check("qwen2_5_1_5b", &LlamaLikeFacts::qwen2_5_1_5b());
+}
+
+/// The lowered qwen2_5 pins: the first force-prefill deployment through
+/// the walk (GQA 6 is outside the flashinfer decode set and XQA is off
+/// live) — the decode class states dequant + the flashinfer prefill
+/// region, whose executor case falls back to the PLAN-LESS launcher when
+/// prepare (deliberately) built no plan. The cuda facts here match the
+/// live L40S derivation (xqa0/dfp0/rt1/fpp1); the digest holds the pair
+/// together.
+#[test]
+fn qwen2_5_1_5b_cuda_decode() {
+    check_plan(
+        "qwen2_5_1_5b.cuda.decode",
+        &llama_like_cuda(
+            &LlamaLikeFacts::qwen2_5_1_5b(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: true,
+                head_dim_padded: false,
+            },
+            FireClass::Decode,
+        ),
+    );
+}
+
+#[test]
+fn qwen2_5_1_5b_cuda_prefill() {
+    check_plan(
+        "qwen2_5_1_5b.cuda.prefill",
+        &llama_like_cuda(
+            &LlamaLikeFacts::qwen2_5_1_5b(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: true,
+                head_dim_padded: false,
+            },
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// The lowered phi3 pins: the first PADDED head dim through the emitter
+/// (96 -> 128) — pad staging around the KV write, the softmax scale
+/// override, the post-attention strip, all constants of the text. The
+/// cuda facts match the live L40S derivation (xqa0/dfp0/rt1/fpp0/pad1).
+#[test]
+fn phi3_mini_cuda_decode() {
+    check_plan(
+        "phi3_mini.cuda.decode",
+        &llama_like_cuda(
+            &LlamaLikeFacts::phi3_mini(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+                head_dim_padded: true,
+            },
+            FireClass::Decode,
+        ),
+    );
+}
+
+#[test]
+fn phi3_mini_cuda_prefill() {
+    check_plan(
+        "phi3_mini.cuda.prefill",
+        &llama_like_cuda(
+            &LlamaLikeFacts::phi3_mini(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+                head_dim_padded: true,
+            },
+            FireClass::Prefill,
+        ),
+    );
+}
+
 /// The unfused-binding variant: three projection matmuls, no SplitQkv. Kept
 /// golden so the binding-driven divergence stays a reviewed artifact rather
 /// than an emergent one.
@@ -402,6 +496,7 @@ fn mistral_7b_v03_cuda_decode() {
                 decode_fused_post: false,
                 rope_table: true,
                 force_prefill_path: false,
+                head_dim_padded: false,
             },
             FireClass::Decode,
         ),
@@ -419,6 +514,7 @@ fn mistral_7b_v03_cuda_prefill() {
                 decode_fused_post: false,
                 rope_table: true,
                 force_prefill_path: false,
+                head_dim_padded: false,
             },
             FireClass::Prefill,
         ),

@@ -28,6 +28,16 @@ inline constexpr std::uint32_t kGvCustomMask  = 1u << 2;
 // and a plain fire of the same (R, N, layout) have different kernel
 // sequences, so they must never share a cache entry. Layout shifts to bit 4.
 inline constexpr std::uint32_t kGvHasHooks    = 1u << 3;
+// The unionized supergraph (S3): a HIGH bit so it can never collide with
+// the shifted layout field. A supergraph key deliberately OMITS the
+// custom-mask bit — folding masked and unmasked fires into one exec is
+// the union's whole point — so the bit keeps supergraph and plain
+// captures from aliasing at the same (R, N, layout).
+inline constexpr std::uint32_t kGvSupergraph  = 1u << 31;
+// Lora-carrying captures (campaign step 3b): their execs live in the
+// fingerprint-partitioned lora store, and the bit keeps their shape keys
+// from aliasing plain or supergraph captures at the same (R, N, layout).
+inline constexpr std::uint32_t kGvLora        = 1u << 30;
 inline constexpr int           kGvLayoutShift = 4;
 
 inline constexpr std::uint32_t kGvFlagMask =

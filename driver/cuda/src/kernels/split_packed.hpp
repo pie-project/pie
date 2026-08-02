@@ -18,6 +18,15 @@ namespace pie_cuda_driver::kernels {
 // `packed` is row-major [N, q_dim + 2*kv_dim]; outputs are row-major
 // [N, q_dim] / [N, kv_dim] / [N, kv_dim]. Buffers must not overlap with
 // `packed`.
+// Peel device-window variant: {start, len} in device memory, full-grid
+// launch with early-out, base pointers.
+void launch_split_qkv_bf16_devwin(
+    const void* packed,
+    void* q_out, void* k_out, void* v_out,
+    const std::uint32_t* win_d,
+    int n_max, int q_dim, int kv_dim,
+    cudaStream_t stream);
+
 void launch_split_qkv_bf16(
     const void* packed,
     void* q_out, void* k_out, void* v_out,
@@ -51,6 +60,37 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
     const std::uint32_t* w_off,
     const std::uint8_t* row_valid,
     int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    bool hnd_layout,
+    float theta,
+    float eps,
+    cudaStream_t stream);
+
+// Peel device-window variant (PREFIX form): the fused decode epilogue
+// owns the hook-free prefix, rows [0, win_d[0]) — the window word's
+// START is this kernel's row count (the tail region starts where the
+// prefix ends). Grid spans the full `n_max` lanes; out-of-window rows
+// early-out, so a captured launch replays across row splits.
+void launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+    const void* packed,
+    void* q_out,
+    void* k_pages,
+    void* v_pages,
+    const void* q_weight,
+    const void* k_weight,
+    const std::int32_t* positions,
+    const float* rope_table,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* w_page,
+    const std::uint32_t* w_off,
+    const std::uint8_t* row_valid,
+    const std::uint32_t* win_d,
+    int n_max,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,

@@ -1,4 +1,6 @@
 #include "batch/forward.hpp"
+
+#include "batch/supergraph.hpp"
 #include "batch/graph_variant.hpp"
 
 #include <algorithm>
@@ -56,6 +58,7 @@ void ForwardFn::attach_model(model::IModel* m) {
     supports_small_prefill_graph = caps.supports_small_prefill_graph;
     supports_runtime_window       = caps.supports_runtime_window;
     supports_hook_graph_capture   = caps.supports_hook_graph_capture;
+    supports_supergraph           = caps.supports_supergraph;
 }
 
 void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
@@ -97,8 +100,29 @@ void ForwardFn::invoke_body(model::Workspace& ws,
     }
 }
 
+std::uint64_t ForwardFn::invoke_lora_stage(model::Workspace& ws,
+                                           const model::LoraTable* lora,
+                                           int total_tokens,
+                                           cudaStream_t stream) {
+    return model ? model->lora_stage(ws, lora, total_tokens, stream) : 0;
+}
+
+bool ForwardFn::invoke_supergraph_body(model::Workspace& ws,
+                                       KvCache& kv,
+                                       AttentionWorkspace& aws,
+                                       ops::CublasHandle& cublas,
+                                       const ForwardInputs& in,
+                                       batch::SupergraphBuilder& sg) {
+    return model != nullptr &&
+           model->supergraph_body(ws, kv, aws, cublas, in, sg);
+}
+
 std::uint32_t ForwardFn::invoke_graph_layout() {
     return model ? model->graph_layout() : 0u;
+}
+
+std::uint32_t ForwardFn::invoke_supergraph_graph_layout() {
+    return model ? model->supergraph_graph_layout() : 0u;
 }
 
 namespace {
@@ -268,9 +292,41 @@ cudaGraphExec_t capture_forward_graph_exec(
     const std::uint32_t* w_off_d,
     bool has_write_desc,
     int runtime_window_left,
-    const model::StageHooks* stage_hooks)
+    const model::StageHooks* stage_hooks,
+    bool use_supergraph,
+    const model::LoraTable* lora)
 {
     auto& pi = engine.inputs;
+
+    // Supergraph capture (S3): the mask arm's captured dispatch needs the
+    // custom prefill plan MATERIALIZED at capture time (the emission's
+    // null-plan check runs on the host, during capture) — and the else
+    // arm needs the decode plan. Prepare builds exactly one per call, so
+    // the supergraph capture runs prepare twice, mask-first; per-fire
+    // prepare at replay then updates whichever plan that fire's live arm
+    // consumes.
+    if (use_supergraph) {
+        ForwardFn::PrepareInputs prep{};
+        prep.qo_indptr_h = qo_indptr_h;
+        prep.kv_page_indices_h = kv_page_indices_h;
+        prep.kv_page_indices_d =
+            reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data());
+        prep.kv_page_indptr_h = kv_page_indptr_h;
+        prep.kv_page_indptr_d =
+            reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data());
+        prep.kv_last_page_lens_h = kv_last_page_lens_h;
+        prep.kv_last_page_lens_d =
+            reinterpret_cast<const std::uint32_t*>(
+                pi.kv_last_page_lens.data());
+        prep.total_tokens = N;
+        prep.num_requests = R;
+        prep.is_pure_decode = is_pure_decode;
+        prep.runtime_window_left = runtime_window_left;
+        prep.have_custom_mask = true;
+        engine.forward_fn.invoke_prepare(engine.attn_ws, prep);
+        prep.have_custom_mask = false;
+        engine.forward_fn.invoke_prepare(engine.attn_ws, prep);
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     CudaStreamOwner capture_stream;
@@ -318,9 +374,33 @@ cudaGraphExec_t capture_forward_graph_exec(
         // KV CSRs) are replay-stable per key by the same argument the plain
         // captured body makes for every other `pi.*` buffer.
         fwd_in.stage_hooks = stage_hooks;
-        engine.forward_fn.invoke_body(
-            engine.ws, engine.kv_cache, engine.attn_ws, engine.cublas,
-            fwd_in);
+        fwd_in.lora = lora;
+        // Peel device-window campaign: a hook capture reads the row split
+        // from the device word, so the exec replays across compositions
+        // and the fingerprint no longer keys on it. Non-hook captures keep
+        // host windows (their split is degenerate and capture-stable).
+        fwd_in.peel_window_d =
+            stage_hooks != nullptr ? pi.peel_window.data() : nullptr;
+        if (use_supergraph) {
+            // The union body: the mask/write-desc data pointers must be
+            // the persistent buffers UNCONDITIONALLY — a masked replay
+            // reads them even though this capture-time fire may carry no
+            // mask.
+            fwd_in.custom_mask_d = pi.custom_mask.data();
+            fwd_in.custom_mask_indptr_d = pi.custom_mask_indptr.data();
+            batch::SupergraphBuilder sg(cstream, pi.supergraph_preds.data());
+            if (!engine.forward_fn.invoke_supergraph_body(
+                    engine.ws, engine.kv_cache, engine.attn_ws,
+                    engine.cublas, fwd_in, sg)) {
+                throw std::runtime_error(
+                    "supergraph capture requested but the model has no "
+                    "emitted build for this deployment");
+            }
+        } else {
+            engine.forward_fn.invoke_body(
+                engine.ws, engine.kv_cache, engine.attn_ws, engine.cublas,
+                fwd_in);
+        }
     }
     CudaGraphOwner graph(capture_guard.end());
     if (engine.tp_comm != nullptr &&
@@ -625,6 +705,7 @@ bool forward_graph_replay_eligible(
     int num_clips,
     bool has_stage_hooks,
     bool has_lora) {
+    (void)has_lora;
     const bool mask_pointers_stable =
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
@@ -645,8 +726,24 @@ bool forward_graph_replay_eligible(
             static_cast<std::size_t>(std::max(forward_R, 0))) &&
         num_images == 0 &&
         num_clips == 0 &&
-        !has_stage_hooks &&
-        !has_lora;
+        !has_stage_hooks;
+    // (campaign step 3b: lora fires are graph-eligible now — their execs
+    // live in the fingerprint-partitioned lora store; `has_lora` remains
+    // a parameter so TP callers can keep refusing, where lora cannot
+    // occur anyway.)
+}
+
+// The unionized supergraph gate: DEFAULT ON since the width batteries
+// (multi-R + all five deployments, byte-identical A/B) went green —
+// PIE_SUPERGRAPH=0 disarms it. Fires outside the union (hooks, lora,
+// score-wanting, windowed, prefill-shaped) take their existing paths
+// untouched; the gate only reroutes union-eligible decode fires.
+static bool supergraph_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_SUPERGRAPH");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
 }
 
 void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) {
@@ -658,6 +755,14 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     auto& forward_fn = engine.forward_fn;
 
     const bool has_hooks = in.stage_hooks != nullptr;
+    // Lora campaign step 3a: stage the fire's lora state HERE — outside
+    // any capture region, before the graph decision — so both the eager
+    // body and (step 3b) a captured one consume the same pre-staged
+    // state. A null table clears; a lora fire re-stages fresh, so the
+    // body's identity check always sees THIS fire's staging.
+    const std::uint64_t lora_fingerprint =
+        engine.forward_fn.invoke_lora_stage(
+            engine.ws, in.lora, in.forward_N, cublas.stream());
     const bool hook_blocks = hook_fire_blocks_graph(engine, has_hooks);
     const bool graph_eligible = forward_graph_replay_eligible(
         engine,
@@ -693,17 +798,29 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     bool hook_prepared = false;
     HookGraphKeyState* hook_state = nullptr;
     HookGraphKeyState::Entry* hook_entry = nullptr;
+    // The unionized supergraph (S3): a pure-decode fire whose
+    // attachments live inside the union (mask x write-desc; no hooks, no
+    // lora — graph_eligible already excludes lora and hook-blocked
+    // fires) replays the conditional graph, and its cache key FOLDS the
+    // mask bit: masked and unmasked fires share the exec, the branch is
+    // the device predicate word's job.
+    const bool use_supergraph = supergraph_enabled() &&
+        engine.forward_fn.supports_supergraph && graph_eligible &&
+        in.is_pure_decode && !has_hooks && in.lora == nullptr;
     ForwardGraphKey key{};
     if (graph_eligible) {
-        const std::uint32_t graph_layout =
-            engine.forward_fn.invoke_graph_layout();
+        const std::uint32_t graph_layout = use_supergraph
+            ? engine.forward_fn.invoke_supergraph_graph_layout()
+            : engine.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
             make_graph_variant(
                 /*small_spec=*/false,
                 /*rs_verify=*/false,
-                in.have_custom_mask,
+                use_supergraph ? false : in.have_custom_mask,
                 graph_layout,
-                /*has_hooks=*/has_hooks);
+                /*has_hooks=*/has_hooks) |
+            (use_supergraph ? kGvSupergraph : 0u) |
+            (in.lora != nullptr ? kGvLora : 0u);
         key = ForwardGraphKey{
             in.forward_R,
             in.forward_N,
@@ -763,13 +880,45 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.lora != nullptr ? 1 : 0);
         }
     }
+    // Lora campaign step 3b: lora execs live in per-fingerprint entries
+    // (the hook store's discipline; the fingerprint IS the entry hash, so
+    // a changed lane structure selects a different entry rather than a
+    // stale one). Ban semantics carry over unchanged.
+    const bool has_lora_fire = in.lora != nullptr;
+    HookGraphKeyState* lora_store = nullptr;
+    HookGraphKeyState::Entry* lora_entry = nullptr;
+    // PIE_LORA_GRAPH=0 keeps lora fires eager (the measurement/rollback
+    // lever; default on since step 3b's batteries).
+    static const bool lora_graphs_enabled = [] {
+        const char* v = std::getenv("PIE_LORA_GRAPH");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (run_graph && has_lora_fire && !lora_graphs_enabled) {
+        run_graph = false;
+    }
+    if (run_graph && has_lora_fire) {
+        if (lora_fingerprint == 0) {
+            // The model has no stage support (or nothing usable) — a
+            // lora fire without staged state must not capture.
+            run_graph = false;
+        } else {
+            lora_store = &engine.lora_graph_states[key];
+            lora_entry = lora_store->find(lora_fingerprint);
+            if (lora_store->banned ||
+                (lora_entry != nullptr && lora_entry->banned)) {
+                run_graph = false;
+            }
+        }
+    }
     if (run_graph) {
         // Hook execs live in the per-program-set entries of
         // `hook_graph_states`, NOT in the shared shape-keyed cache — two hook
         // programs at one (R, N, variant) capture different graphs.
         cudaGraphExec_t exec = has_hooks
             ? (hook_entry != nullptr ? hook_entry->exec : nullptr)
-            : engine.graph_cache->get(key);
+            : has_lora_fire
+                ? (lora_entry != nullptr ? lora_entry->exec : nullptr)
+                : engine.graph_cache->get(key);
         const bool stale =
             has_hooks && exec != nullptr &&
             hook_entry->fingerprint != hook_fingerprint;
@@ -825,7 +974,9 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 pi.w_off.data(),
                 in.has_write_desc,
                 in.structured_window_left,
-                has_hooks ? in.stage_hooks : nullptr);
+                has_hooks ? in.stage_hooks : nullptr,
+                use_supergraph,
+                in.lora);
             if (has_hooks) {
                 // The capture is the one moment the model's per-layer hook
                 // coverage is observable; a body that skipped hooks would
@@ -872,7 +1023,56 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                         static_cast<unsigned long long>(
                             g_hook_graph_counters.captures));
                 }
+            } else if (has_lora_fire) {
+                if (lora_entry == nullptr) {
+                    lora_entry = lora_store->insert(lora_fingerprint);
+                    if (lora_store->banned) {
+                        ++g_hook_graph_counters.bans;
+                    }
+                } else if (lora_entry->exec != nullptr) {
+                    cudaGraphExecDestroy(lora_entry->exec);
+                }
+                lora_entry->exec = exec;
+                lora_entry->fingerprint = lora_fingerprint;
+                if (hook_graph_trace_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[lora-graph] capture R=%d N=%d variant=%u "
+                        "fp=%016llx\n",
+                        key.num_requests, key.num_tokens, key.variant,
+                        static_cast<unsigned long long>(lora_fingerprint));
+                }
             } else {
+                if (use_supergraph) {
+                    if (step_profile_enabled()) {
+                        std::fprintf(
+                            stderr,
+                            "[supergraph] capture at lookup variant=%u "
+                            "(mask=%d wdesc=%d)\n",
+                            key.variant, in.have_custom_mask ? 1 : 0,
+                            in.has_write_desc ? 1 : 0);
+                    }
+                    // The union key includes the CUSTOM prefill plan's
+                    // layout, and the capture's dual-prepare is what
+                    // materializes that plan on a bucket's first fire —
+                    // so the pre-capture key was computed against a null
+                    // plan. Re-key from the post-capture state and store
+                    // under THAT: the next fire (masked or not) recomputes
+                    // the same pair and hits.
+                    const std::uint32_t graph_layout =
+                        engine.forward_fn.invoke_supergraph_graph_layout();
+                    key.variant = make_graph_variant(
+                        /*small_spec=*/false,
+                        /*rs_verify=*/false,
+                        /*custom_mask=*/false,
+                        graph_layout,
+                        /*has_hooks=*/false) | kGvSupergraph;
+                    if (step_profile_enabled()) {
+                        std::fprintf(stderr,
+                                     "[supergraph] stored variant=%u\n",
+                                     key.variant);
+                    }
+                }
                 engine.graph_cache->put(key, exec);
             }
         } else if (has_hooks) {
@@ -895,6 +1095,33 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                     static_cast<unsigned long long>(
                         g_hook_graph_counters.replays));
             }
+        }
+        if (use_supergraph) {
+            // Arm the fire's branches: the graph's set_cond kernels read
+            // these slots (batch/supergraph.hpp). Peel's all-fast bit is
+            // constitutively 1 here — hook fires are outside the union,
+            // so every row is hook-free.
+            std::uint8_t preds[batch::kSupergraphPredSlots] = {};
+            preds[0] = in.has_write_desc ? 1 : 0;
+            preds[4] = in.have_custom_mask ? 1 : 0;
+            preds[batch::kPredSlotPeelAllFast] = 1;
+            preds[batch::kPredSlotPeelAllHooked] = 0;
+            CUDA_CHECK(cudaMemcpyAsync(
+                engine.inputs.supergraph_preds.data(), preds,
+                sizeof(preds), cudaMemcpyHostToDevice, cublas.stream()));
+        }
+        if (has_hooks) {
+            // Arm the fire's Peel window: the captured devwin kernels read
+            // {tail_start, tail_len} from this word, so ONE exec serves
+            // every row split (the device-window campaign's endpoint).
+            const std::uint32_t fast = std::min(
+                in.stage_hooks->hook_free_prefix_rows,
+                static_cast<std::uint32_t>(std::max(in.forward_R, 0)));
+            const std::uint32_t win[2] = {
+                fast, static_cast<std::uint32_t>(in.forward_N) - fast};
+            CUDA_CHECK(cudaMemcpyAsync(
+                engine.inputs.peel_window.data(), win, sizeof(win),
+                cudaMemcpyHostToDevice, cublas.stream()));
         }
         CUDA_CHECK(cudaGraphLaunch(exec, cublas.stream()));
         return;

@@ -135,6 +135,9 @@ pub enum PieForwardOpKind {
     /// `param0`, tail-region count in `param1`; the split is the
     /// fire's hook-free prefix row count, a runtime input.
     Peel = 26,
+    /// Broadcast bias add over `[rows, width]` (Qwen-2 family qkv
+    /// biases): weight name in `name`, width from the value's shape.
+    AddBias = 27,
 }
 
 /// Mirrors [`crate::trace::GuardPred`]'s wire KINDS (each arm crosses as

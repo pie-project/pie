@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 // Llama-like decoder forward — covers every "transformer block with
 // pre-norm + QKV/o + gate-up-down" architecture in pie_driver:
 // llama, qwen2, qwen3, phi3, olmo (post-norm variant), mistral (bf16
@@ -127,17 +129,35 @@ struct LlamaLikeVisionInputs {
 // can refresh the plan before the captured body reads from it. Hoisting
 // the plan out of the body lets the body live entirely inside a CUDA
 // graph capture region — no host-side work, no allocations.
+class LoraFireStateHandle;
+
 struct LlamaLikePlanState {
     ops::DecodePlanCachePtr decode_plan;
     ops::PrefillPlanCachePtr prefill_plan;
     ops::PrefillPlanCachePtr prefill_decode_plan;
+    // Custom-mask PURE-DECODE fires get their OWN plan slot (the
+    // supergraph axiom, S3: an arm may not share a mutable plan slot
+    // with a foreign fire class). Before this, masked decodes re-planned
+    // `prefill_plan` and every request's PREFILL re-planned it back —
+    // the layout oscillation cost the union key one orphan capture per
+    // request, and today's masked-variant graphs the same churn.
+    ops::PrefillPlanCachePtr mask_decode_plan;
     bool use_prefill_plan = false;
     bool use_prefill_decode_plan = false;
+    bool use_mask_decode_plan = false;
     // Set when the prefill plan was built for the FA2 score-capturing
     // dispatch. SM90-vs-FA2 is decided at PLAN time, so the body cannot
     // decide to capture on its own -- it can only honour what the prepare
     // hook already committed to.
     std::uint32_t prefill_score_window = 0;
+    // Lora campaign step 3a: the fire's PRE-STAGED lora state, staged by
+    // the engine OUTSIDE any capture region (ForwardFn::invoke_lora_stage
+    // -> LlamaLikeModel::lora_stage). Bodies consume it read-only and
+    // fall back to local staging only when the engine did not stage
+    // (e.g. a path that never calls the stage hook). Cleared/re-staged
+    // per fire by the stage call itself.
+    std::unique_ptr<LoraFireStateHandle> lora_staged;
+    const LoraTable* lora_staged_table = nullptr;
     bool use_xqa_decode = false;
     int xqa_max_pages_per_seq = 0;
     std::vector<std::uint32_t> prefill_decode_qo_indptr_h;
@@ -168,6 +188,9 @@ void prepare_llama_like_decode_plan(
     // plan is then built for the FA2 score-capturing dispatch. Decided here
     // and not in the body because SM90-vs-FA2 is a plan-time choice.
     std::uint32_t attn_score_window = 0);
+
+std::uint32_t llama_like_supergraph_graph_layout(
+    const LlamaLikePlanState& state);
 
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);
@@ -227,7 +250,12 @@ void llama_like_forward_paged(
     // vanishes with no adapters). Non-null: the body applies
     // `x(W+BA)^T = xW^T + (xA^T)B^T` at each lane's declared sites, scoped
     // to that lane's token rows.
-    const LoraTable* lora = nullptr);
+    const LoraTable* lora = nullptr,
+    // The Peel device window word ({tail_start, tail_len} in device
+    // memory), non-null ONLY on hook-graph captures: the fused-decode
+    // Peel then emits BOTH regions through the devwin kernel forms so the
+    // captured exec replays across row splits. Null keeps host windows.
+    const std::uint32_t* peel_window_d = nullptr);
 
 // The fire-scoped lora staging (`LoraFireState` in llama_like.cpp — the
 // adapter cast + grouping built once per fire), behind an opaque handle so
@@ -246,7 +274,16 @@ public:
         int kv_width,
         int intermediate,
         int tp_size,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        Workspace& ws,
+        // The fire-constant buffers the STAGE phase bakes into the
+        // pointer slab (campaign step 2): the projection input the
+        // correction reads (placement-dependent: ws.y post-norm,
+        // ws.norm_x pre-norm), the q/v outputs, and the xA^T scratch.
+        const void* qkv_in,
+        void* q_out,
+        void* v_out,
+        void* xa_scratch);
     ~LoraFireStateHandle();
     LoraFireStateHandle(const LoraFireStateHandle&) = delete;
     LoraFireStateHandle& operator=(const LoraFireStateHandle&) = delete;
@@ -271,6 +308,22 @@ private:
 // Map HF's rope_scaling_kind enum onto the driver's RopeKind. Llama3-style
 // frequency scaling maps to YaRN; the "original_yarn" branch keeps
 // HuggingFace's original formulation.
+// Lora campaign step 3a: stage the fire's lora state into
+// `state.lora_staged` OUTSIDE any capture region and answer a
+// fingerprint of what was staged (0 = no lora). The fingerprint covers
+// everything a captured lora body bakes: the lane structure (count,
+// ranks, widths, sites, token spans), the adapter device pointers, the
+// grouping mode, and the post-staging arena base (a growth changes
+// addresses and must recapture).
+std::uint64_t llama_like_lora_stage(
+    LlamaLikePlanState& state,
+    Workspace& ws,
+    const LoraTable* lora,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    int total_tokens,
+    cudaStream_t stream);
+
 RopeKind rope_kind_from_hf_config(const HfConfig& hf);
 
 // Populate the RoPE-related fields on LlamaLikeForwardCfg from the

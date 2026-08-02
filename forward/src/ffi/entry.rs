@@ -73,6 +73,10 @@ pub struct PieForwardLlamaLikeFacts {
     pub fused_qkv: u8,
     /// The lm_head weight is the embedding table; non-zero is true.
     pub tied_embeddings: u8,
+    /// Qwen-2 family attention biases (`{q,k,v}_proj.bias` bound and
+    /// added to the raw projections); non-zero is true. Appended field:
+    /// existing zero-initialized C callers read as false.
+    pub qkv_bias: u8,
 }
 
 /// Validate the C facts into the tracer's own type.
@@ -102,6 +106,7 @@ fn read_facts(facts: &PieForwardLlamaLikeFacts) -> Result<LlamaLikeFacts, PieFor
         qk_norm,
         fused_qkv: facts.fused_qkv != 0,
         tied_embeddings: facts.tied_embeddings != 0,
+        qkv_bias: facts.qkv_bias != 0,
     })
 }
 
@@ -126,6 +131,10 @@ pub struct PieForwardLlamaLikeCudaFacts {
     pub rope_table: u8,
     /// FlashInfer's decode set lacks this GQA ratio.
     pub force_prefill_path: u8,
+    /// Attention runs at a padded kernel head dim (Phi-3's 96 → 128);
+    /// non-zero is true. Appended field: existing zero-initialized C
+    /// callers read as false.
+    pub head_dim_padded: u8,
 }
 
 fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
@@ -133,6 +142,7 @@ fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
         xqa_decode: facts.xqa_decode != 0,
         decode_fused_post: facts.decode_fused_post != 0,
         rope_table: facts.rope_table != 0,
+        head_dim_padded: facts.head_dim_padded != 0,
         force_prefill_path: facts.force_prefill_path != 0,
     }
 }

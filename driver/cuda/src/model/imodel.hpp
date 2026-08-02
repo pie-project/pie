@@ -25,6 +25,10 @@ namespace pie_forward {
 class ForwardPlan;
 }
 
+namespace pie_cuda_driver::batch {
+class SupergraphBuilder;
+}  // namespace pie_cuda_driver::batch
+
 namespace pie_cuda_driver {
 
 class LoadedModel;
@@ -38,6 +42,7 @@ class CublasHandle;
 namespace model {
 
 struct Workspace;
+struct LoraTable;
 
 struct MediaEncodeInputs {
     const float* image_pixels_h = nullptr;
@@ -74,6 +79,12 @@ struct ModelCapabilities {
     // on the mask's written_layer cannot be captured), no lora, and a single
     // rank before a hook fire may replay a graph.
     bool supports_hook_graph_capture   = false;
+    // The unionized supergraph (S3): this model can spell its decode body
+    // as a SupergraphBuilder program (the emitted `..._supergraph_build`
+    // exists for the LIVE deployment's digest). The batch engine gates the
+    // capture on this plus the fire-side eligibility (pure decode, no
+    // hooks/lora/score, window == -2).
+    bool supports_supergraph           = false;
 };
 
 // Polymorphic per-model interface. Implementations hold refs to per-arch
@@ -137,7 +148,37 @@ public:
     // equivalent). 0 = a single graph variant suffices.
     virtual std::uint32_t graph_layout() { return 0; }
 
+    // The union key's layout (S3): spans every plan the supergraph's arms
+    // dispatch against. Defaults to the plain layout for models without a
+    // supergraph build.
+    virtual std::uint32_t supergraph_graph_layout() { return graph_layout(); }
+
     virtual bool encode_media(const MediaEncodeInputs&, cudaStream_t) { return false; }
+
+    // Lora campaign step 3a: stage this fire's lora state OUTSIDE any
+    // capture region (cast uploads, slab build — host+stream work the
+    // captured body must not contain). Returns a fingerprint of what
+    // was staged (0 = no lora / unsupported); the engine keys lora
+    // graph replay on it. A null table clears the staged state.
+    virtual std::uint64_t lora_stage(Workspace&,
+                                     const LoraTable*,
+                                     int /*total_tokens*/,
+                                     cudaStream_t /*stream*/) {
+        return 0;
+    }
+
+    // The unionized supergraph's capture body (S3): spell this fire's
+    // decode as conditional-armed graph work on the builder. Returns false
+    // when the deployment has no emitted build (the caller falls back to
+    // the plain capture). Only called under an active stream capture.
+    virtual bool supergraph_body(Workspace&,
+                                 KvCache&,
+                                 AttentionWorkspace&,
+                                 ops::CublasHandle&,
+                                 const ForwardFn::ForwardInputs&,
+                                 batch::SupergraphBuilder&) {
+        return false;
+    }
 };
 
 }  // namespace model

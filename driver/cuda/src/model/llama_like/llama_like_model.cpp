@@ -62,6 +62,11 @@ LlamaLikeModel::LlamaLikeModel(
         declared_ = build_llama_like_declared_plan(
             hf_config_, fwd_cfg_, weights_, kv_cache_);
     }
+    // The unionized supergraph (S3): capability = an emitted build exists
+    // for exactly this deployment's digest (and the generated gate is on).
+    caps_.supports_supergraph =
+        static_cast<bool>(declared_) &&
+        llama_like_supergraph_supported(declared_);
 }
 
 void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
@@ -131,7 +136,8 @@ void LlamaLikeModel::body(Workspace& ws,
             in.runtime_window_left,
             in.custom_mask_d, in.custom_mask_indptr_d,
             in.stage_hooks,
-            in.lora);
+            in.lora,
+            in.peel_window_d);
         return;
     }
     llama_like_forward_paged(
@@ -148,11 +154,59 @@ void LlamaLikeModel::body(Workspace& ws,
         in.runtime_window_left,
         /*vision=*/nullptr,
         in.stage_hooks,
-        in.lora);
+        in.lora,
+        in.peel_window_d);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {
     return llama_like_decode_graph_layout(plan_);
+}
+
+std::uint32_t LlamaLikeModel::supergraph_graph_layout() {
+    return llama_like_supergraph_graph_layout(plan_);
+}
+
+std::uint64_t LlamaLikeModel::lora_stage(Workspace& ws,
+                                         const LoraTable* lora,
+                                         int total_tokens,
+                                         cudaStream_t stream) {
+    return llama_like_lora_stage(
+        plan_, ws, lora, hf_config_, fwd_cfg_, total_tokens, stream);
+}
+
+
+bool LlamaLikeModel::supergraph_body(Workspace& ws,
+                                     KvCache& kv,
+                                     AttentionWorkspace& attn_ws,
+                                     ops::CublasHandle& cublas,
+                                     const ForwardFn::ForwardInputs& in,
+                                     batch::SupergraphBuilder& sg) {
+    // The declared gate's terms, restated (the capture calls this
+    // directly, bypassing body()): descriptors present when promised,
+    // config-window only, fused staging available when the trace
+    // committed to it. Hooks and lora are outside the union by
+    // eligibility; a caller passing them is a drift.
+    if (!static_cast<bool>(declared_)) return false;
+    if (in.stage_hooks != nullptr || in.lora != nullptr) return false;
+    if (in.has_write_desc &&
+        (in.w_page_d == nullptr || in.w_off_d == nullptr)) {
+        return false;
+    }
+    if (in.runtime_window_left != -2) return false;
+    if (declared_.fused_qkv && ws.qkv_fused.empty()) return false;
+    return llama_like_forward_supergraph_build(
+        declared_, weights_, hf_config_, fwd_cfg_, plan_,
+        ws, kv, attn_ws, cublas,
+        in.token_ids, in.positions,
+        in.qo_indptr_d, in.kv_page_indices_d, in.kv_page_indptr_d,
+        in.kv_last_page_lens_d,
+        in.qo_indptr_h, in.kv_page_indptr_h,
+        in.total_tokens, in.num_requests,
+        in.logit_row_indices_d, in.num_logit_rows,
+        in.w_page_d, in.w_off_d,
+        in.row_valid_d, in.has_write_desc,
+        in.custom_mask_d, in.custom_mask_indptr_d,
+        sg);
 }
 
 }  // namespace pie_cuda_driver::model

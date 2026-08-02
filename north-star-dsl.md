@@ -592,3 +592,610 @@ trackb-snapkv + trackb-h2o hook workloads on GEN clean (28 layers
 observed per fire, zero NaN, page masses sane). Everything since the
 last consolidated stamp (census fingerprints, the two naive-masked
 producer modes, doc notes) holds together.
+
+## The qwen2_5 rung — attention biases enter the vocabulary (2026-08-03)
+
+The blocked-board watch found an unused checkpoint in the cache
+(Qwen2.5-1.5B-Instruct) carrying a fact axis no deployment had
+exercised: attention biases. The rung, landed at `5c08a3e5e`:
+- `OpKind::AddBias` (wire 27): broadcast bias add on the raw
+  projections, stated after the lora guard and before norms/rope (the
+  hand-written `maybe_add_bias` position; the lora-vs-bias ORDER
+  matters — the adapter delta lands on base, not base + bias).
+- `LlamaLikeFacts.qkv_bias` (serde-defaulted, append-only); digest
+  grows the `qb` term in BOTH printers; existing incs regenerated.
+- The build gate's bias refusal became a bound-tensor check;
+  `decode_fused_post` carries `!use_qkv_bias` explicitly in both the
+  family predicate and the driver derivation.
+- Surprise second axis: qwen2_5 is the first FORCE-PREFILL deployment
+  through the walk (GQA 6 outside the flashinfer decode set, XQA off
+  live). The hand-written body's final else runs a PLAN-LESS prefill
+  launcher; the executor's stated-prefill case now mirrors that
+  fallback instead of throwing ("prepare built no plan" was the
+  first live failure — caught at model load by the stated-kernel
+  validation, exactly where the design wants drift caught).
+Live: OFF vs ON byte-identical short+long, 53 declared fires. Goldens
+pin semantic + lowered forms (xqa0/dfp0/rt1/fpp1). NEXT: the generated
+inc (emitter AddBias arm + plan-less prefill fallback emission +
+qwen2_5_1_5b write_inc + digest dispatch + GEN parity).
+
+Generated leg, same day (`a4fffd177`): the emitter's AddBias arm
+resolves buffer/width at emission (168 constant-layer launches), and
+the force-prefill decode class emits the PLAN-LESS prefill launcher
+directly — the static form makes at emission the choice the
+interpreter defers to a runtime null-check, which is rung 3's whole
+argument in one arm. qwen2_5_1_5b.inc (11.2k lines) joined the digest
+table and the facts guess matched live on first boot (no fifth catch).
+Live: OFF == GEN byte-identical short+long; the holed battery passes
+through the generated custom-mask arm WITH biases (solo == mixed 6/6,
+composed and three-prefill masked fires); qwen3 GEN sanity unchanged;
+existing incs regenerate byte-identical. THREE llama deployments now
+run generated at full width (qwen3_0_6b, olmo2_1b, qwen2_5_1_5b) plus
+the qwen3_5 hybrid — four static forms, one digest mechanism.
+
+## Mistral + Phi-3 generated legs — the matrix closes (2026-08-03, `6a1822a6f`)
+
+Mistral-7B-v0.3: zero emitter work (fused/no-qk-norm arms existed);
+digest matched first boot; OFF == GEN byte-identical at 7B.
+
+Phi-3-mini: the last emission axis — the PADDED head dim.
+`LlamaLikeCudaFacts.head_dim_padded` (appended, digest `pad` term,
+driver derivation `cfg.head_dim != cfg.head_dim_kernel`); the emitter
+resolves at emission what the interpreter resolves per fire: dk
+staging aliases, the `1/sqrt(d)` softmax override, pad staging around
+both KV-write forms, the post-attention strip after every attention
+arm. XQA×padding and fused-post×padding are emission REFUSALS (no
+deployment, no reference — refuse rather than guess). Live: OFF == GEN
+byte-identical; the holed battery passes the generated PADDED
+custom-mask arm 6/6.
+
+**Every checkpoint in the cache now runs a digest-gated static form**
+(qwen3_0_6b, olmo2_1b, qwen2_5_1_5b, mistral_7b_v03, phi3_mini +
+qwen3_5_0_8b hybrid). Six emitted texts, one digest mechanism, five
+axes it verified live this arc (xqa, dfp, wt/cm, te, and today's
+first-boot matches for qb/fpp/pad). Rung 3's claim — "the declared
+form is statically convertible to C++ at full width" — now has no
+untested deployment in this environment left to test it on.
+
+## The supergraph directive (2026-08-03) — unionized, no compromise
+
+Directive (user, this date): go to the FULL supergraph; the unionized
+supergraph is a non-negotiable condition; fix fallout after. This
+supersedes the measurement-gated stance for this thread — the
+measurement happens after the thing exists.
+
+**What "union" means here.** Today's graph reality fragments on THREE
+axes: the `ForwardGraphKey.variant` bits (mask/layout/spec), the hook
+exec partitions (per program-set, fingerprint-guarded, churn-banned),
+and outright eager fallbacks (lora fires, most attachment combos —
+`forward_graph_replay_eligible`'s exclusion list). The supergraph
+folds ALL of that into ONE conditional graph per (R, N) bucket: the
+guard vocabulary (HasWriteDesc / WantsAttnScore / HasCustomMask /
+HasLora, nested) becomes CUDA conditional IF/ELSE nodes whose
+predicates a graph-embedded kernel reads from a DEVICE-resident aux
+word, and every attachment combination replays through the same exec.
+The (R, N) bucketing stays — kernel grid dims and scalar args are
+baked at capture, which is CUDA-graph physics, and the request lattice
+already handles it; the union axis is ATTACHMENTS, exactly the axis
+the class-collapse amendment (A) reduced to five predicates.
+
+**Proven premises** (tools/supergraph-poc, run on this box):
+conditional IF/ELSE insertion during stream capture; device-read
+predicates via `cudaGraphSetConditional` inside the graph; one exec
+serving both arms across replays. CUDA 13.0 / driver 580 — all green.
+
+**The ladder:**
+- S1 ✓ — PoC + this design.
+- S2 — the emitter's third mode: `..._supergraph_build(...)` per
+  deployment × Decode class — the generated text emitted AS a capture
+  builder (straight-line segments captured; each Guard emitted as
+  conditional-node insertion + body-graph capture of its arms; the
+  set_cond kernels at graph head consuming the device aux word).
+- S3 — driver integration: the fire's aux/pred word moves to a device
+  buffer the replay path updates; `capture_forward_graph_exec` gains
+  the supergraph variant; the graph cache key drops the folded axes
+  (variant mask bit, hook partitions) for supergraph-eligible fires.
+- S4 — batteries (every attachment combo × every deployment, replay
+  vs eager byte-parity) and the fallout-repair pass the directive
+  orders LAST, including the axes the union cannot yet eat:
+  * Peel row windows (`fast_rows` bakes into kernel args — device-read
+    row windows are a kernel-surgery campaign; until then a mixed
+    hooked fire replays the all-hooked arm or falls out),
+  * flashinfer plan stability inside conditional bodies
+    (page-count-independent plans — the page-mask compact precedent),
+  * lora staging (host-driven apply inside a captured body needs the
+    grouped-GEMM form to be capture-safe).
+
+S2 landed (`1acb4ca03`): the emitter's third mode emits
+`..._supergraph_build` for all five llama deployments — guards as
+conditional nodes (mask slot 4, write-desc slot 0, chains nested into
+else bodies), Peel as its endpoint conditionals (7/8), `stream` a
+mutable local rebound per body boundary so launch text stays identical
+to the plain fn's. WantsAttnScore and HasLora arms are explicitly
+OUTSIDE the union (host-driven, capture-hostile — S4 names them);
+their fires stay eager via eligibility. Existing plain emissions
+byte-stable; +31k lines of committed builds; driver compiles; regen
+pins green; live GEN byte-stable. NEXT — S3, driver integration:
+1. a `supergraph_preds` device buffer on the persistent inputs
+   (9 slots, uploaded per fire from the launch's aux/attachment bits +
+   the two Peel endpoint bits);
+2. an IModel/forward-fn hook exposing the build fn to
+   `capture_forward_graph_exec` (the capture wraps
+   cudaStreamBeginCapture around a SupergraphBuilder + the build call);
+3. replay eligibility: supergraph-eligible = decode fire whose
+   attachments ⊆ {mask, write-desc} × Peel endpoints (score/lora/hook
+   fires eager as today);
+4. cache-key collapse: the mask variant bit leaves the key for
+   supergraph-eligible fires (one exec serves masked and unmasked).
+
+S3 landed (`cb9ad3c58`) — the union is LIVE behind PIE_SUPERGRAPH=1:
+one exec per (R, N) serves masked and unmasked decode fires (77
+shared-key replays in the first flight, byte-identical to the
+supergraph-off leg). The integration: the 9-slot device predicate
+word on persistent inputs; IModel::supergraph_body dispatched by
+digest; the capture's dual prepare materializing both arms' plans;
+the union key (kGvSupergraph bit, mask bit folded, layout = a mix
+spanning BOTH plans, post-capture re-key for the first-fire null-plan
+case).
+
+And the first flight earned its keep: the union key EXPOSED a real
+pre-existing defect — masked pure-decode fires shared the custom
+prefill plan slot with genuine prefill fires, whose per-request
+re-planning oscillated the layout (one orphan capture per request;
+today's masked-variant graphs quietly churned the same way). The
+repair is now an axiom in code: **an arm may not share a mutable plan
+slot with a foreign fire class** (`mask_decode_plan`, routed through
+prepare, the hand-written body, the interpreter case and the
+emitter's custom arm alike).
+
+S4 board (fallout repair, ordered): hook fires into the union
+(capture-safe score/page-mask machinery), lora staging capture
+safety, Peel mixed fires (device-read row windows), multi-R sweep +
+batteries at width (all deployments × attachment combos ×
+buckets), then default-on.
+
+S4 batteries, first tier (2026-08-03): the union holds at WIDTH.
+- Multi-R: 4 plain + 2 masked-dense lanes concurrent — lane outputs
+  identical ON vs OFF; the R=4 group and the R=1 solos each share one
+  supergraph exec per bucket (2 captures total, the bucketing physics).
+- All five deployments (qwen3-0.6b, olmo2, qwen2.5, phi3, mistral):
+  baseline + masked-dense + masked-none A/B byte-identical with the
+  supergraph on — the union survives bias, padded-head, post-norm, 7B
+  scale and the force-prefill deployment's captured PLAN-LESS decode.
+Remaining S4: hooks into the union, lora capture-safety, Peel mixed
+fires, then default-on.
+
+Default ON (same day): the interference battery (hook workloads
+byte-identical to the off leg across 12 runs, lora exit criterion
+holding, holed masked-prefill unchanged, small+wide A/Bs
+byte-identical) proved the gate only reroutes union-eligible decode
+fires. PIE_SUPERGRAPH=0 disarms. The supergraph is now the DEFAULT
+serving configuration for eligible fires on every deployment in this
+environment. Remaining S4: hooks and lora INTO the union (their
+machinery must become capture-safe first), Peel mixed fires
+(device-read row windows), and the perf measurement of what the union
+bought (capture-count deltas; the masked-fire graph coverage that
+eager fallbacks previously cost).
+
+## The two-path lesson (2026-08-03, `4dcd7b112`)
+
+The union's first perf guardrail run caught the per-guard form taxing
+decode 5-15%: guards are stated PER LAYER, so the conditional graph
+carried ~112 nodes and as many single-thread arm kernels per replay.
+Two facts resolved it:
+1. PoC-2 (tools/supergraph-poc/poc2.cu): sibling conditional nodes
+   share one root handle; a nested body graph CANNOT reference an
+   ancestor's handle. Per-slot shared handles only work per
+   nesting scope.
+2. Within today's union, every predicate but the mask is a CONSTANT
+   of the graph context (eligibility: write-desc required, score/lora
+   excluded, hooked rows out → Peel at all-fast).
+The build therefore emits the RESOLVED form: one top-level IF/ELSE on
+the mask, each body a fully guard-resolved straight-line walk
+(SgValuation — emission-time evaluation of what the interpreter
+branches on per fire). One handle, one arm kernel, zero nesting;
+release throughput regression gone (ranges overlap, n16 often faster
+ON). The k>1 form (per-guard conditionals + per-slot shared handles
+per scope) returns when hooks/lora join the union and the predicate
+space becomes genuinely multi-dimensional — enumerating 2^k resolved
+paths stops scaling right around k=3 at 28 layers.
+
+## The lora-graph campaign — design (2026-08-03)
+
+Today every lora fire runs eager (`!has_lora` in eligibility) — for a
+lora-serving workload that is EVERY decode step. The blockers, read
+from `LoraFireState` itself, and their resolutions:
+1. **Body-time allocation**: the A/B cast buffers and the grouped-GEMM
+   pointer slab are cudaMallocAsync'd per fire ("a lora fire never
+   enters capture, so body-time allocation is legal" — the comment
+   that stops being true). Resolution: the buffers move to a
+   fingerprint-owned persistent pool.
+2. **Per-fire staging**: the handle's constructor does host loops
+   (lane validation, cast uploads, slab fill). Resolution: split
+   stage/launch — staging becomes a prepare-style host pass OUTSIDE
+   the capture, the captured body reads only staged device buffers.
+3. **Baked GEMM shapes**: ranks, lane counts, grouping and per-lane M
+   bake into captured launches. The saving grace: in PURE DECODE every
+   lane's token span is exactly 1, so the shape set is (R, lane
+   structure, ranks) — stable across a workload's steps. Resolution:
+   a lora fingerprint (the hook-graph pattern verbatim: per-key entry
+   store, fingerprint check per fire, churn ban) keys captures;
+   replay holds while the lane structure holds.
+Steps: (1) stage/launch split + persistent buffers, eager path
+byte-stable under the lora battery; (2) fingerprint + graph
+eligibility for pure-decode lora fires (own exec store, hook
+pattern); (3) union entry — lora as a third resolved path (mask x
+lora paths at k=2 still enumerable; the per-guard shared-handle form
+waits for k=3).
+
+Consolidated sweep at tip `4dcd7b112` (default-on era): forward 78 +
+engine 395 + ABI green; qwen3 GEN short byte-stable vs the prior
+sweep; holed mixed tokens historical; hook battery 12/12 runs — the
+supergraph default holds under the whole net.
+
+Campaign step 1 landed (`c25a45026`): LoraStageArena on the Workspace
+— 256-aligned bump allocation, grow-on-demand with retired blocks
+held for in-flight readers, stream-safe per-fire reset. The cast
+buffers and the pointer slab no longer cudaMallocAsync at body time;
+the comment that justified it ("a lora fire never enters capture") is
+retired. Gate: solo lora byte-stable across a cross-build stash diff;
+zero-adapter equivalence holds. Step 2: slab uploads to a
+prepare-style stage pass, then the fingerprint + eligibility.
+
+Campaign step 2 landed (`dfe182e02`): the stage/launch split. The
+whole slab computes and uploads ONCE at fire setup (every slot value
+is a fire constant — arena addresses, layer-strided adapter slices,
+ws buffer rows); the per-member M arrays precompute into the groups;
+apply() is slot arithmetic + GEMM launches only. The capture-fatal
+pattern (per-layer pageable memcpyAsync from a scope-dying vector) is
+gone. Gates: solo lora byte-stable vs pre-campaign; zero-grouped
+z1==z2 steady-state across repeated runs (the single False is a
+cold-boot first-round composition transient — lane arrival staggers
+through warmup; the deterministic solo oracle carries correctness).
+Step 3: the fingerprint + eligibility — LoraFireState's shape tuple
+(lane count, ranks, sites, spans, grouping) hashes into a per-key
+exec store on the hook pattern; pure decode's span-of-1 keeps it
+stable across a workload's steps.
+
+Step 3a landed (`c25a45026` → this): staging leaves the body. The
+engine stages per fire before the graph decision (invoke_lora_stage;
+the staged handle on plan_state, identity-checked), all three bodies
+consume read-only with local fallback, and the stage call answers the
+step-3b fingerprint. A lora fire's body is now launches-only end to
+end. Live: 128 interpreter-leg fires on the engine-staged state; solo
+byte-stable both legs. 3b next: the fingerprint-keyed exec store +
+eligibility + capture-with-lora.
+
+Step 3b landed (`4ae61cef6`): lora fires capture and replay CUDA
+graphs. The eligibility's !has_lora term retired; kGvLora keys the
+shapes; the fingerprint-partitioned store reuses the hook struct and
+churn discipline (fingerprint = entry hash — a changed lane structure
+selects a different entry, no stale path). Live: 18 captures across
+R buckets and adapter fingerprints, silent replays between, solo
+byte-stable (replay correctness), zero-equivalence all-True, non-lora
+paths untouched. What remains of the campaign: step 4, union entry —
+lora as a resolved path in the supergraph build (k=2: mask x lora),
+which folds the last per-attachment exec split for decode fires.
+
+## The campaign's step 4, resolved by argument (2026-08-03)
+
+Should lora fold INTO the supergraph union (mask x lora, four resolved
+paths)? No — the physics says the separate store IS the terminal
+design. A captured lora arm bakes the adapter staging (GEMM shapes
+from ranks and lane counts; cuBLAS grouped calls take host shape
+arrays), so any exec containing a lora path is FINGERPRINT-KEYED — and
+a union exec would then duplicate every NON-lora path into every
+adapter-set's exec: 4-path walks x per-fingerprint copies, memory and
+instantiation multiplying for zero sharing. The 3b shape is right:
+plain/supergraph execs shared across everything non-lora; lora execs
+per fingerprint carrying only the lora walk. The same argument
+resolves HOOKS-into-union: hook execs bake program-set sideband state,
+so folding them would duplicate the plain paths per program set — the
+existing hook store is the terminal design too. The union's true axis
+is exactly what it holds today: predicates whose arms bake NO
+per-fire-class state (mask, write-desc, Peel endpoints).
+
+**Measured payoff** (release, L40S, lora-probe 128-step decode x3):
+eager 174-211 steps/s -> graph 225-243 steps/s — ~25% throughput on a
+lora-serving workload's steady state, ranges disjoint.
+PIE_LORA_GRAPH=0 is the rollback/measurement lever.
+
+The supergraph thread's remaining REAL work is therefore: Peel mixed
+fires (device-read row windows — kernel surgery; buys mixed-hook
+replay stability and any future row-windowed union axis), and the
+long-horizon capture-safety reworks if hooks/lora ever need to shed
+their fingerprints (device-indirected shapes — blocked on kernel/API
+support, e.g. device-side grouped GEMM shapes, which cuBLAS does not
+offer today).
+
+Consolidated sweep at tip `091ca131d` (2026-08-03): units green
+(forward 78, engine 395, ABI); live byte-stable on every axis —
+parity, supergraph small+wide A/B, holed mixed, hook battery, lora
+solos. The lora campaign's six commits hold together.
+
+## The Peel device-window campaign — design
+
+The supergraph fallout list's last item. Today a MIXED hooked fire
+(0 < fast_rows < N) bakes its row split into kernel args, so hook
+execs churn (or ban to eager) whenever lane composition shifts the
+split. The campaign teaches the Peel-region kernels to read the
+window from DEVICE memory:
+1. A per-fire device window word (pi.peel_window: {start,len} u32x2,
+   uploaded beside the supergraph preds).
+2. Device-window variants of the region kernels — the fused decode
+   epilogue (prefix region) and the tail's split/qk-norm-rope/KV-write
+   — launched at the FULL-N grid with a per-row window check (wasted
+   threads at the tail, bounded by N; the launch shape stops depending
+   on the split).
+3. The interpreter's Win threading and the emitter's Win expressions
+   move from host constants to the device word on the graph paths
+   (eager keeps host windows — no wasted threads where no capture
+   needs stability).
+4. The hook fingerprint drops the split; mixed fires replay one exec
+   across compositions.
+Order: kernels first (each with an A/B against the host-window form),
+then the plumbing, then the fingerprint change, batteries at each
+step. This is deliberate multi-cycle kernel surgery — correctness
+gates are the mixed-hook battery and the full sweep.
+
+## The Peel device-window campaign — landed upfront, batteries deferred (2026-08-03)
+
+Directive: implement the whole remaining campaign in one pass, test
+after. Everything below compiles clean (full driver build); the
+correctness gates (kernel A/B extension, mixed-hook battery, full
+sweep) are the NEXT cycle's work and nothing here is verified live yet.
+
+The five parts:
+1. Kernel 4 — the fused decode epilogue's PREFIX form. Both kernel
+   templates (block + warp) gained a nullable `win` param: rows
+   [0, win[0]) — the window word's START is the prefix's row count,
+   because the word stores the TAIL {start, len} and the prefix ends
+   where the tail starts. One shared dispatch
+   (`qkv_decode_fused_dispatch`); the host launcher passes null, the
+   `_devwin` launcher passes the word and grids at full N. The warp
+   kernel's early-out is warp-uniform (one warp = one (row, head)
+   unit), so the FULL_MASK shuffles never see a partial warp; the
+   block kernel's sits before any __syncthreads.
+2. Kernel 5 — `launch_write_kv_to_pages_bf16_devwin` (TAIL form):
+   `write_kv_kernel` gained the same nullable `win`; the devwin
+   launcher grids every token, out-of-window rows early-out, indexing
+   stays absolute, `first_token` rests at 0. Native-bf16 only;
+   envelope maintenance refuses (the explicit devwin's disposition).
+3. Plumbing — `pi.peel_window` (u32x2 {tail_start, tail_len});
+   `ForwardInputs::peel_window_d`, set ONLY on hook captures
+   (`capture_forward_graph_exec`); `run_forward_dispatch` uploads
+   {fast, N-fast} before EVERY hook-graph launch, beside the
+   supergraph pred upload.
+4. Win threading — the interpreter's Peel walk, the hand-written
+   body's fused branch, and the emitter's Peel emission all branch on
+   `peel_window_d`: device mode emits BOTH regions unconditionally
+   (an empty region's kernels launch and early-out on the word) via
+   the five devwin forms; host mode keeps the fast_rows ifs and
+   caller-offset windows — eager fires pay zero wasted threads. The
+   emitter's `Win` became an enum (Host {start, len} | DevPrefix |
+   DevTail); misplaced-window emissions panic. The hand-written
+   `fused_decode_qkv_post` predicate drops its `fast_rows > 0` term
+   in device mode only — the branch must not depend on the capture
+   fire's split. All five generated forms re-emitted (the sixth,
+   qwen3_5, does not consume the split and is untouched).
+5. The fingerprint — `prepare_attention_phases` no longer mixes
+   `hook_free_prefix_rows`. Safe because llama_like is the ONLY model
+   with `supports_hook_graph_capture`, and both its bodies (declared/
+   generated and hand-written) now read the split from the device
+   word on captures. Lane `token_start` terms still mix — hooked
+   lanes MOVING is real baked state; the campaign's claim is only
+   that the hook-free prefix growing/shrinking stops churning execs.
+
+Deferred (the next cycle's gates, in order): test_peel_window A/B
+cases for kernels 4+5; the mixed-hook battery proving one exec
+replays across compositions ([hook-graph] replay counts where
+captures used to churn); byte parity of hooked fires against the
+pre-campaign tip; the full consolidated sweep.
+
+## Peel campaign — the deferred gates ran, and what they taught (2026-08-03)
+
+Gate results (all on the L40S, debug, Qwen3-0.6B):
+1. Kernel A/B: test_peel_window grew kernels 4+5 — 33/33 byte-equal
+   (fused epilogue prefix at head_dim 64 warp + 32 block, both
+   layouts; windowed to-pages suffix tails). The empty-window case
+   flushed out a LATENT zero-grid launch in the host
+   launch_qk_rmsnorm_rope_bf16 (sticky invalid-argument nobody ever
+   checked) — zero-row guard added.
+2. Solo oracle parity: snapkv/h2o/snapkv-tight/plain outputs
+   byte-identical across the pre-campaign tip (e30d24d78) and the
+   campaign tip — the cross-build deterministic-solo instrument.
+3. Mixed batteries (single long snapkv instance, plain lanes joining
+   and leaving around it, identical-args lanes to hold the ps hash):
+   ONE R=2 capture, 37+38 and 57+59 replay runs across the phases,
+   ZERO fingerprint recaptures, coherent returns. The captured
+   DEVICE-WINDOW body is what replayed — its live correctness is
+   proven, not just its kernel-level byte equality.
+
+The finding the flip choreography forced: at a FIXED (R, N) key on
+pure decode, `hook_free_prefix_rows` ≡ the first hooked lane's row ≡
+that lane's `token_start`. The two fingerprint terms were REDUNDANT —
+so dropping the prefix term alone cannot change replay behavior for
+single-hook fires: a genuine split flip moves the hooked lane, and
+the RETAINED token_start term recaptures. That retention is not
+timidity — the prepared hook launches bake `token_start *
+query_columns` query offsets and the sideband row layout
+(dispatch.cu), so replaying across a lane move without device
+indirection would read the wrong rows.
+
+Terminal statement of the endpoint, revised: "mixed hooked fires
+replay one exec across compositions" = (a) model body reads the split
+from the device word — DONE, live-proven; (b) the hook side's
+lane-row-derived baked args (query offsets, score sideband rows) go
+device-indirected so token_start can leave the fingerprint — the NEXT
+campaign, surgery in dispatch.cu's prepared-launch path. Until (b),
+recaptures happen exactly when a hooked lane MOVES (composition churn
+that preserves hooked-lane placement replays clean — the batteries'
+demonstrated stability, which the old prefix term would have broken
+only in lockstep with token_start anyway).
+
+Environment note (not campaign fallout, verified on the pre-campaign
+tip): concurrent lanes multiplexed on ONE python client connection
+hang at completion delivery (engine finishes, Return events lost);
+one connection per lane works. All batteries here use separate
+connections. The a3-era mixed_fire_test passed this morning on a
+shared connection, so something in the client/event path regressed
+today — external to this thread, worth a board entry.
+
+## Half two landed — and the premise, corrected by the scheduler's sort (2026-08-03)
+
+The score-pad gather was the one captured consumer of a hooked lane's
+row that baked a VALUE (its lane→request index). It now reads the
+index from `Impl::hook_pad_requests` — an address-stable device table
+the prepare pass re-uploads every fire, one u32 per pad in build
+order; the pad bakes `&table[ordinal]`. `token_start` left the lane
+fingerprint (the query/logits/score intrinsic bases were already
+per-fire uploaded table content); the table base is mixed instead, so
+growth recaptures once, honestly. Verified live: solo oracle still
+byte-identical to the pre-campaign build; the mixed batteries replay
+with the same capture/recapture counts as before (the remaining
+recaptures are per-instance `bound` pointer churn — real baked
+sideband state, a different animal).
+
+What the flip choreographies then taught (three attempts, all
+defeated): `fire_plan.rs` STABLE-SORTS fire members with hooked
+programs LAST. The split is therefore a FUNCTION of the entry — at
+fixed (R, N, program set) the hook-free prefix cannot move, and the
+campaign's founding premise ("hook execs churn whenever lane
+composition shifts the split") described a composition change that
+always ALSO changes the bucket or the program set, i.e. selects a
+different exec entry rather than churning one. The split terms the
+fingerprint carried (prefix rows, token_start) were entry-constant
+all along; the live churn that motivated the campaign is per-instance
+pointer churn, which persists by design (one recapture per new
+program instance).
+
+What the campaign is therefore worth, stated precisely: the captured
+bodies (model side AND hook side) are now structurally independent of
+the scheduler's member-ordering policy. The sort key has already
+generalized once (`device_resolved_geometry` joined it); when it
+generalizes again — or when admission starts interleaving 3+ lanes
+(today's engine serializes admissions, another reason no battery
+could compose a flip) — the execs keep replaying where the
+host-window forms would have silently read the wrong rows. Robustness
+bought ahead of need, byte-stable everywhere, zero regression. The
+REAL exec-stability frontier, now visible: instance-independent
+baking (program-set-level sideband slots so a respawned instance
+reuses its predecessor's exec), a separate campaign if churn ever
+matters in practice.
+
+Also noted for the board: engine admissions appear serialized (no
+R=3 co-fire ever formed across every battery; new lanes admit only
+after a running lane completes). Pre-existing behavior, possibly the
+kv-contention grant rewrite's policy — not this thread's, but it caps
+composition diversity in every hook battery.
+
+## THE NORTH-STAR SUPERGRAPH DIRECTIVE (2026-08-03, user) — the spatial merge
+
+The user's verdict on the arc so far, recorded verbatim in substance:
+the shipped supergraph is ARTIFACT-sharing (one exec object reused
+across fire variants — temporal; its gain goes to zero if capture
+were free), while the north star is WORK-sharing (N member programs
+merged into ONE execution inside a fire — spatial; 32 adapters read
+the weights once, a gain no capture cache can produce). The wiki's
+measured numbers (46x/14.09x/1.53x, the 1.01x correction floor, the
+250us conditional region floor, SWITCH constant in bodies) all
+belong to the spatial mechanism. The standing order: build THAT.
+
+What pie already holds, mapped to the tart vocabulary
+(concept/supergraph_ir.md + evidence/layout_planning.md):
+- N programs per fire: EXISTS — co-batched lanes with per-lane
+  attachments; the predicate vocabulary (write-desc, score, mask,
+  lora, hooks) is the Program feature space.
+- CORRECTION class: EXISTS at the 1.01x shape — lora's span-grouped
+  additive correction on materialized q/v ("a fused edge cannot be a
+  merge point" is the has_lora term in the fused predicate).
+- Seriation v0: EXISTS — fire_plan.rs stable sort (geometry,
+  hook_program, arrival); its Prefix lowering is consumed as the
+  Peel split.
+- Lowering::Prefix as a REAL spatial mechanism: EXISTS since the
+  device-window campaign — pi.peel_window is a row-range member mask
+  in device memory; one exec serves any split.
+- Conditional machinery: EXISTS (SupergraphBuilder, device preds,
+  capture-time insertion, handle scope rules) — exactly what the
+  STRUCTURAL class needs; only its GRANULARITY is wrong (wired to
+  fire-level bits, must move to region/row-range level).
+What is missing (the user's five-item ladder, in pie terms):
+1. Per-op member masks: predicates become per-REGION row windows
+   (seriation makes member sets contiguous, so a window word per
+   axis — peel_window's generalization — IS the bitmask).
+2. Edge buffers at divergence points (the materialization decision,
+   today implicit in the fused-vs-unfused predicate, becomes
+   plan-owned).
+3. The row layout planner: the sort key generalized so EVERY axis's
+   member set is an interval (lexicographic refinement now; PQ-tree
+   C1P when axes stop nesting — layout_planning.md).
+4. The union pass: N per-class traces -> one merged op list whose
+   divergent ops carry windows; fire-level Guards dissolve into
+   region windows. This kills the 2^k wall at its root: no path
+   enumeration, member masks on nodes.
+5. (Ready.) The admission side already co-batches the programs.
+
+The NS ladder (each rung parity-gated live, per standing practice):
+- NS-1: seriation refinement — MemberFacts gains the mask axis; the
+  sort key nests it under hooks; a SITE_ATTENTION_MASK site with the
+  unmasked-prefix/masked-tail split as plan data (the mask analogue
+  of Stage 1's fast_rows). Engine-side only, consumed later.
+- NS-2: the first spatial mask fire — the masked pure-decode arm
+  stops serving ALL rows with the custom-mask kernel: unmasked
+  window takes the decode kernel, masked window the custom kernel,
+  both device-windowed (the Peel pattern on a second axis). This is
+  the first fire where two attention kernels serve one fire by row
+  range — the real "여러 멤버를 하나의 실행으로".
+- NS-3: window words become a vector (pi.region_windows), one per
+  divergence axis; the emitter's Guard emission takes windows from
+  the plan instead of fire-level bits; conditional nodes gate on
+  window-nonempty at REGION granularity (>=250us bodies).
+- NS-4: the union pass in the forward crate — per-class traces merge
+  by fingerprint (SCS with the blocking rule); goldens pin the
+  merged op lists; the 2^k supergraph key collapses to bucket keys.
+- NS-5: retire the fire-level two-path form once NS-3/4 serve its
+  fires (it remains the fallback until byte-parity holds everywhere).
+
+## NS-1 live gate + NS-2 design, pinned pre-implementation (2026-08-03)
+
+NS-1 gates (L40S, debug): masked-dense == masked-none byte-identical
+under the new seriation; solo oracle byte-stable vs pre-campaign;
+concurrent masked+plain mix green. The reorder is live and harmless.
+
+NS-2 — the spatial mask fire, design:
+- Scope: hook-free pure-decode fires with 0 < unmasked < R. Hooked+
+  masked fires keep the fire-level arm (the seriation key nests mask
+  under hooks, so the mask set is not contiguous there).
+- The split source of truth is the PLAN: SITE_ATTENTION_MASK's
+  fast_rows crosses the wire exactly as planned_hook_free_prefix_rows
+  does (the B pattern: planned value + driver cross-check against a
+  wire-derivable bound where possible; the driver CANNOT derive
+  per-row maskness itself — composed assemblies synthesize causal
+  rows for unmasked lanes).
+- Prepare builds BOTH plans for such fires: the decode plan over the
+  PREFIX sub-CSR (host CSRs unchanged, R' = split) and the custom
+  mask plan over the SUFFIX (host CSR slices rebased by
+  qo_indptr_h[split]; the device-side rebased suffix CSRs upload into
+  dedicated pi buffers per fire — pi.mask_suffix_{qo,kvpp,kvlpl},
+  R+1 headroom).
+- The body (hand-written first, then interpreter case, then emitter
+  arm): attention ONLY splits — decode kernel over rows [0, split),
+  custom prefill kernel over [split, N) reading the suffix CSRs and
+  the mask (mask indptr is already suffix-relative once composition
+  stops synthesizing causal rows for the prefix — NS-2 keeps the
+  synthesized rows and offsets custom_mask_indptr_d by the prefix's
+  entries instead, so composition stays untouched). QKV, KV-write,
+  MLP, lm_head stay full-N shared — the work-sharing is preserved;
+  attention contributes the two structural points per layer the IR
+  predicts.
+- Numerics statement for the gates: unmasked lanes in a mixed fire
+  MOVE from custom-kernel to decode-kernel numerics — byte-equal to
+  their solo-plain selves (the more consistent contract), NOT to
+  yesterday's mixed output. Masked lanes stay byte-equal to the
+  masked arm. Gates: masked solo unchanged; mixed fire's unmasked
+  lanes == plain solo; dense==none still holds per lane.
+- Gate lever: PIE_SPATIAL_MASK (default OFF until the ladder's own
+  batteries pass; flips ON with its consolidated sweep).
+- Graph path: the supergraph mask arm keeps serving masked fires
+  until NS-3 windows the arms (region windows + window-nonempty
+  conditionals); NS-2 is eager-first.

@@ -144,6 +144,9 @@ pub struct Layer {
     pub q_proj: MatW,
     pub k_proj: MatW,
     pub v_proj: MatW,
+    pub q_bias: MatW,
+    pub k_bias: MatW,
+    pub v_bias: MatW,
     pub o_proj: MatW,
     pub gate_up: MatW,
     pub down: MatW,
@@ -216,6 +219,9 @@ impl M {
             q_proj: mat("q_proj", f.q_width()),
             k_proj: mat("k_proj", f.kv_width()),
             v_proj: mat("v_proj", f.kv_width()),
+            q_bias: mat("q_bias", f.q_width()),
+            k_bias: mat("k_bias", f.kv_width()),
+            v_bias: mat("v_bias", f.kv_width()),
             o_proj: mat("o_proj", f.hidden),
             gate_up: mat("gate_up", 2 * f.intermediate),
             down: mat("down", f.hidden),
@@ -361,6 +367,18 @@ pub fn rmsnorm(x: &Val, w: &NormW) -> Val {
         None => b.rmsnorm(x.id, &w.name, w.variant),
         Some(head_dim) => b.rmsnorm_per_head(x.id, &w.name, head_dim, w.variant),
     });
+    Val {
+        t: x.t.clone(),
+        id,
+        layer: w.layer,
+    }
+}
+
+/// Broadcast bias add (`OpKind::AddBias`): `x[r, :] += bias`. The Qwen-2
+/// family's qkv biases; the kernel is 1:1 so semantic and lowered traces
+/// state the same op.
+pub fn add_bias(x: &Val, w: &MatW) -> Val {
+    let id = x.t.with(w.layer, |b| b.add_bias(x.id, &w.name));
     Val {
         t: x.t.clone(),
         id,
