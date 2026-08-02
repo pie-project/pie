@@ -156,6 +156,13 @@ const GATHER_POLL_US: u64 = 500;
 /// nothing and keeps the dense wait-all path.
 const ESCAPE_GRACE_US: u64 = 2_000;
 
+/// How long a successor that has already consumed its execution slot may keep
+/// an otherwise fully-submitted boundary waiting for its first fire. A healthy
+/// join lands in microseconds, so this is three orders of magnitude of slack,
+/// and it is still fifty times under the strict watchdog — a join that misses
+/// it was never "imminent" in any sense the epoch benefits from.
+const JOIN_SETTLE_US: u64 = 20_000;
+
 struct ArrivedFire {
     slot: u32,
     /// `None` when the fire was rejected at scheduler admission — it counts
@@ -1294,14 +1301,38 @@ impl FramePolicy {
                 return FramePlan::Terminate(expired);
             }
             let joining = engine_owes;
-            let joining = if joining && self.join_gate_circular(executing) {
+            // `missing == 0` is the second, wider way out of the join gate,
+            // and unlike `join_gate_circular` it needs no circularity proof:
+            // every lane the seal is actually waiting on has already
+            // submitted, and nothing is executing to re-decide the boundary.
+            // A joiner is by definition NOT a member yet — it has no lane in
+            // the wait-set — so sealing here excludes nobody. It only starts
+            // the next epoch without a process that was going to arrive
+            // anyway, which is a density optimisation, never correctness.
+            //
+            // `is_joining()` claims that optimisation far too readily under
+            // churn: `(pending_slots > 0 || !departing.is_empty()) &&
+            // !staged.is_empty()` is essentially always true once the pool is
+            // oversubscribed, so a fully-submitted boundary sat out the whole
+            // strict-watchdog window while the GPU idled. Measured on
+            // `churn_extreme` (1024-way over 96 pages): 51.3s with 23 submit
+            // deadline breaches and five `[frame-stall]` reports before,
+            // 33.6s with all 4096 requests completed after.
+            let joining = if joining
+                && (self.join_gate_circular(executing) || (missing == 0 && !executing))
+            {
                 // Same grace period as the rebind escape, for the same
                 // reason: a healthy gather resolves in microseconds, so
                 // waiting ESCAPE_GRACE_US before concluding the cycle is
                 // real costs nothing and keeps the dense wait-all path.
+                let grace = if self.joins_in_flight.is_empty() {
+                    ESCAPE_GRACE_US
+                } else {
+                    JOIN_SETTLE_US
+                };
                 let deadline = *self
                     .join_escape_deadline
-                    .get_or_insert(now + Duration::from_micros(ESCAPE_GRACE_US));
+                    .get_or_insert(now + Duration::from_micros(grace));
                 now < deadline
             } else {
                 self.join_escape_deadline = None;
@@ -1320,11 +1351,8 @@ impl FramePolicy {
             // that was going to resolve, because nothing is executing. The grace
             // period keeps a healthy gather (which resolves in microseconds) on
             // the dense wait-all path.
-            let escaping = missing_idle > 0
-                && !joining
-                && !executing
-                && missing == missing_idle
-                && {
+            let escaping =
+                missing_idle > 0 && !joining && !executing && missing == missing_idle && {
                     let deadline = *self
                         .rebind_escape_deadline
                         .get_or_insert(now + Duration::from_micros(ESCAPE_GRACE_US));
@@ -2364,20 +2392,29 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 60, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 61, 1, 1);
         let queued: QueuedFireIds = [60, 61].into_iter().collect();
-        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![60, 61]);
+        assert_eq!(
+            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            vec![60, 61]
+        );
 
         // b has a complete frame; a is awaited but silent, so nothing seals.
         policy.on_fire_enqueued(stamp(b, 1, 0, 2), Some(b), 70, 1, 1);
         policy.on_fire_enqueued(stamp(b, 1, 1, 2), Some(b), 71, 1, 1);
         let queued: QueuedFireIds = [70, 71].into_iter().collect();
         assert!(
-            !matches!(plan(&mut policy, &queued, Instant::now()), FramePlan::Dispatch(_)),
+            !matches!(
+                plan(&mut policy, &queued, Instant::now()),
+                FramePlan::Dispatch(_)
+            ),
             "wait-all must hold while a is still a member"
         );
 
         // a leaves the wait-set: b's frame is now the whole quorum.
         policy.on_lane_park(a, 1);
-        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![70, 71]);
+        assert_eq!(
+            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            vec![70, 71]
+        );
     }
 
     /// Park is ordered against the lane's OWN submits, not against the call:
@@ -2397,13 +2434,20 @@ mod tests {
         let queued: QueuedFireIds = [80, 81, 90, 91].into_iter().collect();
         let mut sealed = fires(&drive_past_cold_hold(&mut policy, &queued));
         sealed.sort_unstable();
-        assert_eq!(sealed, vec![80, 81, 90, 91], "a's queued frame still counts");
+        assert_eq!(
+            sealed,
+            vec![80, 81, 90, 91],
+            "a's queued frame still counts"
+        );
 
         // Now the park is at the head: b seals alone.
         policy.on_fire_enqueued(stamp(b, 1, 0, 2), Some(b), 92, 1, 1);
         policy.on_fire_enqueued(stamp(b, 1, 1, 2), Some(b), 93, 1, 1);
         let queued: QueuedFireIds = [92, 93].into_iter().collect();
-        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![92, 93]);
+        assert_eq!(
+            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            vec![92, 93]
+        );
     }
 
     /// There is no `join`: the next submit rejoins atomically with the slot
@@ -2426,7 +2470,10 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 1, 1, 2), Some(b), 121, 1, 1);
         let queued: QueuedFireIds = [110, 120, 121].into_iter().collect();
         assert!(
-            !matches!(plan(&mut policy, &queued, Instant::now()), FramePlan::Dispatch(_)),
+            !matches!(
+                plan(&mut policy, &queued, Instant::now()),
+                FramePlan::Dispatch(_)
+            ),
             "the rejoined lane must be awaited again"
         );
 
@@ -2472,7 +2519,10 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 160, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 161, 1, 1);
         let queued: QueuedFireIds = [160, 161].into_iter().collect();
-        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![160, 161]);
+        assert_eq!(
+            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            vec![160, 161]
+        );
     }
 
     /// A member that stops submitting without parking is terminated once the
@@ -2617,7 +2667,10 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 411, 1, 1);
         let queued: QueuedFireIds = [410, 411].into_iter().collect();
         let now = Instant::now();
-        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![410, 411]);
+        assert_eq!(
+            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            vec![410, 411]
+        );
         // Long past the deadline, the parked lane is still alive and can
         // rejoin — it left the wait-set, so it was never blocking anything.
         let queued = QueuedFireIds::default();
@@ -2669,7 +2722,10 @@ mod tests {
         // Bind done: now the clock runs, and only from here.
         policy.on_bind_completed(Some(a));
         let armed = now + deadline * 10;
-        assert!(!matches!(plan(&mut policy, &queued, armed), FramePlan::Terminate(_)));
+        assert!(!matches!(
+            plan(&mut policy, &queued, armed),
+            FramePlan::Terminate(_)
+        ));
         assert_eq!(
             plan(&mut policy, &queued, armed + deadline),
             FramePlan::Terminate(vec![a])
