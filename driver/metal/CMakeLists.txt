@@ -479,6 +479,14 @@ target_include_directories(llama_decode_step_test PRIVATE
 target_link_libraries(llama_decode_step_test PRIVATE pie_driver_metal_lib)
 add_test(NAME llama_decode_step_test COMMAND llama_decode_step_test)
 
+add_executable(llama_mb_test tests/llama_mb_test.cpp)
+target_compile_features(llama_mb_test PRIVATE cxx_std_20)
+target_include_directories(llama_mb_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(llama_mb_test PRIVATE pie_driver_metal_lib)
+add_test(NAME llama_mb_test COMMAND llama_mb_test)
+
 add_executable(heap_layout_slot_test tests/heap_layout_slot_test.cpp)
 target_include_directories(heap_layout_slot_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src

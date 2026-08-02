@@ -39,11 +39,43 @@ Kernel pso_kind(Kind k);
 /// is already an argument here. `mb` is where the paged KV scatter lives; a
 /// paged geometry without it is a load-time error rather than a silent run of
 /// the ring kernel against page-table binds.
+/// `rows` and `head_rows` must mirror what `launch_shape` was given EXACTLY.
+/// A grid computed for one tiling against a pipeline compiled for another is
+/// not a crash -- it is wrong numbers.
 Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& base,
-            const LlamaPsos& ll, const MultiBatchPsos* mb = nullptr);
+            const LlamaPsos& ll, const MultiBatchPsos* mb = nullptr, int rows = 1,
+            int head_rows = 1);
 
-/// Its grid and threadgroup.
-void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadgroup& tg);
+/// Its grid and threadgroup, over `rows` tokens.
+///
+/// One function for M=1 and M>1, where gpt-oss and gemma4 each carry a second
+/// `launch_shape_mb`. The shared `*_mb_dispatch` helpers ARE the M=1 shapes
+/// with a row count folded in and agree with them exactly at `rows == 1`, so a
+/// second switch over the same thirty kinds would buy nothing and would be a
+/// second place for a shape to drift.
+///
+/// `head_rows` is how many rows the TAIL runs on -- what `RowGather` compacted
+/// for the sampler. It is not `rows`: a prefill samples a few of its tokens and
+/// the head is the most expensive dispatch in the step.
+void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadgroup& tg,
+                  int rows = 1, int head_rows = 1);
+
+/// A dense projection's GEMM row count, padded up to a whole BM tile so the
+/// matmul engages at any batch rather than only at exact multiples of one. The
+/// padding rows compute discardable values into pool rows nothing reads.
+int llama_qmm_rows(int rows);
+
+/// The pool's row count: the widest padding any batch up to `max_rows` can ask
+/// for, which is what the scratch must be sized against.
+int llama_qmm_pool_rows(int max_rows);
+
+/// Whether a kind is a dense projection, and so a GEMM candidate. NOT the
+/// routed three -- each row picks its own experts, so a tile spanning rows
+/// would span weights.
+bool llama_is_dense_proj(Kind k);
+
+/// The GEMM's column tile for a dense projection, or 0 to keep the matvec.
+int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows);
 
 /// `run_ends[i]`: the last position of the concurrency run containing `i`. What
 /// the colourer needs to know about which barriers the encoder will drop.
@@ -52,6 +84,7 @@ std::vector<int> llama_run_ends(const std::vector<Dispatch>& dag);
 /// Walk the DAG with a real encoder.
 void encode_llama_step(StepEncoder& se, const std::vector<Dispatch>& dag,
                        const LlamaGeometry& g, const DecodeStepPsos& base, const LlamaPsos& ll,
-                       int ordinal_base = 0, const MultiBatchPsos* mb = nullptr);
+                       int ordinal_base = 0, const MultiBatchPsos* mb = nullptr, int rows = 1,
+                       int head_rows = 1);
 
 }  // namespace pie::metal::llama

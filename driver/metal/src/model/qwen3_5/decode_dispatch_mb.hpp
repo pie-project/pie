@@ -186,7 +186,9 @@ inline void qmm_t_dispatch(int out_vec, int N, int bn, int bm, Grid& g, Threadgr
 // rms_single_row over N tokens × n_rows rows-per-token (e.g. per-head q/k norm). One
 // threadgroup per row; rows stack token-major [N*n_rows, row_size]. grid.x = (row_size/4)*n_rows*N.
 inline void rms_mb_dispatch(int row_size, int n_rows, int N, Grid& g, Threadgroup& tg) {
-    const uint32_t t = uint32_t(row_size) / 4;  // N_READS = 4
+    // Rounded up, matching `rms_dispatch`: at N == 1 these two must agree
+    // exactly, because a family that uses this one for both is relying on it.
+    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows) * uint32_t(N), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }
