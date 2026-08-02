@@ -77,6 +77,25 @@ class ForwardPlan {
         return ForwardPlan(raw);
     }
 
+    /// Trace the LOWERED llama_like — the same text, with the CUDA backend
+    /// facts and a fire class in hand, so the class arms run and the
+    /// traced form STATES its kernels as `Launch` ops (north-star-dsl.md).
+    /// Call once per class the deployment fires; the semantic trace above
+    /// remains the parity reference.
+    static ForwardPlan trace_llama_like_cuda(
+        const PieForwardLlamaLikeFacts& facts,
+        const PieForwardLlamaLikeCudaFacts& cuda,
+        PieForwardFireClass fire_class) {
+        PieForwardPlan raw{};
+        const PieForwardStatus status = pie_forward_trace_llama_like_cuda(
+            &facts, &cuda, static_cast<std::uint32_t>(fire_class), &raw);
+        if (status != PieForwardStatus::Ok) {
+            throw std::runtime_error(
+                "forward plan: lowered trace failed (" + status_name(status) + ")");
+        }
+        return ForwardPlan(raw);
+    }
+
     /// Trace the qwen3_5_moe MoE MLP-block FRAGMENT — the first traced form
     /// carrying `dyn` ops (`TopK`, selector-carrying `Matmul`s,
     /// `WeightedSum`, `SigmoidGateAdd`).
@@ -185,6 +204,9 @@ class ForwardPlan {
 
     IdSpan inputs(const PieForwardOp& op) const { return ids(op.inputs); }
     IdSpan outputs(const PieForwardOp& op) const { return ids(op.outputs); }
+    /// `Launch` only: the weight names the stated kernel consumes, as NAME
+    /// indices (resolve each with [`name`]), in signature order.
+    IdSpan aux_names(const PieForwardOp& op) const { return ids(op.aux_names); }
 
     /// A name-table entry as a view into the plan's blob; valid for the
     /// plan's lifetime (the strings are not NUL-terminated — see

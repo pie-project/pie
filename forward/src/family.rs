@@ -121,13 +121,26 @@ fn llama_like_text(
                     )
                 };
                 // The weight knows its convention (per-head, row-global,
-                // or — under QkNorm::Off — no norm exists to apply).
-                let (q, k) = if f.qk_norm == QkNorm::Off {
-                    (q, k)
+                // or — under QkNorm::Off — no norm exists to apply). A
+                // lowered arm with the per-head convention and Standard
+                // rope states the fused norm+rope kernel (the hand-written
+                // `fuse_qk_norm_rope` branch — bf16 rounds differently
+                // from the triple, so parity requires the same launch);
+                // the Global and Off conventions keep the semantic ops,
+                // whose kernels are 1:1.
+                let per_head_fused = m.lowering().is_some()
+                    && f.qk_norm == QkNorm::PerHead
+                    && f.rope == RopeKind::Standard;
+                let (q, k) = if per_head_fused {
+                    cuda::qk_rmsnorm_rope(&q, &k, &w.q_norm, &w.k_norm)
                 } else {
-                    (rmsnorm(&q, &w.q_norm), rmsnorm(&k, &w.k_norm))
+                    let (q, k) = if f.qk_norm == QkNorm::Off {
+                        (q, k)
+                    } else {
+                        (rmsnorm(&q, &w.q_norm), rmsnorm(&k, &w.k_norm))
+                    };
+                    rope(&q, &k, f.rope)
                 };
-                let (q, k) = rope(&q, &k, f.rope);
                 w.kv.append(&k, &v);
                 q
             };

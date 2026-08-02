@@ -411,6 +411,34 @@ pub mod cuda {
         .expect("fused post produces q")
     }
 
+    /// `kernels::launch_qk_rmsnorm_rope_bf16`: the fused per-head q/k
+    /// norm + Standard rope, one launch — the hand-written
+    /// `fuse_qk_norm_rope` branch. bf16 rounding differs between this
+    /// kernel and the norm+rope triple it replaces, so parity requires
+    /// stating it wherever the hand-written path takes it: every lowered
+    /// arm with per-head qk-norm and Standard rope that did not take the
+    /// fully-fused decode post. In place on q and k; SSA-wise two fresh
+    /// values.
+    pub fn qk_rmsnorm_rope(q: &Val, k: &Val, q_norm: &NormW, k_norm: &NormW) -> (Val, Val) {
+        let ids = q.t.with(q.layer, |b| {
+            let q_sh = b.value_shape(q.id);
+            let k_sh = b.value_shape(k.id);
+            b.launch(
+                "launch_qk_rmsnorm_rope_bf16",
+                vec![q_norm.name.clone(), k_norm.name.clone()],
+                None,
+                vec![q.id, k.id],
+                vec![(q_sh, DType::BF16), (k_sh, DType::BF16)],
+            )
+        });
+        let mk = |id| Val {
+            t: q.t.clone(),
+            id,
+            layer: q.layer,
+        };
+        (mk(ids[0]), mk(ids[1]))
+    }
+
     /// `ops::launch_attention_xqa_decode_bf16_prepared` (whose contract
     /// includes the fire-wide XQA prepare).
     pub fn attention_xqa_decode(q: &Val, kv: &Kv, q_width: u32) -> Val {

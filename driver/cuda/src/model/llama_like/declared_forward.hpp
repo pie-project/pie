@@ -1,22 +1,29 @@
 #pragma once
 
-// Declared-forward executor for the llama_like family (Stage 3,
-// pie-application-plan.md §7): walk the traced form the `forward/` crate
-// produced at model load and launch the SAME kernels, on the SAME workspace
-// buffers, that `llama_like_forward_paged`'s unfused path launches. Nothing
-// here generates a kernel — op→kernel selection is this driver's knowledge,
-// exactly as `contract.hpp` states for the loader's specs.
-//
-// Scope: the hand-written path's full kernel vocabulary, reached through
-// two emitter peepholes over the deliberately-unfused trace:
-//   * RmsnormPerHead x2 + Rope → `launch_qk_rmsnorm_rope_bf16`, the
-//     hand-written `fuse_qk_norm_rope` branch;
-//   * Matmul(qkv) + SplitQkv + RmsnormPerHead x2 + Rope + KvAppend →
-//     `launch_qkv_decode_qk_norm_rope_write_kv_bf16`, the hand-written
-//     `fused_decode_qkv_post` branch, under the SAME predicate (including
-//     the PIE_CUDA_DECODE_FUSED_POST gate).
+// Declared-forward executor for the llama_like family — DUMB since rung 2
+// (north-star-dsl.md): it walks the CLASS trace for the fire's shape
+// (decode/prefill), in which the declaration already STATED every kernel
+// choice — the fused decode-QKV epilogue, the fused qk-norm+rope, the
+// attention kernel — as `Launch` ops carrying launcher symbols. The
+// executor resolves symbols in its name→launcher registry and BINDS
+// (buffers, plan caches, pad/strip staging); it never chooses between two
+// kernels for semantic reasons. The peepholes and `use_*_path` booleans
+// that used to re-derive those choices per fire are deleted; their
+// predicates live in `forward/src/family.rs`'s class arms, evaluated once
+// at model load against `PieForwardLlamaLikeCudaFacts` derived in `build`.
 // Bit-parity requires the same launches, not just the same math — the
 // fused kernels round differently from their unfused sequences.
+//
+// What remains driver-side, documented as remaining and why:
+//   * the `has_write_desc` KV-write mechanism (explicit descriptors vs
+//     page-derived) — a per-fire RUNTIME input; expressing it in the
+//     trace needs the `Guard` op (north-star-dsl.md), until which
+//     KvAppend's and the fused epilogue's write-mechanism branch stays;
+//   * pad/strip staging around KV-write/attention for padded head dims —
+//     buffer routing, the mechanical binding the dumbness criterion
+//     leaves with the driver;
+//   * per-layer window resolution and plan-cache binding — parameters OF
+//     the stated kernel, not choices between kernels.
 // Everything the trace cannot express yet (hooks, custom masks, TP,
 // vision, quantized projections, non-standard rope, qkv bias)
 // falls back to `llama_like_forward_paged` — the caller gates, `build`
@@ -80,29 +87,47 @@
 
 namespace pie_cuda_driver::model {
 
-// The traced form plus what the executor needs to know about how it was
-// traced. Built once at model construction (the facts are load-time facts;
-// re-tracing per fire would contradict the trace's whole premise).
+// The traced forms plus what the executor needs to know about how they
+// were traced. Built once at model construction (the facts are load-time
+// facts; re-tracing per fire would contradict the trace's whole premise).
+//
+// Rung 2 (north-star-dsl.md): `decode`/`prefill` are the CLASS traces —
+// the declaration run with this deployment's derived CUDA facts and a
+// fire class, so every kernel choice is STATED as a `Launch` op. The
+// executor walks whichever class the fire is and resolves launcher
+// symbols in its name→launcher registry; the peepholes and `use_*_path`
+// booleans it used to derive are deleted. `plan` is the SEMANTIC trace,
+// kept as the parity reference and for consumers that predate lowering
+// (site summaries, the Metal emitter).
 struct LlamaLikeDeclaredPlan {
     pie_forward::ForwardPlan plan;
-    // The binding fact the trace was taken against; the per-fire gate
+    pie_forward::ForwardPlan decode;
+    pie_forward::ForwardPlan prefill;
+    // The binding fact the traces were taken against; the per-fire gate
     // re-checks it against the workspace (`ws.qkv_fused` may be empty even
     // when the weight is bound) and falls back on mismatch.
     bool fused_qkv = false;
 
     explicit operator bool() const noexcept {
-        return static_cast<bool>(plan);
+        return static_cast<bool>(plan) && static_cast<bool>(decode) &&
+               static_cast<bool>(prefill);
     }
 };
 
-// Trace the family against this deployment's facts. Returns an empty plan
-// (operator bool false) when the configuration is outside the v0 trace's
-// vocabulary — the caller then keeps the hand-written path, silently: an
-// unrepresentable config is a fallback, not an error.
+// Trace the family against this deployment's facts — the semantic form
+// and both class traces (the CUDA facts derive here: env gates, kernel
+// support, cache format, binding; the same terms the executor booleans
+// used to compute per fire, computed once and stated). Every Launch op's
+// kernel symbol is validated against the executor's registry at build, so
+// a trace/executor drift fails at model load, not mid-fire. Returns an
+// empty plan (operator bool false) when the configuration is outside the
+// trace's vocabulary — the caller then keeps the hand-written path,
+// silently: an unrepresentable config is a fallback, not an error.
 LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
-    const Qwen3Weights& w);
+    const Qwen3Weights& w,
+    const KvCache& cache);
 
 // Execute the traced form. Same argument surface as
 // `llama_like_forward_paged` minus the inputs the eligibility gate already

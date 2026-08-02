@@ -58,7 +58,7 @@ LlamaLikeModel::LlamaLikeModel(
     // path only" — never an error.
     if (declared_forward_enabled()) {
         declared_ = build_llama_like_declared_plan(
-            hf_config_, fwd_cfg_, weights_);
+            hf_config_, fwd_cfg_, weights_, kv_cache_);
     }
 }
 

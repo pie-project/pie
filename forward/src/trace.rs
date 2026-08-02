@@ -476,6 +476,11 @@ impl TraceBuilder {
         self.layer = layer;
     }
 
+    /// A value's shape, for dsl ops whose outputs mirror their inputs.
+    pub(crate) fn value_shape(&self, id: ValueId) -> Shape {
+        self.values[id as usize].shape.clone()
+    }
+
     /// The `+=` fold ([`crate::dsl`]): if `rhs` is the output of the op
     /// just recorded and that op is a plain unfused matmul, rewrite it to
     /// the `beta_one` accumulate against `residual` — id-neutral, the
