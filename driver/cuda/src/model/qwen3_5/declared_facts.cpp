@@ -1,5 +1,9 @@
 #include "model/qwen3_5/declared_facts.hpp"
 
+#include "model/qwen3_5/declared_forward.hpp"
+#include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "store/recurrent_state_cache.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
@@ -553,6 +557,38 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
     out.fused_gdn_in_proj = fused_gdn;
     out.fused_full_attn_qgkv = fused_qgkv;
     out.full_attn_interval = interval;
+
+    // Rung 4c-iii: the CUDA backend facts, derived ONCE from this
+    // deployment — the terms the executor's hoisted booleans compute per
+    // fire, computed here and handed to the declaration, whose class
+    // arms STATE the kernels. Term provenance per line.
+    pie_forward::PieForwardQwen35CudaFacts cuda{};
+    // The recurrent-state dtype: the cache is engine-owned and invisible
+    // at build, so the deployment DEFAULT stands in and the executor
+    // cross-checks the live cache per fire (declared_facts.hpp).
+    cuda.state_bf16 =
+        RecurrentStateCache::recurrent_state_bf16_default() ? 1 : 0;
+    // Warp-tiled prefill eligibility, normal-fire form: K_d <= 256 plus
+    // the state-persist env gate (write_state is always true outside the
+    // verify services — those are 4c-iv classes).
+    cuda.warp_tiled = (cfg.linear_key_head_dim <= 256 &&
+                       qwen35_gdn_warp_tiled_state_persist_enabled())
+                          ? 1
+                          : 0;
+    cuda.warp_tiled_max =
+        static_cast<std::uint32_t>(qwen35_gdn_warp_tiled_max_tokens());
+    cuda.cached_max =
+        static_cast<std::uint32_t>(qwen35_gdn_cached_prefill_max_tokens());
+    out.cuda_state_bf16 = cuda.state_bf16 != 0;
+
+    out.decode = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::Decode);
+    out.prefill = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::Prefill);
+    // Drift between the declaration's stated kernels and the executor's
+    // registry fails at model load, not mid-fire.
+    qwen35_validate_stated_kernels(out.decode);
+    qwen35_validate_stated_kernels(out.prefill);
     return out;
 }
 

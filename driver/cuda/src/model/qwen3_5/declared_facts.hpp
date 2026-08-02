@@ -53,6 +53,13 @@ bool qwen35_declared_forward_enabled();
 // the hand-written path either way.
 struct Qwen35DeclaredPlan {
     pie_forward::ForwardPlan plan;
+    // Rung 4c-iii (north-star-dsl.md): the CLASS traces — the hybrid
+    // declaration run with this deployment's derived CUDA facts and a
+    // fire class, every kernel choice STATED. Normal decode/prefill
+    // fires walk these; the MTP/verify/legacy service fires keep the
+    // semantic `plan` until 4c-iv brings their classes.
+    pie_forward::ForwardPlan decode;
+    pie_forward::ForwardPlan prefill;
     // The binding facts the trace committed to (llama_like's `fused_qkv`
     // precedent); arc 2's per-fire gate re-checks them against the live
     // workspace before emitting.
@@ -62,6 +69,13 @@ struct Qwen35DeclaredPlan {
     // geometry's `is_full_attn` formula) — recorded so arc 2 need not
     // re-derive it from cfg.layer_types.
     int full_attn_interval = 0;
+    // The recurrent-state dtype the class traces committed to. Derived
+    // from `RecurrentStateCache::recurrent_state_bf16_default()` at
+    // build — the cache itself is engine-owned and not visible here —
+    // so the executor CROSS-CHECKS the live cache per fire and falls
+    // back to the semantic walk (loudly, once) on mismatch rather than
+    // running a trace whose kernels bind the wrong dtype.
+    bool cuda_state_bf16 = false;
 
     explicit operator bool() const noexcept {
         return static_cast<bool>(plan);

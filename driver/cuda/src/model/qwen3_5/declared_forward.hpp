@@ -62,6 +62,11 @@ namespace pie_cuda_driver::model {
 // lights up both families.
 bool qwen35_declared_exec_trace_enabled();
 
+// Boot validation (rung 4c-iii): every Launch symbol a class trace
+// states must resolve in this executor's name→launcher registry, so a
+// declaration/executor drift fails at model load, not mid-fire.
+void qwen35_validate_stated_kernels(const pie_forward::ForwardPlan& plan);
+
 // Execute one eligible fire by walking `declared.plan`. The caller
 // (Qwen35Model::body) has already applied the eligibility gate; this
 // function additionally throws (never silently diverges) when the plan
