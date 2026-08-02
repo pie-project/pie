@@ -28,6 +28,26 @@ run to count as passing. Contracts are deliberately loose on numbers
 
 Counter names are keys of the ``[planner-trace]`` line that ``bootstrap.rs``
 emits when ``PIE_CONTENTION_TRACE_MS`` is set.
+
+``--swap-pool-size`` is a HOST-PINNED allocation (``cudaMallocHost`` in
+``driver/cuda/src/store/swap_pool.cpp``, taken up front for every layer), so
+it is not free headroom: pinned pages can be neither swapped nor reclaimed.
+Size it from measured demand, not "generously". The scenarios here used to ask
+for 8192-16384 pages against device pools of 12-256, which took the server to
+32.3 GB RSS and pushed the host into reclaim -- ``/proc/pressure/memory``
+``full avg10`` hit 66% during a run against 0.11% idle. The engine convoys
+badly on that: a thread that stalls in the allocator while holding the global
+KV store mutex freezes every lane behind it, and the KV lock trace
+(``PIE_KV_LOCK_TRACE=1``) caught single ``create_working_set`` calls holding it
+for 1.07s, 1.55s and 5.74s. Downstream that reads as 9-18 lanes falling silent
+at once, ``[frame-stall]``, and ``submit deadline exceeded`` -- i.e. it looks
+exactly like an engine scheduling bug. Every scenario that was flaky used
+16384; none that used <= 512 ever was.
+
+Measured peak use at 1024 is 12 pages (churn), 4 (churn_extreme), 108 (soak),
+215 (mixed_head), so 1024 is still 4.7x the worst case. Right-sizing took the
+suite from five flaky scenarios to 17/17, churn from 15-44s to 8.1s, and
+churn_extreme from 10.8-33.6s to 11.1s on all four repeats.
 """
 
 from __future__ import annotations
@@ -137,7 +157,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="allshared",
         target="Starved{NoEligibleVictim}",
-        args=["--total-pages", "256", "--swap-pool-size", "8192",
+        args=["--total-pages", "256", "--swap-pool-size", "1024",
               "--num-requests", "128", "--concurrency", "64",
               "--max-tokens", "64", "--shared-prefix-words", "900",
               "--no-unique-prompts"],
@@ -209,7 +229,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="hog",
         target="Hog",
-        args=["--total-pages", "40", "--swap-pool-size", "8192",
+        args=["--total-pages", "40", "--swap-pool-size", "1024",
               "--num-requests", "32", "--concurrency", "16",
               "--max-tokens", "512"],
         contract=Contract(max_wall_s=180, min_completed=32, max_failed=0),
@@ -218,7 +238,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="impossible",
         target="Impossible",
-        args=["--total-pages", "16", "--swap-pool-size", "8192",
+        args=["--total-pages", "16", "--swap-pool-size", "1024",
               "--num-requests", "16", "--concurrency", "8",
               "--max-tokens", "1024"],
         contract=Contract(max_wall_s=120, min_completed=0),
@@ -227,7 +247,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="churn",
         target="arrival storm / fleet turnover",
-        args=["--total-pages", "192", "--swap-pool-size", "16384",
+        args=["--total-pages", "192", "--swap-pool-size", "1024",
               "--num-requests", "2048", "--concurrency", "512",
               "--max-tokens", "32"],
         contract=Contract(max_wall_s=240, min_completed=2048, max_failed=0),
@@ -239,7 +259,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="churn_extreme",
         target="extreme turnover / rebind-seal deadlock",
-        args=["--total-pages", "96", "--swap-pool-size", "16384",
+        args=["--total-pages", "96", "--swap-pool-size", "1024",
               "--num-requests", "4096", "--concurrency", "1024",
               "--max-tokens", "16", "--max-model-len", "1536"],
         contract=Contract(max_wall_s=300, min_completed=4096, max_failed=0),
@@ -259,7 +279,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="onefits",
         target="1-resident pool, maximum thrash",
-        args=["--total-pages", "12", "--swap-pool-size", "8192",
+        args=["--total-pages", "12", "--swap-pool-size", "1024",
               "--num-requests", "64", "--concurrency", "32",
               "--max-tokens", "128"],
         contract=Contract(max_wall_s=180, min_completed=64, max_failed=0,
@@ -270,7 +290,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="mixed_head",
         target="head-of-line blocking + heterogeneity",
-        args=["--total-pages", "128", "--swap-pool-size", "16384",
+        args=["--total-pages", "128", "--swap-pool-size", "1024",
               "--num-requests", "256", "--concurrency", "128",
               "--max-tokens", "512", "--mixed-phase",
               "--mixed-long-prompt-words", "800",
@@ -281,7 +301,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="fwd1",
         target="forward serialization vs planner",
-        args=["--total-pages", "128", "--swap-pool-size", "16384",
+        args=["--total-pages", "128", "--swap-pool-size", "1024",
               "--num-requests", "128", "--concurrency", "64",
               "--max-tokens", "64", "--max-forward-requests", "1"],
         contract=Contract(max_wall_s=180, min_completed=128, max_failed=0),
@@ -306,7 +326,7 @@ SCENARIOS: list[Scenario] = [
     Scenario(
         name="soak",
         target="sustained pressure soak",
-        args=["--total-pages", "160", "--swap-pool-size", "16384",
+        args=["--total-pages", "160", "--swap-pool-size", "1024",
               "--num-requests", "4096", "--concurrency", "256",
               "--max-tokens", "96"],
         contract=Contract(max_wall_s=420, min_completed=4096, max_failed=0,
