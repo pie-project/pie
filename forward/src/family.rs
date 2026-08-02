@@ -460,6 +460,29 @@ impl GdnLayerW {
 /// guard chain). Everything else — the norms, the in-projections and
 /// their fused/unfused splits, `gdn_prep`, the gated norm, the o_proj
 /// fold — is a 1:1-kernel semantic op and stays semantic in every form.
+/// The GDN in-projections against `w`'s layer: the fused/unfused branch
+/// resolves at trace time (a binding fact); operand packing mirrors the
+/// driver's: qkvz = [mixed_qkv | z], ba = [b | a]. Returns
+/// `(qkv, z, a, b)`. One function so the CommitAdvance pass's no-stash
+/// arm ([`commit_advance_body`]) runs EXACTLY the normal body's GEMMs
+/// and splits, by construction rather than by parallel maintenance.
+fn gdn_in_proj(x: &Val, w: &GdnLayerW, facts: &Qwen35GdnFacts) -> (Val, Val, Val, Val) {
+    if facts.fused_in_proj {
+        let qkvz = matmul(x, &w.in_proj_qkvz);
+        let (qkv, z) = split_gdn(&qkvz, facts.conv_dim(), facts.value_width());
+        let ba = matmul(x, &w.in_proj_ba);
+        let (b, a) = split_gdn(&ba, facts.value_heads, facts.value_heads);
+        (qkv, z, a, b)
+    } else {
+        (
+            matmul(x, &w.in_proj_qkv),
+            matmul(x, &w.in_proj_z),
+            matmul(x, &w.in_proj_a),
+            matmul(x, &w.in_proj_b),
+        )
+    }
+}
+
 fn gdn_attn_body(
     t: &Trace,
     l: u32,
@@ -472,33 +495,24 @@ fn gdn_attn_body(
 
     let x = rmsnorm(&y, &w.attn_norm);
 
-    // In-projections. The fused/unfused branch resolves at trace time
-    // (a binding fact); operand packing mirrors the driver's:
-    // qkvz = [mixed_qkv | z], ba = [b | a].
-    let (qkv, z, a, b) = if facts.fused_in_proj {
-        let qkvz = matmul(&x, &w.in_proj_qkvz);
-        let (qkv, z) = split_gdn(&qkvz, facts.conv_dim(), facts.value_width());
-        let ba = matmul(&x, &w.in_proj_ba);
-        let (b, a) = split_gdn(&ba, facts.value_heads, facts.value_heads);
-        (qkv, z, a, b)
-    } else {
-        (
-            matmul(&x, &w.in_proj_qkv),
-            matmul(&x, &w.in_proj_z),
-            matmul(&x, &w.in_proj_a),
-            matmul(&x, &w.in_proj_b),
-        )
-    };
+    let (qkv, z, a, b) = gdn_in_proj(&x, &w, facts);
 
     // Conv → prep → recurrence: the GDN core, against the layer's
     // per-request conv/recurrent state. A class arm states the conv
     // kernel; the semantic form keeps the opaque op.
+    // StateOnly is prefill-shaped throughout the backbone — it takes the
+    // Prefill arm in every kernel choice here; only the model epilogue
+    // differs, and that class match lives in `qwen3_5_hybrid_text`.
+    // CommitAdvance never enters this body at all: it is its own pass
+    // ([`commit_advance_body`]), not a variant of the layer loop.
     let qkv = match lower {
         None => causal_conv1d(&qkv, &w.conv),
         Some((_, FireClass::Decode)) => cuda::gdn_conv_update_batched(&qkv, &w.conv, &w.rs),
-        Some((_, FireClass::Prefill)) => cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs),
-        Some((_, FireClass::CommitAdvance | FireClass::StateOnly)) => {
-            unreachable!("qwen3_5_hybrid_cuda refuses the service classes at trace start (4c-iv)")
+        Some((_, FireClass::Prefill | FireClass::StateOnly)) => {
+            cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs)
+        }
+        Some((_, FireClass::CommitAdvance)) => {
+            unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
     let (q, k, v, g, beta) = gdn_prep(
@@ -519,7 +533,7 @@ fn gdn_attn_body(
         Some((c, FireClass::Decode)) => {
             cuda::gdn_step_batched(&q, &k, &v, &g, &beta, &w.rs, gqa, c.state_bf16)
         }
-        Some((c, FireClass::Prefill)) => {
+        Some((c, FireClass::Prefill | FireClass::StateOnly)) => {
             // The prefill recurrence three-way, as the first
             // VALUE-PRODUCING guard chain (north-star-dsl.md 4b): the
             // guard's output is the recurrence core — the same
@@ -557,8 +571,8 @@ fn gdn_attn_body(
                 .otherwise(|| cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, c.state_bf16));
             core
         }
-        Some((_, FireClass::CommitAdvance | FireClass::StateOnly)) => {
-            unreachable!("qwen3_5_hybrid_cuda refuses the service classes at trace start (4c-iv)")
+        Some((_, FireClass::CommitAdvance)) => {
+            unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
 
@@ -745,14 +759,17 @@ fn full_attn_body(
     // prefill arm is the dequant-less planned dispatch), then the
     // multiply-only output gate and the o_proj accumulate (`+=` of a
     // fresh matmul IS the beta=1 fold).
+    // StateOnly runs the full backbone, prefill-shaped — the Prefill arm;
+    // CommitAdvance skips full-attention layers entirely and never enters
+    // this body ([`commit_advance_body`]).
     let attn = match lower {
         None => attention(&q, &w.kv, facts.q_width()),
         Some((_, FireClass::Decode)) => cuda::attention_flashinfer_decode(&q, &w.kv, facts.q_width()),
-        Some((_, FireClass::Prefill)) => {
+        Some((_, FireClass::Prefill | FireClass::StateOnly)) => {
             cuda::attention_flashinfer_prefill_planned(&q, &w.kv, facts.q_width())
         }
-        Some((_, FireClass::CommitAdvance | FireClass::StateOnly)) => {
-            unreachable!("qwen3_5_hybrid_cuda refuses the service classes at trace start (4c-iv)")
+        Some((_, FireClass::CommitAdvance)) => {
+            unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
     let gated = sigmoid_gate_mul(&attn, &gate);
@@ -837,22 +854,17 @@ pub fn qwen3_5_hybrid(facts: &Qwen35HybridFacts) -> ForwardPlan {
 /// traced with the CUDA backend facts and a fire class in hand, so the
 /// class arms run and the traced form states its kernels as raw
 /// signatures ([`crate::dsl::cuda`]; north-star-dsl.md rung 4c). One
-/// trace per [`FireClass`]; family names `qwen3_5_hybrid.cuda.decode` /
-/// `.prefill` — the [`llama_like_cuda`] naming, verbatim.
-///
-/// The service classes (`CommitAdvance` / `StateOnly` — the spec-decode
-/// repair passes, which change WHICH OPS RUN) are rung 4c-iv's and are
-/// refused here; the ffi entry answers `InvalidArgument` before tracing,
-/// and this is the same statement for direct Rust callers.
+/// trace per [`FireClass`] the deployment fires; family names
+/// `qwen3_5_hybrid.cuda.decode` / `.prefill` — the [`llama_like_cuda`]
+/// naming, verbatim — plus the two SERVICE classes (rung 4c-iv):
+/// `.state_only` (the whole backbone, prefill-shaped, minus the
+/// final-norm/lm_head epilogue) and `.commit_advance` (the spec-decode
+/// repair: a genuinely different pass — `commit_advance_body`).
 pub fn qwen3_5_hybrid_cuda(
     facts: &Qwen35HybridFacts,
     cuda: &Qwen35CudaFacts,
     class: FireClass,
 ) -> ForwardPlan {
-    assert!(
-        matches!(class, FireClass::Decode | FireClass::Prefill),
-        "qwen3_5_hybrid_cuda: the CommitAdvance/StateOnly service classes are rung 4c-iv"
-    );
     qwen3_5_hybrid_text(facts, Some((cuda, class)))
 }
 
@@ -883,13 +895,22 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
             match class {
                 FireClass::Decode => "decode",
                 FireClass::Prefill => "prefill",
-                FireClass::CommitAdvance | FireClass::StateOnly => {
-                    unreachable!("qwen3_5_hybrid_cuda refuses the service classes (4c-iv)")
-                }
+                FireClass::CommitAdvance => "commit_advance",
+                FireClass::StateOnly => "state_only",
             }
         ),
     };
     dsl::trace_named(&family, |t| {
+        // CommitAdvance changes WHICH OPS RUN so radically — only the
+        // linear layers' conv+prep+recurrence, no embed/attention/MLP,
+        // nothing after — that it is not a variant of the walk below but
+        // its own pass, stated as its own body (north-star-dsl.md 4b:
+        // "a genuinely different pass, so a genuinely different trace").
+        if let Some((c, FireClass::CommitAdvance)) = lower {
+            commit_advance_body(t, facts, c);
+            return;
+        }
+
         let mut y = dsl::embed_with(t, "embed", hidden);
 
         for l in 0..facts.layers {
@@ -906,6 +927,13 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
             };
         }
 
+        // The epilogue class match: StateOnly is the backbone alone —
+        // the trace simply ends after the last layer, exactly the pair
+        // the hand-written pass's `if (num_logit_rows < 0) return` skips
+        // (final-norm rmsnorm + lm_head, nothing else).
+        if matches!(lower, Some((_, FireClass::StateOnly))) {
+            return;
+        }
         let final_norm = NormW {
             name: "final_norm".to_string(),
             variant: facts.norm_variant,
@@ -915,6 +943,64 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
         let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
         dsl::lm_head_at(t, &rmsnorm(&y, &final_norm), lm_head, facts.vocab);
     })
+}
+
+/// The CommitAdvance pass (north-star-dsl.md 4b, rung 4c-iv): the
+/// spec-decode repair that re-advances each LINEAR layer's conv window
+/// and recurrent state over the confirmed prefix. Full-attention layers,
+/// every MLP, embed and the epilogue do not exist in this pass — per
+/// linear layer it is exactly conv → prep → recurrence, fed either from
+/// the verify hidden stash ([`Qwen35CudaFacts::verify_stash`]) or from
+/// re-run in-projections.
+///
+/// The pass's root value is a bare [`dsl::input`] placeholder, not an
+/// embed: the hand-written no-stash path leans, degenerately, on
+/// whatever the workspace's `norm_x` buffer happens to hold from the
+/// preceding fire, and the placeholder states that reliance honestly —
+/// a value produced by no op of this trace, bound by the driver.
+///
+/// The pass is prefill-shaped, so the conv states the prefill walk; its
+/// `commit_lens` is a runtime argument the driver binds (the FLA family
+/// is the only recurrence family threading commit_lens, which is why the
+/// recurrence states [`cuda::gdn_prefill_fla`] directly — no N-threshold
+/// guard chain). The recurrence output is consumed by NOTHING in this
+/// pass — no gated norm, no o_proj — so the FLA launch stays the
+/// output-less launch it already is: the pass's product is the advanced
+/// per-request state, which is not a traced value.
+fn commit_advance_body(t: &Trace, facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFacts) {
+    let gdn = &facts.gdn;
+    let x = dsl::input(t, facts.hidden());
+    for l in (0..facts.layers).filter(|&l| !facts.is_full_attn(l)) {
+        let w = GdnLayerW::new(t, l, gdn);
+        let (qkv, a, b) = if cuda.verify_stash {
+            // The stash replays the in-proj OUTPUTS, so the GEMMs and
+            // splits are skipped entirely: qkv/a/b arrive via the one
+            // load (z is not stashed — nothing downstream reads it).
+            cuda::verify_stash_load(t, &w.rs, gdn.conv_dim(), gdn.value_heads)
+        } else {
+            // No stash: re-run the in-projections — the normal body's
+            // fused/unfused arms verbatim ([`gdn_in_proj`]) — against
+            // the input placeholder. The z leg is traced (it is part of
+            // those arms) and consumed by nothing, like the recurrence
+            // output below.
+            let (qkv, _z, a, b) = gdn_in_proj(&x, &w, gdn);
+            (qkv, a, b)
+        };
+        let qkv = cuda::gdn_conv_prefill_batched(&qkv, &w.conv, &w.rs);
+        let (q, k, v, g, beta) = gdn_prep(
+            &qkv,
+            &a,
+            &b,
+            &w.prep,
+            gdn.key_heads,
+            gdn.key_head_dim,
+            gdn.value_heads,
+            gdn.value_head_dim,
+        );
+        cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, cuda.state_bf16);
+    }
+    // Nothing after the loop: no final norm, no lm_head — the pass ends
+    // with the last linear layer's recurrence.
 }
 
 #[cfg(test)]

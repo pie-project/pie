@@ -145,6 +145,13 @@ fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
 pub enum PieForwardFireClass {
     Decode = 0,
     Prefill = 1,
+    /// The qwen3_5 spec-decode repair pass (only the linear layers'
+    /// conv+prep+recurrence). Accepted by the qwen3_5 hybrid CUDA entry
+    /// only; llama_like has no service classes and keeps refusing it.
+    CommitAdvance = 2,
+    /// The qwen3_5 backbone-only pass (everything minus the
+    /// final-norm/lm_head epilogue). Same acceptance rule.
+    StateOnly = 3,
 }
 
 /// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
@@ -381,6 +388,12 @@ pub struct PieForwardQwen35CudaFacts {
     /// `qwen35_gdn_cached_prefill_max_tokens()` — the cached arm's
     /// `TokensLE` payload.
     pub cached_max: u32,
+    /// The deployment configures the verify hidden stash
+    /// (`RecurrentStateCache::configure_verify_hidden_stash`): the
+    /// CommitAdvance class replays the linear layers' in-proj outputs
+    /// from the stash instead of re-running the GEMMs. Non-zero is true.
+    /// Appended field (4c-iv) — the append-only struct discipline.
+    pub verify_stash: u8,
 }
 
 fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts {
@@ -389,6 +402,7 @@ fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts 
         warp_tiled: facts.warp_tiled != 0,
         warp_tiled_max: facts.warp_tiled_max,
         cached_max: facts.cached_max,
+        verify_stash: facts.verify_stash != 0,
     }
 }
 
@@ -649,9 +663,11 @@ pub unsafe extern "C" fn pie_forward_trace_qwen3_5_hybrid(
 /// [`PieForwardQwen35HybridFacts`] / [`PieForwardQwen35CudaFacts`];
 /// `out_plan` is null or a writable slot. `class` is a
 /// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
-/// enum rule); anything else answers `InvalidArgument` — including the
-/// service classes CommitAdvance (2) and StateOnly (3), which are rung
-/// 4c-iv's and not yet traceable.
+/// enum rule); anything else answers `InvalidArgument`. ALL FOUR classes
+/// are traceable here (4c-iv): the service classes CommitAdvance (2 —
+/// family `qwen3_5_hybrid.cuda.commit_advance`) and StateOnly (3 —
+/// `...state_only`) alongside Decode/Prefill. They remain qwen3_5's:
+/// the llama_like entry keeps refusing them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_forward_trace_qwen3_5_hybrid_cuda(
     facts: *const PieForwardQwen35HybridFacts,
@@ -675,9 +691,8 @@ pub unsafe extern "C" fn pie_forward_trace_qwen3_5_hybrid_cuda(
         let class = match class {
             0 => FireClass::Decode,
             1 => FireClass::Prefill,
-            // 2 (CommitAdvance) and 3 (StateOnly) are real classes of
-            // this family but their traces are rung 4c-iv; until then
-            // they are refused here, not defaulted.
+            2 => FireClass::CommitAdvance,
+            3 => FireClass::StateOnly,
             _ => return PieForwardStatus::InvalidArgument,
         };
         let plan = crate::family::qwen3_5_hybrid_cuda(&facts, &cuda, class);

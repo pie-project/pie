@@ -60,6 +60,11 @@ struct Qwen35DeclaredPlan {
     // semantic `plan` until 4c-iv brings their classes.
     pie_forward::ForwardPlan decode;
     pie_forward::ForwardPlan prefill;
+    // 4c-iv: the MTP service classes — the spec-decode repair pass and
+    // the epilogue-less whole-backbone flavor. (The frozen-verify class
+    // is the next slice; frozen fires stay on the semantic walk.)
+    pie_forward::ForwardPlan commit_advance;
+    pie_forward::ForwardPlan state_only;
     // The binding facts the trace committed to (llama_like's `fused_qkv`
     // precedent); arc 2's per-fire gate re-checks them against the live
     // workspace before emitting.
@@ -76,6 +81,12 @@ struct Qwen35DeclaredPlan {
     // back to the semantic walk (loudly, once) on mismatch rather than
     // running a trace whose kernels bind the wrong dtype.
     bool cuda_state_bf16 = false;
+    // The verify-stash fact the CommitAdvance trace committed to (stash
+    // configured → the trace replays in-proj activations from it). The
+    // stash is engine-configured like the state dtype, so the executor
+    // cross-checks `verify_hidden_stash_enabled()` per commit fire and
+    // falls back to the semantic walk on mismatch.
+    bool cuda_verify_stash = false;
 
     explicit operator bool() const noexcept {
         return static_cast<bool>(plan);

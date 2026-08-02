@@ -633,6 +633,19 @@ pub struct Qwen35CudaFacts {
     /// (`PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS`, default 0 = the
     /// cached family off) — the cached arm's `TokensLE` payload.
     pub cached_max: u32,
+    /// The deployment configures the verify hidden stash
+    /// (`RecurrentStateCache::configure_verify_hidden_stash`): the
+    /// engine owns that configuration, so — like [`Self::state_bf16`],
+    /// whose dtype the engine likewise decides — the fact is stated here
+    /// and the driver cross-checks its own derivation per fire rather
+    /// than choosing. With the stash live, the CommitAdvance class
+    /// replays each linear layer's in-proj outputs from the stash
+    /// (`cuda::verify_stash_load`) and skips the GEMMs; without it, the
+    /// commit pass re-runs the in-projections against whatever the
+    /// workspace holds. Serde-defaulted so pre-4c-iv facts JSON reads
+    /// back unchanged (the append-only discipline).
+    #[serde(default)]
+    pub verify_stash: bool,
 }
 
 impl Qwen35CudaFacts {
@@ -653,6 +666,7 @@ impl Qwen35CudaFacts {
             warp_tiled: true,
             warp_tiled_max: 64,
             cached_max: 4096,
+            verify_stash: true,
         }
     }
 }

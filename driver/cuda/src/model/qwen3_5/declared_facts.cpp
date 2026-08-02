@@ -581,14 +581,27 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
         static_cast<std::uint32_t>(qwen35_gdn_cached_prefill_max_tokens());
     out.cuda_state_bf16 = cuda.state_bf16 != 0;
 
+    // The verify stash is engine-configured after model build (the MTP
+    // wiring calls configure_verify_hidden_stash), so the fact is the
+    // MTP deployment's normal shape — stash on — and the executor
+    // cross-checks per commit fire (declared_facts.hpp).
+    cuda.verify_stash = 1;
+    out.cuda_verify_stash = true;
+
     out.decode = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
     out.prefill = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Prefill);
+    out.commit_advance = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::CommitAdvance);
+    out.state_only = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
+        facts, cuda, pie_forward::PieForwardFireClass::StateOnly);
     // Drift between the declaration's stated kernels and the executor's
     // registry fails at model load, not mid-fire.
     qwen35_validate_stated_kernels(out.decode);
     qwen35_validate_stated_kernels(out.prefill);
+    qwen35_validate_stated_kernels(out.commit_advance);
+    qwen35_validate_stated_kernels(out.state_only);
     return out;
 }
 

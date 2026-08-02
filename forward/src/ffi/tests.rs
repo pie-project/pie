@@ -812,19 +812,12 @@ fn hybrid_entry_traces_and_validates() {
     );
 }
 
-/// The lowered qwen3_5 decode trace crosses the boundary intact,
-/// `lowered_trace_round_trips_through_the_arena`-style: the GDN Launch
-/// wire form — kernel symbol in the weight slot, the conv weight in
-/// `aux_names`, the RecurrentState mark as param0=2 with the state layer
-/// in param1 — plus the full-attention layers' KV-write Guard and
-/// FlashInfer decode dispatch, with the semantic conv/recurrence/append/
-/// attention kinds absent. The service classes (2/3) answer
-/// InvalidArgument (rung 4c-iv).
-#[test]
-fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
+/// The 0.8B hybrid facts, as a C caller would state them — shared by the
+/// lowered-trace round-trip tests.
+fn c_facts_hybrid_0_8b() -> PieForwardQwen35HybridFacts {
     let facts = Qwen35HybridFacts::qwen3_5_0_8b();
     let gdn = &facts.gdn;
-    let c_facts = PieForwardQwen35HybridFacts {
+    PieForwardQwen35HybridFacts {
         layers: facts.layers,
         full_attn_interval: facts.full_attn_interval,
         vocab: facts.vocab,
@@ -851,13 +844,32 @@ fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
             shared_expert_intermediate: 0,
             norm_variant: 0,
         },
-    };
-    let cuda = PieForwardQwen35CudaFacts {
+    }
+}
+
+/// The synthetic 0.8B CUDA facts, as a C caller would state them.
+fn c_cuda_facts_synthetic() -> PieForwardQwen35CudaFacts {
+    PieForwardQwen35CudaFacts {
         state_bf16: 1,
         warp_tiled: 1,
         warp_tiled_max: 64,
         cached_max: 4096,
-    };
+        verify_stash: 1,
+    }
+}
+
+/// The lowered qwen3_5 decode trace crosses the boundary intact,
+/// `lowered_trace_round_trips_through_the_arena`-style: the GDN Launch
+/// wire form — kernel symbol in the weight slot, the conv weight in
+/// `aux_names`, the RecurrentState mark as param0=2 with the state layer
+/// in param1 — plus the full-attention layers' KV-write Guard and
+/// FlashInfer decode dispatch, with the semantic conv/recurrence/append/
+/// attention kinds absent. An out-of-range class (4) answers
+/// InvalidArgument.
+#[test]
+fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
+    let c_facts = c_facts_hybrid_0_8b();
+    let cuda = c_cuda_facts_synthetic();
     let mut out = PieForwardPlan::default();
     assert_eq!(
         unsafe {
@@ -943,15 +955,89 @@ fn lowered_qwen3_5_trace_round_trips_through_the_arena() {
     )));
     unsafe { pie_forward_release(&mut out) };
 
-    // The service classes are rung 4c-iv: refused, not defaulted.
-    for class in [2, 3] {
-        let mut out2 = PieForwardPlan::default();
-        assert_eq!(
-            unsafe { pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, class, &mut out2) },
-            PieForwardStatus::InvalidArgument
-        );
-        assert!(out2.owner.is_null());
-    }
+    // Past the last class (StateOnly = 3): malformed, not defaulted.
+    let mut out2 = PieForwardPlan::default();
+    assert_eq!(
+        unsafe { pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, 4, &mut out2) },
+        PieForwardStatus::InvalidArgument
+    );
+    assert!(out2.owner.is_null());
+}
+
+/// The service classes cross the boundary (rung 4c-iv). CommitAdvance
+/// (class 2): the stash PSEUDO-SYMBOL in the Launch's weight slot, no
+/// inputs, THREE outputs (qkv/a/b), the RecurrentState mark as param0=2
+/// with the state layer in param1 — and the 72-op shape (18 linear
+/// layers x 4, no embed, no lm_head, nothing on the full-attention
+/// layers). StateOnly (class 3): the prefill backbone that simply ends
+/// after the last layer — no LmHead, no layer-less final norm.
+#[test]
+fn service_class_traces_round_trip_through_the_arena() {
+    let c_facts = c_facts_hybrid_0_8b();
+    let cuda = c_cuda_facts_synthetic();
+
+    let mut out = PieForwardPlan::default();
+    assert_eq!(
+        unsafe {
+            pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, /*CommitAdvance=*/ 2, &mut out)
+        },
+        PieForwardStatus::Ok
+    );
+    assert_eq!(
+        view::name(&out, out.family),
+        "qwen3_5_hybrid.cuda.commit_advance"
+    );
+    let ops = view::ops(&out);
+    assert_eq!(ops.len(), 18 * 4);
+    assert!(ops.iter().all(|op| op.kind == PieForwardOpKind::Launch
+        || op.kind == PieForwardOpKind::GdnPrep));
+    // Nothing on the full-attention layers (3, 7, ... are skipped).
+    assert!(!ops.iter().any(|op| op.layer == 3));
+
+    // The stash load: pseudo-symbol in the weight slot, no inputs, three
+    // outputs, the layer-0 RecurrentState mark.
+    let load = ops
+        .iter()
+        .find(|op| {
+            op.layer == 0
+                && op.kind == PieForwardOpKind::Launch
+                && view::name(&out, op.weight_name) == "qwen35_verify_stash_load"
+        })
+        .expect("the stash-configured commit pass states the stash load");
+    assert_eq!(load.inputs.len, 0);
+    let load_outs = view::ids(&out, load.outputs);
+    assert_eq!(load_outs.len(), 3);
+    assert_eq!(load.param0, 2); // recurrent-state store...
+    assert_eq!(load.param1, 0); // ...of layer 0
+    // ...and gdn_prep consumes exactly that triple (dataflow complete).
+    let prep = ops
+        .iter()
+        .find(|op| op.layer == 0 && op.kind == PieForwardOpKind::GdnPrep)
+        .unwrap();
+    let prep_ins = view::ids(&out, prep.inputs);
+    assert_eq!(prep_ins[1], load_outs[1]); // a
+    assert_eq!(prep_ins[2], load_outs[2]); // b
+    // The GEMMs are skipped: no Matmul anywhere in the pass.
+    assert!(!ops.iter().any(|op| op.kind == PieForwardOpKind::Matmul));
+    unsafe { pie_forward_release(&mut out) };
+
+    // StateOnly: the backbone ends with the last layer — no LmHead, and
+    // every op carries a layer tag (the layer-less final norm is gone).
+    assert_eq!(
+        unsafe {
+            pie_forward_trace_qwen3_5_hybrid_cuda(&c_facts, &cuda, /*StateOnly=*/ 3, &mut out)
+        },
+        PieForwardStatus::Ok
+    );
+    assert_eq!(
+        view::name(&out, out.family),
+        "qwen3_5_hybrid.cuda.state_only"
+    );
+    let ops = view::ops(&out);
+    assert!(!ops.iter().any(|op| op.kind == PieForwardOpKind::LmHead));
+    let last = ops.last().unwrap();
+    assert_eq!(last.layer, 23, "state_only must end inside the last layer");
+    unsafe { pie_forward_release(&mut out) };
 }
 
 /// The unfused binding crosses the boundary too: three per-layer projection

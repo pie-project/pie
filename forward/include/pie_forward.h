@@ -172,6 +172,13 @@ enum class PieForwardQkNorm : uint32_t {
 enum class PieForwardFireClass : uint32_t {
   Decode = 0,
   Prefill = 1,
+  /// The qwen3_5 spec-decode repair pass (only the linear layers'
+  /// conv+prep+recurrence). Accepted by the qwen3_5 hybrid CUDA entry
+  /// only; llama_like has no service classes and keeps refusing it.
+  CommitAdvance = 2,
+  /// The qwen3_5 backbone-only pass (everything minus the
+  /// final-norm/lm_head epilogue). Same acceptance rule.
+  StateOnly = 3,
 };
 
 /// Mirrors [`crate::trace::GuardPred`]'s wire KINDS (each arm crosses as
@@ -508,6 +515,12 @@ struct PieForwardQwen35CudaFacts {
   /// `qwen35_gdn_cached_prefill_max_tokens()` — the cached arm's
   /// `TokensLE` payload.
   uint32_t cached_max;
+  /// The deployment configures the verify hidden stash
+  /// (`RecurrentStateCache::configure_verify_hidden_stash`): the
+  /// CommitAdvance class replays the linear layers' in-proj outputs
+  /// from the stash instead of re-running the GEMMs. Non-zero is true.
+  /// Appended field (4c-iv) — the append-only struct discipline.
+  uint8_t verify_stash;
 };
 
 extern "C" {
@@ -630,9 +643,11 @@ PieForwardStatus pie_forward_trace_qwen3_5_hybrid(const PieForwardQwen35HybridFa
 /// [`PieForwardQwen35HybridFacts`] / [`PieForwardQwen35CudaFacts`];
 /// `out_plan` is null or a writable slot. `class` is a
 /// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
-/// enum rule); anything else answers `InvalidArgument` — including the
-/// service classes CommitAdvance (2) and StateOnly (3), which are rung
-/// 4c-iv's and not yet traceable.
+/// enum rule); anything else answers `InvalidArgument`. ALL FOUR classes
+/// are traceable here (4c-iv): the service classes CommitAdvance (2 —
+/// family `qwen3_5_hybrid.cuda.commit_advance`) and StateOnly (3 —
+/// `...state_only`) alongside Decode/Prefill. They remain qwen3_5's:
+/// the llama_like entry keeps refusing them.
 PieForwardStatus pie_forward_trace_qwen3_5_hybrid_cuda(const PieForwardQwen35HybridFacts *facts,
                                                        const PieForwardQwen35CudaFacts *cuda,
                                                        uint32_t class_,

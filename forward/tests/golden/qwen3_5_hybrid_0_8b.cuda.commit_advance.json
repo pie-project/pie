@@ -1,0 +1,3076 @@
+{
+  "family": "qwen3_5_hybrid.cuda.commit_advance",
+  "values": [
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 1024
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 6144
+        }
+      ],
+      "dtype": "BF16"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        },
+        {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
+          "Const": 16
+        }
+      ],
+      "dtype": "F32"
+    }
+  ],
+  "ops": [
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        1,
+        2,
+        3
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.0.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        1
+      ],
+      "outputs": [
+        4
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.0.a_log",
+          "dt_bias": "layer.0.dt_bias"
+        }
+      },
+      "inputs": [
+        4,
+        2,
+        3
+      ],
+      "outputs": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        10,
+        11,
+        12
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.1.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        10
+      ],
+      "outputs": [
+        13
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.1.a_log",
+          "dt_bias": "layer.1.dt_bias"
+        }
+      },
+      "inputs": [
+        13,
+        11,
+        12
+      ],
+      "outputs": [
+        14,
+        15,
+        16,
+        17,
+        18
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        14,
+        15,
+        16,
+        17,
+        18
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        19,
+        20,
+        21
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.2.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        19
+      ],
+      "outputs": [
+        22
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.2.a_log",
+          "dt_bias": "layer.2.dt_bias"
+        }
+      },
+      "inputs": [
+        22,
+        20,
+        21
+      ],
+      "outputs": [
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        23,
+        24,
+        25,
+        26,
+        27
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        28,
+        29,
+        30
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.4.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        28
+      ],
+      "outputs": [
+        31
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.4.a_log",
+          "dt_bias": "layer.4.dt_bias"
+        }
+      },
+      "inputs": [
+        31,
+        29,
+        30
+      ],
+      "outputs": [
+        32,
+        33,
+        34,
+        35,
+        36
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        32,
+        33,
+        34,
+        35,
+        36
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        37,
+        38,
+        39
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.5.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        37
+      ],
+      "outputs": [
+        40
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.5.a_log",
+          "dt_bias": "layer.5.dt_bias"
+        }
+      },
+      "inputs": [
+        40,
+        38,
+        39
+      ],
+      "outputs": [
+        41,
+        42,
+        43,
+        44,
+        45
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        41,
+        42,
+        43,
+        44,
+        45
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        46,
+        47,
+        48
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.6.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        46
+      ],
+      "outputs": [
+        49
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.6.a_log",
+          "dt_bias": "layer.6.dt_bias"
+        }
+      },
+      "inputs": [
+        49,
+        47,
+        48
+      ],
+      "outputs": [
+        50,
+        51,
+        52,
+        53,
+        54
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        50,
+        51,
+        52,
+        53,
+        54
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        55,
+        56,
+        57
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.8.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [
+        55
+      ],
+      "outputs": [
+        58
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.8.a_log",
+          "dt_bias": "layer.8.dt_bias"
+        }
+      },
+      "inputs": [
+        58,
+        56,
+        57
+      ],
+      "outputs": [
+        59,
+        60,
+        61,
+        62,
+        63
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [
+        59,
+        60,
+        61,
+        62,
+        63
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        64,
+        65,
+        66
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.9.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [
+        64
+      ],
+      "outputs": [
+        67
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.9.a_log",
+          "dt_bias": "layer.9.dt_bias"
+        }
+      },
+      "inputs": [
+        67,
+        65,
+        66
+      ],
+      "outputs": [
+        68,
+        69,
+        70,
+        71,
+        72
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [
+        68,
+        69,
+        70,
+        71,
+        72
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        73,
+        74,
+        75
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.10.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [
+        73
+      ],
+      "outputs": [
+        76
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.10.a_log",
+          "dt_bias": "layer.10.dt_bias"
+        }
+      },
+      "inputs": [
+        76,
+        74,
+        75
+      ],
+      "outputs": [
+        77,
+        78,
+        79,
+        80,
+        81
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [
+        77,
+        78,
+        79,
+        80,
+        81
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        82,
+        83,
+        84
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.12.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [
+        82
+      ],
+      "outputs": [
+        85
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.12.a_log",
+          "dt_bias": "layer.12.dt_bias"
+        }
+      },
+      "inputs": [
+        85,
+        83,
+        84
+      ],
+      "outputs": [
+        86,
+        87,
+        88,
+        89,
+        90
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [
+        86,
+        87,
+        88,
+        89,
+        90
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        91,
+        92,
+        93
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.13.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [
+        91
+      ],
+      "outputs": [
+        94
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.13.a_log",
+          "dt_bias": "layer.13.dt_bias"
+        }
+      },
+      "inputs": [
+        94,
+        92,
+        93
+      ],
+      "outputs": [
+        95,
+        96,
+        97,
+        98,
+        99
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [
+        95,
+        96,
+        97,
+        98,
+        99
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        100,
+        101,
+        102
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.14.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [
+        100
+      ],
+      "outputs": [
+        103
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.14.a_log",
+          "dt_bias": "layer.14.dt_bias"
+        }
+      },
+      "inputs": [
+        103,
+        101,
+        102
+      ],
+      "outputs": [
+        104,
+        105,
+        106,
+        107,
+        108
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [
+        104,
+        105,
+        106,
+        107,
+        108
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        109,
+        110,
+        111
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.16.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [
+        109
+      ],
+      "outputs": [
+        112
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.16.a_log",
+          "dt_bias": "layer.16.dt_bias"
+        }
+      },
+      "inputs": [
+        112,
+        110,
+        111
+      ],
+      "outputs": [
+        113,
+        114,
+        115,
+        116,
+        117
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [
+        113,
+        114,
+        115,
+        116,
+        117
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        118,
+        119,
+        120
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.17.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [
+        118
+      ],
+      "outputs": [
+        121
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.17.a_log",
+          "dt_bias": "layer.17.dt_bias"
+        }
+      },
+      "inputs": [
+        121,
+        119,
+        120
+      ],
+      "outputs": [
+        122,
+        123,
+        124,
+        125,
+        126
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [
+        122,
+        123,
+        124,
+        125,
+        126
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        127,
+        128,
+        129
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.18.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [
+        127
+      ],
+      "outputs": [
+        130
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.18.a_log",
+          "dt_bias": "layer.18.dt_bias"
+        }
+      },
+      "inputs": [
+        130,
+        128,
+        129
+      ],
+      "outputs": [
+        131,
+        132,
+        133,
+        134,
+        135
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [
+        131,
+        132,
+        133,
+        134,
+        135
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        136,
+        137,
+        138
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.20.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [
+        136
+      ],
+      "outputs": [
+        139
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.20.a_log",
+          "dt_bias": "layer.20.dt_bias"
+        }
+      },
+      "inputs": [
+        139,
+        137,
+        138
+      ],
+      "outputs": [
+        140,
+        141,
+        142,
+        143,
+        144
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [
+        140,
+        141,
+        142,
+        143,
+        144
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        145,
+        146,
+        147
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.21.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [
+        145
+      ],
+      "outputs": [
+        148
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.21.a_log",
+          "dt_bias": "layer.21.dt_bias"
+        }
+      },
+      "inputs": [
+        148,
+        146,
+        147
+      ],
+      "outputs": [
+        149,
+        150,
+        151,
+        152,
+        153
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [
+        149,
+        150,
+        151,
+        152,
+        153
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "qwen35_verify_stash_load",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        154,
+        155,
+        156
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_causal_conv1d_prefill_batched_bf16",
+          "weights": [
+            "layer.22.conv"
+          ],
+          "state": {
+            "store": "RecurrentState",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [
+        154
+      ],
+      "outputs": [
+        157
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "GdnPrep": {
+          "a_log": "layer.22.a_log",
+          "dt_bias": "layer.22.dt_bias"
+        }
+      },
+      "inputs": [
+        157,
+        155,
+        156
+      ],
+      "outputs": [
+        158,
+        159,
+        160,
+        161,
+        162
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
+          "state": {
+            "store": "RecurrentState",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [
+        158,
+        159,
+        160,
+        161,
+        162
+      ],
+      "outputs": [],
+      "layer": 22
+    }
+  ]
+}

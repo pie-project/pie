@@ -26,7 +26,7 @@ use pie_forward::family::{
     qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block,
 };
 use pie_forward::{
-    FireClass, ForwardPlan, LlamaLikeCudaFacts, LlamaLikeFacts, Qwen35CudaFacts,
+    FireClass, ForwardPlan, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
@@ -221,6 +221,84 @@ fn qwen3_5_hybrid_0_8b_cuda_prefill() {
             FireClass::Prefill,
         ),
     );
+}
+
+/// The StateOnly service class (rung 4c-iv): the whole prefill-shaped
+/// backbone with the epilogue class-matched away — structurally the
+/// prefill trace minus EXACTLY the final-norm/lm_head pair (the pair the
+/// hand-written `if (num_logit_rows < 0) return` skips), everything else
+/// byte-identical, which the assertions below pin against the prefill
+/// trace before the golden pins the form itself.
+#[test]
+fn qwen3_5_hybrid_0_8b_cuda_state_only() {
+    let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+    let cuda = Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+    let plan = qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::StateOnly);
+    let prefill = qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::Prefill);
+
+    // Prefill minus 2 ops (final rmsnorm + lm_head), prefix-identical…
+    assert_eq!(plan.ops.len(), prefill.ops.len() - 2);
+    assert_eq!(plan.ops[..], prefill.ops[..prefill.ops.len() - 2]);
+    // …and minus their 2 output values, likewise prefix-identical.
+    assert_eq!(plan.values.len(), prefill.values.len() - 2);
+    assert_eq!(plan.values[..], prefill.values[..prefill.values.len() - 2]);
+    assert_eq!(plan.family, "qwen3_5_hybrid.cuda.state_only");
+
+    check_plan("qwen3_5_hybrid_0_8b.cuda.state_only", &plan);
+}
+
+/// The CommitAdvance service class (rung 4c-iv): a genuinely different
+/// pass — no embed (the root is a bare input placeholder), ONLY the 18
+/// linear layers, each exactly [verify-stash load (pseudo-symbol, 3
+/// outputs) → prefill conv walk → GdnPrep → FLA recurrence], nothing
+/// after the loop: 72 ops. The synthetic cuda facts configure the verify
+/// stash, so the in-proj GEMMs are skipped — no Matmul in the pass.
+#[test]
+fn qwen3_5_hybrid_0_8b_cuda_commit_advance() {
+    let facts = Qwen35HybridFacts::qwen3_5_0_8b();
+    let cuda = Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+    let plan = qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::CommitAdvance);
+    assert_eq!(plan.family, "qwen3_5_hybrid.cuda.commit_advance");
+
+    // 18 linear layers x 4 ops; 1 input value + 18 x (3 + 1 + 5) fresh.
+    assert_eq!(plan.ops.len(), 18 * 4);
+    assert_eq!(plan.values.len(), 1 + 18 * 9);
+    // The root is a placeholder no op produces.
+    assert!(!plan.ops.iter().any(|op| op.outputs.contains(&0)));
+
+    for l in (0..facts.layers).filter(|&l| !facts.is_full_attn(l)) {
+        let names: Vec<&str> = plan
+            .layer_ops(l)
+            .map(|op| match &op.kind {
+                OpKind::Launch { kernel, .. } => kernel.as_str(),
+                OpKind::GdnPrep { .. } => "GdnPrep",
+                other => panic!("foreign op in the commit pass: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "qwen35_verify_stash_load",
+                "launch_causal_conv1d_prefill_batched_bf16",
+                "GdnPrep",
+                "launch_chunk_gated_delta_prefill_batched_state_bf16",
+            ],
+            "layer {l}"
+        );
+    }
+    // Full-attention layers do not exist in this pass, and neither does
+    // any GEMM (the stash replays the in-proj outputs).
+    for l in (0..facts.layers).filter(|&l| facts.is_full_attn(l)) {
+        assert_eq!(plan.layer_ops(l).count(), 0, "layer {l} must be skipped");
+    }
+    assert!(
+        !plan
+            .ops
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::Matmul { .. }))
+    );
+
+    check_plan("qwen3_5_hybrid_0_8b.cuda.commit_advance", &plan);
 }
 
 /// The first LOWERED goldens (north-star-dsl.md): the SAME llama_like

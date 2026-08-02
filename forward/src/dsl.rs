@@ -1066,6 +1066,66 @@ pub mod cuda {
         );
     }
 
+    /// `"qwen35_verify_stash_load"`: replay the layer's stashed in-proj
+    /// outputs — `[mixed_qkv | a | b]` from the verify hidden stash slab
+    /// into the workspace buffers the following conv/prep read.
+    ///
+    /// A PSEUDO-SYMBOL, the first: it names an OPERATION the driver
+    /// implements as a `cudaMemcpyAsync` trio, not a `__global__` entry
+    /// point. The contract stands regardless — a launcher may be three
+    /// API calls; the symbol names the operation, and the driver's
+    /// name→launcher registry resolves it like any other. No inputs
+    /// (the stash is the layer's per-request state, marked below);
+    /// THREE outputs, the in-proj triple the GEMMs would have produced —
+    /// mixed_qkv `[Tokens, conv_dim]`, a `[Tokens, value_heads]`, b
+    /// `[Tokens, value_heads]`, all bf16 — so the CommitAdvance pass's
+    /// dataflow into `gdn_prep` stays complete. WHERE those buffers
+    /// live is the driver's binding, [`repeat_interleave_heads`]-style.
+    pub fn verify_stash_load(t: &Trace, rs: &Rs, conv_dim: u32, value_heads: u32) -> (Val, Val, Val) {
+        let ids = t.with(Some(rs.l), |b| {
+            b.launch(
+                "qwen35_verify_stash_load",
+                vec![],
+                rs_state(rs),
+                vec![],
+                vec![
+                    (Shape(vec![Dim::Tokens, Dim::Const(conv_dim)]), DType::BF16),
+                    (Shape(vec![Dim::Tokens, Dim::Const(value_heads)]), DType::BF16),
+                    (Shape(vec![Dim::Tokens, Dim::Const(value_heads)]), DType::BF16),
+                ],
+            )
+        });
+        let mk = |id| Val {
+            t: t.clone(),
+            id,
+            layer: Some(rs.l),
+        };
+        (mk(ids[0]), mk(ids[1]), mk(ids[2]))
+    }
+
+    /// `"qwen35_verify_stash_store"`: persist a linear layer's in-proj
+    /// triple `[qkv, a, b]` into the layer's verify hidden stash slab —
+    /// [`verify_stash_load`]'s writing half, the same pseudo-symbol
+    /// contract (a memcpy trio behind one name). Output-less: the stash
+    /// is the layer's per-request state, not dataflow.
+    ///
+    /// No class this rung states it: its consumer is the future
+    /// frozen-verify class (the `write_state=false` verify pass that
+    /// fills the stash the commit pass replays — semantic this rung).
+    /// The pair is declared together because the load's contract is only
+    /// meaningful against the store's layout.
+    pub fn verify_stash_store(qkv: &Val, a: &Val, b: &Val, rs: &Rs) {
+        record(
+            &qkv.t,
+            Some(rs.l),
+            "qwen35_verify_stash_store",
+            vec![],
+            rs_state(rs),
+            vec![qkv.id, a.id, b.id],
+            None,
+        );
+    }
+
     fn dequant(kv: &Kv) {
         record(
             &kv.t,

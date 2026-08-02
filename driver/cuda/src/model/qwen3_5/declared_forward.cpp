@@ -113,6 +113,8 @@ enum class Q35Kernel {
     PrefillFla,
     PrefillFlaBf16,
     RepeatInterleave,
+    VerifyStashLoad,
+    VerifyStashStore,
     AttnFlashinferDecode,
     AttnFlashinferPrefill,
     WriteKvExplicit,
@@ -135,6 +137,8 @@ Q35Kernel resolve_q35_kernel(std::string_view k) {
     if (k == "launch_chunk_gated_delta_prefill_batched") return Q35Kernel::PrefillFla;
     if (k == "launch_chunk_gated_delta_prefill_batched_state_bf16") return Q35Kernel::PrefillFlaBf16;
     if (k == "launch_repeat_interleave_heads_fp32") return Q35Kernel::RepeatInterleave;
+    if (k == "qwen35_verify_stash_load") return Q35Kernel::VerifyStashLoad;
+    if (k == "qwen35_verify_stash_store") return Q35Kernel::VerifyStashStore;
     if (k == "dispatch_attention_flashinfer_decode") return Q35Kernel::AttnFlashinferDecode;
     if (k == "dispatch_attention_flashinfer_prefill_bf16") return Q35Kernel::AttnFlashinferPrefill;
     if (k == "launch_write_kv_explicit_bf16") return Q35Kernel::WriteKvExplicit;
@@ -207,12 +211,30 @@ void qwen3_5_forward_declared(
     const bool state_only = num_logit_rows < 0;
     const bool state_dtype_ok =
         state_cache.recurrent_state_bf16() == declared.cuda_state_bf16;
-    const bool class_walk =
-        !commit_advance && !state_only && !state_cache.verify_frozen() &&
-        slot_ids_d != nullptr &&
+    // 4c-iv: the service classes route too. Frozen-verify fires stay
+    // semantic (their class — the stash-writing prefill — is the next
+    // slice), and a commit fire whose live stash disagrees with the
+    // traced fact falls back rather than replaying from a stash that is
+    // not there.
+    const bool commit_stash_ok =
+        state_cache.verify_hidden_stash_enabled() == declared.cuda_verify_stash;
+    const pie_forward::ForwardPlan* class_plan = nullptr;
+    if (state_dtype_ok && slot_ids_d != nullptr &&
         (is_pure_decode || qo_indptr != nullptr) &&
-        static_cast<bool>(declared.decode) &&
-        static_cast<bool>(declared.prefill) && state_dtype_ok;
+        !state_cache.verify_frozen()) {
+        if (commit_advance && !state_only) {
+            if (declared.commit_advance && commit_stash_ok) {
+                class_plan = &declared.commit_advance;
+            }
+        } else if (state_only && !commit_advance) {
+            if (declared.state_only) class_plan = &declared.state_only;
+        } else if (!commit_advance && !state_only &&
+                   declared.decode && declared.prefill) {
+            class_plan =
+                is_pure_decode ? &declared.decode : &declared.prefill;
+        }
+    }
+    const bool class_walk = class_plan != nullptr;
     if (!state_dtype_ok) {
         static bool warned = false;
         if (!warned) {
@@ -224,8 +246,7 @@ void qwen3_5_forward_declared(
         }
     }
     const pie_forward::ForwardPlan& plan =
-        class_walk ? (is_pure_decode ? declared.decode : declared.prefill)
-                   : declared.plan;
+        class_walk ? *class_plan : declared.plan;
     if (qwen35_declared_exec_trace_enabled()) {
         std::fprintf(stderr,
                      "[declared-qwen35-exec] N=%d R=%d decode=%d ops=%zu "
@@ -465,8 +486,10 @@ void qwen3_5_forward_declared(
             if (i >= op_count) break;
         }
         const PieForwardOp& op = plan.op(i);
-        if (commit_advance && !commit_advance_runs(op)) continue;
-        if (state_only && state_only_skips(op)) continue;
+        // The op filters serve the SEMANTIC walk only: a class trace
+        // already contains exactly the service's ops.
+        if (!class_walk && commit_advance && !commit_advance_runs(op)) continue;
+        if (!class_walk && state_only && state_only_skips(op)) continue;
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
@@ -1383,6 +1406,54 @@ case PieForwardOpKind::Launch: {
                 kernels::launch_repeat_interleave_heads_fp32(
                     src, dst, N, K_h, V_h, K_d, stream);
                 repeat_next_is_k = !repeat_next_is_k;
+                break;
+            }
+            case Q35Kernel::VerifyStashLoad:
+            case Q35Kernel::VerifyStashStore: {
+                // The pseudo-symbols name an OPERATION the driver
+                // implements as a cudaMemcpyAsync trio ([mixed_qkv|a|b]
+                // against the layer's stash slab) — a launcher may be
+                // three API calls; the symbol names the operation. The
+                // stash is keyed by the COMPACT linear index, storage
+                // knowledge derived from the binding (the semantic arm's
+                // derivation, verbatim).
+                if (!stash_enabled) {
+                    throw_drift("stated stash op but the live stash is "
+                                "disabled (cross-check should have "
+                                "routed this fire to the semantic walk)");
+                }
+                int linear_idx = 0;
+                for (int l = 0; l < SL; ++l) {
+                    if (w.layers[l].kind ==
+                        Qwen3_5LayerWeights::Kind::LinearAttn) {
+                        ++linear_idx;
+                    }
+                }
+                auto* stash = static_cast<std::uint16_t*>(
+                    state_cache.verify_hidden_stash_layer(linear_idx));
+                const bool load =
+                    resolve_q35_kernel(plan.weight_name(op)) ==
+                    Q35Kernel::VerifyStashLoad;
+                const auto cp = [&](void* dst, const void* src,
+                                    std::size_t n) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        dst, src, n, cudaMemcpyDeviceToDevice, stream));
+                };
+                const std::size_t n_qkv =
+                    static_cast<std::size_t>(N) * conv_dim *
+                    sizeof(std::uint16_t);
+                const std::size_t n_ab =
+                    static_cast<std::size_t>(N) * V_h *
+                    sizeof(std::uint16_t);
+                if (load) {
+                    cp(la.mixed_qkv.data(), stash, n_qkv);
+                    cp(la.a.data(), stash + stash_a_off, n_ab);
+                    cp(la.b.data(), stash + stash_b_off, n_ab);
+                } else {
+                    cp(stash, la.mixed_qkv.data(), n_qkv);
+                    cp(stash + stash_a_off, la.a.data(), n_ab);
+                    cp(stash + stash_b_off, la.b.data(), n_ab);
+                }
                 break;
             }
             case Q35Kernel::AttnFlashinferDecode: {
