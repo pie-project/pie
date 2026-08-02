@@ -175,3 +175,74 @@ fn zt_reader_matches_the_native_safetensors_reader() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A sharded `.zt` root: the manifest names shards, the tensors live in other
+/// files, and the loader must end up with coordinates that address the right
+/// bytes in the right file.
+///
+/// `parse_checkpoint` claims a root "brings its shards along". This is that
+/// claim, checked: nothing else in the loader's tests opens a root whose
+/// tensors are somewhere else, so the whole shard-resolution path — name to
+/// file, store id to `FileId` — would otherwise be untested here.
+#[test]
+fn a_sharded_root_addresses_bytes_in_its_shards() {
+    let dir = tmpdir("sharded");
+    let payload = f32_bytes(&[1.5, 2.5, 3.5, 4.5]);
+    let local = f32_bytes(&[7.0, 8.0]);
+
+    // The positional convention: `model.zt` finds a shard named `00001` at
+    // `model-00001.zt`, with no resolver configured by the loader.
+    let shard_path = dir.join("model-00001.zt");
+    write_zt(
+        &shard_path,
+        &[(
+            "embed.weight",
+            vec![2, 2],
+            ztensor::DType::F32,
+            payload.clone(),
+        )],
+    );
+    let identity = ztensor::shard_identity(&shard_path).unwrap();
+    let shard_object = ztensor::validate::manifest_of(&shard_path)
+        .unwrap()
+        .expect("the shard has a manifest")
+        .object("embed.weight")
+        .unwrap()
+        .clone();
+
+    let root = dir.join("model.zt");
+    let mut writer = ztensor::Writer::options()
+        .canonical(false)
+        .create(&root)
+        .unwrap();
+    // One tensor of its own, so the root exercises both a local part and a
+    // foreign one — the two spellings of a blob reference.
+    writer
+        .add("norm.weight", vec![2], ztensor::DType::F32, &local)
+        .unwrap();
+    writer.add_shard("00001", &identity).unwrap();
+    writer.link("embed.weight", &shard_object, "00001").unwrap();
+    writer.finish().unwrap();
+
+    let metadata = parse_checkpoint(&root).unwrap();
+    assert_eq!(metadata.files.len(), 2, "root plus one shard");
+    assert_eq!(bytes_at(&metadata, "embed.weight"), payload);
+    assert_eq!(bytes_at(&metadata, "norm.weight"), local);
+
+    // The foreign tensor must be attributed to the shard, not the root: a
+    // `FileId` that pointed at the root would still read *some* bytes, and
+    // `bytes_at` above would be comparing them against the wrong file.
+    let embed = metadata.tensor_by_name("embed.weight").unwrap();
+    let norm = metadata.tensor_by_name("norm.weight").unwrap();
+    assert_ne!(embed.file_id, norm.file_id);
+    let file_of = |id| {
+        metadata
+            .files
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| f.path.clone())
+            .unwrap()
+    };
+    assert_eq!(file_of(embed.file_id), shard_path.display().to_string());
+    assert_eq!(file_of(norm.file_id), root.display().to_string());
+}

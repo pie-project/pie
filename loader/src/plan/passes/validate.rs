@@ -203,7 +203,8 @@ pub(super) fn validate_scale_factors(program: &mut LoadPlan) -> Result<usize> {
         let wanted = 1 + usize::from(source.is_none());
         if inputs.len() != wanted {
             return Err(Error::Contract(format!(
-                "per-group Scale has {} input operands, expected {wanted}                  (payload then factors)",
+                "per-group Scale has {} input operands, expected {wanted} \
+                 (payload then factors)",
                 inputs.len()
             )));
         }

@@ -88,9 +88,14 @@ fn describe(source: &Source) -> Result<CheckpointMetadata, Error> {
             // The loader addresses checkpoint bytes where they lie, so a part
             // with no address cannot be planned at all — a compressed `.zt`
             // part, a deflated zip entry, a chunked HDF5 dataset.
-            let at = part.locate().map_err(|_| {
+            // zTensor says *why* a part has no address — stored under an
+            // encoding, produced by a foreign reader — and that is the half
+            // that tells someone what to do about it, so it is kept.
+            let at = part.locate().map_err(|why| {
                 Error::Checkpoint(format!(
-                    "{name}: this part has no address — the loader addresses checkpoint                      bytes where they lie; convert the file to a raw one first"
+                    "{name}: this part has no address ({why}) — the loader addresses \
+                     checkpoint bytes where they lie; convert the file to a raw \
+                     one first"
                 ))
             })?;
             let id = TensorId(u32::try_from(tensors.len()).map_err(|_| {
