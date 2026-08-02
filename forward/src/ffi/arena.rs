@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::trace::{ForwardPlan, Op, OpKind, ValueInfo};
+use crate::trace::{ForwardPlan, Op, OpKind, StateRef, StateStore, ValueInfo};
 
 use super::types::*;
 
@@ -85,20 +85,42 @@ fn flatten_value(info: &ValueInfo) -> PieForwardValue {
     }
 }
 
-/// Flatten one [`OpKind`] into (kind tag, weight name, param0, param1,
-/// selector).
+/// One op's flattened slots, [`flatten_kind`]'s result.
+///
+/// `aux_names` is a range of NAME indices in the flat id array — empty for
+/// every kind except `Launch`, whose consumed weight names it carries.
+struct OpParts {
+    kind: PieForwardOpKind,
+    weight_name: u32,
+    param0: u32,
+    param1: u32,
+    selector: u32,
+    aux_names: PieForwardIdRange,
+}
+
+impl OpParts {
+    fn plain(parts: (PieForwardOpKind, u32, u32, u32, u32)) -> Self {
+        let (kind, weight_name, param0, param1, selector) = parts;
+        Self {
+            kind,
+            weight_name,
+            param0,
+            param1,
+            selector,
+            aux_names: PieForwardIdRange { offset: 0, len: 0 },
+        }
+    }
+}
+
+/// Flatten one [`OpKind`] into its POD slots.
 ///
 /// The mapping is the table documented on [`PieForwardOp`]; keeping the two
 /// adjacent to one match arm each is what keeps the table honest. Only the
 /// expert-indexed `Matmul` carries a selector; everything else rests at
 /// [`PIE_FORWARD_NO_VALUE`].
-fn flatten_kind(
-    arena: &mut PlanArena,
-    interner: &mut Interner,
-    kind: &OpKind,
-) -> (PieForwardOpKind, u32, u32, u32, u32) {
+fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -> OpParts {
     let mut name = |arena: &mut PlanArena, weight: &str| interner.intern(arena, weight);
-    match kind {
+    OpParts::plain(match kind {
         OpKind::Embed { weight } => (
             PieForwardOpKind::Embed,
             name(arena, weight),
@@ -159,14 +181,11 @@ fn flatten_kind(
             0,
             PIE_FORWARD_NO_VALUE,
         ),
-        // `param1` is the stated kernel's wire value ([`AttnKernel`]
-        // discriminants), 0 when the semantic trace left it unstated —
-        // the resting value every pre-lowering consumer already reads.
-        OpKind::Attention { layer, kernel } => (
+        OpKind::Attention { layer } => (
             PieForwardOpKind::Attention,
             PIE_FORWARD_NO_NAME,
             *layer,
-            kernel.map_or(0, |k| k as u32),
+            0,
             PIE_FORWARD_NO_VALUE,
         ),
         OpKind::Swiglu { inter } => (
@@ -271,34 +290,41 @@ fn flatten_kind(
             0,
             PIE_FORWARD_NO_VALUE,
         ),
-        // Names two weights, GdnPrep's pattern: q_norm in the weight
-        // slot, k_norm as a param0 NAME INDEX; head_dim in param1. The
-        // layer rides the op's own `layer` field (and the norm names),
-        // so no slot is spent on it.
-        OpKind::QkvDecodeFusedPost {
-            q_norm,
-            k_norm,
-            layer: _,
-            head_dim,
+        // The stated launch: the KERNEL name rides the weight slot (the
+        // one name every Launch has), the weight names it consumes ride
+        // `aux_names` (a range of NAME indices in the flat id array, in
+        // signature order), and the state mark rides the params —
+        // param0 = store (0 none, 1 kv-cache, 2 recurrent), param1 = the
+        // state layer.
+        OpKind::Launch {
+            kernel,
+            weights,
+            state,
         } => {
-            let q_norm = name(arena, q_norm);
-            let k_norm = name(arena, k_norm);
-            (
-                PieForwardOpKind::QkvDecodeFusedPost,
-                q_norm,
-                k_norm,
-                *head_dim,
-                PIE_FORWARD_NO_VALUE,
-            )
+            let kernel = name(arena, kernel);
+            let ids: Vec<u32> = weights.iter().map(|w| name(arena, w)).collect();
+            let aux = store_ids(arena, &ids);
+            let (store, layer) = match state {
+                None => (0, 0),
+                Some(StateRef {
+                    store: StateStore::KvCache,
+                    layer,
+                }) => (1, *layer),
+                Some(StateRef {
+                    store: StateStore::RecurrentState,
+                    layer,
+                }) => (2, *layer),
+            };
+            return OpParts {
+                kind: PieForwardOpKind::Launch,
+                weight_name: kernel,
+                param0: store,
+                param1: layer,
+                selector: PIE_FORWARD_NO_VALUE,
+                aux_names: aux,
+            };
         }
-        OpKind::RopeTableBuild => (
-            PieForwardOpKind::RopeTableBuild,
-            PIE_FORWARD_NO_NAME,
-            0,
-            0,
-            PIE_FORWARD_NO_VALUE,
-        ),
-    }
+    })
 }
 
 /// Append an op's operand ids to the flat array and describe the run.
@@ -312,16 +338,17 @@ fn store_ids(arena: &mut PlanArena, ids: &[u32]) -> PieForwardIdRange {
 }
 
 fn flatten_op(arena: &mut PlanArena, interner: &mut Interner, op: &Op) -> PieForwardOp {
-    let (kind, weight_name, param0, param1, selector) = flatten_kind(arena, interner, &op.kind);
+    let parts = flatten_kind(arena, interner, &op.kind);
     let inputs = store_ids(arena, &op.inputs);
     let outputs = store_ids(arena, &op.outputs);
     PieForwardOp {
-        kind,
+        kind: parts.kind,
         layer: op.layer.map_or(PIE_FORWARD_NO_LAYER, |l| l as i32),
-        weight_name,
-        param0,
-        param1,
-        selector,
+        weight_name: parts.weight_name,
+        param0: parts.param0,
+        param1: parts.param1,
+        selector: parts.selector,
+        aux_names: parts.aux_names,
         inputs,
         outputs,
     }

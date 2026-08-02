@@ -10,10 +10,8 @@ use crate::facts::{
     LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm, Qwen35FullAttnFacts,
     Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
-use crate::trace::{
-    AttnKernel, DType, Dim, FireClass, ForwardPlan, NormVariant, RopeKind, Shape, TraceBuilder,
-    ValueId,
-};
+use crate::dsl::{self, attention, cuda, matmul, rmsnorm, rope, split_qkv, swiglu};
+use crate::trace::{DType, Dim, FireClass, ForwardPlan, NormVariant, RopeKind, Shape, TraceBuilder, ValueId};
 
 /// The llama_like body — SEMANTIC form: no structural divergence, one
 /// trace serves every fire shape, kernel choice stays with the consumer.
@@ -39,169 +37,133 @@ pub fn llama_like(facts: &LlamaLikeFacts) -> ForwardPlan {
 
 /// The LOWERED llama_like: the SAME text as [`llama_like`], traced with
 /// the CUDA backend facts and a fire class in hand, so the class arms run
-/// and the traced form states kernels (north-star-dsl.md). One trace per
+/// and the traced form states its kernels as raw signatures
+/// ([`crate::dsl::cuda`]; north-star-dsl.md). One trace per
 /// [`FireClass`]; family names `llama_like.cuda.decode` / `.prefill`.
 pub fn llama_like_cuda(
     facts: &LlamaLikeFacts,
     cuda: &LlamaLikeCudaFacts,
     class: FireClass,
 ) -> ForwardPlan {
-    llama_like_text(facts, Some(CudaLower { cuda, class }))
-}
-
-/// The lowering context of a class trace: the backend facts and the fire
-/// class the declaration's class arms match on.
-struct CudaLower<'a> {
-    cuda: &'a LlamaLikeCudaFacts,
-    class: FireClass,
+    llama_like_text(facts, Some((cuda, class)))
 }
 
 /// THE one llama_like text (north-star-dsl.md): computation and kernel
-/// choice together. With `lower: None` this is the semantic trace — the
-/// general arm everywhere, no kernel stated, byte-identical to what
-/// `llama_like` always produced. With a lowering, the class arms run as
-/// ordinary trace-time matches beside the fact arms, and what they choose
-/// is exactly what `declared_forward.cpp` chooses at fire time today —
-/// the migration deletes the C++ copy of these matches, not this one.
-fn llama_like_text(facts: &LlamaLikeFacts, lower: Option<CudaLower>) -> ForwardPlan {
-    let family = match &lower {
-        None => "llama_like".to_string(),
-        Some(l) => format!(
-            "llama_like.cuda.{}",
-            match l.class {
-                FireClass::Decode => "decode",
-                FireClass::Prefill => "prefill",
-            }
-        ),
-    };
-    let mut t = TraceBuilder::new(family);
-    let q_w = facts.q_width();
-    let kv_w = facts.kv_width();
-    let post_norm = facts.norm_placement == NormPlacement::Post;
+/// choice together, on the dsl surface. With `lower: None` this is the
+/// semantic trace — the general arm everywhere, no kernel stated,
+/// byte-identical to what `llama_like` always produced (the goldens pin
+/// it). With a lowering, the class arms run as ordinary trace-time
+/// matches beside the fact arms, and what they choose is exactly what
+/// `declared_forward.cpp` chooses at fire time today — the migration
+/// deletes the C++ copy of these matches, not this one.
+fn llama_like_text(
+    facts: &LlamaLikeFacts,
+    lower: Option<(&LlamaLikeCudaFacts, FireClass)>,
+) -> ForwardPlan {
+    dsl::trace(facts, lower, |m| {
+        let f = m.facts().clone();
+        let q_w = f.q_width();
+        let kv_w = f.kv_width();
+        let post_norm = f.norm_placement == NormPlacement::Post;
+        let cuda_of = |class_want: FireClass| {
+            m.lowering()
+                .filter(|(_, class)| *class == class_want)
+                .map(|(c, _)| c)
+        };
 
-    // The fused decode-QKV arm's predicate: the model-fact terms here, the
-    // load-time backend terms on the facts struct — term for term the
-    // hand-written `fused_decode_qkv_post` (declared_forward.cpp:465-479),
-    // written where it belongs: in the declaration.
-    let fused_post = matches!(
-        &lower,
-        Some(l) if l.class == FireClass::Decode && l.cuda.decode_fused_post
-    ) && facts.fused_qkv
-        && facts.qk_norm == QkNorm::PerHead
-        && facts.rope == RopeKind::Standard;
+        // The fused decode-QKV arm's predicate: the model-fact terms
+        // here, the load-time backend terms on the facts struct — term
+        // for term the hand-written `fused_decode_qkv_post`
+        // (declared_forward.cpp:465-479), written where it belongs.
+        let fused_post = cuda_of(FireClass::Decode).is_some_and(|c| c.decode_fused_post)
+            && f.fused_qkv
+            && f.qk_norm == QkNorm::PerHead
+            && f.rope == RopeKind::Standard;
 
-    // The attention kernel this class fires, when a class is in hand. XQA
-    // overrides force_prefill_path (context.cpp:1427); the non-XQA decode
-    // arm's runtime prefill-decode-plan alternative needs `Guard` and is
-    // pinned off until it exists (see `AttnKernel`).
-    let attn_kernel = lower.as_ref().map(|l| match l.class {
-        FireClass::Decode if l.cuda.xqa_decode => AttnKernel::XqaDecode,
-        FireClass::Decode if l.cuda.force_prefill_path => AttnKernel::PrefillDequantDecode,
-        FireClass::Decode => AttnKernel::FlashinferDecode,
-        FireClass::Prefill => AttnKernel::PrefillPlanned,
-    });
+        let mut y = m.embed();
 
-    // The hand-written `rope_table_ready` latch, made trace-time: the
-    // trace unrolls the layer loop, so "first fused layer builds the
-    // table" is a plain mutable bool over that unrolling.
-    let mut rope_table_built = false;
+        // The fire's rope table: a VALUE the fused kernel consumes, built
+        // once — not the hand-written `rope_table_ready` latch, and
+        // hoisted where a once-per-fire launch belongs.
+        let table = (fused_post && cuda_of(FireClass::Decode).is_some_and(|c| c.rope_table))
+            .then(|| cuda::rope_standard_table(m));
 
-    let mut y = t.embed("embed", facts.hidden);
+        for l in 0..f.layers {
+            let w = m.layer(l);
 
-    for l in 0..facts.layers {
-        y = t.layer(l, |t| {
-            let w = |name: &str| format!("layer.{l}.{name}");
-
-            // Attention block: (pre-norm) -> qkv -> (q/k norms) -> rope ->
-            // append -> attention -> o_proj landed on the residual.
+            // Attention block: (pre-norm) -> qkv -> (q/k norms) -> rope
+            // -> append -> attention -> o_proj landed on the residual.
             let x = if post_norm {
-                y
+                y.clone()
             } else {
-                t.rmsnorm(y, &w("attn_norm"), facts.norm_variant)
+                rmsnorm(&y, &w.attn_norm)
             };
             let q = if fused_post {
                 // Decode class, fused binding: the packed GEMM, then ONE
-                // kernel for split + per-head norms + rope + KV write.
-                // The general arm below is this arm's semantics.
-                let packed = t.matmul(x, &w("qkv"), q_w + 2 * kv_w);
-                if lower.as_ref().is_some_and(|l| l.cuda.rope_table) && !rope_table_built {
-                    t.rope_table_build();
-                    rope_table_built = true;
-                }
-                t.qkv_decode_fused_post(
-                    packed,
-                    &w("q_norm"),
-                    &w("k_norm"),
-                    l,
-                    facts.head_dim,
+                // kernel for split + norms + rope + KV write. The general
+                // arm below is this arm's semantics.
+                cuda::qkv_decode_qk_norm_rope_write_kv(
+                    &matmul(&x, &w.qkv),
+                    &w.q_norm,
+                    &w.k_norm,
+                    &w.kv,
+                    table.as_ref(),
                     q_w,
                 )
             } else {
-                let (q, k, v) = if facts.fused_qkv {
-                    let packed = t.matmul(x, &w("qkv"), q_w + 2 * kv_w);
-                    t.split_qkv(packed, q_w, kv_w)
+                let (q, k, v) = if f.fused_qkv {
+                    split_qkv(&matmul(&x, &w.qkv), q_w, kv_w)
                 } else {
                     (
-                        t.matmul(x, &w("q_proj"), q_w),
-                        t.matmul(x, &w("k_proj"), kv_w),
-                        t.matmul(x, &w("v_proj"), kv_w),
+                        matmul(&x, &w.q_proj),
+                        matmul(&x, &w.k_proj),
+                        matmul(&x, &w.v_proj),
                     )
                 };
-                let (q, k) = match facts.qk_norm {
-                    QkNorm::Off => (q, k),
-                    QkNorm::PerHead => (
-                        t.rmsnorm_per_head(q, &w("q_norm"), facts.head_dim, facts.norm_variant),
-                        t.rmsnorm_per_head(k, &w("k_norm"), facts.head_dim, facts.norm_variant),
-                    ),
-                    // The global convention IS a plain row RMSNorm over the
-                    // flattened `[rows, heads * head_dim]` projection — the
-                    // same op (and kernel) as the block norms, applied to q/k.
-                    QkNorm::Global => (
-                        t.rmsnorm(q, &w("q_norm"), facts.norm_variant),
-                        t.rmsnorm(k, &w("k_norm"), facts.norm_variant),
-                    ),
+                // The weight knows its convention (per-head, row-global,
+                // or — under QkNorm::Off — no norm exists to apply).
+                let (q, k) = if f.qk_norm == QkNorm::Off {
+                    (q, k)
+                } else {
+                    (rmsnorm(&q, &w.q_norm), rmsnorm(&k, &w.k_norm))
                 };
-                let (q, k) = t.rope(q, k, facts.rope);
-                t.kv_append(l, k, v);
+                let (q, k) = rope(&q, &k, f.rope);
+                w.kv.append(&k, &v);
                 q
             };
-            let attn = match attn_kernel {
-                None => t.attention(l, q, q_w),
-                Some(kernel) => t.attention_with(l, q, q_w, kernel),
+            let a = match m.lowering() {
+                // The kernel, stated — raw signatures, one per launcher.
+                // XQA overrides force_prefill_path (context.cpp:1427); the
+                // non-XQA decode arm's runtime prefill-decode-plan
+                // alternative needs `Guard` and is pinned off until it
+                // exists (north-star-dsl.md).
+                Some((c, FireClass::Decode)) if c.xqa_decode => {
+                    cuda::attention_xqa_decode(&q, &w.kv, q_w)
+                }
+                Some((c, FireClass::Decode)) if c.force_prefill_path => {
+                    cuda::attention_prefill_dequant(&q, &w.kv, q_w)
+                }
+                Some((_, FireClass::Decode)) => cuda::attention_flashinfer_decode(&q, &w.kv, q_w),
+                Some((_, FireClass::Prefill)) => cuda::attention_flashinfer_prefill(&q, &w.kv, q_w),
+                None => attention(&q, &w.kv, q_w),
             };
-            let y_attn = if post_norm {
-                // Post-norm: o_proj to scratch, norm the OUTPUT, then the
-                // separate residual add — norm placement is an op-order
-                // fact, so the trace states all three.
-                let o = t.matmul(attn, &w("o_proj"), facts.hidden);
-                let o = t.rmsnorm(o, &w("attn_norm"), facts.norm_variant);
-                t.residual_add(o, y)
-            } else {
-                t.matmul_add(attn, &w("o_proj"), y, facts.hidden)
-            };
-
-            // MLP block: (pre-norm) -> gate‖up -> swiglu -> down landed.
-            let m = if post_norm {
-                y_attn
-            } else {
-                t.rmsnorm(y_attn, &w("mlp_norm"), facts.norm_variant)
-            };
-            let packed = t.matmul(m, &w("gate_up"), 2 * facts.intermediate);
-            let act = t.swiglu(packed, facts.intermediate);
             if post_norm {
-                let d = t.matmul(act, &w("down"), facts.hidden);
-                let d = t.rmsnorm(d, &w("mlp_norm"), facts.norm_variant);
-                t.residual_add(d, y_attn)
+                // Post-norm: o_proj to scratch, norm the OUTPUT, then the
+                // separate residual landing (`+=` of a non-matmul records
+                // the explicit ResidualAdd launch).
+                y += rmsnorm(&matmul(&a, &w.o_proj), &w.attn_norm);
+                let mlp = matmul(&swiglu(&matmul(&y, &w.gate_up), f.intermediate), &w.down);
+                y += rmsnorm(&mlp, &w.mlp_norm);
             } else {
-                t.matmul_add(act, &w("down"), y_attn, facts.hidden)
+                // Pre-norm: `+=` of a fresh matmul IS the beta=1 fold.
+                y += matmul(&a, &w.o_proj);
+                let x = rmsnorm(&y, &w.mlp_norm);
+                y += matmul(&swiglu(&matmul(&x, &w.gate_up), f.intermediate), &w.down);
             }
-        });
-    }
+        }
 
-    let final_norm = t.rmsnorm(y, "final_norm", facts.norm_variant);
-    let lm_head = if facts.tied_embeddings { "embed" } else { "lm_head" };
-    t.lm_head(final_norm, lm_head, facts.vocab);
-    t.finish()
+        m.logits(&rmsnorm(&y, &m.final_norm()));
+    })
 }
 
 /// One qwen3_5_moe MoE MLP block, traced standalone — the first `dyn`

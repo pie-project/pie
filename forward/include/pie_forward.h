@@ -108,19 +108,22 @@ enum class PieForwardOpKind : uint32_t {
   /// `out = x * sigmoid(gate)`, elementwise — the full-attention output
   /// gate. A multiply with NO residual: distinct from `SigmoidGateAdd`.
   SigmoidGateMul = 20,
-  /// The fused decode-QKV epilogue a LOWERED decode-class trace states
-  /// (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`): split + per-head
-  /// Plain q/k norms + Standard rope + KV append, one launch. First of
-  /// the lowered kinds (north-star-dsl.md): a kind the SEMANTIC traces
-  /// never contain, produced only by class-lowered declarations
-  /// (`pie_forward_trace_llama_like_cuda`). Names two weights — q_norm
-  /// in the weight slot, k_norm as a param0 NAME INDEX (GdnPrep's
-  /// pattern); head_dim in param1.
+  /// RETIRED (rung 1's per-kernel kind, absorbed into [`Self::Launch`]
+  /// within the same unreleased arc). Never emitted; the discriminant
+  /// stays reserved per the appended-only rule.
   QkvDecodeFusedPost = 21,
-  /// Build the fire's rope cos/sin table (`launch_rope_standard_table`);
-  /// stated once, on the first layer whose fused-QKV arm runs. No
-  /// operands, no results, no params.
+  /// RETIRED — see [`Self::QkvDecodeFusedPost`].
   RopeTableBuild = 22,
+  /// A STATED kernel launch — the ONE kind every lowered trace uses for
+  /// every kernel its class arms call (north-star-dsl.md; raw kernel
+  /// signatures, `dsl::cuda`). The kernel's launcher symbol rides the
+  /// weight slot as a name index; the weight names it consumes ride
+  /// `aux_names` (name indices, signature order); param0 is the
+  /// implicit-state store it addresses (0 none, 1 kv-cache,
+  /// 2 recurrent) and param1 that state's layer. A dumb consumer
+  /// resolves the symbol in its name→launcher registry and launches —
+  /// adding a kernel never grows this enum again.
+  Launch = 23,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -160,26 +163,6 @@ enum class PieForwardQkNorm : uint32_t {
 enum class PieForwardFireClass : uint32_t {
   Decode = 0,
   Prefill = 1,
-};
-
-/// Mirrors [`crate::trace::AttnKernel`] — the values `Attention.param1`
-/// carries; same appended-only discriminant rule as [`PieForwardOpKind`].
-/// `Unspecified` (0) is the semantic trace's resting value: no kernel
-/// stated, the executor derives the path itself, exactly the pre-lowering
-/// contract. A LOWERED trace states one of the rest and a dumb consumer
-/// launches exactly that (north-star-dsl.md).
-enum class PieForwardAttnKernel : uint32_t {
-  Unspecified = 0,
-  /// `launch_attention_xqa_decode_bf16_prepared` (+ the fire-wide XQA
-  /// prepare, hoisted).
-  XqaDecode = 1,
-  /// `dispatch_attention_flashinfer_decode` against the decode plan.
-  FlashinferDecode = 2,
-  /// Decode-shaped fire on the prefill kernel: dequant-to-bf16 +
-  /// planned FlashInfer prefill (the `force_prefill_path` fallback).
-  PrefillDequantDecode = 3,
-  /// Planned FlashInfer prefill.
-  PrefillPlanned = 4,
 };
 
 /// The llama_like facts, as C states them. Mirrors
@@ -281,6 +264,10 @@ struct PieForwardIdRange {
 /// | `RmsnormGated`   | weight               | —                            | —          |
 /// | `SplitQGate`     | none                 | `heads`                      | `head_dim` |
 /// | `SigmoidGateMul` | none                 | —                            | —          |
+/// | `Launch`         | KERNEL symbol        | state store (0/1/2)          | state layer |
+///
+/// `Launch` additionally carries its consumed weight names in
+/// `aux_names` — see the field.
 ///
 /// `RmsnormPerHead`'s param1 and `Rope`'s param1 are serde-additive on the
 /// Rust side (default `Plain` / absent) and appended-param-additive here:
@@ -317,6 +304,11 @@ struct PieForwardOp {
   /// crosses the ABI only here and as the producing `TopK` op — a
   /// per-value flag would duplicate what these two already state.
   uint32_t selector;
+  /// `Launch` only: the weight names the stated kernel consumes, as a
+  /// range of NAME indices in the flat id array (the same array the
+  /// operand ranges index — ids are just u32s; what a range means is
+  /// the field's contract). Empty for every other kind.
+  PieForwardIdRange aux_names;
   /// Values consumed, in operand order.
   PieForwardIdRange inputs;
   /// Values produced (`SplitQkv` produces three, `KvAppend` none).

@@ -14,6 +14,15 @@
       "shape": [
         "Tokens",
         {
+          "Const": 128
+        }
+      ],
+      "dtype": "F32"
+    },
+    {
+      "shape": [
+        "Tokens",
+        {
           "Const": 1024
         }
       ],
@@ -2312,6 +2321,18 @@
     },
     {
       "kind": {
+        "Launch": {
+          "kernel": "launch_rope_standard_table"
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        1
+      ],
+      "layer": null
+    },
+    {
+      "kind": {
         "Rmsnorm": {
           "weight": "layer.0.attn_norm",
           "variant": "Plain"
@@ -2321,7 +2342,7 @@
         0
       ],
       "outputs": [
-        1
+        2
       ],
       "layer": 0
     },
@@ -2333,48 +2354,51 @@
         }
       },
       "inputs": [
+        2
+      ],
+      "outputs": [
+        3
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.0.q_norm",
+            "layer.0.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        3,
         1
       ],
       "outputs": [
-        2
-      ],
-      "layer": 0
-    },
-    {
-      "kind": "RopeTableBuild",
-      "inputs": [],
-      "outputs": [],
-      "layer": 0
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.0.q_norm",
-          "k_norm": "layer.0.k_norm",
-          "layer": 0,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
-        2
-      ],
-      "outputs": [
-        3
-      ],
-      "layer": 0
-    },
-    {
-      "kind": {
-        "Attention": {
-          "layer": 0,
-          "kernel": "XqaDecode"
-        }
-      },
-      "inputs": [
-        3
-      ],
-      "outputs": [
         4
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        4
+      ],
+      "outputs": [
+        5
       ],
       "layer": 0
     },
@@ -2386,23 +2410,8 @@
         }
       },
       "inputs": [
-        4,
+        5,
         0
-      ],
-      "outputs": [
-        5
-      ],
-      "layer": 0
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.0.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        5
       ],
       "outputs": [
         6
@@ -2411,9 +2420,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.0.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.0.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -2426,8 +2435,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.0.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -2440,17 +2450,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        8
+      ],
+      "outputs": [
+        9
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.0.down",
           "beta_one": true
         }
       },
       "inputs": [
-        8,
-        5
+        9,
+        6
       ],
       "outputs": [
-        9
+        10
       ],
       "layer": 0
     },
@@ -2462,10 +2486,10 @@
         }
       },
       "inputs": [
-        9
+        10
       ],
       "outputs": [
-        10
+        11
       ],
       "layer": 1
     },
@@ -2477,23 +2501,6 @@
         }
       },
       "inputs": [
-        10
-      ],
-      "outputs": [
-        11
-      ],
-      "layer": 1
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.1.q_norm",
-          "k_norm": "layer.1.k_norm",
-          "layer": 1,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         11
       ],
       "outputs": [
@@ -2503,16 +2510,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 1,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.1.q_norm",
+            "layer.1.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
         }
       },
       "inputs": [
-        12
+        12,
+        1
       ],
       "outputs": [
         13
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        13
+      ],
+      "outputs": [
+        14
       ],
       "layer": 1
     },
@@ -2524,23 +2557,8 @@
         }
       },
       "inputs": [
-        13,
-        9
-      ],
-      "outputs": [
-        14
-      ],
-      "layer": 1
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.1.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        14
+        14,
+        10
       ],
       "outputs": [
         15
@@ -2549,9 +2567,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.1.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.1.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -2564,8 +2582,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.1.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -2578,17 +2597,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        17
+      ],
+      "outputs": [
+        18
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.1.down",
           "beta_one": true
         }
       },
       "inputs": [
-        17,
-        14
+        18,
+        15
       ],
       "outputs": [
-        18
+        19
       ],
       "layer": 1
     },
@@ -2600,10 +2633,10 @@
         }
       },
       "inputs": [
-        18
+        19
       ],
       "outputs": [
-        19
+        20
       ],
       "layer": 2
     },
@@ -2615,23 +2648,6 @@
         }
       },
       "inputs": [
-        19
-      ],
-      "outputs": [
-        20
-      ],
-      "layer": 2
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.2.q_norm",
-          "k_norm": "layer.2.k_norm",
-          "layer": 2,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         20
       ],
       "outputs": [
@@ -2641,16 +2657,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 2,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.2.q_norm",
+            "layer.2.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
         }
       },
       "inputs": [
-        21
+        21,
+        1
       ],
       "outputs": [
         22
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        22
+      ],
+      "outputs": [
+        23
       ],
       "layer": 2
     },
@@ -2662,23 +2704,8 @@
         }
       },
       "inputs": [
-        22,
-        18
-      ],
-      "outputs": [
-        23
-      ],
-      "layer": 2
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.2.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        23
+        23,
+        19
       ],
       "outputs": [
         24
@@ -2687,9 +2714,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.2.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.2.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -2702,8 +2729,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.2.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -2716,17 +2744,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        26
+      ],
+      "outputs": [
+        27
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.2.down",
           "beta_one": true
         }
       },
       "inputs": [
-        26,
-        23
+        27,
+        24
       ],
       "outputs": [
-        27
+        28
       ],
       "layer": 2
     },
@@ -2738,10 +2780,10 @@
         }
       },
       "inputs": [
-        27
+        28
       ],
       "outputs": [
-        28
+        29
       ],
       "layer": 3
     },
@@ -2753,23 +2795,6 @@
         }
       },
       "inputs": [
-        28
-      ],
-      "outputs": [
-        29
-      ],
-      "layer": 3
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.3.q_norm",
-          "k_norm": "layer.3.k_norm",
-          "layer": 3,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         29
       ],
       "outputs": [
@@ -2779,16 +2804,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 3,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.3.q_norm",
+            "layer.3.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
         }
       },
       "inputs": [
-        30
+        30,
+        1
       ],
       "outputs": [
         31
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        31
+      ],
+      "outputs": [
+        32
       ],
       "layer": 3
     },
@@ -2800,23 +2851,8 @@
         }
       },
       "inputs": [
-        31,
-        27
-      ],
-      "outputs": [
-        32
-      ],
-      "layer": 3
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.3.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        32
+        32,
+        28
       ],
       "outputs": [
         33
@@ -2825,9 +2861,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.3.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.3.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -2840,8 +2876,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.3.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -2854,17 +2891,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        35
+      ],
+      "outputs": [
+        36
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.3.down",
           "beta_one": true
         }
       },
       "inputs": [
-        35,
-        32
+        36,
+        33
       ],
       "outputs": [
-        36
+        37
       ],
       "layer": 3
     },
@@ -2876,10 +2927,10 @@
         }
       },
       "inputs": [
-        36
+        37
       ],
       "outputs": [
-        37
+        38
       ],
       "layer": 4
     },
@@ -2891,23 +2942,6 @@
         }
       },
       "inputs": [
-        37
-      ],
-      "outputs": [
-        38
-      ],
-      "layer": 4
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.4.q_norm",
-          "k_norm": "layer.4.k_norm",
-          "layer": 4,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         38
       ],
       "outputs": [
@@ -2917,16 +2951,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 4,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.4.q_norm",
+            "layer.4.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
         }
       },
       "inputs": [
-        39
+        39,
+        1
       ],
       "outputs": [
         40
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        40
+      ],
+      "outputs": [
+        41
       ],
       "layer": 4
     },
@@ -2938,23 +2998,8 @@
         }
       },
       "inputs": [
-        40,
-        36
-      ],
-      "outputs": [
-        41
-      ],
-      "layer": 4
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.4.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        41
+        41,
+        37
       ],
       "outputs": [
         42
@@ -2963,9 +3008,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.4.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.4.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -2978,8 +3023,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.4.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -2992,17 +3038,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        44
+      ],
+      "outputs": [
+        45
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.4.down",
           "beta_one": true
         }
       },
       "inputs": [
-        44,
-        41
+        45,
+        42
       ],
       "outputs": [
-        45
+        46
       ],
       "layer": 4
     },
@@ -3014,10 +3074,10 @@
         }
       },
       "inputs": [
-        45
+        46
       ],
       "outputs": [
-        46
+        47
       ],
       "layer": 5
     },
@@ -3029,23 +3089,6 @@
         }
       },
       "inputs": [
-        46
-      ],
-      "outputs": [
-        47
-      ],
-      "layer": 5
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.5.q_norm",
-          "k_norm": "layer.5.k_norm",
-          "layer": 5,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         47
       ],
       "outputs": [
@@ -3055,16 +3098,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 5,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.5.q_norm",
+            "layer.5.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
         }
       },
       "inputs": [
-        48
+        48,
+        1
       ],
       "outputs": [
         49
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        49
+      ],
+      "outputs": [
+        50
       ],
       "layer": 5
     },
@@ -3076,23 +3145,8 @@
         }
       },
       "inputs": [
-        49,
-        45
-      ],
-      "outputs": [
-        50
-      ],
-      "layer": 5
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.5.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        50
+        50,
+        46
       ],
       "outputs": [
         51
@@ -3101,9 +3155,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.5.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.5.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -3116,8 +3170,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.5.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -3130,17 +3185,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        53
+      ],
+      "outputs": [
+        54
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.5.down",
           "beta_one": true
         }
       },
       "inputs": [
-        53,
-        50
+        54,
+        51
       ],
       "outputs": [
-        54
+        55
       ],
       "layer": 5
     },
@@ -3152,10 +3221,10 @@
         }
       },
       "inputs": [
-        54
+        55
       ],
       "outputs": [
-        55
+        56
       ],
       "layer": 6
     },
@@ -3167,23 +3236,6 @@
         }
       },
       "inputs": [
-        55
-      ],
-      "outputs": [
-        56
-      ],
-      "layer": 6
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.6.q_norm",
-          "k_norm": "layer.6.k_norm",
-          "layer": 6,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         56
       ],
       "outputs": [
@@ -3193,16 +3245,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 6,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.6.q_norm",
+            "layer.6.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
         }
       },
       "inputs": [
-        57
+        57,
+        1
       ],
       "outputs": [
         58
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        58
+      ],
+      "outputs": [
+        59
       ],
       "layer": 6
     },
@@ -3214,23 +3292,8 @@
         }
       },
       "inputs": [
-        58,
-        54
-      ],
-      "outputs": [
-        59
-      ],
-      "layer": 6
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.6.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        59
+        59,
+        55
       ],
       "outputs": [
         60
@@ -3239,9 +3302,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.6.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.6.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -3254,8 +3317,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.6.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -3268,17 +3332,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        62
+      ],
+      "outputs": [
+        63
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.6.down",
           "beta_one": true
         }
       },
       "inputs": [
-        62,
-        59
+        63,
+        60
       ],
       "outputs": [
-        63
+        64
       ],
       "layer": 6
     },
@@ -3290,10 +3368,10 @@
         }
       },
       "inputs": [
-        63
+        64
       ],
       "outputs": [
-        64
+        65
       ],
       "layer": 7
     },
@@ -3305,23 +3383,6 @@
         }
       },
       "inputs": [
-        64
-      ],
-      "outputs": [
-        65
-      ],
-      "layer": 7
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.7.q_norm",
-          "k_norm": "layer.7.k_norm",
-          "layer": 7,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         65
       ],
       "outputs": [
@@ -3331,16 +3392,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 7,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.7.q_norm",
+            "layer.7.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
         }
       },
       "inputs": [
-        66
+        66,
+        1
       ],
       "outputs": [
         67
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [
+        67
+      ],
+      "outputs": [
+        68
       ],
       "layer": 7
     },
@@ -3352,23 +3439,8 @@
         }
       },
       "inputs": [
-        67,
-        63
-      ],
-      "outputs": [
-        68
-      ],
-      "layer": 7
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.7.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        68
+        68,
+        64
       ],
       "outputs": [
         69
@@ -3377,9 +3449,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.7.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.7.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -3392,8 +3464,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.7.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -3406,17 +3479,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [
+        72
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.7.down",
           "beta_one": true
         }
       },
       "inputs": [
-        71,
-        68
+        72,
+        69
       ],
       "outputs": [
-        72
+        73
       ],
       "layer": 7
     },
@@ -3428,10 +3515,10 @@
         }
       },
       "inputs": [
-        72
+        73
       ],
       "outputs": [
-        73
+        74
       ],
       "layer": 8
     },
@@ -3443,23 +3530,6 @@
         }
       },
       "inputs": [
-        73
-      ],
-      "outputs": [
-        74
-      ],
-      "layer": 8
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.8.q_norm",
-          "k_norm": "layer.8.k_norm",
-          "layer": 8,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         74
       ],
       "outputs": [
@@ -3469,16 +3539,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 8,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.8.q_norm",
+            "layer.8.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
         }
       },
       "inputs": [
-        75
+        75,
+        1
       ],
       "outputs": [
         76
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [
+        76
+      ],
+      "outputs": [
+        77
       ],
       "layer": 8
     },
@@ -3490,23 +3586,8 @@
         }
       },
       "inputs": [
-        76,
-        72
-      ],
-      "outputs": [
-        77
-      ],
-      "layer": 8
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.8.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        77
+        77,
+        73
       ],
       "outputs": [
         78
@@ -3515,9 +3596,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.8.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.8.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -3530,8 +3611,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.8.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -3544,17 +3626,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        80
+      ],
+      "outputs": [
+        81
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.8.down",
           "beta_one": true
         }
       },
       "inputs": [
-        80,
-        77
+        81,
+        78
       ],
       "outputs": [
-        81
+        82
       ],
       "layer": 8
     },
@@ -3566,10 +3662,10 @@
         }
       },
       "inputs": [
-        81
+        82
       ],
       "outputs": [
-        82
+        83
       ],
       "layer": 9
     },
@@ -3581,23 +3677,6 @@
         }
       },
       "inputs": [
-        82
-      ],
-      "outputs": [
-        83
-      ],
-      "layer": 9
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.9.q_norm",
-          "k_norm": "layer.9.k_norm",
-          "layer": 9,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         83
       ],
       "outputs": [
@@ -3607,16 +3686,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 9,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.9.q_norm",
+            "layer.9.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
         }
       },
       "inputs": [
-        84
+        84,
+        1
       ],
       "outputs": [
         85
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [
+        85
+      ],
+      "outputs": [
+        86
       ],
       "layer": 9
     },
@@ -3628,23 +3733,8 @@
         }
       },
       "inputs": [
-        85,
-        81
-      ],
-      "outputs": [
-        86
-      ],
-      "layer": 9
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.9.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        86
+        86,
+        82
       ],
       "outputs": [
         87
@@ -3653,9 +3743,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.9.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.9.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -3668,8 +3758,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.9.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -3682,17 +3773,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        89
+      ],
+      "outputs": [
+        90
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.9.down",
           "beta_one": true
         }
       },
       "inputs": [
-        89,
-        86
+        90,
+        87
       ],
       "outputs": [
-        90
+        91
       ],
       "layer": 9
     },
@@ -3704,10 +3809,10 @@
         }
       },
       "inputs": [
-        90
+        91
       ],
       "outputs": [
-        91
+        92
       ],
       "layer": 10
     },
@@ -3719,23 +3824,6 @@
         }
       },
       "inputs": [
-        91
-      ],
-      "outputs": [
-        92
-      ],
-      "layer": 10
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.10.q_norm",
-          "k_norm": "layer.10.k_norm",
-          "layer": 10,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         92
       ],
       "outputs": [
@@ -3745,16 +3833,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 10,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.10.q_norm",
+            "layer.10.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
         }
       },
       "inputs": [
-        93
+        93,
+        1
       ],
       "outputs": [
         94
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [
+        94
+      ],
+      "outputs": [
+        95
       ],
       "layer": 10
     },
@@ -3766,23 +3880,8 @@
         }
       },
       "inputs": [
-        94,
-        90
-      ],
-      "outputs": [
-        95
-      ],
-      "layer": 10
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.10.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        95
+        95,
+        91
       ],
       "outputs": [
         96
@@ -3791,9 +3890,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.10.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.10.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -3806,8 +3905,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.10.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -3820,17 +3920,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        98
+      ],
+      "outputs": [
+        99
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.10.down",
           "beta_one": true
         }
       },
       "inputs": [
-        98,
-        95
+        99,
+        96
       ],
       "outputs": [
-        99
+        100
       ],
       "layer": 10
     },
@@ -3842,10 +3956,10 @@
         }
       },
       "inputs": [
-        99
+        100
       ],
       "outputs": [
-        100
+        101
       ],
       "layer": 11
     },
@@ -3857,23 +3971,6 @@
         }
       },
       "inputs": [
-        100
-      ],
-      "outputs": [
-        101
-      ],
-      "layer": 11
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.11.q_norm",
-          "k_norm": "layer.11.k_norm",
-          "layer": 11,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         101
       ],
       "outputs": [
@@ -3883,16 +3980,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 11,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.11.q_norm",
+            "layer.11.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
         }
       },
       "inputs": [
-        102
+        102,
+        1
       ],
       "outputs": [
         103
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
+        }
+      },
+      "inputs": [
+        103
+      ],
+      "outputs": [
+        104
       ],
       "layer": 11
     },
@@ -3904,23 +4027,8 @@
         }
       },
       "inputs": [
-        103,
-        99
-      ],
-      "outputs": [
-        104
-      ],
-      "layer": 11
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.11.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        104
+        104,
+        100
       ],
       "outputs": [
         105
@@ -3929,9 +4037,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.11.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.11.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -3944,8 +4052,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.11.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -3958,17 +4067,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        107
+      ],
+      "outputs": [
+        108
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.11.down",
           "beta_one": true
         }
       },
       "inputs": [
-        107,
-        104
+        108,
+        105
       ],
       "outputs": [
-        108
+        109
       ],
       "layer": 11
     },
@@ -3980,10 +4103,10 @@
         }
       },
       "inputs": [
-        108
+        109
       ],
       "outputs": [
-        109
+        110
       ],
       "layer": 12
     },
@@ -3995,23 +4118,6 @@
         }
       },
       "inputs": [
-        109
-      ],
-      "outputs": [
-        110
-      ],
-      "layer": 12
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.12.q_norm",
-          "k_norm": "layer.12.k_norm",
-          "layer": 12,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         110
       ],
       "outputs": [
@@ -4021,16 +4127,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 12,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.12.q_norm",
+            "layer.12.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
         }
       },
       "inputs": [
-        111
+        111,
+        1
       ],
       "outputs": [
         112
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [
+        112
+      ],
+      "outputs": [
+        113
       ],
       "layer": 12
     },
@@ -4042,23 +4174,8 @@
         }
       },
       "inputs": [
-        112,
-        108
-      ],
-      "outputs": [
-        113
-      ],
-      "layer": 12
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.12.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        113
+        113,
+        109
       ],
       "outputs": [
         114
@@ -4067,9 +4184,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.12.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.12.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4082,8 +4199,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.12.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -4096,17 +4214,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        116
+      ],
+      "outputs": [
+        117
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.12.down",
           "beta_one": true
         }
       },
       "inputs": [
-        116,
-        113
+        117,
+        114
       ],
       "outputs": [
-        117
+        118
       ],
       "layer": 12
     },
@@ -4118,10 +4250,10 @@
         }
       },
       "inputs": [
-        117
+        118
       ],
       "outputs": [
-        118
+        119
       ],
       "layer": 13
     },
@@ -4133,23 +4265,6 @@
         }
       },
       "inputs": [
-        118
-      ],
-      "outputs": [
-        119
-      ],
-      "layer": 13
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.13.q_norm",
-          "k_norm": "layer.13.k_norm",
-          "layer": 13,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         119
       ],
       "outputs": [
@@ -4159,16 +4274,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 13,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.13.q_norm",
+            "layer.13.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
         }
       },
       "inputs": [
-        120
+        120,
+        1
       ],
       "outputs": [
         121
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [
+        121
+      ],
+      "outputs": [
+        122
       ],
       "layer": 13
     },
@@ -4180,23 +4321,8 @@
         }
       },
       "inputs": [
-        121,
-        117
-      ],
-      "outputs": [
-        122
-      ],
-      "layer": 13
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.13.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        122
+        122,
+        118
       ],
       "outputs": [
         123
@@ -4205,9 +4331,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.13.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.13.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4220,8 +4346,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.13.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -4234,17 +4361,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        125
+      ],
+      "outputs": [
+        126
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.13.down",
           "beta_one": true
         }
       },
       "inputs": [
-        125,
-        122
+        126,
+        123
       ],
       "outputs": [
-        126
+        127
       ],
       "layer": 13
     },
@@ -4256,10 +4397,10 @@
         }
       },
       "inputs": [
-        126
+        127
       ],
       "outputs": [
-        127
+        128
       ],
       "layer": 14
     },
@@ -4271,23 +4412,6 @@
         }
       },
       "inputs": [
-        127
-      ],
-      "outputs": [
-        128
-      ],
-      "layer": 14
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.14.q_norm",
-          "k_norm": "layer.14.k_norm",
-          "layer": 14,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         128
       ],
       "outputs": [
@@ -4297,16 +4421,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 14,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.14.q_norm",
+            "layer.14.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
         }
       },
       "inputs": [
-        129
+        129,
+        1
       ],
       "outputs": [
         130
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [
+        130
+      ],
+      "outputs": [
+        131
       ],
       "layer": 14
     },
@@ -4318,23 +4468,8 @@
         }
       },
       "inputs": [
-        130,
-        126
-      ],
-      "outputs": [
-        131
-      ],
-      "layer": 14
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.14.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        131
+        131,
+        127
       ],
       "outputs": [
         132
@@ -4343,9 +4478,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.14.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.14.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4358,8 +4493,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.14.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -4372,17 +4508,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        134
+      ],
+      "outputs": [
+        135
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.14.down",
           "beta_one": true
         }
       },
       "inputs": [
-        134,
-        131
+        135,
+        132
       ],
       "outputs": [
-        135
+        136
       ],
       "layer": 14
     },
@@ -4394,10 +4544,10 @@
         }
       },
       "inputs": [
-        135
+        136
       ],
       "outputs": [
-        136
+        137
       ],
       "layer": 15
     },
@@ -4409,23 +4559,6 @@
         }
       },
       "inputs": [
-        136
-      ],
-      "outputs": [
-        137
-      ],
-      "layer": 15
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.15.q_norm",
-          "k_norm": "layer.15.k_norm",
-          "layer": 15,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         137
       ],
       "outputs": [
@@ -4435,16 +4568,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 15,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.15.q_norm",
+            "layer.15.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
         }
       },
       "inputs": [
-        138
+        138,
+        1
       ],
       "outputs": [
         139
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
+        }
+      },
+      "inputs": [
+        139
+      ],
+      "outputs": [
+        140
       ],
       "layer": 15
     },
@@ -4456,23 +4615,8 @@
         }
       },
       "inputs": [
-        139,
-        135
-      ],
-      "outputs": [
-        140
-      ],
-      "layer": 15
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.15.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        140
+        140,
+        136
       ],
       "outputs": [
         141
@@ -4481,9 +4625,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.15.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.15.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4496,8 +4640,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.15.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -4510,17 +4655,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        143
+      ],
+      "outputs": [
+        144
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.15.down",
           "beta_one": true
         }
       },
       "inputs": [
-        143,
-        140
+        144,
+        141
       ],
       "outputs": [
-        144
+        145
       ],
       "layer": 15
     },
@@ -4532,10 +4691,10 @@
         }
       },
       "inputs": [
-        144
+        145
       ],
       "outputs": [
-        145
+        146
       ],
       "layer": 16
     },
@@ -4547,23 +4706,6 @@
         }
       },
       "inputs": [
-        145
-      ],
-      "outputs": [
-        146
-      ],
-      "layer": 16
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.16.q_norm",
-          "k_norm": "layer.16.k_norm",
-          "layer": 16,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         146
       ],
       "outputs": [
@@ -4573,16 +4715,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 16,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.16.q_norm",
+            "layer.16.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
         }
       },
       "inputs": [
-        147
+        147,
+        1
       ],
       "outputs": [
         148
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [
+        148
+      ],
+      "outputs": [
+        149
       ],
       "layer": 16
     },
@@ -4594,23 +4762,8 @@
         }
       },
       "inputs": [
-        148,
-        144
-      ],
-      "outputs": [
-        149
-      ],
-      "layer": 16
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.16.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        149
+        149,
+        145
       ],
       "outputs": [
         150
@@ -4619,9 +4772,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.16.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.16.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4634,8 +4787,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.16.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -4648,17 +4802,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        152
+      ],
+      "outputs": [
+        153
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.16.down",
           "beta_one": true
         }
       },
       "inputs": [
-        152,
-        149
+        153,
+        150
       ],
       "outputs": [
-        153
+        154
       ],
       "layer": 16
     },
@@ -4670,10 +4838,10 @@
         }
       },
       "inputs": [
-        153
+        154
       ],
       "outputs": [
-        154
+        155
       ],
       "layer": 17
     },
@@ -4685,23 +4853,6 @@
         }
       },
       "inputs": [
-        154
-      ],
-      "outputs": [
-        155
-      ],
-      "layer": 17
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.17.q_norm",
-          "k_norm": "layer.17.k_norm",
-          "layer": 17,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         155
       ],
       "outputs": [
@@ -4711,16 +4862,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 17,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.17.q_norm",
+            "layer.17.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
         }
       },
       "inputs": [
-        156
+        156,
+        1
       ],
       "outputs": [
         157
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [
+        157
+      ],
+      "outputs": [
+        158
       ],
       "layer": 17
     },
@@ -4732,23 +4909,8 @@
         }
       },
       "inputs": [
-        157,
-        153
-      ],
-      "outputs": [
-        158
-      ],
-      "layer": 17
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.17.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        158
+        158,
+        154
       ],
       "outputs": [
         159
@@ -4757,9 +4919,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.17.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.17.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4772,8 +4934,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.17.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -4786,17 +4949,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        161
+      ],
+      "outputs": [
+        162
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.17.down",
           "beta_one": true
         }
       },
       "inputs": [
-        161,
-        158
+        162,
+        159
       ],
       "outputs": [
-        162
+        163
       ],
       "layer": 17
     },
@@ -4808,10 +4985,10 @@
         }
       },
       "inputs": [
-        162
+        163
       ],
       "outputs": [
-        163
+        164
       ],
       "layer": 18
     },
@@ -4823,23 +5000,6 @@
         }
       },
       "inputs": [
-        163
-      ],
-      "outputs": [
-        164
-      ],
-      "layer": 18
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.18.q_norm",
-          "k_norm": "layer.18.k_norm",
-          "layer": 18,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         164
       ],
       "outputs": [
@@ -4849,16 +5009,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 18,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.18.q_norm",
+            "layer.18.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
         }
       },
       "inputs": [
-        165
+        165,
+        1
       ],
       "outputs": [
         166
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [
+        166
+      ],
+      "outputs": [
+        167
       ],
       "layer": 18
     },
@@ -4870,23 +5056,8 @@
         }
       },
       "inputs": [
-        166,
-        162
-      ],
-      "outputs": [
-        167
-      ],
-      "layer": 18
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.18.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        167
+        167,
+        163
       ],
       "outputs": [
         168
@@ -4895,9 +5066,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.18.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.18.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -4910,8 +5081,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.18.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -4924,17 +5096,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        170
+      ],
+      "outputs": [
+        171
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.18.down",
           "beta_one": true
         }
       },
       "inputs": [
-        170,
-        167
+        171,
+        168
       ],
       "outputs": [
-        171
+        172
       ],
       "layer": 18
     },
@@ -4946,10 +5132,10 @@
         }
       },
       "inputs": [
-        171
+        172
       ],
       "outputs": [
-        172
+        173
       ],
       "layer": 19
     },
@@ -4961,23 +5147,6 @@
         }
       },
       "inputs": [
-        172
-      ],
-      "outputs": [
-        173
-      ],
-      "layer": 19
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.19.q_norm",
-          "k_norm": "layer.19.k_norm",
-          "layer": 19,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         173
       ],
       "outputs": [
@@ -4987,16 +5156,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 19,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.19.q_norm",
+            "layer.19.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
         }
       },
       "inputs": [
-        174
+        174,
+        1
       ],
       "outputs": [
         175
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
+        }
+      },
+      "inputs": [
+        175
+      ],
+      "outputs": [
+        176
       ],
       "layer": 19
     },
@@ -5008,23 +5203,8 @@
         }
       },
       "inputs": [
-        175,
-        171
-      ],
-      "outputs": [
-        176
-      ],
-      "layer": 19
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.19.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        176
+        176,
+        172
       ],
       "outputs": [
         177
@@ -5033,9 +5213,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.19.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.19.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5048,8 +5228,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.19.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5062,17 +5243,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        179
+      ],
+      "outputs": [
+        180
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.19.down",
           "beta_one": true
         }
       },
       "inputs": [
-        179,
-        176
+        180,
+        177
       ],
       "outputs": [
-        180
+        181
       ],
       "layer": 19
     },
@@ -5084,10 +5279,10 @@
         }
       },
       "inputs": [
-        180
+        181
       ],
       "outputs": [
-        181
+        182
       ],
       "layer": 20
     },
@@ -5099,23 +5294,6 @@
         }
       },
       "inputs": [
-        181
-      ],
-      "outputs": [
-        182
-      ],
-      "layer": 20
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.20.q_norm",
-          "k_norm": "layer.20.k_norm",
-          "layer": 20,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         182
       ],
       "outputs": [
@@ -5125,16 +5303,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 20,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.20.q_norm",
+            "layer.20.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
         }
       },
       "inputs": [
-        183
+        183,
+        1
       ],
       "outputs": [
         184
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [
+        184
+      ],
+      "outputs": [
+        185
       ],
       "layer": 20
     },
@@ -5146,23 +5350,8 @@
         }
       },
       "inputs": [
-        184,
-        180
-      ],
-      "outputs": [
-        185
-      ],
-      "layer": 20
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.20.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        185
+        185,
+        181
       ],
       "outputs": [
         186
@@ -5171,9 +5360,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.20.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.20.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5186,8 +5375,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.20.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5200,17 +5390,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        188
+      ],
+      "outputs": [
+        189
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.20.down",
           "beta_one": true
         }
       },
       "inputs": [
-        188,
-        185
+        189,
+        186
       ],
       "outputs": [
-        189
+        190
       ],
       "layer": 20
     },
@@ -5222,10 +5426,10 @@
         }
       },
       "inputs": [
-        189
+        190
       ],
       "outputs": [
-        190
+        191
       ],
       "layer": 21
     },
@@ -5237,23 +5441,6 @@
         }
       },
       "inputs": [
-        190
-      ],
-      "outputs": [
-        191
-      ],
-      "layer": 21
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.21.q_norm",
-          "k_norm": "layer.21.k_norm",
-          "layer": 21,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         191
       ],
       "outputs": [
@@ -5263,16 +5450,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 21,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.21.q_norm",
+            "layer.21.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
         }
       },
       "inputs": [
-        192
+        192,
+        1
       ],
       "outputs": [
         193
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [
+        193
+      ],
+      "outputs": [
+        194
       ],
       "layer": 21
     },
@@ -5284,23 +5497,8 @@
         }
       },
       "inputs": [
-        193,
-        189
-      ],
-      "outputs": [
-        194
-      ],
-      "layer": 21
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.21.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        194
+        194,
+        190
       ],
       "outputs": [
         195
@@ -5309,9 +5507,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.21.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.21.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5324,8 +5522,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.21.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5338,17 +5537,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        197
+      ],
+      "outputs": [
+        198
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.21.down",
           "beta_one": true
         }
       },
       "inputs": [
-        197,
-        194
+        198,
+        195
       ],
       "outputs": [
-        198
+        199
       ],
       "layer": 21
     },
@@ -5360,10 +5573,10 @@
         }
       },
       "inputs": [
-        198
+        199
       ],
       "outputs": [
-        199
+        200
       ],
       "layer": 22
     },
@@ -5375,23 +5588,6 @@
         }
       },
       "inputs": [
-        199
-      ],
-      "outputs": [
-        200
-      ],
-      "layer": 22
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.22.q_norm",
-          "k_norm": "layer.22.k_norm",
-          "layer": 22,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         200
       ],
       "outputs": [
@@ -5401,16 +5597,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 22,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.22.q_norm",
+            "layer.22.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
         }
       },
       "inputs": [
-        201
+        201,
+        1
       ],
       "outputs": [
         202
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [
+        202
+      ],
+      "outputs": [
+        203
       ],
       "layer": 22
     },
@@ -5422,23 +5644,8 @@
         }
       },
       "inputs": [
-        202,
-        198
-      ],
-      "outputs": [
-        203
-      ],
-      "layer": 22
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.22.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        203
+        203,
+        199
       ],
       "outputs": [
         204
@@ -5447,9 +5654,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.22.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.22.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5462,8 +5669,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.22.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5476,17 +5684,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        206
+      ],
+      "outputs": [
+        207
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.22.down",
           "beta_one": true
         }
       },
       "inputs": [
-        206,
-        203
+        207,
+        204
       ],
       "outputs": [
-        207
+        208
       ],
       "layer": 22
     },
@@ -5498,10 +5720,10 @@
         }
       },
       "inputs": [
-        207
+        208
       ],
       "outputs": [
-        208
+        209
       ],
       "layer": 23
     },
@@ -5513,23 +5735,6 @@
         }
       },
       "inputs": [
-        208
-      ],
-      "outputs": [
-        209
-      ],
-      "layer": 23
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.23.q_norm",
-          "k_norm": "layer.23.k_norm",
-          "layer": 23,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         209
       ],
       "outputs": [
@@ -5539,16 +5744,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 23,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.23.q_norm",
+            "layer.23.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
         }
       },
       "inputs": [
-        210
+        210,
+        1
       ],
       "outputs": [
         211
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
+        }
+      },
+      "inputs": [
+        211
+      ],
+      "outputs": [
+        212
       ],
       "layer": 23
     },
@@ -5560,23 +5791,8 @@
         }
       },
       "inputs": [
-        211,
-        207
-      ],
-      "outputs": [
-        212
-      ],
-      "layer": 23
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.23.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        212
+        212,
+        208
       ],
       "outputs": [
         213
@@ -5585,9 +5801,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.23.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.23.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5600,8 +5816,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.23.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5614,17 +5831,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        215
+      ],
+      "outputs": [
+        216
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.23.down",
           "beta_one": true
         }
       },
       "inputs": [
-        215,
-        212
+        216,
+        213
       ],
       "outputs": [
-        216
+        217
       ],
       "layer": 23
     },
@@ -5636,10 +5867,10 @@
         }
       },
       "inputs": [
-        216
+        217
       ],
       "outputs": [
-        217
+        218
       ],
       "layer": 24
     },
@@ -5651,23 +5882,6 @@
         }
       },
       "inputs": [
-        217
-      ],
-      "outputs": [
-        218
-      ],
-      "layer": 24
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.24.q_norm",
-          "k_norm": "layer.24.k_norm",
-          "layer": 24,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         218
       ],
       "outputs": [
@@ -5677,16 +5891,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 24,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.24.q_norm",
+            "layer.24.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
         }
       },
       "inputs": [
-        219
+        219,
+        1
       ],
       "outputs": [
         220
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
+        }
+      },
+      "inputs": [
+        220
+      ],
+      "outputs": [
+        221
       ],
       "layer": 24
     },
@@ -5698,23 +5938,8 @@
         }
       },
       "inputs": [
-        220,
-        216
-      ],
-      "outputs": [
-        221
-      ],
-      "layer": 24
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.24.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        221
+        221,
+        217
       ],
       "outputs": [
         222
@@ -5723,9 +5948,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.24.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.24.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5738,8 +5963,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.24.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5752,17 +5978,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        224
+      ],
+      "outputs": [
+        225
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.24.down",
           "beta_one": true
         }
       },
       "inputs": [
-        224,
-        221
+        225,
+        222
       ],
       "outputs": [
-        225
+        226
       ],
       "layer": 24
     },
@@ -5774,10 +6014,10 @@
         }
       },
       "inputs": [
-        225
+        226
       ],
       "outputs": [
-        226
+        227
       ],
       "layer": 25
     },
@@ -5789,23 +6029,6 @@
         }
       },
       "inputs": [
-        226
-      ],
-      "outputs": [
-        227
-      ],
-      "layer": 25
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.25.q_norm",
-          "k_norm": "layer.25.k_norm",
-          "layer": 25,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         227
       ],
       "outputs": [
@@ -5815,16 +6038,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 25,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.25.q_norm",
+            "layer.25.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
         }
       },
       "inputs": [
-        228
+        228,
+        1
       ],
       "outputs": [
         229
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
+        }
+      },
+      "inputs": [
+        229
+      ],
+      "outputs": [
+        230
       ],
       "layer": 25
     },
@@ -5836,23 +6085,8 @@
         }
       },
       "inputs": [
-        229,
-        225
-      ],
-      "outputs": [
-        230
-      ],
-      "layer": 25
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.25.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        230
+        230,
+        226
       ],
       "outputs": [
         231
@@ -5861,9 +6095,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.25.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.25.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -5876,8 +6110,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.25.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -5890,17 +6125,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        233
+      ],
+      "outputs": [
+        234
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.25.down",
           "beta_one": true
         }
       },
       "inputs": [
-        233,
-        230
+        234,
+        231
       ],
       "outputs": [
-        234
+        235
       ],
       "layer": 25
     },
@@ -5912,10 +6161,10 @@
         }
       },
       "inputs": [
-        234
+        235
       ],
       "outputs": [
-        235
+        236
       ],
       "layer": 26
     },
@@ -5927,23 +6176,6 @@
         }
       },
       "inputs": [
-        235
-      ],
-      "outputs": [
-        236
-      ],
-      "layer": 26
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.26.q_norm",
-          "k_norm": "layer.26.k_norm",
-          "layer": 26,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         236
       ],
       "outputs": [
@@ -5953,16 +6185,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 26,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.26.q_norm",
+            "layer.26.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
         }
       },
       "inputs": [
-        237
+        237,
+        1
       ],
       "outputs": [
         238
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
+        }
+      },
+      "inputs": [
+        238
+      ],
+      "outputs": [
+        239
       ],
       "layer": 26
     },
@@ -5974,23 +6232,8 @@
         }
       },
       "inputs": [
-        238,
-        234
-      ],
-      "outputs": [
-        239
-      ],
-      "layer": 26
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.26.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        239
+        239,
+        235
       ],
       "outputs": [
         240
@@ -5999,9 +6242,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.26.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.26.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6014,8 +6257,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.26.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -6028,17 +6272,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        242
+      ],
+      "outputs": [
+        243
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.26.down",
           "beta_one": true
         }
       },
       "inputs": [
-        242,
-        239
+        243,
+        240
       ],
       "outputs": [
-        243
+        244
       ],
       "layer": 26
     },
@@ -6050,10 +6308,10 @@
         }
       },
       "inputs": [
-        243
+        244
       ],
       "outputs": [
-        244
+        245
       ],
       "layer": 27
     },
@@ -6065,23 +6323,6 @@
         }
       },
       "inputs": [
-        244
-      ],
-      "outputs": [
-        245
-      ],
-      "layer": 27
-    },
-    {
-      "kind": {
-        "QkvDecodeFusedPost": {
-          "q_norm": "layer.27.q_norm",
-          "k_norm": "layer.27.k_norm",
-          "layer": 27,
-          "head_dim": 128
-        }
-      },
-      "inputs": [
         245
       ],
       "outputs": [
@@ -6091,16 +6332,42 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 27,
-          "kernel": "XqaDecode"
+        "Launch": {
+          "kernel": "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+          "weights": [
+            "layer.27.q_norm",
+            "layer.27.k_norm"
+          ],
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
         }
       },
       "inputs": [
-        246
+        246,
+        1
       ],
       "outputs": [
         247
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_attention_xqa_decode_bf16_prepared",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
+        }
+      },
+      "inputs": [
+        247
+      ],
+      "outputs": [
+        248
       ],
       "layer": 27
     },
@@ -6112,23 +6379,8 @@
         }
       },
       "inputs": [
-        247,
-        243
-      ],
-      "outputs": [
-        248
-      ],
-      "layer": 27
-    },
-    {
-      "kind": {
-        "Rmsnorm": {
-          "weight": "layer.27.mlp_norm",
-          "variant": "Plain"
-        }
-      },
-      "inputs": [
-        248
+        248,
+        244
       ],
       "outputs": [
         249
@@ -6137,9 +6389,9 @@
     },
     {
       "kind": {
-        "Matmul": {
-          "weight": "layer.27.gate_up",
-          "beta_one": false
+        "Rmsnorm": {
+          "weight": "layer.27.mlp_norm",
+          "variant": "Plain"
         }
       },
       "inputs": [
@@ -6152,8 +6404,9 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3072
+        "Matmul": {
+          "weight": "layer.27.gate_up",
+          "beta_one": false
         }
       },
       "inputs": [
@@ -6166,17 +6419,31 @@
     },
     {
       "kind": {
+        "Swiglu": {
+          "inter": 3072
+        }
+      },
+      "inputs": [
+        251
+      ],
+      "outputs": [
+        252
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
         "Matmul": {
           "weight": "layer.27.down",
           "beta_one": true
         }
       },
       "inputs": [
-        251,
-        248
+        252,
+        249
       ],
       "outputs": [
-        252
+        253
       ],
       "layer": 27
     },
@@ -6188,10 +6455,10 @@
         }
       },
       "inputs": [
-        252
+        253
       ],
       "outputs": [
-        253
+        254
       ],
       "layer": null
     },
@@ -6202,10 +6469,10 @@
         }
       },
       "inputs": [
-        253
+        254
       ],
       "outputs": [
-        254
+        255
       ],
       "layer": null
     }

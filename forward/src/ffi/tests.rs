@@ -20,7 +20,7 @@ use crate::facts::{
     LlamaLikeFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 use crate::family::{llama_like, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_moe_mlp_block};
-use crate::trace::{AttnKernel, OpKind};
+use crate::trace::OpKind;
 
 /// The qwen3 parity facts, as a C caller would state them.
 fn c_facts_qwen3() -> PieForwardLlamaLikeFacts {
@@ -68,8 +68,7 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::RmsnormGated { .. } => PieForwardOpKind::RmsnormGated,
         OpKind::SplitQGate { .. } => PieForwardOpKind::SplitQGate,
         OpKind::SigmoidGateMul => PieForwardOpKind::SigmoidGateMul,
-        OpKind::QkvDecodeFusedPost { .. } => PieForwardOpKind::QkvDecodeFusedPost,
-        OpKind::RopeTableBuild => PieForwardOpKind::RopeTableBuild,
+        OpKind::Launch { .. } => PieForwardOpKind::Launch,
     }
 }
 
@@ -86,7 +85,8 @@ fn expect_weight(kind: &OpKind) -> Option<&str> {
         | OpKind::RmsnormGated { weight }
         | OpKind::LmHead { weight } => Some(weight),
         OpKind::GdnPrep { a_log, .. } => Some(a_log),
-        OpKind::QkvDecodeFusedPost { q_norm, .. } => Some(q_norm),
+        // The Launch "weight" slot carries the KERNEL name.
+        OpKind::Launch { kernel, .. } => Some(kernel),
         _ => None,
     }
 }
@@ -832,28 +832,14 @@ fn entry_honours_the_unfused_binding() {
     unsafe { pie_forward_release(&mut out) };
 }
 
-/// The lowered trace crosses the boundary intact: kind 21/22 wire values,
-/// the two-name slot pattern (q_norm in the weight slot, k_norm as a
-/// param0 NAME INDEX), head_dim in param1, and every `Attention.param1`
-/// carrying the stated kernel's wire value — which this test also PINS
-/// against the Rust enum, so the C mirror cannot drift silently.
+/// The lowered trace crosses the boundary intact: the `Launch` wire form
+/// — kernel symbol in the weight slot, consumed weight names in
+/// `aux_names` (signature order), the state mark in the params — plus
+/// the fused decode shape itself: 28 fused posts, ONE table build
+/// consumed by all of them as an operand, and the general arm's
+/// SplitQkv/Rope/KvAppend absent.
 #[test]
 fn lowered_trace_round_trips_through_the_arena() {
-    // The mirror: one assertion per variant, both directions of the pin.
-    assert_eq!(PieForwardAttnKernel::XqaDecode as u32, AttnKernel::XqaDecode as u32);
-    assert_eq!(
-        PieForwardAttnKernel::FlashinferDecode as u32,
-        AttnKernel::FlashinferDecode as u32
-    );
-    assert_eq!(
-        PieForwardAttnKernel::PrefillDequantDecode as u32,
-        AttnKernel::PrefillDequantDecode as u32
-    );
-    assert_eq!(
-        PieForwardAttnKernel::PrefillPlanned as u32,
-        AttnKernel::PrefillPlanned as u32
-    );
-
     let facts = c_facts_qwen3();
     let cuda = PieForwardLlamaLikeCudaFacts {
         xqa_decode: 1,
@@ -867,26 +853,46 @@ fn lowered_trace_round_trips_through_the_arena() {
         PieForwardStatus::Ok
     );
     let ops = view::ops(&out);
-    // Layer 0: ... Matmul(qkv) -> RopeTableBuild -> QkvDecodeFusedPost;
-    // later layers carry no table build (the trace-time latch).
-    let fused: Vec<_> = ops
+
+    let launches: Vec<_> = ops
         .iter()
-        .filter(|op| op.kind == PieForwardOpKind::QkvDecodeFusedPost)
+        .filter(|op| op.kind == PieForwardOpKind::Launch)
         .collect();
-    assert_eq!(fused.len(), 28);
-    let post = fused[0];
-    assert_eq!(view::name(&out, post.weight_name), "layer.0.q_norm");
-    assert_eq!(view::name(&out, post.param0), "layer.0.k_norm");
-    assert_eq!(post.param1, 128); // head_dim
-    assert_eq!(
-        ops.iter()
-            .filter(|op| op.kind == PieForwardOpKind::RopeTableBuild)
-            .count(),
-        1
-    );
-    for op in ops.iter().filter(|op| op.kind == PieForwardOpKind::Attention) {
-        assert_eq!(op.param1, PieForwardAttnKernel::XqaDecode as u32);
+    // 1 table build + 28 fused posts + 28 attentions.
+    assert_eq!(launches.len(), 57);
+
+    let table = launches[0];
+    assert_eq!(view::name(&out, table.weight_name), "launch_rope_standard_table");
+    assert_eq!(table.param0, 0); // no implicit state
+    assert_eq!(table.aux_names.len, 0);
+    let table_out = view::ids(&out, table.outputs)[0];
+
+    let posts: Vec<_> = launches
+        .iter()
+        .filter(|op| {
+            view::name(&out, op.weight_name) == "launch_qkv_decode_qk_norm_rope_write_kv_bf16"
+        })
+        .collect();
+    assert_eq!(posts.len(), 28);
+    let post = posts[0];
+    let aux = view::ids(&out, post.aux_names);
+    assert_eq!(view::name(&out, aux[0]), "layer.0.q_norm");
+    assert_eq!(view::name(&out, aux[1]), "layer.0.k_norm");
+    assert_eq!(post.param0, 1); // kv-cache state...
+    assert_eq!(post.param1, 0); // ...of layer 0
+    // Every fused post consumes THE table value as its second operand.
+    for post in &posts {
+        assert_eq!(view::ids(&out, post.inputs)[1], table_out);
     }
+
+    let attn = launches
+        .iter()
+        .find(|op| {
+            view::name(&out, op.weight_name) == "launch_attention_xqa_decode_bf16_prepared"
+        })
+        .expect("decode class states XQA");
+    assert_eq!(attn.param0, 1);
+
     // No general-arm leftovers in the fused decode class.
     assert!(!ops.iter().any(|op| matches!(
         op.kind,

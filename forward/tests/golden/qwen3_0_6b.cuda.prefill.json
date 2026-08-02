@@ -3930,9 +3930,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 0,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
         }
       },
       "inputs": [
@@ -4127,9 +4144,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 1,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
         }
       },
       "inputs": [
@@ -4324,9 +4358,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 2,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
         }
       },
       "inputs": [
@@ -4521,9 +4572,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 3,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
         }
       },
       "inputs": [
@@ -4718,9 +4786,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 4,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
         }
       },
       "inputs": [
@@ -4915,9 +5000,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 5,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
         }
       },
       "inputs": [
@@ -5112,9 +5214,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 6,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
         }
       },
       "inputs": [
@@ -5309,9 +5428,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 7,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
         }
       },
       "inputs": [
@@ -5506,9 +5642,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 8,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
         }
       },
       "inputs": [
@@ -5703,9 +5856,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 9,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
         }
       },
       "inputs": [
@@ -5900,9 +6070,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 10,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
         }
       },
       "inputs": [
@@ -6097,9 +6284,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 11,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
         }
       },
       "inputs": [
@@ -6294,9 +6498,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 12,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
         }
       },
       "inputs": [
@@ -6491,9 +6712,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 13,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
         }
       },
       "inputs": [
@@ -6688,9 +6926,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 14,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
         }
       },
       "inputs": [
@@ -6885,9 +7140,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 15,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
         }
       },
       "inputs": [
@@ -7082,9 +7354,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 16,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
         }
       },
       "inputs": [
@@ -7279,9 +7568,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 17,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
         }
       },
       "inputs": [
@@ -7476,9 +7782,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 18,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
         }
       },
       "inputs": [
@@ -7673,9 +7996,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 19,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
         }
       },
       "inputs": [
@@ -7870,9 +8210,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 20,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
         }
       },
       "inputs": [
@@ -8067,9 +8424,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 21,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
         }
       },
       "inputs": [
@@ -8264,9 +8638,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 22,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
         }
       },
       "inputs": [
@@ -8461,9 +8852,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 23,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
         }
       },
       "inputs": [
@@ -8658,9 +9066,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 24,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
         }
       },
       "inputs": [
@@ -8855,9 +9280,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 25,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
         }
       },
       "inputs": [
@@ -9052,9 +9494,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 26,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
         }
       },
       "inputs": [
@@ -9249,9 +9708,26 @@
     },
     {
       "kind": {
-        "Attention": {
-          "layer": 27,
-          "kernel": "PrefillPlanned"
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
         }
       },
       "inputs": [

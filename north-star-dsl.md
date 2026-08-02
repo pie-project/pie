@@ -22,6 +22,34 @@ There is **one text**: the model file states the computation and the
 kernel selection together, the way the hand-written pass always did — the
 DSL is that pass, made declarative.
 
+## The surface (v2, set in review 2026-08-02)
+
+Two corrections from review shaped the surface, both now built (`dsl.rs`):
+
+**One text, not two blocks.** The first design split declaration from a
+`backend!` rules block; review rejected the split. The class arms live IN
+the forward text, beside the fact arms, same `match`.
+
+**Raw kernel signatures, not enum tags.** A lowered arm calls a function
+named for the launcher symbol whose parameters are the launcher's
+semantic operands (`cuda::attention_xqa_decode(&q, &w.kv, ..)`), not a
+generic op carrying a kernel enum. The trace records ONE generic
+`Launch { kernel, weights, state }` op for any stated kernel — so the
+ABI stops growing per kernel: the driver resolves the symbol in a
+name→launcher registry, and adding a kernel touches no enum anywhere.
+
+The surface is plan.md's sketch made real: values carry the tape (free
+functions, no builder threading), weights are typed handles from a
+per-layer namespace (`w.qkv` — no strings, no widths in declarations),
+state is an object (`w.kv.append(k, v)`), and `y += matmul(&a,
+&w.o_proj)` IS the beta=1 cuBLAS fold (the tape rewrites the just-recorded
+matmul, id-neutrally) while `y += anything_else` is the explicit
+ResidualAdd landing. Op layer tags derive from what an op touches; the
+semantic goldens pin that this reproduces the old bracketed tagging byte
+for byte. Once-per-fire launches are VALUES, not latches — the rope
+table is built once in the prologue and consumed by every fused-QKV
+launch as an operand.
+
 ## The mechanism: fire class is just another trace-time match
 
 The eDSL's one trick already covers this. Static facts resolve at trace

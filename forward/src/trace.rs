@@ -145,38 +145,10 @@ pub enum FireClass {
     Prefill,
 }
 
-/// The attention kernel a lowered trace states on [`OpKind::Attention`].
-///
-/// Discriminants are the ABI wire values (`param1`); 0 is reserved for
-/// "unspecified" — the semantic trace's `kernel: None`, under which the
-/// executor keeps its own path derivation during migration.
-///
-/// The variants mirror `declared_forward.cpp`'s attention branches:
-/// XQA's fire-wide prepare + per-layer launch, the FlashInfer decode
-/// plan, the dequant + FlashInfer-prefill fallback for decode fires whose
-/// GQA ratio the decode kernel set lacks (`force_prefill_path`), and the
-/// planned FlashInfer prefill every prefill-shaped fire runs. The
-/// non-XQA decode arm's prefill-decode-plan alternative
-/// (`avg_kv_pages >= min_prefill_decode_pages`, llama_like.cpp:767) is a
-/// RUNTIME term — lowering that arm needs the `Guard` op
-/// (north-star-dsl.md), and until it exists the lowered facts pin
-/// `use_prefill_decode_plan` off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u32)]
-pub enum AttnKernel {
-    /// `launch_attention_xqa_decode_bf16_prepared` (+ the fire-wide
-    /// `prepare_attention_xqa_decode_bf16`, which the executor hoists).
-    XqaDecode = 1,
-    /// `dispatch_attention_flashinfer_decode` against the decode plan.
-    FlashinferDecode = 2,
-    /// Decode-shaped fire on the prefill kernel: dequant-to-bf16 +
-    /// `dispatch_attention_flashinfer_prefill_bf16` (the
-    /// `force_prefill_path` fallback).
-    PrefillDequantDecode = 3,
-    /// Planned FlashInfer prefill (`dispatch_attention_flashinfer_prefill_bf16`
-    /// against the prepare-built prefill plan).
-    PrefillPlanned = 4,
-}
+// (The short-lived `AttnKernel` enum — rung 1's `Attention.param1` tag —
+// is gone: a lowered trace states its attention kernel the way it states
+// every kernel, as an [`OpKind::Launch`] with the launcher's name. Raw
+// signatures, not enum tags; north-star-dsl.md.)
 
 /// One operation of the traced form.
 ///
@@ -246,18 +218,10 @@ pub enum OpKind {
     },
     /// Append this fire's K/V rows to the layer's paged cache.
     KvAppend { layer: u32 },
-    /// Paged attention over the layer's cache.
-    ///
-    /// `kernel: None` is the semantic form: opaque, the executor derives
-    /// the path. A LOWERED trace states the kernel ([`AttnKernel`]) — the
-    /// declaration's class arm chose it, and a dumb consumer launches
-    /// exactly what is stated (north-star-dsl.md). Serde-skipped when
-    /// absent so every pre-lowering golden stays byte-identical.
-    Attention {
-        layer: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        kernel: Option<AttnKernel>,
-    },
+    /// Paged attention over the layer's cache. Opaque in the SEMANTIC
+    /// trace: the executor derives the path. A lowered trace states its
+    /// attention kernel as an [`OpKind::Launch`] instead of this kind.
+    Attention { layer: u32 },
     /// SwiGLU over packed `[rows, 2 * inter]` gate‖up.
     Swiglu { inter: u32 },
     /// Gather the sampled rows and project to logits.
@@ -362,40 +326,30 @@ pub enum OpKind {
     /// over the hidden dim and lands on a base stream — here the gate is
     /// full-width and nothing is added.
     SigmoidGateMul,
-    /// The fused decode-QKV epilogue, STATED by a lowered decode-class
-    /// trace (`launch_qkv_decode_qk_norm_rope_write_kv_bf16`): consumes
-    /// the packed QKV GEMM output and, in one launch, splits Q/K/V,
-    /// applies the per-head Plain q/k norms, rotates Q and K (Standard
-    /// rope, full width), and appends K/V to the layer's paged cache.
-    /// Produces roped Q; K/V never materialize as values.
+    /// A STATED kernel launch — the op a LOWERED trace uses wherever the
+    /// declaration's class arm called a raw kernel signature
+    /// (`dsl::cuda`, north-star-dsl.md). `kernel` is the driver's
+    /// launcher symbol; a dumb consumer resolves it in a name→launcher
+    /// registry and launches, and the ABI stops growing per kernel — this
+    /// ONE kind carries every stated kernel, present and future.
     ///
-    /// This op replaces the executor-side peephole (declared_forward.cpp's
-    /// `skip_fused_decode_qkv_ops`): under north-star-dsl.md the fusion is
-    /// written in the declaration's decode arm, whose general arm
-    /// (`SplitQkv` + `RmsnormPerHead`×2 + `Rope` + `KvAppend`) remains the
-    /// semantics the parity harness holds it to. The trace-time predicate
-    /// lives in the declaration: `fused_qkv && qk_norm == PerHead &&
-    /// rope == Standard` from the model facts, the rest
-    /// ([`crate::facts::LlamaLikeCudaFacts::decode_fused_post`]) measured
-    /// and boot-validated. Names two weights, GdnPrep's ABI pattern:
-    /// q_norm in the weight slot, k_norm as a param0 name index; head_dim
-    /// rides param1 and the widths live in the value shapes.
-    QkvDecodeFusedPost {
-        q_norm: String,
-        k_norm: String,
-        layer: u32,
-        head_dim: u32,
+    /// `weights` are the weight names the launcher consumes, in signature
+    /// order. `state` marks the implicit per-layer store the kernel
+    /// addresses (the fused decode-QKV kernel writes the KV cache), the
+    /// same declaration [`OpKind::state_ref`] derives from vocabulary for
+    /// semantic kinds. Operand values ride `inputs`/`outputs` like every
+    /// other op; mechanical launcher parameters (stream, dims, workspace)
+    /// are the driver's binding, not the trace's business.
+    ///
+    /// A SEMANTIC trace never contains one — the general arm it lowers
+    /// remains the semantics the parity harness holds it to.
+    Launch {
+        kernel: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        weights: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<StateRef>,
     },
-    /// Build the fire's rope cos/sin table
-    /// (`launch_rope_standard_table`), stated by a lowered decode-class
-    /// trace ONCE — on the first layer whose fused-QKV arm runs. The
-    /// hand-written `rope_table_ready` runtime latch becomes a trace-time
-    /// latch: layer 0 emits this op, later layers do not, because the
-    /// trace unrolls the layer loop. Emitted only when the workspace
-    /// carries a table ([`crate::facts::LlamaLikeCudaFacts::rope_table`]);
-    /// without one the fused kernel derives cos/sin from theta itself and
-    /// no launch exists to state.
-    RopeTableBuild,
 }
 
 /// Which implicit store an op addresses. Both stores are per-layer and
@@ -403,7 +357,7 @@ pub enum OpKind {
 /// are different resources with different lowerings: the paged KV cache
 /// grows and is page-table-indirected, the recurrent store is fixed-size
 /// slabs advanced in place (and is why RS fires are forced solo today).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateStore {
     /// The paged KV cache (`KvAppend` writes, `Attention` reads).
     KvCache,
@@ -416,7 +370,7 @@ pub enum StateStore {
 /// vocabulary by [`OpKind::state_ref`] — the honest marking of the
 /// per-request state axis (module doc), with the store implicit exactly as
 /// the KV cache always was.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateRef {
     pub store: StateStore,
     pub layer: u32,
@@ -432,12 +386,11 @@ impl OpKind {
     /// today's hand-maintained `touches_rs_buffer()`.
     pub fn state_ref(&self) -> Option<StateRef> {
         match *self {
-            OpKind::KvAppend { layer }
-            | OpKind::Attention { layer, .. }
-            | OpKind::QkvDecodeFusedPost { layer, .. } => Some(StateRef {
+            OpKind::KvAppend { layer } | OpKind::Attention { layer, .. } => Some(StateRef {
                 store: StateStore::KvCache,
                 layer,
             }),
+            OpKind::Launch { state, .. } => state,
             OpKind::CausalConv1d { layer, .. } | OpKind::GatedDelta { layer } => Some(StateRef {
                 store: StateStore::RecurrentState,
                 layer,
@@ -515,6 +468,42 @@ impl TraceBuilder {
         let out = f(self);
         self.layer = previous;
         out
+    }
+
+    /// The dsl surface's per-op layer tag ([`crate::dsl`] derives it from
+    /// the handle an op touches rather than from this bracket).
+    pub(crate) fn set_layer(&mut self, layer: Option<u32>) {
+        self.layer = layer;
+    }
+
+    /// The `+=` fold ([`crate::dsl`]): if `rhs` is the output of the op
+    /// just recorded and that op is a plain unfused matmul, rewrite it to
+    /// the `beta_one` accumulate against `residual` — id-neutral, the
+    /// same op [`Self::matmul_add`] records directly. Returns false when
+    /// the shape doesn't hold (rhs older than the last op, or the last op
+    /// is not a plain matmul), in which case the caller lands the
+    /// residual explicitly.
+    pub(crate) fn try_fold_residual(&mut self, rhs: ValueId, residual: ValueId) -> bool {
+        let Some(op) = self.ops.last_mut() else {
+            return false;
+        };
+        let foldable = matches!(
+            &op.kind,
+            OpKind::Matmul {
+                beta_one: false,
+                selector: None,
+                ..
+            }
+        ) && op.outputs == [rhs];
+        if !foldable {
+            return false;
+        }
+        let OpKind::Matmul { beta_one, .. } = &mut op.kind else {
+            unreachable!("matched above");
+        };
+        *beta_one = true;
+        op.inputs.push(residual);
+        true
     }
 
     fn value(&mut self, shape: Shape, dtype: DType) -> ValueId {
@@ -747,30 +736,8 @@ impl TraceBuilder {
     }
 
     pub fn attention(&mut self, layer: u32, q: ValueId, q_width: u32) -> ValueId {
-        self.attention_inner(layer, q, q_width, None)
-    }
-
-    /// The lowered form: the declaration's class arm states which
-    /// attention kernel fires ([`AttnKernel`]; north-star-dsl.md).
-    pub fn attention_with(
-        &mut self,
-        layer: u32,
-        q: ValueId,
-        q_width: u32,
-        kernel: AttnKernel,
-    ) -> ValueId {
-        self.attention_inner(layer, q, q_width, Some(kernel))
-    }
-
-    fn attention_inner(
-        &mut self,
-        layer: u32,
-        q: ValueId,
-        q_width: u32,
-        kernel: Option<AttnKernel>,
-    ) -> ValueId {
         self.push(
-            OpKind::Attention { layer, kernel },
+            OpKind::Attention { layer },
             vec![q],
             vec![(
                 Shape(vec![Dim::Tokens, Dim::Const(q_width)]),
@@ -779,36 +746,26 @@ impl TraceBuilder {
         )[0]
     }
 
-    /// The fused decode-QKV epilogue of a lowered decode-class trace
-    /// ([`OpKind::QkvDecodeFusedPost`]): packed GEMM output in, roped Q
-    /// out, K/V appended to layer state as a side effect.
-    pub fn qkv_decode_fused_post(
+    /// A STATED kernel launch ([`OpKind::Launch`]) — the recording half of
+    /// the raw kernel signatures in [`crate::dsl::cuda`]; declarations
+    /// call those, never this.
+    pub fn launch(
         &mut self,
-        packed: ValueId,
-        q_norm: &str,
-        k_norm: &str,
-        layer: u32,
-        head_dim: u32,
-        q_width: u32,
-    ) -> ValueId {
-        let rows = self.values[packed as usize].shape.0[0];
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        inputs: Vec<ValueId>,
+        out_shapes: Vec<(Shape, DType)>,
+    ) -> Vec<ValueId> {
         self.push(
-            OpKind::QkvDecodeFusedPost {
-                q_norm: q_norm.to_string(),
-                k_norm: k_norm.to_string(),
-                layer,
-                head_dim,
+            OpKind::Launch {
+                kernel: kernel.to_string(),
+                weights,
+                state,
             },
-            vec![packed],
-            vec![(Shape(vec![rows, Dim::Const(q_width)]), DType::BF16)],
-        )[0]
-    }
-
-    /// The fire's rope-table build ([`OpKind::RopeTableBuild`]): no
-    /// operands, no results — a launch whose effect (the cos/sin table)
-    /// lives in the workspace, like `KvAppend`'s lives in the cache.
-    pub fn rope_table_build(&mut self) {
-        self.push(OpKind::RopeTableBuild, vec![], vec![]);
+            inputs,
+            out_shapes,
+        )
     }
 
     /// SwiGLU halves the trailing gate‖up dim and keeps every leading dim,

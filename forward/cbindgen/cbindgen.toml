@@ -25,11 +25,10 @@ include = [
     "PieForwardRopeKind",
     "PieForwardNormPlacement",
     "PieForwardQkNorm",
-    # The lowered-trace inputs/outputs that cross as `uint32_t`: the fire
-    # class argument of `pie_forward_trace_llama_like_cuda`, and the
-    # kernel statement a lowered `Attention` carries in `param1`.
+    # The lowered-trace input that crosses as `uint32_t`: the fire class
+    # argument of `pie_forward_trace_llama_like_cuda`. (Kernel statements
+    # cross as `Launch` ops carrying launcher NAMES — no enum to export.)
     "PieForwardFireClass",
-    "PieForwardAttnKernel",
 ]
 
 [enum]

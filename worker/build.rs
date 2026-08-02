@@ -37,6 +37,11 @@ fn main() {
     }
     if cuda || metal {
             println!("cargo:rerun-if-changed=../driver/abi/include");
+            // The forward crate's committed C header: the drivers walk its
+            // PODs, so a regenerated header must recompile them — without
+            // this line a POD layout change builds green against stale
+            // objects and corrupts at the first plan walk.
+            println!("cargo:rerun-if-changed=../forward/include");
     }
 
     if cuda {

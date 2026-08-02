@@ -49,6 +49,7 @@
 //!   three bodies into the first whole-model declaration beyond
 //!   llama_like, its layer schedule a static match over the facts.
 
+pub mod dsl;
 pub mod facts;
 pub mod family;
 pub mod ffi;
@@ -59,6 +60,6 @@ pub use facts::{
     Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 pub use trace::{
-    AttnKernel, DType, Dim, DynAxis, FireClass, ForwardPlan, Op, OpKind, Shape, StateRef,
-    StateStore, TraceBuilder, ValueId,
+    DType, Dim, DynAxis, FireClass, ForwardPlan, Op, OpKind, Shape, StateRef, StateStore,
+    TraceBuilder, ValueId,
 };
