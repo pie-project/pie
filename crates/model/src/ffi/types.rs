@@ -649,6 +649,37 @@ pub struct PieForwardRow {
     pub depth_k: i32,
 }
 
+/// What an operand slot names, as a wire tag.
+///
+/// Appended-only, like every other wire enum here.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PieForwardArgKind {
+    /// An activation: `value` is a BYTE OFFSET into the frame's arena.
+    Arena = 0,
+    /// A value the backend binds by name: `value` is its value id.
+    Named = 1,
+    /// A weight: `value` indexes the PLAN's name table, which is where
+    /// weight names live (the lowering's own table holds launcher
+    /// symbols, and the two must not be confused).
+    Weight = 2,
+}
+
+/// One operand a launch binds. Two words, because that is all an
+/// operand is once the lowering has resolved it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PieForwardArg {
+    pub kind: PieForwardArgKind,
+    pub value: u32,
+    /// Elements per row, for `Arena` and `Named`; zero for a `Weight`,
+    /// whose extent is the tensor's own. An arm needs this and would
+    /// otherwise have to re-read the plan — see
+    /// [`model_compiler::lower::Arg`].
+    pub width: u32,
+}
+
+
 /// One rectangle of the flat launch list.
 ///
 /// `kernel_name` indexes a table handed back beside the launches, NOT the
@@ -661,8 +692,16 @@ pub struct PieForwardRow {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PieForwardLaunch {
     /// The statement this rectangle came from — an index into the plan's
-    /// ops, and what a shadow comparison keys on.
+    /// ops, and what a shadow comparison keys on. NOT where the driver
+    /// finds operands: that is `arg_lo`/`arg_hi`, and the two were one
+    /// field until the operands existed.
     pub at_op: u32,
+    /// This launch's operands, as a half-open run of
+    /// [`PieForwardLowered::args`]. A driver that reads these needs
+    /// nothing else about the op — which is what lets ONE driver serve
+    /// every family.
+    pub arg_lo: u32,
+    pub arg_hi: u32,
     pub kernel_name: u32,
     pub row_lo: u32,
     pub row_hi: u32,
@@ -723,6 +762,10 @@ pub struct PieForwardLowered {
     pub kernel_names: *const PieForwardName,
     pub kernel_names_len: usize,
     pub kernel_name_bytes: PieForwardBytes,
+    /// Every launch's operands, concatenated; `PieForwardLaunch::arg_lo`
+    /// and `arg_hi` index it.
+    pub args: *const PieForwardArg,
+    pub args_len: usize,
     /// The STRUCTURAL statements inside live regions, in walk order. A
     /// site launches no table kernel, so it has no rectangle, but it
     /// runs guest programs and brackets a layer's sideband; a form
@@ -731,6 +774,16 @@ pub struct PieForwardLowered {
     pub structural_len: usize,
     /// Peak activation bytes the frame would need.
     pub arena_bytes: usize,
+    /// Where each traced value lives, by value id: a byte offset into
+    /// the arena, or `usize::MAX` for one the backend binds by name.
+    ///
+    /// `args` already carries this for every operand a rectangle names,
+    /// which is all a driver walking rectangles reads. The table is for
+    /// the walk that still exists — the per-family executors step ops
+    /// and ask for a value BY ID, and this lets them take host-assigned
+    /// buffers without first being rewritten to walk rectangles.
+    pub value_offsets: *const usize,
+    pub value_offsets_len: usize,
     /// Non-zero when the fire could not be lowered; `launches` is then
     /// empty and the value says which rule refused.
     pub uncovered: PieForwardUncovered,
@@ -744,9 +797,13 @@ impl Default for PieForwardLowered {
             kernel_names: std::ptr::null(),
             kernel_names_len: 0,
             kernel_name_bytes: PieForwardBytes::default(),
+            args: std::ptr::null(),
+            args_len: 0,
             structural: std::ptr::null(),
             structural_len: 0,
             arena_bytes: 0,
+            value_offsets: std::ptr::null(),
+            value_offsets_len: 0,
             uncovered: PieForwardUncovered::None,
         }
     }

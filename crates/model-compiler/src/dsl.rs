@@ -1385,6 +1385,10 @@ pub mod seam {
 ///
 /// [`OpKind::HookSite`]: crate::trace::OpKind::HookSite
 pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {
+    // The values the statement NAMES. Carried onto the record so buffer
+    // assignment can pin exactly these, rather than guessing from the
+    // operands of whatever op the seam points at.
+    let ids: Vec<crate::trace::ValueId> = sees.iter().map(|v| v.id).collect();
     assert_eq!(
         sees.len(),
         def.sees.len(),
@@ -1404,7 +1408,7 @@ pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {
             let at = t.inner.borrow().op_count_now() - 1;
             t.inner
                 .borrow_mut()
-                .push_seam(def.name, layer, Some(at as u32));
+                .push_seam(def.name, layer, Some(at as u32), ids);
         }
         "attn.qv" => {
             let l = layer.expect("a body seam states its layer");
@@ -1419,10 +1423,10 @@ pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {
                 || cuda::lora_qkv_correction(sees[0], sees[1], l),
                 || {},
             );
-            t.inner.borrow_mut().push_seam(def.name, layer, Some(at));
+            t.inner.borrow_mut().push_seam(def.name, layer, Some(at), ids);
         }
         "in" | "out" => {
-            t.inner.borrow_mut().push_seam(def.name, layer, None);
+            t.inner.borrow_mut().push_seam(def.name, layer, None, ids);
         }
         other => unreachable!("no seam named {other}"),
     }

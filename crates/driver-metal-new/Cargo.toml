@@ -1,0 +1,119 @@
+[package]
+name = "driver-metal-new"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The Metal execution shell, in Rust: MTL4 device objects, heaps and residency, runtime shader compilation and command encoding. Grows beside driver-metal until it replaces it."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+# Deliberately no `links` key. The C++ shell publishes
+# `pie_driver_metal_lib` and the two crates are members of one workspace at
+# the same time -- two packages claiming one `links` value is a resolution
+# error, not a link error, so it would break `cargo metadata` for everyone
+# rather than just for whoever selected this crate.
+[lib]
+name = "driver_metal_new"
+path = "src/lib.rs"
+
+# NOT `[lints] workspace = true`. That table sets `unsafe_code = "forbid"`,
+# which every objc2 message send violates by construction. The rest of it
+# (`missing_docs`, the clippy ratchets) is worth having and is set in
+# `lib.rs`, where `unsafe_code` can be left out of the list.
+
+[features]
+default = []
+
+# Apple-only. Everything that names a Metal type lives under `src/metal/` and
+# is gated on this cfg, so the crate still builds -- and its portable half
+# still tests -- on the Linux boxes the rest of the workspace is developed on.
+# That is the point of the split: `shader.rs` and `tuning.rs` are the parts
+# with logic worth testing, and neither needs a GPU to run.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSError",
+    "NSString",
+    "NSArray",
+    "NSObject",
+    "NSRange",
+    "NSURL",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFBase",
+    "CFNumber",
+    "CFString",
+    "CFDictionary",
+] }
+# `objc2-io-kit` publishes exactly one feature (`AppleUSBDefinitions`) and the
+# registry API is not behind it. `libc` comes with it for `mach_port_t` and
+# `kern_return_t`, which its signatures are written in.
+objc2-io-kit = { version = "0.3.2", default-features = false, features = [
+    # `kIOMainPortDefault` is behind the `libc` feature -- the registry
+    # signatures are written in `libc::mach_port_t`, so the port constant
+    # only exists when that dependency does.
+    "libc",
+] }
+libc = "0.2"
+# The commit-feedback handler is an Objective-C block. `block2` is the only
+# way to hand Metal one, and `objc2-metal`'s own `block2` feature is what
+# exposes `addFeedbackHandler:` at all.
+block2 = "0.6"
+
+# Feature-gated per header, so the list IS the API surface this shell uses.
+# Adding a Metal type means adding its feature here; that is the intended
+# friction, and it is why the list is not `features = ["all"]`.
+[target.'cfg(target_vendor = "apple")'.dependencies.objc2-metal]
+version = "0.3.2"
+default-features = false
+features = [
+    "std",
+    # `addFeedbackHandler:` takes a block, and the method does not exist
+    # without this.
+    "block2",
+    # `MTL4CommitFeedback`'s two timestamps are `CFTimeInterval`, so they do
+    # not exist without this.
+    "objc2-core-foundation",
+    # core device + resources
+    "MTLDevice",
+    "MTLResource",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLHeap",
+    "MTLResidencySet",
+    "MTLEvent",
+    "MTLLibrary",
+    "MTLComputePipeline",
+    "MTLTypes",
+    "MTLPixelFormat",
+    "MTLCounters",
+    "MTLArgument",
+    "MTLCommandBuffer",
+    # `MTLStages` and the encoder barrier live here; the MTL4 encoder's barrier
+    # methods are gated on it even though nothing else in this driver is.
+    "MTLCommandEncoder",
+    # the Metal 4 stack this driver is written against
+    "MTL4CommandQueue",
+    "MTL4CommandBuffer",
+    "MTL4CommandAllocator",
+    "MTL4CommandEncoder",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+    "MTL4ArgumentTable",
+    "MTL4Compiler",
+    "MTL4CompilerTask",
+    "MTL4LibraryDescriptor",
+    "MTL4FunctionDescriptor",
+    "MTL4LibraryFunctionDescriptor",
+    "MTL4PipelineState",
+    "MTL4Counters",
+    "MTL4CommitFeedback",
+    "MTL4Archive",
+    "MTL4PipelineDataSetSerializer",
+]
+
+[dev-dependencies]
+tempfile = "3"

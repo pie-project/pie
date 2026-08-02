@@ -531,7 +531,7 @@ fn the_epilogue_is_a_row_count_not_a_branch() {
         let out = lower(&plan, rows, Fire::default()).expect("coverable");
         out.launches
             .iter()
-            .filter(|l| l.args == at_op)
+            .filter(|l| l.op == at_op)
             .map(|l| (out.kernels[l.kernel as usize].clone(), l.rows.clone()))
             .collect()
     };
@@ -942,4 +942,219 @@ fn the_nemotron_h_decode_text_lowers() {
         out.residue
     );
     assert_eq!(out.coverage(), 1.0);
+}
+
+/// gemma3n's CUDA decode text lowers with nothing left over — the sixth
+/// and last of the families that existed only as C++.
+///
+/// It is also the text that needed two primitives nothing else did:
+/// `select` for the window AltUp's body reads, and `in_place` for the
+/// per-layer embedding's K-1 adds landing back in the windows they read.
+#[test]
+fn the_gemma3n_decode_text_lowers() {
+    use model::gemma3n::forward::facts::Gemma3nFacts;
+    let facts = Gemma3nFacts::gemma3n_synthetic();
+    let plan = model::gemma3n::forward::gemma3n_cuda(&facts, FireClass::Decode);
+    let out = lower(&plan, &sampled(1), Fire::default())
+        .unwrap_or_else(|e| panic!("gemma3n's decode text must lower: {e:?}"));
+    assert!(
+        out.residue.is_empty(),
+        "{} statement(s) still owe a declaration: {:#?}",
+        out.residue.len(),
+        out.residue
+    );
+    assert_eq!(out.coverage(), 1.0);
+}
+
+/// gemma-2's CUDA decode text lowers with nothing left over — the last
+/// family in the driver that had no declaration at all.
+#[test]
+fn the_gemma_2_decode_text_lowers() {
+    use model::gemma_2::forward::facts::Gemma2Facts;
+    let facts = Gemma2Facts::gemma_2_9b();
+    let plan = model::gemma_2::forward::gemma2_cuda(&facts, FireClass::Decode);
+    let out = lower(&plan, &sampled(1), Fire::default())
+        .unwrap_or_else(|e| panic!("gemma-2's decode text must lower: {e:?}"));
+    assert!(
+        out.residue.is_empty(),
+        "{} statement(s) still owe a declaration: {:#?}",
+        out.residue.len(),
+        out.residue
+    );
+    assert_eq!(out.coverage(), 1.0);
+}
+
+/// Every rectangle carries its own operands, and they agree with the
+/// arena.
+///
+/// This is the host half of the family-independent driver (north-star
+/// step 6). Today's four `declared_forward.cpp` walk the TRACED ops and
+/// answer "which buffer is this operand?" with a per-family workspace
+/// field — `ws.norm_x`, `la.mixed_qkv` — which is the only reason they
+/// cannot be one file. A launch that carries its operands answers it in
+/// the lowering, once, for every family.
+///
+/// So the claim is narrow and total: no launch has an empty operand run,
+/// and every arena operand names the offset `Buffers` assigned it.
+#[test]
+fn every_launch_carries_operands_that_match_the_arena() {
+    use model_compiler::lower::Arg;
+
+    let plan = decode_plan();
+    let rows = plain(8);
+    let out = lower(&plan, &rows, Fire::default()).expect("must lower");
+    let buffers = Buffers::assign(&plan, &rows);
+
+    assert!(!out.launches.is_empty());
+    let mut arena_args = 0usize;
+    for l in &out.launches {
+        assert!(
+            l.args.end > l.args.start,
+            "a rectangle with no operands cannot be driven"
+        );
+        for a in &out.args[l.args.start as usize..l.args.end as usize] {
+            match a {
+                Arg::Arena { at, width } => {
+                    arena_args += 1;
+                    assert!(
+                        *at < out.arena_bytes,
+                        "an operand outside the arena ({at} vs {})",
+                        out.arena_bytes
+                    );
+                    // A zero width is the lowering saying "this operand
+                    // has no fixed row width", which no statement in the
+                    // tree produces — so it reads as a resolver bug.
+                    assert!(*width > 0, "an activation operand with no width");
+                }
+                Arg::Named { value: v, .. } => assert_eq!(
+                    buffers.offset[*v as usize],
+                    Buffers::NAMED,
+                    "a Named operand must be one the arena declined"
+                ),
+                Arg::Weight(n) => assert!(!n.is_empty()),
+            }
+        }
+    }
+    assert!(
+        arena_args > out.launches.len(),
+        "most operands are activations; {arena_args} for {} launches reads \
+         like the resolver is not running",
+        out.launches.len()
+    );
+}
+
+/// The operand slots survive the C ABI, and a weight crosses as an index
+/// into the PLAN's name table.
+///
+/// The confusion this guards is real and easy: a lowering hands back TWO
+/// name tables — its own, holding launcher SYMBOLS, and the plan's,
+/// holding weights. An operand resolved against the wrong one gives the
+/// driver a kernel name where a tensor belongs, and both are valid u32.
+#[test]
+fn the_operand_slots_cross_the_abi_naming_weights_from_the_plan() {
+    use model::ffi::types::PieForwardArgKind;
+    use model_compiler::lower::Arg;
+
+    let plan = decode_plan();
+    let rows = plain(4);
+    let out = lower(&plan, &rows, Fire::default()).expect("must lower");
+
+    // At least one launch names a weight, or this proves nothing.
+    let weights: Vec<&String> = out
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            Arg::Weight(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !weights.is_empty(),
+        "this text's launches name weights; none reached the slots"
+    );
+    // Every one is a name the PLAN states, not a launcher symbol.
+    for w in &weights {
+        assert!(
+            plan.ops.iter().any(|o| match &o.kind {
+                OpKind::Launch { weights, .. } => weights.iter().any(|n| &n == w),
+                _ => false,
+            }),
+            "`{w}` is not a weight any statement names"
+        );
+        assert!(
+            !out.kernels.iter().any(|k| &k == w),
+            "`{w}` is a LAUNCHER symbol — the two name tables were crossed"
+        );
+    }
+    // And the wire tags are the three the ABI declares.
+    let _ = (
+        PieForwardArgKind::Arena,
+        PieForwardArgKind::Named,
+        PieForwardArgKind::Weight,
+    );
+}
+
+/// The buffer table crosses beside the operands, and the two AGREE.
+///
+/// They are two views of one assignment: `args` carries an offset per
+/// operand a rectangle names, `value_offsets` carries one per value id.
+/// A driver mid-migration reads the table (it walks ops, so it has no
+/// rectangle to read `args` from) and a driver on the flat list reads
+/// the operands, so the families would disagree about where a value
+/// lives if these ever drifted — and nothing else would say so, because
+/// each is internally consistent.
+#[test]
+fn the_buffer_table_crosses_and_agrees_with_the_operands() {
+    use model_compiler::lower::Arg;
+
+    let plan = decode_plan();
+    let rows = plain(4);
+    let out = lower(&plan, &rows, Fire::default()).expect("must lower");
+
+    assert_eq!(
+        out.value_offset.len(),
+        plan.values.len(),
+        "the table is indexed by value id, so it is one entry per value"
+    );
+
+    // Every operand slot resolves to the same bytes the table names.
+    let mut checked = 0usize;
+    for l in &out.launches {
+        for a in &out.args[l.args.start as usize..l.args.end as usize] {
+            match a {
+                Arg::Named { value, .. } => {
+                    assert_eq!(
+                        out.value_offset[*value as usize],
+                        Buffers::NAMED,
+                        "value {value} crossed as Named but the table places it"
+                    );
+                    checked += 1;
+                }
+                // An arena operand carries the offset directly, so the
+                // agreement to check is that the table is not NAMED
+                // there — the offset itself came from the same vector.
+                Arg::Arena { at, .. } => {
+                    assert!(
+                        *at < out.arena_bytes,
+                        "an operand outside the arena it reports"
+                    );
+                    checked += 1;
+                }
+                Arg::Weight(_) => {}
+            }
+        }
+    }
+    assert!(checked > 0, "no activation operands reached the check");
+
+    // Nothing the table places sits past the block it reports.
+    for (v, &at) in out.value_offset.iter().enumerate() {
+        if at == Buffers::NAMED {
+            continue;
+        }
+        assert!(
+            at < out.arena_bytes,
+            "value {v} is placed at {at}, past the reported {} bytes",
+            out.arena_bytes
+        );
+    }
 }

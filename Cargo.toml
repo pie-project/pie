@@ -54,6 +54,16 @@ members = [
     "crates/driver",
     "crates/driver-cuda",
     "crates/driver-metal",
+    # The Rust rewrite of the Metal shell, grown beside the C++ one rather
+    # than inside it. A member so it shares this lockfile and so a workspace
+    # sweep on a Mac sees it; outside `default-members` for the same reason
+    # `driver-metal` is -- selecting it on a Linux box should be a choice.
+    #
+    # Unlike `driver-metal` it does BUILD on a non-Apple host: everything that
+    # names a Metal type is behind `cfg(target_vendor = "apple")`, and what is
+    # left is the shader-include splicer and the tuning table, which are the
+    # two parts with logic worth testing and no reason to need a GPU.
+    "crates/driver-metal-new",
     "crates/driver-dummy",
 
     # -- model-*: what a model IS, and how it gets onto a device ------------

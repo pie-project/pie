@@ -120,6 +120,36 @@ pub struct Site {
     pub rows: Range<u32>,
 }
 
+/// One operand a launch binds.
+///
+/// This is what makes the flat list FAMILY-INDEPENDENT. An executor that
+/// walks the traced ops has to answer, per op and per family, "which
+/// workspace field is this operand?" — which is why today's four
+/// `declared_forward.cpp` hard-code `ws.norm_x`, `ws.q`, `la.mixed_qkv`
+/// and cannot be shared. A launch that carries its operands answers it
+/// once, in the lowering, for every family at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Arg {
+    /// An activation: a byte offset into the frame's arena, and the
+    /// operand's WIDTH — elements per row.
+    ///
+    /// The width is here because an arm needs it and the alternative is
+    /// worse. Today's per-family executors track it as `cur_d`, `cur_hk`
+    /// and friends — per-layer bookkeeping the walk maintains — and a
+    /// driver that had to re-derive it would be reading the plan again,
+    /// which is exactly what the flat list exists to avoid. The rows come
+    /// from [`Launch::rows`]; together they are the rectangle the kernel
+    /// addresses.
+    Arena { at: usize, width: u32 },
+    /// A value the BACKEND binds by name — the values a seam exposes
+    /// (the observed query, the logits). `Buffers::NAMED` says which.
+    Named { value: ValueId, width: u32 },
+    /// A weight, by the name the trace states (`layer.3.q_proj`). The
+    /// driver resolves it against its own tensor store, which is the one
+    /// thing that stays per-family and is a MAP rather than a switch.
+    Weight(String),
+}
+
 /// One flat launch: a kernel over a rectangle of (rows × layers).
 ///
 /// `args` is an index into the frame's argument slots — the driver binds
@@ -137,7 +167,17 @@ pub struct Launch {
     pub kernel: u16,
     pub rows: Range<u32>,
     pub layers: Range<u16>,
-    pub args: u32,
+    /// Which traced op produced this rectangle. Kept beside the
+    /// operands because it answers a different question: `args` is what
+    /// a driver BINDS, `op` is where a refusal or a shadow comparison
+    /// points. They shared a field until the operands existed, which
+    /// read as one number meaning two things.
+    pub op: u32,
+    /// This launch's operands, as a run of [`Lowered::args`]. Inputs in
+    /// operand order, then outputs, then the weights the statement
+    /// names — the order the trace states them, so nothing here is a
+    /// convention a reader has to learn twice.
+    pub args: Range<u32>,
     /// Which peel region this rectangle sits in, when it sits in one.
     ///
     /// The executing arms read exactly four things about where they
@@ -230,6 +270,23 @@ pub struct Lowered {
     pub rectangles: usize,
     /// Peak activation bytes the frame needs ([`Buffers`]).
     pub arena_bytes: usize,
+    /// Where each traced value lives, by value id: a byte offset into
+    /// the frame's arena, or [`Buffers::NAMED`] for one the backend
+    /// binds.
+    ///
+    /// [`Launch::args`] already carries this for every operand a
+    /// rectangle names, and a driver walking rectangles wants nothing
+    /// else. This is here for the walk that still exists: the per-family
+    /// executors step ops and ask for a value BY ID, so without a table
+    /// they could not move onto host-assigned buffers until they had
+    /// been rewritten to walk rectangles — two migrations chained where
+    /// one will do.
+    pub value_offset: Vec<usize>,
+    /// Every launch's operands, concatenated; [`Launch::args`] indexes
+    /// it. Flat rather than per-launch so the whole frame is two arrays
+    /// and a table — which is the shape a driver can walk without
+    /// knowing whose model it is.
+    pub args: Vec<Arg>,
     /// The STRUCTURAL statements inside live regions, in walk order.
     ///
     /// A site launches no table kernel, so it has no rectangle — but it
@@ -288,15 +345,20 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Un
         residue: Vec::new(),
         fire,
         structural: Vec::new(),
+        args: Vec::new(),
+        buffers: Buffers::assign(plan, rows),
         peel_region: None,
     };
+    let arena_bytes = out.buffers.bytes;
+    let value_offset = out.buffers.offset.clone();
     out.region(0..plan.ops.len(), 0..n)?;
-    let buffers = Buffers::assign(plan, rows);
     Ok(Lowered {
         rectangles: out.launches.len(),
         launches: out.launches,
         kernels: out.kernels,
-        arena_bytes: buffers.bytes,
+        arena_bytes,
+        value_offset,
+        args: out.args,
         structural: out.structural,
         residue: out.residue,
     })
@@ -317,6 +379,12 @@ struct Lowerer<'a> {
     residue: Vec<Unlowered>,
     fire: Fire,
     structural: Vec<Site>,
+    /// The operand slots emitted so far.
+    args: Vec<Arg>,
+    /// The arena, so an operand can be resolved to an offset as it is
+    /// emitted rather than in a second pass that would have to re-walk
+    /// the regions to know which launches exist.
+    buffers: Buffers,
     /// The peel region the launches being emitted sit in.
     peel_region: Option<PeelRegion>,
 }
@@ -494,14 +562,58 @@ impl Lowerer<'_> {
         // one layer. `Launch::layers` is a range because a ROLLED trace
         // states a layer span; both spellings reach the same driver loop.
         let layer = op.layer.unwrap_or(0) as u16;
+        // The operands, resolved HERE — inputs, then outputs, then the
+        // weight names the statement carries. A driver reading this run
+        // needs nothing else about the op, which is the whole point.
+        let first = self.args.len() as u32;
+        for &v in op.inputs.iter().chain(op.outputs.iter()) {
+            self.args.push(self.slot(v));
+        }
+        if let OpKind::Launch { weights, .. } = &op.kind {
+            for name in weights {
+                self.args.push(Arg::Weight(name.clone()));
+            }
+        }
         self.launches.push(Launch {
             kernel: id,
             rows: window.clone(),
             layers: layer..layer + 1,
-            args: at as u32,
+            op: at as u32,
+            args: first..self.args.len() as u32,
             peel: self.peel_region,
         });
         Ok(())
+    }
+
+    /// Where a value's bytes are, and how wide a row of it is.
+    fn slot(&self, v: ValueId) -> Arg {
+        let width = self.row_width(v);
+        match self.buffers.offset.get(v as usize) {
+            Some(&Buffers::NAMED) | None => Arg::Named { value: v, width },
+            Some(&at) => Arg::Arena { at, width },
+        }
+    }
+
+    /// Elements per row: the product of every dim but the leading one.
+    ///
+    /// The leading dim is the row axis (`Tokens` for the body,
+    /// `Requests` for the epilogue), which [`Launch::rows`] already
+    /// names. A symbolic dim after the first would make the width a
+    /// runtime number, and no statement in the tree has one — so this
+    /// takes the constants and says zero if that ever stops being true,
+    /// which a driver reads as "this operand has no fixed width".
+    fn row_width(&self, v: ValueId) -> u32 {
+        let Some(info) = self.plan.values.get(v as usize) else {
+            return 0;
+        };
+        let mut w: u32 = 1;
+        for dim in info.shape.0.iter().skip(1) {
+            match dim {
+                Dim::Const(k) => w = w.saturating_mul(*k),
+                _ => return 0,
+            }
+        }
+        w
     }
 
     /// THE EPILOGUE, as rectangles rather than as a branch.
@@ -958,12 +1070,24 @@ impl Buffers {
             .max(1);
 
         // The values a seam exposes: read off the seam statements, not a
-        // per-family table.
+        // per-family table, and now off the statement's OWN value list
+        // rather than the operands of whatever op it points at.
+        //
+        // The probe that did the guessing is kept as the fallback for a
+        // record written before seams carried their values, and it was
+        // wrong in both directions. It took the neighbouring op's
+        // INPUTS, so `attn.qv` -- which names q and v -- pinned q, k and
+        // v, costing reuse; and no exposed value that is an OUTPUT was
+        // ever pinned at all. That second one is not a cost, it is a
+        // wrong answer: the sampler reads the logit softcap's RESULT,
+        // which the arena was placing while the driver read `ws.logits`.
         let mut pinned: Vec<ValueId> = Vec::new();
         for stmt in &plan.seams {
+            if !stmt.values.is_empty() {
+                pinned.extend(stmt.values.iter().copied());
+                continue;
+            }
             let Some(at) = stmt.op else { continue };
-            // The statement points at the construct; the values it sees
-            // are the operands of the op that carries the observation.
             for probe in [at as usize, at as usize + 1] {
                 if let Some(op) = plan.ops.get(probe) {
                     if matches!(op.kind, OpKind::HookSite { .. } | OpKind::Launch { .. }) {
@@ -973,17 +1097,57 @@ impl Buffers {
                 }
             }
         }
+        // A seam names the value at the point it is STATED, and later
+        // statements may write over those bytes in place -- the logit
+        // softcap accumulates into the logits it was handed. Everything
+        // sharing an exposed value's buffer is therefore exposed too, or
+        // the arena places the final contents somewhere the reader is
+        // not looking.
+        {
+            let owner = alias_owners(plan);
+            let roots: std::collections::BTreeSet<ValueId> =
+                pinned.iter().map(|&v| owner[v as usize]).collect();
+            for v in 0..plan.values.len() {
+                if roots.contains(&owner[v]) {
+                    pinned.push(v as ValueId);
+                }
+            }
+        }
         pinned.sort_unstable();
         pinned.dedup();
 
-        // Last use, in one op pass.
+        // Values that SHARE bytes by construction, and the one of each
+        // set that owns the allocation. Two ops mean this: a `Select`
+        // output is a window of its operand, and an in-place launcher's
+        // output is the operand it accumulates into.
+        let owner = alias_owners(plan);
+
+        // Last use, in one op pass — then folded onto the OWNER, which
+        // is the correction that makes sharing safe.
+        //
+        // Read per value id, a shared buffer frees at the last use of
+        // whichever member the op happened to name. That is not when the
+        // bytes stop being read: a residual stream is a chain of in-place
+        // adds, so the first link's id is dead after one op while the
+        // bytes stay live for the whole network, and the freed block gets
+        // handed to the next value that fits. The window case is the same
+        // shape and was previously reasoned away in a comment here ("the
+        // window's readers are the source's readers by dataflow") — they
+        // are not, because a reader names the WINDOW's id, not the
+        // source's.
         let mut last_use = vec![0usize; plan.values.len()];
         for (i, op) in plan.ops.iter().enumerate() {
             for &v in op.inputs.iter().chain(op.outputs.iter()) {
-                if let Some(slot) = last_use.get_mut(v as usize) {
+                let Some(&own) = owner.get(v as usize) else {
+                    continue;
+                };
+                if let Some(slot) = last_use.get_mut(own as usize) {
                     *slot = (*slot).max(i);
                 }
             }
+        }
+        for v in 0..plan.values.len() {
+            last_use[v] = last_use[owner[v] as usize];
         }
 
         let mut offset = vec![Self::NAMED; plan.values.len()];
@@ -999,14 +1163,14 @@ impl Buffers {
                 if last_use[v as usize] >= i {
                     return true;
                 }
-                free.push((offset[v as usize], size[v as usize]));
+                insert_free(&mut free, (offset[v as usize], size[v as usize]));
                 false
             });
             // A `Select` allocates nothing: its value IS a window of its
             // operand's bytes, which is the whole of what the op means.
-            // The source must therefore stay live as long as the window
-            // does — `last_use` already says so, because the window's
-            // readers are the source's readers by dataflow.
+            // It joins the operand's alias set rather than entering
+            // `live`, so those bytes return to the pool ONCE, at the last
+            // use of the set — see the `last_use` fold above.
             if let OpKind::Select { index } = op.kind {
                 let src = op.inputs[0];
                 let out = op.outputs[0];
@@ -1020,8 +1184,26 @@ impl Buffers {
                         offset[src as usize] + index as usize * want;
                 }
                 size[out as usize] = want;
-                live.push(out);
                 continue;
+            }
+            // An IN-PLACE kernel writes over an operand, so its output
+            // is that operand's bytes — `kernel!`'s `in_place` says
+            // which. Giving it an allocation of its own would be a copy
+            // the model does not make, and for a text that accumulates
+            // into a `select` window it would be worse than wasteful:
+            // the window would keep its pre-update value and the streams
+            // would silently never see the add.
+            if let OpKind::Launch { kernel, .. } = &op.kind {
+                if let Some(idx) = crate::kernels::in_place_operand(plan, kernel) {
+                    if let (Some(&src), Some(&out)) =
+                        (op.inputs.get(idx as usize), op.outputs.first())
+                    {
+                        offset[out as usize] = offset[src as usize];
+                        size[out as usize] =
+                            value_bytes(plan, out, n_tokens, n_requests);
+                        continue;
+                    }
+                }
             }
             for &v in &op.outputs {
                 if pinned.binary_search(&v).is_ok() {
@@ -1032,8 +1214,35 @@ impl Buffers {
                     continue;
                 }
                 let want = value_bytes(plan, v, n_tokens, n_requests);
-                let at = match free.iter().position(|&(_, s)| s >= want) {
-                    Some(f) => free.remove(f).0,
+                // BEST fit, and SPLIT the remainder back.
+                //
+                // First-fit-and-keep-the-whole-block was costing 4-15x
+                // at the fire shape that sizes the driver's activation
+                // block (`arena_soundness.rs` prices it per family): a
+                // freed logits-sized block satisfying a one-row norm
+                // retired the rest of itself, so the walk bump-allocated
+                // almost everything. It read as cheap because the ratio
+                // had been measured on an eight-row all-sampled fire,
+                // where the logits dominate the arena AND the floor and
+                // the loss hides inside both.
+                let at = match free
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, block)| block.1 >= want)
+                    .min_by_key(|(_, block)| block.1)
+                    .map(|(i, _)| i)
+                {
+                    Some(f) => {
+                        let (off, size_of) = free.remove(f);
+                        // The tail keeps the block's alignment, so a
+                        // split never hands out an address the bump path
+                        // would not have.
+                        let tail = (off + want).div_ceil(256) * 256;
+                        if tail < off + size_of {
+                            insert_free(&mut free, (tail, off + size_of - tail));
+                        }
+                        off
+                    }
                     None => {
                         // 256-byte alignment, and BUMP only: a decode
                         // body runs inside a capture, so the same plan
@@ -1055,6 +1264,86 @@ impl Buffers {
             pinned,
         }
     }
+}
+
+/// Return a block to the pool, MERGED with any neighbour it touches.
+///
+/// The pool is kept sorted by offset so this is one scan. Without it,
+/// splitting makes fragmentation worse rather than better: a block cut
+/// into pieces to serve small values never becomes whole again, so a
+/// later large value bump-allocates past a run of adjacent free bytes
+/// that would have held it.
+fn insert_free(free: &mut Vec<(usize, usize)>, block: (usize, usize)) {
+    let (at, len) = block;
+    if len == 0 {
+        return;
+    }
+    let i = free.partition_point(|&(off, _)| off < at);
+    free.insert(i, (at, len));
+    // Merge forward first, then back, so a block filling a hole between
+    // two free neighbours coalesces all three.
+    if i + 1 < free.len() && free[i].0 + free[i].1 == free[i + 1].0 {
+        let (_, next_len) = free.remove(i + 1);
+        free[i].1 += next_len;
+    }
+    if i > 0 && free[i - 1].0 + free[i - 1].1 == free[i].0 {
+        let (_, this_len) = free.remove(i);
+        free[i - 1].1 += this_len;
+    }
+}
+
+/// For each value, the value that OWNS the bytes it lives in.
+///
+/// Most values own their own. The exceptions are the two constructs
+/// whose meaning is that the output does not get memory of its own: a
+/// [`OpKind::Select`] output is a window of its operand, and a launcher
+/// the `kernel!` table marks in-place writes over the operand it
+/// accumulates into. Both chain — a residual stream is a run of in-place
+/// adds — so this is a union-find, and the owner is always the EARLIER
+/// value, i.e. the one whose allocation the rest inherit.
+///
+/// Buffer assignment needs this in two places: the live range of a
+/// shared buffer is the union's, not any one member's, and only the
+/// owner may return those bytes to the free pool.
+fn alias_owners(plan: &ForwardPlan) -> Vec<ValueId> {
+    let mut owner: Vec<ValueId> = (0..plan.values.len() as ValueId).collect();
+
+    fn find(owner: &mut [ValueId], v: ValueId) -> ValueId {
+        let mut v = v;
+        while owner[v as usize] != v {
+            let up = owner[v as usize];
+            owner[v as usize] = owner[up as usize];
+            v = owner[v as usize];
+        }
+        v
+    }
+
+    for op in &plan.ops {
+        let joined = match &op.kind {
+            OpKind::Select { .. } => op.inputs.first().copied(),
+            OpKind::Launch { kernel, .. } => crate::kernels::in_place_operand(plan, kernel)
+                .and_then(|idx| op.inputs.get(idx as usize).copied()),
+            _ => None,
+        };
+        let (Some(src), Some(&out)) = (joined, op.outputs.first()) else {
+            continue;
+        };
+        if src as usize >= owner.len() || out as usize >= owner.len() {
+            continue;
+        }
+        let (a, b) = (find(&mut owner, src), find(&mut owner, out));
+        if a != b {
+            // The earlier value keeps the allocation; SSA numbering makes
+            // "earlier" and "smaller id" the same thing, and the ops are
+            // walked in order anyway.
+            let (keep, drop) = if a <= b { (a, b) } else { (b, a) };
+            owner[drop as usize] = keep;
+        }
+    }
+    for v in 0..owner.len() {
+        owner[v] = find(&mut owner, v as ValueId);
+    }
+    owner
 }
 
 pub fn value_bytes(plan: &ForwardPlan, v: ValueId, n_tokens: usize, n_requests: usize) -> usize {

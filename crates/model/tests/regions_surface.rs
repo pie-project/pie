@@ -134,3 +134,49 @@ fn a_select_launches_nothing_and_windows_its_operand() {
         "index 1's window must sit past the source's start ({win} vs {src})"
     );
 }
+
+/// Accumulating into a `select` window keeps the result IN the window.
+///
+/// This is the pair `select` needed to be useful: a readable window is
+/// only half of gemma3n's AltUp, whose per-layer embedding is added back
+/// into K-1 corrected streams IN PLACE. Without `in_place` the add would
+/// get its own allocation, the window would keep its pre-update value,
+/// and the streams would silently never see it — which is the failure
+/// mode this whole architecture exists to make impossible.
+#[test]
+fn an_in_place_add_lands_in_the_window_it_reads() {
+    use model_compiler::lower::{Buffers, Fire, Row};
+
+    let plan = trace_named("inplace.cuda.decode", |t| {
+        let x = input(t, 8);
+        let streams = cuda::hc_expand(&x, 2, 8);
+        let one = select(&streams, 1);
+        let ple = input(t, 8);
+        let _ = cuda::residual_add(&one, &ple, 8);
+    });
+
+    let rows: Vec<Row> = (0..4).map(|_| Row::default()).collect();
+    let b = Buffers::assign(&plan, &rows);
+
+    let sel = plan
+        .ops
+        .iter()
+        .find(|o| matches!(o.kind, OpKind::Select { .. }))
+        .expect("the plan states a Select");
+    let add = plan
+        .ops
+        .iter()
+        .find(|o| matches!(&o.kind, OpKind::Launch { kernel, .. }
+                           if kernel == "launch_residual_add_bf16"))
+        .expect("the plan states the in-place add");
+
+    let window = b.offset[sel.outputs[0] as usize];
+    let result = b.offset[add.outputs[0] as usize];
+    assert_eq!(
+        result, window,
+        "the add must land IN the window it read ({result} vs {window})"
+    );
+    // And the window is still a window: past the streams' own start.
+    let src = b.offset[sel.inputs[0] as usize];
+    assert!(window > src, "index 1 must sit past the source start");
+}

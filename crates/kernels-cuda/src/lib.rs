@@ -490,7 +490,10 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(moe_gate_up_gemv "launch_moe_gate_up_decode_gemv_bf16"),
     kernel!(moe_down_gemv "launch_moe_down_decode_gemv_bf16"),
     kernel!(moe_shared_gate_dot "launch_sigmoid_dot_scalar_gate_add_bf16"),
-    kernel!(residual_add_cuda "launch_residual_add_bf16"),
+    // Accumulates into its FIRST argument. Stating it is what lets a
+// text add into a window (`select`) and have the window keep the
+// result — see `KernelSig::in_place`.
+kernel!(residual_add_cuda "launch_residual_add_bf16", in_place = Some(0)),
     // The combine folds the residual when the MoE output lands straight
     // on the stream (tp=1) — one launch where the semantic text has a
     // WeightedSum and a ResidualAdd.

@@ -11725,245 +11725,392 @@
     {
       "seam": "attn.q",
       "layer": 0,
-      "op": 8
+      "op": 8,
+      "values": [
+        7
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 0,
-      "op": 13
+      "op": 13,
+      "values": [
+        7
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 1,
-      "op": 27
+      "op": 27,
+      "values": [
+        25
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 1,
-      "op": 32
+      "op": 32,
+      "values": [
+        25
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 2,
-      "op": 46
+      "op": 46,
+      "values": [
+        43
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 2,
-      "op": 51
+      "op": 51,
+      "values": [
+        43
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 3,
-      "op": 66
+      "op": 66,
+      "values": [
+        63
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 3,
-      "op": 72
+      "op": 72,
+      "values": [
+        63
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 4,
-      "op": 85
+      "op": 85,
+      "values": [
+        78
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 4,
-      "op": 90
+      "op": 90,
+      "values": [
+        78
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 5,
-      "op": 104
+      "op": 104,
+      "values": [
+        96
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 5,
-      "op": 109
+      "op": 109,
+      "values": [
+        96
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 6,
-      "op": 123
+      "op": 123,
+      "values": [
+        114
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 6,
-      "op": 128
+      "op": 128,
+      "values": [
+        114
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 7,
-      "op": 143
+      "op": 143,
+      "values": [
+        134
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 7,
-      "op": 149
+      "op": 149,
+      "values": [
+        134
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 8,
-      "op": 162
+      "op": 162,
+      "values": [
+        149
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 8,
-      "op": 167
+      "op": 167,
+      "values": [
+        149
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 9,
-      "op": 181
+      "op": 181,
+      "values": [
+        167
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 9,
-      "op": 186
+      "op": 186,
+      "values": [
+        167
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 10,
-      "op": 200
+      "op": 200,
+      "values": [
+        185
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 10,
-      "op": 205
+      "op": 205,
+      "values": [
+        185
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 11,
-      "op": 220
+      "op": 220,
+      "values": [
+        205
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 11,
-      "op": 226
+      "op": 226,
+      "values": [
+        205
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 12,
-      "op": 239
+      "op": 239,
+      "values": [
+        220
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 12,
-      "op": 244
+      "op": 244,
+      "values": [
+        220
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 13,
-      "op": 258
+      "op": 258,
+      "values": [
+        238
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 13,
-      "op": 263
+      "op": 263,
+      "values": [
+        238
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 14,
-      "op": 277
+      "op": 277,
+      "values": [
+        256
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 14,
-      "op": 282
+      "op": 282,
+      "values": [
+        256
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 15,
-      "op": 297
+      "op": 297,
+      "values": [
+        276
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 15,
-      "op": 303
+      "op": 303,
+      "values": [
+        276
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 16,
-      "op": 316
+      "op": 316,
+      "values": [
+        291
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 16,
-      "op": 321
+      "op": 321,
+      "values": [
+        291
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 17,
-      "op": 335
+      "op": 335,
+      "values": [
+        309
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 17,
-      "op": 340
+      "op": 340,
+      "values": [
+        309
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 18,
-      "op": 354
+      "op": 354,
+      "values": [
+        327
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 18,
-      "op": 359
+      "op": 359,
+      "values": [
+        327
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 19,
-      "op": 374
+      "op": 374,
+      "values": [
+        347
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 19,
-      "op": 380
+      "op": 380,
+      "values": [
+        347
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 20,
-      "op": 393
+      "op": 393,
+      "values": [
+        362
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 20,
-      "op": 398
+      "op": 398,
+      "values": [
+        362
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 21,
-      "op": 412
+      "op": 412,
+      "values": [
+        380
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 21,
-      "op": 417
+      "op": 417,
+      "values": [
+        380
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 22,
-      "op": 431
+      "op": 431,
+      "values": [
+        398
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 22,
-      "op": 436
+      "op": 436,
+      "values": [
+        398
+      ]
     },
     {
       "seam": "attn.q",
       "layer": 23,
-      "op": 451
+      "op": 451,
+      "values": [
+        418
+      ]
     },
     {
       "seam": "attn.out",
       "layer": 23,
-      "op": 457
+      "op": 457,
+      "values": [
+        418
+      ]
     },
     {
-      "seam": "out"
+      "seam": "out",
+      "values": [
+        428
+      ]
     }
   ]
 }

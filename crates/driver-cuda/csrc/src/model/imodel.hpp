@@ -157,6 +157,21 @@ public:
         return nullptr;
     }
 
+    // Bytes of ACTIVATION BLOCK this model's declaration needs for the
+    // widest fire the memory plan admits, or 0 for a family that does
+    // not assign buffers from the host yet.
+    //
+    // Its own hook rather than a use of `declared_plan()` above, for two
+    // reasons: that one is documented as the summary the fire planner
+    // consumes and returns ONE plan, while a family traces one per fire
+    // class and the block must hold the widest of them; and the answer
+    // depends on the deployment's extents, which a plan pointer cannot
+    // carry. `declared::arena_bytes_for_widest` is the shared body.
+    virtual std::size_t declared_arena_bytes(int /*max_tokens*/,
+                                             int /*max_sampled*/) const {
+        return 0;
+    }
+
     // Optional: per-model recurrent state cache (Mamba2 / linear-attn / MTP
     // hidden snapshot). nullptr = model has no recurrent state.
     virtual RecurrentStateCache* state_cache() { return nullptr; }

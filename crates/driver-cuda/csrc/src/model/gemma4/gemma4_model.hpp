@@ -3,6 +3,7 @@
 #include <optional>
 
 #include "model/gemma4/declared_forward.hpp"
+#include "model/declared/value_arena.hpp"
 #include "model/gemma4/gemma4.hpp"
 #include "model/imodel.hpp"
 
@@ -15,6 +16,19 @@ namespace pie_cuda_driver::model {
 // fused-argmax hooks.
 class Gemma4Model final : public IModel {
 public:
+    // The activation block this deployment's declaration needs, over
+    // BOTH traced classes: one block serves whichever fires, and it is
+    // allocated once outside any capture, so it must hold the wider.
+    std::size_t declared_arena_bytes(int max_tokens,
+                                     int max_sampled) const override {
+        if (!declared_.usable) return 0;
+        return std::max(
+            declared::arena_bytes_for_widest(declared_.decode, max_tokens,
+                                             max_sampled),
+            declared::arena_bytes_for_widest(declared_.prefill, max_tokens,
+                                             max_sampled));
+    }
+
     Gemma4Model(
         Gemma4Weights weights,
         const HfConfig& hf_config,

@@ -1707,6 +1707,40 @@ int Context::Impl::load_model(
     model_ = model_holder->get();
     forward_fn.attach_model(model_);
 
+    // THE DECLARED VALUE BLOCK, sized by the DECLARATION.
+    //
+    // `allocate_full` above sized `ws.declared_values` by a formula --
+    // `{N, H + I}`, "one value's worth, which is what the converted
+    // island asks for" -- because when the workspace is built there is
+    // no plan to ask. There is one now: the model is constructed, and
+    // `lower()` reports the peak activation bytes a fire needs
+    // (`Buffers::assign`, host-side, which is the only allocator since
+    // the driver's arena stopped being one).
+    //
+    // Sized for the WIDEST fire the memory plan admits, because the
+    // block is allocated once and a decode body may not grow it inside
+    // a capture. That is affordable for the reason the shape makes
+    // obvious rather than the count: the peak is dominated by the
+    // LOGITS, which are `[Requests, vocab]` and scale with sampled rows,
+    // not with tokens -- 8.4 MB of gemma-4's 12.6 MB floor at eight
+    // rows. The token-scaled remainder is the same ~200 KB per row the
+    // per-field buffers beside it already cost, which is what it will
+    // replace as the pins come out.
+    //
+    // A plan that refuses the widest fire leaves the formula's block
+    // alone: the arena bounds-checks every ask, so a family whose
+    // islands outgrow it refuses by name rather than reading past it.
+    if (const std::size_t want = model_->declared_arena_bytes(
+            max_workspace_tokens, mem_plan.capacity.max_logit_rows)) {
+        if (want > ws.declared_values.nbytes()) {
+            const std::int64_t elements =
+                static_cast<std::int64_t>((want + 1) / 2);
+            ScopedCudaArenaAllocator arena(*workspace_allocator_);
+            ws.declared_values =
+                DeviceTensor::allocate(DType::BF16, {1, elements});
+        }
+    }
+
     // The pipeline registry (program/instance/channel ownership + the single
     // `Dispatch` instance) is constructed once, here, ahead of the batch
     // engine so the engine can hold a non-owning pointer into it for the

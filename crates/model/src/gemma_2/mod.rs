@@ -7,3 +7,8 @@
 
 #[cfg(feature = "chat")]
 pub mod chat;
+
+/// The declared forward — plain attention with a norm PAIR per block, an
+/// alternating sliding window, and softcaps.
+#[cfg(feature = "forward")]
+pub mod forward;

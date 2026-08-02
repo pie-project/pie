@@ -322,6 +322,20 @@ pub struct SeamStatement {
     pub layer: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op: Option<u32>,
+    /// The values this seam EXPOSES — exactly the ones the statement
+    /// names, which is what `seam::check_plan` already validates the
+    /// arity of.
+    ///
+    /// Recorded because buffer assignment needs to know which values
+    /// machinery outside the walk reaches by name, and inferring it from
+    /// the neighbouring op gets the set wrong in BOTH directions: it
+    /// takes that op's inputs, so it over-pins the operands a construct
+    /// happens to share (`attn.qv` names q and v; the attention op's
+    /// inputs are q, k AND v) and it misses any exposed value that is an
+    /// OUTPUT — the sampler reads the logit softcap's result, not its
+    /// operand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<ValueId>,
 }
 
 /// One operation of the traced form.
@@ -954,11 +968,18 @@ impl TraceBuilder {
 
     /// Record that the text stated a seam, with the index of the op
     /// carrying it when one does.
-    pub(crate) fn push_seam(&mut self, seam: &str, layer: Option<u32>, op: Option<u32>) {
+    pub(crate) fn push_seam(
+        &mut self,
+        seam: &str,
+        layer: Option<u32>,
+        op: Option<u32>,
+        values: Vec<ValueId>,
+    ) {
         self.seams.push(SeamStatement {
             seam: seam.to_string(),
             layer,
             op,
+            values,
         });
     }
 

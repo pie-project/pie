@@ -891,12 +891,19 @@ void llama_like_forward_declared(
         }
     }
     // The SSA value arena (`model/declared/value_arena.hpp`): values an arm
-    // asks for by id, over a workspace block. Reset once per fire; the ask
-    // order is the op order, so a value keeps its address across fires of
-    // the same plan — what a captured graph replays against.
+    // asks for by id rather than by this family's workspace name.
+    //
+    // PINS ONLY, because this executor still walks OPS: every value its
+    // moved islands ask for is one the pin pass below binds, and the
+    // buffers come from the workspace exactly as they did. What changed
+    // is who may CHOOSE bytes nobody pinned — the host does now
+    // (`Buffers::assign`), and an arena that answered by allocating was
+    // a second allocator over the same plan. The islands take
+    // host-assigned offsets when this walk moves onto rectangles; until
+    // then an unpinned ask names itself as unbound instead of inventing
+    // an address.
     declared::ValueArena values;
-    values.reset(ws.declared_values.data(), ws.declared_values.nbytes(),
-                 plan, N_fire, R_fire);
+    values.reset_pins_only(plan.value_count());
     // The Peel split (A3): the hook-free prefix row count — the
     // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
     // the stated Peel op, not a choice: with no hooks every row is the
@@ -2287,6 +2294,12 @@ void llama_like_forward_declared(
                 std::to_string(static_cast<std::uint32_t>(flat.uncovered)) +
                 " — an admission answer arriving too late");
         }
+        // This leg HAS a lowering, so it can take the host's buffer
+        // table; the op walk above cannot, and stays on pins alone. The
+        // pins still win where both speak — the arms are the same arms,
+        // and they have not moved yet.
+        values.bind_offsets(ws.declared_values.data(),
+                            ws.declared_values.nbytes(), flat);
         // The band a row count names. `-1` for "the whole fire", which
         // is the walk's own degenerate rule.
         const auto band_of = [&](int live) {
@@ -2311,11 +2324,6 @@ void llama_like_forward_declared(
             if (site_first) {
                 const pie_forward::PieForwardSite& S =
                     flat.structural[next_site];
-                // The arena advances with the STATEMENT, whichever form
-                // is driving: slots whose value was last read before
-                // this op return to the free list, and skipping that is
-                // how a bump arena runs out of block on the first fire.
-                values.begin_op(S.at_op);
                 execute_site(plan.op(S.at_op),
                              static_cast<int>(S.row_hi - S.row_lo));
                 ++next_site;
@@ -2336,7 +2344,6 @@ void llama_like_forward_declared(
                 ++run;
             }
             at = run;
-            values.begin_op(L.at_op);
             const PieForwardOp& op = plan.op(L.at_op);
             const int live = static_cast<int>(L.row_hi - L.row_lo);
             // The mask peel has an UNPLANNED endpoint: when the driver

@@ -9261,7 +9261,10 @@
       "seam": "in"
     },
     {
-      "seam": "out"
+      "seam": "out",
+      "values": [
+        386
+      ]
     }
   ]
 }
