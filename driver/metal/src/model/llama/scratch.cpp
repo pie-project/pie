@@ -348,4 +348,42 @@ std::vector<ValueExtent> llama_value_extents(const std::vector<Dispatch>& dag,
     return ext;
 }
 
+/// How many elements each pool colour must hold.
+///
+/// Unlike the other families' equivalents, this reads the extents off the
+/// VALUES rather than off the dispatch kinds, because for this family the two are not the same
+/// question. A routed layer's expert stack is `experts_per_token` times taller
+/// than the dense tensor it shares a colour with, and a colour is sized by the
+/// widest value in it -- so sizing by kind would under-allocate the stack by a
+/// factor of k and let the last expert's projection run off the end of the
+/// buffer. `llama_value_extents` says which values those are; `color_of_value`
+/// says where they landed.
+std::vector<std::size_t> llama_pool_elems(const std::vector<Dispatch>& dag,
+                                         const ScratchPlan& plan,
+                                         const model::ScratchColoring& col,
+                                         const LlamaGeometry& g, int rows, int head_rows) {
+    const std::vector<ValueExtent> ext = llama_value_extents(dag, plan, g);
+    const int k = g.is_moe() ? g.experts_per_token : 1;
+    std::vector<std::size_t> elems(std::size_t(col.colors_used), 0);
+    for (const Use& u : plan.uses) {
+        if (!u.is_write) continue;
+        if (u.value < 0 || std::size_t(u.value) >= col.color_of_value.size()) continue;
+        const int c = col.color_of_value[std::size_t(u.value)];
+        if (c < 0 || c >= col.colors_used) continue;
+        // The tail's tensors have one row per SAMPLED row; the body's one per
+        // token; the expert stack k per token.
+        using K = Kind;
+        const K kind = dag[std::size_t(u.index)].kind;
+        const bool tail = kind == K::RowGather || kind == K::FinalRms || kind == K::LmHead;
+        const ValueExtent& e = ext[std::size_t(u.value)];
+        const int n = e.rows_are_slots != 0 ? rows * k : (tail ? head_rows : rows);
+        const std::size_t need = std::size_t(n) * std::size_t(e.elems);
+        elems[std::size_t(c)] = std::max(elems[std::size_t(c)], need);
+    }
+    for (std::size_t& e : elems) {
+        if (e == 0) e = std::size_t(rows) * std::size_t(g.hidden);
+    }
+    return elems;
+}
+
 }  // namespace pie::metal::llama

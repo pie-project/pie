@@ -2314,6 +2314,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // qwen3.5's and stays untouched.
     case model::ModelFamily::Gemma4:
     case model::ModelFamily::GptOss:
+    case model::ModelFamily::Llama:
         break;
     case model::ModelFamily::Unknown:
         if (err != nullptr) {
@@ -2328,7 +2329,13 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // (`loader/architecture.md` §9).
     pie_loader::LoadPlan load_plan;
     try {
-        load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type);
+        // `tie_word_embeddings` is the one config fact a contract needs and
+        // cannot see: it decides whether the head is its own tensor or the
+        // embedding table read a second time, and a contract only sees tensors.
+        model::ContractFacts contract_facts;
+        contract_facts.tied_embeddings = cfg.llama.tied_embeddings;
+        load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type,
+                                      contract_facts);
     } catch (const std::exception& error) {
         if (err != nullptr) {
             *err = std::string("LoadPlan compile failed: ") + error.what();

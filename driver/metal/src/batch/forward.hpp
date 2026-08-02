@@ -367,6 +367,39 @@ struct SetupConfig {
         float rope_beta_slow = 1.0f;
         bool present() const { return n_layers > 0 && hidden > 0; }
     } gptoss;
+    /// The llama-shaped families' shape, when `model_type` says so. Zero means
+    /// "not one of them", on the same principle as the two above.
+    ///
+    /// One struct for `llama`, `llama3`, `mistral`, `qwen2`, `qwen3`,
+    /// `qwen2_moe` and `qwen3_moe`, because those differ in two FIELDS and not
+    /// in shape: whether q and k are normed, and whether the FFN is routed.
+    /// Splitting them would be seven copies of the same fifteen integers.
+    struct LlamaFacts {
+        int n_layers = 0;
+        int hidden = 0;
+        int vocab = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;
+        int intermediate = 0;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int moe_intermediate = 0;
+        float eps = 1e-5f;
+        float rope_theta = 500000.0f;
+        float rope_scale = 1.0f;
+        /// `rope_scaling.rope_type`, verbatim. Empty or "linear"/"default" is
+        /// implemented; anything else -- Llama 3.1's piecewise schedule above
+        /// all -- is REFUSED by the geometry rather than approximated by
+        /// `rope_scale`, which runs and is wrong past the original context.
+        std::string rope_scaling_kind;
+        /// Set when the checkpoint ships `self_attn.q_norm`. A config fact
+        /// rather than a model_type one: `qwen3` has it and `qwen2` does not,
+        /// and both are this family.
+        bool qk_norm = false;
+        bool tied_embeddings = true;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } llama;
     // `config.json`'s RoPE hyperparameters, read out of the nested
     // `rope_parameters` object this family uses (context.cpp). The defaults
     // below are Qwen3.5's, so a checkpoint that omits them still lands on the

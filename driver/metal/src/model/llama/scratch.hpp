@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "../family_coloring.hpp"
 #include "decode_step.hpp"
 #include "geometry.hpp"
 
@@ -54,5 +55,16 @@ ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeo
 /// Per-value extents, indexed by value id, sized `plan.value_count`.
 std::vector<ValueExtent> llama_value_extents(const std::vector<Dispatch>& dag,
                                              const ScratchPlan& plan, const LlamaGeometry& g);
+
+/// How many elements each pool colour must hold, indexed by colour.
+///
+/// Separate from the extents because a colour is shared: its size is the widest
+/// value that landed in it, and `col.color_of_value` is what says which those
+/// are.
+std::vector<std::size_t> llama_pool_elems(const std::vector<Dispatch>& dag,
+                                          const ScratchPlan& plan,
+                                          const model::ScratchColoring& col,
+                                          const LlamaGeometry& g, int rows = 1,
+                                          int head_rows = 1);
 
 }  // namespace pie::metal::llama

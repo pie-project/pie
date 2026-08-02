@@ -132,14 +132,33 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name,
     }
     const std::string_view member = tail.substr(dot + 1);
 
-    // A routed FFN must arrive with its experts stacked on axis 0, which is
-    // what `affine_qmv_routed` indexes and what `mlx_lm` emits. Per-expert
-    // tensors would need a gather this driver does not do at load time, so
-    // they are refused by name rather than bound to the wrong offsets.
-    if (member.rfind("mlp.experts.", 0) == 0) {
-        fail("Metal llama schema needs the routed experts stacked on axis 0 "
-             "(one `mlp.gate_proj` per layer, expert-major), but '" +
-             std::string(raw_name) + "' is per-expert");
+    // A routed FFN must arrive with its experts STACKED on axis 0, which is
+    // what `affine_qmv_routed` indexes: one tensor per layer per projection,
+    // expert-major.
+    //
+    // Two spellings of that exist and both are accepted, because the two
+    // toolchains that produce it disagree. `mlx_lm` wraps the mixture in a
+    // `SwitchGLU` and so emits `mlp.switch_mlp.gate_proj`; the fused HF export
+    // emits `mlp.experts.gate_proj`. They are the same bytes in the same
+    // layout, so both map onto the one name `heap_bind.cpp` asks for.
+    //
+    // What is refused is the UNSTACKED form, `mlp.experts.0.gate_proj`, which
+    // is what a stock HF checkpoint ships. Binding it would need a gather at
+    // load time that this driver does not do, and the failure mode of guessing
+    // is expert 0's weights used for all of them -- fluent, and wrong.
+    constexpr std::string_view kSwitch = "mlp.switch_mlp.";
+    if (member.rfind(kSwitch, 0) == 0) {
+        return "layers." + std::string(layer) + ".mlp.experts." +
+               std::string(member.substr(kSwitch.size()));
+    }
+    constexpr std::string_view kExperts = "mlp.experts.";
+    if (member.rfind(kExperts, 0) == 0) {
+        const std::string_view rest_of = member.substr(kExperts.size());
+        if (!rest_of.empty() && std::isdigit(static_cast<unsigned char>(rest_of.front())) != 0) {
+            fail("Metal llama schema needs the routed experts stacked on axis 0 "
+                 "(one `mlp.experts.gate_proj` per layer, expert-major), but '" +
+                 std::string(raw_name) + "' is per-expert");
+        }
     }
 
     return "layers." + std::string(layer) + "." + std::string(member);

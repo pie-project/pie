@@ -26,6 +26,13 @@
 #include "model/gptoss/geometry.hpp"
 #include "model/gptoss/kernels.hpp"
 #include "model/gptoss/scratch.hpp"
+#include "model/llama/bind.hpp"
+#include "model/llama/decode_consts.hpp"
+#include "model/llama/decode_step.hpp"
+#include "model/llama/encode.hpp"
+#include "model/llama/geometry.hpp"
+#include "model/llama/kernels.hpp"
+#include "model/llama/scratch.hpp"
 
 namespace pie::metal::batch {
 
@@ -60,6 +67,17 @@ bool gemma4_geometry(const SetupConfig& cfg, gemma4::Gemma4Geometry& g, int max_
 bool gptoss_geometry(const SetupConfig& cfg, gptoss::GptOssGeometry& g, int max_ctx,
                      std::string* err) {
     if (!gptoss::geometry_from_facts(cfg.gptoss, g, err)) return false;
+    if (cfg.vocab_size != 0) g.vocab = static_cast<int>(cfg.vocab_size);
+    g.kv_max_ctx = max_ctx;
+    return true;
+}
+
+/// The llama families' geometry, likewise. One reader for `llama`, `mistral`,
+/// `qwen2`, `qwen3` and the two MoE variants: they differ in fields this has
+/// already been handed, not in how the config is read.
+bool llama_geometry(const SetupConfig& cfg, llama::LlamaGeometry& g, int max_ctx,
+                    std::string* err) {
+    if (!llama::geometry_from_facts(cfg.llama, g, err)) return false;
     if (cfg.vocab_size != 0) g.vocab = static_cast<int>(cfg.vocab_size);
     g.kv_max_ctx = max_ctx;
     return true;
@@ -839,6 +857,149 @@ class GptOssEngine final : public SimpleFamilyEngine {
     SlotHandle logits_{};
 };
 
+// ── the llama-shaped families ───────────────────────────────────────────────
+
+/// Llama, Mistral, Qwen2/3 and Qwen3-MoE.
+///
+/// RING-BACKED, and deliberately so for now. The family's encoder, binder and
+/// constants are the M=1 contiguous path; the batched one is a separate body of
+/// work (a row-strided embedding and rope, and a GEMM tiling for the dense
+/// projections) that gpt-oss and gemma4 each needed ~300 lines for. Reporting
+/// `paged() == false` is the honest description of what exists: one sequence at
+/// a time, `fire` refused with a message that says so, and `step` replaying a
+/// token at a time. `SimpleFamilyEngine`'s ring case was written for exactly
+/// this and is not a fallback bolted on here.
+class LlamaEngine final : public SimpleFamilyEngine {
+  public:
+    bool init(RawMetalContext& ctx, const std::string& kernels_dir, const SetupConfig& cfg,
+              const pie_loader::LoadPlan& load_plan, int max_ctx, std::string* err) {
+        if (!llama_geometry(cfg, g_, max_ctx, err)) return false;
+        max_ctx_ = max_ctx;
+        g_.paged_kv_enabled = false;
+        g_.kv_max_ctx = max_ctx_;
+
+        try {
+            const auto storage = load_plan.view();
+            pie_loader::CheckpointSource view(storage);
+            StagedWeights staged = stage_plan_weights(
+                ctx, view, load_plan, storage.memory.persistent_bytes,
+                stream_predicate(pie::metal::model::ModelFamily::Llama,
+                                 cfg.stream_routed_experts));
+            b_.weights = std::move(staged.weights);
+            // The pack must outlive the weights that point into it; see the
+            // gpt-oss engine above.
+            stream_pack_ = std::move(staged.stream_pack);
+            if (staged.streamed_bytes > 0) {
+                std::fprintf(stderr,
+                             "[pie-metal] llama: %.2f GB of FFN weights streamed from a pack, "
+                             "and out of the heap\n",
+                             double(staged.streamed_bytes) / 1e9);
+            }
+        } catch (const std::exception& e) {
+            if (err) *err = std::string("staging llama's weights: ") + e.what();
+            return false;
+        }
+
+        // A contiguous KV ring per layer. Uniform layers, so one size serves
+        // the stack -- there is no shared tail and no second head width.
+        b_.kv.resize(std::size_t(g_.n_layers));
+        kv_.resize(std::size_t(g_.n_layers));
+        for (int L = 0; L < g_.n_layers; ++L) {
+            const std::size_t bytes = llama::llama_kv_bytes_per_layer(g_, max_ctx_, 2);
+            kv_[std::size_t(L)].k = ctx.heap_alloc(bytes);
+            kv_[std::size_t(L)].v = ctx.heap_alloc(bytes);
+            if (!kv_[std::size_t(L)].k.valid() || !kv_[std::size_t(L)].v.valid()) {
+                if (err) *err = "llama KV allocation failed";
+                return false;
+            }
+            b_.kv[std::size_t(L)] = kv_[std::size_t(L)];
+        }
+
+        dag_ = llama::build_llama_dag(g_, /*with_argmax=*/false);
+        plan_ = llama::build_llama_scratch(dag_, g_);
+        // Under a tap dump every value needs its own buffer, or a later
+        // dispatch overwrites the one being read.
+        coloring_ = llama::color_llama_scratch(dag_, plan_, /*no_recycle=*/golden_taps_enabled());
+        if (!coloring_.hazard_free) {
+            if (err) *err = "llama's activation colouring is not hazard-free";
+            return false;
+        }
+        b_.pool.resize(std::size_t(coloring_.colors_used));
+        const std::vector<std::size_t> elems =
+            llama::llama_pool_elems(dag_, plan_, coloring_, g_, /*rows=*/1, /*head_rows=*/1);
+        for (int c = 0; c < coloring_.colors_used; ++c) {
+            b_.pool[std::size_t(c)] = ctx.heap_alloc(elems[std::size_t(c)] * 2);
+            if (!b_.pool[std::size_t(c)].valid()) {
+                if (err) *err = "llama activation pool allocation failed";
+                return false;
+            }
+        }
+
+        b_.io.resize(kIoSlotCount);
+        for (int i = 0; i < kIoSlotCount; ++i) b_.io[i] = ctx.heap_alloc(4096);
+        logits_ = ctx.heap_alloc(std::size_t(g_.vocab) * 2);
+        if (!logits_.valid()) {
+            if (err) *err = "llama logits allocation failed";
+            return false;
+        }
+
+        if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
+        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
+
+        llama::bind_llama_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/false);
+        try {
+            llama::bind_llama_dag(ctx, b_, dag_, g_, coloring_);
+        } catch (const std::exception& e) {
+            if (err) *err = std::string("binding llama: ") + e.what();
+            return false;
+        }
+        // The logits leave the pool: the sampler reads a slot of its own, so
+        // the tail writes there and nothing copies afterwards.
+        ctx.arg_bind_ordinal(dag_.back().ordinal, (std::uint8_t)bind::Qmv::Out, logits_);
+        return true;
+    }
+
+    int vocab() const override { return g_.vocab; }
+    int n_layers() const override { return g_.n_layers; }
+
+    void reset() override {
+        for (auto& kv : kv_) {
+            if (kv.k.valid() && kv.k.contents()) std::memset(kv.k.contents(), 0, kv.k.size);
+            if (kv.v.valid() && kv.v.contents()) std::memset(kv.v.contents(), 0, kv.v.size);
+        }
+    }
+
+    StepTiming step(RawMetalContext& ctx, std::uint32_t token_id,
+                    std::uint32_t position) override {
+        write_u32s(b_.io[int(IoSlot::TokenId)], {token_id});
+        write_u32s(b_.io[int(IoSlot::Position)], {position});
+        // The attention reads `position + 1` keys: everything appended so far,
+        // including this token's own, which `KvAppend` wrote a few dispatches
+        // earlier in the same command buffer.
+        write_i32(b_.io[int(IoSlot::SeqLen)], std::int32_t(position) + 1);
+        write_u32s(b_.io[int(IoSlot::SampleRows)], {0u});
+        return ctx.run_step([&](StepEncoder& se) {
+            llama::encode_llama_step(se, dag_, g_, base_, psos_);
+        });
+    }
+
+    SlotHandle logits_slot() const override { return logits_; }
+
+  private:
+    llama::LlamaGeometry g_{};
+    int max_ctx_ = 0;
+    std::vector<llama::Dispatch> dag_{};
+    llama::ScratchPlan plan_{};
+    model::ScratchColoring coloring_{};
+    llama::BoundLlama b_{};
+    llama::LlamaPsos psos_{};
+    DecodeStepPsos base_{};
+    std::vector<llama::KvPages> kv_{};
+    /// Keeps the streamed weights' mapping alive; see the gpt-oss engine.
+    std::shared_ptr<void> stream_pack_{};
+    SlotHandle logits_{};
+};
+
 }  // namespace
 
 std::uint32_t SimpleFamilyEngine::max_forward_tokens_for_budget(
@@ -907,6 +1068,7 @@ std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
             };
         case pie::metal::model::ModelFamily::Gemma4:
         case pie::metal::model::ModelFamily::Qwen35:
+        case pie::metal::model::ModelFamily::Llama:
             // The dense FFN, which is ~70% of a decoder layer. Named by the
             // three projections rather than by "mlp." so the per-layer
             // embedding tensors beside them -- small, and read every token --
@@ -974,6 +1136,22 @@ std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily 
         sampled = gptoss::gptoss_qmm_pool_rows(sampled);
         for (const std::size_t e : go_pool_elems(dag, g, col, rows, sampled)) bytes += e * 2;
         bytes += std::size_t(sampled) * std::size_t(g.vocab) * 2;  // the logits slot
+    } else if (family == pie::metal::model::ModelFamily::Llama) {
+        llama::LlamaGeometry g;
+        std::string ignore;
+        if (!llama_geometry(cfg, g, max_ctx, &ignore)) return bytes;
+        bytes += llama::llama_kv_region_bytes(g, max_ctx, 2);
+        // The pool, summed from the SAME colouring the engine will build. One
+        // row: this engine is ring-backed, so its row budget is not a memory
+        // one and `max_forward_tokens` does not size anything here.
+        const auto dag = llama::build_llama_dag(g, /*with_argmax=*/false);
+        const llama::ScratchPlan plan = llama::build_llama_scratch(dag, g);
+        const model::ScratchColoring col =
+            llama::color_llama_scratch(dag, plan, /*no_recycle=*/golden_taps_enabled());
+        for (const std::size_t e : llama::llama_pool_elems(dag, plan, col, g, 1, 1)) {
+            bytes += e * 2;
+        }
+        bytes += std::size_t(g.vocab) * 2;  // the logits slot
     }
     return bytes;
 }
@@ -989,6 +1167,11 @@ std::unique_ptr<SimpleFamilyEngine> SimpleFamilyEngine::create(
     }
     if (family == pie::metal::model::ModelFamily::GptOss) {
         auto e = std::make_unique<GptOssEngine>();
+        if (!e->init(ctx, kernels_dir, cfg, load_plan, max_ctx, err)) return nullptr;
+        return e;
+    }
+    if (family == pie::metal::model::ModelFamily::Llama) {
+        auto e = std::make_unique<LlamaEngine>();
         if (!e->init(ctx, kernels_dir, cfg, load_plan, max_ctx, err)) return nullptr;
         return e;
     }

@@ -28,6 +28,14 @@ struct ScratchBind {
 
 struct ScratchColoring {
     std::vector<std::vector<ScratchBind>> per_dispatch;
+    /// Which colour each VALUE landed in, indexed by value id.
+    ///
+    /// `per_dispatch` answers what to bind; this answers how big to make it.
+    /// Sizing a pool slot needs the widest value sharing it, and a value's
+    /// width is a property of the value -- a routed model's expert stack is
+    /// `experts_per_token` times taller than the dense tensor beside it, and
+    /// there is no way to see that from a bind index.
+    std::vector<int> color_of_value;
     int colors_used = 0;
     /// False if a value's live range crosses a dispatch that would clobber it
     /// without an intervening barrier. The encoder refuses to run on false
@@ -51,6 +59,7 @@ ScratchColoring color_family_scratch(std::size_t dag_size, const std::vector<Use
 
     ScratchColoring out;
     out.colors_used = colored.colors_used;
+    out.color_of_value = colored.color;
     out.hazard_free = colored.hazard_free;
     out.per_dispatch.resize(dag_size);
     for (const Use& u : uses) {

@@ -13,6 +13,7 @@
 
 #include "gemma4/gemma4_contract.hpp"
 #include "gptoss/gptoss_contract.hpp"
+#include "llama/llama_contract.hpp"
 #include "qwen3_5/qwen3_5_contract.hpp"
 
 namespace pie::metal::model {
@@ -25,6 +26,13 @@ struct ContractFacts {
     /// `num_hidden_layers - num_kv_shared_layers`). -1 when every layer owns its
     /// own, which is every family except gemma4's "E" variants.
     int first_kv_shared_layer = -1;
+
+    /// Whether `lm_head` IS `embed_tokens` (`tie_word_embeddings`, defaulting
+    /// to true when the config omits it). Only the llama schema reads it, and
+    /// only as a hint: a checkpoint that actually ships an `lm_head` overrides
+    /// it, because mapping a real tensor onto `shared_embedding` declares that
+    /// name twice and fails the load.
+    bool tied_embeddings = true;
 };
 
 /// Which storage schema and decode DAG a checkpoint asks for.
@@ -32,19 +40,21 @@ struct ContractFacts {
 /// One place answers this. The contract, the geometry and the executor all need
 /// the same answer, and three independent readings of `model_type` would be
 /// three chances to disagree.
-enum class ModelFamily { Unknown, Qwen35, Gemma4, GptOss };
+enum class ModelFamily { Unknown, Qwen35, Gemma4, GptOss, Llama };
 
 inline ModelFamily model_family_of(std::string_view model_type) {
     if (qwen3_5::is_supported_model_type(model_type)) return ModelFamily::Qwen35;
     if (gemma4::is_supported_model_type(model_type)) return ModelFamily::Gemma4;
     if (gptoss::is_supported_model_type(model_type)) return ModelFamily::GptOss;
+    if (llama::is_supported_model_type(model_type)) return ModelFamily::Llama;
     return ModelFamily::Unknown;
 }
 
 inline bool is_supported_model_type(std::string_view model_type) {
     return qwen3_5::is_supported_model_type(model_type) ||
            gemma4::is_supported_model_type(model_type) ||
-           gptoss::is_supported_model_type(model_type);
+           gptoss::is_supported_model_type(model_type) ||
+           llama::is_supported_model_type(model_type);
 }
 
 inline void author_model_contract(const Checkpoint& checkpoint, std::string_view model_type,
@@ -57,6 +67,11 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
     }
     if (gptoss::is_supported_model_type(model_type)) {
         gptoss::author_model_contract(checkpoint, model_type, target, out);
+        return;
+    }
+    if (llama::is_supported_model_type(model_type)) {
+        llama::author_model_contract(checkpoint, model_type, target, out,
+                                     facts.tied_embeddings);
         return;
     }
     // Refusal for an unknown family belongs to the schema that would have

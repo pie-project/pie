@@ -15,6 +15,7 @@
 //   qwen3-moe        routed, qk-norm       — dense FFN's 4 become 7
 //   mixtral-shaped   routed, no qk-norm    — proving the two axes are independent
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -448,6 +449,97 @@ void check_encode(const char* who, const LlamaGeometry& g) {
 
 }  // namespace
 
+
+/// Pool sizing. The one place a colouring pass cannot be trusted on its own.
+///
+/// A colour is a buffer several values share, so it must be sized by the widest
+/// of them -- and on a routed model "widest" is not a property of any dispatch's
+/// kind. `ExpertGate` writes `[rows * k, moe_intermediate]` where the dense
+/// `QmvGate` beside it writes `[rows, intermediate]`. If the two land in one
+/// colour and it is sized by kind, the last k-1 slots of the expert stack are
+/// written past the end of the buffer -- into whatever colour was allocated
+/// next, which is another live activation.
+void check_pool(const char* who, const LlamaGeometry& g) {
+    std::printf("\n-- pool: %s --\n", who);
+    const std::vector<Dispatch> dag = build_llama_dag(g);
+    const ScratchPlan plan = build_llama_scratch(dag, g);
+    const auto colored = color_llama_scratch(dag, plan);
+    const std::vector<std::size_t> elems = llama_pool_elems(dag, plan, colored, g);
+
+    expect_eq(static_cast<long long>(elems.size()),
+              static_cast<long long>(colored.colors_used),
+              std::string(who) + ": one size per colour");
+    expect_eq(static_cast<long long>(colored.color_of_value.size()),
+              static_cast<long long>(plan.value_count),
+              std::string(who) + ": every value has a colour");
+
+    bool nonzero = true;
+    for (const std::size_t e : elems) {
+        if (e == 0) nonzero = false;
+    }
+    expect(nonzero, std::string(who) + ": no colour is sized zero");
+
+    // The claim, stated directly: every value fits in the colour it was put in.
+    const std::vector<ValueExtent> ext = llama_value_extents(dag, plan, g);
+    const int k = g.is_moe() ? g.experts_per_token : 1;
+    bool fits = true;
+    for (int v = 0; v < plan.value_count; ++v) {
+        const int c = colored.color_of_value[std::size_t(v)];
+        if (c < 0) continue;
+        const ValueExtent& e = ext[std::size_t(v)];
+        const std::size_t need =
+            std::size_t(e.rows_are_slots != 0 ? k : 1) * std::size_t(e.elems);
+        if (need > elems[std::size_t(c)]) fits = false;
+    }
+    expect(fits, std::string(who) + ": every value fits the colour it landed in");
+
+    // The logits are the widest thing in the model by two orders of magnitude,
+    // so a pool that has not noticed them is a pool sized by the body alone.
+    std::size_t widest = 0;
+    for (const std::size_t e : elems) widest = std::max(widest, e);
+    expect_eq(static_cast<long long>(widest), static_cast<long long>(g.vocab),
+              std::string(who) + ": the widest colour is the LM head's");
+}
+
+/// The routed pool, against the dense one at the same shape.
+///
+/// A discriminator rather than an invariant: it fails if `rows_are_slots` is
+/// ignored, which is the specific mistake that costs the last expert its
+/// buffer. Both models have the same hidden size and the same expert width, so
+/// the only thing that can produce a difference is the slot axis.
+void check_pool_counts_the_slots() {
+    std::printf("\n-- pool: the expert stack is k times taller --\n");
+    LlamaGeometry dense = base();
+    dense.intermediate = 768;
+
+    LlamaGeometry routed = base();
+    routed.n_experts = 128;
+    routed.experts_per_token = 8;
+    routed.moe_intermediate = 768;
+
+    const auto sized = [](const LlamaGeometry& g) {
+        const std::vector<Dispatch> dag = build_llama_dag(g);
+        const ScratchPlan plan = build_llama_scratch(dag, g);
+        return llama_pool_elems(dag, plan, color_llama_scratch(dag, plan), g);
+    };
+    const std::vector<std::size_t> d = sized(dense);
+    const std::vector<std::size_t> r = sized(routed);
+
+    const auto has = [](const std::vector<std::size_t>& v, std::size_t want) {
+        for (const std::size_t e : v) {
+            if (e == want) return true;
+        }
+        return false;
+    };
+    expect(has(d, 768), "the dense FFN asks for one 768-wide buffer");
+    expect(has(r, 768 * 8), "the routed FFN asks for an 8-slot stack of them");
+
+    std::size_t dsum = 0, rsum = 0;
+    for (const std::size_t e : d) dsum += e;
+    for (const std::size_t e : r) rsum += e;
+    expect(rsum > dsum, "the routed pool is strictly larger at the same widths");
+}
+
 int main() {
     std::printf("llama_decode_step_test — one family, four configurations\n");
 
@@ -496,6 +588,10 @@ int main() {
     check_coloring("qwen3-moe", qwen3_moe);
     check_encode("llama-3", llama3);
     check_encode("qwen3-moe", qwen3_moe);
+
+    check_pool("llama-3", llama3);
+    check_pool("qwen3-moe", qwen3_moe);
+    check_pool_counts_the_slots();
 
     // Sampling can be off (the caller wants logits, not a token), and that must
     // remove exactly the argmax.

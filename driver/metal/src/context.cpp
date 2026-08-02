@@ -241,6 +241,28 @@ struct ModelFacts {
     float g4_rope_theta_full = 1.0e6f;
     float g4_rope_theta_sliding = 1.0e4f;
     float g4_full_partial_rotary = 0.25f;
+    // ── The llama-shaped families ──
+    // `llama`, `llama3`, `mistral`, `qwen2`, `qwen3` and the two MoE variants.
+    // One set of fields, because they differ in VALUES and not in shape: a
+    // routed model sets the three expert fields, a Qwen3 sets `qk_norm`, and
+    // the rest of the config is read identically. Non-zero `ll_num_hidden_layers`
+    // marks "this config was read as one of them".
+    int ll_num_hidden_layers = 0;
+    int ll_hidden_size = 0;
+    int ll_vocab_size = 0;
+    int ll_num_attention_heads = 0;
+    int ll_num_key_value_heads = 0;
+    int ll_head_dim = 0;
+    int ll_intermediate_size = 0;
+    int ll_num_experts = 0;
+    int ll_num_experts_per_tok = 0;
+    int ll_moe_intermediate_size = 0;
+    float ll_rms_norm_eps = 1e-5f;
+    float ll_rope_theta = 500000.0f;
+    float ll_rope_scale = 1.0f;
+    std::string ll_rope_scaling_kind;
+    bool ll_qk_norm = false;
+    bool ll_tied_embeddings = true;
     // Which storage schema this driver authors against. Parsed here because
     // this is already the driver's one read of `config.json`; the loader no
     // longer opens it (`loader/architecture.md` §10.4).
@@ -397,6 +419,62 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             }
         }
 
+        // ── The llama-shaped families ──
+        // Flat, top-level, and the same keys HF has used since llama 1. Read
+        // only when `model_type` names one of them, on the same principle as
+        // the two above: a config that never mentions this family cannot
+        // accidentally select it.
+        if (pie::metal::model::llama::is_supported_model_type(facts.model_type)) {
+            const auto gi = [](const nlohmann::json& obj, const char* key, int& out) {
+                if (obj.contains(key) && obj[key].is_number_integer()) {
+                    out = obj[key].get<int>();
+                }
+            };
+            const auto gf = [](const nlohmann::json& obj, const char* key, float& out) {
+                if (obj.contains(key) && obj[key].is_number()) {
+                    out = obj[key].get<float>();
+                }
+            };
+            gi(j, "num_hidden_layers", facts.ll_num_hidden_layers);
+            gi(j, "hidden_size", facts.ll_hidden_size);
+            gi(j, "vocab_size", facts.ll_vocab_size);
+            gi(j, "num_attention_heads", facts.ll_num_attention_heads);
+            gi(j, "num_key_value_heads", facts.ll_num_key_value_heads);
+            gi(j, "head_dim", facts.ll_head_dim);
+            gi(j, "intermediate_size", facts.ll_intermediate_size);
+            gi(j, "num_experts", facts.ll_num_experts);
+            // Qwen spells the expert count `num_experts`; Mixtral-derived
+            // configs spell it `num_local_experts`. Whichever is present wins;
+            // neither present is a dense model.
+            gi(j, "num_local_experts", facts.ll_num_experts);
+            gi(j, "num_experts_per_tok", facts.ll_num_experts_per_tok);
+            gi(j, "moe_intermediate_size", facts.ll_moe_intermediate_size);
+            gf(j, "rms_norm_eps", facts.ll_rms_norm_eps);
+            gf(j, "rope_theta", facts.ll_rope_theta);
+            if (j.contains("rope_scaling") && j["rope_scaling"].is_object()) {
+                const auto& rs = j["rope_scaling"];
+                gf(rs, "factor", facts.ll_rope_scale);
+                // `rope_type` is the current key and `type` the older one. The
+                // KIND is carried verbatim rather than reduced to a bool here,
+                // because the geometry refuses the schedules it cannot run and
+                // its message should name the one the config asked for.
+                for (const char* key : {"rope_type", "type"}) {
+                    if (rs.contains(key) && rs[key].is_string()) {
+                        facts.ll_rope_scaling_kind = rs[key].get<std::string>();
+                        break;
+                    }
+                }
+            }
+            if (j.contains("tie_word_embeddings") && j["tie_word_embeddings"].is_boolean()) {
+                facts.ll_tied_embeddings = j["tie_word_embeddings"].get<bool>();
+            }
+            // Qwen3 RMS-normalises q and k per head; llama, mistral and qwen2
+            // do not. The config has no key for it -- it is implied by the
+            // architecture -- so the `model_type` says it.
+            facts.ll_qk_norm =
+                facts.model_type == "qwen3" || facts.model_type == "qwen3_moe";
+        }
+
         // ── Gemma 4 ──
         // Read only when the config says so, so nothing here can perturb the
         // family that already works.
@@ -487,6 +565,31 @@ ModelFacts read_model_facts(const std::string& hf_path) {
 /// and only memory bounds them.
 std::uint32_t simple_family_row_budget(const Config& cfg, const ModelFacts& facts);
 
+/// The rows-per-fire this config should ADVERTISE and then set up with.
+///
+/// One function, called from both places, because the capability and the setup
+/// must name the same number: advertising more rows than setup allocates is a
+/// fire the driver accepts and cannot hold.
+///
+/// Three answers. gemma4 and gpt-oss batch, and their bound is the memory their
+/// pool costs, so it is derived. The llama families are RING-BACKED for now --
+/// their engine reports `paged() == false` and the batch path is refused -- so
+/// the honest advertisement is one row, and a longer prompt is replayed a token
+/// at a time rather than rejected mid-fire. Everything else keeps the config's.
+std::uint32_t simple_family_max_forward_tokens(const Config& cfg, const ModelFacts& facts) {
+    switch (pie::metal::model::model_family_of(facts.model_type)) {
+        case pie::metal::model::ModelFamily::Gemma4:
+        case pie::metal::model::ModelFamily::GptOss:
+            return simple_family_row_budget(cfg, facts);
+        case pie::metal::model::ModelFamily::Llama:
+            return 1;
+        case pie::metal::model::ModelFamily::Qwen35:
+        case pie::metal::model::ModelFamily::Unknown:
+            break;
+    }
+    return cfg.batching.max_forward_tokens;
+}
+
 /// Fill a SetupConfig's model geometry from the facts read out of config.json.
 ///
 /// Shared by the capabilities pass and by setup, because the two must agree
@@ -514,6 +617,22 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
     cfg.gptoss.rope_beta_fast = facts.go_rope_beta_fast;
     cfg.gptoss.rope_beta_slow = facts.go_rope_beta_slow;
     cfg.gptoss.rope_original_max_position = facts.go_rope_original_max_position;
+    cfg.llama.n_layers = facts.ll_num_hidden_layers;
+    cfg.llama.hidden = facts.ll_hidden_size;
+    cfg.llama.vocab = facts.ll_vocab_size;
+    cfg.llama.n_q_heads = facts.ll_num_attention_heads;
+    cfg.llama.n_kv_heads = facts.ll_num_key_value_heads;
+    cfg.llama.head_dim = facts.ll_head_dim;
+    cfg.llama.intermediate = facts.ll_intermediate_size;
+    cfg.llama.n_experts = facts.ll_num_experts;
+    cfg.llama.experts_per_token = facts.ll_num_experts_per_tok;
+    cfg.llama.moe_intermediate = facts.ll_moe_intermediate_size;
+    cfg.llama.eps = facts.ll_rms_norm_eps;
+    cfg.llama.rope_theta = facts.ll_rope_theta;
+    cfg.llama.rope_scale = facts.ll_rope_scale;
+    cfg.llama.rope_scaling_kind = facts.ll_rope_scaling_kind;
+    cfg.llama.qk_norm = facts.ll_qk_norm;
+    cfg.llama.tied_embeddings = facts.ll_tied_embeddings;
     cfg.gemma4.n_layers = facts.g4_num_hidden_layers;
     cfg.gemma4.hidden = facts.g4_hidden_size;
     cfg.gemma4.intermediate = facts.g4_intermediate_size;
@@ -658,17 +777,10 @@ std::string build_caps_json(const Config& cfg,
     // creation fails with no mention of which row budget caused it. `512` is
     // `kPagedMaxForwardTokensCeiling`, the same bound qwen3.5's paged path
     // measured its way to; a longer prompt is chunked, exactly as it is there.
-    const bool simple_family_engine =
-        pie::metal::model::model_family_of(facts.model_type) ==
-            pie::metal::model::ModelFamily::Gemma4 ||
-        pie::metal::model::model_family_of(facts.model_type) ==
-            pie::metal::model::ModelFamily::GptOss;
     const std::uint32_t max_forward_tokens =
         rs_cache_required
             ? std::min(cfg.batching.max_forward_tokens, kMetalPagedMaxForwardTokens)
-            : (simple_family_engine
-                   ? simple_family_row_budget(cfg, facts)
-                   : cfg.batching.max_forward_tokens);
+            : simple_family_max_forward_tokens(cfg, facts);
     const std::uint32_t max_model_len =
         rs_cache_required ? std::min(facts.max_model_len, kMetalPhase1aMaxCtxTokens)
                           : facts.max_model_len;
@@ -2401,12 +2513,7 @@ class Context::Impl {
         setup_cfg.kv_page_size = cfg_.batching.kv_page_size;
         // The same bound the capabilities advertised, from the same function:
         // these families allocate their pool for this many rows.
-        const auto setup_family = pie::metal::model::model_family_of(facts_.model_type);
-        setup_cfg.max_forward_tokens =
-            (setup_family == pie::metal::model::ModelFamily::Gemma4 ||
-             setup_family == pie::metal::model::ModelFamily::GptOss)
-                ? simple_family_row_budget(cfg_, facts_)
-                : cfg_.batching.max_forward_tokens;
+        setup_cfg.max_forward_tokens = simple_family_max_forward_tokens(cfg_, facts_);
         setup_cfg.max_forward_requests = cfg_.batching.max_forward_requests;
         setup_cfg.snapshot_dir = cfg_.model.hf_path;
         setup_cfg.stream_routed_experts = cfg_.model.stream_routed_experts;

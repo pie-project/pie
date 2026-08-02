@@ -262,9 +262,18 @@ void test_the_schema_owns_its_model_types() {
                                  "qwen3_6"}) {
         check(model::is_supported_model_type(yes), std::string(yes) + " is this schema's");
     }
-    for (std::string_view no : {"llama", "qwen3", "qwen3_5_vision", ""}) {
-        check(!model::is_supported_model_type(no), std::string(no) + " is not this schema's");
+    for (std::string_view no : {"qwen3_5_vision", ""}) {
+        check(!model::is_supported_model_type(no), std::string(no) + " is nobody's");
     }
+    // `llama` and `qwen3` ARE supported -- by the llama schema, not this one.
+    // Which is the point of asking: one table answers "whose", so a name that
+    // two schemas both claimed would be a routing bug rather than a coin toss.
+    for (std::string_view ll : {"llama", "llama3", "mistral", "qwen2", "qwen3", "qwen3_moe"}) {
+        check(model::model_family_of(ll) == model::ModelFamily::Llama,
+              std::string(ll) + " routes to the llama schema");
+    }
+    check(model::model_family_of("qwen3_5") == model::ModelFamily::Qwen35,
+          "qwen3_5 still routes to this one");
 
     // The refusal has to happen before anything is authored, or a caller gets a
     // half-built contract and a message about a missing tensor.
@@ -272,7 +281,7 @@ void test_the_schema_owns_its_model_types() {
     pie_loader::ModelContract contract;
     bool threw = false;
     try {
-        model::author_model_contract(empty, "llama", pie::metal::metal_device_target(), contract);
+        model::author_model_contract(empty, "gpt2", pie::metal::metal_device_target(), contract);
     } catch (const std::exception&) {
         threw = true;
     }
