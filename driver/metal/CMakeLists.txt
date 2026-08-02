@@ -128,11 +128,12 @@ target_include_directories(pie_driver_metal_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels
     ${CMAKE_CURRENT_SOURCE_DIR}/src/store
     ${CMAKE_CURRENT_SOURCE_DIR}/src/loader
-    # ../abi/include carries the shared launch-package view headers
-    # (pie_native/launch/{program,plan,op_table,fire_geometry}.hpp — CUDA-free,
-    # namespace pie_native::launch). Metal no longer reaches into
+    # ../common/include carries the shared launch-package view headers
+    # (pie/driver/launch/{program,plan,op_table}.hpp, pie/driver/fire/geometry.hpp —
+    # CUDA-free,
+    # namespace pie::driver::launch). Metal no longer reaches into
     # driver/cuda/src for anything.
-    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR} ${PIE_LOADER_INCLUDE_DIR})
 
 target_compile_options(pie_driver_metal_lib PRIVATE
@@ -334,7 +335,6 @@ if(NOT APPLE)
       -I${CMAKE_CURRENT_SOURCE_DIR}/src/store
       -I${CMAKE_CURRENT_SOURCE_DIR}/src/loader
       -I${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-      -I${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
       -I${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
       -I${PIE_DRIVER_ABI_INCLUDE_DIR}
       -I${PIE_LOADER_INCLUDE_DIR}
@@ -348,7 +348,7 @@ function(add_metal_host_test target source)
   # here lists it; without it these two do not compile.
   target_include_directories(${target} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
     ${PIE_DRIVER_ABI_INCLUDE_DIR})
   add_test(NAME ${target} COMMAND ${target})
 endfunction()
@@ -389,7 +389,7 @@ add_executable(pipeline_launch_conformance_test
   tests/pipeline_launch_conformance_test.cpp)
 target_include_directories(pipeline_launch_conformance_test PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/../abi/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
   ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
   ${CMAKE_CURRENT_SOURCE_DIR}/../../interface/driver/include)
 # The fixture directory is generated, so it is passed as an absolute path

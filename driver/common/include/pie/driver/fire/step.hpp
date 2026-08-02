@@ -16,7 +16,7 @@
 
 #include <pie_driver_abi.h>
 
-namespace pie_native {
+namespace pie::driver::fire {
 
 struct StepLaunch {
     PieU64Slice instance_ids;
@@ -87,4 +87,4 @@ struct StepLaunch {
     PieU32Slice channel_ticket_indptr;
 };
 
-}  // namespace pie_native
+}  // namespace pie::driver::fire

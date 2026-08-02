@@ -8,12 +8,12 @@
 // in #mac: beta owns CSR interpretation, alpha owns IO-buffer population + decoder feed).
 
 #include "batch_schedule.hpp"
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/fire/view.hpp"
 
 namespace pie::metal {
 
 // Interpret the marshaled CSR view into the batch plan. page_size = runtime kv_page_size (32).
-inline BatchSchedule build_batch_schedule(const pie_native::LaunchView& v, int page_size) {
+inline BatchSchedule build_batch_schedule(const pie::driver::fire::LaunchView& v, int page_size) {
     return build_batch_schedule(
         v.token_ids.data(),         int(v.token_ids.size()),
         v.qo_indptr.data(),

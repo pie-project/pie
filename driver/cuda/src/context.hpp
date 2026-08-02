@@ -5,7 +5,7 @@
 #include <string>
 
 #include <pie_driver_abi.h>
-#include <pie_native/step_launch.hpp>
+#include <pie/driver/fire/step.hpp>
 
 namespace pie::cuda {
 

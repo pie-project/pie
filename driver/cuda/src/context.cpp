@@ -1,4 +1,4 @@
-#include <pie_native/step_launch.hpp>
+#include <pie/driver/fire/step.hpp>
 #include "context.hpp"
 
 #include <algorithm>
@@ -162,8 +162,8 @@ struct LaunchScratch {
     std::vector<std::uint64_t> ptir_program_hashes;
     std::vector<std::uint64_t> ptir_program_instances;
 
-    pie_native::LaunchView build(
-        const pie_native::StepLaunch& launch,
+    pie::driver::fire::LaunchView build(
+        const pie::driver::fire::StepLaunch& launch,
         const std::vector<pie_cuda_driver::pipeline::InstanceRecord>& instances) {
         const std::size_t lanes = instances.size();
         ptir_program_hashes.clear();
@@ -175,61 +175,61 @@ struct LaunchScratch {
             ptir_program_instances.push_back(inst.instance_id);
         }
 
-        pie_native::LaunchView view{};
-        view.terminal_cells = pie_native::slice_from(launch.terminal_cells.ptr, launch.terminal_cells.len);
-        view.token_ids = pie_native::slice_from_u32(launch.token_ids.ptr, launch.token_ids.len);
-        view.position_ids = pie_native::slice_from_u32(launch.position_ids.ptr, launch.position_ids.len);
-        view.kv_page_indices = pie_native::slice_from_u32(launch.kv_page_indices.ptr, launch.kv_page_indices.len);
-        view.kv_page_indptr = pie_native::slice_from_u32(launch.kv_page_indptr.ptr, launch.kv_page_indptr.len);
-        view.kv_last_page_lens = pie_native::slice_from_u32(launch.kv_last_page_lens.ptr, launch.kv_last_page_lens.len);
-        view.qo_indptr = pie_native::slice_from_u32(launch.qo_indptr.ptr, launch.qo_indptr.len);
-        view.rs_slot_ids = pie_native::slice_from_u32(launch.rs_slot_ids.ptr, launch.rs_slot_ids.len);
-        view.rs_slot_flags = pie_native::slice_from_u8(launch.rs_slot_flags.ptr, launch.rs_slot_flags.len);
-        view.rs_fold_lens = pie_native::slice_from_u32(launch.rs_fold_lens.ptr, launch.rs_fold_lens.len);
-        view.rs_buffer_slot_ids = pie_native::slice_from_u32(launch.rs_buffer_slot_ids.ptr, launch.rs_buffer_slot_ids.len);
-        view.rs_buffer_slot_indptr = pie_native::slice_from_u32(launch.rs_buffer_slot_indptr.ptr, launch.rs_buffer_slot_indptr.len);
-        view.rs_buffer_read_slot_ids = pie_native::slice_from_u32(launch.rs_buffer_read_slot_ids.ptr, launch.rs_buffer_read_slot_ids.len);
-        view.rs_buffer_read_indptr = pie_native::slice_from_u32(launch.rs_buffer_read_indptr.ptr, launch.rs_buffer_read_indptr.len);
-        view.rs_buffer_read_lens = pie_native::slice_from_u32(launch.rs_buffer_read_lens.ptr, launch.rs_buffer_read_lens.len);
-        view.rs_buffer_heads = pie_native::slice_from_u32(launch.rs_buffer_heads.ptr, launch.rs_buffer_heads.len);
-        view.rs_translation = pie_native::slice_from_u32(launch.rs_translation.ptr, launch.rs_translation.len);
-        view.rs_translation_indptr = pie_native::slice_from_u32(launch.rs_translation_indptr.ptr, launch.rs_translation_indptr.len);
-        view.flattened_masks = pie_native::slice_from_u32(launch.masks.words.ptr, launch.masks.words.len);
-        view.mask_indptr = pie_native::slice_from_u32(launch.masks.word_indptr.ptr, launch.masks.word_indptr.len);
-        view.sampling_indices = pie_native::slice_from_u32(launch.sampling_indices.ptr, launch.sampling_indices.len);
-        view.sampling_indptr = pie_native::slice_from_u32(launch.sampling_indptr.ptr, launch.sampling_indptr.len);
-        view.ptir_program_hashes = pie_native::slice_from_u64(ptir_program_hashes.data(), ptir_program_hashes.size());
-        view.ptir_program_instances = pie_native::slice_from_u64(ptir_program_instances.data(), ptir_program_instances.size());
-        view.kv_translation = pie_native::slice_from_u32(launch.kv_translation.ptr, launch.kv_translation.len);
-        view.kv_translation_indptr = pie_native::slice_from_u32(launch.kv_translation_indptr.ptr, launch.kv_translation_indptr.len);
-        view.ptir_program_row_indptr = pie_native::slice_from_u32(launch.ptir_program_row_indptr.ptr, launch.ptir_program_row_indptr.len);
-        view.ptir_kv_write_lower_bounds = pie_native::slice_from_u64(
+        pie::driver::fire::LaunchView view{};
+        view.terminal_cells = pie::driver::slice_from(launch.terminal_cells.ptr, launch.terminal_cells.len);
+        view.token_ids = pie::driver::slice_from_u32(launch.token_ids.ptr, launch.token_ids.len);
+        view.position_ids = pie::driver::slice_from_u32(launch.position_ids.ptr, launch.position_ids.len);
+        view.kv_page_indices = pie::driver::slice_from_u32(launch.kv_page_indices.ptr, launch.kv_page_indices.len);
+        view.kv_page_indptr = pie::driver::slice_from_u32(launch.kv_page_indptr.ptr, launch.kv_page_indptr.len);
+        view.kv_last_page_lens = pie::driver::slice_from_u32(launch.kv_last_page_lens.ptr, launch.kv_last_page_lens.len);
+        view.qo_indptr = pie::driver::slice_from_u32(launch.qo_indptr.ptr, launch.qo_indptr.len);
+        view.rs_slot_ids = pie::driver::slice_from_u32(launch.rs_slot_ids.ptr, launch.rs_slot_ids.len);
+        view.rs_slot_flags = pie::driver::slice_from_u8(launch.rs_slot_flags.ptr, launch.rs_slot_flags.len);
+        view.rs_fold_lens = pie::driver::slice_from_u32(launch.rs_fold_lens.ptr, launch.rs_fold_lens.len);
+        view.rs_buffer_slot_ids = pie::driver::slice_from_u32(launch.rs_buffer_slot_ids.ptr, launch.rs_buffer_slot_ids.len);
+        view.rs_buffer_slot_indptr = pie::driver::slice_from_u32(launch.rs_buffer_slot_indptr.ptr, launch.rs_buffer_slot_indptr.len);
+        view.rs_buffer_read_slot_ids = pie::driver::slice_from_u32(launch.rs_buffer_read_slot_ids.ptr, launch.rs_buffer_read_slot_ids.len);
+        view.rs_buffer_read_indptr = pie::driver::slice_from_u32(launch.rs_buffer_read_indptr.ptr, launch.rs_buffer_read_indptr.len);
+        view.rs_buffer_read_lens = pie::driver::slice_from_u32(launch.rs_buffer_read_lens.ptr, launch.rs_buffer_read_lens.len);
+        view.rs_buffer_heads = pie::driver::slice_from_u32(launch.rs_buffer_heads.ptr, launch.rs_buffer_heads.len);
+        view.rs_translation = pie::driver::slice_from_u32(launch.rs_translation.ptr, launch.rs_translation.len);
+        view.rs_translation_indptr = pie::driver::slice_from_u32(launch.rs_translation_indptr.ptr, launch.rs_translation_indptr.len);
+        view.flattened_masks = pie::driver::slice_from_u32(launch.masks.words.ptr, launch.masks.words.len);
+        view.mask_indptr = pie::driver::slice_from_u32(launch.masks.word_indptr.ptr, launch.masks.word_indptr.len);
+        view.sampling_indices = pie::driver::slice_from_u32(launch.sampling_indices.ptr, launch.sampling_indices.len);
+        view.sampling_indptr = pie::driver::slice_from_u32(launch.sampling_indptr.ptr, launch.sampling_indptr.len);
+        view.ptir_program_hashes = pie::driver::slice_from_u64(ptir_program_hashes.data(), ptir_program_hashes.size());
+        view.ptir_program_instances = pie::driver::slice_from_u64(ptir_program_instances.data(), ptir_program_instances.size());
+        view.kv_translation = pie::driver::slice_from_u32(launch.kv_translation.ptr, launch.kv_translation.len);
+        view.kv_translation_indptr = pie::driver::slice_from_u32(launch.kv_translation_indptr.ptr, launch.kv_translation_indptr.len);
+        view.ptir_program_row_indptr = pie::driver::slice_from_u32(launch.ptir_program_row_indptr.ptr, launch.ptir_program_row_indptr.len);
+        view.ptir_kv_write_lower_bounds = pie::driver::slice_from_u64(
             launch.ptir_kv_write_lower_bounds.ptr,
             launch.ptir_kv_write_lower_bounds.len);
-        view.ptir_kv_write_upper_bounds = pie_native::slice_from_u64(
+        view.ptir_kv_write_upper_bounds = pie::driver::slice_from_u64(
             launch.ptir_kv_write_upper_bounds.ptr,
             launch.ptir_kv_write_upper_bounds.len);
-        view.logical_fire_ids = pie_native::slice_from_u64(launch.logical_fire_ids.ptr, launch.logical_fire_ids.len);
-        view.channel_expected_head = pie_native::slice_from_u64(launch.channel_expected_head.ptr, launch.channel_expected_head.len);
-        view.channel_expected_tail = pie_native::slice_from_u64(launch.channel_expected_tail.ptr, launch.channel_expected_tail.len);
-        view.channel_ticket_indptr = pie_native::slice_from_u32(launch.channel_ticket_indptr.ptr, launch.channel_ticket_indptr.len);
+        view.logical_fire_ids = pie::driver::slice_from_u64(launch.logical_fire_ids.ptr, launch.logical_fire_ids.len);
+        view.channel_expected_head = pie::driver::slice_from_u64(launch.channel_expected_head.ptr, launch.channel_expected_head.len);
+        view.channel_expected_tail = pie::driver::slice_from_u64(launch.channel_expected_tail.ptr, launch.channel_expected_tail.len);
+        view.channel_ticket_indptr = pie::driver::slice_from_u32(launch.channel_ticket_indptr.ptr, launch.channel_ticket_indptr.len);
         view.has_user_mask = launch.has_user_mask != 0;
-        view.image_grids = pie_native::slice_from_u32(launch.image_grids.ptr, launch.image_grids.len);
-        view.image_pixels = pie_native::slice_from_u8(launch.image_pixels.ptr, launch.image_pixels.len);
-        view.image_pixel_indptr = pie_native::slice_from_u32(launch.image_pixel_indptr.ptr, launch.image_pixel_indptr.len);
-        view.image_mrope_positions = pie_native::slice_from_u32(launch.image_mrope_positions.ptr, launch.image_mrope_positions.len);
-        view.image_mrope_indptr = pie_native::slice_from_u32(launch.image_mrope_indptr.ptr, launch.image_mrope_indptr.len);
-        view.image_patch_positions = pie_native::slice_from_u32(launch.image_patch_positions.ptr, launch.image_patch_positions.len);
-        view.image_anchor_rows = pie_native::slice_from_u32(launch.image_anchor_rows.ptr, launch.image_anchor_rows.len);
-        view.audio_features = pie_native::slice_from_u8(launch.audio_features.ptr, launch.audio_features.len);
-        view.audio_feature_indptr = pie_native::slice_from_u32(launch.audio_feature_indptr.ptr, launch.audio_feature_indptr.len);
-        view.audio_anchor_rows = pie_native::slice_from_u32(launch.audio_anchor_rows.ptr, launch.audio_anchor_rows.len);
-        view.embed_rows = pie_native::slice_from_u8(launch.embed_rows.ptr, launch.embed_rows.len);
-        view.embed_indptr = pie_native::slice_from_u32(launch.embed_indptr.ptr, launch.embed_indptr.len);
-        view.embed_shapes = pie_native::slice_from_u32(launch.embed_shapes.ptr, launch.embed_shapes.len);
-        view.embed_dtypes = pie_native::slice_from_u8(launch.embed_dtypes.ptr, launch.embed_dtypes.len);
-        view.embed_anchor_rows = pie_native::slice_from_u32(launch.embed_anchor_rows.ptr, launch.embed_anchor_rows.len);
-        view.embed_block_indptr = pie_native::slice_from_u32(launch.embed_block_indptr.ptr, launch.embed_block_indptr.len);
+        view.image_grids = pie::driver::slice_from_u32(launch.image_grids.ptr, launch.image_grids.len);
+        view.image_pixels = pie::driver::slice_from_u8(launch.image_pixels.ptr, launch.image_pixels.len);
+        view.image_pixel_indptr = pie::driver::slice_from_u32(launch.image_pixel_indptr.ptr, launch.image_pixel_indptr.len);
+        view.image_mrope_positions = pie::driver::slice_from_u32(launch.image_mrope_positions.ptr, launch.image_mrope_positions.len);
+        view.image_mrope_indptr = pie::driver::slice_from_u32(launch.image_mrope_indptr.ptr, launch.image_mrope_indptr.len);
+        view.image_patch_positions = pie::driver::slice_from_u32(launch.image_patch_positions.ptr, launch.image_patch_positions.len);
+        view.image_anchor_rows = pie::driver::slice_from_u32(launch.image_anchor_rows.ptr, launch.image_anchor_rows.len);
+        view.audio_features = pie::driver::slice_from_u8(launch.audio_features.ptr, launch.audio_features.len);
+        view.audio_feature_indptr = pie::driver::slice_from_u32(launch.audio_feature_indptr.ptr, launch.audio_feature_indptr.len);
+        view.audio_anchor_rows = pie::driver::slice_from_u32(launch.audio_anchor_rows.ptr, launch.audio_anchor_rows.len);
+        view.embed_rows = pie::driver::slice_from_u8(launch.embed_rows.ptr, launch.embed_rows.len);
+        view.embed_indptr = pie::driver::slice_from_u32(launch.embed_indptr.ptr, launch.embed_indptr.len);
+        view.embed_shapes = pie::driver::slice_from_u32(launch.embed_shapes.ptr, launch.embed_shapes.len);
+        view.embed_dtypes = pie::driver::slice_from_u8(launch.embed_dtypes.ptr, launch.embed_dtypes.len);
+        view.embed_anchor_rows = pie::driver::slice_from_u32(launch.embed_anchor_rows.ptr, launch.embed_anchor_rows.len);
+        view.embed_block_indptr = pie::driver::slice_from_u32(launch.embed_block_indptr.ptr, launch.embed_block_indptr.len);
         return view;
     }
 };
@@ -242,7 +242,7 @@ struct StepExpansion {
     std::vector<std::uint64_t> instance_ids;
     std::vector<std::uint32_t> kv_translation;
     std::vector<std::uint32_t> kv_translation_indptr;
-    pie_native::StepLaunch launch{};
+    pie::driver::fire::StepLaunch launch{};
 };
 
 void expand_step(
@@ -270,7 +270,7 @@ void expand_step(
         out->kv_translation_indptr.push_back(
             static_cast<std::uint32_t>(out->kv_translation.size()));
     }
-    pie_native::StepLaunch& launch = out->launch;
+    pie::driver::fire::StepLaunch& launch = out->launch;
     launch.instance_ids = {out->instance_ids.data(), out->instance_ids.size()};
     launch.terminal_cells = step.terminal_cells;
     launch.token_ids = step.token_ids;
@@ -577,12 +577,12 @@ class Context::Impl {
     }
 
     int validate_finalized_launch(
-        const pie_native::StepLaunch& launch,
+        const pie::driver::fire::StepLaunch& launch,
         std::vector<pie_cuda_driver::pipeline::InstanceRecord>* instances,
         LaunchScratch* scratch,
-        pie_native::LaunchView* view) const;
-    int required_kv_pages(const pie_native::StepLaunch& launch) const;
-    std::size_t required_state_slots(const pie_native::StepLaunch& launch) const;
+        pie::driver::fire::LaunchView* view) const;
+    int required_kv_pages(const pie::driver::fire::StepLaunch& launch) const;
+    std::size_t required_state_slots(const pie::driver::fire::StepLaunch& launch) const;
     std::vector<pie_cuda_driver::CudaAllocatorTarget> frame_targets(
         int kv_required,
         std::size_t state_required,
@@ -2059,7 +2059,7 @@ void Context::Impl::recalibrate_elastic_budget(bool reset_hard_ceiling) {
         reset_hard_ceiling);
 }
 
-int Context::Impl::required_kv_pages(const pie_native::StepLaunch& launch) const {
+int Context::Impl::required_kv_pages(const pie::driver::fire::StepLaunch& launch) const {
     int pages = static_cast<int>(launch.required_kv_pages);
     if (executor_->graph_pad_page >= 0 && kv_cache_->num_pages() > 0) {
         pages = std::max(pages, executor_->graph_pad_page + 1);
@@ -2075,7 +2075,7 @@ int Context::Impl::required_kv_pages(const pie_native::StepLaunch& launch) const
 }
 
 std::size_t Context::Impl::required_state_slots(
-    const pie_native::StepLaunch& launch) const {
+    const pie::driver::fire::StepLaunch& launch) const {
     if (executor_->rs_cache == nullptr) return 0;
     std::size_t slots = 0;
     auto include = [&slots](PieU32Slice ids) {
@@ -2133,10 +2133,10 @@ Context::Impl::frame_targets(
 }
 
 int Context::Impl::validate_finalized_launch(
-    const pie_native::StepLaunch& launch,
+    const pie::driver::fire::StepLaunch& launch,
     std::vector<pie_cuda_driver::pipeline::InstanceRecord>* instances,
     LaunchScratch* scratch,
-    pie_native::LaunchView* view) const {
+    pie::driver::fire::LaunchView* view) const {
     if (executor_ == nullptr) return PIE_STATUS_CLOSED;
     if (launch.embed_rows.len > 0 &&
         (model_ == nullptr ||
@@ -2267,7 +2267,7 @@ int Context::Impl::launch(const PieFrameDesc& frame, PieCompletion completion) {
     std::vector<std::vector<pie_cuda_driver::pipeline::InstanceRecord>>
         instances(step_count);
     std::vector<LaunchScratch> scratch(step_count);
-    std::vector<pie_native::LaunchView> views(step_count);
+    std::vector<pie::driver::fire::LaunchView> views(step_count);
     int kv_required = 0;
     std::size_t state_required = 0;
     for (std::size_t i = 0; i < step_count; ++i) {

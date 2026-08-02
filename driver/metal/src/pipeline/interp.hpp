@@ -21,13 +21,13 @@
 #include <pie_driver_abi.h>
 #include <rng_contract.generated.h>
 
-#include "pie_native/launch/plan.hpp"
-#include "pie_native/launch/program.hpp"
+#include "pie/driver/launch/plan.hpp"
+#include "pie/driver/launch/program.hpp"
 #include "pipeline/shared_storage.hpp"
 
 namespace pie::metal::pipeline {
 
-namespace launch = pie_native::launch;
+namespace launch = pie::driver::launch;
 using launch::DType;
 using launch::OpCode;
 using launch::Trace;

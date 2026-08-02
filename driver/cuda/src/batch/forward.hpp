@@ -19,7 +19,7 @@
 #include "cuda_check.hpp"
 #include "distributed.hpp"
 #include "batch/forward_graph.hpp"
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/slice.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "batch/persistent_inputs.hpp"
 #include <memory>

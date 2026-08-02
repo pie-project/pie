@@ -157,7 +157,7 @@ class ModuleCache {
 
     std::shared_ptr<const FusedProgramExecutable> compile_program(
         std::uint64_t program_hash,
-        const std::vector<pie_native::launch::plan::StagePlan>& plans,
+        const std::vector<pie::driver::launch::plan::StagePlan>& plans,
         CompileFailureKind& failure_kind,
         std::string& error,
         HostSource host_source = nullptr,
@@ -675,7 +675,7 @@ class ModuleCache {
     }
 
     static std::string stage_key(
-        const pie_native::launch::plan::StagePlan& plan,
+        const pie::driver::launch::plan::StagePlan& plan,
         int major,
         int minor,
         int nvrtc_major,
@@ -780,7 +780,7 @@ class ModuleCache {
     }
 
     static bool complete_stage_coverage(
-        const pie_native::launch::plan::StagePlan& plan,
+        const pie::driver::launch::plan::StagePlan& plan,
         const FusedStageExecutable& stage,
         std::string& error) {
         if (plan.fused.whole_stage_fallback ||

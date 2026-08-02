@@ -14,9 +14,9 @@
 
 #include <pie_driver_abi.h>
 
-#include "pie_native/launch/program.hpp"
+#include "pie/driver/launch/program.hpp"
 
-namespace pie_native::launch::plan {
+namespace pie::driver::launch::plan {
 
 // One dimension of a value's type: either a trace-known extent or a symbolic
 // one (`PTIR_EXTENT_*`) resolved at fire time.
@@ -241,4 +241,4 @@ inline StagePlan adopt(std::uint8_t stage, const PieLaunchStagePlan& src) {
     return plan;
 }
 
-}  // namespace pie_native::launch::plan
+}  // namespace pie::driver::launch::plan

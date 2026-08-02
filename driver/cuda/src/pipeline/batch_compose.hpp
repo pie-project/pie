@@ -32,17 +32,17 @@
 #include <string>
 #include <vector>
 
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/fire/view.hpp"
 
 #include "batch/rs_metadata.hpp"
-#include "pie_native/fire/fire_geometry.hpp"
+#include "pie/driver/fire/geometry.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
+// fire-geometry) now lives in pie::driver::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
+using namespace pie::driver::fire;
 
 inline int mtp_global_history_tokens(
     int input_position,
@@ -548,7 +548,7 @@ inline std::optional<int> runtime_window_for_tail_aligned(
 // descriptor resolution. Requires `view.ptir_program_row_indptr` (the runtime
 // ships it for every direct launch). Returns false + `*err` on a violated
 // contract; the executor must fail the fire.
-inline bool compose_forward_batch(const pie_native::LaunchView& view,
+inline bool compose_forward_batch(const pie::driver::fire::LaunchView& view,
                                   const ResolvedPrograms& resolved,
                                   std::uint32_t page_size,
                                   ComposedBatch& out,
@@ -1184,7 +1184,7 @@ inline bool compose_forward_batch(const pie_native::LaunchView& view,
 // Per-program logits row offsets for a PURE-WIRE launch (no device-geometry
 // program resolved): the gathered order is the wire request order, so program
 // `p`'s sampled rows start at `sampling_indptr[row_indptr[p]]`.
-inline bool wire_program_sample_offsets(const pie_native::LaunchView& view,
+inline bool wire_program_sample_offsets(const pie::driver::fire::LaunchView& view,
                                         std::vector<std::uint32_t>& out,
                                         std::string* err) {
     const std::size_t n_prog = view.ptir_program_hashes.size();

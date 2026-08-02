@@ -25,16 +25,16 @@
 
 #include <pie_driver_abi.h>
 
-#include "pie_native/launch_view.hpp"
+#include "pie/driver/fire/view.hpp"
 
-#include "pie_native/fire/fire_geometry.hpp"
+#include "pie/driver/fire/geometry.hpp"
 
 namespace pie_cuda_driver::pipeline {
 
 // Shared pure-host PTIR decode model (trace/op-table/container/bound/
-// fire-geometry) now lives in pie_native::launch (driver/common); bring it into
+// fire-geometry) now lives in pie::driver::launch (driver/common); bring it into
 // scope so the CUDA-side tier-0/1 code below can use it unqualified.
-using namespace pie_native::launch;
+using namespace pie::driver::fire;
 
 class RetryableLaunchError : public std::runtime_error {
   public:
@@ -184,7 +184,7 @@ class Dispatch {
                       PieInstanceBinding* binding,
                       std::string* err);
 
-    int validate_launch(const pie_native::LaunchView& view, std::string* err);
+    int validate_launch(const pie::driver::fire::LaunchView& view, std::string* err);
 
     // Declared-phase execution, split along the frame pipeline's two
     // tracks (venus decision: FramePrepare is host-only, StepEnqueue is
@@ -208,18 +208,18 @@ class Dispatch {
     // `execute_attention_phase` for each layer. `finish` executes Epilogue
     // and performs the sole atomic channel publication.
     std::unique_ptr<StagedLaunch> begin_host(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         cudaStream_t stream);
 
     void begin_enqueue(StagedLaunch& launch);
 
     std::unique_ptr<StagedLaunch> begin(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         cudaStream_t stream);
 
     void update_launch_geometry(
         StagedLaunch& launch,
-        const pie_native::LaunchView& resolved_view,
+        const pie::driver::fire::LaunchView& resolved_view,
         std::span<const std::uint32_t> program_token_starts);
 
     void execute_attention_phase(
@@ -258,7 +258,7 @@ class Dispatch {
 
     bool finish(
         StagedLaunch& launch,
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         const void* logits, std::uint32_t vocab, cudaStream_t stream,
         const PieRuntimeCallbacks* runtime,
         PieCompletion completion,
@@ -279,20 +279,20 @@ class Dispatch {
     void abort(StagedLaunch& launch, cudaStream_t stream) noexcept;
 
     bool launch_has_attention_stages(
-        const pie_native::LaunchView& view) const;
+        const pie::driver::fire::LaunchView& view) const;
 
     // Whether any program in this launch reads `AttnScore`. Capture is opt-in
     // per fire because it costs an extra `[num_q_heads, kv_len]` write inside
     // the attention kernel; a launch that does not observe scores must pay
     // nothing.
     bool launch_wants_attn_score(
-        const pie_native::LaunchView& view) const;
+        const pie::driver::fire::LaunchView& view) const;
 
     // Whether any program in this launch writes the `attn_page_mask` sink. The
     // model body allocates the keep buffer only when true, and only then does
     // it pay the per-layer compaction.
     bool launch_wants_page_mask(
-        const pie_native::LaunchView& view) const;
+        const pie::driver::fire::LaunchView& view) const;
 
     // Whether every epilogue in this launch is a bare greedy argmax over
     // `logits` that only publishes its token to a channel. That is the one
@@ -303,7 +303,7 @@ class Dispatch {
     // weight's row count: a program declaring a narrower one is rejected,
     // because the fused reduction cannot honour it.
     bool launch_epilogue_is_greedy_argmax(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         std::uint32_t vocab) const;
 
     // Whether this model's decode path can honour a page mask: the plan must
@@ -328,7 +328,7 @@ class Dispatch {
     void close_instance(std::uint64_t instance_id);
     int close_channel(std::uint64_t channel_id, std::string* err);
 
-    bool run(const pie_native::LaunchView& view,
+    bool run(const pie::driver::fire::LaunchView& view,
              const void* logits, std::uint32_t vocab, cudaStream_t stream,
              const PieRuntimeCallbacks* runtime,
              PieCompletion completion,
@@ -339,10 +339,10 @@ class Dispatch {
              std::uint32_t direct_bf16_row_capacity = 0);
 
     std::vector<std::uint32_t> mtp_draft_rows(
-        const pie_native::LaunchView& view) const;
+        const pie::driver::fire::LaunchView& view) const;
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> settle_failed_launch(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         cudaStream_t execution_stream);
 
     // W1.1 PRE-FORWARD descriptor resolution, over EVERY device-geometry
@@ -360,7 +360,7 @@ class Dispatch {
     // channel (W1.6), bad geometry — the executor must fail the fire).
     // When allowed, fixed one-token graph buckets return a shape-only template;
     // `enqueue_fixed_decode` resolves their values entirely on device.
-    bool resolve_descriptors(const pie_native::LaunchView& view,
+    bool resolve_descriptors(const pie::driver::fire::LaunchView& view,
                              std::uint32_t page_size,
                              std::uint32_t device_pages,
                              ResolvedPrograms& out,
@@ -395,7 +395,7 @@ class Dispatch {
     };
 
     bool stage_fixed_decode(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         std::uint32_t page_size,
         std::uint32_t device_pages,
         const FixedDecodeDeviceBuffers& buffers,
@@ -410,7 +410,7 @@ class Dispatch {
 
     // Resolve device-carried decode values into a host-owned shape template.
     bool stage_decode_envelopes(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         std::span<const std::uint32_t> program_token_starts,
         std::span<const std::uint32_t> program_request_starts,
         std::span<const std::uint32_t> template_kv_page_indptr,
@@ -424,7 +424,7 @@ class Dispatch {
         StagedLaunch& launch);
 
     bool has_decode_envelopes(
-        const pie_native::LaunchView& view) const;
+        const pie::driver::fire::LaunchView& view) const;
 
     // Per-request page counts for attention PLANNING of a device-composed
     // batch: wire counts raised to each envelope lane's host-known upper
@@ -433,7 +433,7 @@ class Dispatch {
     // geometry — keeps XQA bucket selection and FlashInfer plans safe for
     // any device-resolved length. Returns false if no lane needed a bound.
     bool envelope_plan_page_bounds(
-        const pie_native::LaunchView& view,
+        const pie::driver::fire::LaunchView& view,
         std::span<const std::uint32_t> program_request_starts,
         std::span<const std::uint32_t> wire_kv_page_indptr,
         std::vector<std::uint32_t>& per_request_pages) const;

@@ -28,7 +28,7 @@
 #include <cub/block/block_scan.cuh>
 
 #include "cuda_check.hpp"
-#include "pie_native/launch/plan.hpp"
+#include "pie/driver/launch/plan.hpp"
 #include "pipeline/channels.hpp"
 #include "pipeline/grouped_copy.hpp"
 #include "pipeline/library_region.hpp"

@@ -5,7 +5,7 @@
 
 #include <pie_driver_abi.h>
 
-#include "pie_native/abi_validation.hpp"
+#include "pie/driver/validate.hpp"
 #include "pipeline/batch_compose.hpp"
 
 namespace {
@@ -45,13 +45,13 @@ int main() {
     const std::uint32_t empty_qo[] = {0};
     launch.qo_indptr = {.ptr = empty_qo, .len = 1};
     expect(
-        pie_native::abi::validate_step_desc(&launch, kTestRosterLen) == PIE_STATUS_OK,
+        pie::driver::validate::step_desc(&launch, kTestRosterLen) == PIE_STATUS_OK,
         "empty wire geometry accepts a self-consistent deferred B=2 RS CSR");
 
     const std::uint32_t non_monotonic[] = {0, 2, 1};
     launch.rs_buffer_slot_indptr = {.ptr = non_monotonic, .len = 3};
     expect(
-        pie_native::abi::validate_step_desc(&launch, kTestRosterLen) ==
+        pie::driver::validate::step_desc(&launch, kTestRosterLen) ==
             PIE_STATUS_INVALID_ARGUMENT,
         "deferred RS CSR still validates monotonicity");
 
@@ -93,12 +93,12 @@ int main() {
     mixed_launch.rs_buffer_slot_indptr = {
         .ptr = mixed_buffer_ptr, .len = 4};
     expect(
-        pie_native::abi::validate_step_desc(&mixed_launch, kTestRosterLen) ==
+        pie::driver::validate::step_desc(&mixed_launch, kTestRosterLen) ==
             PIE_STATUS_OK,
         "mixed wire+descriptor launch defers RS outer cardinality");
     mixed_launch.ptir_program_row_indptr = {};
     expect(
-        pie_native::abi::validate_step_desc(&mixed_launch, kTestRosterLen) ==
+        pie::driver::validate::step_desc(&mixed_launch, kTestRosterLen) ==
             PIE_STATUS_INVALID_ARGUMENT,
         "wire-only launch still enforces exact RS outer cardinality");
     mixed_launch.ptir_program_row_indptr = {
@@ -108,28 +108,28 @@ int main() {
     mixed_launch.rs_slot_flags = {
         .ptr = inconsistent_fold_flags, .len = 3};
     expect(
-        pie_native::abi::validate_step_desc(&mixed_launch, kTestRosterLen) ==
+        pie::driver::validate::step_desc(&mixed_launch, kTestRosterLen) ==
             PIE_STATUS_INVALID_ARGUMENT,
         "shared ABI rejects RS fold flags/lens disagreement");
     mixed_launch.rs_slot_flags = {.ptr = mixed_flags, .len = 3};
 
     const std::uint64_t hash = 9;
     const std::uint32_t row_attribution[] = {0, 0};
-    pie_native::LaunchView view{};
+    pie::driver::fire::LaunchView view{};
     view.ptir_program_hashes =
-        pie_native::slice_from_u64(&hash, 1);
+        pie::driver::slice_from_u64(&hash, 1);
     view.ptir_program_row_indptr =
-        pie_native::slice_from_u32(row_attribution, 2);
+        pie::driver::slice_from_u32(row_attribution, 2);
     view.rs_slot_ids =
-        pie_native::slice_from_u32(folded_slots, 2);
+        pie::driver::slice_from_u32(folded_slots, 2);
     view.rs_slot_flags =
-        pie_native::slice_from_u8(folded_flags, 2);
+        pie::driver::slice_from_u8(folded_flags, 2);
     view.rs_buffer_slot_ids =
-        pie_native::slice_from_u32(buffer_slots, 2);
+        pie::driver::slice_from_u32(buffer_slots, 2);
     view.rs_buffer_slot_indptr =
-        pie_native::slice_from_u32(buffer_indptr, 3);
+        pie::driver::slice_from_u32(buffer_indptr, 3);
 
-    pie_native::launch::ResolvedPrograms resolved;
+    pie::driver::fire::ResolvedPrograms resolved;
     resolved.per_program.resize(1);
     resolved.is_device_geometry = {1};
     resolved.device_count = 1;
@@ -156,7 +156,7 @@ int main() {
 
     const std::uint32_t short_indptr[] = {0, 2};
     view.rs_buffer_slot_indptr =
-        pie_native::slice_from_u32(short_indptr, 2);
+        pie::driver::slice_from_u32(short_indptr, 2);
     expect(
         !pie_cuda_driver::pipeline::compose_forward_batch(
             view, resolved, 16, composed, &error),
@@ -171,39 +171,39 @@ int main() {
     const std::uint32_t mixed_wire_last[] = {1};
     const std::uint32_t mixed_wire_sample[] = {0};
     const std::uint32_t mixed_wire_sample_ptr[] = {0, 1};
-    pie_native::LaunchView mixed_view{};
+    pie::driver::fire::LaunchView mixed_view{};
     mixed_view.ptir_program_hashes =
-        pie_native::slice_from_u64(mixed_hashes, 2);
+        pie::driver::slice_from_u64(mixed_hashes, 2);
     mixed_view.ptir_program_row_indptr =
-        pie_native::slice_from_u32(mixed_program_rows, 3);
+        pie::driver::slice_from_u32(mixed_program_rows, 3);
     mixed_view.token_ids =
-        pie_native::slice_from_u32(mixed_wire_token, 1);
+        pie::driver::slice_from_u32(mixed_wire_token, 1);
     mixed_view.position_ids =
-        pie_native::slice_from_u32(mixed_wire_position, 1);
+        pie::driver::slice_from_u32(mixed_wire_position, 1);
     mixed_view.qo_indptr =
-        pie_native::slice_from_u32(mixed_wire_qo, 2);
+        pie::driver::slice_from_u32(mixed_wire_qo, 2);
     mixed_view.kv_page_indices =
-        pie_native::slice_from_u32(mixed_wire_pages, 1);
+        pie::driver::slice_from_u32(mixed_wire_pages, 1);
     mixed_view.kv_page_indptr =
-        pie_native::slice_from_u32(mixed_wire_page_ptr, 2);
+        pie::driver::slice_from_u32(mixed_wire_page_ptr, 2);
     mixed_view.kv_last_page_lens =
-        pie_native::slice_from_u32(mixed_wire_last, 1);
+        pie::driver::slice_from_u32(mixed_wire_last, 1);
     mixed_view.sampling_indices =
-        pie_native::slice_from_u32(mixed_wire_sample, 1);
+        pie::driver::slice_from_u32(mixed_wire_sample, 1);
     mixed_view.sampling_indptr =
-        pie_native::slice_from_u32(mixed_wire_sample_ptr, 2);
+        pie::driver::slice_from_u32(mixed_wire_sample_ptr, 2);
     mixed_view.rs_slot_ids =
-        pie_native::slice_from_u32(mixed_slots, 3);
+        pie::driver::slice_from_u32(mixed_slots, 3);
     mixed_view.rs_slot_flags =
-        pie_native::slice_from_u8(mixed_flags, 3);
+        pie::driver::slice_from_u8(mixed_flags, 3);
     mixed_view.rs_fold_lens =
-        pie_native::slice_from_u32(mixed_fold_lens, 3);
+        pie::driver::slice_from_u32(mixed_fold_lens, 3);
     mixed_view.rs_buffer_slot_ids =
-        pie_native::slice_from_u32(mixed_buffer_slots, 3);
+        pie::driver::slice_from_u32(mixed_buffer_slots, 3);
     mixed_view.rs_buffer_slot_indptr =
-        pie_native::slice_from_u32(mixed_buffer_ptr, 4);
+        pie::driver::slice_from_u32(mixed_buffer_ptr, 4);
 
-    pie_native::launch::ResolvedPrograms mixed_resolved;
+    pie::driver::fire::ResolvedPrograms mixed_resolved;
     mixed_resolved.per_program.resize(2);
     mixed_resolved.is_device_geometry = {1, 0};
     mixed_resolved.device_count = 1;
@@ -309,14 +309,14 @@ int main() {
             &error),
         "buffered RS is rejected before mutation on unsupported models");
 
-    const pie_native::launch::StructuredMaskDescriptor unset_masks[2]{};
-    const pie_native::launch::StructuredMaskDescriptor explicit_masks[2] = {
-        {pie_native::launch::StructuredMaskKind::SlidingWindow, 8, 0, 4},
-        {pie_native::launch::StructuredMaskKind::SlidingWindow, 8, 0, 4},
+    const pie::driver::fire::StructuredMaskDescriptor unset_masks[2]{};
+    const pie::driver::fire::StructuredMaskDescriptor explicit_masks[2] = {
+        {pie::driver::fire::StructuredMaskKind::SlidingWindow, 8, 0, 4},
+        {pie::driver::fire::StructuredMaskKind::SlidingWindow, 8, 0, 4},
     };
-    const pie_native::launch::StructuredMaskDescriptor mixed_masks[2] = {
+    const pie::driver::fire::StructuredMaskDescriptor mixed_masks[2] = {
         {},
-        {pie_native::launch::StructuredMaskKind::SlidingWindow, 8, 0, 4},
+        {pie::driver::fire::StructuredMaskKind::SlidingWindow, 8, 0, 4},
     };
     expect(
         pie_cuda_driver::pipeline::structured_mask_coverage(unset_masks) ==

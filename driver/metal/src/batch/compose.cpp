@@ -1,4 +1,4 @@
-#include <pie_native/step_launch.hpp>
+#include <pie/driver/fire/step.hpp>
 #include "batch/compose.hpp"
 
 #include <stdexcept>
@@ -21,40 +21,40 @@ std::vector<T> copy_slice(const T* ptr, std::size_t len) {
 
 }  // namespace
 
-pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
-    pie_native::LaunchView view{};
+pie::driver::fire::LaunchView build_launch_view(const pie::driver::fire::StepLaunch& launch) {
+    pie::driver::fire::LaunchView view{};
     view.token_ids =
-        pie_native::slice_from_u32(launch.token_ids.ptr, launch.token_ids.len);
+        pie::driver::slice_from_u32(launch.token_ids.ptr, launch.token_ids.len);
     view.position_ids =
-        pie_native::slice_from_u32(launch.position_ids.ptr, launch.position_ids.len);
+        pie::driver::slice_from_u32(launch.position_ids.ptr, launch.position_ids.len);
     view.kv_page_indices =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.kv_page_indices.ptr,
             launch.kv_page_indices.len);
     view.kv_page_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.kv_page_indptr.ptr,
             launch.kv_page_indptr.len);
     view.kv_last_page_lens =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.kv_last_page_lens.ptr,
             launch.kv_last_page_lens.len);
     view.qo_indptr =
-        pie_native::slice_from_u32(launch.qo_indptr.ptr, launch.qo_indptr.len);
+        pie::driver::slice_from_u32(launch.qo_indptr.ptr, launch.qo_indptr.len);
     view.rs_slot_ids =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.rs_slot_ids.ptr,
             launch.rs_slot_ids.len);
     view.rs_slot_flags =
-        pie_native::slice_from_u8(
+        pie::driver::slice_from_u8(
             launch.rs_slot_flags.ptr,
             launch.rs_slot_flags.len);
     view.rs_buffer_slot_ids =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.rs_buffer_slot_ids.ptr,
             launch.rs_buffer_slot_ids.len);
     view.rs_buffer_slot_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.rs_buffer_slot_indptr.ptr,
             launch.rs_buffer_slot_indptr.len);
     // The buffer READ path is CUDA-only. Metal has no extended token layout,
@@ -171,41 +171,41 @@ pie_native::LaunchView build_launch_view(const pie_native::StepLaunch& launch) {
         }
     }
     view.rs_translation =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.rs_translation.ptr,
             launch.rs_translation.len);
     view.rs_translation_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.rs_translation_indptr.ptr,
             launch.rs_translation_indptr.len);
     view.sampling_indices =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.sampling_indices.ptr,
             launch.sampling_indices.len);
     view.sampling_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.sampling_indptr.ptr,
             launch.sampling_indptr.len);
     view.kv_translation =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.kv_translation.ptr,
             launch.kv_translation.len);
     view.kv_translation_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.kv_translation_indptr.ptr,
             launch.kv_translation_indptr.len);
     view.flattened_masks =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.masks.words.ptr, launch.masks.words.len);
     view.mask_indptr =
-        pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(
             launch.masks.word_indptr.ptr,
             launch.masks.word_indptr.len);
     view.has_user_mask = launch.has_user_mask != 0;
     return view;
 }
 
-OwnedLaunchView OwnedLaunchView::capture(const pie_native::StepLaunch& launch) {
+OwnedLaunchView OwnedLaunchView::capture(const pie::driver::fire::StepLaunch& launch) {
     OwnedLaunchView owned;
     owned.token_ids = copy_slice(launch.token_ids.ptr, launch.token_ids.len);
     owned.position_ids = copy_slice(launch.position_ids.ptr, launch.position_ids.len);
@@ -252,53 +252,53 @@ OwnedLaunchView OwnedLaunchView::capture(const pie_native::StepLaunch& launch) {
     return owned;
 }
 
-pie_native::LaunchView OwnedLaunchView::view() const {
-    pie_native::LaunchView view{};
-    view.token_ids = pie_native::slice_from_u32(token_ids.data(), token_ids.size());
+pie::driver::fire::LaunchView OwnedLaunchView::view() const {
+    pie::driver::fire::LaunchView view{};
+    view.token_ids = pie::driver::slice_from_u32(token_ids.data(), token_ids.size());
     view.position_ids =
-        pie_native::slice_from_u32(position_ids.data(), position_ids.size());
+        pie::driver::slice_from_u32(position_ids.data(), position_ids.size());
     view.kv_page_indices =
-        pie_native::slice_from_u32(kv_page_indices.data(), kv_page_indices.size());
+        pie::driver::slice_from_u32(kv_page_indices.data(), kv_page_indices.size());
     view.kv_page_indptr =
-        pie_native::slice_from_u32(kv_page_indptr.data(), kv_page_indptr.size());
+        pie::driver::slice_from_u32(kv_page_indptr.data(), kv_page_indptr.size());
     view.kv_last_page_lens =
-        pie_native::slice_from_u32(kv_last_page_lens.data(), kv_last_page_lens.size());
-    view.qo_indptr = pie_native::slice_from_u32(qo_indptr.data(), qo_indptr.size());
+        pie::driver::slice_from_u32(kv_last_page_lens.data(), kv_last_page_lens.size());
+    view.qo_indptr = pie::driver::slice_from_u32(qo_indptr.data(), qo_indptr.size());
     view.rs_slot_ids =
-        pie_native::slice_from_u32(rs_slot_ids.data(), rs_slot_ids.size());
+        pie::driver::slice_from_u32(rs_slot_ids.data(), rs_slot_ids.size());
     view.rs_slot_flags =
-        pie_native::slice_from_u8(rs_slot_flags.data(), rs_slot_flags.size());
-    view.rs_buffer_slot_ids = pie_native::slice_from_u32(
+        pie::driver::slice_from_u8(rs_slot_flags.data(), rs_slot_flags.size());
+    view.rs_buffer_slot_ids = pie::driver::slice_from_u32(
         rs_buffer_slot_ids.data(), rs_buffer_slot_ids.size());
-    view.rs_buffer_slot_indptr = pie_native::slice_from_u32(
+    view.rs_buffer_slot_indptr = pie::driver::slice_from_u32(
         rs_buffer_slot_indptr.data(), rs_buffer_slot_indptr.size());
     view.rs_translation =
-        pie_native::slice_from_u32(rs_translation.data(), rs_translation.size());
-    view.rs_translation_indptr = pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(rs_translation.data(), rs_translation.size());
+    view.rs_translation_indptr = pie::driver::slice_from_u32(
         rs_translation_indptr.data(), rs_translation_indptr.size());
     view.sampling_indices =
-        pie_native::slice_from_u32(sampling_indices.data(), sampling_indices.size());
+        pie::driver::slice_from_u32(sampling_indices.data(), sampling_indices.size());
     view.sampling_indptr =
-        pie_native::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
+        pie::driver::slice_from_u32(sampling_indptr.data(), sampling_indptr.size());
     view.kv_translation =
-        pie_native::slice_from_u32(kv_translation.data(), kv_translation.size());
-    view.kv_translation_indptr = pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(kv_translation.data(), kv_translation.size());
+    view.kv_translation_indptr = pie::driver::slice_from_u32(
         kv_translation_indptr.data(), kv_translation_indptr.size());
     view.flattened_masks =
-        pie_native::slice_from_u32(mask_words.data(), mask_words.size());
-    view.mask_indptr = pie_native::slice_from_u32(
+        pie::driver::slice_from_u32(mask_words.data(), mask_words.size());
+    view.mask_indptr = pie::driver::slice_from_u32(
         mask_word_indptr.data(), mask_word_indptr.size());
     view.has_user_mask = has_user_mask;
     return view;
 }
 
 bool build_member_forward_desc(
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     std::size_t member,
     std::size_t member_count,
     bool has_linear_attn,
     std::uint32_t page_size,
-    const pie_native::launch::FireGeometry* resolved,
+    const pie::driver::fire::FireGeometry* resolved,
     MemberForwardDesc& desc,
     std::string& error) {
     page_size = std::max<std::uint32_t>(page_size, 1);
