@@ -136,17 +136,23 @@ fn a_corrupt_artifact_is_caught_by_its_digest() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The quantized schemes safetensors has no tag for. `write_safetensors`
-/// refuses these outright; the point of the `.zt` output is that it does not
-/// have to.
+/// The quantized schemes safetensors has no tag for, and the property that
+/// makes the profile parametric: each one comes back as *itself*.
+///
+/// AWQ and GPTQ differ only in packing order, and MLX-affine only in how its
+/// zero points are stored. If the reader recovered the scheme from a name the
+/// writer had left behind, this test would pass while telling us nothing. It
+/// passes because the parameters are in the file.
 #[test]
-fn schemes_safetensors_cannot_tag_survive_a_round_trip() {
+fn each_affine_group_scheme_round_trips_as_itself() {
     let dir = tmpdir("schemes");
     for (scheme, group, bits) in [
         (QuantScheme::AwqInt4, 128u32, 4u8),
         (QuantScheme::GptqInt4, 128, 4),
         (QuantScheme::MlxAffineU4, 64, 4),
         (QuantScheme::Int4B8, 32, 4),
+        (QuantScheme::Int8Symmetric, 0, 8),
+        (QuantScheme::Int8Asymmetric, 0, 8),
     ] {
         let path = dir.join(format!("{scheme:?}.zt"));
         let payload = vec![0x5au8; 512];
@@ -165,23 +171,62 @@ fn schemes_safetensors_cannot_tag_survive_a_round_trip() {
         )
         .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
 
-        // It reads back as *a* quantized encoding with the parameters intact.
-        // The scheme itself round-trips only for profiles the reader's table
-        // names; the rest land on the shared affine-group profile, which is
-        // the honest outcome — the file says what it is, and the reader says
-        // what it can name.
         let metadata = parse_checkpoint(&path).unwrap_or_else(|err| {
             panic!("{scheme:?} was written but could not be read back: {err}")
         });
         let w = metadata.tensor_by_name("w").unwrap();
         match &w.encoding {
             Encoding::Quant(got) => {
-                assert_eq!(got.group_size, group, "{scheme:?}: group size");
+                assert_eq!(
+                    got.scheme, scheme,
+                    "{scheme:?} came back as {:?} — the parameters did not identify it",
+                    got.scheme
+                );
                 assert_eq!(got.bits_per_element, bits, "{scheme:?}: bits");
             }
             other => panic!("{scheme:?} read back as {other:?}"),
         }
         assert_eq!(bytes_at(&metadata, "w"), payload, "{scheme:?}: payload");
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// No name is carried. The file describes the scheme by its parameters, so a
+/// reader that never heard of pie's enum can still decode it — and a reader
+/// that has one recovers it without being told.
+#[test]
+fn the_artifact_names_parameters_not_schemes() {
+    let dir = tmpdir("parametric");
+    let path = dir.join("model.zt");
+    let spec = QuantSpec {
+        scheme: QuantScheme::GptqInt4,
+        logical_dtype: DType::BF16,
+        bits_per_element: 4,
+        group_size: 128,
+        channel_axis: None,
+    };
+    let d = decl("w", vec![1024], Encoding::Quant(spec));
+    write_zt(
+        &path,
+        &BTreeMap::new(),
+        &[WriteTensor { decl: &d, bytes: &vec![0u8; 512] }],
+    )
+    .unwrap();
+
+    let reader = ztensor::Reader::open(&path).unwrap();
+    let object = reader.get("w").unwrap();
+    assert_eq!(object.layout.as_str(), "zt.quant_group/1");
+
+    let attributes = object.attributes.as_ref().expect("parameters are recorded");
+    let rendered = format!("{attributes:?}");
+    for parameter in ["bits", "group_size", "packing", "scale_form", "zero_point"] {
+        assert!(rendered.contains(parameter), "missing {parameter}");
+    }
+    // The scheme's own name appears nowhere: that is the point.
+    assert!(
+        !rendered.contains("GptqInt4"),
+        "the file carries the scheme's name: {rendered}"
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }

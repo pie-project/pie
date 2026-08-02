@@ -233,28 +233,23 @@ fn encoding_of(object: &Object, part: &Part) -> Result<Encoding, Error> {
     ))
 }
 
-/// Layout profile id to quantization scheme.
+/// Layout profile to quantization scheme.
 ///
-/// The `gguf.*` family is the projection of GGUF's block structs, kept
-/// verbatim; `zt.mx/1` is OCP Microscaling. `zt.quant_group/1` names a
-/// *family* — affine integers with a group scale — whose members differ in
-/// packing order and zero-point convention, which the profile does not
-/// distinguish; a file this loader wrote records which member it is in the
-/// object's `scheme` attribute, and that is what is read back here. A
-/// `zt.quant_group/1` object from elsewhere carries no such attribute and is
-/// refused rather than guessed at.
+/// `zt.quant_group/1` is parametric (core spec §5.2): the profile names a
+/// space, and the attributes say which point. So the scheme is *derived*
+/// from the packing order, the scale form and the zero-point form rather
+/// than read out of a name the file was asked to carry — a file written by
+/// something that never heard of this enum still lands on the right one.
 ///
-/// A profile this table does not name is refused.
+/// The `gguf.*` family is opaque: the block struct is preserved verbatim and
+/// the profile identifies the layout. `zt.mx/1` is OCP Microscaling.
+///
+/// A profile this function cannot resolve is refused. A plan cannot address
+/// bytes it cannot describe, and guessing is what the object model exists to
+/// prevent.
 fn scheme_of(layout: &str, object: &Object) -> Result<QuantScheme, Error> {
     if layout == "zt.quant_group/1" {
-        let named = attr_text(object, "scheme").ok_or_else(|| {
-            Error::Checkpoint(
-                "zt.quant_group/1 without a 'scheme' attribute: the profile names a \
-                 family, and which member decides how the payload is packed"
-                    .to_string(),
-            )
-        })?;
-        return scheme_from_name(named);
+        return affine_group_scheme(object);
     }
     Ok(match layout {
         "zt.mx/1" => QuantScheme::Mxfp4E2M1E8M0,
@@ -273,30 +268,61 @@ fn scheme_of(layout: &str, object: &Object) -> Result<QuantScheme, Error> {
     })
 }
 
-/// The affine-group members, by the name `write_zt` records.
-fn scheme_from_name(name: &str) -> Result<QuantScheme, Error> {
-    Ok(match name {
-        "AwqInt4" => QuantScheme::AwqInt4,
-        "GptqInt4" => QuantScheme::GptqInt4,
-        "MlxAffineU4" => QuantScheme::MlxAffineU4,
-        "Int4B8" => QuantScheme::Int4B8,
-        "Int8Symmetric" => QuantScheme::Int8Symmetric,
-        "Int8Asymmetric" => QuantScheme::Int8Asymmetric,
-        "Fp8E4M3" => QuantScheme::Fp8E4M3,
-        "Fp8E5M2" => QuantScheme::Fp8E5M2,
-        other => {
+/// Which point of the affine-group space an object names.
+///
+/// The parameters that separate the schemes this loader knows are the bit
+/// width, the packing order, and the form of the zero point. Anything the
+/// combination does not name is refused rather than rounded to the nearest
+/// scheme: reading GPTQ codes as AWQ would decode every weight backwards
+/// within its word.
+fn affine_group_scheme(object: &Object) -> Result<QuantScheme, Error> {
+    let missing = |what: &str| {
+        Error::Checkpoint(format!(
+            "zt.quant_group/1 is parametric and its {what} attribute is required; \
+             a decoder cannot be chosen without it"
+        ))
+    };
+    let bits = attr_u64(object, "bits").ok_or_else(|| missing("bits"))?;
+    let packing = attr_map(object, "packing").ok_or_else(|| missing("packing"))?;
+    let order = map_text(packing, "order").ok_or_else(|| missing("packing.order"))?;
+    let zero = attr_map(object, "zero_point").ok_or_else(|| missing("zero_point"))?;
+    let form = map_text(zero, "form").ok_or_else(|| missing("zero_point.form"))?;
+    let zero_packing = map_text(zero, "packing");
+
+    Ok(match (bits, order, form, zero_packing) {
+        (4, "lsb_first", "tensor", Some("same_as_data")) => QuantScheme::AwqInt4,
+        (4, "msb_first", "tensor", Some("same_as_data")) => QuantScheme::GptqInt4,
+        (4, "lsb_first", "tensor", Some("plain")) => QuantScheme::MlxAffineU4,
+        (4, "lsb_first", "implied", _) => QuantScheme::Int4B8,
+        (8, _, "none", _) => QuantScheme::Int8Symmetric,
+        (8, _, "tensor", _) => QuantScheme::Int8Asymmetric,
+        _ => {
             return Err(Error::Checkpoint(format!(
-                "scheme {other:?} is not one this loader knows"
+                "zt.quant_group/1 with bits {bits}, packing order {order:?}, zero point \
+                 {form:?}{} names no scheme this loader implements",
+                zero_packing
+                    .map(|p| format!(" packed {p:?}"))
+                    .unwrap_or_default()
             )));
         }
     })
 }
 
-fn attr_text<'a>(object: &'a Object, key: &str) -> Option<&'a str> {
+fn attr_map<'a>(object: &'a Object, key: &str) -> Option<&'a [(ztensor::cbor::Value, ztensor::cbor::Value)]> {
     object
         .attributes
         .as_ref()?
         .as_map()?
+        .iter()
+        .find(|(k, _)| k.as_text() == Some(key))
+        .and_then(|(_, v)| v.as_map())
+}
+
+fn map_text<'a>(
+    entries: &'a [(ztensor::cbor::Value, ztensor::cbor::Value)],
+    key: &str,
+) -> Option<&'a str> {
+    entries
         .iter()
         .find(|(k, _)| k.as_text() == Some(key))
         .and_then(|(_, v)| v.as_text())

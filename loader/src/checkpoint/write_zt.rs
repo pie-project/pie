@@ -63,57 +63,136 @@ fn storage_of(decl_dtype: DType, encoding: &Encoding) -> Result<(ZDType, Option<
     })
 }
 
-/// The layout profile a declaration's encoding names.
-fn layout_of(encoding: &Encoding) -> Result<&'static str, Error> {
+/// The layout profile a declaration's encoding names, and the attributes
+/// that make it readable again.
+///
+/// `zt.quant_group/1` is parametric: what distinguishes AWQ from GPTQ from
+/// MLX-affine is the packing order, the scale form and the zero-point form,
+/// so those are written down and the scheme's *name* is not. A reader
+/// recovers the scheme by looking at the parameters, which is what keeps the
+/// file readable by something that never heard of pie's enum.
+fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Error> {
     let Encoding::Quant(spec) = encoding else {
-        return Ok("dense");
-    };
-    Ok(match spec.scheme {
-        QuantScheme::None => "dense",
-        QuantScheme::Mxfp4E2M1E8M0 => "zt.mx/1",
-        QuantScheme::GgufQ4_0 => "gguf.q4_0/1",
-        QuantScheme::GgufQ4K => "gguf.q4_k/1",
-        QuantScheme::GgufQ5_0 => "gguf.q5_0/1",
-        QuantScheme::GgufQ5K => "gguf.q5_k/1",
-        QuantScheme::GgufQ8_0 => "gguf.q8_0/1",
-        // The affine-integer family: bits, group size and packing are what
-        // distinguish them, and the profile carries all three.
-        QuantScheme::AwqInt4
-        | QuantScheme::GptqInt4
-        | QuantScheme::MlxAffineU4
-        | QuantScheme::Int4B8
-        | QuantScheme::Int8Symmetric
-        | QuantScheme::Int8Asymmetric
-        | QuantScheme::Fp8E4M3
-        | QuantScheme::Fp8E5M2 => "zt.quant_group/1",
-    })
-}
-
-/// The attributes a quantized object needs for its scheme to be readable
-/// again: what a reader must know that the shape does not say.
-fn attributes_of(encoding: &Encoding) -> Option<Value> {
-    let Encoding::Quant(spec) = encoding else {
-        return None;
+        return Ok(("dense", None));
     };
     let spec = spec.clone().normalized();
-    let mut entries = vec![
-        (
-            Value::Text("bits".into()),
-            Value::Uint(u64::from(spec.bits_per_element)),
-        ),
-        (
-            Value::Text("group_size".into()),
-            Value::Uint(u64::from(spec.group_size)),
-        ),
-        (
-            Value::Text("scheme".into()),
-            Value::Text(format!("{:?}", spec.scheme)),
-        ),
-    ];
-    if let Some(axis) = spec.channel_axis {
-        entries.push((Value::Text("axis".into()), Value::Uint(u64::from(axis.0))));
+    let bits = u64::from(spec.normalized_bits());
+    let group = u64::from(spec.normalized_group_size());
+    let axis = u64::from(spec.channel_axis.map(|a| a.0).unwrap_or(0));
+
+    // The GGUF family is opaque: the block struct interleaves its scales with
+    // its codes, so the profile names the layout and carries the constants a
+    // reader needs to check sizes.
+    if let Some((elems, bytes)) = spec.block_layout() {
+        let name = match spec.scheme {
+            QuantScheme::GgufQ4_0 => "gguf.q4_0/1",
+            QuantScheme::GgufQ4K => "gguf.q4_k/1",
+            QuantScheme::GgufQ5_0 => "gguf.q5_0/1",
+            QuantScheme::GgufQ5K => "gguf.q5_k/1",
+            QuantScheme::GgufQ8_0 => "gguf.q8_0/1",
+            other => {
+                return Err(Error::Checkpoint(format!(
+                    "{other:?} reports a block layout but has no gguf profile"
+                )));
+            }
+        };
+        return Ok((
+            name,
+            Some(Value::Map(vec![
+                (Value::Text("elems_per_block".into()), Value::Uint(elems)),
+                (Value::Text("block_bytes".into()), Value::Uint(bytes)),
+            ])),
+        ));
     }
-    Some(Value::Map(entries))
+
+    match spec.scheme {
+        QuantScheme::None => Ok(("dense", None)),
+
+        // OCP Microscaling: its own profile, because the element is a
+        // sub-byte float and the scale form is fixed by that specification.
+        QuantScheme::Mxfp4E2M1E8M0 => Ok((
+            "zt.mx/1",
+            Some(Value::Map(vec![
+                (Value::Text("axis".into()), Value::Uint(axis)),
+                (Value::Text("block_size".into()), Value::Uint(group)),
+                (
+                    Value::Text("scale_form".into()),
+                    Value::Text("e8m0_exponent".into()),
+                ),
+            ])),
+        )),
+
+        // FP8 weights are not group-quantized codes: they are plain f8
+        // elements whose scales, when there are any, are a separate tensor a
+        // contract pairs with them. `dense` plus the logical type says that
+        // exactly.
+        QuantScheme::Fp8E4M3 | QuantScheme::Fp8E5M2 => Ok(("dense", None)),
+
+        // Everything else is a point in the affine-group space.
+        scheme => {
+            let (order, zero) = match scheme {
+                QuantScheme::AwqInt4 => ("lsb_first", zero_tensor("same_as_data")),
+                QuantScheme::GptqInt4 => ("msb_first", zero_tensor("same_as_data")),
+                QuantScheme::MlxAffineU4 => ("lsb_first", zero_tensor("plain")),
+                QuantScheme::Int4B8 => ("lsb_first", zero_implied(8)),
+                QuantScheme::Int8Symmetric => ("lsb_first", zero_none()),
+                QuantScheme::Int8Asymmetric => ("lsb_first", zero_tensor("plain")),
+                other => {
+                    return Err(Error::Checkpoint(format!(
+                        "{other:?} has no zTensor layout profile"
+                    )));
+                }
+            };
+            let word = if bits == 8 { "u8" } else { "u32" };
+            let word_bits = if bits == 8 { 8 } else { 32 };
+            let per_word = word_bits / bits.max(1);
+            let scale_form = match scheme {
+                QuantScheme::MlxAffineU4 | QuantScheme::AwqInt4 | QuantScheme::GptqInt4 => {
+                    "f16_factors"
+                }
+                _ => "f32_factors",
+            };
+            Ok((
+                "zt.quant_group/1",
+                Some(Value::Map(vec![
+                    (Value::Text("axis".into()), Value::Uint(axis)),
+                    (Value::Text("bits".into()), Value::Uint(bits)),
+                    (Value::Text("group_size".into()), Value::Uint(group)),
+                    (
+                        Value::Text("packing".into()),
+                        Value::Map(vec![
+                            (Value::Text("order".into()), Value::Text(order.into())),
+                            (Value::Text("per_word".into()), Value::Uint(per_word)),
+                            (Value::Text("word".into()), Value::Text(word.into())),
+                        ]),
+                    ),
+                    (
+                        Value::Text("scale_form".into()),
+                        Value::Text(scale_form.into()),
+                    ),
+                    (Value::Text("zero_point".into()), zero),
+                ])),
+            ))
+        }
+    }
+}
+
+fn zero_none() -> Value {
+    Value::Map(vec![(Value::Text("form".into()), Value::Text("none".into()))])
+}
+
+fn zero_implied(value: u64) -> Value {
+    Value::Map(vec![
+        (Value::Text("form".into()), Value::Text("implied".into())),
+        (Value::Text("value".into()), Value::Uint(value)),
+    ])
+}
+
+fn zero_tensor(packing: &str) -> Value {
+    Value::Map(vec![
+        (Value::Text("form".into()), Value::Text("tensor".into())),
+        (Value::Text("packing".into()), Value::Text(packing.into())),
+    ])
 }
 
 /// Writes `tensors` as one canonical `.zt` file at `path`.
@@ -161,11 +240,12 @@ pub fn write_zt(
                 })
             })
             .collect::<Result<_, _>>()?;
+        let (layout, attributes) = profile_of(&decl.encoding)?;
         writer
             .add_object(
                 &decl.name,
                 &shape,
-                layout_of(&decl.encoding)?,
+                layout,
                 &[(
                     "data",
                     PartDef {
@@ -175,7 +255,7 @@ pub fn write_zt(
                         data: tensor.bytes,
                     },
                 )],
-                attributes_of(&decl.encoding),
+                attributes,
             )
             .map_err(zt_err)?;
     }

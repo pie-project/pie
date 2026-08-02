@@ -324,13 +324,16 @@ The only layout defined by this document.
 
 Every other layout — sparse, quantized, anything future — is a **profile**:
 a separately published mini-specification identified by a namespaced,
-versioned id such as `zt.sparse_csr/1` or `pie.paged_kv/1`.
+versioned id such as `zt.sparse_csr/1` or `pie.paged_kv/1`. Profiles live
+beside this document under `spec/profiles/`; this core specification
+defines the mechanism and nothing else.
 
 A layout profile MUST completely specify: its required and optional parts;
 each part's permitted `dtype`/`type`; how each part's decoded size derives
 from `shape` and the object's `attributes`; the meaning of every attribute
 key it uses; and its validation rules. A profile that cannot be implemented
-from its text alone is not a profile.
+from its text alone is not a profile. The test is whether two independent
+implementations, working from the text, produce interchangeable files.
 
 The `zt.` namespace is reserved for profiles blessed by the zTensor registry.
 Vendors MUST use their own namespace prefix. Version suffixes (`/1`, `/2`)
@@ -339,18 +342,50 @@ are mandatory; any semantic change requires a new version.
 A reader encountering an unknown layout MUST NOT interpret the object; it
 MAY expose the object structurally (shape, attributes, raw parts).
 
-Appendix B specifies `zt.sparse_csr/1` as the model of what a profile must
-contain. Further profiles live beside this document under `spec/profiles/`:
-`zt.sparse_coo/1`, `zt.quant_group/1`, `zt.mx/1` (OCP Microscaling block
-formats), and the projection-only `gguf.<type>/1` family.
+The registry at the time of writing: `zt.sparse_csr/1`, `zt.sparse_coo/1`,
+`zt.quant_group/1`, `zt.mx/1`, the `gguf.<type>/1` family, and the encoding
+profile `zt.zstd-seekable/1`.
+
+#### Parametric and opaque profiles
+
+There are two kinds of profile, and choosing the wrong one is the common
+way to write a bad one.
+
+A **parametric** profile describes a space, not a scheme: its attributes
+determine the decoder, and two different attribute sets under the same
+profile are two different schemes. `zt.quant_group/1` is one — affine
+group quantization, where the bit width, group size, packing order, scale
+form and zero-point form are each stated. A parametric profile MUST make
+every parameter its decoder needs a required attribute; anything left
+unstated will be inferred from something incidental, which is how a file
+that happens to use a 32-element group comes to be read as the one scheme
+that used to have 32-element groups.
+
+An **opaque** profile does not describe the payload's internal structure
+at all. It names an authoritative external definition and preserves the
+bytes verbatim. The `gguf.<type>/1` family is opaque: a ggml block struct
+interleaves scales with data, and `q4_k` nests a second level of scales
+quantized to six bits inside a super-block — structure no attribute set
+describes without inventing a layout language. An opaque profile MUST
+still carry the constants a reader needs to validate sizes without
+knowing the layout (for the `gguf` family, `elems_per_block` and
+`block_bytes`), and its version suffix carries real weight: an external
+definition that changes under a stable name is exactly what the suffix
+distinguishes.
+
+Which kind a profile is settled by one question: **can the attributes
+alone determine the decoder?** If they cannot, do not force it. A profile
+parameterized past what its payload actually admits is readable only by
+implementations of the invented language, which is worse than an opaque
+profile with an accurate name.
 
 ### 5.3 Encoding profiles
 
 The core defines exactly one encoding: **raw** (the absence of the
 `encoding` field). Compression algorithms are the most obviously mortal
 component of any container, so they live in L2 like layouts:
-namespaced, versioned encoding profiles. Appendix C specifies
-`zt.zstd-seekable/1`.
+namespaced, versioned encoding profiles, published under
+`spec/profiles/` like layouts.
 
 A reader encountering an unknown encoding MUST refuse to decode the part
 (structural access to the encoded bytes MAY be offered).
@@ -590,40 +625,7 @@ function to `num_elements(shape)`; other layout profiles state which element
 count each part's size function receives (e.g., the reserved `zt.mx/1`
 profile gives the `scales` part one `f8_e8m0` element per 32-element block).
 
-## Appendix B — Layout profile `zt.sparse_csr/1`
-
-Included as the normative model of what a layout profile must specify.
-
-- **Applicability:** rank-2 objects; `shape = [R, C]`.
-- **Parts:**
-  - `values` — nnz elements; any registered `dtype`/`type`.
-  - `indices` — column index per value; `dtype` MUST be `u32` or `u64`;
-    no `type`.
-  - `indptr` — row pointers; same `dtype` as `indices`; decoded element
-    count MUST be `R + 1`.
-- **Derived quantities:** `nnz` = decoded element count of `indices` (whose
-  size function is exact); the decoded size of `values` MUST equal the
-  values type's size function at `nnz`. (Deriving `nnz` from `values` would
-  be ill-defined for packed sub-byte value types.)
-- **Validation (MUST):** `indptr[0] == 0`; `indptr` non-decreasing;
-  `indptr[R] == nnz`; within each row, `indices` strictly increasing;
-  every index `< C`.
-- **Attributes:** none.
-
-## Appendix C — Encoding profile `zt.zstd-seekable/1`
-
-- The encoded bytes are a stream in the **zstd seekable format** (a sequence
-  of independent zstd frames followed by a standard skippable-frame seek
-  table), decodable by any conforming zstd implementation.
-- Every frame MUST carry a content checksum. Frame content size MUST be
-  ≤ 16 MiB; all frames except the last MUST have equal content size (this
-  makes chunk→frame lookup a division).
-- The concatenated decoded output MUST be exactly `decoded_length` bytes;
-  any mismatch is an error.
-- Readers MAY decode individual frames to serve range reads of the decoded
-  stream.
-
-## Appendix D — Recommended conventions (non-normative)
+## Appendix B — Recommended conventions (non-normative)
 
 - **Shard resolution (positional):** for a root file named `<stem>.zt`,
   shard index `k` resolves to a sibling file `<stem>-<k as 5 digits>.zt`
