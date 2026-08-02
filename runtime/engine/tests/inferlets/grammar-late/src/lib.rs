@@ -6,8 +6,8 @@
 //! coalesced into the fire) IS the production device-alias supply path — the
 //! single channel mechanism now serves both the `grammar` (`MASK_OP_OK`) and
 //! this `grammar-late` (`LATE_MASK_OK`) verify. Kept as its own inferlet (own
-//! JSON knobs + result field names) so the R=2 barrier (`cuda_grammar_r2`)
-//! keeps its two DISJOINT-alphabet, distinguishable-token proof.
+//! JSON knobs + result field names) so it keeps its two DISJOINT-alphabet,
+//! distinguishable-token proof.
 //!
 //! Two non-degenerate asserts (the cut #1 discipline — an all-allowed no-op
 //! mask cannot pass):

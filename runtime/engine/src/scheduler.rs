@@ -241,14 +241,14 @@ pub fn channel_capacity() -> usize {
 }
 
 // =============================================================================
-// Fire trace (`PIE_SCHED_TRACE` / `PIE_SCHED_TRACE_FILE`)
+// Frame dispatch trace (`PIE_SCHED_TRACE` / `PIE_SCHED_TRACE_FILE`)
 // =============================================================================
 
-/// Whether the scheduler fire trace is enabled. Read once (cached, like
+/// Whether the scheduler dispatch trace is enabled. Read once (cached, like
 /// `frame::configured_max_in_flight`'s env lever) — MUST be set before the first fire
 /// (before boot), since later env mutations are never re-observed. `worker`
-/// checks this before doing any per-fire trace bookkeeping (e.g. the
-/// distinct-program count), so tracing off costs nothing on the hot path.
+/// checks this before doing any per-dispatch trace bookkeeping, so tracing
+/// off costs nothing on the hot path.
 pub(crate) fn sched_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
@@ -257,9 +257,8 @@ pub(crate) fn sched_trace_enabled() -> bool {
 
 /// The optional trace sink (`PIE_SCHED_TRACE_FILE`), opened once in append
 /// mode. A real file — unlike `eprintln!`'s fd 2 — survives libtest's
-/// stdout/stderr capture-sink for a background scheduler thread (see
-/// `cuda_grammar10.rs`'s `StderrCapture` doc for why the file form exists
-/// alongside the fd-2 form `cuda_grammar_r2.rs` captures via `dup2`).
+/// stdout/stderr capture-sink for a background scheduler thread, which is
+/// why the file form exists alongside the fd-2 form.
 fn sched_trace_file() -> Option<&'static Mutex<std::fs::File>> {
     static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
     FILE.get_or_init(|| {
@@ -274,13 +273,12 @@ fn sched_trace_file() -> Option<&'static Mutex<std::fs::File>> {
     .as_ref()
 }
 
-/// Appends one `[pie-sched-trace] …` fire line: to stderr (fd 2 — the
-/// `cuda_grammar_r2` capture) always when [`sched_trace_enabled`], and ALSO
-/// to `PIE_SCHED_TRACE_FILE` when set (the `cuda_grammar10` capture),
+/// Appends one `[pie-sched-trace] …` line: to stderr (fd 2) always when
+/// [`sched_trace_enabled`], and ALSO to `PIE_SCHED_TRACE_FILE` when set,
 /// flushed immediately so a polling reader observes it append-only and
-/// promptly. Callers should guard any per-fire bookkeeping this line needs
-/// (e.g. a distinct-program count) behind [`sched_trace_enabled`] first, so
-/// tracing-off costs nothing beyond that one flag read.
+/// promptly. Callers should guard any per-dispatch bookkeeping this line
+/// needs behind [`sched_trace_enabled`] first, so tracing-off costs nothing
+/// beyond that one flag read.
 pub(crate) fn sched_trace_write(args: std::fmt::Arguments) {
     if !sched_trace_enabled() {
         return;
