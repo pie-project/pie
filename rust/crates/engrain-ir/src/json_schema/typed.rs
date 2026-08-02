@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
 use super::{
-    JsonSchemaOptions, format_to_regex, generate_bounded_number_regex,
+    JsonSchemaOptions, digit_tail, format_to_regex, generate_bounded_number_regex,
     generate_integer_range_regex, parse_i64_keyword, sanitize_rule_name,
 };
 use crate::frontend::{FrontendExpr as Expr, FrontendGrammar, FrontendRule};
@@ -327,7 +327,7 @@ impl<'a> Converter<'a> {
         let name = self.fresh_name(&format!("{}_value", hint));
         let value = Expr::RuleRef(name.clone());
         let string = self.json_string(0, None)?;
-        let number = self.lexeme("number", unbounded_number())?;
+        let number = self.lexeme("number", unbounded_number(self.options.max_digits))?;
         let pair = seq(vec![
             string.clone(),
             self.ws(),
@@ -488,7 +488,7 @@ impl<'a> Converter<'a> {
         if matches!((min, max), (Some(min), Some(max)) if min > max) {
             bail!("minimum > maximum");
         }
-        regex_to_expr(&generate_integer_range_regex(min, max))
+        regex_to_expr(&generate_integer_range_regex(min, max, self.options.max_digits))
     }
 
     fn visit_number(&mut self, schema: &Value) -> Result<Expr> {
@@ -497,7 +497,7 @@ impl<'a> Converter<'a> {
             .iter()
             .any(|keyword| object.contains_key(*keyword));
         if !has_bounds {
-            return Ok(unbounded_number());
+            return Ok(unbounded_number(self.options.max_digits));
         }
         if object.contains_key("exclusiveMinimum") || object.contains_key("exclusiveMaximum") {
             bail!("exclusive bounds are not supported for number schemas");
@@ -1820,9 +1820,18 @@ fn byte_literal(byte: u8) -> Expr {
     Expr::literal(vec![byte])
 }
 
-fn unbounded_number() -> Expr {
-    regex_to_expr(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
-        .expect("builtin number regex is valid")
+fn unbounded_number(max_digits: Option<u32>) -> Expr {
+    // Every run of digits is bounded by the same budget, because a fraction or
+    // an exponent runs away exactly as an integer part does.
+    let tail = digit_tail(max_digits);
+    let run = match max_digits {
+        Some(budget) => format!("[0-9]{{1,{budget}}}"),
+        None => "[0-9]+".to_string(),
+    };
+    regex_to_expr(&format!(
+        r"-?(?:0|[1-9]{tail})(?:\.{run})?(?:[eE][+-]?{run})?"
+    ))
+    .expect("builtin number regex is valid")
 }
 
 fn json_literal(value: &Value) -> Expr {

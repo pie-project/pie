@@ -42,6 +42,8 @@ pub struct Limits {
     /// `additionalProperties` is open - and it is not cheap. See the note on
     /// `compile_json_schema`.
     pub exact: bool,
+    /// Digits an unbounded number may run to. See `JsonSchemaOptions`.
+    pub max_digits: Option<u32>,
 }
 
 impl Default for Limits {
@@ -51,6 +53,7 @@ impl Default for Limits {
             lexer_states: 20_000,
             productions: DEFAULT_PRODUCTION_BUDGET,
             exact: false,
+            max_digits: None,
         }
     }
 }
@@ -223,6 +226,7 @@ pub fn compile_json_schema(
     for precision in Precision::LEVELS.iter().copied().skip(entry) {
         let options = JsonSchemaOptions {
             precision,
+            max_digits: limits.max_digits,
             ..Default::default()
         };
         match compile_at(schema, vocabulary, limits, &options) {

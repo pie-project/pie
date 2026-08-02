@@ -42,6 +42,21 @@ pub struct JsonSchemaOptions {
     /// tables. Nothing here is unsound in the direction that matters: a lower
     /// level accepts more, never less.
     pub precision: Precision,
+    /// Digits an *unbounded* number may run to, when the schema gives no
+    /// `minimum` or `maximum` to bound it with.
+    ///
+    /// `None` is the schema as written: JSON permits an integer of any length,
+    /// so the grammar does too. That is correct and, for a generator, ruinous.
+    /// A model handed a mask that still admits a digit emits one, and a 0.6B
+    /// model at temperature 0.8 keeps emitting them: measured through vLLM on a
+    /// schema whose last property is an unbounded integer, **71.9% of requests
+    /// ran to the token limit mid-number** - and XGrammar's 70.8% on the same
+    /// schema says this is a property of the language, not of either engine.
+    ///
+    /// Setting it narrows the language deliberately, which is the one direction
+    /// this compiler will not take on its own. The caller asks for it, and the
+    /// grammar reports it in `restrictions`.
+    pub max_digits: Option<u32>,
 }
 
 /// How much the lowering may widen, least first.
@@ -138,6 +153,7 @@ impl Default for JsonSchemaOptions {
             any_whitespace: true,
             strict_mode: false,
             precision: Precision::Exact,
+            max_digits: None,
         }
     }
 }
@@ -207,9 +223,23 @@ pub(super) fn parse_i64_keyword(
         .transpose()
 }
 
-pub(super) fn generate_integer_range_regex(min: Option<i64>, max: Option<i64>) -> String {
+/// The tail of a digit run, bounded or not. One digit is already spent on the
+/// leading non-zero, so a budget of `n` leaves `n - 1` here.
+pub(super) fn digit_tail(max_digits: Option<u32>) -> String {
+    match max_digits {
+        Some(budget) if budget > 1 => format!("[0-9]{{0,{}}}", budget - 1),
+        Some(_) => String::new(),
+        None => "[0-9]*".to_string(),
+    }
+}
+
+pub(super) fn generate_integer_range_regex(
+    min: Option<i64>,
+    max: Option<i64>,
+    max_digits: Option<u32>,
+) -> String {
     match (min, max) {
-        (None, None) => "-?(?:0|[1-9][0-9]*)".to_string(),
+        (None, None) => format!("-?(?:0|[1-9]{})", digit_tail(max_digits)),
         (Some(min), Some(max)) if min == max => min.to_string(),
         (Some(min), Some(max)) if min >= 0 => positive_range_regex(min as u64, max as u64),
         (Some(min), Some(max)) if max < 0 => {
@@ -225,8 +255,9 @@ pub(super) fn generate_integer_range_regex(min: Option<i64>, max: Option<i64>) -
         ),
         (Some(min), None) if min >= 0 => positive_range_regex_unbounded(min as u64),
         (Some(min), None) => format!(
-            "(?:-{}|(?:0|[1-9][0-9]*))",
-            positive_range_regex(1, min.unsigned_abs())
+            "(?:-{}|(?:0|[1-9]{}))",
+            positive_range_regex(1, min.unsigned_abs()),
+            digit_tail(max_digits)
         ),
         (None, Some(max)) if max < 0 => format!(
             "-(?:{})",

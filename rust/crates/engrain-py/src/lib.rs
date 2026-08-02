@@ -101,17 +101,19 @@ impl Compiler {
     }
 
     /// Compile a JSON Schema, searching the lowerings for one that is LALR(1).
-    #[pyo3(signature = (schema, lexer_states = None, exact = false))]
+    #[pyo3(signature = (schema, lexer_states = None, exact = false, max_digits = None))]
     fn compile_json_schema(
         &self,
         python: Python<'_>,
         schema: &str,
         lexer_states: Option<usize>,
         exact: bool,
+        max_digits: Option<u32>,
     ) -> PyResult<CompiledGrammar> {
         let limits = Limits {
             lexer_states: lexer_states.unwrap_or(Limits::default().lexer_states),
             exact,
+            max_digits,
             ..Default::default()
         };
         // Compiling holds no Python object and takes tens of milliseconds
