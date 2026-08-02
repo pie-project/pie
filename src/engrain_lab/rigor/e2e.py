@@ -104,6 +104,16 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--repeats", type=int, default=12)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument(
+        "--unique",
+        action="store_true",
+        help="give every request its own schema, drawn from the corpus rather "
+        "than the three built in. This is the case that should hurt us: our "
+        "fill deduplicates rows sharing a grammar and a parse state, and the "
+        "buffers are sized by maxima over the whole pool, while a host-side "
+        "matcher's per-sequence call is schema-agnostic. It also makes the "
+        "compiler part of the measurement, which is where we are weakest.",
+    )
     parser.add_argument("--memory", type=float, default=0.45)
     arguments = parser.parse_args()
 
@@ -125,13 +135,37 @@ def main() -> int:
         **settings,
     )
 
-    report = {"backend": arguments.backend, "model": arguments.model, "rows": []}
+    corpus: list[dict] = []
+    if arguments.unique:
+        # Only schemas every engine compiles, so no arm is measured on a set
+        # another could not have run. The list comes from the coverage sweep.
+        common = json.loads((RESULTS / "baseline-coverage.json").read_text())["common"]
+        instances = json.loads(
+            (RESULTS / "jsonschemabench-instances.json").read_text()
+        )["instances"]
+        corpus = [json.loads(instances[i]["schema"]) for i in common]
+
+    report = {
+        "backend": arguments.backend,
+        "model": arguments.model,
+        "unique": arguments.unique,
+        "rows": [],
+    }
     for batch in arguments.batches:
-        assigned = [SCHEMAS[i % len(SCHEMAS)] for i in range(batch)]
-        prompts = [
-            f"Give a JSON {SUBJECTS[i % len(SCHEMAS)]} record {i}. JSON only."
-            for i in range(batch)
-        ]
+        if arguments.unique:
+            assigned = [corpus[i % len(corpus)] for i in range(batch)]
+            prompts = [
+                f"Produce one JSON document, number {i}. JSON only."
+                for i in range(batch)
+            ]
+            distinct = min(batch, len(corpus))
+        else:
+            assigned = [SCHEMAS[i % len(SCHEMAS)] for i in range(batch)]
+            prompts = [
+                f"Give a JSON {SUBJECTS[i % len(SCHEMAS)]} record {i}. JSON only."
+                for i in range(batch)
+            ]
+            distinct = min(batch, len(SCHEMAS))
         params = [
             SamplingParams(
                 temperature=0.8,
@@ -170,11 +204,16 @@ def main() -> int:
                 document = json.loads(output.outputs[0].text.strip())
             except Exception:  # noqa: BLE001
                 continue
-            if set(document) == set(schema["required"]):
+            # Over a corpus of real schemas the cheap key check does not apply,
+            # so parseability is what is counted and the soundness harness is
+            # what checks the schema.
+            required = schema.get("required") if isinstance(schema, dict) else None
+            if required is None or set(document) >= set(required):
                 valid += 1
 
         row = {
             "batch": batch,
+            "distinct_schemas": distinct,
             "seconds": _quantiles(seconds),
             "tokens_per_second": _quantiles(rates),
             "tokens_generated_p50": statistics.median(produced),
@@ -188,12 +227,13 @@ def main() -> int:
             f"[p25 {rate['p25']:.0f}, p75 {rate['p75']:.0f}, "
             f"range {rate['min']:.0f}-{rate['max']:.0f}]  "
             f"{row['tokens_generated_p50']} tokens  "
-            f"{valid}/{batch} valid",
+            f"{distinct} schemas  {valid}/{batch} valid",
             flush=True,
         )
 
     RESULTS.mkdir(exist_ok=True)
-    out = RESULTS / f"e2e-{arguments.backend}.json"
+    tag = "-unique" if arguments.unique else ""
+    out = RESULTS / f"e2e-{arguments.backend}{tag}.json"
     out.write_text(json.dumps(report, indent=2))
     print(f"written to {out}")
     return 0
