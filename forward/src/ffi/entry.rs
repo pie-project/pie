@@ -20,8 +20,8 @@
 //!   answer.
 
 use crate::facts::{
-    LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm, Qwen35FullAttnFacts,
-    Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
+    LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm, Qwen35CudaFacts,
+    Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 use crate::trace::{FireClass, NormVariant, RopeKind};
 
@@ -356,6 +356,42 @@ fn read_hybrid_facts(
     })
 }
 
+/// The CUDA backend facts for a LOWERED qwen3_5 hybrid trace, as C
+/// states them. Mirrors [`crate::facts::Qwen35CudaFacts`] field for
+/// field; same input-side rules as [`PieForwardLlamaLikeFacts`] (the
+/// bools are `uint8_t`, non-zero is true; the thresholds are plain
+/// `uint32_t` values the tracer has no basis to second-guess).
+///
+/// The driver fills this from its OWN derivation (the env gates
+/// `PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST` /
+/// `..._WARP_TILED_MAX_TOKENS` / `..._CACHED_PREFILL_MAX_TOKENS`, the
+/// state dtype, the K_d bound) at cold start — the same terms
+/// `declared_forward.cpp`'s hoisted predicates compute today.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieForwardQwen35CudaFacts {
+    /// The recurrent-state store dtype is bf16; non-zero is true.
+    pub state_bf16: u8,
+    /// The warp-tiled prefill arm exists at all (K_d bound && the
+    /// state-persist env gate); non-zero is true.
+    pub warp_tiled: u8,
+    /// `qwen35_gdn_warp_tiled_max_tokens()` — the warp-tiled arm's
+    /// `TokensLE` payload.
+    pub warp_tiled_max: u32,
+    /// `qwen35_gdn_cached_prefill_max_tokens()` — the cached arm's
+    /// `TokensLE` payload.
+    pub cached_max: u32,
+}
+
+fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts {
+    Qwen35CudaFacts {
+        state_bf16: facts.state_bf16 != 0,
+        warp_tiled: facts.warp_tiled != 0,
+        warp_tiled_max: facts.warp_tiled_max,
+        cached_max: facts.cached_max,
+    }
+}
+
 /// Run `f`, aborting the process if it panics.
 ///
 /// Equivalent to letting the unwind hit the `extern "C"` boundary — the
@@ -599,6 +635,57 @@ pub unsafe extern "C" fn pie_forward_trace_qwen3_5_hybrid(
     })
 }
 
+/// Trace the LOWERED qwen3_5 hybrid — the same text as
+/// [`pie_forward_trace_qwen3_5_hybrid`], with the CUDA backend facts and
+/// a fire class in hand, so the class arms run and the traced form
+/// states its kernels as `Launch` ops with the recurrence three-way
+/// behind value-producing `Guard` chains (north-star-dsl.md rung 4c).
+/// Call once per class the deployment fires; the semantic entry remains
+/// the parity reference.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardQwen35HybridFacts`] / [`PieForwardQwen35CudaFacts`];
+/// `out_plan` is null or a writable slot. `class` is a
+/// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
+/// enum rule); anything else answers `InvalidArgument` — including the
+/// service classes CommitAdvance (2) and StateOnly (3), which are rung
+/// 4c-iv's and not yet traceable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_forward_trace_qwen3_5_hybrid_cuda(
+    facts: *const PieForwardQwen35HybridFacts,
+    cuda: *const PieForwardQwen35CudaFacts,
+    class: u32,
+    out_plan: *mut PieForwardPlan,
+) -> PieForwardStatus {
+    abort_on_panic(|| {
+        if out_plan.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        unsafe { *out_plan = PieForwardPlan::default() };
+        if facts.is_null() || cuda.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        let facts = match read_hybrid_facts(unsafe { &*facts }) {
+            Ok(facts) => facts,
+            Err(status) => return status,
+        };
+        let cuda = read_qwen35_cuda_facts(unsafe { &*cuda });
+        let class = match class {
+            0 => FireClass::Decode,
+            1 => FireClass::Prefill,
+            // 2 (CommitAdvance) and 3 (StateOnly) are real classes of
+            // this family but their traces are rung 4c-iv; until then
+            // they are refused here, not defaulted.
+            _ => return PieForwardStatus::InvalidArgument,
+        };
+        let plan = crate::family::qwen3_5_hybrid_cuda(&facts, &cuda, class);
+        unsafe { *out_plan = arena::build(&plan) };
+        PieForwardStatus::Ok
+    })
+}
+
 /// Free the storage behind a plan header filled by
 /// [`pie_forward_trace_llama_like`], [`pie_forward_trace_qwen3_5_moe_mlp`],
 /// [`pie_forward_trace_qwen3_5_gdn`],
@@ -634,12 +721,13 @@ unsafe impl Sync for EntryAddr {}
 /// (`loader/src/ffi/entry.rs:637-652`, `loader/architecture.md` §3.4).
 /// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
-static KEEP_ALIVE: [EntryAddr; 7] = [
+static KEEP_ALIVE: [EntryAddr; 8] = [
     EntryAddr(pie_forward_trace_llama_like as *const ()),
     EntryAddr(pie_forward_trace_llama_like_cuda as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_moe_mlp as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_gdn as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_full_attn as *const ()),
     EntryAddr(pie_forward_trace_qwen3_5_hybrid as *const ()),
+    EntryAddr(pie_forward_trace_qwen3_5_hybrid_cuda as *const ()),
     EntryAddr(pie_forward_release as *const ()),
 ];

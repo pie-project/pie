@@ -683,6 +683,18 @@ pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f
     guarded(m).arm(pred, then_f).otherwise(else_f);
 }
 
+/// [`guard`] for declarations that carry no [`M`] (the qwen3_5 bodies
+/// build their own weight namespaces and run against a bare [`Trace`]):
+/// the same two-way chain, opened on the tape directly.
+pub(crate) fn guard_on(
+    t: &Trace,
+    pred: crate::trace::GuardPred,
+    then_f: impl FnOnce(),
+    else_f: impl FnOnce(),
+) {
+    guarded_on(t).arm(pred, then_f).otherwise(else_f);
+}
+
 // ── Raw kernel signatures ──────────────────────────────────────────────
 
 /// The CUDA launchers a lowered declaration may state, one function per
@@ -723,6 +735,15 @@ pub mod cuda {
         Some(StateRef {
             store: StateStore::KvCache,
             layer: kv.l,
+        })
+    }
+
+    /// The GDN ops' state mark, [`kv_state`]-style: the layer's
+    /// per-request conv/recurrent slabs.
+    fn rs_state(rs: &Rs) -> Option<StateRef> {
+        Some(StateRef {
+            store: StateStore::RecurrentState,
+            layer: rs.l,
         })
     }
 
@@ -829,6 +850,17 @@ pub mod cuda {
         attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
     }
 
+    /// `ops::dispatch_attention_flashinfer_prefill_bf16` ALONE — no
+    /// dequant launch. The llama_like pair above is llama-specific: its
+    /// cache may be quantized, so the hand-written prefill path dequants
+    /// the layer first. qwen3_5's full-attention path gates on a
+    /// native-bf16 cache and launches only the dispatch
+    /// (`qwen3_5_forward.cpp::full_attn_layer_body`), so its lowered arm
+    /// states exactly one launch.
+    pub fn attention_flashinfer_prefill_planned(q: &Val, kv: &Kv, q_width: u32) -> Val {
+        attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_bf16")
+    }
+
     /// `kernels::launch_write_kv_explicit_bf16`: the explicit-descriptor
     /// KV write (graph-replay steering; N cells, one per query token).
     /// Stated inside the `HasWriteDesc` guard's then-region.
@@ -855,6 +887,181 @@ pub mod cuda {
             vec![],
             kv_state(kv),
             vec![k.id, v.id],
+            None,
+        );
+    }
+
+    /// `kernels::launch_causal_conv1d_update_batched_bf16`: the
+    /// slot-indirected decode conv update (+ fused SiLU) against the
+    /// layer's per-request conv slab. Shape-preserving, like the
+    /// semantic [`causal_conv1d`] it lowers.
+    pub fn gdn_conv_update_batched(x: &Val, w: &ConvW, rs: &Rs) -> Val {
+        gdn_conv(x, w, rs, "launch_causal_conv1d_update_batched_bf16")
+    }
+
+    /// `kernels::launch_causal_conv1d_prefill_batched_bf16`: the batched
+    /// prefill conv walk (each request walking its qo_indptr window and
+    /// persisting the trailing K-window into the slab).
+    pub fn gdn_conv_prefill_batched(x: &Val, w: &ConvW, rs: &Rs) -> Val {
+        gdn_conv(x, w, rs, "launch_causal_conv1d_prefill_batched_bf16")
+    }
+
+    fn gdn_conv(x: &Val, w: &ConvW, rs: &Rs, kernel: &str) -> Val {
+        let ids = x.t.with(Some(w.layer), |b| {
+            let shape = b.value_shape(x.id);
+            b.launch(
+                kernel,
+                vec![w.name.clone()],
+                rs_state(rs),
+                vec![x.id],
+                vec![(shape, DType::BF16)],
+            )
+        });
+        Val {
+            t: x.t.clone(),
+            id: ids[0],
+            layer: Some(w.layer),
+        }
+    }
+
+    /// `kernels::launch_recurrent_gated_delta_step_batched[_gqa][_state_bf16]`:
+    /// the one-token decode recurrence step against the layer's
+    /// per-request recurrent state. `gqa` states the compact-K_h-indexing
+    /// GQA variant (value heads != key heads); `state_bf16` the store
+    /// dtype. Output = the semantic [`gated_delta`]'s: the core keeps v's
+    /// `[Tokens, Vh, Vd]` f32 shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_step_batched(
+        q: &Val,
+        k: &Val,
+        v: &Val,
+        g: &Val,
+        beta: &Val,
+        rs: &Rs,
+        gqa: bool,
+        state_bf16: bool,
+    ) -> Val {
+        let kernel = match (gqa, state_bf16) {
+            (true, true) => "launch_recurrent_gated_delta_step_batched_gqa_state_bf16",
+            (true, false) => "launch_recurrent_gated_delta_step_batched_gqa",
+            (false, true) => "launch_recurrent_gated_delta_step_batched_state_bf16",
+            (false, false) => "launch_recurrent_gated_delta_step_batched",
+        };
+        let ids = q.t.with(Some(rs.l), |b| {
+            let shape = b.value_shape(v.id);
+            b.launch(
+                kernel,
+                vec![],
+                rs_state(rs),
+                vec![q.id, k.id, v.id, g.id, beta.id],
+                vec![(shape, DType::F32)],
+            )
+        });
+        Val {
+            t: q.t.clone(),
+            id: ids[0],
+            layer: Some(rs.l),
+        }
+    }
+
+    /// `kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled[_gqa][_state_bf16]`:
+    /// the warp-tiled small-N prefill recurrence. NOT a value producer:
+    /// the three prefill recurrence signatures record launches with NO
+    /// outputs, because each runs inside a value-producing guard chain
+    /// ([`guarded_value`]) whose output IS the recurrence core — the
+    /// region launches bind the guard's buffer and add no SSA values of
+    /// their own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_prefill_warp_tiled(
+        q: &Val,
+        k: &Val,
+        v: &Val,
+        g: &Val,
+        beta: &Val,
+        rs: &Rs,
+        gqa: bool,
+        state_bf16: bool,
+    ) {
+        let kernel = match (gqa, state_bf16) {
+            (true, true) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
+            (true, false) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa",
+            (false, true) => "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+            (false, false) => "launch_chunk_gated_delta_prefill_batched_warp_tiled",
+        };
+        gdn_prefill(q, k, v, g, beta, rs, kernel);
+    }
+
+    /// `kernels::launch_chunk_gated_delta_prefill_batched_cached[_state_bf16]`:
+    /// the env-gated cached prefill recurrence. No `_gqa` variant exists —
+    /// this family indexes the REPEATED `[Vh]`-head layout, which is why
+    /// its guard arm materializes [`repeat_interleave_heads`] first.
+    /// Guard-region launch, output-less like the warp-tiled form.
+    pub fn gdn_prefill_cached(
+        q: &Val,
+        k: &Val,
+        v: &Val,
+        g: &Val,
+        beta: &Val,
+        rs: &Rs,
+        state_bf16: bool,
+    ) {
+        let kernel = if state_bf16 {
+            "launch_chunk_gated_delta_prefill_batched_cached_state_bf16"
+        } else {
+            "launch_chunk_gated_delta_prefill_batched_cached"
+        };
+        gdn_prefill(q, k, v, g, beta, rs, kernel);
+    }
+
+    /// `kernels::launch_chunk_gated_delta_prefill_batched[_state_bf16]`:
+    /// the batched GQA-aware FLA prefill recurrence — the fallback arm
+    /// (it indexes the compact K_h layout directly, so no repeats).
+    /// Guard-region launch, output-less like the warp-tiled form.
+    pub fn gdn_prefill_fla(
+        q: &Val,
+        k: &Val,
+        v: &Val,
+        g: &Val,
+        beta: &Val,
+        rs: &Rs,
+        state_bf16: bool,
+    ) {
+        let kernel = if state_bf16 {
+            "launch_chunk_gated_delta_prefill_batched_state_bf16"
+        } else {
+            "launch_chunk_gated_delta_prefill_batched"
+        };
+        gdn_prefill(q, k, v, g, beta, rs, kernel);
+    }
+
+    fn gdn_prefill(q: &Val, k: &Val, v: &Val, g: &Val, beta: &Val, rs: &Rs, kernel: &str) {
+        record(
+            &q.t,
+            Some(rs.l),
+            kernel,
+            vec![],
+            rs_state(rs),
+            vec![q.id, k.id, v.id, g.id, beta.id],
+            None,
+        );
+    }
+
+    /// `kernels::launch_repeat_interleave_heads_fp32`: materialize the
+    /// K_h → V_h head repeat of a compact per-head f32 value into the
+    /// workspace buffer the cached recurrence family reads. Output-less:
+    /// where that buffer lives is the driver's binding, not dataflow —
+    /// the same stance as the KV writes. Stated only inside the cached
+    /// arm, because only that kernel family consumes the repeated layout
+    /// (the decode-GQA step, warp-tiled and FLA kernels all index the
+    /// compact layout directly).
+    pub fn repeat_interleave_heads(x: &Val) {
+        record(
+            &x.t,
+            x.layer,
+            "launch_repeat_interleave_heads_fp32",
+            vec![],
+            None,
+            vec![x.id],
             None,
         );
     }

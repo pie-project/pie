@@ -23,11 +23,11 @@ use std::path::PathBuf;
 
 use pie_forward::family::{
     llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
-    qwen3_5_moe_mlp_block,
+    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block,
 };
 use pie_forward::{
-    FireClass, ForwardPlan, LlamaLikeCudaFacts, LlamaLikeFacts, Qwen35FullAttnFacts,
-    Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
+    FireClass, ForwardPlan, LlamaLikeCudaFacts, LlamaLikeFacts, Qwen35CudaFacts,
+    Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
 fn golden_path(name: &str) -> PathBuf {
@@ -181,6 +181,45 @@ fn qwen3_5_hybrid_0_8b() {
     check_plan(
         "qwen3_5_hybrid_0_8b",
         &qwen3_5_hybrid(&Qwen35HybridFacts::qwen3_5_0_8b()),
+    );
+}
+
+/// The first LOWERED qwen3_5 goldens (north-star-dsl.md rung 4c-ii): the
+/// SAME hybrid text, traced with the SYNTHETIC CUDA backend facts
+/// ([`Qwen35CudaFacts::qwen3_5_0_8b_synthetic`] — these pin the golden
+/// FORM only; the live derivation + digest validation is 4c-iii) and a
+/// fire class in hand. Decode: every GDN layer states the conv update +
+/// decode recurrence step as Launches (no Guard — the decode step has no
+/// N-threshold), every full-attention layer the HasWriteDesc KV-write
+/// guard + the FlashInfer decode dispatch.
+#[test]
+fn qwen3_5_hybrid_0_8b_cuda_decode() {
+    check_plan(
+        "qwen3_5_hybrid_0_8b.cuda.decode",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_5_0_8b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+/// The prefill-class lowering of the same text: every GDN layer states
+/// the prefill conv walk and the recurrence three-way as the first
+/// VALUE-PRODUCING guard chain — TokensLE(64) warp-tiled, TokensLE(4096)
+/// cached, else FLA, the guard's output being the core the gated norm
+/// consumes — and every full-attention layer the KV-write guard + the
+/// dequant-less planned prefill dispatch (qwen3_5's cache is bf16-gated,
+/// unlike llama_like's dequant+dispatch pair).
+#[test]
+fn qwen3_5_hybrid_0_8b_cuda_prefill() {
+    check_plan(
+        "qwen3_5_hybrid_0_8b.cuda.prefill",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_5_0_8b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::Prefill,
+        ),
     );
 }
 

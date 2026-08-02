@@ -485,6 +485,31 @@ struct PieForwardQwen35HybridFacts {
   PieForwardQwen35MoeMlpFacts moe;
 };
 
+/// The CUDA backend facts for a LOWERED qwen3_5 hybrid trace, as C
+/// states them. Mirrors [`crate::facts::Qwen35CudaFacts`] field for
+/// field; same input-side rules as [`PieForwardLlamaLikeFacts`] (the
+/// bools are `uint8_t`, non-zero is true; the thresholds are plain
+/// `uint32_t` values the tracer has no basis to second-guess).
+///
+/// The driver fills this from its OWN derivation (the env gates
+/// `PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST` /
+/// `..._WARP_TILED_MAX_TOKENS` / `..._CACHED_PREFILL_MAX_TOKENS`, the
+/// state dtype, the K_d bound) at cold start — the same terms
+/// `declared_forward.cpp`'s hoisted predicates compute today.
+struct PieForwardQwen35CudaFacts {
+  /// The recurrent-state store dtype is bf16; non-zero is true.
+  uint8_t state_bf16;
+  /// The warp-tiled prefill arm exists at all (K_d bound && the
+  /// state-persist env gate); non-zero is true.
+  uint8_t warp_tiled;
+  /// `qwen35_gdn_warp_tiled_max_tokens()` — the warp-tiled arm's
+  /// `TokensLE` payload.
+  uint32_t warp_tiled_max;
+  /// `qwen35_gdn_cached_prefill_max_tokens()` — the cached arm's
+  /// `TokensLE` payload.
+  uint32_t cached_max;
+};
+
 extern "C" {
 
 /// Trace the llama_like family against `facts` and publish the traced form
@@ -590,6 +615,28 @@ PieForwardStatus pie_forward_trace_qwen3_5_full_attn(const PieForwardQwen35FullA
 /// `out_plan` is null or a writable slot.
 PieForwardStatus pie_forward_trace_qwen3_5_hybrid(const PieForwardQwen35HybridFacts *facts,
                                                   PieForwardPlan *out_plan);
+
+/// Trace the LOWERED qwen3_5 hybrid — the same text as
+/// [`pie_forward_trace_qwen3_5_hybrid`], with the CUDA backend facts and
+/// a fire class in hand, so the class arms run and the traced form
+/// states its kernels as `Launch` ops with the recurrence three-way
+/// behind value-producing `Guard` chains (north-star-dsl.md rung 4c).
+/// Call once per class the deployment fires; the semantic entry remains
+/// the parity reference.
+///
+/// # Safety
+///
+/// `facts` / `cuda` are null or point at readable
+/// [`PieForwardQwen35HybridFacts`] / [`PieForwardQwen35CudaFacts`];
+/// `out_plan` is null or a writable slot. `class` is a
+/// [`PieForwardFireClass`] value crossed as `uint32_t` (the input-side
+/// enum rule); anything else answers `InvalidArgument` — including the
+/// service classes CommitAdvance (2) and StateOnly (3), which are rung
+/// 4c-iv's and not yet traceable.
+PieForwardStatus pie_forward_trace_qwen3_5_hybrid_cuda(const PieForwardQwen35HybridFacts *facts,
+                                                       const PieForwardQwen35CudaFacts *cuda,
+                                                       uint32_t class_,
+                                                       PieForwardPlan *out_plan);
 
 /// Free the storage behind a plan header filled by
 /// [`pie_forward_trace_llama_like`], [`pie_forward_trace_qwen3_5_moe_mlp`],
