@@ -243,14 +243,14 @@ LoadedModel LoadedModel::load(
     LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
     log_stage("compile LoadPlan done");
 
-    log_stage("open safetensors begin");
+    log_stage("open checkpoint source begin");
     // On the heap because streaming outlives this function: a group is paged
     // in by reading the same files the resident load read, so the handles have
     // to survive it, and the cache holds a reference to them.
     auto source = std::make_unique<pie_loader::CheckpointSource>(
         planned_load.plan.view());
     pie_loader::CheckpointSource& loader = *source;
-    log_stage("open safetensors done");
+    log_stage("open checkpoint source done");
 
     // What used to sit here: `supports_tp()` — a list of twenty-odd model_type
     // strings — followed by eighty lines of per-family divisibility rules read
