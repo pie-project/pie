@@ -35,6 +35,7 @@ pub use frame::FrameStamp;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
@@ -154,6 +155,32 @@ pub async fn debug_dump(driver_id: usize) -> Result<String> {
 // =============================================================================
 // Frame size (`PIE_FRAME_SIZE`) — the Vesuvius deployment constant k
 // =============================================================================
+
+/// How long a lane that is holding the frame wait-set may go without
+/// HARD-BLOCKING a frame's seal may go without submitting before the engine
+/// terminates it (`[model.scheduler] submit_deadline_us`, default 50ms).
+/// Guests read it as `model.submit-deadline-us()`.
+///
+/// Small enough to be a real bound on fleet exposure because it measures a
+/// much narrower interval than its size suggests: the clock runs only while
+/// the lane is an awaited member with nothing submitted, and is stopped by
+/// run-ahead, by an unretired dispatch (the engine owes it a result), by a
+/// bind in flight, and by `forward.park()`. Host turnaround has its own
+/// headroom in `HOST_TURNAROUND_WAVES`.
+///
+/// Static, deliberately: a number that can kill must not move, so unlike
+/// `channel-capacity` this is never adapted from runtime timing.
+pub fn configured_submit_deadline() -> Duration {
+    *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(50_000))
+}
+
+/// Install the configured deadline at bootstrap. First writer wins; later
+/// calls are ignored so the value a guest has already read cannot change.
+pub fn set_submit_deadline(deadline: Duration) {
+    let _ = SUBMIT_DEADLINE.set(deadline);
+}
+
+static SUBMIT_DEADLINE: OnceLock<Duration> = OnceLock::new();
 
 /// Waves per frame (k): a static deployment constant, fixed at engine start
 /// exactly like the KV page size — never renegotiated per frame and never

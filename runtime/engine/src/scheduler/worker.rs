@@ -158,6 +158,20 @@ pub(crate) async fn notify_pipeline_close(pid: ProcessId) {
     notify_pipeline_leave_and_wait(pid, LeaveKind::Close).await;
 }
 
+/// `forward.park()`: the lane is leaving the frame wait-set until it fires
+/// again. Broadcast to every driver's scheduler and fire-and-forget — a
+/// policy that has never seen the lane fire ignores it, and the exit is
+/// ordered by `seq` against that lane's own submits rather than against this
+/// call. Deliberately NOT routed through the control path: park exists to
+/// release a gather, and the control slot is depth 1, so a park queued behind
+/// the dispatch the gather is holding could never arrive.
+pub(crate) fn notify_lane_park(pid: ProcessId, seq: u64) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::LanePark { lane: pid, seq });
+    }
+}
+
 /// A retiring process released its capped execution permit (capped
 /// deployments only). Broadcast to every driver's scheduler (mirrors
 /// [`notify_pipeline_leave`]): a policy with no staged successor ignores it,
@@ -665,6 +679,12 @@ enum SchedulerItem {
         seq: u64,
         submitted: u32,
     },
+    /// `forward.park()`: the guest is leaving the seal's wait-set until it
+    /// fires again. Ordered against that lane's submits by `seq` — the exit
+    /// lands once every frame submitted before it has sealed, so a guest may
+    /// park with fires still outstanding (frame mode only; a no-op
+    /// otherwise).
+    LanePark { lane: ProcessId, seq: u64 },
     /// Snapshot the run loop's state as a human-readable dump (queue
     /// composition, in-flight work, barrier membership). Answered inline on
     /// dequeue — a held wave must be inspectable from outside the thread.
@@ -2137,7 +2157,6 @@ impl SchedulerHandle {
     pub(crate) fn nudge(&self) -> Result<()> {
         self.send(SchedulerItem::Nudge)
     }
-
     pub async fn register_program(&self, plan: ProgramRegistration) -> Result<u64> {
         let program_hash = plan.program_hash;
         {
@@ -2496,6 +2515,7 @@ impl BatchScheduler {
                 &mut instances,
                 &mut pending,
                 &stats,
+                &mut frame_policy,
             );
             progress |= Self::retire_ready_control(&mut in_flight_control);
             let retire_done = Instant::now();
@@ -3003,6 +3023,9 @@ impl BatchScheduler {
                 submitted,
             } => {
                 frame_policy.on_frame_truncated(lane, seq, submitted);
+            }
+            SchedulerItem::LanePark { lane, seq } => {
+                frame_policy.on_lane_park(lane, seq);
             }
             SchedulerItem::RegisterProgram { plan, response } => {
                 pending.push_back(QueuedItem::RegisterProgram { plan, response });
@@ -3918,6 +3941,28 @@ impl BatchScheduler {
                         break;
                     }
                     FramePlan::Park => break,
+                    FramePlan::Terminate(pids) => {
+                        // Submit-deadline breach. The policy has already
+                        // dropped these lanes from the wait-set, so the
+                        // `continue` re-plans a gather that no longer waits
+                        // on them; the terminate itself is asynchronous and
+                        // arrives back as the usual leave.
+                        for pid in pids {
+                            tracing::error!(
+                                pid = %pid,
+                                "scheduler: terminating process for submit-deadline breach \
+                                 (held the frame wait-set without submitting; a pipeline that \
+                                 intends to stop must call forward.park())"
+                            );
+                            crate::inferlet::process::terminate(
+                                pid,
+                                Err("submit deadline exceeded: the pipeline held a frame's \
+                                     wait-set without submitting and without parking"
+                                    .to_string()),
+                            );
+                        }
+                        continue;
+                    }
                 }
             };
             if let Some(plan_started) = plan_started {
@@ -4202,6 +4247,7 @@ impl BatchScheduler {
         instances: &mut HashMap<u64, TrackedInstance>,
         pending: &mut PendingQueue,
         stats: &Arc<SchedulerStats>,
+        frame_policy: &mut FramePolicy,
     ) -> bool {
         let mut progress = false;
         while let Some(front) = in_flight_launches.front() {
@@ -4224,6 +4270,10 @@ impl BatchScheduler {
                 _ => None,
             };
             let mut retired = in_flight_launches.pop_front().expect("front batch exists");
+            // The engine has answered these lanes: re-arm their submit
+            // deadline from here so the wave they waited on is not charged
+            // to them (see `FramePolicy::on_frame_retired`).
+            frame_policy.on_frame_retired(retired.requests.iter().filter_map(|r| r.pipeline_id));
             let native_complete_us = retired.timing.as_ref().map(|_| super::fire_timing_now_us());
             let timing_snapshots = retired
                 .timing

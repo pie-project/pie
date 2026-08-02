@@ -68,6 +68,12 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::configured_frame_size() as u32)
     }
 
+    /// Bound on how long a pipeline may hold a frame's wait-set without
+    /// submitting. See `scheduler::configured_submit_deadline`.
+    async fn submit_deadline_us(&mut self) -> Result<u64> {
+        Ok(crate::scheduler::configured_submit_deadline().as_micros() as u64)
+    }
+
     /// Host-reader channel capacity, in cells, that sustains the engine's
     /// run-ahead for one lane. Includes the staging margin; see
     /// `scheduler::channel_capacity`.
