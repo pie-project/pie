@@ -316,6 +316,27 @@ pub struct LlamaLikeCudaFacts {
     /// Serde-defaulted (append-only discipline).
     #[serde(default)]
     pub head_dim_padded: bool,
+    /// The checkpoint materialised a packed gate‖up bank
+    /// (`w.layers[l].gate_up_proj_fused != nullptr`), so the MLP's packed
+    /// GEMM lands in one buffer and the activation is the CHUNKED swiglu
+    /// over it; without it the projection writes two buffers and the
+    /// activation is the pair form.
+    ///
+    /// A pure WEIGHT-BINDING fact, which is why it belongs here rather
+    /// than in the walk. The executor derived it per layer as
+    /// `gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty()`, but
+    /// the second term is dead: `workspace.cpp` allocates that buffer
+    /// unconditionally ("Always allocated … lets the forward dispatch
+    /// decide per layer"). So the binding alone decides, the binding is
+    /// known at model construction, and the taxonomy's first row applies
+    /// — a load-time fact is a trace-time `match`, erased.
+    ///
+    /// Stating it deletes a runtime branch from three places at once: the
+    /// interpreter's `arm_swiglu`, the generated `.inc`'s
+    /// `if (gate_up_fused_N)` per layer, and the flat list's residue.
+    /// Serde-defaulted (append-only discipline).
+    #[serde(default)]
+    pub gate_up_fused: bool,
 }
 
 /// The METAL backend's load-time facts — what the Metal deployment
@@ -383,6 +404,13 @@ impl LlamaLikeCudaFacts {
             rope_table: true,
             force_prefill_path: false,
             head_dim_padded: false,
+            // The loader's `dense_fused_projection_joins` contract packs
+            // BF16 dense groups and declines quantized ones, so a plain
+            // BF16 deployment carries the bank. VERIFIED LIVE, not
+            // assumed — the boot log's declared-facts line is what says
+            // so, and the digest refuses the deployment if this fixture
+            // and the binding disagree.
+            gate_up_fused: true,
         }
     }
 }
@@ -640,6 +668,13 @@ impl Qwen35FullAttnFacts {
 /// One enum for the whole model because the family applies the same MLP
 /// kind to every layer (`qwen3_5_forward.cpp` has no per-layer MLP switch;
 /// the per-layer axis of this family is the ATTENTION kind).
+///
+/// WHICH ARM A CHECKPOINT TAKES IS A READING OF ITS CONFIG, not of its
+/// `model_type`. Qwen3.6-27B is `model_type: qwen3_5` and takes `Dense`
+/// (no `num_experts`, `intermediate_size` 17408); the MoE arm is the
+/// 35B-A3B-shaped checkpoints'. Worth stating because the opposite was
+/// once assumed here, and it aimed a stretch of work at a branch the
+/// checkpoint in question never reaches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Qwen35MlpKind {
     Dense { intermediate: u32 },
@@ -740,6 +775,35 @@ pub struct Qwen35CudaFacts {
     /// back unchanged (the append-only discipline).
     #[serde(default)]
     pub verify_stash: bool,
+    /// `Qwen3_5MoeMlpWorkspace::cutlass_max_rows` — `min(max_tokens, 512)`
+    /// when `ops::flashinfer_cutlass_moe_enabled()` sized a workspace,
+    /// else 0. Zero means the fused leg does not exist on this
+    /// deployment; non-zero is the ROW BOUND of the MoE text, and fires
+    /// above it decline rather than the declaration guessing which of
+    /// the remaining three legs the pass would have taken.
+    #[serde(default)]
+    pub moe_cutlass_max_rows: u32,
+    /// `add_to_residual` — tp==1, so the MoE block's output lands on the
+    /// residual stream inside this pass. At tp>1 the block writes to
+    /// scratch and an allreduce follows, which is a different (and
+    /// unstated) shape.
+    #[serde(default)]
+    pub moe_residual_fold: bool,
+    /// The shared expert's gate weight is bound and unquantized, so its
+    /// landing is the fused dot form. False sends it to the
+    /// `[Tokens, 1]` GEMM plus a separate scalar-gate add, which this
+    /// text does not state.
+    #[serde(default)]
+    pub moe_shared_gate_dot: bool,
+    /// `Lw.expert_cache != nullptr` — the experts are paged one at a
+    /// time, so every device-side leg that strides a fused slab is off
+    /// the table and the pass takes the host-routed path.
+    #[serde(default)]
+    pub moe_streamed_experts: bool,
+    /// `qwen35_moe_force_general_path()` — the env that pins the pass to
+    /// the host-routed path regardless of shape.
+    #[serde(default)]
+    pub moe_force_general: bool,
 }
 
 impl Qwen35CudaFacts {
@@ -769,6 +833,19 @@ impl Qwen35CudaFacts {
             warp_tiled_max: 64,
             cached_max: 4096,
             verify_stash: true,
+            // The MoE fields describe the fused leg as the driver has it
+            // today: the CUTLASS workspace is always sized
+            // (`flashinfer_cutlass_moe_enabled()` returns true
+            // unconditionally), 512 is `kFusedMoeMaxRows`, tp=1 folds the
+            // residual, and neither the streamed-expert cache nor the
+            // force-general env is on by default. Synthetic like the rest
+            // of this fixture — the 0.8B checkpoint is dense and reaches
+            // none of them; they pin the MoE block's golden form.
+            moe_cutlass_max_rows: 512,
+            moe_residual_fold: true,
+            moe_shared_gate_dot: true,
+            moe_streamed_experts: false,
+            moe_force_general: false,
         }
     }
 }
@@ -813,6 +890,60 @@ impl Qwen35HybridFacts {
             attn: Qwen35FullAttnFacts::qwen3_5_0_8b(),
             gdn: Qwen35GdnFacts::qwen3_5_0_8b(),
             mlp: Qwen35MlpKind::Dense { intermediate: 3584 },
+        }
+    }
+
+    /// Qwen3.6-27B — the DENSE hybrid, read from the checkpoint's own
+    /// `config.json` (`text_config`), not inferred from the family name.
+    ///
+    /// Every value here is a field of that file or the driver's stated
+    /// derivation from one: 64 layers, `full_attention_interval` 4,
+    /// `vocab_size` 248320, `tie_word_embeddings` false,
+    /// `intermediate_size` 17408 (no `num_experts` — this checkpoint
+    /// takes the `Dense` arm, see [`Qwen35MlpKind`]), hidden 5120,
+    /// 24 q heads over 4 kv heads at `head_dim` 256, and
+    /// `partial_rotary_factor` 0.25 → `rotary_dim` 64 by the driver's
+    /// `max(2, 2 * int(0.5 * f * head_dim))`. The GDN half is the
+    /// `linear_*` block: 16 key heads, 48 value heads (a GQA ratio of 3,
+    /// which `family.rs`'s gdn body already branches on), 128/128 head
+    /// dims, `linear_conv_kernel_dim` 4.
+    ///
+    /// `fused_in_proj` / `fused_qkv` are false because both joins are
+    /// env-gated default-off, the same as 0.8B's.
+    ///
+    /// NOT reachable on an L40S at bf16 — 27B is ~55 GB against 46. An
+    /// FP8 checkpoint of the same geometry is what would boot here; the
+    /// traced form is identical either way, which is why the fixture is
+    /// worth having before the hardware is.
+    pub fn qwen3_6_27b() -> Self {
+        Self {
+            layers: 64,
+            full_attn_interval: 4,
+            vocab: 248_320,
+            tied_embeddings: false,
+            norm_variant: NormVariant::Gemma,
+            attn: Qwen35FullAttnFacts {
+                hidden: 5120,
+                q_heads: 24,
+                kv_heads: 4,
+                head_dim: 256,
+                rotary_dim: 64,
+                fused_qkv: false,
+                norm_variant: NormVariant::Gemma,
+            },
+            gdn: Qwen35GdnFacts {
+                hidden: 5120,
+                key_heads: 16,
+                value_heads: 48,
+                key_head_dim: 128,
+                value_head_dim: 128,
+                conv_kernel: 4,
+                fused_in_proj: false,
+                norm_variant: NormVariant::Gemma,
+            },
+            mlp: Qwen35MlpKind::Dense {
+                intermediate: 17_408,
+            },
         }
     }
 }

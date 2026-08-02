@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use pie_forward::family::{
     llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
-    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block,
+    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
 };
 use pie_forward::{
     FireClass, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
@@ -136,6 +136,7 @@ fn qwen2_5_1_5b_cuda_decode() {
                 rope_table: true,
                 force_prefill_path: true,
                 head_dim_padded: false,
+                gate_up_fused: true,
             },
             FireClass::Decode,
         ),
@@ -154,6 +155,7 @@ fn qwen2_5_1_5b_cuda_prefill() {
                 rope_table: true,
                 force_prefill_path: true,
                 head_dim_padded: false,
+                gate_up_fused: true,
             },
             FireClass::Prefill,
         ),
@@ -176,6 +178,7 @@ fn phi3_mini_cuda_decode() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: true,
+                gate_up_fused: true,
             },
             FireClass::Decode,
         ),
@@ -194,6 +197,7 @@ fn phi3_mini_cuda_prefill() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: true,
+                gate_up_fused: true,
             },
             FireClass::Prefill,
         ),
@@ -227,6 +231,59 @@ fn qwen3_5_moe_mlp_35b_a3b() {
     check_plan(
         "qwen3_5_moe_mlp_35b_a3b",
         &qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b()),
+    );
+}
+
+/// Qwen3.6-27B, the dense hybrid — the SAME traced form as 0.8B at a
+/// different geometry, which is the claim worth pinning: this checkpoint
+/// needs no new vocabulary, only its dims.
+///
+/// It is the first fixture whose GDN half is GQA (48 value heads over 16
+/// key heads), so it is also the first golden where the `_gqa`
+/// recurrence and the head-repeat are the stated form rather than a
+/// branch nothing takes.
+#[test]
+fn qwen3_6_27b_cuda_decode() {
+    check_plan(
+        "qwen3_6_27b_cuda_decode",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_6_27b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+#[test]
+fn qwen3_6_27b_cuda_prefill() {
+    check_plan(
+        "qwen3_6_27b_cuda_prefill",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_6_27b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// The same fragment's CUDA reading: the fused CUTLASS leg, which is the
+/// one the decode path takes and the only one of `run_moe_mlp`'s four
+/// that is a single rectangle.
+///
+/// Read it against the semantic golden above and the difference IS the
+/// argument: the selector's two `matmul_per_token`s, the routed swiglu
+/// and the `WeightedSum` collapse into ONE launch that produces
+/// `[Tokens, hidden]`, and the trailing `ResidualAdd` becomes an
+/// explicit `launch_residual_add_bf16` because the fused runner
+/// overwrites its output rather than accumulating.
+#[test]
+fn qwen3_5_moe_mlp_35b_a3b_cuda() {
+    check_plan(
+        "qwen3_5_moe_mlp_35b_a3b_cuda",
+        &qwen3_5_moe_mlp_block_cuda(
+            &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+        ),
     );
 }
 
@@ -497,6 +554,7 @@ fn mistral_7b_v03_cuda_decode() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: false,
+                gate_up_fused: true,
             },
             FireClass::Decode,
         ),
@@ -515,6 +573,7 @@ fn mistral_7b_v03_cuda_prefill() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: false,
+                gate_up_fused: true,
             },
             FireClass::Prefill,
         ),

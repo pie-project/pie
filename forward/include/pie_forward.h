@@ -460,6 +460,11 @@ struct PieForwardLlamaLikeCudaFacts {
   /// non-zero is true. Appended field: existing zero-initialized C
   /// callers read as false.
   uint8_t head_dim_padded;
+  /// The checkpoint bound a packed gate‖up bank, so the MLP activation
+  /// is the chunked swiglu over one buffer rather than the pair form
+  /// over two. Appended field, same zero-init rule — and the default is
+  /// the UNFUSED form, the conservative one.
+  uint8_t gate_up_fused;
 };
 
 /// The qwen3_5_moe MLP-block facts, as C states them. Mirrors
@@ -570,6 +575,123 @@ struct PieForwardQwen35CudaFacts {
   /// from the stash instead of re-running the GEMMs. Non-zero is true.
   /// Appended field (4c-iv) — the append-only struct discipline.
   uint8_t verify_stash;
+  /// The MoE block's row bound: `kFusedMoeMaxRows` (512) when
+  /// `ops::flashinfer_cutlass_moe_enabled()` sized a workspace, else 0.
+  /// The workspace is `min(max_tokens, 512)` rows and no fire exceeds
+  /// `max_tokens`, so 512 is the bound whatever `max_tokens` is. Zero
+  /// means the deployment has no fused leg and the MoE block is not
+  /// stated at all. Appended field — the append-only struct discipline.
+  uint32_t moe_cutlass_max_rows;
+  /// `add_to_residual`: tp==1, so the MoE output lands on the residual
+  /// stream inside this pass. Non-zero is true.
+  uint8_t moe_residual_fold;
+  /// The shared expert's gate weight is bound unquantized, so its
+  /// landing is the fused dot form. Non-zero is true.
+  uint8_t moe_shared_gate_dot;
+  /// `Lw.expert_cache != nullptr`: experts are paged one at a time, so
+  /// the pass takes the host-routed path. Non-zero is true.
+  uint8_t moe_streamed_experts;
+  /// `qwen35_moe_force_general_path()`. Non-zero is true.
+  uint8_t moe_force_general;
+};
+
+/// One row of a fire as the engine's seriation ordered them — the input
+/// side of `lower`.
+///
+/// Flags rather than a bitfield because the driver fills this per row per
+/// fire and a named field is what keeps a filler honest; `depth_k` is
+/// negative for a full-depth row.
+struct PieForwardRow {
+  uint8_t multi_token;
+  uint8_t custom_mask;
+  uint8_t hooked;
+  uint8_t lora;
+  uint8_t write_desc;
+  uint8_t wants_scores;
+  /// This row's logits are read (the fire's sampled set).
+  uint8_t samples;
+  uint8_t _pad;
+  /// Truncated at this layer, or negative for full depth.
+  int32_t depth_k;
+};
+
+/// One rectangle of the flat launch list.
+///
+/// `kernel_name` indexes the table handed back beside the launches, NOT
+/// the plan's name table: a lowering names launcher SYMBOLS, and the
+/// plan's names are weights.
+///
+/// `row_lo/row_hi` are read in the op's own row space — tokens for the
+/// body, requests for the epilogue.
+struct PieForwardLaunch {
+  /// The statement this rectangle came from — an index into the plan's
+  /// ops, and what a shadow comparison keys on.
+  uint32_t at_op;
+  uint32_t kernel_name;
+  uint32_t row_lo;
+  uint32_t row_hi;
+  uint16_t layer_lo;
+  uint16_t layer_hi;
+  /// Which row partition this rectangle sits in: 0 = none, 1 = the
+  /// hook-free prefix's axis, 2 = the unmasked prefix's.
+  uint8_t peel_axis;
+  /// Non-zero for the SUFFIX region rather than the prefix — the
+  /// executor's mask region, and what decides whether a statement
+  /// addresses rows at absolute offsets.
+  uint8_t peel_tail;
+  /// Non-zero when `row_lo/row_hi` are the HOST's belief and the
+  /// executing form must read the fire's runtime split instead. Set
+  /// only inside a CAPTURED fire's peel — the one place a rectangle is
+  /// not a pair of numbers.
+  uint8_t rows_device;
+  uint8_t _pad;
+};
+
+/// One STRUCTURAL statement: where it sits, and the rows it brackets.
+///
+/// The rows are why this is a struct rather than an index. A site hands
+/// an observation program `row_hi - row_lo` rows of the query buffer,
+/// and past the live count those rows are frozen at whatever the last
+/// layer that owned them left behind — so a truncated fire's site needs
+/// its window for the same reason its launches do.
+struct PieForwardSite {
+  uint32_t at_op;
+  uint32_t row_lo;
+  uint32_t row_hi;
+  uint32_t _pad;
+};
+
+/// Zero is a lowering; every other value is a group that should not have
+/// been formed (an ADMISSION answer, not a runtime fire split).
+enum class PieForwardUncovered : uint32_t {
+  None = 0,
+  Rows = 1,
+  WholeKernelSplit = 2,
+  Discontiguous = 3,
+  UnknownBackend = 4,
+};
+
+/// The flat launch list for one fire, pointing into storage the plan owns
+/// until the next `pie_forward_lower` on the same plan.
+struct PieForwardLowered {
+  const PieForwardLaunch *launches;
+  size_t launches_len;
+  /// The distinct launcher symbols, in first-launch order; entries
+  /// substring `kernel_name_bytes`.
+  const PieForwardName *kernel_names;
+  size_t kernel_names_len;
+  PieForwardBytes kernel_name_bytes;
+  /// The STRUCTURAL statements inside live regions, in walk order. A
+  /// site launches no table kernel, so it has no rectangle, but it runs
+  /// guest programs and brackets a layer's sideband; a form driven by
+  /// this list runs these and only these.
+  const PieForwardSite *structural;
+  size_t structural_len;
+  /// Peak activation bytes the frame would need.
+  size_t arena_bytes;
+  /// Non-zero when the fire could not be lowered; `launches` is then
+  /// empty and the value says which rule refused.
+  PieForwardUncovered uncovered;
 };
 
 extern "C" {
@@ -716,6 +838,34 @@ PieForwardStatus pie_forward_trace_qwen3_5_hybrid_cuda(const PieForwardQwen35Hyb
 /// `plan` is null, or points at a writable header that is empty or was
 /// filled by [`pie_forward_trace_llama_like`].
 void pie_forward_release(PieForwardPlan *plan);
+
+/// Lower a traced plan over one fire's rows — the SHADOW comparison's
+/// Rust half (`.wiki/tart/dsl.md` migration step 6).
+///
+/// The driver walks a nested region IR; `lower` produces the flat launch
+/// list meant to replace it. Calling both on the same fire and comparing
+/// is how the replacement earns the right to happen.
+///
+/// It EXECUTES NOTHING. The result describes what would run.
+///
+/// `*out` points into storage the plan owns, valid until the next call on
+/// the SAME plan (one slot). Copy or compare before calling again; do not
+/// free it — `pie_forward_release` does, with the plan.
+///
+/// # Safety
+///
+/// `plan` is null or points at a writable header built by a trace entry
+/// point and not yet released; `rows` is null or points at `rows_len`
+/// readable `PieForwardRow`s; `out` is null or a writable slot.
+/// `captures_across_splits` is non-zero when the fire is captured once
+/// and replayed across DIFFERENT row splits: a peel then emits BOTH
+/// regions whatever this fire's split is, and their launches carry
+/// `rows_device`.
+PieForwardStatus pie_forward_lower(PieForwardPlan *plan,
+                                   const PieForwardRow *rows,
+                                   size_t rows_len,
+                                   uint8_t captures_across_splits,
+                                   PieForwardLowered *out);
 
 }  // extern "C"
 

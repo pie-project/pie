@@ -174,6 +174,37 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(write_kv_explicit "launch_write_kv_explicit_bf16"),
     kernel!(write_kv_to_pages "launch_write_kv_to_pages"),
 
+    // ── mlp ────────────────────────────────────────────────────────
+    // Two spellings of one arithmetic, and the BINDING picks: a packed
+    // gate‖up bank feeds the chunked form, two narrow buffers the pair
+    // form. A load-time fact, so the declaration states it.
+    kernel!(chunked_swiglu "launch_chunked_swiglu_bf16"),
+    kernel!(swiglu "launch_swiglu_bf16"),
+
+    // ── MoE ────────────────────────────────────────────────────────
+    // The router's top-k, then the decode GEMV leg's two routed
+    // projections and its combine. The expert axis rides INSIDE the
+    // value on this leg, so the whole branch stays a list of rectangles;
+    // the grouped-GEMM and host-routed legs reach the same numbers by
+    // shapes no `Dim` spells, and are named refusals, not entries.
+    kernel!(topk_softmax "launch_topk_softmax_bf16"),
+    // The whole routed block as one call — permute, both grouped GEMMs,
+    // the activation and the weighted finalize. The leg decode actually
+    // takes, and the only one that is a single rectangle.
+    // Namespaced because it is not a `kernels::launch_*` at all: it is an
+    // `ops::` entry point that installs tactics and runs a CUTLASS
+    // pipeline. The symbol says so.
+    kernel!(moe_fused_cutlass "ops::flashinfer_cutlass_moe_bf16"),
+    kernel!(moe_gate_up_gemv "launch_moe_gate_up_decode_gemv_bf16"),
+    kernel!(moe_down_gemv "launch_moe_down_decode_gemv_bf16"),
+    kernel!(moe_shared_gate_dot "launch_sigmoid_dot_scalar_gate_add_bf16"),
+    kernel!(residual_add_cuda "launch_residual_add_bf16"),
+    // The combine folds the residual when the MoE output lands straight
+    // on the stream (tp=1) — one launch where the semantic text has a
+    // WeightedSum and a ResidualAdd.
+    kernel!(moe_weighted_sum "launch_token_batched_weighted_sum_bf16"),
+    kernel!(moe_weighted_sum_add "launch_token_batched_weighted_sum_add_bf16"),
+
     // ── adapters ───────────────────────────────────────────────────
     kernel!(lora_qkv_correction "pie_lora_qkv_correction"),
 
@@ -488,14 +519,60 @@ mod tests {
             "only the planned decode dispatch swaps"
         );
 
-        // A trace that does NOT declare the axis puts nothing on it.
+        // PREFILL declares the axis too (the cutover's last decline
+        // class was a truncated prefill), and its layer-tagged ops are
+        // on it — but NOTHING there takes the prefix-plan swap, because
+        // that is a property of the planned DECODE dispatch and a
+        // prefill fire does not run one. Which is the whole difference
+        // between the two halves of the axis: stopping after layer `k`
+        // costs a prefill nothing, and narrowing rows under it would
+        // cost it a plan it has no way to build.
         let prefill = family::llama_like_cuda(
             &facts,
             &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
             FireClass::Prefill,
         );
-        assert!(!prefill.depth_window);
-        assert!(prefill.ops.iter().all(|op| !prefill.depth_windowed(op)));
+        assert!(prefill.depth_window);
+        assert!(prefill
+            .ops
+            .iter()
+            .any(|op| prefill.depth_windowed(op)));
+        assert_eq!(
+            prefill.ops.iter().filter(|op| prefill.depth_prefix_plan(op)).count(),
+            0,
+            "a prefill fire runs no planned decode dispatch, so nothing swaps"
+        );
+
+        // A PADDED-HEAD deployment declares the axis too. It cannot serve
+        // the narrowing half — its staging offsets are physical width
+        // while a row window's are logical — but stopping after layer `k`
+        // addresses nothing, and `k` is a runtime input the trace does
+        // not have. So the trace states the axis and the DRIVER refuses
+        // the shapes that narrow (`PaddedHeadNarrowing`), which is the
+        // same division of labour the Prefill class settled.
+        let padded = family::llama_like_cuda(
+            &facts,
+            &LlamaLikeCudaFacts {
+                head_dim_padded: true,
+                ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
+            },
+            FireClass::Prefill,
+        );
+        assert!(padded.depth_window);
+
+        // The XQA decode deployment is the one that still withholds it:
+        // its prepare is fire-wide and R-shaped, so even the free half
+        // has nothing to stand on.
+        let xqa = family::llama_like_cuda(
+            &facts,
+            &LlamaLikeCudaFacts {
+                xqa_decode: true,
+                ..LlamaLikeCudaFacts::qwen3_0_6b_l40s()
+            },
+            FireClass::Decode,
+        );
+        assert!(!xqa.depth_window);
+        assert!(xqa.ops.iter().all(|op| !xqa.depth_windowed(op)));
     }
 
     /// No symbol is declared twice, and no dsl-side name is either.
@@ -536,6 +613,13 @@ mod tests {
         ] {
             plans.push(family::qwen3_5_hybrid_cuda(
                 &Qwen35HybridFacts::qwen3_5_0_8b(),
+                &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+                class,
+            ));
+            // Qwen3.6-27B: the same text at a different geometry, and
+            // the first one whose GDN half is GQA.
+            plans.push(family::qwen3_5_hybrid_cuda(
+                &Qwen35HybridFacts::qwen3_6_27b(),
                 &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
                 class,
             ));

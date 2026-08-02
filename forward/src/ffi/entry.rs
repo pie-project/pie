@@ -26,7 +26,7 @@ use crate::facts::{
 use crate::trace::{FireClass, NormVariant, RopeKind};
 
 use super::arena;
-use super::types::PieForwardPlan;
+use super::types::{PieForwardLowered, PieForwardPlan, PieForwardRow};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +135,12 @@ pub struct PieForwardLlamaLikeCudaFacts {
     /// non-zero is true. Appended field: existing zero-initialized C
     /// callers read as false.
     pub head_dim_padded: u8,
+    /// The checkpoint bound a packed gate‖up bank, so the MLP activation
+    /// is the chunked swiglu over one buffer rather than the pair form
+    /// over two. Appended field, same zero-init rule — and note the
+    /// default is the UNFUSED form, which is the conservative one: it
+    /// reads the two narrow buffers a decliner writes.
+    pub gate_up_fused: u8,
 }
 
 fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
@@ -144,6 +150,7 @@ fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
         rope_table: facts.rope_table != 0,
         head_dim_padded: facts.head_dim_padded != 0,
         force_prefill_path: facts.force_prefill_path != 0,
+        gate_up_fused: facts.gate_up_fused != 0,
     }
 }
 
@@ -410,6 +417,17 @@ pub struct PieForwardQwen35CudaFacts {
     /// from the stash instead of re-running the GEMMs. Non-zero is true.
     /// Appended field (4c-iv) — the append-only struct discipline.
     pub verify_stash: u8,
+    /// The MoE block's row bound — `kFusedMoeMaxRows` (512) when the
+    /// CUTLASS workspace is sized, else 0 (no fused leg, no MoE text).
+    pub moe_cutlass_max_rows: u32,
+    /// `add_to_residual` (tp==1). Non-zero is true.
+    pub moe_residual_fold: u8,
+    /// The shared expert's gate takes the fused dot landing.
+    pub moe_shared_gate_dot: u8,
+    /// The experts are paged, so the pass is host-routed.
+    pub moe_streamed_experts: u8,
+    /// `qwen35_moe_force_general_path()`.
+    pub moe_force_general: u8,
 }
 
 fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts {
@@ -419,6 +437,11 @@ fn read_qwen35_cuda_facts(facts: &PieForwardQwen35CudaFacts) -> Qwen35CudaFacts 
         warp_tiled_max: facts.warp_tiled_max,
         cached_max: facts.cached_max,
         verify_stash: facts.verify_stash != 0,
+        moe_cutlass_max_rows: facts.moe_cutlass_max_rows,
+        moe_residual_fold: facts.moe_residual_fold != 0,
+        moe_shared_gate_dot: facts.moe_shared_gate_dot != 0,
+        moe_streamed_experts: facts.moe_streamed_experts != 0,
+        moe_force_general: facts.moe_force_general != 0,
     }
 }
 
@@ -770,3 +793,65 @@ static KEEP_ALIVE: [EntryAddr; 8] = [
     EntryAddr(pie_forward_trace_qwen3_5_hybrid_cuda as *const ()),
     EntryAddr(pie_forward_release as *const ()),
 ];
+
+/// Lower a traced plan over one fire's rows — the SHADOW comparison's
+/// Rust half (`.wiki/tart/dsl.md` migration step 6).
+///
+/// The driver walks a nested region IR; `lower` produces the flat launch
+/// list that is meant to replace it. Calling both on the same fire and
+/// comparing is how the replacement earns the right to happen, and this
+/// is the entry point for the comparing.
+///
+/// It EXECUTES NOTHING. The result is a description of what would run.
+///
+/// `*out` points into storage the plan owns, valid until the next call
+/// on the SAME plan (one slot). Copy or compare before calling again; do
+/// not free it — `pie_forward_release` does, with the plan.
+///
+/// # Safety
+///
+/// `plan` is null or points at a writable header built by one of the
+/// trace entry points and not yet released; `rows` is null or points at
+/// `rows_len` readable [`PieForwardRow`]s; `out` is null or a writable
+/// slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pie_forward_lower(
+    plan: *mut PieForwardPlan,
+    rows: *const PieForwardRow,
+    rows_len: usize,
+    captures_across_splits: u8,
+    out: *mut PieForwardLowered,
+) -> PieForwardStatus {
+    abort_on_panic(|| {
+        if out.is_null() {
+            return PieForwardStatus::InvalidArgument;
+        }
+        unsafe { *out = PieForwardLowered::default() };
+        if plan.is_null() || (rows.is_null() && rows_len != 0) {
+            return PieForwardStatus::InvalidArgument;
+        }
+        let wire = if rows_len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(rows, rows_len) }
+        };
+        let rows: Vec<crate::lower::Row> = wire
+            .iter()
+            .map(|r| crate::lower::Row {
+                multi_token: r.multi_token != 0,
+                custom_mask: r.custom_mask != 0,
+                hooked: r.hooked != 0,
+                lora: r.lora != 0,
+                depth_k: (r.depth_k >= 0).then_some(r.depth_k as u32),
+                write_desc: r.write_desc != 0,
+                wants_scores: r.wants_scores != 0,
+                samples: r.samples != 0,
+            })
+            .collect();
+        let fire = crate::lower::Fire {
+            captures_across_splits: captures_across_splits != 0,
+        };
+        unsafe { *out = arena::lower(&mut *plan, &rows, fire) };
+        PieForwardStatus::Ok
+    })
+}

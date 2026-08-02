@@ -2,6 +2,8 @@
 
 #include "model/qwen3_5/declared_forward.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "model/qwen3_5/qwen3_5_moe_forward.hpp"
+#include "ops/flashinfer_moe.hpp"
 #include "store/recurrent_state_cache.hpp"
 
 #include <algorithm>
@@ -613,6 +615,66 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
     cuda.verify_stash = 1;
     out.cuda_verify_stash = true;
 
+    // The MoE block's terms. Only the fused CUTLASS leg is stated, so
+    // these say whether that leg exists and what row bound it carries;
+    // the trace refuses the block outright when any of them says no,
+    // and the fire declines above the bound.
+    if constexpr (kMoe) {
+        // 512 rather than `min(max_tokens, 512)`: the workspace is sized
+        // for `min(max_tokens, 512)` rows and no fire carries more than
+        // `max_tokens`, so the smaller term never binds. That is what
+        // lets this be derived here, where `max_tokens` is not in scope.
+        //
+        // The env gate is NOT the condition. The forward reads
+        // `!cutlass_ws.empty()`, and the workspace is empty whenever the
+        // SIZE QUERY reports zero — which it does on any arch whose
+        // grouped-GEMM units this build did not compile (sm90 today: the
+        // vendored units are sm80 and, behind PIE_HAS_SM100, sm100). So
+        // ask the same question the forward asks. Mirroring the env
+        // instead would declare a fused leg on exactly the machines that
+        // fall back to the unfused path.
+        //
+        // The query is also the arch probe, and in this tree it still
+        // THROWS rather than reporting zero when no config is backed
+        // (upstream 48c280d45 turns that into a zero). Catching here
+        // gives the same answer without waiting for the merge, and a
+        // throw means the same thing zero does: no fused leg.
+        cuda.moe_cutlass_max_rows = 0;
+        if (ops::flashinfer_cutlass_moe_enabled()) {
+            std::size_t bytes = 0;
+            try {
+                bytes = ops::flashinfer_cutlass_moe_workspace_bytes(
+                    ops::MoeActivation::Swiglu, 512, cfg.hidden_size,
+                    cfg.moe_intermediate_size, cfg.num_experts,
+                    cfg.num_experts_per_tok, /*tp_size=*/1, /*tp_rank=*/0);
+            } catch (const std::exception&) {
+                bytes = 0;
+            }
+            cuda.moe_cutlass_max_rows = (bytes > 0) ? 512u : 0u;
+        }
+        // `add_to_residual` is `(T == 1) && use_decode_fast_path`; the
+        // tp term is the deployment's, the other is the class's.
+        cuda.moe_residual_fold = (tp_size == 1) ? 1 : 0;
+        cuda.moe_force_general = qwen35_moe_force_general_path() ? 1 : 0;
+        // Streamed experts are a per-layer binding, but the pass reads
+        // one flag for the whole block, so disagreement between layers
+        // would already be a load bug. Any layer paging its experts
+        // takes the whole model off the device-side legs.
+        bool streamed = false;
+        bool shared_gate_dot = true;
+        for (const auto& lw : w.layers) {
+            if (lw.expert_cache != nullptr) streamed = true;
+            // The fused dot landing needs the gate bound and unquantized;
+            // a checkpoint with no shared expert never reads it, and the
+            // trace only consults this fact when it has one.
+            if (lw.shared_gate == nullptr || lw.shared_gate_quant.has_value()) {
+                shared_gate_dot = false;
+            }
+        }
+        cuda.moe_streamed_experts = streamed ? 1 : 0;
+        cuda.moe_shared_gate_dot = shared_gate_dot ? 1 : 0;
+    }
+
     // The digest naming what these traces were taken from — one format,
     // two printers (this and `emit_qwen35::facts_digest`); the live
     // static-form gate is what holds them together, llama's mechanism.
@@ -664,6 +726,21 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
 
 }  // namespace
 
+// SAME env name as llama_like's gate, DELIBERATELY OPPOSITE DEFAULT,
+// and that is worth a warning rather than a tidy-up.
+//
+// llama_like flipped to default-on at cutover step 4(a). This family did
+// not, because it cannot currently be validated end to end: qwen3.5 CUDA
+// serving emits garbage at the upstream dev head (reproduced
+// byte-identically on pure dev; `.wiki/tart/upstream_findings.md` entry
+// 5), so a default-on declared path here would be an unmeasured path on
+// by default. It goes on when that is fixed and the family's own parity
+// bar runs green — not before, and not for symmetry.
+//
+// The consequence to remember: an unset `PIE_DECLARED_FORWARD` means
+// DECLARED for llama_like and HAND-WRITTEN here, so any test reading the
+// env to label its run must know which family it is testing
+// (`cuda_gdn_site_summary_parity` reads it for this one).
 bool qwen35_declared_forward_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_DECLARED_FORWARD");

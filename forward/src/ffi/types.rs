@@ -585,3 +585,131 @@ impl Default for PieForwardPlan {
         }
     }
 }
+
+// ── The lowering, for the shadow comparison ────────────────────────────
+
+/// One row of a fire as the engine's seriation ordered them — the input
+/// side of [`crate::lower::lower`], as C states it.
+///
+/// Flags rather than a bitfield because the driver fills this per row per
+/// fire and a named field is what keeps a filler honest; `depth_k` is
+/// negative for a full-depth row, which is the same "no truncation"
+/// spelling the wire already uses elsewhere.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PieForwardRow {
+    pub multi_token: u8,
+    pub custom_mask: u8,
+    pub hooked: u8,
+    pub lora: u8,
+    pub write_desc: u8,
+    pub wants_scores: u8,
+    /// This row's logits are read (the fire's sampled set).
+    pub samples: u8,
+    pub _pad: u8,
+    /// Truncated at this layer, or negative for full depth.
+    pub depth_k: i32,
+}
+
+/// One rectangle of the flat launch list.
+///
+/// `kernel_name` indexes a table handed back beside the launches, NOT the
+/// plan's name table: a lowering names launcher SYMBOLS, and the plan's
+/// names are weights.
+///
+/// `rows` is read in the op's own row space — `Dim::Tokens` for the body,
+/// `Dim::Requests` for the epilogue (see [`crate::lower::Launch`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PieForwardLaunch {
+    /// The statement this rectangle came from — an index into the plan's
+    /// ops, and what a shadow comparison keys on.
+    pub at_op: u32,
+    pub kernel_name: u32,
+    pub row_lo: u32,
+    pub row_hi: u32,
+    pub layer_lo: u16,
+    pub layer_hi: u16,
+    /// Which row partition this rectangle sits in: 0 = none,
+    /// 1 = the hook-free prefix's axis, 2 = the unmasked prefix's.
+    pub peel_axis: u8,
+    /// Non-zero for the SUFFIX region rather than the prefix — the
+    /// executor's mask region, and what decides whether a statement
+    /// addresses rows at absolute offsets.
+    pub peel_tail: u8,
+    /// Non-zero when `row_lo/row_hi` are the HOST's belief and the
+    /// executing form must read the fire's runtime split instead. Set
+    /// only inside a CAPTURED fire's peel — the one place a rectangle
+    /// is not a pair of numbers.
+    pub rows_device: u8,
+    pub _pad: u8,
+}
+
+/// One STRUCTURAL statement: where it sits, and the rows it brackets.
+///
+/// The rows are why this is a struct rather than an index. A site hands
+/// an observation program `row_hi - row_lo` rows of the query buffer,
+/// and past the live count those rows are frozen at whatever the last
+/// layer that owned them left behind — so a truncated fire's site needs
+/// its window for the same reason its launches do.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PieForwardSite {
+    pub at_op: u32,
+    pub row_lo: u32,
+    pub row_hi: u32,
+    pub _pad: u32,
+}
+
+/// What [`crate::lower::Uncovered`] crosses as: zero is a lowering, and
+/// every other value is a group that should not have been formed.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieForwardUncovered {
+    None = 0,
+    Rows = 1,
+    WholeKernelSplit = 2,
+    Discontiguous = 3,
+    UnknownBackend = 4,
+}
+
+/// The flat launch list for one fire, pointing into storage the plan owns
+/// until the next [`crate::ffi::pie_forward_lower`] on the same plan.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PieForwardLowered {
+    pub launches: *const PieForwardLaunch,
+    pub launches_len: usize,
+    /// The distinct launcher symbols, in first-launch order; entries
+    /// substring `kernel_name_bytes`.
+    pub kernel_names: *const PieForwardName,
+    pub kernel_names_len: usize,
+    pub kernel_name_bytes: PieForwardBytes,
+    /// The STRUCTURAL statements inside live regions, in walk order. A
+    /// site launches no table kernel, so it has no rectangle, but it
+    /// runs guest programs and brackets a layer's sideband; a form
+    /// driven by this list runs these and only these.
+    pub structural: *const PieForwardSite,
+    pub structural_len: usize,
+    /// Peak activation bytes the frame would need.
+    pub arena_bytes: usize,
+    /// Non-zero when the fire could not be lowered; `launches` is then
+    /// empty and the value says which rule refused.
+    pub uncovered: PieForwardUncovered,
+}
+
+impl Default for PieForwardLowered {
+    fn default() -> Self {
+        Self {
+            launches: std::ptr::null(),
+            launches_len: 0,
+            kernel_names: std::ptr::null(),
+            kernel_names_len: 0,
+            kernel_name_bytes: PieForwardBytes::default(),
+            structural: std::ptr::null(),
+            structural_len: 0,
+            arena_bytes: 0,
+            uncovered: PieForwardUncovered::None,
+        }
+    }
+}

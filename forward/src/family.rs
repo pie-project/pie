@@ -296,12 +296,34 @@ fn llama_like_cuda_text(
         let cuda_of = |class_want: FireClass| (class == class_want).then_some(cuda);
 
         // STRUCTURAL S-3, stated IN THE BODY (V2 rung ②; formerly the
-        // post-trace paint-over the review named): the lowered Decode
-        // class declares the depth axis exactly where its body can
-        // honour it — the same deployment gate as the mask peel's.
-        // Recording assigns each layer-tagged op's role from here on.
-        if cuda_of(FireClass::Decode)
-            .is_some_and(|c| !c.xqa_decode && !c.head_dim_padded)
+        // post-trace paint-over the review named): a class declares the
+        // depth axis exactly where its body can honour it — the same
+        // deployment gate as the mask peel's. Recording assigns each
+        // layer-tagged op's role from here on.
+        //
+        // PREFILL states it too, since the cutover's last decline class
+        // was "truncated-prefill" and this was its whole cause. What a
+        // truncated prefill needs is the cheap half of the axis: every
+        // row sits at the same `k`, so the window STOPS after layer `k`
+        // and narrows nothing. The expensive half — a UNION fire, where
+        // full-depth rows sit beside truncated ones and the tail layers
+        // run over a row prefix — needs the qo/kv CSRs narrowed with
+        // them, and there is no prefill analogue of
+        // `depth_prefix_decode_plan`. The trace cannot tell those apart
+        // (`k` is a runtime input), so it states the axis and the
+        // driver's eligibility test admits only the uniform case.
+        //
+        // `xqa_decode` is a decode-path property and gates the Decode
+        // class only. `head_dim_padded` gates NEITHER, and that is the
+        // same two-halves argument one step further: a padded deployment
+        // stages q/k at PHYSICAL width while a row window addresses at
+        // logical width, so it cannot serve the narrowing half — but
+        // stopping after layer `k` addresses nothing at all, because the
+        // retired ops simply do not run. The driver holds `k`, so the
+        // driver is where that split gets decided; withholding the axis
+        // here refused the free half along with the costly one.
+        if cuda_of(FireClass::Decode).is_some_and(|c| !c.xqa_decode)
+            || cuda_of(FireClass::Prefill).is_some()
         {
             m.depth_window();
         }
@@ -493,9 +515,29 @@ fn llama_like_cuda_text(
                                     // fires: any mix of prefill and
                                     // plain-decode requests, ragged qo.
                                     if window_one && !c.force_prefill_path {
-                                        cuda::attention_flashinfer_decode(
-                                            q, &w.kv,
-                                        );
+                                        // hook×mask: the prefix decode IS
+                                        // the paged decode path and the
+                                        // hooked rows live in it (the
+                                        // seriation puts masked rows in
+                                        // the suffix, so the prefix
+                                        // starts at row 0 and the request
+                                        // ordinals are the unsplit ones).
+                                        // So the score capture rides here
+                                        // exactly as in the unsplit arm —
+                                        // the hand-written body's
+                                        // `if (score_capture.active())`
+                                        // on this same branch.
+                                        dsl::guarded(m)
+                                            .arm(GuardPred::WantsAttnScore, || {
+                                                cuda::attention_flashinfer_decode_capture(
+                                                    q, &w.kv,
+                                                );
+                                            })
+                                            .otherwise(|| {
+                                                cuda::attention_flashinfer_decode(
+                                                    q, &w.kv,
+                                                );
+                                            });
                                     } else {
                                         cuda::dequant_only(&w.kv);
                                         cuda::attention_flashinfer_prefill(
@@ -542,12 +584,13 @@ fn llama_like_cuda_text(
                         g.arm(GuardPred::HasCustomMask, || {
                             // Masked+hooked composes here: the sites run
                             // around the custom dispatch exactly as the
-                            // hand-written unconditional invokes do. No
-                            // WantsAttnScore guard — the custom dispatch
-                            // has no capture variant, so nothing
-                            // publishes and the OnAttn sideband hands
-                            // the programs a null scores pointer (the
-                            // publish-gated contract).
+                            // hand-written unconditional invokes do. The
+                            // SPLIT's unmasked prefix carries the score
+                            // capture (see `masked_attention`); only the
+                            // masked suffix's custom dispatch has no
+                            // capture variant, and a fire that is masked
+                            // all the way down publishes nothing, which
+                            // is the publish-gated contract.
                             let q = general_qkv();
                             dsl::seam(q.trace(), &dsl::seam::ATTN_Q, &[&q], Some(l));
                             masked_attention(&q);
@@ -625,13 +668,18 @@ fn llama_like_cuda_text(
                 // separate residual landing (`+=` of a non-matmul records
                 // the explicit ResidualAdd launch).
                 y += rmsnorm(&matmul(&a, &w.o_proj), &w.attn_norm);
-                let mlp = matmul(&swiglu(&matmul(&y, &w.gate_up), f.intermediate), &w.down);
-                y += rmsnorm(&mlp, &w.mlp_norm);
+                // ② The activation STATES its kernel: which of the two
+                // swiglu spellings runs is the gate_up BINDING's answer,
+                // known at load, so it erases here instead of being
+                // re-derived from a workspace on every fire.
+                let act = cuda::swiglu(&matmul(&y, &w.gate_up), f.intermediate, cuda.gate_up_fused);
+                y += rmsnorm(&matmul(&act, &w.down), &w.mlp_norm);
             } else {
                 // Pre-norm: `+=` of a fresh matmul IS the beta=1 fold.
                 y += matmul(&a, &w.o_proj);
                 let x = rmsnorm(&y, &w.mlp_norm);
-                y += matmul(&swiglu(&matmul(&x, &w.gate_up), f.intermediate), &w.down);
+                let act = cuda::swiglu(&matmul(&x, &w.gate_up), f.intermediate, cuda.gate_up_fused);
+                y += matmul(&act, &w.down);
             }
         }
 
@@ -757,6 +805,112 @@ fn moe_mlp_body(l: u32, facts: &Qwen35MoeMlpFacts, y: &Val) -> Val {
     // Not a fresh matmul, so `+=` records the explicit ResidualAdd.
     y += combined;
     y
+}
+
+/// The MoE MLP fragment's CUDA reading, traced standalone at layer 0 —
+/// [`qwen3_5_moe_mlp_block`]'s peer, and the only place the MoE block's
+/// stated form is pinned on its own.
+pub fn qwen3_5_moe_mlp_block_cuda(
+    facts: &Qwen35MoeMlpFacts,
+    cuda: &Qwen35CudaFacts,
+) -> ForwardPlan {
+    dsl::trace_named("qwen3_5_moe_mlp_block.cuda.decode", |t| {
+        let y = dsl::input(t, facts.hidden);
+        moe_mlp_body_cuda(0, facts, cuda, &y, FireClass::Decode);
+    })
+}
+
+/// The MoE MLP block's CUDA reading — [`moe_mlp_body`]'s peer, naming
+/// the kernels the hand-written pass fires instead of leaving the
+/// selector and the combine opaque.
+///
+/// # Which leg this states, and why only one
+///
+/// `run_moe_mlp` reaches the same numbers four ways. Three of them are
+/// not rectangles:
+///
+/// - the ALIGNED/grouped leg pads routes into blocks, giving its
+///   intermediates `ceil((N*k + min(E, N*k)*(block-1)) / block) * block`
+///   rows — an extent no [`crate::trace::Dim`] spells;
+/// - the decode GEMV leg is a rectangle, but the aligned block size is
+///   8 or 16 and never 1, so the aligned leg always exists and the GEMV
+///   arm covers only `N * k < 64` (N <= 7 at top_k 8);
+/// - the HOST-routed general path reads the router back to the CPU and
+///   issues one gather/GEMM/scatter per expert, so its launch COUNT is a
+///   device-derived number.
+///
+/// The fused CUTLASS call is the fourth and the one decode actually
+/// takes: permute, both grouped GEMMs, the activation and the weighted
+/// finalize in ONE call producing `[Tokens, hidden]`. Its `bool` return
+/// is decided before the fire (see [`dsl::cuda::moe_fused_cutlass`]), so
+/// the leg is a fact plus a row bound.
+///
+/// Fires outside that bound do not get a guarded arm — a guard whose
+/// other arm cannot be stated refuses the whole plan. They DECLINE, the
+/// llama_like way: the plan states one rectangle and the driver's
+/// eligibility sends the rest to the hand-written path.
+///
+/// Everything this body refuses returns [`moe_mlp_body`] unchanged, so
+/// the refusal shows up where every other refusal does — as residue in
+/// the coverage ledger, naming its own cause.
+fn moe_mlp_body_cuda(
+    l: u32,
+    facts: &Qwen35MoeMlpFacts,
+    cuda: &Qwen35CudaFacts,
+    y: &Val,
+    class: FireClass,
+) -> Val {
+    // The fused leg is the decode fast path's. Prefill and the service
+    // classes take the host-routed path, as do a streamed expert cache
+    // (no fused slab to stride) and the force-general env; and a
+    // deployment that sized no CUTLASS workspace has no fused leg at
+    // all. tp>1 writes to scratch and follows with an allreduce, which
+    // is a different shape than the one stated here.
+    if class != FireClass::Decode
+        || cuda.moe_cutlass_max_rows == 0
+        || cuda.moe_streamed_experts
+        || cuda.moe_force_general
+        || !cuda.moe_residual_fold
+        || (facts.shared_expert_intermediate > 0 && !cuda.moe_shared_gate_dot)
+    {
+        return moe_mlp_body(l, facts, y);
+    }
+
+    let w = MoeLayerW::new(l, facts);
+    // Semantic: the lowering reads the variant and names the fold's
+    // kernel, so there is nothing here for a CUDA reading to add.
+    let m = rmsnorm(y, &w.mlp_norm);
+
+    // The router stays two ops — a plain GEMM for the logits, then the
+    // fused top-k/softmax/renormalize — because the fused call takes the
+    // routing as operands rather than computing it.
+    let logits = matmul(&m, &w.router);
+    let (experts, weights) = dsl::cuda::topk(&logits, facts.top_k);
+    let routed = dsl::cuda::moe_fused_cutlass(
+        &m,
+        &experts,
+        &weights,
+        &w.expert_gate_up,
+        &w.expert_down,
+        facts.hidden,
+    );
+
+    // The fused runner overwrites its output, so a folded residual costs
+    // a separate add — still one launch, and it is why the CUDA reading
+    // has no ResidualAdd at the end where the semantic body does.
+    let y = dsl::cuda::residual_add(&routed, y, facts.hidden);
+
+    if facts.shared_expert_intermediate == 0 {
+        return y;
+    }
+
+    // The shared expert is dense: two cuBLAS GEMMs around the chunked
+    // activation, then the landing accumulates into the stream the
+    // routed block already wrote.
+    let inter = facts.shared_expert_intermediate;
+    let act = dsl::cuda::swiglu(&matmul(&m, &w.shared_gate_up), inter, true);
+    let shared = matmul(&act, &w.shared_down);
+    dsl::cuda::sigmoid_dot_scalar_gate_add(&m, &w.shared_gate, &shared, &y, facts.hidden)
 }
 
 /// One qwen3_5 GDN (gated-deltanet) linear-attention block, traced
@@ -1450,7 +1604,7 @@ pub fn qwen3_5_hybrid_cuda(
                 Qwen35MlpKind::Dense { intermediate } => {
                     dense_mlp_body(l, hidden, *intermediate, facts.norm_variant, &y_attn)
                 }
-                Qwen35MlpKind::Moe(moe) => moe_mlp_body(l, moe, &y_attn),
+                Qwen35MlpKind::Moe(moe) => moe_mlp_body_cuda(l, moe, cuda, &y_attn, class),
             };
         }
 

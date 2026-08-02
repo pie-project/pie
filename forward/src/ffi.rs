@@ -20,7 +20,7 @@ pub mod types;
 pub use entry::{
     PieForwardLlamaLikeFacts, PieForwardQwen35FullAttnFacts, PieForwardQwen35GdnFacts,
     PieForwardQwen35HybridFacts, PieForwardQwen35MoeMlpFacts, PieForwardStatus,
-    pie_forward_release, pie_forward_trace_llama_like, pie_forward_trace_qwen3_5_full_attn,
+    pie_forward_lower, pie_forward_release, pie_forward_trace_llama_like, pie_forward_trace_qwen3_5_full_attn,
     pie_forward_trace_qwen3_5_gdn, pie_forward_trace_qwen3_5_hybrid,
     pie_forward_trace_qwen3_5_moe_mlp,
 };

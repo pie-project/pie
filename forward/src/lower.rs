@@ -16,12 +16,13 @@
 //!                       L.layers.lo, L.layers.hi, stream);
 //! ```
 //!
-//! This module is the host half of that, and ONLY the host half. The
-//! driver still executes `declared_forward.cpp` and the generated
-//! `.inc`s; switching it over is a separate change whose gate is the
-//! killer soak and the declared==hand A/B, not a byte comparison — see
-//! `.wiki/tart/macos.md`'s sibling note in `dsl.md` step 6. Nothing here
-//! is on any execution path yet.
+//! **This is what a declared fire runs.** `declared_forward.cpp` builds
+//! the rows, calls `pie_forward_lower`, and executes the result; its
+//! walk over the region IR was deleted in the cutover's step 3, so there
+//! is no second form and no switch between them. The one remaining
+//! consumer of the traced form that does NOT come through here is the
+//! generated `.inc` — an ahead-of-time emission of the same declaration
+//! that also carries the unionized supergraph build.
 //!
 //! # Three decisions this module makes, from the doc's amendments
 //!
@@ -77,18 +78,96 @@ pub struct Row {
     pub write_desc: bool,
     /// The fire's attached programs read attention scores.
     pub wants_scores: bool,
+    /// This row's logits are read — it is one of the fire's SAMPLED
+    /// rows. A pure-decode fire samples every row; a prefill fire
+    /// samples the last row of each request and gathers them, which is
+    /// what makes the epilogue's row space [`Dim::Requests`] rather than
+    /// [`Dim::Tokens`], and what the driver spells `logit_row_indices`.
+    pub samples: bool,
+}
+
+/// How the fire will be EXECUTED, where that changes what runs.
+///
+/// Not row facts and not a guard: one thing the driver decides about the
+/// fire as a whole, which the lowering has to know because it changes
+/// the launch list rather than the launch arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Fire {
+    /// The fire is captured once and replayed across DIFFERENT row
+    /// splits, so a peel's regions cannot bake their row counts: both
+    /// regions launch and an empty one early-outs on a device word.
+    ///
+    /// Set, a peel emits BOTH regions even when one is empty here, and
+    /// their launches carry [`Launch::rows_device`]. Clear, the host's
+    /// counts are the truth and an empty region emits nothing.
+    pub captures_across_splits: bool,
+}
+
+/// A STRUCTURAL statement and the rows it brackets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    pub at_op: u32,
+    /// The rows live where it sits — the SAME window its neighbouring
+    /// launches take.
+    ///
+    /// A site observes rows, so it needs a row count for the same
+    /// reason a launch needs a grid: an observation program is handed
+    /// `rows` rows of the query buffer, and past the live count those
+    /// rows are frozen at whatever the last layer that owned them left
+    /// behind. Carrying only the statement index (what this list did
+    /// when sites first joined it) makes every site a fire-wide one,
+    /// which is right for exactly the fires that are not truncated.
+    pub rows: Range<u32>,
 }
 
 /// One flat launch: a kernel over a rectangle of (rows × layers).
 ///
 /// `args` is an index into the frame's argument slots — the driver binds
 /// operands from there, which is why no buffer appears in this struct.
+///
+/// `rows` is read in the OP'S OWN row space, which its output shape
+/// names. That is [`Dim::Tokens`] for the body — where it is the fire's
+/// rows and every window is a run of them — and [`Dim::Requests`] for
+/// the epilogue, whose statements run over the SAMPLED rows after the
+/// gather has collected them. A gather is not a window: its source rows
+/// are an index list, which is an operand (hence `args`), while the
+/// rectangle it fills is contiguous like every other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     pub kernel: u16,
     pub rows: Range<u32>,
     pub layers: Range<u16>,
     pub args: u32,
+    /// Which peel region this rectangle sits in, when it sits in one.
+    ///
+    /// The executing arms read exactly four things about where they
+    /// are: the row count, the layer, which side of a row split they
+    /// serve, and which prepared plan to use. The first two are `rows`
+    /// and `layers`; the third is this; and the fourth stops being a
+    /// question — a prepared plan is found by the rectangle's ROW
+    /// COUNT, which is why the driver's band index, and its three-band
+    /// ceiling, has nothing left to index.
+    pub peel: Option<PeelRegion>,
+}
+
+/// A rectangle's place inside a row partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeelRegion {
+    pub axis: PeelWindow,
+    /// The SUFFIX region (hook-visible rows, masked rows) rather than
+    /// the prefix — what the executor calls its mask region, and what
+    /// decides whether a statement addresses rows at absolute offsets.
+    pub tail: bool,
+    /// `rows` is the host's BELIEF and the executing form must read the
+    /// fire's runtime split instead.
+    ///
+    /// This is the one place a rectangle is not a pair of numbers, and
+    /// deliberately the only one: a captured fire replays across splits,
+    /// so both regions launch and each early-outs on a device word.
+    /// Everything else stays plain counts — "mostly numbers, two of them
+    /// runtime" is a list you can still read, which "any of these might
+    /// be runtime" would not be.
+    pub rows_device: bool,
 }
 
 /// Why a fire cannot be lowered against this trace.
@@ -151,11 +230,33 @@ pub struct Lowered {
     pub rectangles: usize,
     /// Peak activation bytes the frame needs ([`Buffers`]).
     pub arena_bytes: usize,
+    /// The STRUCTURAL statements inside live regions, in walk order.
+    ///
+    /// A site launches no table kernel, so it has no rectangle — but it
+    /// runs guest programs and brackets a layer's sideband, so a form
+    /// driven by this list has to run it, and only when the region
+    /// holding it is live. A site inside an arm the guards did not take
+    /// must not fire, and `launches` alone cannot say which those are.
+    ///
+    /// So the list is what a fire DOES: rectangles for what it launches,
+    /// these for what it brackets.
+    pub structural: Vec<Site>,
     /// Statements that still run on the device without a rectangle —
     /// see [`Unlowered`]. Empty is the cutover gate: only then is
     /// `launches` the WHOLE of what a fire executes, and only then can
     /// the driver stop walking.
     pub residue: Vec<Unlowered>,
+}
+
+impl Launch {
+    /// Whether this rectangle names `symbol`, against the lowering it
+    /// came from — the kernel table is per-`Lowered`, not global.
+    pub fn kernel_is(&self, lowered: &Lowered, symbol: &str) -> bool {
+        lowered
+            .kernels
+            .get(self.kernel as usize)
+            .is_some_and(|k| k == symbol)
+    }
 }
 
 impl Lowered {
@@ -173,7 +274,7 @@ impl Lowered {
 }
 
 /// Lower `plan` over `rows`, in the order the engine seriated them.
-pub fn lower(plan: &ForwardPlan, rows: &[Row]) -> Result<Lowered, Uncovered> {
+pub fn lower(plan: &ForwardPlan, rows: &[Row], fire: Fire) -> Result<Lowered, Uncovered> {
     let backend = Backend::of_family(&plan.family);
     let n = rows.len() as u32;
     let mut out = Lowerer {
@@ -185,6 +286,9 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row]) -> Result<Lowered, Uncovered> {
         kernel_ids: BTreeMap::new(),
         peel_tail: false,
         residue: Vec::new(),
+        fire,
+        structural: Vec::new(),
+        peel_region: None,
     };
     out.region(0..plan.ops.len(), 0..n)?;
     let buffers = Buffers::assign(plan, rows);
@@ -193,6 +297,7 @@ pub fn lower(plan: &ForwardPlan, rows: &[Row]) -> Result<Lowered, Uncovered> {
         launches: out.launches,
         kernels: out.kernels,
         arena_bytes: buffers.bytes,
+        structural: out.structural,
         residue: out.residue,
     })
 }
@@ -210,6 +315,10 @@ struct Lowerer<'a> {
     /// asking, not the driver choosing — so the lowering knows it.
     peel_tail: bool,
     residue: Vec<Unlowered>,
+    fire: Fire,
+    structural: Vec<Site>,
+    /// The peel region the launches being emitted sit in.
+    peel_region: Option<PeelRegion>,
 }
 
 impl Lowerer<'_> {
@@ -230,7 +339,7 @@ impl Lowerer<'_> {
                     let mut at = i + 1;
                     let mut remaining = window.clone();
                     for arm in arms {
-                        let taken = self.select(&remaining, arm.pred, i)?;
+                        let taken = self.select(&remaining, arm.pred);
                         let body = at..at + arm.ops as usize;
                         if !taken.is_empty() {
                             self.region(body, taken.clone())?;
@@ -255,21 +364,53 @@ impl Lowerer<'_> {
                     let tail = split..window.end;
                     let p = i + 1..i + 1 + *prefix_ops as usize;
                     let t = p.end..p.end + *tail_ops as usize;
-                    if !prefix.is_empty() {
-                        self.region(p, prefix)?;
-                    }
+                    // A captured fire replays across splits, so BOTH
+                    // regions launch whatever this fire's split is and
+                    // each early-outs on the device word. Skipping an
+                    // empty one here would describe a graph that cannot
+                    // serve the next fire.
+                    //
+                    // And each region's rows are then the WHOLE window,
+                    // not its half: the launches are full-window grids
+                    // and the split is a device word they read, which is
+                    // the entire point of capturing across splits. A
+                    // rectangle that named the half would be describing
+                    // a grid nobody launches, and an executor that
+                    // believed it would freeze THIS fire's split into
+                    // the graph — a wrong answer no byte-parity run can
+                    // see, because it is only wrong on the REPLAY.
+                    let device = self.fire.captures_across_splits;
+                    let outer_region = self.peel_region;
+                    let axis = *axis;
+                    let grid = window.clone();
+                    let mut run = |me: &mut Self, span: Range<usize>, w: Range<u32>, tail_side: bool| {
+                        if !device && w.is_empty() {
+                            return Ok(());
+                        }
+                        let w = if device { grid.clone() } else { w };
+                        me.peel_region = Some(PeelRegion {
+                            axis,
+                            tail: tail_side,
+                            rows_device: device,
+                        });
+                        let outer = std::mem::replace(&mut me.peel_tail, tail_side);
+                        let r = me.region(span, w);
+                        me.peel_tail = outer;
+                        r
+                    };
                     let next = t.end;
-                    if !tail.is_empty() {
-                        let outer = std::mem::replace(&mut self.peel_tail, true);
-                        let r = self.region(t, tail);
-                        self.peel_tail = outer;
-                        r?;
-                    }
+                    run(self, p, prefix, false)?;
+                    run(self, t, tail, true)?;
+                    self.peel_region = outer_region;
                     i = next;
                 }
                 OpKind::Launch { kernel, .. } => {
                     let live = self.depth_window(op, &window, i)?;
                     self.emit(i, kernel, op, &live)?;
+                    i += 1;
+                }
+                OpKind::LmHead { .. } => {
+                    self.epilogue(i, op, &window)?;
                     i += 1;
                 }
                 // Everything else is a SEMANTIC statement, and it still
@@ -279,7 +420,21 @@ impl Lowerer<'_> {
                 // itself structural, or refuses — never falls through.
                 kind => {
                     match semantic(kind, self.peel_tail) {
-                        Semantic::Structural => {}
+                        Semantic::Structural => {
+                            // A site is layer-tagged like any other
+                            // statement, so a RETIRED layer's bracket
+                            // does not fire: the rows it would observe
+                            // are gone. Same window the launches take,
+                            // and skipping it here is what the walk
+                            // does by refusing to enter the op at all.
+                            let live = self.depth_window(op, &window, i)?;
+                            if !live.is_empty() {
+                                self.structural.push(Site {
+                                    at_op: i as u32,
+                                    rows: live,
+                                });
+                            }
+                        }
                         Semantic::Kernels(symbols) => {
                             let live = self.depth_window(op, &window, i)?;
                             for symbol in symbols {
@@ -306,7 +461,7 @@ impl Lowerer<'_> {
         op: &Op,
         window: &Range<u32>,
     ) -> Result<(), Uncovered> {
-        if window.is_empty() {
+        if window.is_empty() && !self.peel_region.is_some_and(|r| r.rows_device) {
             return Ok(());
         }
         let backend = self
@@ -344,7 +499,54 @@ impl Lowerer<'_> {
             rows: window.clone(),
             layers: layer..layer + 1,
             args: at as u32,
+            peel: self.peel_region,
         });
+        Ok(())
+    }
+
+    /// THE EPILOGUE, as rectangles rather than as a branch.
+    ///
+    /// The executor reads two runtime inputs here and picks between
+    /// three shapes: nothing at all when the fire samples no rows
+    /// (`emit_logits` is `num_sampling > 0`, per fire), gather → norm →
+    /// project when it samples fewer rows than it carries, and
+    /// norm → project when every row is sampled. That reads like a
+    /// two-level branch, and in the driver it is one.
+    ///
+    /// It is not one here, because all three shapes are the same three
+    /// statements over a ROW COUNT:
+    ///
+    /// * the norm and the projection run over the sampled rows — the
+    ///   epilogue's row space, which the trace already names
+    ///   [`Dim::Requests`];
+    /// * the gather EXISTS only when there are unsampled rows to skip
+    ///   past, and an empty rectangle emits nothing, which is how "no
+    ///   gather" is spelled without a branch;
+    /// * a fire that samples nothing produces zero rectangles, which is
+    ///   how `emit_logits == false` is spelled.
+    ///
+    /// So the branch survives only as long as the driver walks; when it
+    /// consumes this list instead, it disappears — which is the same
+    /// thing that happened to the swiglu's binding `if`, one layer up.
+    ///
+    /// The gather's SOURCE rows are deliberately not a rectangle. They
+    /// are an index list (`logit_row_indices`) and therefore an operand;
+    /// a prefill fire samples the last row of each request, which is not
+    /// a contiguous run and was never going to be one.
+    fn epilogue(&mut self, at: usize, op: &Op, window: &Range<u32>) -> Result<(), Uncovered> {
+        let sampled = window
+            .clone()
+            .filter(|&i| self.rows[i as usize].samples)
+            .count() as u32;
+        if sampled == 0 {
+            return Ok(());
+        }
+        let out = 0..sampled;
+        if sampled < window.len() as u32 {
+            self.emit(at, "launch_gather_bf16_rows", op, &out)?;
+        }
+        self.emit(at, "launch_rmsnorm_bf16", op, &out)?;
+        self.emit(at, "gemm_act_x_w", op, &out)?;
         Ok(())
     }
 
@@ -393,37 +595,46 @@ impl Lowerer<'_> {
         Ok(window.start..end)
     }
 
-    /// The rows in `window` satisfying `pred`, as a contiguous range.
-    fn select(
-        &self,
-        window: &Range<u32>,
-        pred: GuardPred,
-        at: usize,
-    ) -> Result<Range<u32>, Uncovered> {
-        let (axis, holds): (&'static str, fn(&Row) -> bool) = match pred {
-            GuardPred::HasCustomMask => ("mask", |r| r.custom_mask),
-            GuardPred::HasLora => ("lora", |r| r.lora),
-            GuardPred::HasStageHooks => ("hook", |r| r.hooked),
-            GuardPred::WantsAttnScore => ("scores", |r| r.wants_scores),
-            GuardPred::HasWriteDesc => ("write_desc", |r| r.write_desc),
-            // Token-count predicates are FIRE-wide, not per row: they
-            // read the fire's N. Every row is in or out together.
-            GuardPred::TokensLE(k) => {
-                return Ok(if self.rows.len() as u32 <= k {
-                    window.clone()
-                } else {
-                    window.start..window.start
-                });
-            }
-            GuardPred::TokensGT(k) => {
-                return Ok(if self.rows.len() as u32 > k {
-                    window.clone()
-                } else {
-                    window.start..window.start
-                });
-            }
+    /// Whether `pred` holds for THE FIRE — so the arm covers `window`
+    /// whole, or not at all.
+    ///
+    /// Every `GuardPred` is a fire fact. The vocabulary says so in each
+    /// variant's own words ("the fire carries…") and the taxonomy says
+    /// it in one line: a guard chain is *per-fire runtime input, kernel
+    /// choice within one op list*, while the *per-fire ROW SPLIT* is the
+    /// [`OpKind::Peel`]. Two constructs, two jobs.
+    ///
+    /// This function used to select the SUBSET of `window` whose rows
+    /// carried the mark — inventing row semantics for a fire-level
+    /// construct, and quietly giving the DSL two row-partitioning
+    /// mechanisms where it had deliberately built one. The live shadow
+    /// comparison is what surfaced it (`.wiki/tart/dsl.md`): the walk
+    /// entered the `HasCustomMask` arm with the whole fire while the
+    /// lowering handed the unmasked rows to the *else* arm — the
+    /// fused/lora path, not the causal decode those rows want.
+    ///
+    /// So the fix is a DELETION. `Row` still carries the marks, because
+    /// the peel reads them and because moving an axis from a guard to a
+    /// row predicate is how it becomes per-row — a deliberate change,
+    /// stated in the text, not a reinterpretation the backend performs
+    /// on its own.
+    fn select(&self, window: &Range<u32>, pred: GuardPred) -> Range<u32> {
+        let holds = match pred {
+            GuardPred::HasCustomMask => self.rows.iter().any(|r| r.custom_mask),
+            GuardPred::HasLora => self.rows.iter().any(|r| r.lora),
+            GuardPred::HasStageHooks => self.rows.iter().any(|r| r.hooked),
+            GuardPred::WantsAttnScore => self.rows.iter().any(|r| r.wants_scores),
+            GuardPred::HasWriteDesc => self.rows.iter().any(|r| r.write_desc),
+            // The token thresholds read the fire's N, which is the same
+            // question asked of a count instead of a flag.
+            GuardPred::TokensLE(k) => self.rows.len() as u32 <= k,
+            GuardPred::TokensGT(k) => self.rows.len() as u32 > k,
         };
-        contiguous(self.rows, window, holds, axis, at)
+        if holds {
+            window.clone()
+        } else {
+            window.start..window.start
+        }
     }
 
     /// Where a peel's axis splits `window` — the prefix is the rows that
@@ -489,14 +700,22 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         AddBias { .. } => Semantic::Kernels(&["launch_add_bias_bf16"]),
         ResidualAdd => Semantic::Kernels(&["launch_residual_add_bf16"]),
 
-        // Gemma folds `(1 + w)` — different arithmetic, a different
-        // kernel, and this executor refuses it outright.
+        // Gemma folds `(1 + w)` — different arithmetic, so a different
+        // kernel, but the same signature and the same row space. The
+        // variant is already on the wire (`param0`), so naming the
+        // symbol is the whole of what the lowering owes; the executor
+        // reads the same field to pick.
+        //
+        // The per-head kind differs only in its ROW COUNT (`N * heads`
+        // rows of `head_dim` rather than `N` of `hidden`), which the
+        // executor derives from the weight's geometry either way — so
+        // both kinds fan onto the same pair.
         Rmsnorm { variant, .. } | RmsnormPerHead { variant, .. } => {
-            if variant.is_plain() {
-                Semantic::Kernels(&["launch_rmsnorm_bf16"])
+            Semantic::Kernels(if variant.is_plain() {
+                &["launch_rmsnorm_bf16"]
             } else {
-                Semantic::Unlowered("only the Plain rmsnorm variant is emitted")
-            }
+                &["launch_rmsnorm_gemma_bf16"]
+            })
         }
 
         // Inside a peel's tail the split serves absolute row offsets in a
@@ -550,12 +769,26 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
             Semantic::Unlowered("the fused-gate_up binding fact is not in the facts")
         }
 
-        // Three launches, and which three depends on whether the fire
-        // gathers a compact logit set — a ROW WINDOW, which is precisely
-        // what `Launch::rows` expresses. It lowers once the trace says so.
-        LmHead { .. } => {
-            Semantic::Unlowered("the compact-logit gather is an unstated row window")
-        }
+        // The MoE branch's three statements, each refused BY NAME until
+        // `moe_mlp_body_cuda` states its kernel. They are grouped here
+        // because they share one cause, and a residue ledger that says
+        // "no lowering rule for this kind" three times would read as
+        // three gaps instead of one missing text.
+        TopK { .. } => Semantic::Unlowered(
+            "the MoE branch has no CUDA text yet (dsl::cuda::topk states the kernel)",
+        ),
+        WeightedSum { .. } => Semantic::Unlowered(
+            "the MoE combine has two forms (token-batched vs per-expert \
+             scatter-add, and a fused +residual); the CUDA text has to \
+             state which, as the swiglu binding does",
+        ),
+        SigmoidGateAdd => Semantic::Unlowered(
+            "the shared-expert landing awaits the MoE branch's CUDA text",
+        ),
+
+        // Handled by `Lowerer::epilogue`, which needs the row counts and
+        // so cannot answer from the kind alone.
+        LmHead { .. } => Semantic::Structural,
 
         _ => Semantic::Unlowered("no lowering rule for this kind"),
     }
@@ -682,7 +915,17 @@ impl Buffers {
 
     pub fn assign(plan: &ForwardPlan, rows: &[Row]) -> Buffers {
         let n_tokens = rows.len();
-        let n_requests = rows.iter().filter(|r| !r.multi_token).count().max(1);
+        // `Dim::Requests` sizes the epilogue's values, so it must bound
+        // the SAMPLED rows too: a multi-token fire whose extra rows are
+        // sampled (MTP verify) has more logit rows than the
+        // one-row-per-request count admits, and under-sizing the logits
+        // is not a defect the arena would report.
+        let n_requests = rows
+            .iter()
+            .filter(|r| !r.multi_token)
+            .count()
+            .max(rows.iter().filter(|r| r.samples).count())
+            .max(1);
 
         // The values a seam exposes: read off the seam statements, not a
         // per-family table.
@@ -789,8 +1032,28 @@ mod tests {
     use crate::family;
     use crate::trace::FireClass;
 
+    /// A fire whose rows are all plain AND all sampled — the ordinary
+    /// decode shape, and the one every row-axis test wants.
     fn plain(n: usize) -> Vec<Row> {
-        vec![Row::default(); n]
+        sampled(n)
+    }
+
+    fn sampled(n: usize) -> Vec<Row> {
+        vec![
+            Row {
+                samples: true,
+                ..Row::default()
+            };
+            n
+        ]
+    }
+
+    /// A prefill-shaped fire: `n` token rows, one of them sampled, so
+    /// the epilogue gathers.
+    fn gathered(n: usize) -> Vec<Row> {
+        let mut rows = vec![Row::default(); n];
+        rows[n - 1].samples = true;
+        rows
     }
 
     fn decode_plan() -> ForwardPlan {
@@ -824,55 +1087,336 @@ mod tests {
         out
     }
 
-    /// THE CUTOVER LEDGER. Every statement a live fire executes is
-    /// either a rectangle in the flat list or a named entry in the
-    /// residue — and this test pins WHICH, by kind, across every
-    /// deployment the driver serves today.
+    /// The qwen3_5 family's residue LEDGER, pinned by kind and count.
     ///
-    /// It exists to be read, not just to pass. `residue` empty is the
-    /// gate that lets the driver stop walking; until then this is the
-    /// worklist, and the count moving the wrong way is a regression in
-    /// the migration itself.
+    /// llama_like's cutover was driven by exactly this: a ledger that
+    /// names what the flat list still does not carry, so each rung can
+    /// be read as a line leaving it. qwen3_5 has never had one — its
+    /// executor still walks, and "it walks" was the whole of what was
+    /// written down.
+    ///
+    /// The counts are per fire, not per layer, so they move when a body
+    /// changes and stay put when a fixture does.
     #[test]
-    fn the_flat_list_says_what_it_does_not_cover() {
-        let mut kinds: BTreeMap<&'static str, (&'static str, usize)> = BTreeMap::new();
-        let mut worst = 1.0f64;
-        for (name, plan) in live_plans() {
-            let out = lower(&plan, &plain(4)).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-            for item in &out.residue {
-                let e = kinds.entry(item.kind).or_insert((item.why, 0));
-                e.1 += 1;
-            }
-            worst = worst.min(out.coverage());
-            // Whatever a statement is, it is accounted for exactly once.
+    fn the_qwen3_5_residue_ledger() {
+        let facts = crate::facts::Qwen35HybridFacts::qwen3_5_0_8b();
+        let cuda = crate::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+        let plan = family::qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::Decode);
+        let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
+        let mut ledger: std::collections::BTreeMap<String, usize> = Default::default();
+        for u in &out.residue {
+            *ledger
+                .entry(format!("{}: {}", u.kind, u.why))
+                .or_default() += 1;
+        }
+        let seen: Vec<String> = ledger
+            .iter()
+            .map(|(k, n)| format!("{n:>4}  {k}"))
+            .collect();
+        let expected: Vec<String> = LEDGER_QWEN35_DECODE.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            seen,
+            expected,
+            "the qwen3_5 residue ledger moved.\n\
+             Every line here is a statement the flat list does not carry. \
+             If a rung removed one, update the constant and say which \
+             statement now names its kernel; if a rung ADDED one, that is \
+             a body stating something the lowering cannot read."
+        );
+    }
+
+    /// The ledger's current contents — see [`the_qwen3_5_residue_ledger`].
+    /// One entry per (kind, reason), counted per DECODE fire.
+    const LEDGER_QWEN35_DECODE: &[&str] = &[
+        "  18  GdnPrep: no lowering rule for this kind",
+        "  18  RmsnormGated: no lowering rule for this kind",
+        "   6  Rope: partial rope is a different kernel",
+        "   6  SigmoidGateMul: no lowering rule for this kind",
+        "   6  SplitQGate: no lowering rule for this kind",
+        "  24  Swiglu: the fused-gate_up binding fact is not in the facts",
+    ];
+
+    /// Qwen3.6-27B owes NOTHING that Qwen3.5-0.8B does not already owe.
+    ///
+    /// The qwen3_5 family's flat list does not cover itself yet — its
+    /// executor still walks, and both geometries carry the same large
+    /// residue (the Gemma norms, the GDN prep/gated-norm pair, the
+    /// swiglu binding fact). So the claim worth pinning is not coverage
+    /// but CONTAINMENT: the 27B checkpoint needs its dims and no new
+    /// vocabulary, which is exactly "its residue is a subset of the one
+    /// already being worked".
+    ///
+    /// It is the first geometry whose GDN half is GQA (48 value heads
+    /// over 16 key heads), so a NEW `why` here would most likely be the
+    /// head-repeat or the `_gqa` recurrence — something 0.8B cannot
+    /// prove either way. That is the case this test exists to catch.
+    #[test]
+    fn qwen3_6_27b_owes_nothing_new() {
+        let cuda = crate::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+        let whys = |facts: &crate::facts::Qwen35HybridFacts, class| {
+            let plan = family::qwen3_5_hybrid_cuda(facts, &cuda, class);
+            let out = lower(&plan, &sampled(4), Fire::default()).expect("the plan lowers");
+            out.residue
+                .into_iter()
+                .map(|u| format!("{}: {}", u.kind, u.why))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        for class in [FireClass::Decode, FireClass::Prefill] {
+            let known = whys(&crate::facts::Qwen35HybridFacts::qwen3_5_0_8b(), class);
+            let fresh = whys(&crate::facts::Qwen35HybridFacts::qwen3_6_27b(), class);
+            let novel: Vec<_> = fresh.difference(&known).collect();
             assert!(
-                out.launches.len() + out.residue.len() > 0,
-                "{name}: a fire that executes nothing is not a fire"
+                novel.is_empty(),
+                "{class:?}: Qwen3.6-27B owes something 0.8B does not: {novel:#?}"
             );
         }
+    }
 
-        // The inventory, as of the flat list's first coverage pass. Each
-        // line is one statement kind still owed a declaration; the `why`
-        // is what the trace would have to state for it to become a
-        // rectangle. Update this WITH the fix, never to make a red test
-        // green.
-        let inventory: Vec<&str> = kinds.keys().copied().collect();
-        assert_eq!(
-            inventory,
-            vec!["LmHead", "Swiglu"],
-            "the residue changed — kinds: {kinds:#?}"
-        );
-        // Measured 2026-08-06: 88.7% (qwen3_0_6b decode) to 93.8%
-        // (olmo2_1b prefill). The residue is one LmHead per fire plus one
-        // Swiglu PER LAYER — the MLP statement is the bulk of it, which is
-        // why closing `Swiglu` is worth more than its one line suggests.
-        // The floor is here so a regression that drops a whole layer's
-        // worth of statements cannot hide behind a passing kind list.
+    /// The MoE block's own ledger, and the argument for the fused leg.
+    ///
+    /// The SEMANTIC reading is residue — a selector, a combine and a
+    /// shared-expert landing that no kernel is named for. The CUDA
+    /// reading of the same fragment is a list of rectangles. Both halves
+    /// are asserted here because either one alone is half the claim: a
+    /// covered CUDA reading proves the statements exist, and an
+    /// uncovered semantic one proves they were needed.
+    #[test]
+    fn the_moe_block_covers_itself_only_in_its_cuda_reading() {
+        let facts = crate::facts::Qwen35MoeMlpFacts::qwen3_5_35b_a3b();
+        let cuda = crate::facts::Qwen35CudaFacts::qwen3_5_0_8b_synthetic();
+
+        // The semantic fragment names no backend at all, so it does not
+        // reach the residue ledger — it is refused before any op is
+        // read. That is the honest baseline: the MoE block had no CUDA
+        // reading, not a partial one.
+        let semantic = family::qwen3_5_moe_mlp_block(&facts);
         assert!(
-            worst > 0.88,
-            "the flat list covers {:.1}% of the worst deployment's statements",
-            worst * 100.0
+            matches!(
+                lower(&semantic, &sampled(4), Fire::default()),
+                Err(Uncovered::UnknownBackend(_))
+            ),
+            "the semantic MoE block named a backend — if it was given a \
+             CUDA reading, this test is the one that should say so"
         );
+
+        let declared = family::qwen3_5_moe_mlp_block_cuda(&facts, &cuda);
+        let out = lower(&declared, &sampled(4), Fire::default())
+            .unwrap_or_else(|e| panic!("the CUDA MoE block must lower: {e:?}"));
+        assert!(
+            out.residue.is_empty(),
+            "{} statements still owe a declaration: {:#?}",
+            out.residue.len(),
+            out.residue
+        );
+        assert_eq!(out.coverage(), 1.0);
+    }
+
+    /// THE CUTOVER GATE. Every statement a live fire executes is a
+    /// rectangle in the flat list — no residue, on every deployment the
+    /// driver serves, in both classes, sampled and unsampled.
+    ///
+    /// This started as a ledger (88.7%-93.8%, residue `Swiglu` per layer
+    /// + `LmHead` per fire) and is now the gate itself: `launches` is
+    /// the WHOLE of what a fire runs, which is the property the driver
+    /// needs before it can stop walking. A regression here is a
+    /// statement that would silently not execute.
+    #[test]
+    fn the_flat_list_covers_every_statement() {
+        for (name, plan) in live_plans() {
+            // Both epilogue shapes: a decode fire samples every row, a
+            // prefill fire samples one row per request and gathers.
+            for (shape, rows) in [("all-sampled", sampled(4)), ("gathered", gathered(4))] {
+                let out = lower(&plan, &rows, Fire::default()).unwrap_or_else(|e| panic!("{name}/{shape}: {e:?}"));
+                assert!(
+                    out.residue.is_empty(),
+                    "{name}/{shape}: {} statements still owe a declaration: {:#?}",
+                    out.residue.len(),
+                    out.residue
+                );
+                assert_eq!(out.coverage(), 1.0, "{name}/{shape}");
+                assert!(
+                    !out.launches.is_empty(),
+                    "{name}/{shape}: a fire that executes nothing is not a fire"
+                );
+            }
+        }
+    }
+
+    /// A site inside an arm the guards did not take must NOT fire, and
+    /// the rectangles alone cannot say which those are — so the list
+    /// carries the live ones. This is what a form driven by the list
+    /// needs in order to bracket a layer's sideband correctly.
+    #[test]
+    fn the_live_sites_are_named_and_the_dead_ones_are_not() {
+        let plan = decode_plan();
+        let sites: Vec<usize> = plan
+            .ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op.kind, OpKind::HookSite { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!sites.is_empty(), "the class trace carries observation sites");
+
+        // A plain fire takes the else arm; a MASKED fire takes the mask
+        // arm. Both bracket their layers, and they are DIFFERENT sites —
+        // which is the whole reason the list has to say.
+        let plain_out = lower(&plan, &sampled(4), Fire::default()).unwrap();
+        let mut masked = sampled(4);
+        for r in &mut masked {
+            r.custom_mask = true;
+        }
+        let masked_out = lower(&plan, &masked, Fire::default()).unwrap();
+
+        for out in [&plain_out, &masked_out] {
+            assert!(!out.structural.is_empty(), "a live fire brackets its layers");
+            assert!(
+                out.structural
+                    .iter()
+                    .all(|s| sites.contains(&(s.at_op as usize))),
+                "only sites are structural"
+            );
+            // Ordered, because a bracket opens before it closes.
+            assert!(out
+                .structural
+                .windows(2)
+                .all(|w| w[0].at_op < w[1].at_op));
+            // And every site brackets a NON-EMPTY window — an empty one
+            // would be a retired layer's, which does not fire at all.
+            assert!(out.structural.iter().all(|s| !s.rows.is_empty()));
+        }
+        assert_ne!(
+            plain_out.structural, masked_out.structural,
+            "the two arms bracket through different sites"
+        );
+        // And a dead arm's sites are absent from BOTH.
+        assert!(plain_out.structural.len() < sites.len());
+        assert!(masked_out.structural.len() < sites.len());
+    }
+
+    /// A CAPTURED fire emits both peel regions whatever its split is,
+    /// and says so on the launches — the one place a rectangle is not a
+    /// pair of numbers.
+    ///
+    /// The shadow comparison is what asked for this: the walk emits both
+    /// regions under device-window capture (an empty one early-outs on
+    /// the device word, so one graph replays across every split) and the
+    /// flat list described only the non-empty one.
+    #[test]
+    fn a_captured_fire_emits_both_peel_regions() {
+        let plan = decode_plan();
+        // fast_rows == 0: every row hooked, so the hook-free prefix is
+        // empty. Uncaptured, it contributes nothing.
+        let mut rows = sampled(4);
+        for r in &mut rows {
+            r.hooked = true;
+        }
+        let host = lower(&plan, &rows, Fire::default()).expect("coverable");
+        assert!(host.launches.iter().all(|l| l.peel.is_none_or(|p| !p.rows_device)));
+        assert!(
+            !host
+                .launches
+                .iter()
+                .any(|l| l.kernel_is(&host, "launch_qkv_decode_qk_norm_rope_write_kv_bf16")),
+            "an empty prefix launches nothing when the host's count is the truth"
+        );
+
+        // Captured: the prefix's launches ARE in the list, marked as
+        // reading the fire's split rather than these counts.
+        let captured = lower(
+            &plan,
+            &rows,
+            Fire {
+                captures_across_splits: true,
+            },
+        )
+        .expect("coverable");
+        let fused: Vec<_> = captured
+            .launches
+            .iter()
+            .filter(|l| l.kernel_is(&captured, "launch_qkv_decode_qk_norm_rope_write_kv_bf16"))
+            .collect();
+        assert!(!fused.is_empty(), "the captured graph carries the prefix");
+        assert!(fused
+            .iter()
+            .all(|l| l.peel.is_some_and(|p| p.axis == PeelWindow::HookFreePrefix
+                && p.rows_device)));
+        // And its rows are the WHOLE window, not the empty prefix half:
+        // a captured region launches a full-window grid and reads the
+        // split off the device word. Naming the half would describe a
+        // grid nobody launches, and an executor that believed it would
+        // bake this fire's split into the graph — wrong only on the
+        // REPLAY, which is why this is asserted here rather than left to
+        // a parity run to notice.
+        assert!(
+            fused
+                .iter()
+                .all(|l| l.rows.start == 0 && l.rows.end == rows.len() as u32),
+            "a captured peel region's rectangle is the full window"
+        );
+
+        // And ONLY the peel's regions are marked: everything outside is
+        // still a plain count, which is what keeps the list readable.
+        assert!(captured
+            .launches
+            .iter()
+            .filter(|l| l.peel.is_some_and(|p| p.rows_device))
+            .count()
+            < captured.launches.len());
+    }
+
+    /// The epilogue is three statements over a ROW COUNT, and the two
+    /// runtime branches the executor takes are the count being zero and
+    /// the count being short.
+    #[test]
+    fn the_epilogue_is_a_row_count_not_a_branch() {
+        let plan = decode_plan();
+        // The epilogue's launches are the ones carrying the LmHead
+        // statement's index. Identifying them by SYMBOL would not work:
+        // its projection is `gemm_act_x_w`, the same launcher every
+        // body matmul takes.
+        let at_op = plan
+            .ops
+            .iter()
+            .position(|op| matches!(op.kind, OpKind::LmHead { .. }))
+            .expect("the class trace has an epilogue") as u32;
+        let epilogue = |rows: &[Row]| -> Vec<(String, Range<u32>)> {
+            let out = lower(&plan, rows, Fire::default()).expect("coverable");
+            out.launches
+                .iter()
+                .filter(|l| l.args == at_op)
+                .map(|l| (out.kernels[l.kernel as usize].clone(), l.rows.clone()))
+                .collect()
+        };
+
+        // Every row sampled: norm and project over all four rows, no
+        // gather — there is nothing to skip past.
+        let all = epilogue(&sampled(4));
+        assert_eq!(
+            all,
+            vec![
+                ("launch_rmsnorm_bf16".to_string(), 0..4),
+                ("gemm_act_x_w".to_string(), 0..4),
+            ]
+        );
+
+        // One sampled row of four: the gather appears, and all three
+        // statements run over ONE row while the body ran over four —
+        // the epilogue's row space is Requests.
+        assert_eq!(
+            epilogue(&gathered(4)),
+            vec![
+                ("launch_gather_bf16_rows".to_string(), 0..1),
+                ("launch_rmsnorm_bf16".to_string(), 0..1),
+                ("gemm_act_x_w".to_string(), 0..1),
+            ]
+        );
+
+        // Nothing sampled (`emit_logits == false`, a fire whose logits
+        // nobody reads): no rectangle at all, while the body still runs.
+        let none = vec![Row::default(); 4];
+        assert!(epilogue(&none).is_empty());
+        assert!(!lower(&plan, &none, Fire::default()).unwrap().launches.is_empty());
     }
 
     /// A plain fire lowers, and every launch covers every row — the
@@ -881,7 +1425,7 @@ mod tests {
     fn a_plain_fire_is_one_rectangle_per_statement() {
         let plan = decode_plan();
         let rows = plain(8);
-        let out = lower(&plan, &rows).expect("a plain fire is coverable");
+        let out = lower(&plan, &rows, Fire::default()).expect("a plain fire is coverable");
         assert!(out.rectangles > 0);
         assert!(out.launches.iter().all(|l| l.rows == (0..8)));
         // The frame's kernel table is what the driver would index.
@@ -901,7 +1445,7 @@ mod tests {
         for r in &mut rows[6..] {
             r.custom_mask = true;
         }
-        let out = lower(&plan, &rows).expect("mask + plain is coverable");
+        let out = lower(&plan, &rows, Fire::default()).expect("mask + plain is coverable");
         let masked = out
             .launches
             .iter()
@@ -912,7 +1456,7 @@ mod tests {
         assert!(plain_rows > 0, "and the plain rows theirs");
         // More rectangles than the unsplit fire — what the row order
         // costs, reported rather than acted on.
-        let flat = lower(&plan, &plain(8)).unwrap();
+        let flat = lower(&plan, &plain(8), Fire::default()).unwrap();
         assert!(out.rectangles > flat.rectangles);
     }
 
@@ -926,7 +1470,7 @@ mod tests {
         rows[1].custom_mask = true;
         rows[5].custom_mask = true;
         assert!(matches!(
-            lower(&plan, &rows),
+            lower(&plan, &rows, Fire::default()),
             Err(Uncovered::Discontiguous { .. })
         ));
     }
@@ -952,16 +1496,20 @@ mod tests {
             "this deployment states XQA"
         );
         // Whole fire: fine.
-        assert!(lower(&plan, &plain(8)).is_ok());
-        // A masked suffix would hand XQA the unmasked prefix only.
+        assert!(lower(&plan, &plain(8), Fire::default()).is_ok());
+        // And a MASKED fire is fine too, which is the point: a guard is
+        // a fire fact, so the mask arm takes the whole fire and XQA — in
+        // the else arm — does not run at all. Nothing hands a kernel a
+        // row window except a Peel, and a `whole` kernel inside a Peel
+        // is refused STATICALLY at trace time (`kernels::check_plan`),
+        // so this dynamic check is a backstop rather than the rule's
+        // live enforcement. It stays because the flat list is about to
+        // become the thing that executes.
         let mut rows = plain(8);
         for r in &mut rows[6..] {
             r.custom_mask = true;
         }
-        assert!(matches!(
-            lower(&plan, &rows),
-            Err(Uncovered::WholeKernelSplit { kernel, .. }) if kernel.contains("xqa")
-        ));
+        assert!(lower(&plan, &rows, Fire::default()).is_ok());
     }
 
     /// Liveness reuse is the point of assigning buffers here: a
@@ -1009,7 +1557,7 @@ mod tests {
                 r.depth_k = Some(k);
             }
         }
-        let out = lower(&plan, &rows).expect("four bands is not a special case");
+        let out = lower(&plan, &rows, Fire::default()).expect("four bands is not a special case");
         // Layer 0 runs over everybody; layer 23 only over the rows whose
         // k is past it (the full-depth prefix plus the k=24 block).
         let at = |l: u16| {
@@ -1044,11 +1592,11 @@ mod tests {
             };
             4
         ];
-        let out = lower(&plan, &rows).unwrap();
+        let out = lower(&plan, &rows, Fire::default()).unwrap();
         assert!(out.launches.iter().all(|l| l.layers.start < 12
             || l.layers.start >= 28
             || l.rows.is_empty()));
-        let full = lower(&plan, &plain(4)).unwrap();
+        let full = lower(&plan, &plain(4), Fire::default()).unwrap();
         assert!(out.rectangles < full.rectangles, "truncation costs less");
     }
 
