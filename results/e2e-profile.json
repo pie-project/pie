@@ -1,0 +1,17 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "rows": [
+    {
+      "batch": 256,
+      "host_advance_us": 11.602183803915977,
+      "set_matchers_us": 224.47016090154648,
+      "fill_us": 33.08197483420372,
+      "mask_to_host_us": 347.92092628777027,
+      "row_copies_us": 2226.2842394411564,
+      "row_copies_vectorised_us": 71.11788727343082,
+      "ours_total_us": 2843.359485268593,
+      "ours_total_vectorised_us": 688.1931331008673,
+      "xgrammar_us": 1869.294559583068
+    }
+  ]
+}
