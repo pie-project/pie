@@ -18,12 +18,12 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 mod common;
 
 fn build_inferlet() -> Result<std::path::PathBuf> {
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",
@@ -134,7 +134,7 @@ async fn buffering_a_token_costs_what_it_costs() -> Result<()> {
     // unbuffered fold-all recurrent fire take the device-composed template,
     // which resolves descriptor ports at KERNEL time rather than at frame
     // entry — so the chained value is there by the time the consumer reads it.
-    // The engine-side refusal (`validate_frame` in `runtime/engine/src/
+    // The engine-side refusal (`validate_frame` in `crates/engine/src/
     // pipeline/fire.rs`) was narrowed to the two shapes the template still
     // refuses: a buffered row, and a device-resident fold length.
     //

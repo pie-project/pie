@@ -1,0 +1,17 @@
+[package]
+name = "kernels"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The vocabulary a kernel signature is written in: KernelSig, the capabilities a kernel may lack, the host plan it obligates, and the kernel! macro that declares one."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "kernels"
+path = "src/lib.rs"
+
+# No dependencies, and none is wanted: a row in a backend's table must be
+# writable next to the .cu it describes without dragging a graph along.
+[dependencies]

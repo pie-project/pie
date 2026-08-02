@@ -1,0 +1,34 @@
+[package]
+name = "driver-cuda"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The CUDA execution shell: dispatch, memory/arenas, streams, graph capture and TP comm, built from csrc/ and linked into the binary as one static archive."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+# Linux/NVIDIA only. Selecting this crate on any other host is a build error
+# from build.rs rather than a link failure much later.
+links = "pie_driver_cuda_lib"
+
+[lib]
+name = "driver_cuda"
+path = "src/lib.rs"
+
+[build-dependencies]
+cmake = "0.1"
+
+# All four are here for their build scripts' `cargo:include` handoffs, not for
+# Rust: this crate has no Rust code that calls them. Cargo only sets
+# `DEP_<links>_INCLUDE` for DIRECT dependencies, so the edge has to exist.
+[dependencies]
+driver = { path = "../driver" }
+driver-abi = { path = "../driver-abi" }
+model-loader-capi = { path = "../model-loader-capi", default-features = false }
+# `links = "pie_forward"` moved to `model` with the header it publishes;
+# `forward` is the aspect that has one.
+model = { path = "../model", default-features = false, features = ["forward"] }
+# The kernels, with `native` ON -- this is the one crate in the workspace that
+# asks for the CUDA build. It brings the archive, the include path the shell
+# compiles against, and the FlashInfer tree `batch/workspace.cu` reaches into.
+kernels-cuda = { path = "../kernels-cuda", features = ["native"] }

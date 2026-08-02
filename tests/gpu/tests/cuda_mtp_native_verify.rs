@@ -27,7 +27,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 mod common;
 
@@ -56,7 +56,7 @@ async fn mtp_logits_value_verify() -> Result<()> {
     eprintln!("[mtp-native-verify] k = {k}");
 
     // Build the mtp-native-verify inferlet (wasm).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",
@@ -176,7 +176,7 @@ async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
     common::init_trace();
     let k = draft_k();
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",
@@ -265,7 +265,7 @@ async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
             checks that the mtp_logits intrinsic is then refused"]
 async fn mtp_logits_capability_false() -> Result<()> {
     common::init_trace();
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",

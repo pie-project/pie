@@ -1,0 +1,32 @@
+[package]
+name = "model-compiler"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Forward-pass declarations: a tracing eDSL from model facts to the traced form a driver executes."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# No `links` any more: the C header and the `#[repr(C)]` surface it describes
+# are `crates/model`'s, because they are how a DRIVER reaches a declaration and
+# a declaration is a model's, not the toolchain's. build.rs stays for the
+# tracer fingerprint alone, which needs no `links` -- it is a
+# `cargo:rustc-env`, read back by `compiler_version()`.
+build = "build.rs"
+
+[lib]
+name = "model_compiler"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The signature tables, TABLE ONLY. `default-features = false` is what keeps a
+# compiler dev loop off nvcc: `check_plan` reads these on every trace, and
+# looking up a symbol's contract must not build a `.cu`. `driver-cuda` is the
+# crate that turns `native` on.
+kernels = { path = "../kernels" }
+kernels-cuda = { path = "../kernels-cuda", default-features = false }
+kernels-metal = { path = "../kernels-metal", default-features = false }
+
+[dev-dependencies]

@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 const MAX_TOKENS: usize = 32;
 
@@ -93,8 +93,8 @@ async fn gdn_site_summary_parity() -> Result<()> {
 
     let snapshot = resolve_qwen35_base_snapshot()?;
     let (controller, gateway, worker) =
-        pie_bin::derive::derive_standalone(&common::cuda_standalone_toml(&snapshot))?;
-    let pie = pie_bin::run_standalone(controller, gateway, worker).await?;
+        pie::derive::derive_standalone(&common::cuda_standalone_toml(&snapshot))?;
+    let pie = pie::run_standalone(controller, gateway, worker).await?;
     eprintln!(
         "[gdn-site-summary] booted listen={} declared={declared}",
         pie.listen_addr
@@ -103,7 +103,7 @@ async fn gdn_site_summary_parity() -> Result<()> {
     // generate-gdn: the greedy decode that binds BOTH working sets (KV +
     // recurrent state) — the hybrid's linear-attention layers need
     // runtime-assigned rs_cache slots (see cuda_mtp_stage1).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "generate-gdn"])
         .current_dir(&ws)

@@ -1,0 +1,39 @@
+[package]
+name = "controller"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "Distributed control plane for Pie"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "controller"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+# Pure library (Seam 1): no `main.rs`, no `[[bin]]`. The standalone process lives
+# in the thin `bin/controller` shell (bootstrap + this lib); single-node embeds
+# via `embed()`.
+
+[dependencies]
+# Control-plane data types + the `Control` tarpc service (unified).
+controller-api = { path = "../controller-api" }
+# Cross-node id atoms (`WorkerId`/`GatewayId`/`NodeId`).
+ids = { path = "../ids" }
+# tarpc serves the `Control` RPC: Bincode over tarpc-native TCP or Unix sockets.
+tarpc = { version = "0.37", features = [
+    "serde-transport",
+    "serde-transport-bincode",
+    "tcp",
+    "unix",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# CancellationToken — cooperative shutdown of the actor/reaper/serve tasks.
+tokio-util = "0.7"
+futures = "0.3"
+tracing = "0.1"
+anyhow = "1"
+# Config is TOML (project convention): pure `Config::parse(&str)` via serde.
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"

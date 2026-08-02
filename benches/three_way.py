@@ -155,8 +155,8 @@ def main() -> None:
                 if engine == "pie":
                     cmd = [PIE_PY, "pie_bench.py"] + base + [
                         "--driver", "metal", "--inferlet-dir", args.inferlet_dir]
-                    env = {"PYTHONPATH": f"{ROOT.parent}/client/python/src:"
-                                         f"{ROOT.parent}/sdk/python-server/python"}
+                    env = {"PYTHONPATH": f"{ROOT.parent}/sdk/client/python/src:"
+                                         f"{ROOT.parent}/sdk/inferlet/python-server/python"}
                 elif engine == "mlx":
                     cmd, env = [MLX_PY, "mlx_bench.py"] + base, None
                 else:

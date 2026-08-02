@@ -1,0 +1,146 @@
+[package]
+name = "engine"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Programmable Inference Engine (Pie)"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "engine"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# tart: the declared-forward toolchain — the fire planner's site table
+# maps driver-reported model sites onto its vocabulary.
+model-compiler = { path = "../model-compiler" }
+driver-abi = { path = "../driver-abi" }
+driver-dummy = { path = "../driver-dummy" }
+tensor-ir = { path = "../tensor-ir" }
+tensor-compiler = { path = "../tensor-compiler" }
+# The native execution shells, for their archives alone -- see the feature
+# comments above and the `extern crate ... as _` in lib.rs.
+driver-cuda = { path = "../driver-cuda", optional = true }
+driver-metal = { path = "../driver-metal", optional = true }
+client = { path = "../client" }
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = "0.7"
+parking_lot = "0.12"
+tarpc = { version = "0.37", features = ["serde1"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+rand = { version = "0.10.2", features = ["std_rng", "sys_rng"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = "0.1.44"
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+opentelemetry-semantic-conventions = "0.32"
+serde_json = { version = "1.0", features = ["preserve_order"] }
+wasmtime = { version = "47.0.1", features = ["pooling-allocator"] }
+wasmtime-wasi = { version = "47.0.1", features = ["p3"] }
+wasmtime-wasi-http = { version = "47.0.1", features = ["p3"] }
+# Names `http::uri::Scheme` for the wasi:http@0.3 network-policy hook
+# (ProcessCtx::PieHttpHooks); shared with wasmtime-wasi-http's http 1.x.
+http = "1"
+bytes = "1.12.1"
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
+dashmap = "6.2.1"
+boxcar = "0.2.14"
+crossbeam-queue = "0.3"
+thiserror = "2.0.19"
+futures = "0.3.33"
+waker = { path = "../waker" }
+tokenizer = { path = "../tokenizer" }
+grammar = { path = "../grammar" }
+# `forward` for the site table, which traces a real declaration to work out
+# where a fire's hook sites are.
+model = { path = "../model", features = ["forward"] }
+rmp-serde = "1.3.1"
+blake3 = "1.8.5"
+num-traits = "0.2.19"
+rmpv = { version = "1.3.1", features = ["with-serde"] }
+fancy-regex = "0.18.0"
+once_cell = "1.21"
+async-trait = "0.1.91"
+wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
+wasmparser = "0.254.0"
+wasm-metadata = "0.254.0"
+chrono = "0.4"
+ringbuffer = "0.16"
+libc = "0.2"
+# default-features off so reqwest's `default-tls` (native-tls → openssl) is
+# never pulled in: it dynamically links libssl.so.1.1, which doesn't exist on
+# OpenSSL-3 distros (Ubuntu 22.04+) and breaks the manylinux_2_28 release
+# binary. rustls is statically linked and distro-independent.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "charset"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+ipc-channel = "0.22"
+rustc-hash = "2.1"
+aho-corasick = "1"
+memchr = "2"
+unicode-normalization = "0.1"
+smallvec = "1"
+lru = "0.18.1"
+ahash = "0.8.12"
+ipnet = "2"
+# Host-side media decode for the model-agnostic multimodal API: the inferlet
+# hands raw encoded bytes (PNG/JPEG still, animated GIF) and the host decodes
+# them here, then resizes/patchifies per the bound model. Lean feature set —
+# WAV is parsed by hand in `multimodal::audio` (no extra crate).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+
+[features]
+default = []
+# Programmable-sampling output→tensor fast-path (#27 cut #1). Gates the host
+# eager-D2H populate: the `extern "C"` `pie_pinned_alloc`/`pie_pinned_free`
+# decls + the `sampling_output_*` carrier fill + the pinned `output()` read.
+# OFF (host-only builds / `cargo test -p pie`) ⇒ the fast-path is compiled out
+# entirely (the `pie_driver_cuda_lib` symbols are never referenced, so no
+# undefined-symbol link error), leaving the legacy host output path.
+#
+# ON ⇒ the fast-path is active, and this crate must be the one that supplies
+# the archive. It used to say "propagated from `worker`'s `driver-cuda`,
+# which links `pie_driver_cuda_lib`", and that held for the final binary and
+# ONLY for it: `worker` depends on this crate, not the other way round, so
+# THIS crate's own test binaries had the externs and no archive. Any build that
+# turned the feature on workspace-wide -- and `sdk/python-server` turns it on
+# unconditionally -- could not link `cargo test -p pie-engine`.
+#
+# The crate that declares an `extern "C"` is the crate that owes the symbol.
+driver-cuda = ["dep:driver-cuda"]
+driver-metal = ["dep:driver-metal"]
+# Host-side performance probes. Each scenario is a separate flag so you
+# only pay for the probes you ask for — different domains have different
+# sample rates and different audiences. The `probe_<domain>!` macros in
+# `src/scheduler/probe.rs` expands to zero code when its feature is off.
+#
+# Adding a new domain: define it under `src/scheduler/probe.rs` (or an
+# `src/scheduler/probe/` submodule) with its probe-holder
+# struct + `probe_<domain>!` macro pair, then add a feature flag here.
+profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
+profile-hot-path = ["profile-fire"]  # convenience bundle
+profile-all = ["profile-fire"]       # everything
+
+[dev-dependencies]
+tempfile = "3"
+tensor-ir = { path = "../tensor-ir" }
+criterion = { version = "0.8", features = ["html_reports"] }
+# Benchmarks must allocate the way production does. Every engine entry point
+# links `worker`, which sets mimalloc as the global allocator; a bench that
+# omitted it would measure glibc malloc and report a machine nobody runs.
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
+
+[[bench]]
+name = "grammar_wit"
+harness = false
+
+#[profile.release]
+#lto = "fat"
+#codegen-units = 1

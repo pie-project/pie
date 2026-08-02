@@ -15,7 +15,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "diagnostic: needs the local qwen3 snapshot (tokenizer) + a built generate.wasm"]
@@ -24,7 +24,7 @@ async fn add_program_completes_on_dummy_driver() -> Result<()> {
     let pie = common::boot_dummy().await?;
     eprintln!("[diag] booted, listen_addr={}", pie.listen_addr);
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "generate"])
         .current_dir(&ws)

@@ -1,0 +1,34 @@
+[package]
+name = "driver-metal"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The Metal execution shell (MTL4): dispatch, heaps and residency, command encoding and the .metal shader library, built from csrc/ and linked into the binary as one static archive."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+# macOS/Apple Silicon only. Selecting this crate on any other host is a build error
+# from build.rs rather than a link failure much later.
+links = "pie_driver_metal_lib"
+
+[lib]
+name = "driver_metal"
+path = "src/lib.rs"
+
+[build-dependencies]
+cmake = "0.1"
+
+# All four are here for their build scripts' `cargo:include` handoffs, not for
+# Rust: this crate has no Rust code that calls them. Cargo only sets
+# `DEP_<links>_INCLUDE` for DIRECT dependencies, so the edge has to exist.
+[dependencies]
+driver = { path = "../driver" }
+driver-abi = { path = "../driver-abi" }
+model-loader-capi = { path = "../model-loader-capi", default-features = false }
+# `links = "pie_forward"` moved to `model` with the header it publishes;
+# `forward` is the aspect that has one.
+model = { path = "../model", default-features = false, features = ["forward"] }
+# The shaders. `native` is what stages `ptir_rng.generated.metal` beside them;
+# there is nothing to compile, because Metal builds its pipeline state objects
+# from `.metal` text at run time.
+kernels-metal = { path = "../kernels-metal", features = ["native"] }

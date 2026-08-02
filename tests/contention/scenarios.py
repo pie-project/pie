@@ -30,7 +30,7 @@ Counter names are keys of the ``[planner-trace]`` line that ``bootstrap.rs``
 emits when ``PIE_CONTENTION_TRACE_MS`` is set.
 
 ``--swap-pool-size`` is a HOST-PINNED allocation (``cudaMallocHost`` in
-``driver/cuda/src/store/swap_pool.cpp``, taken up front for every layer), so
+``crates/driver-cuda/csrc/src/store/swap_pool.cpp``, taken up front for every layer), so
 it is not free headroom: pinned pages can be neither swapped nor reclaimed.
 Size it from measured demand, not "generously". The scenarios here used to ask
 for 8192-16384 pages against device pools of 12-256, which took the server to

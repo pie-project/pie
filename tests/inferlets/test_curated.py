@@ -15,7 +15,7 @@ import os
 
 # `quest-attention` needs the per-page key envelopes, which are an operator
 # opt-in because they cost `2/page_size` of the KV pool and have to be
-# allocated with the pages (driver/cuda/src/store/kv_cache.cpp). Set it before
+# allocated with the pages (crates/driver-cuda/csrc/src/store/kv_cache.cpp). Set it before
 # the engine boots — the driver reads it while sizing the cache. Enabling it
 # for the whole run is deliberate: it also proves the envelope maintenance that
 # now rides every KV append does not perturb the other inferlets.

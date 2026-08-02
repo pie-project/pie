@@ -33,7 +33,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "§6.2 beam Design B device e2e: needs the 4090 + cuda + qwen-3-0.6b + the ptir feature"]
@@ -44,7 +44,7 @@ async fn beam_designb_on_real_driver() -> Result<()> {
 
     // Build the `beam-designb` inferlet to wasm (member of the runtime
     // test-inferlets ws). The crate name normalizes to `beam_designb.wasm`.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "beam-designb"])
         .current_dir(&ws)

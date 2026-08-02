@@ -38,7 +38,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 mod common;
 
@@ -123,7 +123,7 @@ async fn mtp_specdecode_device_ab() -> Result<()> {
     let k = draft_k();
     eprintln!("[specdecode-ab] k = {k}");
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     build_wasm(&ws, "mtp-specdecode")?;
     build_wasm(&ws, "mtp-native-verify")?;
 

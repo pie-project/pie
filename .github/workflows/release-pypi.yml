@@ -8,9 +8,9 @@ on:
         required: true
         type: choice
         options:
-          - pie-client (client/python/)
-          - pie-bakery (sdk/tools/bakery/)
-          - inferlet (sdk/python/)
+          - pie-client (sdk/client/python/)
+          - pie-bakery (sdk/inferlet/tools/bakery/)
+          - inferlet (sdk/inferlet/python/)
       dry_run:
         description: 'Dry run (build and validate but do not publish)'
         required: false
@@ -31,16 +31,16 @@ jobs:
         id: info
         run: |
           case "${{ inputs.package }}" in
-            "pie-client (client/python/)")
-              echo "path=client/python" >> "$GITHUB_OUTPUT"
+            "pie-client (sdk/client/python/)")
+              echo "path=sdk/client/python" >> "$GITHUB_OUTPUT"
               echo "backend=python" >> "$GITHUB_OUTPUT"
               ;;
-            "pie-bakery (sdk/tools/bakery/)")
-              echo "path=sdk/tools/bakery" >> "$GITHUB_OUTPUT"
+            "pie-bakery (sdk/inferlet/tools/bakery/)")
+              echo "path=sdk/inferlet/tools/bakery" >> "$GITHUB_OUTPUT"
               echo "backend=python" >> "$GITHUB_OUTPUT"
               ;;
-            "inferlet (sdk/python/)")
-              echo "path=sdk/python" >> "$GITHUB_OUTPUT"
+            "inferlet (sdk/inferlet/python/)")
+              echo "path=sdk/inferlet/python" >> "$GITHUB_OUTPUT"
               echo "backend=python" >> "$GITHUB_OUTPUT"
               ;;
           esac
@@ -71,7 +71,7 @@ jobs:
       # SDK reaches no forward-pass surface at all, which is the state today.
       # See forward_refactor.md 10.4.
       - name: Check SDK targets a live WIT surface
-        if: needs.setup.outputs.package_path == 'sdk/python'
+        if: needs.setup.outputs.package_path == 'sdk/inferlet/python'
         run: scripts/check-sdk-interfaces.sh
 
       # The unit tests stub `wit_world`, so they prove the wrapper layer's
@@ -79,19 +79,19 @@ jobs:
       # previous suite passed for months against a mock of a deleted
       # interface.
       - name: Unit tests
-        if: needs.setup.outputs.package_path == 'sdk/python'
+        if: needs.setup.outputs.package_path == 'sdk/inferlet/python'
         run: |
           python -m pip install pytest
-          python -m pytest sdk/python/tests -q
+          python -m pytest sdk/inferlet/python/tests -q
 
       # This is the one that checks the world. The wheel's `import inferlet`
       # cannot run outside a componentize-py build (the smoke test below says
       # so), but componentize-py itself can be installed here, and building a
-      # component resolves every WIT import against `interface/inferlet/` for
+      # component resolves every WIT import against `crates/inferlet-api/wit/` for
       # real. An interface, function, or signature the host no longer offers
       # fails at this step.
       - name: Build a component against the SDK
-        if: needs.setup.outputs.package_path == 'sdk/python'
+        if: needs.setup.outputs.package_path == 'sdk/inferlet/python'
         run: |
           python -m pip install componentize-py
           mkdir -p "$RUNNER_TEMP/componentize"
@@ -118,10 +118,10 @@ jobs:
                   session.send(input)
                   return "ok"
           PY
-          componentize-py -d interface/inferlet -w inferlet componentize \
+          componentize-py -d crates/inferlet-api/wit -w inferlet componentize \
             -p "$RUNNER_TEMP/componentize" \
-            -p sdk/python/src \
-            -p sdk/python/src/inferlet/bindings \
+            -p sdk/inferlet/python/src \
+            -p sdk/inferlet/python/src/inferlet/bindings \
             app -o "$RUNNER_TEMP/componentize/app.wasm"
 
       - name: Build package
@@ -131,14 +131,14 @@ jobs:
         run: python -m twine check "${{ needs.setup.outputs.package_path }}"/dist/*
 
       - name: Check package data
-        if: needs.setup.outputs.package_path == 'sdk/tools/bakery'
+        if: needs.setup.outputs.package_path == 'sdk/inferlet/tools/bakery'
         run: |
           python - <<'PY'
           import pathlib
           import sys
           import zipfile
 
-          wheel = next(pathlib.Path("sdk/tools/bakery/dist").glob("*.whl"))
+          wheel = next(pathlib.Path("sdk/inferlet/tools/bakery/dist").glob("*.whl"))
           required = {
               "bakery/templates/Pie.toml.template",
               "bakery/templates/rust/Cargo.toml.template",
@@ -162,15 +162,15 @@ jobs:
           "$RUNNER_TEMP/smoke/bin/python" -m pip install "${{ needs.setup.outputs.package_path }}"/dist/*.whl
 
           case "${{ needs.setup.outputs.package_path }}" in
-            "client/python")
+            "sdk/client/python")
               "$RUNNER_TEMP/smoke/bin/python" -c "import pie_client"
               "$RUNNER_TEMP/smoke/bin/pie-client" --help >/dev/null
               ;;
-            "sdk/tools/bakery")
+            "sdk/inferlet/tools/bakery")
               "$RUNNER_TEMP/smoke/bin/python" -c "import bakery"
               "$RUNNER_TEMP/smoke/bin/bakery" --help >/dev/null
               ;;
-            "sdk/python")
+            "sdk/inferlet/python")
               # `import inferlet` needs the WIT-generated `wit_world`, which only
               # exists inside a componentize-py build, not a plain venv. Verify
               # the wheel installed and is registered instead.

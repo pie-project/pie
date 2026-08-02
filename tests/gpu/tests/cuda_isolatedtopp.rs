@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the 4090 + cuda + qwen-3-0.6b"]
@@ -35,7 +35,7 @@ async fn isolatedtopp_on_real_driver() -> Result<()> {
         pie.listen_addr, seed
     );
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "isolatedtopp"])
         .current_dir(&ws)

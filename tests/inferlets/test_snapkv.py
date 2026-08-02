@@ -56,7 +56,7 @@ def _window_pages(r):
     than reported by the inferlet.
 
     The driver captures the last `window` query rows of the prompt
-    (`default_attn_score_window()` in driver/cuda/src/model/attn_score.hpp,
+    (`default_attn_score_window()` in crates/driver-cuda/csrc/src/model/attn_score.hpp,
     overridable by PIE_ATTN_SCORE_WINDOW). Those rows start at token
     `prompt_len - window`, so the kv positions they weight most heavily span
     every page from that token onward.

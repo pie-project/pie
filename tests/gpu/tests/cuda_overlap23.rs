@@ -45,7 +45,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 // ── alpha's seam contract (CONFIRMED on `alpha-23-overlap @ 337e0e0b`) ────────
 // Q1 (link numbering): `next_input_link_counter` is per-instance, init 0,
@@ -84,7 +84,7 @@ async fn found_abort_overlap_on_real_driver() -> Result<()> {
     );
 
     // Build the run-ahead carryover inferlet (the overlap driver).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "runahead"])
         .current_dir(&ws)

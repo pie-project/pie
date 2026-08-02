@@ -84,13 +84,13 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_bin::sweep::fleet::{self, FleetRun};
+use pie::sweep::fleet::{self, FleetRun};
 
 /// The inferlet every lane runs. Named here rather than inside the fleet
 /// helper because the sweep and this test drive different programs through
 /// the same load generator.
 const GENERATE: &str = "generate@0.1.0";
-use pie_client::client::Client;
+use client::client::Client;
 
 /// A fleet large enough that its combined KV demand exceeds the shrunk pool
 /// (see `SMALL_POOL_GPU_MEM_UTIL`) — forcing the preempt/restore path.
@@ -200,7 +200,7 @@ fn write_profile_record(
         "bubble_p50_us": bubble_p50_us,
         "bubble_p99_us": bubble_p99_us,
     });
-    if let Some(planner) = pie_engine::planner::planner() {
+    if let Some(planner) = engine::planner::planner() {
         let diagnostics = planner.diagnostics();
         document[mode]["contention"] = serde_json::json!({
             "parked": diagnostics.parks_total,
@@ -274,7 +274,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
             .unwrap_or(8)
     };
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     anyhow::ensure!(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip2", "-p", "generate"])
@@ -318,7 +318,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         );
         reference.push(r);
     }
-    let scheduler_before = pie_engine::scheduler::get_stats().await;
+    let scheduler_before = engine::scheduler::get_stats().await;
 
     // Over-capacity: launch the whole fleet at once. Combined demand > pool ⇒ the
     // losers OOM in prep → acquire() → wait → a finisher frees → drain → retry.
@@ -331,7 +331,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         Some(tokio::spawn(async move {
             let t0 = std::time::Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(planner) = pie_engine::planner::planner() {
+                if let Some(planner) = engine::planner::planner() {
                     let d = planner.diagnostics();
                     eprintln!(
                         "[contention-trace] t={}ms parked={} woken={} suspends={} restores={} \
@@ -371,7 +371,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         .filter_map(Option::as_ref)
         .map(Vec::len)
         .sum();
-    let scheduler_after = pie_engine::scheduler::get_stats().await;
+    let scheduler_after = engine::scheduler::get_stats().await;
     let batches = scheduler_after
         .total_batches
         .saturating_sub(scheduler_before.total_batches);
@@ -402,7 +402,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         bubble_p50_us,
         bubble_p99_us,
     );
-    if let Some(planner) = pie_engine::planner::planner() {
+    if let Some(planner) = engine::planner::planner() {
         let diagnostics = planner.diagnostics();
         eprintln!(
             "[contention-profile] parked={} woken={} suspends={} restores={} \
@@ -435,7 +435,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // assertion so a transparency RED still surfaces whether preempt/restore
     // fired (a degenerate-replay mismatch with suspends==0 falsifies the
     // "restore corruption" framing → the bug is not on the restore path).
-    if let Some(planner) = pie_engine::planner::planner() {
+    if let Some(planner) = engine::planner::planner() {
         let d = planner.diagnostics();
         eprintln!(
             "[contention] final-engagement: parked={} woken={} suspends={} restores={}",
@@ -463,7 +463,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // trivially. Engagement = allocation waiters that PARKED (demand outran
     // the pool → blocked in acquire's queue) and were later WOKEN (freed
     // pages covered them → the drain released them → they succeeded).
-    let (parked, woken, suspends, restores) = pie_engine::planner::planner()
+    let (parked, woken, suspends, restores) = engine::planner::planner()
         .map(|planner| {
             let d = planner.diagnostics();
             (

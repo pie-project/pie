@@ -15,11 +15,11 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
-use pie_bin::derive::derive_standalone;
-use pie_bin::{run_standalone};
+use pie::derive::derive_standalone;
+use pie::{run_standalone};
 
 /// Install a `tracing` subscriber driven by `RUST_LOG` so the inproc
-/// forward-path debug probes (`pie_engine::driver::inproc`) and any other `tracing`
+/// forward-path debug probes (`engine::driver::inproc`) and any other `tracing`
 /// events surface on the diagnostic runs. Idempotent + non-panicking: a 2nd
 /// call (or a boot that already set a global) is a silent no-op.
 pub fn init_trace() {
@@ -128,7 +128,7 @@ pub fn cuda_standalone_toml_capped(
 /// Boot the embedded standalone (controller + gateway + worker) with the real
 /// CUDA driver + qwen-3-0.6b on the 4090. The client edge is at
 /// `handle.listen_addr` (`ws://{listen_addr}` for the `pie-client`).
-pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
+pub async fn boot_4090() -> Result<pie::StandaloneHandle> {
     let snapshot = resolve_qwen3_snapshot()?;
     let (controller, gateway, worker) = derive_standalone(&cuda_standalone_toml(&snapshot))?;
     run_standalone(controller, gateway, worker).await
@@ -139,7 +139,7 @@ pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
 /// depth to MATCH the chain depth its carrier submits, and config is the only
 /// way to say so: the depth used to be an env var the engine silently clamped,
 /// so a test asking for 4 quietly ran the engine at 3.
-pub async fn boot_4090_dispatch_depth(depth: u32) -> Result<pie_bin::StandaloneHandle> {
+pub async fn boot_4090_dispatch_depth(depth: u32) -> Result<pie::StandaloneHandle> {
     let snapshot = resolve_qwen3_snapshot()?;
     let toml = format!(
         "{}\n[runtime]\nframe_dispatch_depth = {depth}\n",
@@ -159,7 +159,7 @@ pub async fn boot_4090_dispatch_depth(depth: u32) -> Result<pie_bin::StandaloneH
 /// modest fleet genuinely over-fills it deterministically (CI-friendly).
 pub const SMALL_POOL_GPU_MEM_UTIL: f64 = 0.3;
 
-pub async fn boot_4090_kv_cap(total_pages: u32) -> Result<pie_bin::StandaloneHandle> {
+pub async fn boot_4090_kv_cap(total_pages: u32) -> Result<pie::StandaloneHandle> {
     let util = std::env::var("PIE_CONTENTION_UTIL")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -171,7 +171,7 @@ pub async fn boot_4090_kv_cap(total_pages: u32) -> Result<pie_bin::StandaloneHan
     run_standalone(controller, gateway, worker).await
 }
 
-pub async fn boot_4090_small_kv() -> Result<pie_bin::StandaloneHandle> {
+pub async fn boot_4090_small_kv() -> Result<pie::StandaloneHandle> {
     // charlie: explicit KV-page cap (deterministic tiny pool, independent of the
     // forward-layout budget floor). Default 8 forces genuine contention out-of-the
     // -box; `PIE_CONTENTION_TOTAL_PAGES=0` restores the derive-from-util path.
@@ -244,7 +244,7 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
 /// through `[model.driver.options]` like any other driver setting -- 0 disables
 /// speculation and gives the non-spec baseline. Client edge at
 /// `handle.listen_addr`.
-pub async fn boot_4090_mtp(mtp_num_drafts: u32) -> Result<pie_bin::StandaloneHandle> {
+pub async fn boot_4090_mtp(mtp_num_drafts: u32) -> Result<pie::StandaloneHandle> {
     let snapshot = resolve_qwen35_snapshot()?;
     let (controller, gateway, worker) =
         derive_standalone(&cuda_mtp_standalone_toml(&snapshot, mtp_num_drafts))?;
@@ -289,7 +289,7 @@ pub fn dummy_standalone_toml(hf_repo: &str) -> String {
 /// Boot the embedded standalone with the **dummy** driver (no GPU). Fast repro
 /// harness for the driver-agnostic client edge (e.g. the chunked-`add_program`
 /// session-bridge path).
-pub async fn boot_dummy() -> Result<pie_bin::StandaloneHandle> {
+pub async fn boot_dummy() -> Result<pie::StandaloneHandle> {
     let snapshot = resolve_qwen3_snapshot()?;
     let (controller, gateway, worker) = derive_standalone(&dummy_standalone_toml(&snapshot))?;
     run_standalone(controller, gateway, worker).await
@@ -306,7 +306,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
-use pie_client::client::Client;
+use client::client::Client;
 
 /// Build the capability inferlets to `wasm32-wasip2` and return
 /// `(wasm, manifest)` for `name` ∈ {"generate", "mirostat", "grammar"}. Paths resolve from
@@ -314,7 +314,7 @@ use pie_client::client::Client;
 /// (one cargo invocation) so a multi-capability harness pays the build once.
 pub fn build_inferlet(name: &str) -> (PathBuf, PathBuf) {
     let workspace =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args([
             "build",

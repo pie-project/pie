@@ -1,0 +1,27 @@
+[package]
+name = "inferlet"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Inferlet support library for Pie"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+keywords = ["wasi", "wasm", "pie", "inferlet"]
+categories = ["wasm"]
+
+[dependencies]
+# The contract and the bindings generated from it. This crate holds no
+# `wit_bindgen::generate!` of its own and no `wit/` -- both live in
+# `inferlet-api`, which is what lets this crate be published without a
+# vendored copy of the WIT package beside it.
+inferlet-api = { version = "0.4.0", path = "../inferlet-api" }
+trait-variant = "0.1.2"
+inferlet-macros = { version = "0.4.0", path = "../inferlet-macros" }
+futures = "0.3.33"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The PTIR authoring DSL (eDSL + neutral trace Builder). Host-`cargo test`able,
+# wasm-buildable, no wit-bindgen (the single `wit_bindgen::generate!` stays here
+# in `inferlet`). The `inferlet::ptir` bridge wraps the WIT ptir resources and
+# drives this crate's `Builder`.
+tensor-dsl = { path = "../tensor-dsl" }

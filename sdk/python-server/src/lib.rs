@@ -1,9 +1,9 @@
 //! `pie-server` Python bindings — the embeddable counterpart to the
 //! `pie` CLI binary.
 //!
-//! Both surfaces drive the same library (`pie-worker`); this crate
-//! is just a pyo3 wrapper around [`pie_worker::engine::start_engine`]
-//! plus a [`pie_worker::engine::EngineHandle`] handle. Lifecycle:
+//! Both surfaces drive the same library (`worker`); this crate
+//! is just a pyo3 wrapper around [`worker::engine::start_engine`]
+//! plus a [`worker::engine::EngineHandle`] handle. Lifecycle:
 //! when the Python `EngineHandle` is dropped (or the user's interpreter
 //! exits), the embedded tokio runtime + every subprocess driver are
 //! torn down — combined with the `PR_SET_PDEATHSIG` hook in
@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use pie_worker::config::Config as ServeConfig;
-use pie_worker::engine::{self, EngineHandle as ServeHandle};
+use worker::config::Config as ServeConfig;
+use worker::engine::{self, EngineHandle as ServeHandle};
 
 /// Live engine returned by `bootstrap`. Holds the tokio runtime that
 /// keeps the WS scheduler + driver supervisors alive.

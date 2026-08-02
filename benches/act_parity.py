@@ -2,7 +2,7 @@
 
 Produce the two dumps first:
 
-    PIE_ACT_DUMP_DIR=/tmp/act/pie sdk/python-server/.venv/bin/python \
+    PIE_ACT_DUMP_DIR=/tmp/act/pie sdk/inferlet/python-server/.venv/bin/python \
         benches/pie_bench.py latency --model M --driver cuda_native ... \
         --pretokenized-prompts
     /root/.venv/vllm/bin/python benches/act_dump_vllm.py --model M \

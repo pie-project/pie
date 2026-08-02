@@ -43,7 +43,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 /// Fleet width — the 8-pipeline homogeneous decode fleet.
 const FLEET: usize = 8;
@@ -117,7 +117,7 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
     let input = deep_input();
 
     // Build the deep-pre-submission inferlet (wasm32-wasip2, raw-WIT carrier).
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", &pkg])
         .current_dir(&ws)
@@ -194,7 +194,7 @@ async fn deep_presubmit_coverify_on_real_driver() -> Result<()> {
     eprintln!("[deep-coverify] fleet done: {n_match}/{FLEET} pipelines DEEP-k byte-identical");
 
     // Read the wait-for-all wave gauges in-process (the engine ran here).
-    let stats = pie_engine::scheduler::get_stats().await;
+    let stats = engine::scheduler::get_stats().await;
     pie.shutdown().await;
 
     let total_batches = stats.total_batches;

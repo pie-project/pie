@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "echo",
+    "context",
+    "error",
+    "direct-channel-e2e",
+    "direct-mixed-e2e",
+    "generate",
+    "generate-gdn",
+    "generate-gdn-n1",
+    "rs-buffer-bench",
+    "generate-gdn-frame",
+    "gdn-foldcommit",
+    "grammar",
+    "grammar-late",
+    "grammar-wit-bench",
+    "mirostat",
+    "entropycheck",
+    "tempgen",
+    "multisamp",
+    "isolatedtopp",
+    "isolatedtopp-pipelined",
+    "multisamp-pipelined",
+    "tempgen-pipelined",
+    "runahead",
+    "lowlevel-chat",
+    "specverify",
+    "beam-baseline",
+    "grammarmb",
+    "mtp-specdecode",
+    "mtpverify",
+    "mtp-native-verify",
+    "beam",
+    "beam-designb",
+    "beam-designb-compact",
+    "mtp-grammar",
+    "ptir-prefill-e2e",
+    "prefix-cache-e2e",
+    "selfspec",
+]
+
+[workspace.dependencies]
+inferlet = { path = "../../../../crates/inferlet" }
+inferlet-macros = { path = "../../../../crates/inferlet-macros" }

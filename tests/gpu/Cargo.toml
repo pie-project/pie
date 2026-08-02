@@ -22,20 +22,20 @@ doctest = false
 # this crate without one of these gets the dummy fallback, which is what the
 # handful of no-GPU diagnostics here run against.
 default = []
-driver-cuda = ["pie-bin/driver-cuda"]
-driver-metal = ["pie-bin/driver-metal"]
-driver-dummy = ["pie-bin/driver-dummy"]
+driver-cuda = ["pie/driver-cuda"]
+driver-metal = ["pie/driver-metal"]
+driver-dummy = ["pie/driver-dummy"]
 
 [dev-dependencies]
 # The composition root. These tests boot the same `run_standalone` a `pie
 # serve` does — that is the point of them.
-pie-bin = { path = "../../bin/pie" }
+pie = { path = "../.." }
 # The client edge. Load goes over the websocket a deployment is reached by,
 # because an in-process shortcut would prove something nobody runs.
-pie-client = { path = "../../client/rust" }
+client = { path = "../../crates/client" }
 # The runtime lib — read `inference::get_stats()` in-process to observe the
 # scheduler's fire probes (the thrust-2 bubble/quorum gate) after a decode.
-pie-engine = { path = "../../runtime/engine" }
+engine = { path = "../../crates/engine" }
 
 anyhow = "1.0"
 tokio = { version = "1.53", features = ["full"] }
@@ -46,6 +46,8 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# `cuda_grammar_r2` reads RSS out of the live process to bound the
-# grammar cache's growth, which is a libc call.
+# `cuda_declared_family_parity` captures fd 2 to assert on what the driver
+# printed during a fire (no `declined:`, a first-fire line), which is a libc
+# call. Upstream dropped this dependency when it deleted the three tests that
+# were its only users there; here the parity gate still needs it.
 libc = "0.2"

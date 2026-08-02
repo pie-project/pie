@@ -15,7 +15,7 @@
 //!     layer; the text differs and must be deterministic across runs.
 //!
 //! v0 sites: `q` only (bit 0 of the llama-like site vocabulary,
-//! driver/cuda/src/model/lora.hpp). One lane carries ONE (A, B) pair with one
+//! crates/driver-cuda/csrc/src/model/lora.hpp). One lane carries ONE (A, B) pair with one
 //! trace-known d_out, and qwen3-0.6b's q width (2048) differs from its v
 //! width (1024), so a q+v adapter would need either per-site pairs or a
 //! packed layout — the algebra proof only needs one site. `v` is the

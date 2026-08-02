@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sweep this driver's per-device crossovers and print a `tuning_for()` block.
 
-Every crossover in `driver/metal/src/device_tuning.hpp` was measured on one
+Every crossover in `crates/driver-metal/csrc/src/device_tuning.hpp` was measured on one
 machine. The file's rule is that a default-constructed `DeviceTuning`
 reproduces those numbers exactly and a new device gets an override carrying
 its own measurement -- which means somebody has to run the measurement, and
@@ -204,7 +204,7 @@ class Knob:
 # that owns them, and a knob whose first candidate is not the default is a hard
 # error rather than a footnote.
 _TUNING_HPP = (Path(__file__).resolve().parent.parent
-               / "driver/metal/src/device_tuning.hpp")
+               / "crates/driver-metal/csrc/src/device_tuning.hpp")
 
 
 def header_defaults() -> dict[str, int]:
@@ -520,7 +520,7 @@ def main() -> int:
         print("provably diverge, nothing beat the M1 numbers by more than the runs")
         print("moved on their own.")
         return 0
-    print("Paste into `tuning_for()` in driver/metal/src/device_tuning.cpp, under")
+    print("Paste into `tuning_for()` in crates/driver-metal/csrc/src/device_tuning.cpp, under")
     print("the case for this device's family, WITH the runs above as the comment.")
     print("A value without its measurement is the thing that file exists to stop.\n")
     for field_name, value in chosen.items():

@@ -29,26 +29,24 @@ module-name = "pie._engine"
 manifest-path = "Cargo.toml"
 
 [tool.uv.sources]
-pie-client = { path = "../../client/python", editable = true }
+pie-client = { path = "../client/python", editable = true }
 
 [tool.uv]
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },
     { file = "src/**/*.rs" },
-    { file = "../../worker/Cargo.toml" },
-    { file = "../../worker/src/**/*.rs" },
     # The embedded engine compiles the whole runtime + driver + WIT surface;
-    # without these keys a source edit there serves a stale cached wheel.
-    { file = "../../runtime/**/*.rs" },
-    { file = "../../driver/**/*.rs" },
-    { file = "../../driver/**/*.cpp" },
-    { file = "../../driver/**/*.cu" },
-    { file = "../../driver/**/*.cuh" },
-    { file = "../../driver/**/*.hpp" },
-    { file = "../../driver/**/*.h" },
-    { file = "../../driver/**/CMakeLists.txt" },
-    { file = "../../interface/**/*.wit" },
-    { file = "../../interface/**/*.rs" },
-    { file = "../../interface/**/*.h" },
+    # without these keys a source edit there serves a stale cached wheel. Every
+    # crate lives under `crates/` now, so this is one glob instead of eleven.
+    { file = "../../crates/**/Cargo.toml" },
+    { file = "../../crates/**/*.rs" },
+    { file = "../../crates/**/*.wit" },
+    { file = "../../crates/**/*.cpp" },
+    { file = "../../crates/**/*.cu" },
+    { file = "../../crates/**/*.cuh" },
+    { file = "../../crates/**/*.hpp" },
+    { file = "../../crates/**/*.h" },
+    { file = "../../crates/**/*.metal" },
+    { file = "../../crates/**/CMakeLists.txt" },
 ]

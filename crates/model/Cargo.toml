@@ -1,0 +1,70 @@
+[package]
+name = "model"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "What a model is: the two registries (model_type -> load-contract author, arch_name -> chat template), the twenty generations they dispatch to, the vocabulary those share, and host-side multimodal decode."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# `links = "pie_forward"` publishes the committed C header directory to
+# downstream build scripts via `DEP_PIE_FORWARD_INCLUDE` -- the same handoff
+# `model-loader-capi` uses for `pie_loader.h`. It is here rather than on
+# `model-compiler` because the header is how a DRIVER reaches a declaration,
+# and a declaration is a model's, not the toolchain's.
+links = "pie_forward"
+build = "build.rs"
+
+[lib]
+name = "model"
+path = "src/lib.rs"
+
+[features]
+# One feature per aspect, because the aspects pull different worlds: `chat`
+# needs the tokenizer and the image decoders, `contract` needs the loader's
+# algebra, `forward` will need the DSL. A consumer links only the aspect it
+# reads — the loader's C ABI builds with `contract` alone, so a driver link
+# never carries a chat template.
+#
+# These used to fan out: `chat` named fourteen generation crates' own `chat`
+# features and `contract` named twelve more, so adding a generation meant
+# editing this line twice and the row that dispatches to it. One crate, and a
+# feature gates modules directly.
+default = ["chat"]
+chat = ["dep:tokenizer", "dep:anyhow", "dep:serde_json", "dep:image"]
+# `model-config` comes with the contract aspect because `ModelFacts` is
+# read out of a `pie.model/1` descriptor, and that crate owns the descriptor's
+# schema. It is a serde-only leaf — no loader, no runtime — so this does not
+# widen a driver link.
+contract = ["dep:model-loader", "dep:model-config", "dep:serde_json"]
+# The forward aspect: a model's forward pass, written in `model-compiler`'s
+# tracing eDSL, and the `#[repr(C)]` boundary a driver traces it across. NOT
+# default -- `pie model convert` reads a chat template and a load contract and
+# must not drag the tracer in behind them.
+forward = ["dep:model-compiler", "dep:serde"]
+
+[dependencies]
+# The facts a declaration traces against are serialized for the goldens, the
+# same way the traced form is.
+serde = { version = "1.0", features = ["derive"], optional = true }
+tokenizer = { path = "../tokenizer", optional = true }
+model-config = { path = "../model-config", optional = true }
+# `default-features = false` drops the loader's testkit half — the authoring
+# side needs the algebra, never the host executor.
+model-loader = { path = "../model-loader", default-features = false, optional = true }
+# The tracing eDSL a declaration is written in, plus the traced form it
+# produces. The dependency runs THIS way: a model names the toolchain, never
+# the reverse.
+model-compiler = { path = "../model-compiler", optional = true }
+anyhow = { version = "1.0", optional = true }
+serde_json = { version = "1.0", features = ["preserve_order"], optional = true }
+# Host-side media decode for the model-agnostic multimodal API.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"], optional = true }
+
+[dev-dependencies]
+# The contract tests compile and verify what the authors declare, which is the
+# loader's whole job; the marshalled-view verifier they finish with lives in
+# the ABI crate, the same pipeline a driver boot runs.
+model-loader = { path = "../model-loader", default-features = false }
+model-loader-capi = { path = "../model-loader-capi", default-features = false }
+serde_json = { version = "1.0", features = ["preserve_order"] }

@@ -1,0 +1,35 @@
+[package]
+name = "kernels-cuda"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "CUDA kernel implementations and the signature table that declares them: one .cu and one table row per kernel, in the same directory."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+# The archive `native` builds, and the include trees that come with it. A
+# `links` key is how `driver-cuda` reads `DEP_PIE_KERNELS_CUDA_INCLUDE` and
+# friends -- including the FlashInfer paths, which only this crate's CMake
+# knows because only this crate's CMake fetches and patches FlashInfer.
+links = "pie_kernels_cuda"
+build = "build.rs"
+
+[lib]
+name = "kernels_cuda"
+path = "src/lib.rs"
+
+[features]
+# `native` = build `csrc/` into libpie_kernels_cuda.a and publish its include
+# dir. Off by default, and that is the point rather than caution:
+# `model-compiler` reads the signature table on every trace, and a compiler
+# dev loop must not pay nvcc to look up a symbol's contract. `driver-cuda`
+# turns it on; everyone else takes the table alone.
+default = []
+native = ["dep:cmake"]
+
+[dependencies]
+kernels = { path = "../kernels" }
+
+[build-dependencies]
+cmake = { version = "0.1", optional = true }

@@ -19,7 +19,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 const FLEET: usize = 8;
 
@@ -68,7 +68,7 @@ async fn run_fleet_concurrent(addr: &str, prompts: &[String]) -> Vec<Option<Vec<
 async fn concurrent_decode_matches_sequential() -> Result<()> {
     common::init_trace();
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     anyhow::ensure!(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip2", "-p", "generate"])

@@ -43,7 +43,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "§6.1 composed MTP+grammar e2e: needs the 4090 + cuda + qwen-3-0.6b + the matrix select-mask ∘ spec-verify DAG lowering"]
@@ -53,7 +53,7 @@ async fn mtp_grammar_composition_on_real_driver() -> Result<()> {
     eprintln!("[mtp-verify] booted, listen_addr={}", pie.listen_addr);
 
     // Build the §6.1 composed spec-verify ⟂ per-position grammar inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "mtpverify"])
         .current_dir(&ws)

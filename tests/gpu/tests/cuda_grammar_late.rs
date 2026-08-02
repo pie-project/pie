@@ -40,7 +40,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 /// Concurrent grammar-late inferlets, each on its own session (R=1 each). Verifies
 /// the masking mechanism under concurrency (distinct Late buffers, no device-arena
@@ -56,7 +56,7 @@ async fn grammar_late_supply_on_real_driver() -> Result<()> {
     eprintln!("[grammar-late] booted, listen_addr={}", pie.listen_addr);
 
     // Build the Late-supply grammar masking verify inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "grammar-late"])
         .current_dir(&ws)

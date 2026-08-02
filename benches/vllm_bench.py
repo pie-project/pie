@@ -131,6 +131,13 @@ def run(args: argparse.Namespace):
     llm_kwargs = {}
     if args.attention_backend:
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}
+    if getattr(args, "moe_backend", None):
+        # `auto` is not always the fastest thing the installed vLLM can run:
+        # on sm_100 it picked TRITON for gpt-oss even though vLLM's own
+        # gpt-oss priority list puts the FlashInfer TRTLLM MXFP4 kernels
+        # ahead of it. Being able to name the backend is what makes
+        # "is this baseline hobbled?" a measurement instead of an argument.
+        llm_kwargs["kernel_config"] = {"moe_backend": args.moe_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
     if getattr(args, "num_gpu_blocks_override", 0):
@@ -139,6 +146,14 @@ def run(args: argparse.Namespace):
         llm_kwargs["block_size"] = args.block_size
     if getattr(args, "kv_cache_dtype", "auto") != "auto":
         llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
+    # Chunked prefill decides how much a prefill costs the decode it rides
+    # with, which is the axis that separates a uniform-output-length run from a
+    # fanned one: with uniform lengths completions synchronise and prefills
+    # arrive in bursts, so most steps are pure decode; fan them and most steps
+    # carry a prefill. Exposed so that attribution can be tested by toggling it
+    # rather than inferred from a correlation.
+    if getattr(args, "no_chunked_prefill", False):
+        llm_kwargs["enable_chunked_prefill"] = False
     speculative_config = None
     if args.speculative_config is not None:
         speculative_config = json.loads(args.speculative_config)
@@ -358,6 +373,14 @@ def run_streaming(args: argparse.Namespace):
         engine_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
     if getattr(args, "block_size", 0):
         engine_kwargs["block_size"] = args.block_size
+    if getattr(args, "attention_backend", None):
+        engine_kwargs["attention_config"] = {"backend": args.attention_backend}
+    # Same override as the offline path. This one matters more, because every
+    # cell of the B200 comparison runs through `tput` -- it is the only mode
+    # that stamps per-token deliveries -- so a knob wired only into `run()`
+    # would silently do nothing.
+    if getattr(args, "moe_backend", None):
+        engine_kwargs["kernel_config"] = {"moe_backend": args.moe_backend}
     engine = AsyncLLM.from_engine_args(
         AsyncEngineArgs(
             model=args.model,
@@ -411,6 +434,15 @@ def run_streaming(args: argparse.Namespace):
         token_arrival_s: list[float] = []
         token_arrival_monotonic_ns: list[int] = []
         n_tokens = 0
+        # `ignore_eos` pins the token count to max_tokens whatever the model
+        # emitted, so a correctness gate has to read the text. The offline
+        # `run()` path already returns it; this one dropped it, which left
+        # the streaming path -- the only one that reports inter-token gaps --
+        # ungateable.
+        want_text = getattr(args, "dump_all_texts", False) or getattr(
+            args, "dump_first_text", False
+        )
+        text: str | None = None
         try:
             async for out in engine.generate(
                 prompt, params or sampling, request_id
@@ -419,6 +451,8 @@ def run_streaming(args: argparse.Namespace):
                 now_monotonic_ns = time.clock_gettime_ns(
                     time.CLOCK_MONOTONIC
                 )
+                if want_text:
+                    text = out.outputs[0].text
                 new_total = len(out.outputs[0].token_ids)
                 if new_total > n_tokens:
                     if measured_epoch_monotonic_ns is not None:
@@ -467,6 +501,7 @@ def run_streaming(args: argparse.Namespace):
                     else None
                 ),
                 process_id=request_id,
+                output_text=text,
             )
         except Exception as e:  # noqa: BLE001
             return RequestResult(
@@ -581,7 +616,21 @@ def main() -> None:
     for sp in parser._subparsers._group_actions[0].choices.values():
         add_output_dump_args(sp)
         sp.add_argument("--attention-backend", default=None)
+        sp.add_argument(
+            "--moe-backend",
+            default=None,
+            help="Override vLLM's MoE kernel choice (kernel_config.moe_backend): "
+                 "auto, triton, flashinfer_trtllm, flashinfer_cutlass, marlin, "
+                 "... Default None leaves vLLM's own 'auto' selection alone, "
+                 "which is what a deployment gets and therefore what the "
+                 "headline baseline should report.",
+        )
         sp.add_argument("--enforce-eager", action="store_true")
+        sp.add_argument(
+            "--no-chunked-prefill", action="store_true",
+            help="disable vLLM's chunked prefill. Prefill then does not share "
+                 "a step with decode, which is the mechanism a fanned "
+                 "--output-spread is thought to tax.")
         sp.add_argument(
             "--num-gpu-blocks-override",
             type=int,

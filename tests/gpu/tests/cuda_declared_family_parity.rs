@@ -45,9 +45,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_bin::derive::derive_standalone;
-use pie_bin::run_standalone;
-use pie_client::client::Client;
+use pie::derive::derive_standalone;
+use pie::run_standalone;
+use client::client::Client;
 
 /// How many times each side is sampled. Four is enough to separate a
 /// warm-up artifact (run 1 differs, runs 2..N agree) from a real

@@ -22,7 +22,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_client::client::Client;
+use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "1a run-ahead carryover verify: needs the 4090 + cuda + qwen-3-0.6b + delta's carrier"]
@@ -32,7 +32,7 @@ async fn runahead_carryover_on_real_driver() -> Result<()> {
     eprintln!("[runahead] booted, listen_addr={}", pie.listen_addr);
 
     // Build the run-ahead carryover inferlet.
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     let ok = Command::new("cargo")
         .args(["build", "--target", "wasm32-wasip2", "-p", "runahead"])
         .current_dir(&ws)

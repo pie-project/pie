@@ -8,8 +8,8 @@ on:
         required: true
         type: choice
         options:
-          - pie-client (client/javascript/)
-          - inferlet (sdk/javascript/)
+          - pie-client (sdk/client/javascript/)
+          - inferlet (sdk/inferlet/javascript/)
       dry_run:
         description: 'Dry run (build but do not publish)'
         required: false
@@ -34,11 +34,11 @@ jobs:
         id: info
         run: |
           case "${{ inputs.package }}" in
-            "pie-client (client/javascript/)")
-              echo "path=client/javascript" >> $GITHUB_OUTPUT
+            "pie-client (sdk/client/javascript/)")
+              echo "path=sdk/client/javascript" >> $GITHUB_OUTPUT
               ;;
-            "inferlet (sdk/javascript/)")
-              echo "path=sdk/javascript" >> $GITHUB_OUTPUT
+            "inferlet (sdk/inferlet/javascript/)")
+              echo "path=sdk/inferlet/javascript" >> $GITHUB_OUTPUT
               ;;
           esac
       
@@ -49,7 +49,7 @@ jobs:
       # forward-pass surface at all, which is the state today. See
       # forward_refactor.md 10.4.
       - name: Check SDK targets a live WIT surface
-        if: steps.info.outputs.path == 'sdk/javascript'
+        if: steps.info.outputs.path == 'sdk/inferlet/javascript'
         run: scripts/check-sdk-interfaces.sh
 
       - name: Install dependencies
@@ -61,8 +61,8 @@ jobs:
       # generated from, and `tsc` is happy to typecheck against a stale one --
       # every specifier still resolves, just to the wrong shapes. This is the
       # step that makes the build below mean something.
-      - name: Bindings are current with interface/inferlet
-        if: steps.info.outputs.path == 'sdk/javascript'
+      - name: Bindings are current with crates/inferlet-api/wit
+        if: steps.info.outputs.path == 'sdk/inferlet/javascript'
         working-directory: ${{ steps.info.outputs.path }}
         run: |
           npm run generate-bindings
@@ -73,7 +73,7 @@ jobs:
         run: npm run build --if-present
 
       - name: Test
-        if: steps.info.outputs.path == 'client/javascript' || steps.info.outputs.path == 'sdk/javascript'
+        if: steps.info.outputs.path == 'sdk/client/javascript' || steps.info.outputs.path == 'sdk/inferlet/javascript'
         working-directory: ${{ steps.info.outputs.path }}
         run: npm test
 

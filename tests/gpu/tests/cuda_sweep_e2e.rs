@@ -34,8 +34,8 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use pie_bin::sweep::{self, Knobs};
-use pie_client::client::Client;
+use pie::sweep::{self, Knobs};
+use client::client::Client;
 
 const GENERATE: &str = "generate@0.1.0";
 
@@ -69,7 +69,7 @@ fn probe_candidates() -> Vec<Knobs> {
 async fn a_sweep_measures_many_candidates_against_one_resident_model() -> Result<()> {
     common::init_trace();
 
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/engine/tests/inferlets");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/engine/tests/inferlets");
     anyhow::ensure!(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip2", "-p", "generate"])
@@ -143,9 +143,9 @@ async fn a_sweep_measures_many_candidates_against_one_resident_model() -> Result
     //     observable from outside the scheduler, because guests are told it —
     //     so read it back through the same accessor the host function serves.
     anyhow::ensure!(
-        pie_engine::scheduler::configured_frame_size() == 2,
+        engine::scheduler::configured_frame_size() == 2,
         "the last round set k=2; the engine reports {}",
-        pie_engine::scheduler::configured_frame_size()
+        engine::scheduler::configured_frame_size()
     );
 
     // (4) No drift across the sweep. Rounds 0 and 3 ran identical knobs; if the

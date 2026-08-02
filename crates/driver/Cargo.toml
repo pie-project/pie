@@ -1,0 +1,19 @@
+[package]
+name = "driver"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The host C++ vocabulary both execution shells interpret the direct ABI with: launch plan, op_table, program, fire geometry, validate. Ships headers only."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+# `links` + the `cargo:include` its build.rs emits are how the two shells find
+# these headers -- the same handoff `driver-abi` and `model-loader-capi` use.
+# A driver crate asks cargo where the substrate is instead of walking out of
+# its own tree to guess.
+links = "pie_driver"
+
+[lib]
+name = "driver"
+path = "src/lib.rs"

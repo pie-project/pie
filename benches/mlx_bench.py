@@ -114,7 +114,7 @@ async def maybe_server(args: argparse.Namespace, batch: int):
                 "recorded answer in this tree came from:\n"
                 "  python3.14 -m venv ~/.cache/pie-metal/mlxenv\n"
                 "  ~/.cache/pie-metal/mlxenv/bin/pip install -r "
-                "driver/metal/tests/parity/requirements.txt\n"
+                "crates/driver-metal/csrc/tests/parity/requirements.txt\n"
                 "or point --python at another one."
             )
         url = f"http://127.0.0.1:{args.port}"

@@ -1,0 +1,31 @@
+[package]
+name = "kernels-metal"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Metal kernel implementations (.metal shaders + PSO construction) and the signature table that declares them."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+# The shader directory. `driver-metal` reads DEP_PIE_KERNELS_METAL_KERNELS_DIR
+# and bakes it in as the runtime shader path, and DEP_..._INCLUDE for the
+# param headers a shader and its host caller must agree on.
+links = "pie_kernels_metal"
+build = "build.rs"
+
+[lib]
+name = "kernels_metal"
+path = "src/lib.rs"
+
+[features]
+# `native` means something quieter here than on the CUDA side, because Metal
+# compiles its shaders at RUN time: there is no build to gate, only the
+# staging of `ptir_rng.generated.metal` out of `tensor-compiler`. Off by
+# default for the same reason regardless -- `model-compiler` takes the
+# signature table and should reach nothing else.
+default = []
+native = []
+
+[dependencies]
+kernels = { path = "../kernels" }
