@@ -68,6 +68,23 @@ inline bool geometry_from_facts(const Facts& f, DecodeGeometry& out, std::string
     }
     if (f.gdn_conv_k <= 0) return refuse("the linear-attention block needs "
                                          "linear_conv_kernel_dim");
+    // q and k carry `linear_num_key_heads` heads and are repeated to the value
+    // head count; a remainder would leave some value heads with no key head.
+    if (f.gdn_v_heads % f.gdn_k_heads != 0) {
+        return refuse("linear_num_value_heads " + std::to_string(f.gdn_v_heads) +
+                      " is not a multiple of linear_num_key_heads " +
+                      std::to_string(f.gdn_k_heads) + ", which the GDN's "
+                      "head repeat requires");
+    }
+    if (f.gdn_k_dim % 32 != 0) {
+        return refuse("linear_key_head_dim " + std::to_string(f.gdn_k_dim) +
+                      " is not a multiple of 32; the GDN core reduces a head "
+                      "across one simdgroup's lanes");
+    }
+    if (f.gdn_k_dim / 32 > 8) {
+        return refuse("linear_key_head_dim " + std::to_string(f.gdn_k_dim) +
+                      " exceeds the 256 the GDN core's per-lane registers hold");
+    }
     out.gdn_k_heads = f.gdn_k_heads;
     out.gdn_v_heads = f.gdn_v_heads;
     out.gdn_k_dim = f.gdn_k_dim;
@@ -109,10 +126,10 @@ inline bool geometry_from_facts(const Facts& f, DecodeGeometry& out, std::string
                           std::to_string(shared_kernels::kRouterMaxExperts) +
                           " a single threadgroup can rank");
         }
-        if (!f.norm_topk_prob) {
-            return refuse("norm_topk_prob is false; the router normalizes over the "
-                          "selected experts only");
-        }
+        // Not refused any more: `RouterParams::softmax_over_all` gives the
+        // router the other denominator, so a config that wants the softmax
+        // over every expert gets it rather than being turned away.
+        out.norm_topk_prob = f.norm_topk_prob;
         // A shared expert runs beside the routed bank on every token. Every
         // released routed member of this family has one, so it is carried
         // rather than refused. A shared width that is not a multiple of the

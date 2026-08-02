@@ -1029,10 +1029,13 @@ impl RsStore {
     }
 
     /// Retire completion epochs `<= epoch`, making recycled slots
-    /// allocatable. Like `KvStore::retire_through`, the store computes its own
-    /// bound — the newest sequence known complete — rather than trusting the
-    /// caller's, so no recycled slot is handed out while an operation that
-    /// could reference it is still outstanding.
+    /// allocatable. Retirement is gated on the global in-flight count rather
+    /// than the epoch: no recycled slot is ever handed out while any prepared
+    /// write is still outstanding. Note this is the coarse rule the KV store
+    /// USED to share — `KvStore::settle` now tracks the outstanding sequence
+    /// set and retires through the oldest, because waiting for global
+    /// quiescence there cost a 4.5 ms per-completion supply drip (analysis.md
+    /// 10.16-10.17). RS slots have not shown the same pressure.
     pub fn retire_through(&mut self, _epoch: u64) {
         self.retire_idle();
     }

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use wasmtime::component::{ResourceAny, ResourceTable};
@@ -88,6 +89,9 @@ pub struct ProcessCtx {
     execution_permit: Option<OwnedSemaphorePermit>,
     execution_admitted: bool,
     admission_wait_us: u64,
+    /// This process's lock-free planner residency flag, taken once on the
+    /// first residency-gate call. See [`crate::planner::Planner::residency_flag`].
+    residency_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for ProcessCtx {
@@ -286,11 +290,30 @@ impl ProcessCtx {
             execution_permit: None,
             execution_admitted: false,
             admission_wait_us: 0,
+            residency_flag: None,
         })
     }
 
     pub fn id(&self) -> ProcessId {
         self.id
+    }
+
+    /// The residency-gate fast path: one relaxed load, no lookup, no lock.
+    ///
+    /// The flag is taken once and cached; until the planner hands one out
+    /// (pre-registration, or no planner at all) the process holds no
+    /// pooled pages and is resident by definition.
+    pub(crate) fn is_resident_fast(&mut self) -> bool {
+        if self.residency_flag.is_none() {
+            let Some(planner) = crate::planner::planner() else {
+                return true;
+            };
+            self.residency_flag = planner.residency_flag(self.id);
+        }
+        match &self.residency_flag {
+            Some(flag) => flag.load(Ordering::Acquire),
+            None => true,
+        }
     }
 
     pub(crate) fn install_prewarm_permit(&mut self, permit: Option<OwnedSemaphorePermit>) {

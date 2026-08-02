@@ -35,16 +35,6 @@ class ServerConfig:
 
 
 # ---------------------------------------------------------------------------
-# [auth]
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AuthConfig:
-    enabled: Optional[bool] = None
-    authorized_users_dir: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
 # [telemetry]
 # ---------------------------------------------------------------------------
 
@@ -92,6 +82,15 @@ class DriverConfig:
 class SchedulerConfig:
     request_timeout_secs: Optional[int] = None
     speculation_depth: Optional[int] = None
+    # Frame geometry. Absent means the engine's own defaults, which is what
+    # every ordinary run wants; these exist so a measurement can hold the
+    # geometry fixed while something else varies. `pie config tune` moves the
+    # same three through `scheduler::reconfigure`, but only inside its own
+    # sweep -- without these there is no way to ask the QUESTION of a bench
+    # shape, and the sweep's synthetic fleet is not every shape.
+    frame_size: Optional[int] = None
+    frame_submit_depth: Optional[int] = None
+    frame_dispatch_depth: Optional[int] = None
 
 
 @dataclass
@@ -109,7 +108,6 @@ class ModelConfig:
 @dataclass
 class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
-    auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -122,7 +120,6 @@ class Config:
         emitters from drifting apart again.
         """
         _emit_table(buf, f"{prefix}server", _block(self.server))
-        _emit_table(buf, f"{prefix}auth", _block(self.auth))
         _emit_table(buf, f"{prefix}telemetry", _block(self.telemetry))
         _emit_table(buf, f"{prefix}runtime", _block(self.runtime))
         m = self.model

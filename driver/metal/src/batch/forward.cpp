@@ -604,6 +604,7 @@ struct MetalExecutor::Impl {
         const pie_loader::LoadPlan& load_plan,
         std::size_t storage_page_size,
         bool stream_routed_experts,
+        std::uint32_t max_ctx_tokens,
         std::string* error);
     bool ready() const { return ctx_ != nullptr; }
     int vocab() const { return simple_ ? simple_->vocab() : g_.vocab; }
@@ -698,7 +699,7 @@ struct PtirLogitsCopyParams {
     std::uint32_t reserved = 0;
 };
 
-inline constexpr int kPtirLogitsCopyOrdinal = 90000;
+
 // Rows one staging dispatch can carry. Bounded by the paged forward's row
 // capacity, which is what `LogitsOut::rows` is drawn from.
 inline constexpr std::size_t kPtirLogitsCopyMaxRows = kPagedMaxForwardTokensCeiling;
@@ -732,10 +733,11 @@ void write_u32(const SlotHandle& s, uint32_t v) {
 // first dispatch. The sizing is right to twenty megabytes. What is optimistic
 // is `recommendedMaxWorkingSetSize` itself -- on this M1 Max it is 24.96 GiB,
 // a flat 78% of the 32 GiB the machine has, taking no account of the 6 GiB the
-// kernel had wired down by the time prefill ran. So a plan can clear this bar
-// and still exhaust the machine. The bar is a ceiling, not a promise, and this
-// refusal is written to catch the models that are plainly over it rather than
-// to predict the ones that are close.
+// kernel had wired down by the time prefill ran. That is why the check below
+// asks the kernel a second question -- what is reclaimable right now -- and
+// refuses on whichever bound is tighter. The device ceiling catches models
+// that are plainly too big for the GPU; the host bound catches models that
+// would fit a quiet machine and not this one.
 // The elastic budget's four addends, kept apart so a refusal can name the one
 // that is large. Assembled by the caller because only it knows the scratch
 // pool, which the heap plan does not carry.
@@ -746,19 +748,95 @@ struct ElasticBreakdown {
     std::size_t scratch = 0;
 };
 
+// Say once, before anything is allocated, that this machine is carrying GPU
+// memory nobody owns.
+//
+// A model small enough to fit alongside the leak is admitted by the check
+// below and runs fine, so nothing on the path to a successful load would
+// otherwise mention it -- and the danger is not to the run. Wired pages
+// cannot be paged out and are charged to no live process, so `ps`, Activity
+// Monitor and free-memory readings all look ordinary while the window server
+// is one composite away from being unable to allocate. When it cannot, it
+// blocks in the kernel inside its own Metal submit, misses the 120-second
+// userspace watchdog, and the desktop dies. Observed here twice: once during
+// a run, and once **ten hours after** the run that leaked the memory, with no
+// pie process alive to connect it to.
+//
+// So this warns rather than refuses. The load is not what is unsafe; leaving
+// the machine up is. The threshold is half of RAM because a healthy idle Mac
+// sits near 3%, and the leaks seen here were 59% -- there is no ambiguous
+// middle to tune against.
+void warn_once_if_the_gpu_leaked_memory_before_this_run() {
+    [[maybe_unused]] static const bool said = [] {
+        const auto [wired, installed] =
+            RawMetalContext::host_wired_and_installed_bytes();
+        if (installed == 0 || wired * 2 <= installed) return true;
+        const auto gib = [](std::size_t b) { return double(b) / (1024.0 * 1024.0 * 1024.0); };
+        std::fprintf(stderr,
+                     "[pie-metal] warning: %.2f GiB of this machine's %.2f GiB is wired "
+                     "before this model is loaded. No process has to be holding it: a GPU "
+                     "context whose command buffer never signalled is abandoned rather "
+                     "than released, and its pages stay wired until reboot. They cannot "
+                     "be paged out, so the window server can be starved of memory hours "
+                     "later and take the desktop down with it. Reboot before leaving this "
+                     "machine unattended.\n",
+                     gib(wired), gib(installed));
+        return true;
+    }();
+}
+
 bool fits_on_this_gpu(std::size_t heap_bytes,
                       std::size_t elastic_bytes,
                       std::size_t resident_weights,
                       std::string* err,
                       const ElasticBreakdown* parts = nullptr) {
+    warn_once_if_the_gpu_leaked_memory_before_this_run();
     const std::size_t limit = RawMetalContext::device_working_set_bytes();
     if (limit == 0) return true;  // the device would not say; do not invent one
     const std::size_t want = heap_bytes + elastic_bytes;
-    if (want <= limit) return true;
+
+    // The device ceiling is what this GPU would hold on an idle machine. What
+    // the machine will actually give us right now is a second, independent
+    // bound, and on unified memory it is usually the smaller one. Checking
+    // only the first is how a 14 GiB model was admitted onto a box with 18 GiB
+    // left, allocated its pools, and then hung: the command buffer never
+    // signalled, the context was abandoned as unsafe to release, and the
+    // process became unkillable. Every retry left another one, so free memory
+    // fell with each attempt while the ceiling being checked never moved.
+    //
+    // Refusing here is the only cheap moment. Afterwards there is no failure
+    // path -- the allocation does not fail, the dispatch does not return, and
+    // nothing short of a reboot recovers the memory.
+    //
+    // The margin is headroom for what the load itself adds beyond the plan:
+    // the mmap'd weights file leaves a file-backed copy roughly the size of
+    // the model, and the kernel needs room to keep running. It is deliberately
+    // a flat floor rather than a fraction, so that the refusal stays legible.
+    const std::size_t reclaimable =
+        RawMetalContext::device_working_set_is_forced()
+            ? 0  // a forced ceiling describes a device, not this machine
+            : RawMetalContext::host_reclaimable_bytes();
+    constexpr std::size_t kHostMargin = 2ull * 1024 * 1024 * 1024;
+    const bool host_bound =
+        reclaimable != 0 && want + kHostMargin > reclaimable && want <= limit;
+
+    if (want <= limit && !host_bound) return true;
     if (err) {
         const auto gib = [](std::size_t b) {
             return std::to_string(double(b) / (1024.0 * 1024.0 * 1024.0)).substr(0, 5);
         };
+        if (host_bound) {
+            *err = "this model does not fit the memory this machine has left: "
+                   "it needs " + gib(want) + " GiB resident (" +
+                   gib(resident_weights) + " GiB of weights, " +
+                   gib(elastic_bytes) + " GiB of KV, state and scratch) and only " +
+                   gib(reclaimable) + " GiB is reclaimable. The GPU itself would "
+                   "hold " + gib(limit) + " GiB, so this is the machine, not the "
+                   "device: something else already has the memory. On macOS a "
+                   "previously wedged run is the usual cause -- it survives "
+                   "kill -9, holds its pages, and is only cleared by a reboot.";
+            return false;
+        }
         *err = "this model does not fit this GPU: it needs " + gib(want) +
                " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
                gib(elastic_bytes) + " GiB of KV, state and scratch) and the device "
@@ -976,8 +1054,17 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
                             const pie_loader::LoadPlan& load_plan,
                             std::size_t storage_page_size,
                             bool stream_routed_experts,
+                            std::uint32_t max_ctx_tokens,
                             std::string* err) {
     g_ = geom;
+    // The same line `setup_simple` has, for the same reason: `max_ctx_` sizes
+    // the M=1 ring `plan_heap` reserves, and this path used to leave it at the
+    // ceiling. So `max_model_len` moved nothing here while the refusal that
+    // printed the ring named `max_model_len` as its knob -- an operator could
+    // set it to 512, watch 8 GiB not move, and have nothing to read.
+    if (max_ctx_tokens > 0) {
+        max_ctx_ = int(std::min<std::uint32_t>(max_ctx_tokens, kMetalMaxCtxTokens));
+    }
 
     // The mmap is transient: the LoadPlan copies each finalized tensor
     // once into the resident weights region.
@@ -995,11 +1082,30 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // ── Build the decode DAG (shipped config: GdnPrep ON, no argmax dispatch — host samples). ──
     // Under the accuracy gate every activation value gets its own pool buffer, so a
     // tap's producer is still readable once the command buffer retires.
-    const bool taps = golden_taps_enabled();
+    const bool taps = golden_taps_enabled() && !golden_taps_recycle();
     dag_ = build_decode_dag(g_, /*with_argmax=*/false, fuse_residual_, gdn_prep_);
+    // Each DAG owns one region of the argument-table namespace. A DAG longer
+    // than its region reaches into the next one's, and the two then share
+    // tables silently -- see `ordinals_fit`.
+    if (!ordinals_fit(dag_.size())) {
+        if (err) {
+            *err = "this decoder emits " + std::to_string(dag_.size()) +
+                   " dispatches and one argument-table region holds " +
+                   std::to_string(kPrefillOrdinalStride);
+        }
+        return false;
+    }
     if (g_.paged_kv_enabled) {
         mb_dag_ = build_decode_dag_mb(g_, std::max(1, g_.max_tokens),
                                       kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
+        if (!ordinals_fit(mb_dag_.size())) {
+            if (err) {
+                *err = "this decoder's batched DAG emits " + std::to_string(mb_dag_.size()) +
+                       " dispatches and one argument-table region holds " +
+                       std::to_string(kPrefillOrdinalStride);
+            }
+            return false;
+        }
         mb_sched_ = build_scratch_schedule(mb_dag_, g_, /*no_recycle=*/taps);
         prefill_dags_ = build_decode_prefill_dags(g_, std::max(1, g_.max_tokens),
                                                    fuse_residual_, gdn_prep_);
@@ -1107,6 +1213,22 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
+    }
+    // The second quantized set. A checkpoint that spares its two routing
+    // projections at another width gets one more table, and only the two kinds
+    // that read it are taken from it -- everything else stays on the pipelines
+    // the model-wide format named. `mb_geometry` and the strided branch both
+    // keep those kinds on the matvec, so there is no batched shape to build.
+    if (g_.has_alt_quant()) {
+        DecodeStepPsos alt{};
+        if (!load_decode_psos(*ctx_, kernels_dir, alt, g_.alt_quant, &load_err,
+                              DecodePsoFeatures{.routing_only = true})) {
+            if (err) *err = "PSO load failed (second quantized set): " + load_err;
+            ctx_.reset();
+            return false;
+        }
+        psos_[Kernel::LlRouter] = alt[Kernel::LlRouter];
+        psos_[Kernel::LlSharedGateProj] = alt[Kernel::LlSharedGateProj];
     }
     if (g_.paged_kv_enabled &&
         !load_multibatch_psos(
@@ -2573,6 +2695,41 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // and read back here rather than decided a second time -- see
         // `plan_ties_embeddings`.
         geom.tied_embeddings = plan_ties_embeddings(load_plan);
+        // The routing projections' format, read off the checkpoint rather than
+        // the config: mlx_lm's quantization predicate singles out tensors by
+        // NAME, and `config.json` records only the model-wide choice beside a
+        // list of exceptions this driver does not parse. Both routing weights
+        // are read, and a disagreement between them is refused rather than
+        // resolved -- there is one alternate pipeline table.
+        {
+            const auto view = load_plan.view();
+            AffineFormat found{0, 0};
+            bool conflict = false;
+            for (std::size_t i = 0; i < view.tensors.len; ++i) {
+                const auto& t = view.tensors.ptr[i];
+                const std::string name(reinterpret_cast<const char*>(t.name.ptr), t.name.len);
+                const bool routing = name.find("mlp.gate.weight") != std::string::npos ||
+                                     name.find("mlp.shared_expert_gate.weight") != std::string::npos;
+                if (!routing) continue;
+                const AffineFormat f{int(t.quant_bits_per_element), int(t.quant_group_size)};
+                if (f.bits == 0 || f.group == 0) continue;
+                if (f.bits == geom.quant.bits && f.group == geom.quant.group) continue;
+                if (found.bits != 0 && (found.bits != f.bits || found.group != f.group)) {
+                    conflict = true;
+                    break;
+                }
+                found = f;
+            }
+            if (conflict) {
+                if (err != nullptr) {
+                    *err = "qwen3.5: the router and the shared expert's gate are quantized "
+                           "differently from each other, and this driver builds one "
+                           "alternate pipeline table";
+                }
+                return false;
+            }
+            geom.alt_quant = found;
+        }
     }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes
@@ -2651,6 +2808,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             load_plan,
             cfg.storage_page_size,
             cfg.stream_routed_experts,
+            cfg.max_ctx_tokens,
             &derr)) {
         if (err != nullptr) *err = "Metal forward setup failed: " + derr;
         return false;

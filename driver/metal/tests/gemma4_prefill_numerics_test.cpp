@@ -34,6 +34,7 @@
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/encode.hpp"
 #include "model/gemma4/geometry.hpp"
+#include "model_facts.hpp"
 #include "model/gemma4/kernels.hpp"
 #include "model/gemma4/scratch.hpp"
 
@@ -246,9 +247,43 @@ int main(int argc, char** argv) {
     }
     const int N = int(ids.size());
 
+    // Read the CHECKPOINT, not a copy of gemma-4-E2B's shape. The hardcoded
+    // `Facts{}` below is E2B's, so this harness answered about E2B whatever
+    // path it was given -- and asked for E2B's `embed_tokens_per_layer` on
+    // models that ship none, which is how it became unreachable on the two
+    // checkpoints whose numbers are wrong.
+    Facts facts{};
+    {
+        const pie::metal::ModelFacts mf = pie::metal::read_model_facts(ckpt);
+        if (mf.g4_num_hidden_layers > 0) {
+            facts.n_layers = mf.g4_num_hidden_layers;
+            facts.hidden = mf.g4_hidden_size;
+            facts.intermediate = mf.g4_intermediate_size;
+            facts.n_q_heads = mf.g4_num_attention_heads;
+            facts.n_kv_heads = mf.g4_num_key_value_heads;
+            facts.head_dim = mf.g4_head_dim;
+            facts.global_head_dim = mf.g4_global_head_dim;
+            facts.sliding_window = mf.g4_sliding_window;
+            facts.num_kv_shared_layers = mf.g4_num_kv_shared_layers;
+            facts.per_layer_emb_dim = mf.g4_per_layer_emb_dim;
+            facts.full_attn_interval = mf.g4_full_attn_interval;
+            facts.double_wide_mlp = mf.g4_double_wide_mlp;
+            facts.final_softcap = mf.g4_final_softcap;
+            facts.rope_theta_full = mf.g4_rope_theta_full;
+            facts.rope_theta_sliding = mf.g4_rope_theta_sliding;
+            facts.full_partial_rotary = mf.g4_full_partial_rotary;
+            facts.enable_moe = mf.g4_enable_moe;
+            facts.n_experts = mf.g4_num_experts;
+            facts.experts_per_token = mf.g4_experts_per_token;
+            facts.moe_intermediate = mf.g4_moe_intermediate;
+            facts.attention_k_eq_v = mf.g4_attention_k_eq_v;
+            facts.n_global_kv_heads = mf.g4_num_global_kv_heads;
+        }
+    }
+
     Gemma4Geometry g;
     std::string err;
-    if (!geometry_from_facts(Facts{}, g, &err)) {
+    if (!geometry_from_facts(facts, g, &err)) {
         std::printf("  FAIL  geometry: %s\n", err.c_str());
         return 1;
     }
@@ -264,7 +299,15 @@ int main(int argc, char** argv) {
     // the pool is the budget rather than the weights.
     // Under a tap dump every activation VALUE gets its own slot, so the pool
     // scales with the row count. 8 rows fit in 14 GB; 16 do not.
-    auto ctx = RawMetalContext::create(std::size_t(golden_taps_enabled() ? 12 : 8) << 30);
+    // 8 GiB fits every gemma-4 this test was written against and none of the
+    // 26B/31B builds, which is how a numerics harness stops being reachable
+    // exactly where the numbers are wrong. Overridable, so the next one is.
+    std::size_t heap_gib = golden_taps_enabled() ? 12 : 8;
+    if (const char* env = std::getenv("PIE_G4_HEAP_GIB"); env != nullptr && *env != '\0') {
+        const long v = std::atol(env);
+        if (v > 0) heap_gib = std::size_t(v);
+    }
+    auto ctx = RawMetalContext::create(heap_gib << 30);
     if (!ctx) {
         std::printf("  FAIL  RawMetalContext::create\n");
         return 1;
@@ -602,6 +645,22 @@ int main(int argc, char** argv) {
     //
     // 16 rows does not catch it (BM=16 there) and 12 does not either, so the
     // wide block needs a case of its own.
+    //
+    // It is earning its keep again. gemma-4-26b-a4b-it-4bit reports
+    // `argmax -1` here, which is not "a wrong token" -- the search starts at
+    // -1e30 and only NaN leaves it at -1, so every logit in the row is NaN.
+    // gemma-4-31b-it-4bit, same head widths (256 sliding, 512 full) and the
+    // same 4-bit affine group of 64, reports 818 and matches. So it is the
+    // MIXTURE at BM=32, not the width and not the quantisation. Ruled out
+    // already: the pipeline exists (`instantiate_qmm_t(64, 32, 32, 16, 4)` and
+    // its five siblings are all there), K is a whole number of BK=32 (2816 and
+    // 2112 are 88 and 66), and it happens with tiled attention forced off.
+    //
+    // Separately and not the same thing: this checkpoint's tiled attention is
+    // wrong too. `PIE_METAL_SDPA_TILE_MIN_ROWS=4096` -- which turns tiling off
+    // -- takes its 53-token answer from "deike-no'=emptyia deK=A" to
+    // "The capital of France es[|im_und|>", so most of the damage at a real
+    // prompt length is there, and what is left over is this.
     if (default_prompt) {
         std::vector<std::uint32_t> ids32;
         for (int rep = 0; rep < 4; ++rep) ids32.insert(ids32.end(), ids.begin(), ids.end());

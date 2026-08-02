@@ -15,8 +15,10 @@
 //!   regenerated — not something the port decides on its own.
 //! - **Field order in the source is load-bearing.** `norm_topk_prob` has an
 //!   in-class default of `true` and is then read with a default of `false`,
-//!   so the effective default is `false`. Reordering to group the MoE fields
-//!   would quietly change that.
+//!   so the effective default is `false` -- for the families that inherit
+//!   that config class. The qwen3.5/3.6/next line has its own class that
+//!   defaults to `true`, so the default here is keyed on the model type.
+//!   Reordering to group the MoE fields would quietly change both.
 //!
 //! `head_dim_kernel` is the one field here that is not a fact about the
 //! checkpoint: it rounds `head_dim` up to a head dim the *driver build*
@@ -316,8 +318,36 @@ pub fn normalize(root: &Value, path: &str) -> Result<HfConfig> {
     cfg.num_experts_per_tok = opt_i32(j, "num_experts_per_tok", top_k, path)?;
     cfg.first_k_dense_replace = opt_i32(j, "first_k_dense_replace", 0, path)?;
     cfg.n_shared_experts = opt_i32(j, "n_shared_experts", 0, path)?;
-    // Read with a default of `false`, which overrides the schema's `true`.
-    cfg.norm_topk_prob = opt_bool(j, "norm_topk_prob", false, path)?;
+    // Read with a default of `false`, which overrides the schema's `true` --
+    // faithful to the reference for every family that inherits `qwen3_moe`'s
+    // config class, where the in-class `True` is shadowed by a `False` read.
+    //
+    // The qwen3.5/3.6/next line does NOT inherit it. Its own config class
+    // defaults to `True` (`transformers` qwen3_next, mlx-lm qwen3_5) and its
+    // released checkpoints OMIT the field, so a flat `false` here is not a
+    // faithful port of anything -- it is an invented fact about a checkpoint
+    // that never stated one. It is also the only family that both omits the
+    // key and has a geometry that checks it: gemma-4 and gpt-oss omit it too
+    // but never consult it, and Qwen3-30B-A3B states `true` outright.
+    //
+    // The cost of getting this wrong is not subtle in either direction. False
+    // when the model means true weights the FFN by a softmax over ALL experts,
+    // which sums to less than one and scales the whole block down -- fluent,
+    // plausible, wrong tokens. The driver refuses `false` rather than run it,
+    // so in practice Qwen3.6-35B-A3B did not load at all: "norm_topk_prob is
+    // false; the router normalizes over the selected experts only", about a
+    // key the checkpoint never contained.
+    let renormalizes_by_default = matches!(
+        cfg.model_type.as_str(),
+        "qwen3_5"
+            | "qwen3_5_text"
+            | "qwen3_5_moe"
+            | "qwen3_5_moe_text"
+            | "qwen3_next"
+            | "qwen3_next_text"
+            | "qwen3_6"
+    );
+    cfg.norm_topk_prob = opt_bool(j, "norm_topk_prob", renormalizes_by_default, path)?;
     cfg.routed_scaling_factor = opt_f32(j, "routed_scaling_factor", 1.0, path)?;
 
     if cfg.model_type == "deepseek_v4" {

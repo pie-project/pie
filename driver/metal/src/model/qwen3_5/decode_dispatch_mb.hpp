@@ -30,18 +30,21 @@ namespace pie::metal {
 // block. grid threads = (32*N, out/4, 1) → N*(out/8) threadgroups, tg=(32,2,1). At N=1 this is
 // exactly qmv_dispatch (the sealed M=1 fast path). out%8==0 holds for every qwen3.6 projection.
 inline void qmv_mb_dispatch(int out_vec, int N, Grid& g, Threadgroup& tg) {
-    g  = Grid{32u * uint32_t(N), uint32_t(out_vec) / 4, 1};
+    // Rounded UP, for the reason `qmv_dispatch` gives.
+    g  = Grid{32u * uint32_t(N), (uint32_t(out_vec) + 3u) / 4u, 1};
     tg = Threadgroup{32, 2, 1};
 }
 
 // Below this batch the GEMV is the faster kernel. The crossover is a property
-// of the MACHINE, not of the model: it was measured on an M1 Max, where pie's
-// per-step cost beats mlx-lm's at every batch up to 8 with the GEMV and only
-// loses above it, and an M4 Pro moves it down to 8. See `device_tuning.hpp` --
-// an unrecognised device still gets the 12 this constant was.
+// of the MACHINE and of whether the checkpoint's FFN is routed -- see
+// `device_tuning.hpp`. It was measured on an M1 Max, where pie's per-step cost
+// beats mlx-lm's at every batch up to 8 with the GEMV and only loses above it;
+// an M2 Max and an M4 Pro both move the DENSE crossover down to 8 and an
+// unrecognised device still gets the 12 this constant was.
 //
-// A call and not a `constexpr`, which is the whole point: the value is not
-// known until there is a device to ask.
+// Passed in rather than asked for here, which is the whole point: the value is
+// not known until there is a device to ask AND a geometry to ask about, and
+// this header has neither.
 // The ported steel GEMM is instantiated aligned-only, at BM=16 and BK=32. K is
 // not checked: every qwen3.6 projection has K % 512 == 0 (the same fact the
 // GEMV port relies on for its "fast" variant), so K % BK == 0 is free.
@@ -114,9 +117,9 @@ inline int qmm_bm_slot(int bm) {
 // BN partitions output columns only -- every element's K sum is unchanged -- so
 // the choice is bit-exact whichever way it goes.
 
-inline int qmm_bn(int out_vec, int N) {
+inline int qmm_bn(int out_vec, int N, int min_batch) {
     const int bm = qmm_bm(N);
-    if (N < qmm_min_batch() || N % bm != 0) return 0;
+    if (N < min_batch || N % bm != 0) return 0;
     // Take the WIDEST tile that divides the output, full stop.
     //
     // This used to gate on a threadgroup count, and that was right when the
@@ -198,9 +201,9 @@ inline int qmm_bn_crossover_tg_value() { return qmm_bn_crossover_tg(); }
 /// BN partitions output columns only, so this is bit-exact whichever way it
 /// goes; it decides how many times a weight tile is dequantized, not what the
 /// sum is.
-inline int qmm_bn_unsplit(int out_vec, int N) {
+inline int qmm_bn_unsplit(int out_vec, int N, int min_batch) {
     const int bm = qmm_bm(N);
-    if (N < qmm_min_batch() || N % bm != 0 || out_vec % 16 != 0) return 0;
+    if (N < min_batch || N % bm != 0 || out_vec % 16 != 0) return 0;
     const int row_tiles = N / bm;
     if (out_vec % 32 == 0 && (out_vec / 32) * row_tiles >= qmm_bn_crossover_tg_value())
         return 32;
@@ -311,7 +314,14 @@ inline void qmm_t_dispatch(int out_vec, int N, int bn, int bm, Grid& g, Threadgr
 inline void rms_mb_dispatch(int row_size, int n_rows, int N, Grid& g, Threadgroup& tg) {
     // Rounded up, matching `rms_dispatch`: at N == 1 these two must agree
     // exactly, because a family that uses this one for both is relying on it.
-    const uint32_t t = (uint32_t(row_size) + 3) / 4;  // N_READS = 4
+    //
+    // Capped, because a threadgroup is not allowed to be any size: 1024 is what
+    // Metal permits and `ceil(row_size / 4)` passes it at a hidden of 4100.
+    // Nothing rejected the oversized ask -- the dispatch was simply not made
+    // and the rows came out untouched, which is what Qwen3.6-27B (5120) and
+    // gemma-4-31b (5376) were reading when they answered nonsense. The kernel
+    // strides the row now, so a capped threadgroup still covers all of it.
+    const uint32_t t = std::min<uint32_t>((uint32_t(row_size) + 3) / 4, 1024);  // N_READS = 4
     g  = Grid{t * uint32_t(n_rows) * uint32_t(N), 1, 1};
     tg = Threadgroup{t, 1, 1};
 }

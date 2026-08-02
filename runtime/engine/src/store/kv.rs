@@ -257,6 +257,16 @@ pub struct KvStore {
     /// via [`Self::retire_idle`] when nothing is in flight.
     seq: u64,
     in_flight: u64,
+    /// Sequences of prepared writes that have not settled yet. Freed pages
+    /// tagged at epoch E are safe to reuse once every fire that could still
+    /// name them — those prepared at or before E — has settled, so the pool
+    /// retires through `min(outstanding) - 1` (or `seq` when nothing is in
+    /// flight). Tracking the set rather than a counter is what lets a
+    /// completion's pages return within a wave instead of waiting for a
+    /// moment of GLOBAL quiescence, which at high concurrency never comes:
+    /// that wait was measured as a 4.5 ms per-completion supply drip
+    /// (analysis.md 10.16-10.17).
+    outstanding: std::collections::BTreeSet<u64>,
 }
 
 #[cfg(test)]
@@ -306,6 +316,7 @@ impl KvStore {
             indexes: HashMap::new(),
             seq: 0,
             in_flight: 0,
+            outstanding: std::collections::BTreeSet::new(),
         }
     }
 
@@ -320,10 +331,25 @@ impl KvStore {
         self.seq
     }
 
-    /// Retire everything immediately when no prepared write is in flight.
+    /// Retire every recycle epoch that no in-flight fire can still name.
+    ///
+    /// A page freed at epoch E may sit in the device translation of a fire
+    /// prepared at or before E, so E is retirable exactly when the oldest
+    /// unsettled sequence is greater than E. With nothing in flight the whole
+    /// pending set retires.
     pub fn retire_idle(&mut self) {
+        // Nothing in flight: everything retires, and the tracking set is
+        // resynced. `settle` and `cancel_prepared` both remove their own
+        // sequence, so `outstanding` should already be empty here; the clear
+        // is belt-and-braces against a future producer of sequences that has
+        // no matching consumer.
         if self.in_flight == 0 {
+            self.outstanding.clear();
             self.pool.retire_through(self.seq);
+            return;
+        }
+        if let Some(&oldest) = self.outstanding.iter().next() {
+            self.pool.retire_through(oldest.saturating_sub(1));
         }
     }
 
@@ -847,6 +873,7 @@ impl KvStore {
 
         self.seq += 1;
         self.in_flight += 1;
+        self.outstanding.insert(self.seq);
         Ok(KvPreparedWrite {
             ws,
             targets,
@@ -958,10 +985,22 @@ impl KvStore {
         self.pool
             .recycle_after_epoch(prepared.allocated, prepared.seq);
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.outstanding.remove(&prepared.seq);
         self.retire_idle();
     }
 
-    pub fn settle(&mut self, intents: Vec<CasIntent>, success: bool) {
+    /// Settle `seq`'s fire: publish its CAS intents (or discard them on
+    /// failure), drop it from the in-flight set, and retire every recycle
+    /// epoch it was gating.
+    ///
+    /// `seq` is a parameter rather than a separate `retire_through(seq)` call
+    /// because forgetting the second call is not a visible failure: the stale
+    /// entry pins `retire_idle` at `min(outstanding) - 1` forever, freed pages
+    /// stop reaching the free list, and the only self-heal is a moment of
+    /// GLOBAL quiescence — which at high concurrency never comes (that wait is
+    /// exactly the 4.5 ms per-completion supply drip of analysis.md
+    /// 10.16-10.17). One call, one signature, no discipline to remember.
+    pub fn settle(&mut self, seq: u64, intents: Vec<CasIntent>, success: bool) {
         #[cfg(test)]
         if success {
             for intent in intents {
@@ -984,11 +1023,7 @@ impl KvStore {
         #[cfg(not(test))]
         let _ = (intents, success);
         self.in_flight = self.in_flight.saturating_sub(1);
-        self.retire_idle();
-    }
-
-    /// Retire completion epochs `<= epoch`, making recycled slots allocatable.
-    pub fn retire_through(&mut self, _epoch: u64) {
+        self.outstanding.remove(&seq);
         self.retire_idle();
     }
 
@@ -1279,8 +1314,7 @@ impl KvStore {
             });
         }
         let (sequence, intents) = self.publish_prepared(prepared, &commits)?;
-        self.settle(intents, true);
-        self.retire_through(sequence);
+        self.settle(sequence, intents, true);
         Ok(page_count)
     }
 
@@ -1288,8 +1322,12 @@ impl KvStore {
     /// of WorkingSets would ACTUALLY free, answered by the same rule
     /// `prepare_suspend` applies — with a typed reason when the answer is
     /// zero. Batched: the shared exclusions cost one pass for the whole set.
-    pub fn reclaim_quotes(&self, groups: &[HashSet<WorkingSetId>]) -> Vec<ReclaimQuote> {
-        self.table.reclaim_quotes(groups)
+    pub fn reclaim_quotes(
+        &self,
+        groups: &[HashSet<WorkingSetId>],
+        budget: u32,
+    ) -> Vec<ReclaimQuote> {
+        self.table.reclaim_quotes(groups, budget)
     }
 
     pub fn reserve_device_pages(&mut self, count: usize) -> Option<Vec<PhysicalKvPageId>> {
@@ -1540,6 +1578,17 @@ impl KvStore {
 
     pub fn page_len(&self, ws: WorkingSetId) -> Result<u64, KvStoreError> {
         Ok(self.table.page_len(ws)?)
+    }
+
+    /// The lock-free `page_len` mirror for `ws`. Handed to the
+    /// [`KvWorkingSet`](crate::store::kv::working_set::KvWorkingSet) handle
+    /// at construction so the hot readers never take this store's mutex to
+    /// load one integer.
+    pub fn page_len_mirror(
+        &self,
+        ws: WorkingSetId,
+    ) -> Result<std::sync::Arc<std::sync::atomic::AtomicU64>, KvStoreError> {
+        Ok(self.table.page_len_mirror(ws)?)
     }
 
     pub fn available_pages(&self) -> usize {

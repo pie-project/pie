@@ -24,6 +24,19 @@ namespace pie::metal {
 const std::string& golden_tap_dir();
 inline bool golden_taps_enabled() { return !golden_tap_dir().empty(); }
 
+/// Whether a tap dump keeps the ordinary scratch recycling.
+///
+/// A dump normally gives every value its own pool buffer, because a recycled
+/// producer's buffer holds someone else's value by the time the fire retires
+/// and there would be nothing to read. The cost is that the taps then describe
+/// an allocation no fire outside the dump ever runs against -- so a colouring
+/// that reuses a buffer while its value is still live is the ONE class of
+/// defect this dump structurally cannot see. `PIE_METAL_TAPS_RECYCLE=1` dumps
+/// against the real allocation instead: values whose buffer was reused read as
+/// whatever overwrote them, which is exactly what makes the two dumps
+/// comparable and the first diverging tap the answer.
+bool golden_taps_recycle();
+
 // Write every tapped activation of `dag` as `<dir>/<layer>.<kernel>.npy`, float32,
 // shape [n_rows, width]. Row t is read at `t * row_stride_bytes` inside its pool slot,
 // which is how bind_scratch lays the per-token prefill rows out.
