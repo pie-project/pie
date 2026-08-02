@@ -688,6 +688,12 @@ struct PreparedStep::Impl {
     int pack_dense_lanes = 0;
     int pack_dense_stride = 0;
     std::size_t pack_dense_bytes = 0;
+    // NS-2: the masked program's RESOLVED per-suffix-lane geometry (page
+    // counts + last-page lens), harvested by the spatial dense pack for
+    // the suffix mask PLAN (the host wire views are placeholders for
+    // composed-envelope lanes).
+    std::vector<std::uint32_t> spatial_suffix_page_counts;
+    std::vector<std::uint32_t> spatial_suffix_last_lens;
 
     // RS.
     pipeline::RsExecutionPlan rs_plan;
@@ -940,7 +946,14 @@ void prepare_step(
             // This resolve-time throw is the unreachable backstop: by now
             // `begin_host` has mutated wave state, so failing here poisons
             // the whole frame.
-            if (s.rpg.per_program.size() > 1) {
+            static const bool spatial_mask_on = [] {
+                const char* v = std::getenv("PIE_SPATIAL_MASK");
+                return v == nullptr || v[0] != '0';
+            }();
+            const bool spatial_planned = spatial_mask_on &&
+                view.planned_unmasked_prefix_rows !=
+                    PIE_UNMASKED_PREFIX_UNPLANNED;
+            if (s.rpg.per_program.size() > 1 && !spatial_planned) {
                 for (std::size_t p = 0; p < s.rpg.per_program.size(); ++p) {
                     if (s.rpg.is_device_geometry[p] &&
                         s.rpg.per_program[p].has_mask) {
@@ -1341,6 +1354,10 @@ void prepare_step(
         // layout: pure causal decodes to nothing and the structured pack
         // covers the batch. Anything non-causal here is a scheduler breach
         // — fail loud below rather than silently dropping a mask.
+        // (NS-2 note: a composed spatial-mask step's wire rows are the
+        // WIRE lanes' synthesized causal masks — pure causal, handled by
+        // the walk below; the masked lane's DEVICE-carried mask packs in
+        // the spatial dense-pack block after this one.)
         const bool resolved_custom_wire =
             s.dg_resolved && view.has_user_mask &&
             view.ptir_program_hashes.size() == 1;
@@ -1658,6 +1675,173 @@ void prepare_step(
                 throw std::runtime_error(
                     "dense attention mask exceeds persistent capacity");
             }
+        }
+    }
+
+    // NS-2 (the spatial mask fire): a COMPOSED multi-program step whose
+    // scheduler planned an unmasked prefix packs the dense-masked
+    // program's mask at its composed SUFFIX positions — prefix rows get
+    // zero-length indptr entries (klen 0, the pack kernel no-ops them and
+    // the split body never reads them). The dense source is staged PADDED
+    // to fire-lane indexing so `launch_pack_dense_mask` needs no offset
+    // parameter. Shape contract, enforced loudly: exactly ONE masked
+    // device-geometry program, its rows exactly the planned suffix.
+    // Per-wave reset: these are harvested only by the spatial pack below;
+    // a later wave must never see a previous wave's geometry through the
+    // prepare pointers (stale sizes read out of bounds).
+    s.spatial_suffix_page_counts.clear();
+    s.spatial_suffix_last_lens.clear();
+    if (s.dg_resolved && s.rpg.per_program.size() > 1 &&
+        !use_structured_mask && !s.have_custom_mask) {
+        static const bool spatial_mask_on2 = [] {
+            const char* v = std::getenv("PIE_SPATIAL_MASK");
+            return v == nullptr || v[0] != '0';
+        }();
+        struct MaskedProgram {
+            int program = 0;
+            int base = 0;
+            int rows = 0;
+            int stride = 0;
+        };
+        std::vector<MaskedProgram> masked_programs;
+        const auto& rip = view.ptir_program_row_indptr;
+        const bool have_rip =
+            rip.size() == s.rpg.per_program.size() + 1;
+        for (std::size_t p = 0; p < s.rpg.per_program.size(); ++p) {
+            if (s.rpg.is_device_geometry[p] &&
+                s.rpg.per_program[p].has_mask &&
+                !s.rpg.per_program[p].mask.empty()) {
+                MaskedProgram m;
+                m.program = static_cast<int>(p);
+                if (have_rip) {
+                    m.base = static_cast<int>(rip.data()[p]);
+                    m.rows = static_cast<int>(rip.data()[p + 1]) - m.base;
+                }
+                masked_programs.push_back(m);
+            }
+        }
+        if (!masked_programs.empty()) {
+            const bool spatial_planned = spatial_mask_on2 &&
+                view.planned_unmasked_prefix_rows !=
+                    PIE_UNMASKED_PREFIX_UNPLANNED;
+            if (!spatial_planned || !have_rip) {
+                throw std::runtime_error(
+                    "ptir: dense-masked program in a composed step outside "
+                    "the planned spatial-mask shape (" +
+                    std::to_string(masked_programs.size()) +
+                    " masked programs, " +
+                    (spatial_planned ? "planned" : "UNPLANNED") + ")");
+            }
+            const int lanes = static_cast<int>(qo_view.size()) - 1;
+            const int split =
+                static_cast<int>(view.planned_unmasked_prefix_rows);
+            const int suffix = lanes - split;
+            // The masked programs' composed rows must tile EXACTLY the
+            // planned suffix (the seriation puts masked members last;
+            // program order gives ascending bases).
+            int cursor = split;
+            int stride_max = 0;
+            for (auto& m : masked_programs) {
+                if (m.base != cursor || m.rows <= 0) {
+                    throw std::runtime_error(
+                        "ptir: masked programs' composed rows do not tile "
+                        "the planned suffix (seriation drift)");
+                }
+                cursor += m.rows;
+                const pipeline::FireGeometry& fgp =
+                    s.rpg.per_program[static_cast<std::size_t>(m.program)];
+                if (fgp.mask.size() %
+                        static_cast<std::size_t>(m.rows) != 0) {
+                    throw std::runtime_error(
+                        "ptir: spatial dense mask size does not divide "
+                        "its program's row count");
+                }
+                m.stride = static_cast<int>(
+                    fgp.mask.size() / static_cast<std::size_t>(m.rows));
+                stride_max = std::max(stride_max, m.stride);
+            }
+            if (cursor != lanes) {
+                throw std::runtime_error(
+                    "ptir: masked programs' composed rows do not reach the "
+                    "fire's end (seriation drift)");
+            }
+            const int stride = stride_max;
+            const std::uint32_t page =
+                static_cast<std::uint32_t>(kv_cache.page_size());
+            std::vector<std::uint8_t> padded(
+                static_cast<std::size_t>(lanes) * stride, 0);
+            std::vector<std::uint32_t> klen(
+                static_cast<std::size_t>(lanes), 0);
+            std::vector<std::int32_t> mindptr(
+                static_cast<std::size_t>(lanes) + 1, 0);
+            s.spatial_suffix_page_counts.assign(
+                static_cast<std::size_t>(suffix), 0);
+            s.spatial_suffix_last_lens.assign(
+                static_cast<std::size_t>(suffix), 0);
+            for (const auto& m : masked_programs) {
+                const pipeline::FireGeometry& fgp =
+                    s.rpg.per_program[static_cast<std::size_t>(m.program)];
+                for (int fl = 0; fl < m.rows; ++fl) {
+                    const int l = m.base + fl;
+                    std::memcpy(
+                        padded.data() +
+                            static_cast<std::size_t>(l) * stride,
+                        fgp.mask.data() +
+                            static_cast<std::size_t>(fl) * m.stride,
+                        static_cast<std::size_t>(m.stride));
+                    const bool resolved_geometry =
+                        !fgp.kv_page_indptr.empty();
+                    const std::uint32_t np = resolved_geometry
+                        ? ((fl + 1 <
+                            static_cast<int>(fgp.kv_page_indptr.size()))
+                               ? fgp.kv_page_indptr[fl + 1] -
+                                     fgp.kv_page_indptr[fl]
+                               : 0u)
+                        : kvpp_view[l + 1] - kvpp_view[l];
+                    const std::uint32_t lpl = resolved_geometry
+                        ? ((fl < static_cast<int>(
+                                     fgp.kv_last_page_lens.size()))
+                               ? fgp.kv_last_page_lens[fl]
+                               : 0u)
+                        : kvlpl_view[l];
+                    s.spatial_suffix_page_counts[
+                        static_cast<std::size_t>(l - split)] = np;
+                    s.spatial_suffix_last_lens[
+                        static_cast<std::size_t>(l - split)] = lpl;
+                    klen[l] = np == 0 ? 0u : (np - 1) * page + lpl;
+                }
+            }
+            for (int l = 0; l < lanes; ++l) {
+                const std::uint32_t qo_len = qo_view[l + 1] - qo_view[l];
+                const std::uint64_t bits =
+                    static_cast<std::uint64_t>(qo_len) * klen[l];
+                mindptr[l + 1] = mindptr[l] +
+                    static_cast<std::int32_t>((bits + 7u) / 8u);
+            }
+            const std::size_t packed_bytes =
+                static_cast<std::size_t>(mindptr[lanes]);
+            if (packed_bytes == 0 ||
+                packed_bytes > pi.custom_mask.size() ||
+                padded.size() > pi.dense_mask.size() ||
+                static_cast<std::size_t>(lanes) + 1 >
+                    pi.custom_mask_indptr.size() ||
+                klen.size() > pi.structured_mask_klen.size()) {
+                throw std::runtime_error(
+                    "ptir: spatial dense mask exceeds persistent capacity");
+            }
+            s.up_dense_mask = pi.dense_mask.stage_from_host(
+                std::span<const std::uint8_t>(padded));
+            s.up_dense_klen = pi.structured_mask_klen.stage_from_host(
+                std::span<const std::uint32_t>(klen));
+            s.up_dense_indptr = pi.custom_mask_indptr.stage_from_host(
+                std::span<const std::int32_t>(mindptr));
+            s.pack_dense = true;
+            s.pack_dense_lanes = lanes;
+            s.pack_dense_stride = stride;
+            s.pack_dense_bytes = packed_bytes;
+            s.have_custom_mask = true;
+            s.mask_bytes = static_cast<int>(packed_bytes);
+            s.mask_indptr_count = lanes + 1;
         }
     }
 
@@ -2420,6 +2604,18 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                     engine.dispatch->launch_wants_attn_score(s.dispatch_view)
                         ? model::default_attn_score_window()
                         : 0u,
+                .unmasked_prefix_rows =
+                    s.dispatch_view.planned_unmasked_prefix_rows,
+                .full_depth_rows =
+                    s.dispatch_view.planned_full_depth_rows,
+                .mask_suffix_page_counts_h =
+                    s.spatial_suffix_page_counts.empty()
+                        ? nullptr
+                        : s.spatial_suffix_page_counts.data(),
+                .mask_suffix_last_lens_h =
+                    s.spatial_suffix_last_lens.empty()
+                        ? nullptr
+                        : s.spatial_suffix_last_lens.data(),
             });
         engine.attn_ws.end_plan_update(cublas.stream());
         plan_timer.stop();
@@ -2574,6 +2770,11 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .num_sampling = s.num_sampling,
             .is_pure_decode = s.is_pure_decode,
             .have_custom_mask = s.have_custom_mask,
+            .unmasked_prefix_rows =
+                s.dispatch_view.planned_unmasked_prefix_rows,
+            .planned_max_layers = s.dispatch_view.planned_max_layers,
+            .planned_full_depth_rows =
+                s.dispatch_view.planned_full_depth_rows,
             .compact_logits = s.compact_logits,
             .structured_window_left = s.structured_window_left,
             .has_write_desc = s.has_write_desc,

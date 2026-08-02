@@ -230,6 +230,23 @@ struct ForwardFn {
         // row splits and the hook fingerprint can drop the split. Null
         // everywhere else — eager fires keep the host windows.
         const std::uint32_t* peel_window_d = nullptr;
+
+        // NS-2 (spatial mask fire, eager-first): when != UINT32_MAX the
+        // attention splits at this wire row — decode kernel over
+        // [0, split), custom-mask kernel over [split, N) reading the
+        // rebased suffix CSRs below (uploaded per fire by the engine).
+        std::uint32_t unmasked_prefix_rows = 0xffffffffu;
+        const std::uint32_t* mask_suffix_qo_indptr_d = nullptr;
+        const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr;
+        // STRUCTURAL v0 (S-1): run layers [0, k) and take the head at k
+        // (UINT32_MAX = full). Truncated fires are SOLO and EAGER (graphs
+        // refuse them); the hand-written body honours the bound, the
+        // declared legs throw loudly until S-4 states the depth peel.
+        std::uint32_t max_layers = 0xffffffffu;
+        // STRUCTURAL S-2: the depth union's request split — leading
+        // members run all L layers, the truncated suffix stops at
+        // `max_layers` (one tail serves both). UINT32_MAX = uniform.
+        std::uint32_t full_depth_rows = 0xffffffffu;
     };
 
     struct PrepareInputs {
@@ -251,6 +268,22 @@ struct ForwardFn {
         // SM90-vs-FA2 is chosen, and only FA2 is instrumented. Zero on the
         // paths that run no stage hooks.
         std::uint32_t attn_score_window = 0;
+        // NS-2: the scheduler-planned unmasked wire-row prefix
+        // (PIE_UNMASKED_PREFIX_UNPLANNED-equivalent UINT32_MAX = no plan /
+        // no split). When 0 < value < R on a masked pure-decode fire and
+        // the spatial-mask gate is on, prepare builds BOTH the prefix
+        // decode plan and the rebased suffix mask plan.
+        std::uint32_t unmasked_prefix_rows = 0xffffffffu;
+        // STRUCTURAL S-2: the depth union's request split (UINT32_MAX =
+        // uniform); prepare builds the prefix decode plan when planned.
+        std::uint32_t full_depth_rows = 0xffffffffu;
+        // NS-2: the masked program's RESOLVED per-suffix-lane geometry
+        // (page counts / last-page lens), from the frame's spatial dense
+        // pack. The suffix mask plan MUST use these — the host wire views
+        // are placeholders for composed-envelope lanes. Null when the fire
+        // is not a spatial compose.
+        const std::uint32_t* mask_suffix_page_counts_h = nullptr;
+        const std::uint32_t* mask_suffix_last_lens_h = nullptr;
     };
 
     // The arch implementation. context.cpp sets this once at construction;
@@ -530,7 +563,11 @@ cudaGraphExec_t capture_forward_graph_exec(
     // Lora campaign step 3b: non-null captures a LORA-carrying body —
     // the launches read the ENGINE-staged state (the caller must have
     // staged this fire), and the exec lives in the fingerprint store.
-    const model::LoraTable* lora = nullptr);
+    const model::LoraTable* lora = nullptr,
+    // NS-3: the spatial split (UINT32_MAX = not a spatial fire). The
+    // captured body splits its attention and reads the identity qo from
+    // pi.mask_suffix_qo_indptr.
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu);
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
 // (not private to batch/forward.cpp) because `enqueue_step` in
@@ -617,6 +654,14 @@ struct ForwardDispatchInputs {
     int num_sampling = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
+    // NS-2: planned unmasked wire-row prefix (UINT32_MAX = no split).
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu;
+    // STRUCTURAL v0 (S-1): run only the first k layers and take the head
+    // there (UINT32_MAX = full model; truncated steps are SOLO).
+    std::uint32_t planned_max_layers = 0xffffffffu;
+    // STRUCTURAL S-2: the depth seriation's request split (leading
+    // members at FULL depth; UINT32_MAX = uniform fire).
+    std::uint32_t planned_full_depth_rows = 0xffffffffu;
     // Direct non-graph prefill/mixed launches may gather the requested hidden
     // rows before lm_head instead of materializing [N, vocab] logits.
     bool compact_logits = false;

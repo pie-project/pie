@@ -68,6 +68,13 @@ pub struct LaunchPlan {
     /// Exclusive physical KV page high-water required before this launch.
     #[serde(default)]
     pub required_kv_pages: u32,
+    /// STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
+    /// take the head at layer `k` (the logit-lens / layerskip-draft
+    /// class). `None` = the full model — every pre-S1 request. v0 keeps
+    /// truncated fires SOLO (the scheduler's blocking rule); the depth
+    /// UNION (a `FullDepthPrefix` peel) is the recorded next rung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_layers: Option<u32>,
     pub image_indptr: Vec<u32>,
     pub image_grids: Vec<u32>,
     pub image_anchor_positions: Vec<u32>,

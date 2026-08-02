@@ -109,6 +109,12 @@ struct LaunchView {
     // dispatch derives the prefix alone.
     std::uint32_t planned_hook_free_prefix_rows =
         PIE_HOOK_FREE_PREFIX_UNPLANNED;
+    // NS-2: the scheduler's planned unmasked prefix (wire rows; hook-free
+    // steps only). PIE_UNMASKED_PREFIX_UNPLANNED = no plan / do not split.
+    std::uint32_t planned_max_layers = PIE_MAX_LAYERS_FULL;
+    std::uint32_t planned_full_depth_rows = PIE_FULL_DEPTH_UNPLANNED;
+    std::uint32_t planned_unmasked_prefix_rows =
+        PIE_UNMASKED_PREFIX_UNPLANNED;
     // The batch carries a GUEST-supplied custom mask (vs engine-synthesized
     // causal BRLE rows, which accompany every wire prefill and are safely
     // dropped when a composed batch runs the standard causal path).

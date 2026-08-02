@@ -365,6 +365,18 @@ impl PendingRequest {
         if self.prebuilt && self.pipeline_id.is_none() {
             return Some("prebuilt-untracked");
         }
+        // STRUCTURAL v0 (S-1): a layer-truncated request fires alone
+        // until the depth union is ARMED (S-2, PIE_DEPTH_UNION=1) —
+        // composed, the two-range body serves full members at depth L
+        // and the truncated tail at k with one head. The batch planner
+        // still declines any shape outside the v0 contract (masks,
+        // hooks, lora, multi-token, mixed k), which falls back to the
+        // fire-level uniform bound.
+        if self.request.max_layers.is_some()
+            && !crate::scheduler::batch::depth_union_enabled()
+        {
+            return Some("truncated-depth");
+        }
         if self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0) {
             return Some("multirow-zero-tokens");
         }
@@ -438,6 +450,38 @@ pub(crate) struct LaunchGrouping {
     /// A member carries a qo row spanning more than one token (chunk
     /// prefill / multi-token step).
     has_multi_token: bool,
+    /// NS-2: a member is a wire-BRLE-masked DEVICE-GEOMETRY decode lane
+    /// admitted under the spatial-mask compose relax. Such a group must
+    /// stay pure single-token decode with no hooks, no lora, and no
+    /// structured mask — the split body is the only correct consumer.
+    has_wire_masked_envelope: bool,
+    /// NS-2: a member carries hooks or a lora sink (the planner sends
+    /// UNPLANNED for such fires, so a wire-masked envelope must not join).
+    has_hook_or_lora: bool,
+}
+
+/// NS-2 (the spatial mask fire): engine-side mirror of the driver's
+/// PIE_SPATIAL_MASK gate. When armed, wire-BRLE-masked DEVICE-GEOMETRY
+/// decode lanes may compose with plain envelope lanes — the split body
+/// needs no mask rows for the unmasked prefix, which is what forced the
+/// solo rule (the fire-level arm demanded a mask row per lane, and an
+/// envelope lane's causal row cannot be host-synthesized).
+fn spatial_mask_compose_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("PIE_SPATIAL_MASK").is_ok_and(|v| v == "0")
+    })
+}
+
+/// The mixed fire (M-1): masked envelopes composing with multi-token
+/// rows — the prefill-class mask peel serves the shape on all three
+/// legs. DEFAULT ON (`PIE_SPATIAL_MIXED=0` disarms and restores the
+/// pre-mixed refusals).
+fn spatial_mixed_compose_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("PIE_SPATIAL_MIXED").is_ok_and(|v| v == "0")
+    })
 }
 
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
@@ -524,13 +568,66 @@ impl LaunchGrouping {
         let wire_masked = request.request.has_user_mask
             && !request.request.masks.is_empty()
             && !request.request.device_resolved_geometry;
+        // NS-2 relax: a wire-BRLE-masked envelope DECODE lane composes when
+        // the gate is armed and the group can take the split body — pure
+        // single-token decode, no hooks/lora (the planner sends UNPLANNED
+        // for those and the frame refuses an unplanned spatial compose),
+        // no structured mask (one custom-mask source per fire), no dense
+        // device mask. Both join directions are checked.
+        let spatial_composable_masked_envelope = spatial_mask_compose_enabled()
+            && wire_mask_on_device_geometry
+            && request.request.token_ids.len() <= 1
+            && !request.has_multi_token_row()
+            && !request.hook_program
+            && !request.lora_program;
+        let wire_mask_on_device_geometry_blocks =
+            wire_mask_on_device_geometry && !spatial_composable_masked_envelope;
         if self.count != 0
             && (masked_device_geometry
-                || wire_mask_on_device_geometry
+                || (wire_mask_on_device_geometry_blocks)
+                // The mixed fire (M-1, ARMED by PIE_SPATIAL_MIXED=1):
+                // multi-token rows stop blocking a spatial-composable
+                // masked envelope in either join direction — the
+                // prefill-class mask peel serves the shape. DEFAULT OFF:
+                // the newly-admitted shapes still crash in the driver
+                // (illegal access on the fire-level arm too — under
+                // investigation), so the refusals hold until that lands.
+                || (spatial_composable_masked_envelope
+                    && ((!spatial_mixed_compose_enabled()
+                         && self.has_multi_token)
+                        || self.has_structured_mask
+                        || self.has_hook_or_lora
+                        || self.has_masked_device_geometry))
                 || self.has_masked_device_geometry
+                || (self.has_wire_masked_envelope
+                    && ((!spatial_mixed_compose_enabled()
+                         && request.has_multi_token_row())
+                        || request.request.structured_device_mask
+                        || request.hook_program
+                        || request.lora_program))
                 || (wire_masked && self.has_structured_mask)
                 || (request.request.structured_device_mask && self.has_user_mask))
         {
+            if spatial_mask_compose_enabled() {
+                eprintln!(
+                    "[spatial-compose] REFUSE: req(mask={} dg={} stm={} \
+                     ntok={} hook={} lora={} structured={}) group(mde={} \
+                     wme={} hl={} mt={} sm={} um={})",
+                    request.request.has_user_mask,
+                    request.request.device_resolved_geometry,
+                    request.request.single_token_mode,
+                    request.request.token_ids.len(),
+                    request.hook_program,
+                    request.lora_program,
+                    request.request.structured_device_mask,
+                    self.has_masked_device_geometry,
+                    self.has_wire_masked_envelope,
+                    self.has_hook_or_lora,
+                    self.has_multi_token,
+                    self.has_structured_mask,
+                    self.has_user_mask,
+                );
+            }
             return Some("mask-compose");
         }
         // Invariant: a batch containing an `attn_page_mask`-writing program
@@ -586,10 +683,19 @@ impl LaunchGrouping {
         self.has_device_geometry |= request.request.device_resolved_geometry;
         self.has_page_mask |= request.page_mask_program;
         self.has_structured_mask |= request.request.structured_device_mask;
+        let wire_masked_envelope = request.request.has_user_mask
+            && !request.request.masks.is_empty()
+            && request.request.device_resolved_geometry;
+        let spatial_relaxed = spatial_mask_compose_enabled()
+            && wire_masked_envelope
+            && request.request.token_ids.len() <= 1
+            && !request.has_multi_token_row()
+            && !request.hook_program
+            && !request.lora_program;
         self.has_masked_device_geometry |= has_dense_device_mask(&request.request)
-            || (request.request.has_user_mask
-                && !request.request.masks.is_empty()
-                && request.request.device_resolved_geometry);
+            || (wire_masked_envelope && !spatial_relaxed);
+        self.has_wire_masked_envelope |= spatial_relaxed;
+        self.has_hook_or_lora |= request.hook_program || request.lora_program;
         self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
@@ -7551,11 +7657,15 @@ mod tests {
             !grouping.push(&host_on_device, limits, 16),
             "wire rows distinguish a host-derived mask from dense device lowering"
         );
+        // NS-2 (spatial mask, default ON): a wire-BRLE-masked
+        // device-geometry decode lane COMPOSES — the split body serves the
+        // masked suffix and the unmasked prefix needs no mask rows, which
+        // is what dissolved the old solo rule.
         let mut ordinary_group = LaunchGrouping::default();
         ordinary_group.push(&dummy_launch_request(ProcessId::new_v4(), 5), limits, 16);
         assert!(
-            !ordinary_group.accepts(&host_on_device, limits, 16),
-            "resolved-geometry host masks remain incompatible with reordered wire rows"
+            ordinary_group.accepts(&host_on_device, limits, 16),
+            "the spatial split composes resolved-geometry host masks"
         );
     }
 
@@ -7611,34 +7721,36 @@ mod tests {
             request
         };
 
-        for host_lowered in [true, false] {
-            // Masked fire first: no wire fire, prefill chunk, or envelope
-            // decode lane may join behind it.
-            let masked = pooled_masked(1, host_lowered);
+        // NS-2 (spatial mask, default ON): the HOST-lowered pooled masked
+        // fire (wire BRLE rows) now COMPOSES with wire decode fires and
+        // envelope lanes — the split body's contract — while chunk
+        // prefills stay refused (multi-token) and the DEVICE-lowered
+        // (dense channel, no wire rows) shape stays fully solo.
+        {
+            let masked = pooled_masked(1, true);
             let mut grouping = LaunchGrouping::default();
             assert!(grouping.accepts(&masked, limits, 16));
             grouping.push(&masked, limits, 16);
             assert!(
-                !grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 2), limits, 16),
-                "a wire decode fire must not join a pooled masked \
-                 device-geometry fire (host_lowered={host_lowered})"
+                grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 2), limits, 16),
+                "a wire decode fire composes with a host-lowered masked \
+                 device-geometry fire (the spatial split)"
             );
             let mut prefill = dummy_launch_request(ProcessId::new_v4(), 3);
             prefill.request = dummy_prefill(64);
             assert!(
-                !grouping.accepts(&prefill, limits, 16),
-                "a chunk-prefill fire must not join a pooled masked \
-                 device-geometry fire (host_lowered={host_lowered})"
+                grouping.accepts(&prefill, limits, 16),
+                "the mixed fire (default ON): a chunk-prefill fire \
+                 composes with a host-lowered masked device-geometry \
+                 fire — the prefill-class mask peel serves the shape \
+                 (prefix causal dispatch, masked 1-token suffix; \
+                 PIE_SPATIAL_MIXED=0 restores the refusal)"
             );
             assert!(
-                !grouping.accepts(&envelope_decode(4), limits, 16),
-                "an envelope decode lane must not join a pooled masked \
-                 device-geometry fire (host_lowered={host_lowered})"
+                grouping.accepts(&envelope_decode(4), limits, 16),
+                "an envelope decode lane composes with a host-lowered \
+                 masked device-geometry fire (the spatial split)"
             );
-
-            // Wire fire first: the masked fire defers instead of joining —
-            // the exact composition observed live (mixed load, a plain
-            // lane's wire fire already grouped).
             let mut grouping = LaunchGrouping::default();
             grouping.push(
                 &dummy_launch_request(ProcessId::new_v4(), 5),
@@ -7646,17 +7758,37 @@ mod tests {
                 16,
             );
             assert!(
-                !grouping.accepts(&pooled_masked(6, host_lowered), limits, 16),
-                "a pooled masked device-geometry fire must not join wire \
-                 fires (host_lowered={host_lowered})"
+                grouping.accepts(&pooled_masked(6, true), limits, 16),
+                "a host-lowered masked device-geometry fire joins wire \
+                 fires (the spatial split)"
             );
-
-            // Liveness: the deferred fire still heads its own fresh group.
+        }
+        {
+            // The DEVICE-lowered dense mask: no wire rows, nothing to
+            // pack at composed positions — solo in both directions,
+            // exactly as before.
+            let masked = pooled_masked(11, false);
+            let mut grouping = LaunchGrouping::default();
+            assert!(grouping.accepts(&masked, limits, 16));
+            grouping.push(&masked, limits, 16);
+            assert!(
+                !grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 12), limits, 16),
+                "a wire decode fire must not join a dense-device-masked fire"
+            );
+            let mut grouping = LaunchGrouping::default();
+            grouping.push(
+                &dummy_launch_request(ProcessId::new_v4(), 13),
+                limits,
+                16,
+            );
+            assert!(
+                !grouping.accepts(&pooled_masked(14, false), limits, 16),
+                "a dense-device-masked fire must not join wire fires"
+            );
             let fresh = LaunchGrouping::default();
             assert!(
-                fresh.accepts(&pooled_masked(7, host_lowered), limits, 16),
-                "the refused masked fire stays schedulable solo \
-                 (host_lowered={host_lowered})"
+                fresh.accepts(&pooled_masked(15, false), limits, 16),
+                "the refused masked fire stays schedulable solo"
             );
         }
     }

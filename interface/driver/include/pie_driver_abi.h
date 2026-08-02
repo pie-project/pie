@@ -344,7 +344,18 @@
  * sentinel. Not zero: zero is a legitimate planned value ("no fast
  * prefix" — an all-hooked step).
  */
+#define PIE_UNMASKED_PREFIX_UNPLANNED PIE_HOOK_FREE_PREFIX_UNPLANNED
 #define PIE_HOOK_FREE_PREFIX_UNPLANNED UINT32_MAX
+
+/**
+ * [`PieStepDesc::planned_max_layers`]'s "full model" sentinel.
+ */
+#define PIE_MAX_LAYERS_FULL UINT32_MAX
+
+/**
+ * [`PieStepDesc::planned_full_depth_rows`]'s "no depth split" sentinel.
+ */
+#define PIE_FULL_DEPTH_UNPLANNED UINT32_MAX
 
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
@@ -1433,9 +1444,28 @@ typedef struct PieStepDesc {
    */
   uint32_t planned_hook_free_prefix_rows;
   /**
-   * Reserved; must be zero.
+   * NS-2 (the spatial mask fire): the scheduler-planned count of leading
+   * wire rows whose members carry NO user mask. The seriation nests the
+   * mask key under hooks, so the value is meaningful only for hook-free
+   * steps; [`PIE_UNMASKED_PREFIX_UNPLANNED`] means no plan (hooked or
+   * maskless steps, or a pre-plan engine) and the driver must not split.
    */
-  uint32_t reserved_step_tail0;
+  uint32_t planned_unmasked_prefix_rows;
+  /**
+   * STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
+   * take the head at layer `k` (the layerskip-draft class).
+   * [`PIE_MAX_LAYERS_FULL`] means the full model (every pre-S1 step).
+   * v0 truncated steps are SOLO (the scheduler's blocking rule), so one
+   * per-step word suffices until the depth union.
+   */
+  uint32_t planned_max_layers;
+  /**
+   * STRUCTURAL S-2: leading members at FULL depth (the depth
+   * seriation's request split; the truncated suffix's uniform k is
+   * `planned_max_layers`). [`PIE_FULL_DEPTH_UNPLANNED`] = a uniform
+   * fire; the driver must not depth-split.
+   */
+  uint32_t planned_full_depth_rows;
 } PieStepDesc;
 
 /**

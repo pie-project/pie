@@ -879,6 +879,15 @@ impl ForwardPass {
             .set_rs_mode(&wit::RsMode::FoldBuffered(tokens.to_vec()))
     }
 
+    /// STRUCTURAL v0: run only the first `max_layers` transformer layers
+    /// for this pass's fires and take the head there — the
+    /// layerskip-draft / logit-lens class. Values at or above the model's
+    /// depth are the identity; zero is rejected. v0 schedules truncated
+    /// fires solo.
+    pub fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
+        self.wit.set_max_layers(max_layers)
+    }
+
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::Readout])?;
         let indices_wit = indices.wit();

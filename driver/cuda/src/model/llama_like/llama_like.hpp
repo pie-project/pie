@@ -142,6 +142,22 @@ struct LlamaLikePlanState {
     // the layout oscillation cost the union key one orphan capture per
     // request, and today's masked-variant graphs the same churn.
     ops::PrefillPlanCachePtr mask_decode_plan;
+    // STRUCTURAL S-2: the depth union's PREFIX decode plan (requests
+    // [0, split) at layers [k, L)); planned against the SECONDARY
+    // workspace (two same-family plans must not share scheduling
+    // buffers — the mixed-fire lesson; a depth fire is never also a
+    // spatial-mask fire, so the workspace is free).
+    ops::DecodePlanCachePtr depth_prefix_decode_plan;
+    // NS-2: when >= 0, this fire's attention splits at this REQUEST
+    // index — the prefix plans cover requests [0, split),
+    // mask_decode_plan covers the REBASED suffix. -1 = fire-level
+    // plans (the pre-NS-2 shape).
+    int spatial_mask_split = -1;
+    // The mixed fire (M-2): the split's TOKEN-ROW offset (q/out
+    // pointer arithmetic). Equal to spatial_mask_split on pure-decode
+    // fires; diverges when prefill rows share the fire. -1 with
+    // spatial_mask_split >= 0 never happens (set together).
+    int spatial_mask_row_split = -1;
     bool use_prefill_plan = false;
     bool use_prefill_decode_plan = false;
     bool use_mask_decode_plan = false;
@@ -162,6 +178,13 @@ struct LlamaLikePlanState {
     int xqa_max_pages_per_seq = 0;
     std::vector<std::uint32_t> prefill_decode_qo_indptr_h;
 };
+
+// The mixed fire's dedicated suffix-plan workspace (llama_like.cpp):
+// the prefix causal plan and the suffix custom plan are both
+// prefill-family and must not share one AttentionWorkspace's scheduling
+// buffers. Prepare plans the suffix against this; the mixed dispatch
+// sites pair with it.
+AttentionWorkspace& spatial_suffix_attn_ws();
 
 // Refresh the decode plan for the current fire. Caller invokes this
 // BEFORE either a direct forward call OR a graph replay, outside any
@@ -187,7 +210,22 @@ void prepare_llama_like_decode_plan(
     // Non-zero when the fire's PTIR programs read `AttnScore`; the prefill
     // plan is then built for the FA2 score-capturing dispatch. Decided here
     // and not in the body because SM90-vs-FA2 is a plan-time choice.
-    std::uint32_t attn_score_window = 0);
+    std::uint32_t attn_score_window = 0,
+    // NS-2: the planned unmasked wire-row prefix (UINT32_MAX = no split).
+    // When 0 < value < R on a masked pure-decode fire and PIE_SPATIAL_MASK
+    // is armed, prepare builds the PREFIX decode plan and the rebased
+    // SUFFIX mask plan, and records the split on the plan state.
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu,
+    // NS-2: resolved suffix geometry for the mask plan (see
+    // ForwardFn::PrepareInputs) — required when the split is active on a
+    // composed-envelope fire, else the host CSR slices serve.
+    const std::uint32_t* mask_suffix_page_counts_h = nullptr,
+    const std::uint32_t* mask_suffix_last_lens_h = nullptr,
+    // STRUCTURAL S-2: the depth union's request split (UINT32_MAX =
+    // uniform fire). When planned on a plain pure-decode fire, prepare
+    // ALSO builds the prefix decode plan (requests [0, split)) into its
+    // dedicated slot against the secondary workspace.
+    std::uint32_t full_depth_rows = 0xffffffffu);
 
 std::uint32_t llama_like_supergraph_graph_layout(
     const LlamaLikePlanState& state);
@@ -255,7 +293,22 @@ void llama_like_forward_paged(
     // memory), non-null ONLY on hook-graph captures: the fused-decode
     // Peel then emits BOTH regions through the devwin kernel forms so the
     // captured exec replays across row splits. Null keeps host windows.
-    const std::uint32_t* peel_window_d = nullptr);
+    const std::uint32_t* peel_window_d = nullptr,
+    // NS-2: see declared_forward.hpp — the spatial mask split and the
+    // rebased suffix CSRs (UINT32_MAX / null = fire-level mask arm).
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu,
+    const std::uint32_t* mask_suffix_qo_indptr_d = nullptr,
+    const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr,
+    // STRUCTURAL v0 (S-1): run layers [0, k) and take the head at k
+    // (UINT32_MAX = full model). The layerskip-draft / logit-lens class:
+    // the tail (final norm + lm_head) is unchanged — it simply reads
+    // layer k's hidden state.
+    std::uint32_t max_layers = 0xffffffffu,
+    // STRUCTURAL S-2: the depth union's request split (leading members
+    // at full depth; UINT32_MAX = uniform fire). The two-range body:
+    // layers [0, max_layers) run full-N, layers [max_layers, L) run the
+    // full-depth prefix only, ONE unchanged tail serves both.
+    std::uint32_t full_depth_rows = 0xffffffffu);
 
 // The fire-scoped lora staging (`LoraFireState` in llama_like.cpp — the
 // adapter cast + grouping built once per fire), behind an opaque handle so

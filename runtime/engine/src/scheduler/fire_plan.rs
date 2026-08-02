@@ -260,6 +260,12 @@ pub(crate) struct MemberFacts {
     /// contiguous tail — the row-window precondition for the spatial mask
     /// fire (NS-2), exactly as hooks-last was the Peel's precondition.
     pub(crate) custom_mask: bool,
+    /// STRUCTURAL S-2: the member requests a layer truncation. The
+    /// seriation key nests this INSIDE the mask key (truncated members
+    /// sort after full-depth, before hooks' tail) — the depth peel's
+    /// row-window precondition, exactly as mask-last was the spatial
+    /// fire's.
+    pub(crate) truncated: bool,
     /// Device-resolved (chained-decode envelope) geometry: composes as the
     /// ordered suffix sub-batch, never interleaved with wire members.
     pub(crate) device_resolved_geometry: bool,
@@ -337,6 +343,7 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
             member.device_resolved_geometry,
             member.hook_program,
             member.custom_mask,
+            member.truncated,
             member.arrival,
         )
     });
@@ -436,6 +443,7 @@ mod tests {
             hook_program,
             lora,
             custom_mask: false,
+            truncated: false,
             device_resolved_geometry,
             arrival,
         }
@@ -446,6 +454,7 @@ mod tests {
             hook_program: false,
             lora: false,
             custom_mask: true,
+            truncated: false,
             device_resolved_geometry: false,
             arrival,
         }

@@ -50,6 +50,10 @@ PersistentInputs PersistentInputs::allocate(
     p.supergraph_preds   = DeviceBuffer<std::uint8_t >::alloc(
         batch::kSupergraphPredSlots);
     p.peel_window        = DeviceBuffer<std::uint32_t>::alloc(2);
+    p.mask_suffix_qo_indptr =
+        DeviceBuffer<std::uint32_t>::alloc(static_cast<std::size_t>(max_requests) + 1);
+    p.mask_suffix_kv_page_indptr =
+        DeviceBuffer<std::uint32_t>::alloc(static_cast<std::size_t>(max_requests) + 1);
     p.custom_mask_indptr = DeviceBuffer<std::int32_t >::alloc(static_cast<std::size_t>(max_requests) + 1);
     p.dense_mask         = DeviceBuffer<std::uint8_t >::alloc(
         dense_mask_staging_bytes(max_custom_mask_bytes));

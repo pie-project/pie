@@ -103,6 +103,118 @@ fn planned_prefix_wire_rows(
     first_hook_row
 }
 
+/// NS-2: the attention_mask site's unmasked prefix, converted to WIRE
+/// rows through the attribution CSR — the value
+/// [`StepSubmission::planned_unmasked_prefix_rows`] carries. Meaningful
+/// only on hook-free steps with at least one masked member (the
+/// seriation nests mask under hooks, so a hooked step's masked members
+/// are not contiguous); everything else is UNPLANNED and the driver
+/// keeps the fire-level mask arm.
+/// STRUCTURAL S-2: the depth union's REQUEST split — the count of
+/// leading full-depth members. Planned only for the v0 shape: at least
+/// one truncated member AND at least one full member, every member a
+/// plain 1-token decode lane (no hooks/lora/masks/multi-token), all
+/// truncated members sharing ONE k and seriated as the contiguous tail
+/// (the sort key guarantees it; the scan verifies loudly-silently by
+/// declining).
+fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
+    if !depth_union_enabled() {
+        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
+    }
+    let truncated = ordered
+        .iter()
+        .filter(|r| r.request.max_layers.is_some())
+        .count();
+    if truncated == 0 || truncated == ordered.len() {
+        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
+    }
+    let mut k: Option<u32> = None;
+    for req in ordered.iter() {
+        if req.hook_program
+            || req.lora_program
+            || req.request.has_user_mask
+            || req.request.token_ids.len() > ordered.len()
+            || req
+                .request
+                .qo_indptr
+                .windows(2)
+                .any(|w| w[1] - w[0] > 1)
+        {
+            return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
+        }
+        if let Some(this_k) = req.request.max_layers {
+            if *k.get_or_insert(this_k) != this_k {
+                return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
+            }
+        }
+    }
+    let split = ordered.len() - truncated;
+    if ordered[split..]
+        .iter()
+        .any(|r| r.request.max_layers.is_none())
+    {
+        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
+    }
+    split as u32
+}
+
+/// The depth union's arm switch — DEFAULT ON (`PIE_DEPTH_UNION=0`
+/// disarms and restores the S-1 solo rule). The union oracle and the
+/// wide battery (R=4, mixed-k decline, all-truncated control) passed
+/// on the armed boots before the flip.
+pub(crate) fn depth_union_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("PIE_DEPTH_UNION").is_ok_and(|v| v == "0")
+    })
+}
+
+fn planned_unmasked_prefix_wire_rows(
+    plan: &fire_plan::FirePlan,
+    ordered: &[Box<PendingRequest>],
+    row_indptr: &[u32],
+) -> u32 {
+    if ordered.iter().any(|req| req.hook_program || req.lora_program)
+        || !ordered.iter().any(|req| req.request.has_user_mask)
+    {
+        return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
+    }
+    if row_indptr.len() != ordered.len() + 1 {
+        return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
+    }
+    let total = *row_indptr.last().expect("indptr has a total");
+    if total == 0 {
+        return 0;
+    }
+    let mut first_masked_row = total;
+    for (member, req) in ordered.iter().enumerate() {
+        if !req.request.has_user_mask {
+            continue;
+        }
+        let (lo, hi) = (row_indptr[member], row_indptr[member + 1]);
+        if hi <= lo {
+            return 0;
+        }
+        first_masked_row = first_masked_row.min(lo);
+    }
+    if let Some(site) = plan
+        .sites
+        .iter()
+        .find(|site| site.name == fire_plan::SITE_ATTENTION_MASK)
+    {
+        let unmasked_members = match site.lowering {
+            fire_plan::Lowering::Prefix { fast_rows } => fast_rows as usize,
+            _ => unreachable!("a masked step always plans the Prefix arm"),
+        };
+        debug_assert_eq!(
+            first_masked_row,
+            row_indptr[unmasked_members.min(ordered.len())],
+            "the plan's member prefix and the row-span scan must agree"
+        );
+    }
+    first_masked_row
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RequestCapacityUsage {
     pub(crate) forward_requests: usize,
@@ -420,6 +532,7 @@ pub(crate) fn build_frame_submission(
                 hook_program: req.hook_program,
                 lora: req.lora_program,
                 custom_mask: req.request.has_user_mask,
+                truncated: req.request.max_layers.is_some(),
                 device_resolved_geometry: req.request.device_resolved_geometry,
                 arrival,
             })
@@ -512,14 +625,30 @@ pub(crate) fn build_frame_submission(
         // compiled-plan derivation and refuses the launch on drift.
         let planned_hook_free_prefix_rows =
             planned_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
+        let planned_unmasked_prefix_rows =
+            planned_unmasked_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
+        // STRUCTURAL S-2: a planned depth union stamps the SUFFIX's
+        // uniform k onto the merged plan (the wire merge does not carry
+        // per-member max_layers); a DECLINED composed shape leaves it
+        // None — every member runs full depth, the safe degradation of
+        // an advisory truncation.
+        let planned_full_depth_rows = planned_full_depth_request_split(&group);
+        let mut merged_plan = build.plan;
+        if planned_full_depth_rows != pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED {
+            merged_plan.max_layers = group
+                .iter()
+                .find_map(|r| r.request.max_layers);
+        }
         steps.push(StepSubmission {
-            plan: build.plan,
+            plan: merged_plan,
             roster_rows,
             sub_batch_indptr,
             sub_batch_class,
             terminal_cells: build.terminal_cells,
             program_row_indptr: build.program_row_indptr,
             planned_hook_free_prefix_rows,
+            planned_unmasked_prefix_rows,
+            planned_full_depth_rows,
             logical_fire_ids: build.logical_fire_ids,
             channel_expected_head: build.channel_expected_head,
             channel_expected_tail: build.channel_expected_tail,

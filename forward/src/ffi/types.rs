@@ -131,9 +131,13 @@ pub enum PieForwardOpKind {
     HookSite = 25,
     /// Loop peeling (A3, the class-collapse amendment): two regions
     /// that BOTH run over complementary row ranges — prefix `[0,
-    /// fast_rows)`, tail `[fast_rows, N)`. Prefix-region op count in
-    /// `param0`, tail-region count in `param1`; the split is the
-    /// fire's hook-free prefix row count, a runtime input.
+    /// split)`, tail `[split, N)`. Prefix-region op count in `param0`,
+    /// tail-region count in `param1`; the split is a runtime input.
+    /// WHICH runtime row count ([`crate::trace::PeelWindow`]) rides
+    /// the aux run: EMPTY = the hook-free prefix (`fast_rows`, A3),
+    /// `[1]` = the unmasked prefix (the spatial mask split — prefix
+    /// region serves the plain decode rows, tail the masked suffix;
+    /// UNPLANNED collapses to tail-only full-N fire-level).
     Peel = 26,
     /// Broadcast bias add over `[rows, width]` (Qwen-2 family qkv
     /// biases): weight name in `name`, width from the value's shape.

@@ -38,6 +38,13 @@ inline constexpr std::uint32_t kGvSupergraph  = 1u << 31;
 // fingerprint-partitioned lora store, and the bit keeps their shape keys
 // from aliasing plain or supergraph captures at the same (R, N, layout).
 inline constexpr std::uint32_t kGvLora        = 1u << 30;
+
+// NS-3: the spatial mask fire's exec partition. The SPLIT itself rides
+// the model's graph layout hash (llama_like_decode_graph_layout mixes
+// both plans' layouts with the split — the same hash-keyed posture every
+// layout already takes); this bit only keeps spatial and non-spatial
+// execs out of each other's slots.
+inline constexpr std::uint32_t kGvSpatial     = 1u << 29;
 inline constexpr int           kGvLayoutShift = 4;
 
 inline constexpr std::uint32_t kGvFlagMask =

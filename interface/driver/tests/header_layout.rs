@@ -266,7 +266,9 @@ fn contract_source() -> String {
         channel_expected_tail,
         channel_ticket_indptr,
         planned_hook_free_prefix_rows,
-        reserved_step_tail0
+        planned_unmasked_prefix_rows,
+        planned_max_layers,
+        planned_full_depth_rows
     );
     contract!(out, PieStepDescSlice, ptr, len);
     contract!(

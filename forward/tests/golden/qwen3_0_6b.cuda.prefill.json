@@ -3470,7 +3470,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -3487,6 +3487,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 0
+        }
+      },
+      "inputs": [
+        6
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
         }
       },
       "inputs": [
@@ -3840,7 +3882,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -3857,6 +3899,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 1
+        }
+      },
+      "inputs": [
+        19
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
         }
       },
       "inputs": [
@@ -4210,7 +4294,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -4227,6 +4311,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 2
+        }
+      },
+      "inputs": [
+        32
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
         }
       },
       "inputs": [
@@ -4580,7 +4706,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -4597,6 +4723,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 3
+        }
+      },
+      "inputs": [
+        45
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
         }
       },
       "inputs": [
@@ -4950,7 +5118,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -4967,6 +5135,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 4
+        }
+      },
+      "inputs": [
+        58
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
         }
       },
       "inputs": [
@@ -5320,7 +5530,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -5337,6 +5547,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 5
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
         }
       },
       "inputs": [
@@ -5690,7 +5942,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -5707,6 +5959,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 6
+        }
+      },
+      "inputs": [
+        84
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
         }
       },
       "inputs": [
@@ -6060,7 +6354,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -6077,6 +6371,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 7
+        }
+      },
+      "inputs": [
+        97
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
         }
       },
       "inputs": [
@@ -6430,7 +6766,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -6447,6 +6783,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 8
+        }
+      },
+      "inputs": [
+        110
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
         }
       },
       "inputs": [
@@ -6800,7 +7178,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -6817,6 +7195,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 9
+        }
+      },
+      "inputs": [
+        123
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
         }
       },
       "inputs": [
@@ -7170,7 +7590,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -7187,6 +7607,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 10
+        }
+      },
+      "inputs": [
+        136
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
         }
       },
       "inputs": [
@@ -7540,7 +8002,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -7557,6 +8019,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 11
+        }
+      },
+      "inputs": [
+        149
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
         }
       },
       "inputs": [
@@ -7910,7 +8414,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -7927,6 +8431,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 12
+        }
+      },
+      "inputs": [
+        162
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
         }
       },
       "inputs": [
@@ -8280,7 +8826,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -8297,6 +8843,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 13
+        }
+      },
+      "inputs": [
+        175
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
         }
       },
       "inputs": [
@@ -8650,7 +9238,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -8667,6 +9255,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 14
+        }
+      },
+      "inputs": [
+        188
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
         }
       },
       "inputs": [
@@ -9020,7 +9650,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -9037,6 +9667,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 15
+        }
+      },
+      "inputs": [
+        201
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
         }
       },
       "inputs": [
@@ -9390,7 +10062,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -9407,6 +10079,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 16
+        }
+      },
+      "inputs": [
+        214
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
         }
       },
       "inputs": [
@@ -9760,7 +10474,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -9777,6 +10491,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 17
+        }
+      },
+      "inputs": [
+        227
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
         }
       },
       "inputs": [
@@ -10130,7 +10886,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -10147,6 +10903,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 18
+        }
+      },
+      "inputs": [
+        240
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
         }
       },
       "inputs": [
@@ -10500,7 +11298,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -10517,6 +11315,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 19
+        }
+      },
+      "inputs": [
+        253
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
         }
       },
       "inputs": [
@@ -10870,7 +11710,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -10887,6 +11727,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 20
+        }
+      },
+      "inputs": [
+        266
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
         }
       },
       "inputs": [
@@ -11240,7 +12122,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -11257,6 +12139,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 21
+        }
+      },
+      "inputs": [
+        279
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
         }
       },
       "inputs": [
@@ -11610,7 +12534,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -11627,6 +12551,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 22
+        }
+      },
+      "inputs": [
+        292
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
         }
       },
       "inputs": [
@@ -11980,7 +12946,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -11997,6 +12963,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 23
+        }
+      },
+      "inputs": [
+        305
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
         }
       },
       "inputs": [
@@ -12350,7 +13358,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -12367,6 +13375,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 24
+        }
+      },
+      "inputs": [
+        318
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
         }
       },
       "inputs": [
@@ -12720,7 +13770,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -12737,6 +13787,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 25
+        }
+      },
+      "inputs": [
+        331
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
         }
       },
       "inputs": [
@@ -13090,7 +14182,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -13107,6 +14199,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 26
+        }
+      },
+      "inputs": [
+        344
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
         }
       },
       "inputs": [
@@ -13460,7 +14594,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 3
+              "ops": 6
             }
           ],
           "else_ops": 6
@@ -13477,6 +14611,48 @@
         "HookSite": {
           "stage": "OnAttnProj",
           "layer": 27
+        }
+      },
+      "inputs": [
+        357
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Peel": {
+          "prefix_ops": 2,
+          "tail_ops": 1,
+          "window": "unmasked_prefix"
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_bf16",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
         }
       },
       "inputs": [

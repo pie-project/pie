@@ -1199,3 +1199,646 @@ NS-2 — the spatial mask fire, design:
 - Graph path: the supergraph mask arm keeps serving masked fires
   until NS-3 windows the arms (region windows + window-nonempty
   conditionals); NS-2 is eager-first.
+
+## NS-2 built end to end — and its live subject is scheduler-blocked (2026-08-03)
+
+The spatial mask fire is implemented across every layer: the engine
+plans the unmasked prefix (attention_mask site → wire rows, lora and
+hooks excluded at the planner so prepare's gate and dispatch's gate
+cannot drift), the value crosses the ABI in the claimed reserved
+step slot (PieStepDesc.planned_unmasked_prefix_rows), prepare builds
+BOTH plans (prefix decode via a recursive prepare at R'=split — XQA
+deployments guarded to the fire-level arm — and the custom plan over
+the REBASED suffix), the eager dispatch uploads the two rebased
+suffix CSRs (pi.mask_suffix_{qo,kv_page}_indptr; every other suffix
+array is a pointer offset), and both bodies (interpreter and
+hand-written) split the attention: decode kernel over [0, split),
+custom kernel over the suffix, everything else full-N shared.
+Spatial fires refuse graph capture (NS-3's job) and the generated
+path (NS-4's job). PIE_SPATIAL_MASK arms it, default off.
+
+Live: the crossing is verified (solo masked fires arrive with
+planned=0 — the correct all-masked answer), outputs all byte-stable.
+But the split never engaged, and the reject trace shows why: EVERY
+masked fire is R=1. `mask_blocks_composition` (scheduler/worker.rs)
+refuses wire-BRLE-masked lanes into composed batches in both
+directions — "wire masks index the wire request layout composition
+replaces". Only STRUCTURED device masks compose (the Stage 2 item A
+relax). So the spatial mask fire's SUBJECT — a masked+plain
+pure-decode co-batch — cannot form today.
+
+The unblocking campaign, next: the wire-BRLE compose relax. The
+frame assembly must re-index masked lanes' BRLE rows against the
+composed layout and synthesize causal rows for the mask-free lanes
+(the machinery the structured path already has); the grouping rule
+then admits wire-masked lanes. Independently valuable — the code
+comment itself prices the solo regime at 1.8-2.3x per token for the
+co-batched plain lanes — and it is the LAST precondition for the
+spatial mask fire's first live engagement.
+
+## The compose blocker, dissected — and the split dissolves it (2026-08-03)
+
+Why masked decode fires are all R=1: steady decode lanes ride the
+DEVICE-RESOLVED chained-decode envelope geometry, and worker.rs
+refuses `wire_mask_on_device_geometry` ("its BRLE indexes the
+placeholder layout composition replaces; the solo
+resolved_custom_wire path serves it"). Plain WIRE-geometry masked
+lanes already compose (the dense-mask compose relax) — but decode is
+envelope-class, so the spatial fire's subject never forms.
+
+The deeper reason the solo rule exists: a composed fire-level mask
+arm needs a mask row for EVERY lane, and an envelope lane's kv_len is
+device-only knowledge — the host cannot synthesize its causal row
+("nothing to assemble from"). The fire-level uniformity is what
+demands the impossible row.
+
+NS-2's split removes exactly that demand: the unmasked prefix takes
+the DECODE kernel and needs NO mask rows; only the masked suffix's
+rows — program-authored, host-known BRLE content — need staging, and
+the split body already reads `custom_mask_indptr_d + split`. So the
+wire-mask-on-device-geometry relax becomes possible ONLY under the
+spatial split — the north-star thesis in miniature: per-region
+members eliminate the whole-fire obligation that forced the solo
+lowering.
+
+The unblocking campaign (next, in order):
+1. Engine grouping: admit `wire_mask_on_device_geometry` lanes into
+   device-geometry groups when PIE_SPATIAL_MASK is armed engine-side
+   (std::env gate mirroring the driver's), keeping the structured-mix
+   and dense-device refusals.
+2. Frame: the device-composed fixed-decode assembly stages the masked
+   lanes' BRLE rows at their seriated suffix positions (lane order is
+   host-known even when geometry is device-resolved) — mask_indptr
+   entries for prefix lanes stay empty/zero-length, which the split
+   body never reads.
+3. The seriation must hold on the device-compose path too (the
+   envelope suffix contract composes with mask-last within the
+   envelope class — verify member_order flows into the device compose
+   lane order).
+4. Gates: masked-solo unchanged; the mixed fire engages ([spatial-
+   mask] R>1 lines); masked lane byte-equal to solo; plain lanes
+   byte-equal to solo-plain; then the wide battery and the sweep.
+
+## The compose relax, first live contact — the mask is device-carried (2026-08-03)
+
+The engine grouping relax works: with PIE_SPATIAL_MASK armed on both
+sides, the masked+plain pure-decode group FORMS (census mask-compose
+deferrals gone). The composed step then fails at the DRIVER's
+admission: "program carries a dense device mask in a multi-program
+batch (v1 mask scope is solo only)". The lesson: naive-masked's
+decode-phase mask is NOT wire BRLE at all — it is DEVICE-CARRIED,
+a `kPortAttnMask` channel the program writes, resolved per fire by
+RV-6 descriptor resolution (`dense_mask_scope_violation` walks the
+trace PORTS, not the wire rows). The wire-mask frame extension I
+built this cycle serves the wire-BRLE flavors (prefill-phase masks,
+future wire producers) but the live decode subject rides the device
+channel.
+
+Remaining surgery, pinned for the next stretch:
+1. `Dispatch::dense_mask_scope_violation` admits the dense-masked
+   program in a multi-program batch WHEN
+   `view.planned_unmasked_prefix_rows` is a valid split and the
+   masked program's rows are exactly the suffix (the seriation
+   guarantee).
+2. The dense pack (`resolve_attention_mask` → pi.dense_mask →
+   launch_pack_dense_mask → pi.custom_mask) packs the masked
+   program's rows AT THEIR COMPOSED SUFFIX POSITIONS: indptr entries
+   for the prefix rows stay empty (the split body never reads them),
+   the suffix rows carry the device-resolved mask content.
+3. Then the battery: [spatial-mask] R=2 engage lines, masked lane
+   byte-equal to solo, plain lane byte-equal to solo — the FIRST
+   spatial merge fire.
+Current state is safe to ship gated: default-off changes nothing;
+gate-on forms the group and fails LOUD at admission (no corruption
+path), which is exactly where the next stretch picks up.
+
+## THE FIRST SPATIAL FIRE ENGAGED (2026-08-03) — half the gate green
+
+With the scope admits (dispatch admission + frame backstop, both
+gated on a valid planned split) and the suffix-positioned dense pack
+(the masked program's device-carried mask staged PADDED to fire-lane
+indexing — prefix rows klen 0, the pack kernel no-ops them), the
+composed masked+plain pure-decode fire RUNS THE SPLIT:
+[spatial-mask] R=2 split=1, seventeen fires, prefix on the decode
+kernel, suffix on the custom kernel, one fire. And the first gate
+half is GREEN: the plain lane's mixed output is BYTE-EQUAL to its
+solo self — the unmasked prefix truly runs the decode kernel inside
+a fire that also serves a masked lane. This is the north-star merge,
+alive.
+
+The masked suffix's numerics are wrong (garbage tokens), and the
+cause is identified: the suffix plan and the rebased suffix CSRs
+were built from the HOST wire views (h_qo/h_kvpp), which for a
+composed-envelope lane are placeholders — the truth lives in the
+RESOLVER's per-program host geometry (fg.kv_page_indptr/
+kv_last_page_lens, exactly what the dense pack block already
+consumes) and in the composed DEVICE CSRs. The fix, pinned:
+1. The suffix dispatch needs NO uploaded rebased CSRs at all — pass
+   DEVICE pointer offsets with ABSOLUTE values: q/out at BASE (not
+   bf16_row offsets), qo_indptr_d + split, kv_page_indices_d BASE,
+   kv_page_indptr_d + split, kvlpl_d + split, mask_indptr_d + split.
+   The kernel indexes rows through the (absolute) indptr values, so
+   no rebasing is needed device-side. pi.mask_suffix_* buffers and
+   the forward.cpp upload block then retire.
+2. The suffix PLAN still needs host counts: thread the masked
+   program's RESOLVED host geometry (np/lpl per suffix lane, from
+   fg) from the frame into PrepareInputs (new pointer fields staged
+   on the wave state), replacing the h_kvpp slices.
+3. Wire flavors (prefill-phase masks) keep the fire-level arm; the
+   frame's resolved_custom_wire stays single-program (the reverted
+   extension's lesson: a composed spatial step's wire rows are the
+   WIRE lanes' synthesized causal masks, pure-causal by the walk).
+
+## THE SPATIAL FIRE IS CORRECT (2026-08-03) — NS-2 live gates green
+
+The masked-suffix fix that landed it, measured against two failed
+addressing hypotheses: the custom kernel's q/o side is
+plan/qo[0]-RELATIVE (offset q/out pointers + the uploaded identity
+qo), while its KV side reads the device CSR ABSOLUTELY (base page
+indices + kv_page_indptr at +split with composed-device values — no
+host rebase, no host knowledge). The suffix PLAN's host counts come
+from the RESOLVER's per-program geometry, harvested by the spatial
+dense-pack block onto the wave state and threaded into prepare
+(mask_suffix_page_counts_h / last_lens_h) — the host wire views are
+placeholders for composed-envelope lanes and produced attempt 4's
+garbage.
+
+Gates, with the corrected statement:
+- masked mixed == masked solo: BYTE-EQUAL through the spatial fire
+  ([spatial-mask] R=2 split=1; prefix decode kernel + suffix custom
+  kernel + shared everything else, one fire).
+- plain mixed vs plain solo diverges at ~token 30 — and the CONTROL
+  (two PLAIN lanes co-batched, no mask anywhere) diverges the same
+  way: this is the generic co-batch GEMM-rounding class that has
+  always existed at N>1, not a spatial defect. The original gate
+  statement ("plain mixed == plain solo") was stronger than the
+  system's own invariant; the corrected gate is "masked == solo, and
+  plain divergence bounded to the generic co-batch class" — both
+  hold.
+
+NS-2 is therefore LIVE and correct, eager, PIE_SPATIAL_MASK-gated.
+What remains on the ladder: default-on decision after the wide
+battery + sweep; NS-3 (region windows + graphing the split); NS-4
+(union pass); NS-5 (retire the two-path form).
+
+## NS-2 wide batteries green (2026-08-04) — and the all-masked fire
+
+The wide compositions taught three more lessons, each now in the
+tree: the pack serves N masked programs (per-program strides, padded
+to the max; the programs must tile the suffix exactly — seriation
+enforced loudly); split == 0 is the ALL-MASKED composed fire and
+admits everywhere (two masked lanes share one fire where each fired
+solo before — a capability nothing in the system had); and the
+harvested suffix geometry is per-wave state that MUST reset (the
+stale-pointer read produced flashinfer's negative-indptr throw).
+Solo masked fires now route through the same spatial machinery
+(R=1 split=0) with byte-identical outputs — one code path.
+
+Battery state: R=4 split=2 / R=2 both splits / all-masked pairs —
+zero errors, every composition engages, deterministic compositions
+byte-stable, mixed-fire text within the generic co-batch class.
+Default-off regression green (oracle, masked solo, hooks).
+
+Default-on remains deliberately open until: the consolidated sweep
+(all five deployments + supergraph A/B + lora + hooks) runs under
+the gate, and NS-3 decides how spatial fires graph (today they force
+eager — a masked steady-state decode loses graph replay, which is a
+real regression for masked-heavy workloads until NS-3 lands).
+
+## NS-3 v1 design — graphing the split (2026-08-04, pre-implementation)
+
+What a captured spatial fire bakes, walked term by term: the two
+attention dispatches' pointer offsets and both plans' grids are
+functions of SPLIT; the pack runs prepare-side (outside capture) into
+stable pi addresses; the suffix qo identity's CONTENT (0..rs) is a
+prefix of one universal sequence, so ONE buffer serves every split;
+mask indptr/content refresh per fire at stable addresses. Therefore
+v1 keys the exec on the split: variant bits 21-28 carry it (R <= 255
+by the bucket lattice) plus kGvSpatial at bit 29 — at most R execs
+per bucket, the honest 2^k-free form until region windows
+(device-windowed attention needs flashinfer-side work; NOT v1).
+Changes: run_graph stops excluding spatial fires; use_supergraph
+EXCLUDES them (the union's fire-level mask arm is wrong for a split
+fire); capture threads unmasked_prefix_rows + the suffix qo pointer
+into the captured body; the per-fire prepare already rebuilds both
+plans (graph_mode_plan for the suffix mask plan is already true).
+Gates: spatial battery under graphs (engage lines + replays, outputs
+per the numerics contract), default-off regression, then the
+consolidated sweep for the default-on decision.
+
+## Spatial mask DEFAULT ON (2026-08-04)
+
+The sweep under the gate: solo oracle byte-stable vs pre-campaign,
+masked dense==none, hook solos + mixed hook battery, lora solos
+deterministic. Flipped at all six sites (PIE_SPATIAL_MASK=0
+disarms); the era-pinning grouping tests now pin the spatial
+contract. Live default boot: R=2 split=1 engages, oracle stable.
+The ladder's remaining rungs: NS-4 (the union pass — the emitter
+still skips spatial fires to the interpreter; per-class traces
+should merge into one windowed op list, killing the fire-level
+Guard at its root) and NS-5 (retire the two-path supergraph form
+once NS-4 serves its fires). A flip-era caution for the record:
+a pattern-based env flip catches NEIGHBORING gates — the first
+attempt flipped TP_DISABLE_DEVICE_COMPOSE / STEP_PROFILE /
+HOOK_GRAPH_TRACE to default-on before the per-name pass restored
+them.
+
+## THE LADDER'S V1 IS COMPLETE (2026-08-04) — NS-5, retirement by promotion
+
+PIE_SUPERGRAPH defaults OFF: the temporal union's one live axis (the
+mask) was promoted to the spatial form, no fire can arm its
+conditional, and the exec had reduced to the plain graph plus dead
+capture weight. The machinery stays for the STRUCTURAL class. The
+directive's five items, closed in pie terms: (1) per-op member masks
+= the split's row windows, live and default; (2) edge buffers = the
+materialization the split body already honors (fused edges stay
+non-merge-points); (3) seriation = the mask-nested member sort;
+(4) the union = the Guard's fire-level mask arm dissolved into
+windowed regions, stated by the emitter; (5) N programs per fire =
+the compose relax, including the all-masked fire class.
+
+What v1 deliberately leaves open, for the record: the SCS union of
+GENUINELY separate member programs (today's members are attachment
+combinations over one model trace; a second model-structural program
+class — spec verify, early exit — is what forces the supersequence
+alignment and the conditional regions, and the retired-but-kept
+builder is its organ); PQ-tree seriation when the axes stop nesting
+(hooks x mask today nests, so the lexicographic key suffices); the
+split under XQA and padded head dims (both guarded to the fire-level
+arm); and flashinfer-side device row windows (which would collapse
+the split-keyed exec family to one exec per bucket).
+
+## THE REVIEW LANDS: THE MASK SPLIT BECOMES VOCABULARY (2026-08-04)
+
+The post-v1 review's finding, accepted whole: the two live window
+axes lived in different layers — the hook axis as IR (OpKind::Peel)
+and the mask axis as C++ text the emitter printed into the custom
+arm. Same failure the DSL exists to kill ("the smarts accumulated
+there"), relocated from the driver into the emitter; no golden could
+pin it and no second backend could consume it. The review's own
+sentence is the fix: Peel is already the word for "two regions that
+both run over complementary row ranges" — only the split's SOURCE
+differs. So Peel gained a WINDOW AXIS (PeelWindow: HookFreePrefix,
+the serde default keeping every pre-window golden byte-identical;
+UnmaskedPrefix, the spatial mask split), and the mask arm of the
+decode declaration now STATES the split (dsl::peel_masked) exactly
+where prepare's deployment gate holds (!xqa && !padded). The axis
+crosses the FFI as the Peel's aux run (empty = hook, [1] = mask).
+
+Two consequences the lift forced, both improvements the text form
+had hidden: (a) the UNPLANNED endpoint is the peel's own degenerate
+form (tail-only, full-N, fire-level addressing) — the fire-level
+custom dispatch is not a separate op; (b) the prefix region states
+THE DEPLOYMENT'S decode form, not a hardcoded decode dispatch —
+qwen2_5 (force_prefill: GQA ratio outside the decode kernel's set)
+states dequant staging + the plan-free prefill launcher over
+[0, split), which CLOSED A LIVE LANDMINE: since spatial default-on,
+a masked mixed fire on qwen2_5 threw "no prefix decode plan" on all
+three legs. The emitter text could never have said this per
+deployment without another nested runtime branch; the trace says it
+per deployment for free, because deployments are what traces are.
+
+Emitter and interpreter are region walkers again: emit_cuda spells
+the window plumbing once at the Peel and the attention arms key
+their addressing on the region marker (Win::MaskPrefix/MaskTail);
+declared_forward's walk carries mask-region events as a SEPARATE
+axis from the hook window (they never nest — the engine plans
+UNPLANNED for hooked fires). Goldens now pin the split as structure
+(qwen3/mistral: decode-region prefix; qwen2_5: dequant+prefill
+prefix; phi3 padded: no peel). Verified live, all three legs:
+canonical masked solo byte-equal, solo oracle byte-equal to the
+pre-campaign reference, mixed masked+2-plain engaging planned
+splits (R=4 split=2, ~22 fires/leg) with plains byte-consistent
+across legs. Board: use_prefill_decode_plan (Hopper) prefix
+polymorphism — the prefix region's plan-family choice under sm>=9
+is not yet stated; off on sm_89.
+
+Commit 797cdefc6.
+
+## THE PROMOTION, PRICED (2026-08-04) — release A/B of the spatial default
+
+The retired solo regime was only ever priced by a code comment
+("1.8-2.3x per token for the co-batched plain lanes", projected, never
+measured). Measured now, release build on the L40S (llama-3.2-1b,
+256 tokens/lane, warm rounds, masked lane joining mid-stream; ON =
+default, OFF = PIE_SPATIAL_MASK=0):
+
+  plain-only R=4/R=8 . ON == OFF (~1.22-1.24s)  — no regression
+  mixed R=4 . plains 1.29s vs 1.43s (ON 10% faster), masked 11% faster
+  mixed R=8 . plains 1.30s vs 1.57s (ON 17% faster), masked 15% faster
+
+The shape of the numbers is the thesis: the masked lane's tax on its
+co-batched plains is CONSTANT ~6% under the spatial merge (one marginal
+row in a shared fire) and GROWS with R under the solo regime (+15% at
+R=4, +27% at R=8 — the duplicate weight read plus the eager mask
+dispatch bill the whole co-batch). 285 R=4 split=3 fires confirmed
+composing during the bench; canonical masked output byte-stable
+throughout. The old comment's 1.8-2.3x was the lockstep worst case —
+the real solo regime pipelined some of the cost; the merge removes it
+structurally rather than hiding it. Gains scale with R and with model
+size (the fire is launch-bound at 1B/R<=8; the weight-read term the
+merge deletes is the one that grows). Bench + table:
+.wiki/tart/bench_spatial_results.md, scratchpad bench_spatial.py.
+
+## ADMISSION RETRACTION + THE STRUCTURAL CLASS V0 DESIGN (2026-08-04)
+
+Retraction first, measured: the board's "engine admissions serialize —
+no R=3 co-fire ever forms" is FALSE for the current engine. Release,
+256 tok/lane, same-instant launches: 4 lanes form 128 R=4 split=3
+co-fires, 8 lanes form 128 R=8 split=7 — full composition through the
+entire overlap window; the solo tail is the masked lane OUTLIVING the
+plains. Composition rate is governed by lifetime overlap, nothing
+else. (The old finding belonged to the capped-flip battery era; short
+64-token lanes under-compose because they finish inside the prefill
+stagger.) The scheduler needs no fix; the 6%-vs-27% merge win applies
+whenever lifetimes overlap.
+
+With that closed, the frontier is the review's two remaining X rows
+(Supergraph = DAG, union pass): both blocked on a SECOND program
+class. Design for its v0, grounded in the organs that exist:
+
+THE CLASS: fixed-k layer-truncated decode ("layerskip draft" — logit
+lens over layer k's hidden state; a real drafting technique, and
+later the self-speculative drafter's verify counterpart). Chosen over
+spec-verify (drafter is bravo's) and confidence-exit (dynamic k is a
+PER-ROW branch — not a fire-plannable window) because fixed k gives a
+STATIC second class: the trace differs from the full class in WHICH
+OPS RUN, not in any per-fire value — exactly Div::STRUCTURAL
+(fire_plan.rs already carries the vocabulary).
+
+THE KEY INSIGHT — the union stays in Peel vocabulary: seriate members
+by depth (full-depth first, truncated last) and the structural
+divergence is ANOTHER ROW WINDOW. At layer k the fire splits: layers
+[k, L) + final norm + lm_head run over the full-depth prefix rows
+[0, n_full); the truncated tail rows take final norm + lm_head
+(logit-lens head) at layer k. That is a Peel whose regions differ in
+OPS (they always could — the hook peel's regions already do) and
+whose window is a third axis: PeelWindow::FullDepthPrefix. No DAG
+machinery, no SCS alignment, no conditional regions needed — the
+supersequence of "layers [0,k) ++ head" and "layers [0,L) ++ head"
+IS the full trace with one peel at k. The kept SupergraphBuilder
+stays in reserve for classes that DON'T prefix-share (true SCS); the
+PQ-tree moment arrives only when a third axis crosses (mask x depth
+in one fire, hooks x depth, or two distinct k values).
+
+THE LADDER (mirroring NS-2's, rung by rung):
+  S-1 the channel: a `max_layers` (k) request field, client ->
+      engine request -> MemberFacts (the Stage-4 lora channel
+      pattern); v0 restricts a fire to ONE k (scheduler refuses
+      mixed-k composition — lowest-order blocking rule).
+  S-2 seriation + wire: sort key gains the depth bit (full first,
+      truncated last, before hooks in the order — depth nests
+      OUTSIDE mask/hooks in v0 by REFUSING their composition with
+      truncated members at all: truncated lanes are plain decode
+      only); a planned `full_depth_rows` wire word beside
+      planned_unmasked_prefix_rows (same reserved-slot pattern).
+  S-3 the trace: Peel { window: FullDepthPrefix } at layer k in the
+      DECLARATION — prefix region = layers [k,L)+norm+lm_head ops,
+      tail region = norm+lm_head-at-k ops (the logit-lens head reuses
+      the final norm weights in v0 — stated plainly so parity is
+      honest). K is a TRACE-TIME constant per deployment-variant
+      (v0: one k per model config, e.g. L/2), so traces stay static;
+      per-request k is v1+ (it re-keys the trace, the same way
+      deployments do).
+  S-4 driver: prepare plans logits rows for both regions; the
+      interpreter/emitter walk the depth peel exactly as the mask
+      peel (region markers, windowed call forms — the attention/MLP
+      launches need only their existing row-window forms since the
+      prefix region is a contiguous row prefix at every layer).
+  S-5 verification: truncated solo == full solo prefix layers
+      byte-check at k (logit-lens oracle), mixed fire == the two
+      solos' logits row-for-row, then graphs (split-keyed on
+      (n_full, k)), then the README's 1.53x-class measurement.
+
+V0 exclusions, stated loudly: dynamic/confidence k (per-row branch),
+mixed-k fires (PQ-tree), truncated x mask / truncated x hooks / x
+lora (blocking rule refuses), trained exit heads (weights don't
+exist; logit-lens is the honest v0 head). Each is a recorded rung,
+not a silent gap.
+
+## THE MIXED FIRE DIRECTIVE (2026-08-04): decode + masked decode + prefill, one pass, two streams
+
+The user's target example, verbatim: one batched forward pass carrying
+custom-mask decode (the prefill kernel), causal-mask decode, and
+prefill together — with the custom-mask attention and the prefill
+attention on DIFFERENT STREAMS. Mapped onto the organs:
+
+What already exists: plain decode + prefill co-batch TODAY (the
+chunk-prefill clause in worker.rs is deliberately narrow — only
+page-mask x multitoken and mask x multitoken refuse); the driver runs
+such a fire through the PREFILL class, decode lanes as 1-token
+qo_indptr entries through the causal prefill dispatch. Streams exist
+in pieces (CudaStreamOwner, the supergraph's non-blocking stream).
+
+What blocks the example: exactly one clause — a wire-masked decode
+lane refuses multi-token groups (and conversely), because the prefill
+class's mask arm is still the FIRE-LEVEL custom dispatch: it would
+take every row through the custom kernel, and synthesizing causal
+masks for prefill rows explodes (the recorded reason for the
+refusal). The fix is the one we already know: THE MASK PEEL
+GENERALIZES TO THE PREFILL CLASS. Seriation puts masked decode rows
+last; the causal prefill dispatch serves the prefix rows (prefill
+AND plain-decode rows — v0 keeps them merged in one causal dispatch,
+the decode-kernel specialization of plain rows is a later rung); the
+custom dispatch serves the masked suffix. Same PeelWindow::
+UnmaskedPrefix word, now stated in the Prefill class arm too.
+
+THE ONE NEW INVARIANT — two split words: in a pure-decode fire,
+request index == token row, and the single planned word served both
+the CSR offset (+split requests) and the q/o row offset (bf16_row at
+split rows). In a mixed fire they DIVERGE (prefill rows contribute
+many tokens): the wire needs BOTH the unmasked-prefix REQUEST count
+(CSR/mask-indptr/last-lens offsets, suffix plan geometry) and the
+unmasked-prefix TOKEN-ROW count (q/out pointer offsets). Threading
+the second word retraces the first's exact path (batch.rs ->
+reserved ABI slot -> step_launch/launch_view -> prepare/dispatch).
+
+THE STREAM FORK (the requirement's second half): within the layer
+body, after the KV write completes, the causal prefill dispatch and
+the custom dispatch have disjoint outputs (attn_out row windows) and
+read-only-shared inputs (q, the layer's KV) — a textbook fork:
+  event E1 on main stream after KV write; stream B waits E1;
+  causal dispatch on main, custom dispatch on B; event E2 on B;
+  main waits E2 before o_proj.
+One secondary stream per context (CudaStreamOwner pattern), events
+reused per layer. Prefill-shaped fires run EAGER (no decode-graph
+capture applies), so v0 needs no graph-side stream work — capture-
+time forking (parallel graph branches) is a recorded later rung.
+
+THE LADDER:
+  M-1 engine: relax the mask x multitoken refusals for wire-BRLE
+      masked decode lanes (both join directions); seriation orders
+      [prefill | plain decode | masked decode] rows; plan BOTH split
+      words (requests + token rows); UNPLANNED stays the hooks/lora/
+      structured escape. Gate: PIE_SPATIAL_MASK (same switch — the
+      axis is the same).
+  M-2 driver: the Prefill class mask arm becomes the peel
+      (dsl::peel_masked with the causal-dispatch region and the
+      custom region); prepare builds the suffix mask plan for
+      prefill-shaped fires (the resolver-geometry pattern verbatim);
+      hand-written + interpreter + emitter learn the token-row
+      offset forms (the decode-class forms parameterized by the
+      second word). Goldens regenerate; phi3/XQA keep fire-level.
+  M-3 streams: the custom region dispatches on the secondary stream
+      between the fork/join events; ONLY when the peel is planned
+      (fire-level custom keeps the main stream). A PIE_SPATIAL_
+      STREAM=0 escape hatch for bisection.
+  M-4 the example battery: one fire holding [prefill lane, plain
+      decode lane, masked decode lane]; numerics leg (mixed ==
+      each solo's rows, the composed-fire equality class); overlap
+      leg (wall time of the fire vs =0, and an nsys trace showing
+      the two dispatches overlapped); the three-leg parity sweep.
+
+V0 exclusions, loud: plain-decode-row specialization to the decode
+kernel inside mixed fires (they ride the causal dispatch); graph
+capture of mixed fires (eager); masked x hooks/lora (UNPLANNED as
+today); multiple masked programs already work (the N-program tiling
+carries over).
+
+## THE MIXED FIRE IS DEFAULT (2026-08-04) — the directive's example, standing
+
+The campaign closed in five commits: the driver slice (2924da047, two
+split domains + side stream), the WIP disarm (97c86c4ec), the
+workspace root-cause and fix (8c4934cae, 9a3fcc85d — two
+prefill-family plans must not share one AttentionWorkspace's
+scheduling buffers; the suffix plan owns a dedicated workspace, which
+also gives the two concurrent dispatches disjoint scratch), the
+declaration (fe4cbd236 — the prefill-class mask arm states the same
+UnmaskedPrefix peel as the decode class, goldens pin it, all three
+legs serve it, the tail's plan/workspace pairing rule stated), and
+the flip (55c022f36). The user's example — custom-mask decode +
+causal-mask decode + prefill in ONE batched forward pass, the custom
+and prefill attentions on DIFFERENT streams — is now the default
+behavior: seriation orders [wire prefill+decode | masked envelope
+suffix], the planned word (REQUEST domain — measured, the one
+surprise of the campaign) splits the fire, the prefix causal
+dispatch serves any mix of prefill and plain-decode requests on the
+main stream, the masked 1-token suffix's custom dispatch runs on the
+side stream between fork/join events.
+
+Honest edges, recorded: the overlap WIN is unmeasured at 1B scale
+(span timing is noise-level vs serialized; heavy-workload evidence
+owed); mixed numerics sit in the generic co-batch rounding class
+(control-proven, 2/8 both ways); masked x hooks/lora and padded/XQA
+shapes keep the fire-level word; graph capture does not cover
+prefill-shaped fires (eager by class).
+
+## THE OVERLAP, MEASURED (2026-08-04) — the deferred edge closes
+
+Release build, heavy shapes (a 2.4k-token masked KV decoding 256 steps
+while 1.9k-token prefills join at 0.1s stagger; L0 fork->join span,
+PIE_SPATIAL_STREAM_TIMING=1):
+
+  two streams . med 0.096 ms  p90 0.103 ms  (n=24)
+  serialized  . med 0.115 ms  p90 0.115 ms  (n=23)
+
+The masked suffix's custom dispatch (~19us at this KV size) hides
+COMPLETELY behind the prefix causal dispatch — a ~17% shorter
+attention section per layer, the whole distribution shifted, on the
+default path. The win scales with the suffix's work (longer masked
+KV, more masked lanes); at 1B/16-layers it is ~0.3ms per mixed fire.
+The directive's two-stream requirement is not just structural — it
+pays, measurably. Battery: .wiki/tart/heavy_overlap.py.
+
+## STRUCTURAL S-1 LANDS (2026-08-04) — the second class's first organ
+
+The layer-truncation channel runs end to end (5f1c5bb6e):
+LaunchPlan.max_layers -> the scheduler's solo blocking rule
+("truncated-depth" — the depth union is the next rung) -> the appended
+ABI word (planned_max_layers, MAX = full) -> graphs refuse, declared
+legs route to the hand-written body, the layer loop bounds at k and
+the UNCHANGED tail (final norm + lm_head) is the logit-lens head.
+Oracle on Qwen3-0.6B (28 layers): k=28 BYTE-IDENTICAL to unset (the
+channel is numerics-neutral and truncation at full depth is the
+identity); k=16/k=8 deterministic degraded drafts, deeper = better —
+logit-lens behavior, the layerskip-draft class's honest v0 head.
+Producer is a TEST SCAFFOLD (PIE_DEBUG_MAX_LAYERS stamps every fire)
+until slice B lands the WIT surface. Next rungs stand as recorded:
+S-B the inferlet-facing channel, S-2 depth seriation + wire, S-3 the
+FullDepthPrefix peel in the declaration, S-4 the walkers, S-5 the
+union oracle and the 1.53x measurement.
+
+## DESIGN NOTE (2026-08-04): the PEFT correction surface — form joins structure and contents
+
+From the user's question ("how would LoRA-family PEFT express elegantly,
+no shape limits, covering the variants"), worked against the live WIT:
+the WIT is ALREADY shape-agnostic (channel(shape, dtype, capacity));
+every restriction lives in the DSL's named sink `kernel::lora(a, b,
+sites)` — trace-known rank (bucket per rank), packed per-site shapes
+(the lora-probe q+v pain), one hardcoded form. The generalization keeps
+§6.5's principle and adds a third term: placement is STRUCTURE (one
+`correct(site, region)` declaration per site, shapes free per site),
+weights are CONTENTS (channels), and FORM is a small closed expression
+over (x, y): {mm-by-channel-tensor, elementwise scale, add, reshape}.
+The compiler CLASSIFIES the expression — recognized forms lower to the
+existing span-grouped CORRECTION kernels (LoRA/AdaLoRA `y+B(Ax)`, VeRA
+`y+Λb·B(Λd·Ax)`, DoRA `s⊙(y+B(Ax))` with s precomputed per adapter,
+IA3 `l⊙y`, BitFit `y+bias`, LoKr via reshape+two-small-mm) — unknown
+forms refuse loudly (v0 closed world; the driver stays dumb). Rank
+stops being trace-known: grouped GEMM takes per-problem shapes, so
+ragged per-layer/per-member ranks become instance data; graphs bucket
+on (form structure, shape class) or stay eager first. Honest class
+boundaries: LoHa (Hadamard of matrices does not distribute over
+matvec) is Div::WEIGHT (merge per-adapter ΔW, the MoE organ);
+prefix/prompt tuning is the KV axis (learned pages), not a correction.
+Composition: the form's structure hash joins the seriation key —
+same-form adapters span-group exactly as lora does today, cross-form
+v0 solo, later a row window like every axis before it.
+
+## DESIGN FINAL (2026-08-04): fwd.adapter(site, |x, y| expr) — the seat is the builder, the body is PTIR
+
+Converged with the user over three rounds. The earlier note's two
+candidate surfaces merge: the DSL-sink generality was right about the
+PAYLOAD (an open expression, not a closed WIT variant — VeRA/DoRA and
+future compositions without WIT churn), and the builder-method
+instinct was right about the SEAT (adapters are pass-level
+configuration, not traced-program plumbing the guest should hand-roll).
+The house already holds the reconciliation: prologue/epilogue are
+builder methods that TRACE CLOSURES into container regions — adapter
+is their sibling. So:
+
+  fwd.adapter(Site::Q, |x, y| y + mm(b.read(), mm(a.read(), x)));
+
+- SEAT: an sdk ForwardPass method beside prologue/epilogue (noun
+  style, one call per site). WIT UNCHANGED — the container carries
+  the region, exactly as it carries prologue/epilogue.
+- BODY: a per-site ADAPTER REGION (new region kind) over the closed
+  op set {mm-by-channel, scale, add, reshape} with x/y as
+  SYMBOLIC-DIM tensors (SiteIn/SiteOut resolved at bind against the
+  ModelProfile — the lora-probe D_OUT hardcoding dies). The validator
+  checks the op set; the compiler classifies structure into the
+  span-grouped CORRECTION lowerings and refuses the unknown loudly;
+  the region's structure hash joins the composition key.
+- The honest trade, recorded: rank rides channel shapes, so a rank
+  change re-traces the container (cheap, guest-side; a new identity
+  bucket). v1 extends symbolic dims to channel declarations' rank
+  axis, completing "swap adapter = re-seed" for rank too.
+- kernel::lora becomes the deprecated special case of the low-rank
+  form; §6.5's span-grouped lowering stays the execution organ.
+
+## S-2/S-3 DESIGN (2026-08-04): the depth union executes with ONE tail
+
+The load-bearing discovery for the FullDepthPrefix peel: seriate
+full-depth members first, truncated last, and then
+
+  layers [0, k)   run FULL-N (every row, exactly today's body);
+  layers [k, L)   run over the PREFIX rows only (row-major
+                  activations make the prefix contiguous: GEMMs/norms
+                  just take N' = prefix tokens; attention takes a
+                  prefix-request plan);
+  the tail        (final norm + lm_head) runs FULL-N, UNCHANGED.
+
+No hidden-state stash, no second head: layers [k, L) never write the
+suffix rows, so the suffix's x is FROZEN at its layer-k value and the
+one full-N tail IS the logit-lens head for the truncated rows while
+being the ordinary head for the full rows. The union costs two loop
+bounds and a prefix plan.
+
+Wire: the fire-level k word (planned_max_layers) becomes the SUFFIX's
+uniform k; a new planned_full_depth_rows request-split word rides the
+same appended-word pattern (UNPLANNED = uniform fire, today's solo
+shape). v0 blocking: truncated members compose ONLY with plain
+full-depth decode (no masks/hooks/lora/mixed-k — each a recorded
+later rung), which makes the second plan workspace reusable: a depth
+fire is never also a spatial-mask fire, so the dedicated secondary
+workspace serves both mutually-exclusive shapes.

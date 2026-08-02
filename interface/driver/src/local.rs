@@ -1191,14 +1191,42 @@ pub struct PieStepDesc {
     /// the launch on drift — the declaration-side hook stamp and the
     /// compiled stage plans must agree.
     pub planned_hook_free_prefix_rows: u32,
-    /// Reserved; must be zero.
-    pub reserved_step_tail0: u32,
+    /// NS-2: the scheduler-planned count of leading wire rows whose
+    /// members carry NO user mask (meaningful only on hook-free steps;
+    /// the seriation nests mask under hooks).
+    /// [`PIE_UNMASKED_PREFIX_UNPLANNED`] = no plan; the driver must not
+    /// split the attention.
+    pub planned_unmasked_prefix_rows: u32,
+    /// STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
+    /// take the head at layer `k` (the layerskip-draft class).
+    /// [`PIE_MAX_LAYERS_FULL`] = the full model (every pre-S1 step). v0
+    /// steps carrying a truncation are SOLO (the scheduler's blocking
+    /// rule), so one per-step word suffices until the depth union.
+    pub planned_max_layers: u32,
+    /// STRUCTURAL S-2: leading members at FULL depth (the depth
+    /// seriation's request split; the truncated suffix's uniform k is
+    /// `planned_max_layers`). [`PIE_FULL_DEPTH_UNPLANNED`] = a uniform
+    /// fire; the driver must not depth-split.
+    pub planned_full_depth_rows: u32,
 }
 
 /// [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
 /// sentinel. Not zero: zero is a legitimate planned value ("no fast
 /// prefix" — an all-hooked step).
 pub const PIE_HOOK_FREE_PREFIX_UNPLANNED: u32 = u32::MAX;
+
+/// [`PieStepDesc::planned_unmasked_prefix_rows`]'s "no plan sent"
+/// sentinel (zero is a legitimate planned value: an all-masked step).
+pub const PIE_UNMASKED_PREFIX_UNPLANNED: u32 = u32::MAX;
+
+/// [`PieStepDesc::planned_max_layers`]'s "full model" sentinel (zero is
+/// never a legitimate depth).
+pub const PIE_MAX_LAYERS_FULL: u32 = u32::MAX;
+
+/// [`PieStepDesc::planned_full_depth_rows`]'s "no depth split" sentinel
+/// (zero would mean an all-truncated composed fire, a legal future
+/// value).
+pub const PIE_FULL_DEPTH_UNPLANNED: u32 = u32::MAX;
 
 impl Default for PieStepDesc {
     fn default() -> Self {
@@ -1255,7 +1283,9 @@ impl Default for PieStepDesc {
             channel_expected_tail: PieU64Slice::default(),
             channel_ticket_indptr: PieU32Slice::default(),
             planned_hook_free_prefix_rows: PIE_HOOK_FREE_PREFIX_UNPLANNED,
-            reserved_step_tail0: 0,
+            planned_unmasked_prefix_rows: PIE_UNMASKED_PREFIX_UNPLANNED,
+            planned_max_layers: PIE_MAX_LAYERS_FULL,
+            planned_full_depth_rows: PIE_FULL_DEPTH_UNPLANNED,
         }
     }
 }

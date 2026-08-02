@@ -7711,6 +7711,22 @@ int Dispatch::dense_mask_scope_violation(const pie_native::LaunchView& view,
     if (n_prog <= 1 || view.ptir_program_instances.size() != n_prog) {
         return -1;
     }
+    // NS-2 (the spatial mask fire): a multi-program step whose scheduler
+    // PLANNED an unmasked prefix split may carry dense-masked programs —
+    // the split body serves the masked suffix with the custom kernel and
+    // the frame packs the mask at its composed suffix positions. Deeper
+    // shape checks (single masked program, suffix placement) fail loud at
+    // the frame's pack; admission only answers the scope question.
+    static const bool spatial_on = [] {
+        const char* v = std::getenv("PIE_SPATIAL_MASK");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (spatial_on &&
+        view.planned_unmasked_prefix_rows != PIE_UNMASKED_PREFIX_UNPLANNED) {
+        // planned == 0 is the all-masked composed fire: the suffix covers
+        // every row and the custom kernel serves the whole step.
+        return -1;
+    }
     const Impl& s = *impl_;
     for (std::size_t p = 0; p < n_prog; ++p) {
         const std::uint64_t iid = view.ptir_program_instances.data()[p];

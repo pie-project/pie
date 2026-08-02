@@ -3109,6 +3109,10 @@ fn single_step_frame(
             // submission): the driver derives the hook prefix alone.
             planned_hook_free_prefix_rows:
                 pie_driver_abi::PIE_HOOK_FREE_PREFIX_UNPLANNED,
+            planned_unmasked_prefix_rows:
+                pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED,
+            planned_full_depth_rows:
+                pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED,
             logical_fire_ids,
             channel_expected_head,
             channel_expected_tail,

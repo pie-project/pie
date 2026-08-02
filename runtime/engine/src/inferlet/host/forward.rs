@@ -470,7 +470,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, attention, readout, rs_working_sets, rs_mode) = {
+        let (embed, attention, readout, rs_working_sets, rs_mode, max_layers) = {
             let pass = self.ctx().table.get(&this)?;
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
@@ -496,6 +496,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                     .map(Resource::new_borrow)
                     .collect::<Vec<Resource<RsWorkingSet>>>(),
                 pass.bindings.rs_mode.clone(),
+                pass.bindings.max_layers,
             )
         };
         let kv_working_set: Resource<KvWorkingSet> = Resource::new_borrow(attention.kv_ws);
@@ -963,6 +964,7 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
                 kv_declaration: crate::pipeline::instance::KvDeclaration { readable, writable },
                 rs_ws: rs_reps,
                 rs_mode,
+                max_layers,
                 kv_declaration_realized: false,
                 failed: None,
                 devgeo,
@@ -1074,6 +1076,32 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
             }
         } else {
             pass.bindings.rs_mode = mode;
+        }
+        Ok(Ok(()))
+    }
+
+    async fn set_max_layers(
+        &mut self,
+        this: Resource<ForwardPass>,
+        max_layers: u32,
+    ) -> Anyhow<Result<(), String>> {
+        // STRUCTURAL v0 (S-1): the layerskip-draft depth. Zero is
+        // meaningless; values at or above the model's depth are the
+        // identity by the driver's bound. Settable before or after
+        // program-attach, like rs-mode.
+        if max_layers == 0 {
+            return Ok(Err(
+                "pipeline: max-layers: zero layers is not a model".to_string(),
+            ));
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            match pass.bound_mut() {
+                Ok(bound) => bound.max_layers = Some(max_layers),
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            pass.bindings.max_layers = Some(max_layers);
         }
         Ok(Ok(()))
     }

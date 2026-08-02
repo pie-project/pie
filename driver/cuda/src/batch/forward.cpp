@@ -294,7 +294,11 @@ cudaGraphExec_t capture_forward_graph_exec(
     int runtime_window_left,
     const model::StageHooks* stage_hooks,
     bool use_supergraph,
-    const model::LoraTable* lora)
+    const model::LoraTable* lora,
+    // NS-3: the spatial split (UINT32_MAX = not a spatial fire). The
+    // captured body splits its attention and reads the identity qo from
+    // pi.mask_suffix_qo_indptr.
+    std::uint32_t unmasked_prefix_rows)
 {
     auto& pi = engine.inputs;
 
@@ -381,6 +385,13 @@ cudaGraphExec_t capture_forward_graph_exec(
         // host windows (their split is degenerate and capture-stable).
         fwd_in.peel_window_d =
             stage_hooks != nullptr ? pi.peel_window.data() : nullptr;
+        if (unmasked_prefix_rows != 0xffffffffu) {
+            fwd_in.unmasked_prefix_rows = unmasked_prefix_rows;
+            fwd_in.mask_suffix_qo_indptr_d =
+                pi.mask_suffix_qo_indptr.data();
+            fwd_in.mask_suffix_kv_page_indptr_d =
+                pi.mask_suffix_kv_page_indptr.data();
+        }
         if (use_supergraph) {
             // The union body: the mask/write-desc data pointers must be
             // the persistent buffers UNCONDITIONALLY — a masked replay
@@ -733,15 +744,35 @@ bool forward_graph_replay_eligible(
     // occur anyway.)
 }
 
-// The unionized supergraph gate: DEFAULT ON since the width batteries
-// (multi-R + all five deployments, byte-identical A/B) went green —
-// PIE_SUPERGRAPH=0 disarms it. Fires outside the union (hooks, lora,
-// score-wanting, windowed, prefill-shaped) take their existing paths
-// untouched; the gate only reroutes union-eligible decode fires.
+// NS-2 (the spatial mask fire), DEFAULT ON since the ladder's sweep: a
+// hook-free lora-free masked pure-decode fire with a planned unmasked
+// prefix splits its attention — decode kernel over the prefix, custom
+// kernel over the rebased suffix — and captures/replays in split-keyed
+// execs (NS-3). PIE_SPATIAL_MASK=0 disarms.
+static bool spatial_mask_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_SPATIAL_MASK");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+// The unionized supergraph gate: RETIRED BY PROMOTION (NS-5). The
+// union's one live axis was the mask, and the spatial mask fire now
+// serves every plannable masked pure-decode composition by row window
+// inside ONE fire — no fire can arm the union's mask conditional
+// anymore, so the two-path exec reduces to the plain graph plus dead
+// capture weight (dual-prepare, re-key, pred upload). Default OFF;
+// PIE_SUPERGRAPH=1 re-arms it for study. The MACHINERY stays: the
+// SupergraphBuilder (capture-time conditional insertion, device
+// predicate words, handle scope rules) is exactly what the IR's
+// STRUCTURAL class needs when a genuinely different-operator axis
+// (spec verify, early exit) lands — at region granularity, per the
+// measured 250us floor.
 static bool supergraph_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_SUPERGRAPH");
-        return v == nullptr || v[0] != '0';
+        return v != nullptr && v[0] == '1';
     }();
     return on;
 }
@@ -778,8 +809,83 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.num_images,
         in.num_clips,
         hook_blocks,
-        in.lora != nullptr);
+        in.lora != nullptr) &&
+        // STRUCTURAL v0 (S-1): truncated fires are eager — the graph
+        // exec family is full-depth (the depth peel is the recorded
+        // union rung).
+        in.planned_max_layers == 0xffffffffu;
+    const bool use_spatial_mask = spatial_mask_enabled() &&
+        in.is_pure_decode && in.have_custom_mask && !has_hooks &&
+        in.lora == nullptr &&
+        in.unmasked_prefix_rows != 0xffffffffu &&
+        in.unmasked_prefix_rows < static_cast<std::uint32_t>(in.forward_R);
+    // THE MIXED FIRE (M-2): a prefill-shaped fire with a planned
+    // unmasked prefix — prefill + plain-decode rows serve the causal
+    // dispatch, the masked 1-token suffix the custom dispatch. The
+    // planned word counts TOKEN ROWS here; the request split derives
+    // from the host qo indptr (the suffix starts on a request
+    // boundary). Prepare re-validates the shape and keeps the
+    // fire-level arm when it does not hold.
+    // DEFAULT ON (PIE_SPATIAL_MIXED=0 disarms): the mixed fire — a
+    // prefill-shaped masked fire splits into the prefix causal dispatch
+    // and the masked suffix custom dispatch (its own plan workspace, its
+    // own stream). All three legs serve it; numerics sit in the generic
+    // co-batch equality class (control-proven).
+    static const bool spatial_mixed_armed = [] {
+        const char* v = std::getenv("PIE_SPATIAL_MIXED");
+        return v == nullptr || v[0] != '0';
+    }();
+    const bool use_spatial_mask_mixed = spatial_mixed_armed &&
+        spatial_mask_enabled() &&
+        !in.is_pure_decode && in.have_custom_mask && !has_hooks &&
+        in.lora == nullptr &&
+        in.unmasked_prefix_rows != 0xffffffffu &&
+        in.unmasked_prefix_rows > 0 &&
+        in.unmasked_prefix_rows < static_cast<std::uint32_t>(in.forward_R);
     bool run_graph = graph_eligible;
+    if (!use_spatial_mask && in.is_pure_decode && in.have_custom_mask &&
+        std::getenv("PIE_SPATIAL_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "[spatial-mask] REJECT R=%d planned=%u hooks=%d "
+                     "lora=%d enabled=%d\n",
+                     in.forward_R, in.unmasked_prefix_rows,
+                     has_hooks ? 1 : 0, in.lora != nullptr ? 1 : 0,
+                     spatial_mask_enabled() ? 1 : 0);
+    }
+    if (in.have_custom_mask && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "[spatial-mask] SHAPE R=%d N=%u pure=%d planned=%u "
+                     "mixed_gate=%d\n",
+                     in.forward_R,
+                     in.h_qo_forward != nullptr
+                         ? in.h_qo_forward[in.forward_R]
+                         : 0u,
+                     in.is_pure_decode ? 1 : 0,
+                     in.unmasked_prefix_rows,
+                     use_spatial_mask_mixed ? 1 : 0);
+    }
+    if (use_spatial_mask_mixed && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "[spatial-mask] MIXED R=%d N=%u rows_split=%u qo=[",
+                     in.forward_R,
+                     in.h_qo_forward != nullptr
+                         ? in.h_qo_forward[in.forward_R]
+                         : 0u,
+                     in.unmasked_prefix_rows);
+        for (int r = 0; r <= in.forward_R && r <= 8; ++r) {
+            std::fprintf(stderr, "%u%s",
+                         in.h_qo_forward != nullptr ? in.h_qo_forward[r]
+                                                    : 0u,
+                         r < in.forward_R ? "," : "");
+        }
+        std::fprintf(stderr, "] (prefix causal + suffix custom)\n");
+    }
+    if (use_spatial_mask && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "[spatial-mask] R=%d split=%u (prefix decode + suffix "
+                     "custom, one fire)\n",
+                     in.forward_R, in.unmasked_prefix_rows);
+    }
     std::uint64_t hook_fingerprint = 0;
     // Eager-path unification (the increment-4 "future point"): the
     // fire-level `prepare_replay` pass runs for EVERY pure-decode hook fire
@@ -806,7 +912,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     // the device predicate word's job.
     const bool use_supergraph = supergraph_enabled() &&
         engine.forward_fn.supports_supergraph && graph_eligible &&
-        in.is_pure_decode && !has_hooks && in.lora == nullptr;
+        in.is_pure_decode && !has_hooks && in.lora == nullptr &&
+        // NS-3: a spatial-split fire must NOT take the union's fire-level
+        // mask arm; it graphs in its own split-keyed partition.
+        !use_spatial_mask;
     ForwardGraphKey key{};
     if (graph_eligible) {
         const std::uint32_t graph_layout = use_supergraph
@@ -820,7 +929,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 graph_layout,
                 /*has_hooks=*/has_hooks) |
             (use_supergraph ? kGvSupergraph : 0u) |
-            (in.lora != nullptr ? kGvLora : 0u);
+            (in.lora != nullptr ? kGvLora : 0u) |
+            (use_spatial_mask ? kGvSpatial : 0u);
         key = ForwardGraphKey{
             in.forward_R,
             in.forward_N,
@@ -976,7 +1086,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.structured_window_left,
                 has_hooks ? in.stage_hooks : nullptr,
                 use_supergraph,
-                in.lora);
+                in.lora,
+                (use_spatial_mask || use_spatial_mask_mixed)
+                    ? in.unmasked_prefix_rows
+                    : 0xffffffffu);
             if (has_hooks) {
                 // The capture is the one moment the model's per-layer hook
                 // coverage is observable; a body that skipped hooks would
@@ -1110,6 +1223,22 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 engine.inputs.supergraph_preds.data(), preds,
                 sizeof(preds), cudaMemcpyHostToDevice, cublas.stream()));
         }
+        if (use_spatial_mask) {
+            // The captured suffix dispatch reads the identity qo from
+            // pi.mask_suffix_qo_indptr; identity content is
+            // split-invariant, but re-upload per fire keeps the buffer
+            // owned by no particular capture (R+1 u32s, trivial).
+            std::vector<std::uint32_t> qo(
+                static_cast<std::size_t>(in.forward_R) + 1);
+            for (int i = 0; i <= in.forward_R; ++i) {
+                qo[static_cast<std::size_t>(i)] =
+                    static_cast<std::uint32_t>(i);
+            }
+            CUDA_CHECK(cudaMemcpy(
+                engine.inputs.mask_suffix_qo_indptr.data(), qo.data(),
+                qo.size() * sizeof(std::uint32_t),
+                cudaMemcpyHostToDevice));
+        }
         if (has_hooks) {
             // Arm the fire's Peel window: the captured devwin kernels read
             // {tail_start, tail_len} from this word, so ONE exec serves
@@ -1183,6 +1312,38 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.precomputed_embeddings       = in.precomputed_embeddings;
     fwd_in.stage_hooks                  = in.stage_hooks;
     fwd_in.lora                         = in.lora;
+    fwd_in.max_layers                   = in.planned_max_layers;
+    fwd_in.full_depth_rows              = in.planned_full_depth_rows;
+    if (use_spatial_mask || use_spatial_mask_mixed) {
+        // The masked suffix's rebased device CSRs (pure decode: qo is the
+        // identity, kv_page_indptr rebases by its page base; every other
+        // suffix array is a pointer offset in the body). Synchronous
+        // copies: tiny, eager-only, and the host staging dies here.
+        // The planned word is the REQUEST/lane index in BOTH shapes
+        // (measured live on the mixed fire: R=4 qo=[0,221,...] plans 3,
+        // the masked member's lane start) — pure-decode fires never
+        // showed the distinction (row == lane).
+        const int split = static_cast<int>(in.unmasked_prefix_rows);
+        const int rs = in.forward_R - split;
+        std::vector<std::uint32_t> qo(static_cast<std::size_t>(rs) + 1);
+        std::vector<std::uint32_t> kvpp(static_cast<std::size_t>(rs) + 1);
+        const std::uint32_t page_base = in.h_kvpp_forward[split];
+        for (int i = 0; i <= rs; ++i) {
+            qo[static_cast<std::size_t>(i)] = static_cast<std::uint32_t>(i);
+            kvpp[static_cast<std::size_t>(i)] =
+                in.h_kvpp_forward[split + i] - page_base;
+        }
+        CUDA_CHECK(cudaMemcpy(
+            pi.mask_suffix_qo_indptr.data(), qo.data(),
+            qo.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            pi.mask_suffix_kv_page_indptr.data(), kvpp.data(),
+            kvpp.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+        fwd_in.unmasked_prefix_rows = in.unmasked_prefix_rows;
+        fwd_in.mask_suffix_qo_indptr_d = pi.mask_suffix_qo_indptr.data();
+        fwd_in.mask_suffix_kv_page_indptr_d =
+            pi.mask_suffix_kv_page_indptr.data();
+    }
     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
     if (hook_prepared && in.stage_hooks->verify_replay_capture != nullptr) {
         // Prepared-EAGER hook fire (the unified seam, no capture): the same
