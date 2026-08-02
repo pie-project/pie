@@ -16,8 +16,12 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "../../mtl4_context.hpp"
+#include "../shared_kernels.hpp"
 
 namespace pie::metal::gemma4 {
+
+using shared_kernels::RowGatherParams;
+using shared_kernels::elementwise_dispatch;
 
 /// Params structs, replicated EXACTLY from the .metal sources. A mismatch here
 /// is silent: the GPU reads whatever bytes are at the offset.
@@ -41,10 +45,6 @@ struct LayerScalarParams {  // layer_scalar.metal:14  (buffer 3)
 struct PleCombineParams {   // ple_combine.metal:15   (buffer 3)
     float inv_sqrt2;
     std::uint32_t n;
-};
-struct RowGatherParams {    // row_gather.metal       (buffer 3)
-    std::uint32_t width;
-    std::uint32_t count;
 };
 struct VNormParams {        // vnorm.metal:14         (buffer 2)
     float eps;
@@ -102,13 +102,6 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gem
                        std::string* err);
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
-
-/// Flat elementwise kernels: one thread per element, `dispatchThreads` style.
-inline void elementwise_dispatch(int n, Grid& g, Threadgroup& tg) {
-    const int width = n < 256 ? (n > 0 ? n : 1) : 256;
-    g = Grid{std::uint32_t(n > 0 ? n : 1), 1, 1};
-    tg = Threadgroup{std::uint32_t(width), 1, 1};
-}
 
 /// `vnorm_single_row`: one threadgroup per row, the row's width in threads,
 /// four elements each — the same shape `rms_single_row` uses.

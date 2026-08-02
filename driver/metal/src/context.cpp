@@ -711,6 +711,53 @@ std::string build_caps_json(const Config& cfg,
 
 }  // namespace
 
+
+/// Everything `run_launch_job`'s four phases hand to each other.
+///
+/// The phases were one 750-line function whose only real coupling was this
+/// state; naming it lets each phase be read on its own.
+struct LaunchJobState {
+    std::size_t M = 0;
+    std::vector<std::uint32_t> outcomes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
+    std::string kv_commit_error;
+    bool kv_commit_failed = false;
+    M0TimingSnapshot timing_before{};
+
+    // Phase 1 -> Phase 2.
+    std::vector<executor::LogitsOut> fwd_outs;
+    std::vector<std::uint8_t> fwd_ok;
+    std::vector<std::string> fwd_err;
+    std::string setup_err;
+    bool executor_ready = true;
+
+#if defined(__APPLE__)
+    struct PendingM3Group {
+        std::vector<std::size_t> members;
+        std::vector<pipeline::M3LaneCandidate> candidates;
+        std::vector<std::uint8_t> accepted;
+        std::vector<std::size_t> accepted_members;
+        std::shared_ptr<pipeline::M3GroupCommand> command;
+        bool finalized = false;
+        std::size_t leader = std::numeric_limits<std::size_t>::max();
+    };
+    pipeline::M3GroupStats m3_before{};
+    std::vector<std::shared_ptr<pipeline::M1PreparedFire>> prepared;
+    std::vector<std::shared_ptr<pipeline::M2CommandPlan>> m2_commands;
+    std::vector<std::uint8_t> m2_active;
+    std::vector<std::shared_ptr<PendingM3Group>> m3_for_member;
+    std::vector<pipeline::M1ExecuteOutcome> m3_outcomes;
+    // Why, parallel to the outcome. The grouped path settles its lanes ahead of
+    // the settlement loop, so unlike the singleton and M2 paths it has no
+    // `failure` string in scope when it decides -- and its reason used to be
+    // printed only under `verbose` and then dropped. A member that failed for a
+    // stated reason would report an empty one.
+    std::vector<std::string> m3_errors;
+    std::vector<std::uint8_t> m3_active;
+    std::vector<std::shared_ptr<PendingM3Group>> m3_groups;
+#endif
+};
+
 class Context::Impl {
   public:
     struct LaunchDemand {
@@ -955,28 +1002,10 @@ class Context::Impl {
         // ABI v14 says a frame carries k steps the driver runs as one closed
         // system. Whether the engine actually sends k > 1 decides whether the
         // per-step host round trip is the driver's to remove or the engine's.
-        if (std::getenv("PIE_METAL_FRAME_TRACE") != nullptr) {
-            // Whether a step's tokens come off the device decides whether a
-            // non-tail step could commit without waiting. Measured: every step
-            // carries HOST token ids (device=0 host=256), so `commit_step_async`
-            // cannot be used here without double-buffering the per-step IO --
-            // the host's write for step i+1 would race step i's read.
-            for (std::size_t si = 0; si < step_count; ++si) {
-                static int dg = 0, hg = 0;
-                (steps[si].token_ids.len == 0 ? dg : hg) += 1;
-                if ((dg + hg) % 512 == 0)
-                    std::fprintf(stderr, "[geom] device-carried=%d host-carried=%d\n", dg,
-                                 hg);
-            }
-            static std::map<std::size_t, int> hist;
-            static int n = 0;
-            ++hist[step_count];
-            if (++n % 256 == 0) {
-                std::fprintf(stderr, "[frame] steps-per-launch:");
-                for (const auto& [k, c] : hist) std::fprintf(stderr, " %zux%d", k, c);
-                std::fprintf(stderr, "\n");
-            }
-        }
+        // Measured (PIE_METAL_FRAME_TRACE, since removed): every step carries
+        // HOST token ids (device=0 host=256), so `commit_step_async` cannot be
+        // used here without double-buffering the per-step IO -- the host's
+        // write for step i+1 would race step i's read.
         for (std::size_t i = 0; i < step_count; ++i) {
             StepExpansion expansion;
             expand_step(frame, steps[i], &expansion);
@@ -1202,52 +1231,24 @@ class Context::Impl {
     // mutex. Item 3: exceptions from the forward or a member's settlement are
     // caught and translated to that member's terminal FAILED with the original
     // what() diagnostic — never swallowed, never left pending.
-    void run_launch_job(std::shared_ptr<LaunchJobData> job) {
-        const M0TimingSnapshot timing_before =
-            m0_timing_counters().snapshot();
+    /// Phase 0: execution-time ticket validation against the channel rings.
+    void launch_validate(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
 #if defined(__APPLE__)
-        const pipeline::M3GroupStats m3_before =
-            m1_runtime_ != nullptr ? m1_runtime_->m3_stats()
-                                   : pipeline::M3GroupStats{};
-#endif
-        const std::size_t M = job->members.size();
-        std::vector<std::uint32_t> outcomes(M, PIE_TERMINAL_OUTCOME_SUCCESS);
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> notifications;
-        std::string kv_commit_error;
-        const bool kv_commit_failed =
-            job->launch.required_kv_pages != 0 &&
-            (executor_ == nullptr ||
-             !executor_->ensure_kv_pages(
-                 job->launch.required_kv_pages, &kv_commit_error));
-        if (kv_commit_failed && kv_commit_error.empty()) {
-            kv_commit_error = "Metal KV commit failed";
-        }
-#if defined(__APPLE__)
-        struct PendingM3Group {
-            std::vector<std::size_t> members;
-            std::vector<pipeline::M3LaneCandidate> candidates;
-            std::vector<std::uint8_t> accepted;
-            std::vector<std::size_t> accepted_members;
-            std::shared_ptr<pipeline::M3GroupCommand> command;
-            bool finalized = false;
-            std::size_t leader = std::numeric_limits<std::size_t>::max();
-        };
-        std::vector<std::shared_ptr<pipeline::M1PreparedFire>> prepared(M);
-        std::vector<std::shared_ptr<pipeline::M2CommandPlan>> m2_commands(M);
-        std::vector<std::uint8_t> m2_active(M, 0);
-        std::vector<std::shared_ptr<PendingM3Group>> m3_for_member(M);
-        std::vector<pipeline::M1ExecuteOutcome> m3_outcomes(
-            M, pipeline::M1ExecuteOutcome::Failed);
-        // Why, parallel to the outcome. The grouped path settles its lanes
-        // ahead of the settlement loop, so unlike the singleton and M2 paths it
-        // has no `failure` string in scope when it decides — and its reason used
-        // to be printed only under `verbose` and then dropped. A member that
-        // failed for a stated reason would report an empty one.
-        std::vector<std::string> m3_errors(M);
-        std::vector<std::uint8_t> m3_active(M, 0);
-        std::vector<std::shared_ptr<PendingM3Group>> m3_groups;
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
 #endif
 
+        auto& kv_commit_error = st.kv_commit_error;
+        const bool kv_commit_failed = st.kv_commit_failed;
         // ── Phase 0: execution-time ticket validation directly against the
         // authoritative Shared-storage channel rings. ──
         const pie::driver::fire::LaunchView view = job->launch.view();
@@ -1335,12 +1336,24 @@ class Context::Impl {
             }
         }
 
-        // ── Phase 1: GPU forward (no mutex; executor is worker-owned) ──
-        std::vector<executor::LogitsOut> fwd_outs;
-        std::vector<std::uint8_t> fwd_ok;
-        std::vector<std::string> fwd_err;
-        std::string setup_err;
-        bool executor_ready = true;
+    }
+
+    /// Phase 1a: group members by channel and prepare the M3 lanes.
+    void plan_m3_groups(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
+#if defined(__APPLE__)
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
+#endif
+
 #if defined(__APPLE__)
         {
             std::unordered_map<std::string, std::vector<std::size_t>>
@@ -1403,6 +1416,70 @@ class Context::Impl {
             }
         }
 #endif
+    }
+
+    /// Phase 1c: settle each prepared M3 group and record its lane outcomes.
+    void finish_m3_groups(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
+#if defined(__APPLE__)
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
+#endif
+
+#if defined(__APPLE__)
+        for (const auto& group : m3_groups) {
+            if (group->command == nullptr) continue;
+            std::string group_error;
+            const auto group_outcomes =
+                m1_runtime_->finish_m3_group(
+                    group->command, group_error);
+            for (std::size_t lane = 0;
+                 lane < group_outcomes.size() &&
+                 lane < group->accepted_members.size();
+                 ++lane) {
+                m3_outcomes[group->accepted_members[lane]] =
+                    group_outcomes[lane];
+                m3_errors[group->accepted_members[lane]] = group_error;
+            }
+            if (!group_error.empty() && cfg_.runtime.verbose) {
+                std::cerr << "[pie-driver-metal] M3 finish: "
+                          << group_error << "\n";
+            }
+        }
+#endif
+    }
+    /// Phase 1: GPU forward (no mutex; executor is worker-owned).
+    void launch_forward(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
+#if defined(__APPLE__)
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
+#endif
+
+        auto& fwd_outs = st.fwd_outs;
+        auto& fwd_ok = st.fwd_ok;
+        auto& fwd_err = st.fwd_err;
+        auto& setup_err = st.setup_err;
+        auto& executor_ready = st.executor_ready;
+
+        // ── Phase 1: GPU forward (no mutex; executor is worker-owned) ──
+        plan_m3_groups(job, st);
         bool has_forward = false;
         for (std::size_t m = 0; m < M; ++m)
             if (outcomes[m] == PIE_TERMINAL_OUTCOME_SUCCESS &&
@@ -1725,28 +1802,33 @@ class Context::Impl {
                 setup_err = "forward raised: unknown exception";
             }
         }
+        finish_m3_groups(job, st);
+
+    }
+
+    /// Phase 2: generated singleton execution + channel settlement.
+    void launch_settle(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
 #if defined(__APPLE__)
-        for (const auto& group : m3_groups) {
-            if (group->command == nullptr) continue;
-            std::string group_error;
-            const auto group_outcomes =
-                m1_runtime_->finish_m3_group(
-                    group->command, group_error);
-            for (std::size_t lane = 0;
-                 lane < group_outcomes.size() &&
-                 lane < group->accepted_members.size();
-                 ++lane) {
-                m3_outcomes[group->accepted_members[lane]] =
-                    group_outcomes[lane];
-                m3_errors[group->accepted_members[lane]] = group_error;
-            }
-            if (!group_error.empty() && cfg_.runtime.verbose) {
-                std::cerr << "[pie-driver-metal] M3 finish: "
-                          << group_error << "\n";
-            }
-        }
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
 #endif
 
+        auto& fwd_outs = st.fwd_outs;
+        auto& fwd_ok = st.fwd_ok;
+        auto& fwd_err = st.fwd_err;
+        auto& setup_err = st.setup_err;
+        auto& executor_ready = st.executor_ready;
+
+        auto& notifications = st.notifications;
         // ── Phase 2: generated singleton execution + channel settlement. ──
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1883,6 +1965,29 @@ class Context::Impl {
             }
         }
 
+    }
+
+    /// Phase 3: publication of terminals and notifications.
+    void launch_publish(const std::shared_ptr<LaunchJobData>& job, LaunchJobState& st) {
+        const std::size_t M = st.M;
+        auto& outcomes = st.outcomes;
+#if defined(__APPLE__)
+        using PendingM3Group = LaunchJobState::PendingM3Group;
+        auto& prepared = st.prepared;
+        auto& m2_commands = st.m2_commands;
+        auto& m2_active = st.m2_active;
+        auto& m3_for_member = st.m3_for_member;
+        auto& m3_outcomes = st.m3_outcomes;
+        auto& m3_errors = st.m3_errors;
+        auto& m3_active = st.m3_active;
+        auto& m3_groups = st.m3_groups;
+#endif
+
+        auto& notifications = st.notifications;
+        const auto& timing_before = st.timing_before;
+#if defined(__APPLE__)
+        const auto& m3_before = st.m3_before;
+#endif
         // ── Phase 3: publication (no mutex — leased terminal cells + notify
         //    callbacks): terminals, per-channel notifies, then the batch notify
         //    exactly once. Always runs, so a fault above still settles here. ──
@@ -1940,6 +2045,37 @@ class Context::Impl {
         }
     }
 
+    void run_launch_job(std::shared_ptr<LaunchJobData> job) {
+        LaunchJobState st;
+        st.M = job->members.size();
+        st.timing_before = m0_timing_counters().snapshot();
+        st.outcomes.assign(st.M, PIE_TERMINAL_OUTCOME_SUCCESS);
+        st.kv_commit_failed =
+            job->launch.required_kv_pages != 0 &&
+            (executor_ == nullptr ||
+             !executor_->ensure_kv_pages(
+                 job->launch.required_kv_pages, &st.kv_commit_error));
+        if (st.kv_commit_failed && st.kv_commit_error.empty()) {
+            st.kv_commit_error = "Metal KV commit failed";
+        }
+#if defined(__APPLE__)
+        st.m3_before = m1_runtime_ != nullptr ? m1_runtime_->m3_stats()
+                                              : pipeline::M3GroupStats{};
+        st.prepared.resize(st.M);
+        st.m2_commands.resize(st.M);
+        st.m2_active.assign(st.M, 0);
+        st.m3_for_member.resize(st.M);
+        st.m3_outcomes.assign(st.M, pipeline::M1ExecuteOutcome::Failed);
+        st.m3_errors.resize(st.M);
+        st.m3_active.assign(st.M, 0);
+#endif
+        launch_validate(job, st);
+        launch_forward(job, st);
+        launch_settle(job, st);
+        launch_publish(job, st);
+    }
+
+
     // Phase 1b/3 paged-KV bridge: real, page-addressable KV pool copy — see
     // MetalExecutor::copy_kv_pages/copy_kv_cells (memcpy over the SEPARATE
     // Shared-storage NHD standalone pool — genuinely page-addressable,
@@ -1953,10 +2089,15 @@ class Context::Impl {
     // thin public wrapper just forwards to the worker and returns its status;
     // `worker_.run` rethrows a job exception, which the extern "C" wrapper maps
     // to DRIVER_ERROR.
-    int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
+    template <class Body>
+    int on_worker(Body&& body) {
         int status = PIE_STATUS_OK;
-        worker_.run([&] { status = copy_kv_impl(copy, completion); });
+        worker_.run([&] { status = body(); });
         return status;
+    }
+
+    int copy_kv(const PieKvCopyDesc& copy, PieCompletion completion) {
+        return on_worker([&] { return copy_kv_impl(copy, completion); });
     }
 
     int copy_kv_impl(const PieKvCopyDesc& copy, PieCompletion completion) {
@@ -2021,9 +2162,7 @@ class Context::Impl {
     }
 
     int copy_state(const PieStateCopyDesc& copy, PieCompletion completion) {
-        int status = PIE_STATUS_OK;
-        worker_.run([&] { status = copy_state_impl(copy, completion); });
-        return status;
+        return on_worker([&] { return copy_state_impl(copy, completion); });
     }
 
     int copy_state_impl(const PieStateCopyDesc& copy, PieCompletion completion) {
@@ -2061,9 +2200,7 @@ class Context::Impl {
     }
 
     int resize_pool(const PiePoolResizeDesc& resize, PieCompletion completion) {
-        int status = PIE_STATUS_OK;
-        worker_.run([&] { status = resize_pool_impl(resize, completion); });
-        return status;
+        return on_worker([&] { return resize_pool_impl(resize, completion); });
     }
 
     int resize_pool_impl(const PiePoolResizeDesc& resize, PieCompletion completion) {
@@ -2157,9 +2294,7 @@ class Context::Impl {
     // thread and can never race an in-flight forward or its settlement. The
     // map mutation takes the state mutex (shared with launch preflight).
     int close_instance(std::uint64_t instance_id) {
-        int status = PIE_STATUS_OK;
-        worker_.run([&] { status = close_instance_impl(instance_id); });
-        return status;
+        return on_worker([&] { return close_instance_impl(instance_id); });
     }
 
     int close_instance_impl(std::uint64_t instance_id) {
@@ -2177,9 +2312,7 @@ class Context::Impl {
     }
 
     int close_channel(std::uint64_t channel_id) {
-        int status = PIE_STATUS_OK;
-        worker_.run([&] { status = close_channel_impl(channel_id); });
-        return status;
+        return on_worker([&] { return close_channel_impl(channel_id); });
     }
 
     int close_channel_impl(std::uint64_t channel_id) {

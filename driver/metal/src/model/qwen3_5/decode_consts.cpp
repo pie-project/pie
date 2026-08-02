@@ -10,18 +10,14 @@
 
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg}
 #include "mtl4_context.hpp"
+#include "../shared_kernels.hpp"
 
 namespace pie::metal {
 
 namespace {
 
 // ── Kernel param structs, replicated EXACTLY from the .metal sources ──
-struct RmsParams {       // rms_norm.metal:22  (buffer 3)
-    float eps;
-    uint32_t axis_size;  // feature dim
-    uint32_t w_stride;   // 1 (contiguous)
-    uint32_t plus_one;   // qwen3.5: 0 for ALL norms → gain is the raw weight
-};
+using shared_kernels::RmsParams;
 struct GatedRmsParams {  // gated_rms.metal:20  (buffer 4)
     float eps;
     uint32_t vd;         // value-head dim (reduction axis)
@@ -34,14 +30,7 @@ struct GdnCoreParams {   // gdn_core.metal:39  (buffer 11)
 // Bind a POD constant value into a fresh resident slot at (ordinal, bind_index).
 template <class V>
 inline void bind_const(RawMetalContext& ctx, int ord, uint8_t idx, const V& val, int* count) {
-    SlotHandle s = ctx.const_slot(ord, idx, sizeof(V));
-    if (!s.valid()) throw std::runtime_error("decode_consts: heap_alloc failed (budget too small)");
-    std::memcpy(s.contents(), &val, sizeof(V));
-    ctx.arg_bind_ordinal(ord, idx, s);
-    if (std::getenv("PIE_CONST_DEBUG") && ord <= 1)
-        std::fprintf(stderr, "[const] ord=%d idx=%u size=%zu addr=%p\n",
-                     ord, (unsigned)idx, sizeof(V), s.contents());
-    if (count) ++*count;
+    shared_kernels::bind_const(ctx, ord, idx, val, count, "decode");
 }
 
 

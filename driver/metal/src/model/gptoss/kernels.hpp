@@ -18,16 +18,16 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "../../mtl4_context.hpp"
+#include "../shared_kernels.hpp"
 #include "geometry.hpp"
 
 namespace pie::metal::gptoss {
 
+using shared_kernels::RowGatherParams;
+using shared_kernels::elementwise_dispatch;
+
 /// Params structs, replicated EXACTLY from the .metal sources. A mismatch here
 /// is silent: the GPU reads whatever bytes are at the offset.
-struct RowGatherParams {   // row_gather.metal (buffer 3)
-    std::uint32_t width;
-    std::uint32_t count;
-};
 struct RouterParams {          // gptoss.metal
     std::uint32_t n_experts;
     std::uint32_t experts_per_token;
@@ -105,13 +105,6 @@ std::vector<float> yarn_inv_freq(const GptOssGeometry& g);
 float yarn_mscale(const GptOssGeometry& g);
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
-
-/// Flat elementwise kernels: one thread per element.
-inline void elementwise_dispatch(int n, Grid& g, Threadgroup& tg) {
-    const int width = n < 256 ? (n > 0 ? n : 1) : 256;
-    g = Grid{std::uint32_t(n > 0 ? n : 1), 1, 1};
-    tg = Threadgroup{std::uint32_t(width), 1, 1};
-}
 
 /// `router_topk`: one threadgroup, one lane per expert. 32 on this family, so a
 /// single simdgroup holds the whole distribution.
