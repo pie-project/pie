@@ -202,7 +202,9 @@ pub(crate) fn kv_reclaim_quotes(
     let Some(stores) = crate::store::registry::try_get(model, driver) else {
         return vec![None; pids.len()];
     };
-    crate::store::registry::with_kv_lock(&stores.kv, "planner", |kv| quote_locked(kv, working_sets))
+    crate::store::registry::with_kv_lock(&stores.kv, "planner-quotes", |kv| {
+        quote_locked(kv, working_sets)
+    })
 }
 
 #[cfg(test)]
