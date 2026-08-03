@@ -2035,6 +2035,15 @@ bool MetalExecutor::Impl::run_prefill_step(
     // single contended window decides the answer.
     static bool prefill_ab_flip = false;
     if (ab_enabled()) ab_set_arm(prefill_ab_flip = !prefill_ab_flip);
+    // The staging copy rides this command buffer, exactly as it rides the
+    // decode step's. It used to ride only the decode step's: a prefill fire
+    // computed its logits, wrote them, and never copied the sampled row out, so
+    // the caller read whatever the staging buffer held from the fire before --
+    // zeros on the first, which reads back as a confident argmax of token 0.
+    // Nothing failed and nothing was slow; the first token of every prompt was
+    // simply the wrong one.
+    std::string stage_err;
+    bool stage_failed = false;
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
@@ -2047,9 +2056,11 @@ bool MetalExecutor::Impl::run_prefill_step(
             for (const auto& callbacks : *ptir)
                 if (callbacks.post_forward) callbacks.post_forward(se);
         }
+        if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
     });
     if (!timing.succeeded())
         return fail("Metal command timed out before its completion fence");
+    if (stage_failed) return fail(stage_err);
     // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
     // compares across arms -- a raw total confuses "faster" with "shorter prompt".
     if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
@@ -2384,7 +2395,14 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // linear-attention geometry, and said nothing about it: the loader binds by
     // NAME, and a name carries no dimension to disagree with.
     DecodeGeometry geom{};
-    {
+    const model::ModelFamily family = model::model_family_of(cfg.model_type);
+    // Only this family's. `geometry_from_facts` reads `cfg.qwen35`, which a
+    // llama or gemma4 checkpoint never fills, and it refuses an empty one --
+    // correctly, but it was being asked unconditionally, so every simple
+    // family's setup died on "qwen3.5 geometry: config carried no decoder
+    // shape" before it ever reached `setup_simple`, which builds its own
+    // geometry from its own facts.
+    if (family == model::ModelFamily::Qwen35) {
         std::string gerr;
         if (!geometry_from_facts(cfg.qwen35, geom, &gerr)) {
             if (err != nullptr) *err = gerr;
@@ -2423,7 +2441,26 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             : geom.head_dim;
     geom.kv_page_size = static_cast<int>(cfg.kv_page_size);
     geom.total_pages = static_cast<int>(cfg.total_pages);
-    geom.paged_kv_enabled = cfg.total_pages > 0 && cfg.kv_page_size > 0 &&
+    // `total_pages` and `max_ctx_tokens` are two spellings of one capacity, and
+    // only the simple families read the second: `setup_simple` derives
+    // `total_pages = kv_max_ctx / page_size` for itself. The native path read
+    // the first alone, so a caller that sized its ring in TOKENS -- which is
+    // what the field is for, and what `llama_bench` does -- got zero pages, a
+    // DAG built unpaged, and a pool left disabled. Nothing failed: setup
+    // succeeded and `kv_pool_page_size()` returned zero to a caller with no
+    // reason to expect it. One capacity, one derivation, in both halves.
+    //
+    // Scoped to this family on purpose. The simple engines compute their own
+    // pool from `max_ctx` a few lines into `setup_simple`, and handing them a
+    // second answer here would be two derivations of one fact again.
+    if (family == model::ModelFamily::Qwen35 && geom.total_pages == 0 &&
+        geom.kv_page_size > 0) {
+        const std::uint32_t ctx =
+            cfg.max_ctx_tokens > 0 ? cfg.max_ctx_tokens : kMetalMaxCtxTokens;
+        const std::uint32_t ps = std::uint32_t(geom.kv_page_size);
+        geom.total_pages = static_cast<int>((ctx + ps - 1) / ps);
+    }
+    geom.paged_kv_enabled = geom.total_pages > 0 && geom.kv_page_size > 0 &&
                             geom.max_tokens > 0 && geom.max_requests > 0;
     // The vocabulary is a property of the checkpoint, so take it from the
     // checkpoint. It used to be cross-checked against the hard-coded 248320 and
@@ -2433,7 +2470,6 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         geom.vocab = static_cast<int>(cfg.vocab_size);
     }
     std::string derr;
-    const model::ModelFamily family = model::model_family_of(cfg.model_type);
     if (family != model::ModelFamily::Qwen35) {
         if (!impl->setup_simple(family, cfg.kernels_dir, cfg, load_plan, &derr)) {
             if (err != nullptr) *err = "Metal forward setup failed: " + derr;
@@ -2461,9 +2497,10 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // copy_state) do not depend on the pool at all; only copy_kv/resize_pool
     // would report UNSUPPORTED if this didn't succeed (e.g. total_pages==0
     // in config, the default, deliberately leaves the pool disabled).
-    if (cfg.total_pages > 0 && cfg.kv_page_size > 0) {
+    if (geom.total_pages > 0 && geom.kv_page_size > 0) {
         std::string pool_err;
-        if (!impl->setup_kv_pool(cfg.total_pages, cfg.kv_page_size, &pool_err)) {
+        if (!impl->setup_kv_pool(std::uint32_t(geom.total_pages),
+                                 std::uint32_t(geom.kv_page_size), &pool_err)) {
             std::cerr << "[pie-driver-metal] MetalExecutor::setup: KV page pool allocation "
                          "failed, copy_kv/resize_pool will be UNSUPPORTED: "
                       << pool_err << "\n";

@@ -1149,18 +1149,8 @@ std::vector<WeightBind> weight_binds(
     case Kernel::QmvIn: push_quant(weights, prefix + "linear_attn.in_proj_qkv"); break;
     case Kernel::QmvInZ: push_quant(weights, prefix + "linear_attn.in_proj_z"); break;
     case Kernel::QmvOut: push_quant(weights, prefix + "linear_attn.out_proj"); break;
-    case Kernel::GdnInA:
-        weights.push_back({
-            static_cast<std::uint8_t>(bind::Dense::W),
-            prefix + "linear_attn.in_proj_a.weight",
-        });
-        break;
-    case Kernel::GdnInB:
-        weights.push_back({
-            static_cast<std::uint8_t>(bind::Dense::W),
-            prefix + "linear_attn.in_proj_b.weight",
-        });
-        break;
+    case Kernel::GdnInA: push_quant(weights, prefix + "linear_attn.in_proj_a"); break;
+    case Kernel::GdnInB: push_quant(weights, prefix + "linear_attn.in_proj_b"); break;
     // ── Gemma 4 ──
     // The norm sandwich: four per layer, so three of them need their own kind.
     case Kernel::G4AttnPostNorm:

@@ -189,10 +189,6 @@ enum class Residual : uint8_t { X = 0, Residual = 1, Out = 2, Width = 3 };
 // SwiGLU (golden `swiglu`): Out = silu(Gate) * Up, elementwise over intermediate.
 enum class SiluMul : uint8_t { Gate = 0, Up = 1, Out = 2, Width = 3 };
 
-// dense bf16 GEMV (M=1) for GDN `gdn_in_a`/`gdn_in_b` (in_proj_a/b stored DENSE
-// bf16 [V_h,hidden], NOT 4-bit). Out[N] = sum_k W[N,K]*X[K], float accum.
-enum class Dense : uint8_t { W = 0, X = 1, Out = 2, K = 3, N = 4 };
-
 // q_gate_split: deinterleave 2x-wide q_proj output (qwen3.5 gated attn).
 // qg[n_q,2,head_dim] -> Q[n_q,head_dim] + gate[n_q,head_dim]. Internal (no golden tag).
 enum class QSplit : uint8_t { Qg = 0, QOut = 1, GateOut = 2, HeadDim = 3 };

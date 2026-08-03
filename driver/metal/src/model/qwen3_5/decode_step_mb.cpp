@@ -29,6 +29,8 @@ int qmv_out_size(Kernel k, const DecodeGeometry& g) {
     switch (k) {
         case Kernel::QmvIn: return g.gdn_conv_dim;
         case Kernel::QmvInZ: return g.gdn_v_total;
+        case Kernel::GdnInA:
+        case Kernel::GdnInB: return g.gdn_v_heads;
         case Kernel::QmvOut:
         case Kernel::QmvO:
         case Kernel::QmvDown:
@@ -103,11 +105,6 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
             rms(g.head_dim, g.n_q_heads); break;
         case Kernel::KNorm:
             rms(g.head_dim, g.n_kv_heads); break;
-        case Kernel::GdnInA:
-        case Kernel::GdnInB:
-            d.grid = Grid{32u, uint32_t(g.gdn_v_heads), uint32_t(n)};
-            d.tg = Threadgroup{32, 1, 1};
-            break;
         case Kernel::GdnPrepSlotted:
             d.grid = Grid{32u, 1u, uint32_t(n * g.gdn_v_heads)};
             d.tg = Threadgroup{32, 1, 1};
@@ -562,16 +559,6 @@ void encode_prefill_dags_mb(StepEncoder& se,
                 case Kernel::GatedRms:
                     if (d0.grid.z == 1) {
                         strided = mb_psos.gated_rms_strided;
-                        grid.z = uint32_t(n);
-                    }
-                    break;
-                case Kernel::GdnInA:
-                case Kernel::GdnInB:
-                    // grid is (32, N_out, 1): the simdgroup lane, the output row,
-                    // and -- once strided -- the prompt row.  Worth 1.4% of the
-                    // fire: 18 GDN layers x 2 is 42% of its per-row dispatches.
-                    if (d0.grid.z == 1) {
-                        strided = mb_psos.dense_gemv_strided;
                         grid.z = uint32_t(n);
                     }
                     break;

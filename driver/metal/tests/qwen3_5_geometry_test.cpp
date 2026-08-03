@@ -455,6 +455,24 @@ void check_the_routed_matvecs_know_their_own_width() {
                qmv_kn(Kernel::LlExpertDown, g).N == g.hidden,
            "an expert's down comes back to hidden");
 
+    // The GDN decay and beta projections are QUANTIZED, like every other
+    // projection in the layer. They were bound as dense bf16 matrices, which is
+    // what a Qwen3-Next preview repack shipped; both released Qwen3.5
+    // checkpoints ship them as a 4-bit weight with its own scales and biases,
+    // and reading those as bf16 produced NaN in a quarter of the channels and
+    // plausible garbage in the rest. `qmv_kn` answering for them is what makes
+    // them a matvec at all -- `is_qmv` is defined as `N != 0` -- so it decides
+    // the constant binding, the batched launch shape and the PSO together.
+    expect(qmv_kn(Kernel::GdnInA, g).K == g.hidden &&
+               qmv_kn(Kernel::GdnInA, g).N == g.gdn_v_heads,
+           "the GDN decay projection is a matvec from hidden to one scalar per v-head");
+    expect(qmv_kn(Kernel::GdnInB, g).K == g.hidden &&
+               qmv_kn(Kernel::GdnInB, g).N == g.gdn_v_heads,
+           "the GDN beta projection is a matvec from hidden to one scalar per v-head");
+    expect(pie::metal::qmv_out_size(Kernel::GdnInA, g) == g.gdn_v_heads &&
+               pie::metal::qmv_out_size(Kernel::GdnInB, g) == g.gdn_v_heads,
+           "the batched path launches the GDN a/b projections over their own width");
+
     // And the trap. `qmv_kn` answers off the geometry it is GIVEN, and the
     // predicate that decides whether a dispatch gets a K and an N at all used
     // to ask a default-constructed one. Every dense projection's width is

@@ -20,7 +20,7 @@
 //
 // All struct layouts + buffer indices below are replicated EXACTLY from the ported
 // kernels (rms_norm.metal, gdn_core.metal, gated_rms.metal, quantized_qmv.metal,
-// dense_gemv.metal, rope.metal, sdpa_vector.metal, kv_append.metal, embed_gather.metal,
+// rope.metal, sdpa_vector.metal, kv_append.metal, embed_gather.metal,
 // attn_gate.metal q_gate_split) and the bind:: enums in decode_abi.hpp.
 
 #include <vector>

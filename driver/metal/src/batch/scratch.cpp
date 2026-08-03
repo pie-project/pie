@@ -36,7 +36,6 @@ namespace bi {
 constexpr uint8_t EmbedOut   = 4;             // bind::Embed::Out
 constexpr uint8_t RmsX = 0, RmsOut = 2;       // bind::Rms
 constexpr uint8_t QmvX = 3, QmvOut = 4, QmvResidual = 7;  // bind::Qmv (Residual = fused epilogue)
-constexpr uint8_t DenseX = 1, DenseOut = 2;   // bind::Dense
 constexpr uint8_t QSplitIn = 0, QSplitQ = 1, QSplitGate = 2;  // bind::QSplit
 constexpr uint8_t RopeX = 0;                  // bind::Rope: in-place activation (1=pos IO, 2/3/4=consts)
 constexpr uint8_t SdpaQ = 0, SdpaOut = 3;     // bind::Sdpa (K/V from KV region)
@@ -131,10 +130,10 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
                 zg = fresh(); rd(o, bi::QmvX, normed); wr(o, bi::QmvOut, zg);
                 break;
             case Kernel::GdnInA:
-                ag = fresh(); rd(o, bi::DenseX, normed); wr(o, bi::DenseOut, ag);
+                ag = fresh(); rd(o, bi::QmvX, normed); wr(o, bi::QmvOut, ag);
                 break;
             case Kernel::GdnInB:
-                bg = fresh(); rd(o, bi::DenseX, normed); wr(o, bi::DenseOut, bg);
+                bg = fresh(); rd(o, bi::QmvX, normed); wr(o, bi::QmvOut, bg);
                 break;
             case Kernel::GdnPrep:
             case Kernel::GdnPrepSlotted:  // dv-independent q/k path → fp32 scratch (once/head)

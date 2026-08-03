@@ -99,8 +99,8 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             emit(Kernel::Rms,     L, rms(g.hidden, 1));
             emit(Kernel::QmvIn,   L, qmv(g.gdn_conv_dim));             // 6144, 4-bit
             emit(Kernel::QmvInZ,  L, qmv(g.gdn_v_total));              // 2048, 4-bit (gate z)
-            { LD l; dense_gemv_dispatch(g.gdn_v_heads, l.grid, l.tg); emit(Kernel::GdnInA, L, l); }  // dense bf16 [16,1024]
-            { LD l; dense_gemv_dispatch(g.gdn_v_heads, l.grid, l.tg); emit(Kernel::GdnInB, L, l); }
+            emit(Kernel::GdnInA,  L, qmv(g.gdn_v_heads));              // 1024 → 16, 4-bit
+            emit(Kernel::GdnInB,  L, qmv(g.gdn_v_heads));              // 1024 → 16, 4-bit
             if (gdn_prep) {
                 // Prep-dispatch split: dv-independent q/k path hoisted to GdnPrep (once/head),
                 // then the slimmed recurrent core reads its fp32 scratch (full 128×→1×).

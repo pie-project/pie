@@ -63,6 +63,16 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
     switch (k) {
         case Kernel::QmvIn:     return {H, g.gdn_conv_dim};   // 1024 → 6144
         case Kernel::QmvInZ:    return {H, g.gdn_v_total};    // 1024 → 2048
+        // The GDN decay and beta projections. These were bound as DENSE bf16
+        // matrices, which is what a Qwen3-Next preview repack shipped and what
+        // no released checkpoint ships: both Qwen3.5-0.8B and Qwen3.5-35B-A3B
+        // quantize them like every other projection in the layer, so reading
+        // `in_proj_a.weight` as bf16 read packed 4-bit nibbles as floats. It
+        // was NaN in the first four output channels and small, plausible,
+        // wrong numbers in the other twelve -- the shape was right, the
+        // dispatch succeeded, and the model produced token 0 forever.
+        case Kernel::GdnInA:
+        case Kernel::GdnInB:    return {H, g.gdn_v_heads};     // 1024 → 16
         case Kernel::QmvOut:    return {g.gdn_v_total, H};    // 2048 → 1024
         case Kernel::QmvQ:      return {H, q_wide};           // 1024 → 4096
         case Kernel::QmvK:      return {H, kv_dim};           // 1024 → 512
@@ -221,13 +231,6 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             case Kernel::KNorm:
                 bind_const<RmsParams>(ctx, ord, (uint8_t)bind::Rms::Params,
                                       RmsParams{g.eps, (uint32_t)g.head_dim, 1u, 0u}, &count);
-                break;
-
-            // GDN in_proj_a / in_proj_b — DENSE bf16 GEMV [16,1024].
-            case Kernel::GdnInA:
-            case Kernel::GdnInB:
-                bind_const<uint32_t>(ctx, ord, (uint8_t)bind::Dense::K, (uint32_t)g.hidden, &count);
-                bind_const<uint32_t>(ctx, ord, (uint8_t)bind::Dense::N, (uint32_t)g.gdn_v_heads, &count);
                 break;
 
             case Kernel::GdnPrep: {

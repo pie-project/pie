@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "batch/forward.hpp"
+#include "model/contract.hpp"
 #include "model/llama/encode.hpp"
 #include "model/llama/geometry.hpp"
 #include "model_facts.hpp"
@@ -70,6 +71,16 @@ MemberForwardDesc desc_for(Seq& s, std::uint32_t n, std::uint32_t page_size,
     d.sequence_id = s.id;
     d.requires_paged = true;
     const std::uint32_t end = s.next_position + n;
+    // A page size of zero makes this loop unbounded -- it pushes pages forever,
+    // grows the vector until the machine gives out, and says nothing. That is
+    // how a driver returning `kv_pool_page_size() == 0` presented itself: eight
+    // gigabytes of resident memory and no output at all. An unbounded loop fed
+    // by a value the driver chose deserves the check.
+    if (page_size == 0) {
+        std::printf("  FAIL  the driver's KV pool has no page size, so it is not paged.\n"
+                    "        This fire is `requires_paged` and there is nothing to page into.\n");
+        std::exit(1);
+    }
     while (std::uint64_t(s.pages.size()) * page_size < end) s.pages.push_back(next_free_page++);
     for (std::uint32_t i = 0; i < n; ++i) {
         d.token_ids.push_back(s.tokens[s.next_position + i]);
@@ -166,6 +177,46 @@ std::vector<std::uint32_t> long_gate_prompt() {
     return out;
 }
 
+/// The shape a gate keys on, whichever family's sub-config holds it.
+///
+/// `SetupConfig` has one struct per family and a checkpoint fills exactly one of
+/// them, so reading `cfg.llama` unconditionally -- which is what this file did
+/// -- printed `0 layers, hidden 0` for a qwen3.5 checkpoint and matched it
+/// against a table keyed on zeros. Both the printout and the reference lookup
+/// go through here so they cannot disagree about which model is running.
+struct BenchShape {
+    const char* family = "?";
+    int n_layers = 0, hidden = 0, n_q_heads = 0, n_kv_heads = 0, head_dim = 0;
+    int intermediate = 0, n_experts = 0, experts_per_token = 0, moe_intermediate = 0;
+};
+
+BenchShape bench_shape(const SetupConfig& cfg) {
+    BenchShape s;
+    switch (pie::metal::model::model_family_of(cfg.model_type)) {
+    case pie::metal::model::ModelFamily::Qwen35:
+        s = {"qwen3.5", cfg.qwen35.n_layers, cfg.qwen35.hidden, cfg.qwen35.n_q_heads,
+             cfg.qwen35.n_kv_heads, cfg.qwen35.head_dim, cfg.qwen35.intermediate,
+             cfg.qwen35.n_experts, cfg.qwen35.experts_per_token, cfg.qwen35.moe_intermediate};
+        break;
+    case pie::metal::model::ModelFamily::GptOss:
+        s = {"gpt-oss", cfg.gptoss.n_layers, cfg.gptoss.hidden, cfg.gptoss.n_q_heads,
+             cfg.gptoss.n_kv_heads, cfg.gptoss.head_dim, cfg.gptoss.intermediate,
+             cfg.gptoss.n_experts, cfg.gptoss.experts_per_token, cfg.gptoss.intermediate};
+        break;
+    case pie::metal::model::ModelFamily::Gemma4:
+        s = {"gemma4", cfg.gemma4.n_layers, cfg.gemma4.hidden, cfg.gemma4.n_q_heads,
+             cfg.gemma4.n_kv_heads, cfg.gemma4.head_dim, cfg.gemma4.intermediate, 0, 0, 0};
+        break;
+    case pie::metal::model::ModelFamily::Llama:
+    case pie::metal::model::ModelFamily::Unknown:
+        s = {"llama", cfg.llama.n_layers, cfg.llama.hidden, cfg.llama.n_q_heads,
+             cfg.llama.n_kv_heads, cfg.llama.head_dim, cfg.llama.intermediate,
+             cfg.llama.n_experts, cfg.llama.experts_per_token, cfg.llama.moe_intermediate};
+        break;
+    }
+    return s;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -214,14 +265,15 @@ int main(int argc, char** argv) {
         std::max<std::size_t>(std::size_t(std::max(n_prompt + n_decode, 1)),
                               long_gate_prompt().size() + 8) + 64);
     fill_family_geometry(cfg, facts);
-    std::printf("  %s: %d layers, hidden %d, %d/%d heads x %d", cfg.model_type.c_str(),
-                cfg.llama.n_layers, cfg.llama.hidden, cfg.llama.n_q_heads,
-                cfg.llama.n_kv_heads, cfg.llama.head_dim);
-    if (cfg.llama.n_experts > 0) {
-        std::printf(", %d experts top-%d x %d", cfg.llama.n_experts,
-                    cfg.llama.experts_per_token, cfg.llama.moe_intermediate);
+    const BenchShape shape = bench_shape(cfg);
+    std::printf("  %s [%s]: %d layers, hidden %d, %d/%d heads x %d", cfg.model_type.c_str(),
+                shape.family, shape.n_layers, shape.hidden, shape.n_q_heads,
+                shape.n_kv_heads, shape.head_dim);
+    if (shape.n_experts > 0) {
+        std::printf(", %d experts top-%d x %d", shape.n_experts,
+                    shape.experts_per_token, shape.moe_intermediate);
     } else {
-        std::printf(", ffn %d", cfg.llama.intermediate);
+        std::printf(", ffn %d", shape.intermediate);
     }
     std::printf("\n");
 
@@ -269,10 +321,17 @@ int main(int argc, char** argv) {
             // " Tokyo. The capital of Brazil", then the sentence again
             {"Qwen3-30B-A3B", 48, 128, {26194, 13, 576, 6722, 315, 15948},
              {785, 6722, 315, 9625, 374, 12095}},
+            // Qwen3.5 tokenizes these ids differently -- its vocabulary is
+            // 248320, not Qwen3's 151936 -- so the continuation is a different
+            // sentence in the same shape. The gate is on IDS, which is what the
+            // driver and mlx-lm both consume, so the disagreement about what
+            // they spell is not the gate's business.
+            {"Qwen3.5-0.8B", 24, 0, {12095, 13, 576, 6722, 315, 198},
+             {785, 6722, 315, 9625, 374, 12095}},
         };
         const Known* ref = nullptr;
         for (const Known& k : known) {
-            if (k.n_layers == cfg.llama.n_layers && k.n_experts == cfg.llama.n_experts) {
+            if (k.n_layers == shape.n_layers && k.n_experts == shape.n_experts) {
                 ref = &k;
                 break;
             }

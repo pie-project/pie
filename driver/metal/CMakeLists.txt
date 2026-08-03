@@ -231,7 +231,6 @@ set(PIE_METAL_SHADER_NAMES
   argmax
   attn_gate
   bf16_gemv
-  dense_gemv
   embed_gather
   gated_rms
   gdn_core

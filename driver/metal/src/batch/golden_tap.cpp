@@ -33,8 +33,8 @@ bool tap_for(const Dispatch& d, const DecodeGeometry& g, Tap& out) {
 
         case Kernel::QmvIn:         out = {"gdn_in_qkv", 4, g.gdn_conv_dim}; return true;
         case Kernel::QmvInZ:        out = {"gdn_in_z",   4, g.gdn_v_total};  return true;
-        case Kernel::GdnInA:        out = {"gdn_in_a",   2, g.gdn_v_heads};  return true;
-        case Kernel::GdnInB:        out = {"gdn_in_b",   2, g.gdn_v_heads};  return true;
+        case Kernel::GdnInA:        out = {"gdn_in_a",   4, g.gdn_v_heads};  return true;
+        case Kernel::GdnInB:        out = {"gdn_in_b",   4, g.gdn_v_heads};  return true;
         // The reference's `gdn_core` tap is the output of gated_delta_net, which
         // already includes the gate RMSNorm — so it lines up with GatedRms here,
         // not with the bare recurrence.
