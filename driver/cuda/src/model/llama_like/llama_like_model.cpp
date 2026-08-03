@@ -164,6 +164,14 @@ std::uint32_t LlamaLikeModel::supergraph_graph_layout() {
     return llama_like_supergraph_graph_layout(plan_);
 }
 
+std::uint64_t LlamaLikeModel::lora_stage(Workspace& ws,
+                                         const LoraTable* lora,
+                                         int total_tokens,
+                                         cudaStream_t stream) {
+    return llama_like_lora_stage(
+        plan_, ws, lora, hf_config_, fwd_cfg_, total_tokens, stream);
+}
+
 
 bool LlamaLikeModel::supergraph_body(Workspace& ws,
                                      KvCache& kv,

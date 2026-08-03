@@ -42,6 +42,7 @@ class CublasHandle;
 namespace model {
 
 struct Workspace;
+struct LoraTable;
 
 struct MediaEncodeInputs {
     const float* image_pixels_h = nullptr;
@@ -153,6 +154,18 @@ public:
     virtual std::uint32_t supergraph_graph_layout() { return graph_layout(); }
 
     virtual bool encode_media(const MediaEncodeInputs&, cudaStream_t) { return false; }
+
+    // Lora campaign step 3a: stage this fire's lora state OUTSIDE any
+    // capture region (cast uploads, slab build — host+stream work the
+    // captured body must not contain). Returns a fingerprint of what
+    // was staged (0 = no lora / unsupported); the engine keys lora
+    // graph replay on it. A null table clears the staged state.
+    virtual std::uint64_t lora_stage(Workspace&,
+                                     const LoraTable*,
+                                     int /*total_tokens*/,
+                                     cudaStream_t /*stream*/) {
+        return 0;
+    }
 
     // The unionized supergraph's capture body (S3): spell this fire's
     // decode as conditional-armed graph work on the builder. Returns false

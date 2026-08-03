@@ -77,8 +77,13 @@ const LoraTable* lora)
     const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
     std::optional<LayerScoreCapture> score_capture;
 
+    const LoraFireStateHandle* lora_staged =
+        (lora != nullptr && lora->usable() &&
+         plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get() : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
-    if (lora != nullptr && lora->usable()) {
+    if (lora != nullptr && lora->usable() &&
+        lora_staged == nullptr) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
                            /*tp=*/1, stream, ws,
                            ws.norm_x.data(),
@@ -105,12 +110,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[0].v_proj, "layer.0.v_proj"), w.layers[0].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 0, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -362,12 +368,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[1].v_proj, "layer.1.v_proj"), w.layers[1].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 1, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -619,12 +626,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[2].v_proj, "layer.2.v_proj"), w.layers[2].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 2, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -876,12 +884,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[3].v_proj, "layer.3.v_proj"), w.layers[3].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 3, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1133,12 +1142,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[4].v_proj, "layer.4.v_proj"), w.layers[4].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 4, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1390,12 +1400,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[5].v_proj, "layer.5.v_proj"), w.layers[5].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 5, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1647,12 +1658,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[6].v_proj, "layer.6.v_proj"), w.layers[6].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 6, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1904,12 +1916,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[7].v_proj, "layer.7.v_proj"), w.layers[7].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 7, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2161,12 +2174,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[8].v_proj, "layer.8.v_proj"), w.layers[8].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 8, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2418,12 +2432,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[9].v_proj, "layer.9.v_proj"), w.layers[9].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 9, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2675,12 +2690,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[10].v_proj, "layer.10.v_proj"), w.layers[10].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 10, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2932,12 +2948,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[11].v_proj, "layer.11.v_proj"), w.layers[11].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 11, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3189,12 +3206,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[12].v_proj, "layer.12.v_proj"), w.layers[12].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 12, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3446,12 +3464,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[13].v_proj, "layer.13.v_proj"), w.layers[13].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 13, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3703,12 +3722,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[14].v_proj, "layer.14.v_proj"), w.layers[14].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 14, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3960,12 +3980,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[15].v_proj, "layer.15.v_proj"), w.layers[15].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 15, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4217,12 +4238,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[16].v_proj, "layer.16.v_proj"), w.layers[16].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 16, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4474,12 +4496,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[17].v_proj, "layer.17.v_proj"), w.layers[17].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 17, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4731,12 +4754,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[18].v_proj, "layer.18.v_proj"), w.layers[18].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 18, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4988,12 +5012,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[19].v_proj, "layer.19.v_proj"), w.layers[19].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 19, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -5245,12 +5270,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[20].v_proj, "layer.20.v_proj"), w.layers[20].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 20, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -5502,12 +5528,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[21].v_proj, "layer.21.v_proj"), w.layers[21].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 21, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -5759,12 +5786,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[22].v_proj, "layer.22.v_proj"), w.layers[22].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 22, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6016,12 +6044,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[23].v_proj, "layer.23.v_proj"), w.layers[23].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 23, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6273,12 +6302,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[24].v_proj, "layer.24.v_proj"), w.layers[24].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 24, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6530,12 +6560,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[25].v_proj, "layer.25.v_proj"), w.layers[25].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 25, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6787,12 +6818,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[26].v_proj, "layer.26.v_proj"), w.layers[26].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 26, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7044,12 +7076,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[27].v_proj, "layer.27.v_proj"), w.layers[27].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 27, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7301,12 +7334,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[28].v_proj, "layer.28.v_proj"), w.layers[28].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 28, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7558,12 +7592,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[29].v_proj, "layer.29.v_proj"), w.layers[29].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 29, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7815,12 +7850,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[30].v_proj, "layer.30.v_proj"), w.layers[30].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 30, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -8072,12 +8108,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[31].v_proj, "layer.31.v_proj"), w.layers[31].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 31, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -8410,8 +8447,13 @@ const LoraTable* lora)
     const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
     std::optional<LayerPrefillScoreCapture> prefill_score_capture;
 
+    const LoraFireStateHandle* lora_staged =
+        (lora != nullptr && lora->usable() &&
+         plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get() : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
-    if (lora != nullptr && lora->usable()) {
+    if (lora != nullptr && lora->usable() &&
+        lora_staged == nullptr) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
                            /*tp=*/1, stream, ws,
                            ws.norm_x.data(),
@@ -8438,12 +8480,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[0].v_proj, "layer.0.v_proj"), w.layers[0].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 0, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -8668,12 +8711,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[1].v_proj, "layer.1.v_proj"), w.layers[1].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 1, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -8898,12 +8942,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[2].v_proj, "layer.2.v_proj"), w.layers[2].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 2, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9128,12 +9173,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[3].v_proj, "layer.3.v_proj"), w.layers[3].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 3, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9358,12 +9404,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[4].v_proj, "layer.4.v_proj"), w.layers[4].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 4, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9588,12 +9635,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[5].v_proj, "layer.5.v_proj"), w.layers[5].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 5, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9818,12 +9866,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[6].v_proj, "layer.6.v_proj"), w.layers[6].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 6, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10048,12 +10097,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[7].v_proj, "layer.7.v_proj"), w.layers[7].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 7, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10278,12 +10328,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[8].v_proj, "layer.8.v_proj"), w.layers[8].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 8, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10508,12 +10559,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[9].v_proj, "layer.9.v_proj"), w.layers[9].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 9, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10738,12 +10790,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[10].v_proj, "layer.10.v_proj"), w.layers[10].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 10, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10968,12 +11021,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[11].v_proj, "layer.11.v_proj"), w.layers[11].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 11, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -11198,12 +11252,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[12].v_proj, "layer.12.v_proj"), w.layers[12].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 12, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -11428,12 +11483,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[13].v_proj, "layer.13.v_proj"), w.layers[13].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 13, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -11658,12 +11714,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[14].v_proj, "layer.14.v_proj"), w.layers[14].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 14, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -11888,12 +11945,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[15].v_proj, "layer.15.v_proj"), w.layers[15].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 15, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -12118,12 +12176,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[16].v_proj, "layer.16.v_proj"), w.layers[16].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 16, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -12348,12 +12407,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[17].v_proj, "layer.17.v_proj"), w.layers[17].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 17, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -12578,12 +12638,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[18].v_proj, "layer.18.v_proj"), w.layers[18].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 18, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -12808,12 +12869,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[19].v_proj, "layer.19.v_proj"), w.layers[19].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 19, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -13038,12 +13100,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[20].v_proj, "layer.20.v_proj"), w.layers[20].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 20, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -13268,12 +13331,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[21].v_proj, "layer.21.v_proj"), w.layers[21].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 21, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -13498,12 +13562,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[22].v_proj, "layer.22.v_proj"), w.layers[22].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 22, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -13728,12 +13793,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[23].v_proj, "layer.23.v_proj"), w.layers[23].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 23, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -13958,12 +14024,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[24].v_proj, "layer.24.v_proj"), w.layers[24].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 24, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -14188,12 +14255,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[25].v_proj, "layer.25.v_proj"), w.layers[25].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 25, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -14418,12 +14486,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[26].v_proj, "layer.26.v_proj"), w.layers[26].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 26, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -14648,12 +14717,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[27].v_proj, "layer.27.v_proj"), w.layers[27].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 27, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -14878,12 +14948,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[28].v_proj, "layer.28.v_proj"), w.layers[28].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 28, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -15108,12 +15179,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[29].v_proj, "layer.29.v_proj"), w.layers[29].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 29, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -15338,12 +15410,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[30].v_proj, "layer.30.v_proj"), w.layers[30].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 30, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -15568,12 +15641,13 @@ const LoraTable* lora)
         make_weight_view(require(w.layers[31].v_proj, "layer.31.v_proj"), w.layers[31].v_proj_quant),
         ws.v.data(), N, Hk, H);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 31, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -15881,8 +15955,13 @@ const LoraTable* lora,
     const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
     std::optional<LayerScoreCapture> score_capture;
 
+    const LoraFireStateHandle* lora_staged =
+        (lora != nullptr && lora->usable() &&
+         plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get() : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
-    if (lora != nullptr && lora->usable()) {
+    if (lora != nullptr && lora->usable() &&
+        lora_staged == nullptr) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
                            /*tp=*/1, stream, ws,
                            ws.norm_x.data(),

@@ -68,8 +68,13 @@ const LoraTable* lora)
     const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
     std::optional<LayerScoreCapture> score_capture;
 
+    const LoraFireStateHandle* lora_staged =
+        (lora != nullptr && lora->usable() &&
+         plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get() : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
-    if (lora != nullptr && lora->usable()) {
+    if (lora != nullptr && lora->usable() &&
+        lora_staged == nullptr) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
                            /*tp=*/1, stream, ws,
                            ws.norm_x.data(),
@@ -92,12 +97,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 0, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -271,12 +277,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 1, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -450,12 +457,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 2, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -629,12 +637,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 3, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -808,12 +817,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 4, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -987,12 +997,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 5, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1166,12 +1177,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 6, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1345,12 +1357,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 7, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1524,12 +1537,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 8, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1703,12 +1717,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 9, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1882,12 +1897,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 10, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2061,12 +2077,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 11, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2240,12 +2257,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 12, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2419,12 +2437,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 13, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2598,12 +2617,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 14, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2777,12 +2797,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 15, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -2956,12 +2977,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 16, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3135,12 +3157,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 17, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3314,12 +3337,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 18, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3493,12 +3517,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 19, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3672,12 +3697,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 20, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -3851,12 +3877,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 21, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4030,12 +4057,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 22, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4209,12 +4237,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 23, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4388,12 +4417,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 24, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4567,12 +4597,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 25, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4746,12 +4777,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 26, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -4925,12 +4957,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 27, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -5180,8 +5213,13 @@ const LoraTable* lora)
     const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
     std::optional<LayerPrefillScoreCapture> prefill_score_capture;
 
+    const LoraFireStateHandle* lora_staged =
+        (lora != nullptr && lora->usable() &&
+         plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get() : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
-    if (lora != nullptr && lora->usable()) {
+    if (lora != nullptr && lora->usable() &&
+        lora_staged == nullptr) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
                            /*tp=*/1, stream, ws,
                            ws.norm_x.data(),
@@ -5204,12 +5242,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 0, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -5418,12 +5457,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 1, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -5632,12 +5672,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 2, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -5846,12 +5887,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 3, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6060,12 +6102,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 4, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6274,12 +6317,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 5, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6488,12 +6532,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 6, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6702,12 +6747,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 7, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -6916,12 +6962,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 8, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7130,12 +7177,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 9, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7344,12 +7392,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 10, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7558,12 +7607,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 11, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7772,12 +7822,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 12, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -7986,12 +8037,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 13, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -8200,12 +8252,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 14, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -8414,12 +8467,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 15, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -8628,12 +8682,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 16, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -8842,12 +8897,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 17, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9056,12 +9112,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 18, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9270,12 +9327,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 19, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9484,12 +9542,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 20, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9698,12 +9757,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 21, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -9912,12 +9972,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 22, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10126,12 +10187,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 23, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10340,12 +10402,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 24, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10554,12 +10617,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 25, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10768,12 +10832,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 26, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -10982,12 +11047,13 @@ const LoraTable* lora)
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
     if (lora != nullptr && lora->usable()) {
-        if (!lora_state) {
+        if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
                 "generated forward: lora correction stated but no "
                 "usable lora table (guard/pred drift)");
         }
-        lora_state->apply(
+        (lora_staged != nullptr ? *lora_staged : *lora_state)
+            .apply(
             cublas.handle(), 27, ws.norm_x.data(),
             H, Hq, Hk,
             ws.q.data(), ws.v.data(), ws.gate.data());
@@ -11274,8 +11340,13 @@ const LoraTable* lora,
     const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
     std::optional<LayerScoreCapture> score_capture;
 
+    const LoraFireStateHandle* lora_staged =
+        (lora != nullptr && lora->usable() &&
+         plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get() : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
-    if (lora != nullptr && lora->usable()) {
+    if (lora != nullptr && lora->usable() &&
+        lora_staged == nullptr) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
                            /*tp=*/1, stream, ws,
                            ws.norm_x.data(),

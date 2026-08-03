@@ -42,6 +42,10 @@ public:
                          batch::SupergraphBuilder& sg) override;
     std::uint32_t graph_layout() override;
     std::uint32_t supergraph_graph_layout() override;
+    std::uint64_t lora_stage(Workspace& ws,
+                             const LoraTable* lora,
+                             int total_tokens,
+                             cudaStream_t stream) override;
 
     // The validated declared plan (empty → nullptr), for the load-time
     // capability site summary (imodel.hpp).

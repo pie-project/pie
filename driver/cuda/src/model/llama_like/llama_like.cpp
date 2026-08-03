@@ -964,31 +964,42 @@ void llama_like_forward_paged(
     // body is byte-for-byte what it was ("with no adapters the code is
     // what it was").
     const bool has_lora = lora != nullptr && lora->usable();
+    // Campaign step 3a: prefer the ENGINE-staged state (staged outside
+    // any capture region; identity-checked against this fire's table).
+    // Local staging remains the fallback for callers that never invoke
+    // the stage hook.
+    const LoraFireStateHandle* lora_staged =
+        (has_lora && plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get()
+            : nullptr;
     std::optional<LoraFireState> lora_state;
-    if (has_lora) {
+    if (has_lora && lora_staged == nullptr) {
         lora_state.emplace(
             *lora, cfg, N, H, Hq, Hk, I, T, stream, ws.lora_arena,
             fwd_cfg.norm_placement == NormPlacement::Post
                 ? static_cast<const void*>(ws.y.data())
                 : static_cast<const void*>(ws.norm_x.data()),
             ws.q.data(), ws.v.data(), ws.gate.data());
-        // Co-batch evidence, PIE_HOOK_PREFIX_TRACE's pattern: one line per
-        // fire proving how many request rows this fire carries (R) and how
-        // many of them are adapter lanes with which token spans. R > lanes'
-        // covered rows means adapter and no-adapter lanes shared the fire.
-        if (std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
-            std::string spans;
-            for (std::uint32_t i = 0; i < lora->count; ++i) {
-                const LoraLaneView& lane = lora->lanes[i];
-                spans += (i == 0 ? "" : ",");
-                spans += std::to_string(lane.token_start) + "+" +
-                         std::to_string(lane.token_count);
-            }
-            std::fprintf(stderr,
-                         "[lora-fire] R=%d lanes=%u spans=%s grouping=%s\n",
-                         R, lora->count, spans.c_str(),
-                         lora_state->grouping_desc().c_str());
+    }
+    // Co-batch evidence, PIE_HOOK_PREFIX_TRACE's pattern: one line per
+    // fire proving how many request rows this fire carries (R) and how
+    // many of them are adapter lanes with which token spans. R > lanes'
+    // covered rows means adapter and no-adapter lanes shared the fire.
+    if (has_lora && std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
+        std::string spans;
+        for (std::uint32_t i = 0; i < lora->count; ++i) {
+            const LoraLaneView& lane = lora->lanes[i];
+            spans += (i == 0 ? "" : ",");
+            spans += std::to_string(lane.token_start) + "+" +
+                     std::to_string(lane.token_count);
         }
+        std::fprintf(stderr,
+                     "[lora-fire] R=%d lanes=%u spans=%s grouping=%s%s\n",
+                     R, lora->count, spans.c_str(),
+                     lora_staged != nullptr
+                         ? lora_staged->grouping_desc().c_str()
+                         : lora_state->grouping_desc().c_str(),
+                     lora_staged != nullptr ? " (engine-staged)" : "");
     }
 
     // When head_dim is padded, the attention kernel runs at `dk`
@@ -1226,7 +1237,11 @@ void llama_like_forward_paged(
         // (rank <= I is validated at fire setup), and the grouped
         // lanes' packed per-lane regions (sum of spans x rank <= N * I,
         // verified against this alias's bound at fire setup).
-        if (has_lora) {
+        if (has_lora && lora_staged != nullptr) {
+            lora_staged->apply(
+                cublas.handle(), L, qkv_in, H, Hq, Hk,
+                ws.q.data(), ws.v.data(), ws.gate.data());
+        } else if (has_lora) {
             lora_state->apply(
                 cublas.handle(), L, qkv_in, H, Hq, Hk,
                 ws.q.data(), ws.v.data(), ws.gate.data());
@@ -1811,6 +1826,57 @@ void apply_rope_config(LlamaLikeForwardCfg& fwd_cfg, const HfConfig& hf) {
     fwd_cfg.yarn_beta_fast             = hf.rope_beta_fast;
     fwd_cfg.yarn_beta_slow             = hf.rope_beta_slow;
     fwd_cfg.yarn_attention_factor      = hf.rope_attention_factor;
+}
+
+
+std::uint64_t llama_like_lora_stage(
+    LlamaLikePlanState& state,
+    Workspace& ws,
+    const LoraTable* lora,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    int total_tokens,
+    cudaStream_t stream)
+{
+    if (lora == nullptr || !lora->usable()) {
+        state.lora_staged.reset();
+        state.lora_staged_table = nullptr;
+        return 0;
+    }
+    const int H = cfg.hidden_size;
+    const int Hq = cfg.num_attention_heads * cfg.head_dim;
+    const int Hk = cfg.num_key_value_heads * cfg.head_dim;
+    const int I = cfg.intermediate_size;
+    const int T = fwd_cfg.tp_size > 0 ? fwd_cfg.tp_size : 1;
+    const bool post_norm =
+        fwd_cfg.norm_placement == NormPlacement::Post;
+    state.lora_staged = std::make_unique<LoraFireStateHandle>(
+        *lora, cfg, total_tokens, H, Hq, Hk, I, T, stream, ws,
+        post_norm ? static_cast<const void*>(ws.y.data())
+                  : static_cast<const void*>(ws.norm_x.data()),
+        ws.q.data(), ws.v.data(), ws.gate.data());
+    state.lora_staged_table = lora;
+
+    // Fingerprint: everything a captured lora body bakes. splitmix mix.
+    auto mix = [](std::uint64_t x) {
+        x += 0x9e3779b97f4a7c15ull;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+        return x ^ (x >> 31);
+    };
+    std::uint64_t h = mix(static_cast<std::uint64_t>(lora->count));
+    h ^= mix(static_cast<std::uint64_t>(total_tokens));
+    h ^= mix(lora_grouped_enabled() ? 1u : 2u);
+    h ^= mix(reinterpret_cast<std::uintptr_t>(ws.lora_arena.buf.data()));
+    for (std::uint32_t i = 0; i < lora->count; ++i) {
+        const LoraLaneView& v = lora->lanes[i];
+        h ^= mix(v.rank) + mix(v.d_in) * 3 + mix(v.d_out) * 5;
+        h ^= mix(v.sites_bits) + mix(v.token_start) * 7 +
+             mix(v.token_count) * 11;
+        h ^= mix(reinterpret_cast<std::uintptr_t>(v.a));
+        h ^= mix(reinterpret_cast<std::uintptr_t>(v.b));
+    }
+    return h == 0 ? 1 : h;
 }
 
 // ── LoraFireStateHandle: the opaque fire-scoped staging the declared

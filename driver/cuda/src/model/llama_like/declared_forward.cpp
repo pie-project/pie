@@ -545,19 +545,29 @@ void llama_like_forward_declared(
     // (the hand-written `lora_state`), consumed by the HasLora guard's
     // correction launches. Constructed only when the predicate holds.
     const bool has_lora = lora != nullptr && lora->usable();
+    // Campaign step 3a: prefer the ENGINE-staged state (outside any
+    // capture region); local staging is the fallback.
+    const LoraFireStateHandle* lora_staged =
+        (has_lora && plan_state.lora_staged_table == lora)
+            ? plan_state.lora_staged.get()
+            : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
-    if (has_lora) {
+    if (has_lora && lora_staged == nullptr) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, /*tp=*/1, stream,
                            ws,
                            post_norm ? static_cast<const void*>(ws.y.data())
                                      : static_cast<const void*>(
                                            ws.norm_x.data()),
                            ws.q.data(), ws.v.data(), ws.gate.data());
-        if (std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
-            std::fprintf(stderr,
-                         "[lora-fire] declared R=%d lanes=%u grouping=%s\n",
-                         R, lora->count, lora_state->grouping_desc().c_str());
-        }
+    }
+    if (has_lora && std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[lora-fire] declared R=%d lanes=%u grouping=%s%s\n",
+                     R, lora->count,
+                     lora_staged != nullptr
+                         ? lora_staged->grouping_desc().c_str()
+                         : lora_state->grouping_desc().c_str(),
+                     lora_staged != nullptr ? " (engine-staged)" : "");
     }
 
     // With padding the attention kernel runs at `dk` but the softmax must
@@ -1207,7 +1217,7 @@ void llama_like_forward_declared(
                 // param1 rests at 0 — reading it applied layer 0's
                 // adapter slice everywhere, the bug the first live A/B
                 // caught).
-                if (!lora_state) {
+                if (lora_staged == nullptr && !lora_state) {
                     throw std::runtime_error(
                         "declared forward: lora correction stated but no "
                         "usable lora table (guard/pred drift)");
@@ -1219,9 +1229,9 @@ void llama_like_forward_declared(
                 }
                 const void* const qkv_in =
                     post_norm ? ws.y.data() : ws.norm_x.data();
-                lora_state->apply(
-                    cublas.handle(), op.layer, qkv_in, H, Hq, Hk,
-                    ws.q.data(), ws.v.data(), ws.gate.data());
+                (lora_staged != nullptr ? *lora_staged : *lora_state)
+                    .apply(cublas.handle(), op.layer, qkv_in, H, Hq, Hk,
+                           ws.q.data(), ws.v.data(), ws.gate.data());
                 break;
             }
             case LaunchKernel::WriteKvToPages: {

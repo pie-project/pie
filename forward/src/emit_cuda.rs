@@ -264,8 +264,15 @@ fn emit_class_fn(
                  if kernel == "pie_lora_qkv_correction")
     });
     if states_lora {
+        // Campaign step 3a: prefer the ENGINE-staged state (outside any
+        // capture region); local staging is the fallback.
+        b.line("    const LoraFireStateHandle* lora_staged =");
+        b.line("        (lora != nullptr && lora->usable() &&");
+        b.line("         plan_state.lora_staged_table == lora)");
+        b.line("            ? plan_state.lora_staged.get() : nullptr;");
         b.line("    std::optional<LoraFireStateHandle> lora_state;");
-        b.line("    if (lora != nullptr && lora->usable()) {");
+        b.line("    if (lora != nullptr && lora->usable() &&");
+        b.line("        lora_staged == nullptr) {");
         b.line("        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,");
         // Campaign steps 1-2: the staging arena rides on the workspace,
         // and the stage phase bakes the fire-constant buffer pointers
@@ -1272,7 +1279,7 @@ fn emit_launch(
             let layer = op
                 .layer
                 .expect("lora correction carries its layer tag");
-            b.stmt("if (!lora_state) {");
+            b.stmt("if (lora_staged == nullptr && !lora_state) {");
             b.stmt("    throw std::runtime_error(");
             b.stmt("        \"generated forward: lora correction stated but no \"");
             b.stmt("        \"usable lora table (guard/pred drift)\");");
@@ -1282,7 +1289,8 @@ fn emit_launch(
             } else {
                 "ws.norm_x.data()"
             };
-            b.stmt("lora_state->apply(");
+            b.stmt("(lora_staged != nullptr ? *lora_staged : *lora_state)");
+            b.stmt("    .apply(");
             b.stmt(&format!("    cublas.handle(), {layer}, {qkv_in},"));
             b.stmt("    H, Hq, Hk,");
             b.stmt("    ws.q.data(), ws.v.data(), ws.gate.data());");

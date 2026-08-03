@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 // Llama-like decoder forward — covers every "transformer block with
 // pre-norm + QKV/o + gate-up-down" architecture in pie_driver:
 // llama, qwen2, qwen3, phi3, olmo (post-norm variant), mistral (bf16
@@ -127,6 +129,8 @@ struct LlamaLikeVisionInputs {
 // can refresh the plan before the captured body reads from it. Hoisting
 // the plan out of the body lets the body live entirely inside a CUDA
 // graph capture region — no host-side work, no allocations.
+class LoraFireStateHandle;
+
 struct LlamaLikePlanState {
     ops::DecodePlanCachePtr decode_plan;
     ops::PrefillPlanCachePtr prefill_plan;
@@ -146,6 +150,14 @@ struct LlamaLikePlanState {
     // decide to capture on its own -- it can only honour what the prepare
     // hook already committed to.
     std::uint32_t prefill_score_window = 0;
+    // Lora campaign step 3a: the fire's PRE-STAGED lora state, staged by
+    // the engine OUTSIDE any capture region (ForwardFn::invoke_lora_stage
+    // -> LlamaLikeModel::lora_stage). Bodies consume it read-only and
+    // fall back to local staging only when the engine did not stage
+    // (e.g. a path that never calls the stage hook). Cleared/re-staged
+    // per fire by the stage call itself.
+    std::unique_ptr<LoraFireStateHandle> lora_staged;
+    const LoraTable* lora_staged_table = nullptr;
     bool use_xqa_decode = false;
     int xqa_max_pages_per_seq = 0;
     std::vector<std::uint32_t> prefill_decode_qo_indptr_h;
@@ -291,6 +303,22 @@ private:
 // Map HF's rope_scaling_kind enum onto the driver's RopeKind. Llama3-style
 // frequency scaling maps to YaRN; the "original_yarn" branch keeps
 // HuggingFace's original formulation.
+// Lora campaign step 3a: stage the fire's lora state into
+// `state.lora_staged` OUTSIDE any capture region and answer a
+// fingerprint of what was staged (0 = no lora). The fingerprint covers
+// everything a captured lora body bakes: the lane structure (count,
+// ranks, widths, sites, token spans), the adapter device pointers, the
+// grouping mode, and the post-staging arena base (a growth changes
+// addresses and must recapture).
+std::uint64_t llama_like_lora_stage(
+    LlamaLikePlanState& state,
+    Workspace& ws,
+    const LoraTable* lora,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    int total_tokens,
+    cudaStream_t stream);
+
 RopeKind rope_kind_from_hf_config(const HfConfig& hf);
 
 // Populate the RoPE-related fields on LlamaLikeForwardCfg from the

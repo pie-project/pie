@@ -100,6 +100,13 @@ void ForwardFn::invoke_body(model::Workspace& ws,
     }
 }
 
+std::uint64_t ForwardFn::invoke_lora_stage(model::Workspace& ws,
+                                           const model::LoraTable* lora,
+                                           int total_tokens,
+                                           cudaStream_t stream) {
+    return model ? model->lora_stage(ws, lora, total_tokens, stream) : 0;
+}
+
 bool ForwardFn::invoke_supergraph_body(model::Workspace& ws,
                                        KvCache& kv,
                                        AttentionWorkspace& aws,
@@ -736,6 +743,13 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     auto& forward_fn = engine.forward_fn;
 
     const bool has_hooks = in.stage_hooks != nullptr;
+    // Lora campaign step 3a: stage the fire's lora state HERE — outside
+    // any capture region, before the graph decision — so both the eager
+    // body and (step 3b) a captured one consume the same pre-staged
+    // state. A null table clears; a lora fire re-stages fresh, so the
+    // body's identity check always sees THIS fire's staging.
+    engine.forward_fn.invoke_lora_stage(
+        engine.ws, in.lora, in.forward_N, cublas.stream());
     const bool hook_blocks = hook_fire_blocks_graph(engine, has_hooks);
     const bool graph_eligible = forward_graph_replay_eligible(
         engine,

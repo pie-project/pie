@@ -263,6 +263,10 @@ struct ForwardFn {
                      AttentionWorkspace& aws,
                      ops::CublasHandle& cublas,
                      const ForwardInputs& in);
+    std::uint64_t invoke_lora_stage(model::Workspace& ws,
+                                    const model::LoraTable* lora,
+                                    int total_tokens,
+                                    cudaStream_t stream);
     bool invoke_supergraph_body(model::Workspace& ws,
                                 KvCache& kv,
                                 AttentionWorkspace& aws,
