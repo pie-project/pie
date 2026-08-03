@@ -799,3 +799,36 @@ ON). The k>1 form (per-guard conditionals + per-slot shared handles
 per scope) returns when hooks/lora join the union and the predicate
 space becomes genuinely multi-dimensional — enumerating 2^k resolved
 paths stops scaling right around k=3 at 28 layers.
+
+## The lora-graph campaign — design (2026-08-03)
+
+Today every lora fire runs eager (`!has_lora` in eligibility) — for a
+lora-serving workload that is EVERY decode step. The blockers, read
+from `LoraFireState` itself, and their resolutions:
+1. **Body-time allocation**: the A/B cast buffers and the grouped-GEMM
+   pointer slab are cudaMallocAsync'd per fire ("a lora fire never
+   enters capture, so body-time allocation is legal" — the comment
+   that stops being true). Resolution: the buffers move to a
+   fingerprint-owned persistent pool.
+2. **Per-fire staging**: the handle's constructor does host loops
+   (lane validation, cast uploads, slab fill). Resolution: split
+   stage/launch — staging becomes a prepare-style host pass OUTSIDE
+   the capture, the captured body reads only staged device buffers.
+3. **Baked GEMM shapes**: ranks, lane counts, grouping and per-lane M
+   bake into captured launches. The saving grace: in PURE DECODE every
+   lane's token span is exactly 1, so the shape set is (R, lane
+   structure, ranks) — stable across a workload's steps. Resolution:
+   a lora fingerprint (the hook-graph pattern verbatim: per-key entry
+   store, fingerprint check per fire, churn ban) keys captures;
+   replay holds while the lane structure holds.
+Steps: (1) stage/launch split + persistent buffers, eager path
+byte-stable under the lora battery; (2) fingerprint + graph
+eligibility for pure-decode lora fires (own exec store, hook
+pattern); (3) union entry — lora as a third resolved path (mask x
+lora paths at k=2 still enumerable; the per-guard shared-handle form
+waits for k=3).
+
+Consolidated sweep at tip `4dcd7b112` (default-on era): forward 78 +
+engine 395 + ABI green; qwen3 GEN short byte-stable vs the prior
+sweep; holed mixed tokens historical; hook battery 12/12 runs — the
+supergraph default holds under the whole net.
