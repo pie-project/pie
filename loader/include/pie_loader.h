@@ -12,12 +12,6 @@ struct PieLoaderPlan;
 
 namespace pie_loader {
 
-/// The alignment to write. 16 KiB is Apple silicon's page; x86-64 Linux uses 4
-/// KiB, which divides it, so one artifact is streamable on both. Padding to the
-/// larger costs at most 12 KiB per aligned tensor, against the megabytes that
-/// make a tensor worth streaming in the first place.
-constexpr static const uint64_t STREAM_PAGE_BYTES = 16384;
-
 /// `PieLoaderExprNode::src` when the node has no single operand.
 constexpr static const uint32_t PIE_LOADER_NO_NODE = UINT32_MAX;
 
@@ -73,6 +67,9 @@ enum class PieLoaderCheckpointFormat : uint32_t {
   Safetensors = 0,
   Gguf = 1,
   Unknown = 2,
+  /// Appended: adding a value in the middle would renumber `Unknown` under
+  /// every driver already compiled against this header.
+  Zt = 3,
 };
 
 enum class PieLoaderSeverity : uint32_t {

@@ -117,6 +117,7 @@ fn describe(source: &Source) -> Result<CheckpointMetadata, Error> {
 
 fn checkpoint_format(label: &str) -> CheckpointFormat {
     match label {
+        "zt" => CheckpointFormat::Zt,
         "safetensors" => CheckpointFormat::Safetensors,
         "gguf" => CheckpointFormat::Gguf,
         _ => CheckpointFormat::Unknown,

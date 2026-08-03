@@ -65,11 +65,21 @@ impl DType {
     }
 }
 
+/// Which on-disk format a checkpoint file is.
+///
+/// `Unknown` keeps its ABI value, so `Zt` is appended rather than slotted in
+/// beside its siblings: a C caller compiled against the older header still
+/// reads every value it knew as the number it knew. It also still covers the
+/// formats the loader reads but does not name here — `.npz`, `.pt`, `.h5`,
+/// `.onnx` — which are read through the same projection and would each be
+/// another ABI value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CheckpointFormat {
     Safetensors,
     Gguf,
     Unknown,
+    /// The loader's own container (`.zt`), including a root that names shards.
+    Zt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

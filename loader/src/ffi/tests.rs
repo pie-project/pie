@@ -1540,6 +1540,7 @@ fn mirror_enum_discriminants_are_pinned() {
     assert_eq!(PieLoaderCheckpointFormat::Safetensors as u32, 0);
     assert_eq!(PieLoaderCheckpointFormat::Gguf as u32, 1);
     assert_eq!(PieLoaderCheckpointFormat::Unknown as u32, 2);
+    assert_eq!(PieLoaderCheckpointFormat::Zt as u32, 3);
 }
 
 /// The operation tag is the first four bytes of `PieLoaderStorageOp`, and this

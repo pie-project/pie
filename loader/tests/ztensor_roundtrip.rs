@@ -246,3 +246,25 @@ fn a_sharded_root_addresses_bytes_in_its_shards() {
     assert_eq!(file_of(embed.file_id), shard_path.display().to_string());
     assert_eq!(file_of(norm.file_id), root.display().to_string());
 }
+
+/// A `.zt` checkpoint reports itself as `.zt`.
+///
+/// It used to come back `Unknown` — the enum predated the zTensor reader and
+/// never grew a variant for the loader's own container. This reads the format
+/// off a real file rather than the mapping table, so it also covers a shard,
+/// which is a `.zt` reached a different way.
+#[test]
+fn a_zt_checkpoint_says_it_is_zt() {
+    use pie_loader::types::CheckpointFormat;
+
+    let dir = tmpdir("format");
+    let path = dir.join("model.zt");
+    write_zt(
+        &path,
+        &[("w", vec![2], ztensor::DType::F32, f32_bytes(&[1.0, 2.0]))],
+    );
+
+    let metadata = parse_checkpoint(&path).unwrap();
+    assert_eq!(metadata.files.len(), 1);
+    assert_eq!(metadata.files[0].format, CheckpointFormat::Zt);
+}
