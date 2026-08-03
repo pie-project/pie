@@ -225,9 +225,16 @@ class Approximations(unittest.TestCase):
         self.assertEqual(self.engine.compile_json_schema(schema).relaxations, [])
 
     def test_an_open_object_declares_that_a_declared_type_may_not_hold(self):
+        """The declaration has to match what the mask actually does.
+
+        Excluding the declared names from the generic key is exact and regular
+        and `Exact` does it. It is not the default because doing it per object
+        under a budget was measured at 4x compile time - p50 121 ms against 488
+        over the corpus - for 13% less over-acceptance, and tightening the
+        budget until compile recovered took the benefit with it.
+        """
         schema = json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
         grammar = self.engine.compile_json_schema(schema)
-        # The declaration has to match what the mask actually does.
         self.assertEqual(len(grammar.relaxations), 1)
         self.assertTrue(self.accepts(grammar, '{"a":1}'))
 

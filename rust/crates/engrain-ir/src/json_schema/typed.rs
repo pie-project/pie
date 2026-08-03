@@ -652,6 +652,10 @@ impl<'a> Converter<'a> {
         // `additionalProperties: false` allows *only* these keys, which is why
         // the pattern pairs have to survive `additional` being absent.
         let mut repeatable = Vec::new();
+        // Whether a generic key can spell a name this object declares. False
+        // means the two readings are disjoint and nothing forks here, which is
+        // what lets `build_unordered` use the larger budget.
+        let mut disjoint = true;
         for (pattern, sub) in object
             .get("patternProperties")
             .map(|value| {
@@ -678,12 +682,21 @@ impl<'a> Converter<'a> {
                 .flat_map(|declared| declared.keys())
                 .cloned()
                 .collect();
+            // Only at `Exact`, and that was measured rather than assumed:
+            // doing it per object under a budget - eight names, sixty-four
+            // bytes, sixteen distinct sets a schema - took over-acceptance
+            // from 101 walks to 88 and cost 4x compile time, p50 121 ms
+            // against 488, on the number this project is already worst at.
+            // Tightening the budget until compile recovered took the benefit
+            // with it: `required`, which is what the exclusion was for, went
+            // back to exactly where it had been.
             let excluded = self
                 .options
                 .precision
                 .excludes_declared_names()
                 .then(|| string_body_excluding(&declared))
                 .flatten();
+            disjoint = excluded.is_some() || declared.is_empty();
             let name = match excluded {
                 Some(body) => self.lexeme(
                     "key",
@@ -721,7 +734,8 @@ impl<'a> Converter<'a> {
         if self.options.precision.enforces_counting()
             && min <= required.len() as u32
             && max.is_none()
-            && let Some(object) = self.build_unordered(hint, &known, &additional_pair)?
+            && let Some(object) =
+                self.build_unordered(hint, &known, &additional_pair, disjoint)?
         {
             return Ok(object);
         }
@@ -781,6 +795,7 @@ impl<'a> Converter<'a> {
         hint: &str,
         known: &[Property],
         additional: &Option<Expr>,
+        disjoint: bool,
     ) -> Result<Option<Expr>> {
         let required: Vec<usize> = known
             .iter()
@@ -797,8 +812,12 @@ impl<'a> Converter<'a> {
         // on. The budget is therefore the matcher's configuration budget seen
         // from the other side, and it is tighter when a generic key exists.
         let budget = match additional {
-            Some(_) => UNORDERED_REQUIRED_BUDGET_OPEN,
-            None => UNORDERED_REQUIRED_BUDGET_CLOSED,
+            // An open object whose generic key excludes the declared names has
+            // no second reading to fork on, so its subsets cost grammar size
+            // rather than live configurations - the same position a closed
+            // object is in, and it gets the same budget.
+            Some(_) if !disjoint => UNORDERED_REQUIRED_BUDGET_OPEN,
+            _ => UNORDERED_REQUIRED_BUDGET_CLOSED,
         };
         if required.len() > budget {
             return Ok(None);
@@ -928,6 +947,8 @@ pub const UNORDERED_REQUIRED_BUDGET_OPEN: usize = 7;
 /// there, so the subsets are grammar states rather than live configurations
 /// and the budget is bounded by size alone, which is why it is higher.
 pub const UNORDERED_REQUIRED_BUDGET_CLOSED: usize = 10;
+
+
 
 #[derive(Clone)]
 struct Property {
