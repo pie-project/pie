@@ -1250,14 +1250,11 @@ void llama_like_forward_declared(
                             "spatial mask: the XQA prefix is not wired "
                             "yet (its fire-wide prepare is R-shaped)");
                     }
-                    if (decode_plan == nullptr ||
-                        mask_suffix_qo_indptr_d == nullptr ||
-                        mask_suffix_kv_page_indptr_d == nullptr) {
+                    if (decode_plan == nullptr) {
                         throw std::runtime_error(
-                            "spatial mask: split active but the prefix "
-                            "plan or suffix CSRs are missing");
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
                     }
-                    const int rs = R - split;
                     const int layer_window_left =
                         (!fwd_cfg.per_layer_window_left.empty() &&
                          L < static_cast<int>(
@@ -1271,17 +1268,30 @@ void llama_like_forward_declared(
                         kv_last_page_lens,
                         attn_ws, stream, layer_window_left,
                         /*logits_soft_cap=*/0.f, sm_scale_override);
+                    // The suffix: BASE buffers + device CSR pointers at
+                    // +split with their ABSOLUTE values — the kernel
+                    // indexes rows through the indptr values, so the
+                    // composed device truth needs no rebasing and no
+                    // host knowledge (composed-envelope lanes' host
+                    // views are placeholders).
+                    if (mask_suffix_qo_indptr_d == nullptr) {
+                        throw std::runtime_error(
+                            "spatial mask: suffix qo identity missing");
+                    }
+                    // Hybrid addressing, measured live: the kernel's q/o rows are
+                    // plan/qo[0]-relative (offset pointers + the identity qo), the
+                    // KV side reads the device CSR ABSOLUTELY (base indices +
+                    // +split indptr — the composed device truth, no host rebase).
                     ops::dispatch_attention_flashinfer_prefill_custom(
                         *mask_plan,
                         bf16_row(attn_q, split, Hq), kv_view,
                         bf16_row(attn_out_buf, split, Hq),
                         mask_suffix_qo_indptr_d,
-                        kv_page_indices + kv_page_indptr_h[split],
-                        mask_suffix_kv_page_indptr_d,
+                        kv_page_indices,
+                        kv_page_indptr + split,
                         kv_last_page_lens + split,
                         custom_mask_d, custom_mask_indptr_d + split,
                         attn_ws, stream);
-                    (void)rs;
                     break;
                 }
                 ops::dispatch_attention_flashinfer_prefill_custom(

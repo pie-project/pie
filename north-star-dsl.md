@@ -1348,3 +1348,35 @@ consumes) and in the composed DEVICE CSRs. The fix, pinned:
    frame's resolved_custom_wire stays single-program (the reverted
    extension's lesson: a composed spatial step's wire rows are the
    WIRE lanes' synthesized causal masks, pure-causal by the walk).
+
+## THE SPATIAL FIRE IS CORRECT (2026-08-03) — NS-2 live gates green
+
+The masked-suffix fix that landed it, measured against two failed
+addressing hypotheses: the custom kernel's q/o side is
+plan/qo[0]-RELATIVE (offset q/out pointers + the uploaded identity
+qo), while its KV side reads the device CSR ABSOLUTELY (base page
+indices + kv_page_indptr at +split with composed-device values — no
+host rebase, no host knowledge). The suffix PLAN's host counts come
+from the RESOLVER's per-program geometry, harvested by the spatial
+dense-pack block onto the wave state and threaded into prepare
+(mask_suffix_page_counts_h / last_lens_h) — the host wire views are
+placeholders for composed-envelope lanes and produced attempt 4's
+garbage.
+
+Gates, with the corrected statement:
+- masked mixed == masked solo: BYTE-EQUAL through the spatial fire
+  ([spatial-mask] R=2 split=1; prefix decode kernel + suffix custom
+  kernel + shared everything else, one fire).
+- plain mixed vs plain solo diverges at ~token 30 — and the CONTROL
+  (two PLAIN lanes co-batched, no mask anywhere) diverges the same
+  way: this is the generic co-batch GEMM-rounding class that has
+  always existed at N>1, not a spatial defect. The original gate
+  statement ("plain mixed == plain solo") was stronger than the
+  system's own invariant; the corrected gate is "masked == solo, and
+  plain divergence bounded to the generic co-batch class" — both
+  hold.
+
+NS-2 is therefore LIVE and correct, eager, PIE_SPATIAL_MASK-gated.
+What remains on the ladder: default-on decision after the wide
+battery + sweep; NS-3 (region windows + graphing the split); NS-4
+(union pass); NS-5 (retire the two-path form).

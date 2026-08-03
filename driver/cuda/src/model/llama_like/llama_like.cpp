@@ -675,7 +675,9 @@ void prepare_llama_like_decode_plan(
     bool is_pure_decode,
     bool have_custom_mask,
     std::uint32_t attn_score_window,
-    std::uint32_t unmasked_prefix_rows)
+    std::uint32_t unmasked_prefix_rows,
+    const std::uint32_t* mask_suffix_page_counts_h,
+    const std::uint32_t* mask_suffix_last_lens_h)
 {
     // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
     // pinned/device buffers in `attn_ws` that the captured body reads via
@@ -723,12 +725,27 @@ void prepare_llama_like_decode_plan(
             static_cast<std::size_t>(rs) + 1);
         std::vector<std::uint32_t> kvpp_suffix(
             static_cast<std::size_t>(rs) + 1);
-        const std::uint32_t page_base = kv_page_indptr_h[split];
+        // Composed-envelope fires: the host wire CSRs are placeholders;
+        // the RESOLVER's per-suffix-lane geometry (threaded from the
+        // frame's spatial pack) is the planning truth. Wire-composed
+        // fires fall back to the host CSR slices.
         for (int i = 0; i <= rs; ++i) {
             qo_suffix[static_cast<std::size_t>(i)] =
                 static_cast<std::uint32_t>(i);
-            kvpp_suffix[static_cast<std::size_t>(i)] =
-                kv_page_indptr_h[split + i] - page_base;
+        }
+        if (mask_suffix_page_counts_h != nullptr) {
+            kvpp_suffix[0] = 0;
+            for (int i = 0; i < rs; ++i) {
+                kvpp_suffix[static_cast<std::size_t>(i) + 1] =
+                    kvpp_suffix[static_cast<std::size_t>(i)] +
+                    mask_suffix_page_counts_h[i];
+            }
+        } else {
+            const std::uint32_t page_base = kv_page_indptr_h[split];
+            for (int i = 0; i <= rs; ++i) {
+                kvpp_suffix[static_cast<std::size_t>(i)] =
+                    kv_page_indptr_h[split + i] - page_base;
+            }
         }
         if (!state.mask_decode_plan) {
             state.mask_decode_plan = ops::make_prefill_plan();
@@ -738,7 +755,9 @@ void prepare_llama_like_decode_plan(
             *state.mask_decode_plan,
             qo_suffix.data(),
             kvpp_suffix.data(),
-            kv_last_page_lens_h + split,
+            mask_suffix_last_lens_h != nullptr
+                ? mask_suffix_last_lens_h
+                : kv_last_page_lens_h + split,
             rs,
             rs,
             cfg.num_attention_heads / T,
@@ -1688,12 +1707,10 @@ void llama_like_forward_paged(
                         "spatial mask: the planned split and the prepared "
                         "split drifted");
                 }
-                if (decode_plan == nullptr ||
-                    mask_suffix_qo_indptr_d == nullptr ||
-                    mask_suffix_kv_page_indptr_d == nullptr) {
+                if (decode_plan == nullptr) {
                     throw std::runtime_error(
-                        "spatial mask: split active but the prefix plan "
-                        "or suffix CSRs are missing");
+                        "spatial mask: split active but prepare built no "
+                        "prefix decode plan");
                 }
                 ops::dispatch_attention_flashinfer_decode(
                     *decode_plan,
@@ -1701,13 +1718,23 @@ void llama_like_forward_paged(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, sm_scale_override);
+                // BASE buffers + ABSOLUTE device CSR values at +split —
+                // see the interpreter's split branch for why no rebasing.
+                if (mask_suffix_qo_indptr_d == nullptr) {
+                    throw std::runtime_error(
+                        "spatial mask: suffix qo identity missing");
+                }
+                // Hybrid addressing, measured live: the kernel's q/o rows are
+                // plan/qo[0]-relative (offset pointers + the identity qo), the
+                // KV side reads the device CSR ABSOLUTELY (base indices +
+                // +split indptr — the composed device truth, no host rebase).
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *mask_plan,
                     bf16_row(attn_q, split, Hq), kv_view,
                     bf16_row(attn_out_buf, split, Hq),
                     mask_suffix_qo_indptr_d,
-                    kv_page_indices + kv_page_indptr_h[split],
-                    mask_suffix_kv_page_indptr_d,
+                    kv_page_indices,
+                    kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
                     attn_ws, stream);

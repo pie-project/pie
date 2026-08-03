@@ -688,6 +688,12 @@ struct PreparedStep::Impl {
     int pack_dense_lanes = 0;
     int pack_dense_stride = 0;
     std::size_t pack_dense_bytes = 0;
+    // NS-2: the masked program's RESOLVED per-suffix-lane geometry (page
+    // counts + last-page lens), harvested by the spatial dense pack for
+    // the suffix mask PLAN (the host wire views are placeholders for
+    // composed-envelope lanes).
+    std::vector<std::uint32_t> spatial_suffix_page_counts;
+    std::vector<std::uint32_t> spatial_suffix_last_lens;
 
     // RS.
     pipeline::RsExecutionPlan rs_plan;
@@ -1748,6 +1754,10 @@ void prepare_step(
                 static_cast<std::size_t>(lanes), 0);
             std::vector<std::int32_t> mindptr(
                 static_cast<std::size_t>(lanes) + 1, 0);
+            s.spatial_suffix_page_counts.assign(
+                static_cast<std::size_t>(suffix), 0);
+            s.spatial_suffix_last_lens.assign(
+                static_cast<std::size_t>(suffix), 0);
             for (int l = 0; l < lanes; ++l) {
                 std::uint32_t k = 0;
                 if (l >= split) {
@@ -1767,6 +1777,10 @@ void prepare_step(
                                ? fg.kv_last_page_lens[fl]
                                : 0u)
                         : kvlpl_view[l];
+                    s.spatial_suffix_page_counts[
+                        static_cast<std::size_t>(fl)] = np;
+                    s.spatial_suffix_last_lens[
+                        static_cast<std::size_t>(fl)] = lpl;
                     k = np == 0 ? 0u : (np - 1) * page + lpl;
                 }
                 klen[l] = k;
@@ -2564,6 +2578,14 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                         : 0u,
                 .unmasked_prefix_rows =
                     s.dispatch_view.planned_unmasked_prefix_rows,
+                .mask_suffix_page_counts_h =
+                    s.spatial_suffix_page_counts.empty()
+                        ? nullptr
+                        : s.spatial_suffix_page_counts.data(),
+                .mask_suffix_last_lens_h =
+                    s.spatial_suffix_last_lens.empty()
+                        ? nullptr
+                        : s.spatial_suffix_last_lens.data(),
             });
         engine.attn_ws.end_plan_update(cublas.stream());
         plan_timer.stop();

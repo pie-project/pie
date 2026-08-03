@@ -265,6 +265,13 @@ struct ForwardFn {
         // the spatial-mask gate is on, prepare builds BOTH the prefix
         // decode plan and the rebased suffix mask plan.
         std::uint32_t unmasked_prefix_rows = 0xffffffffu;
+        // NS-2: the masked program's RESOLVED per-suffix-lane geometry
+        // (page counts / last-page lens), from the frame's spatial dense
+        // pack. The suffix mask plan MUST use these — the host wire views
+        // are placeholders for composed-envelope lanes. Null when the fire
+        // is not a spatial compose.
+        const std::uint32_t* mask_suffix_page_counts_h = nullptr;
+        const std::uint32_t* mask_suffix_last_lens_h = nullptr;
     };
 
     // The arch implementation. context.cpp sets this once at construction;

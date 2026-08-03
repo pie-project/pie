@@ -196,7 +196,12 @@ void prepare_llama_like_decode_plan(
     // When 0 < value < R on a masked pure-decode fire and PIE_SPATIAL_MASK
     // is armed, prepare builds the PREFIX decode plan and the rebased
     // SUFFIX mask plan, and records the split on the plan state.
-    std::uint32_t unmasked_prefix_rows = 0xffffffffu);
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu,
+    // NS-2: resolved suffix geometry for the mask plan (see
+    // ForwardFn::PrepareInputs) — required when the split is active on a
+    // composed-envelope fire, else the host CSR slices serve.
+    const std::uint32_t* mask_suffix_page_counts_h = nullptr,
+    const std::uint32_t* mask_suffix_last_lens_h = nullptr);
 
 std::uint32_t llama_like_supergraph_graph_layout(
     const LlamaLikePlanState& state);
