@@ -38,8 +38,8 @@ pub struct Image {
     pub patch_grid: multimodal::Grid,
     /// Model-specific delimiter tokens the context places immediately before /
     /// after this span (e.g. Qwen `<|vision_start|>` / `<|vision_end|>`). Empty
-    /// when the model needs none. The SDK's `append-image` applies them, so the
-    /// inferlet never names them.
+    /// when the model needs none. A guest reads them off the span and splices
+    /// them in, so it never names them itself.
     pub prefix: Vec<u32>,
     pub suffix: Vec<u32>,
 }

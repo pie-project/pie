@@ -640,8 +640,9 @@ pub fn audio_arch_supported(arch: &str) -> bool {
 }
 
 /// Delimiter *strings* the model wraps a visual span with — encoded host-side by
-/// the model's own tokenizer and applied by the SDK's `append-image`, so the
-/// inferlet never names them. `("", "")` means the model needs none. (Qwen3-VL
+/// the model's own tokenizer and surfaced as `image.prefix-tokens` /
+/// `image.suffix-tokens`, so the inferlet never names them. `("", "")` means
+/// the model needs none. (Qwen3-VL
 /// wraps image rows in `<|vision_start|>` / `<|vision_end|>`; Gemma 4 needs none
 /// here, matching the verified behavior.)
 pub fn vision_delimiters(arch: VisionArch) -> (&'static str, &'static str) {

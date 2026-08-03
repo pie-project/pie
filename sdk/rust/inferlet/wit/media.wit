@@ -42,8 +42,8 @@ interface media {
 
         // Model-specific delimiter tokens the context must place immediately
         // before / after this span (e.g. Qwen `<|vision_start|>` /
-        // `<|vision_end|>`); empty for models that need none. The SDK's
-        // `append-image` applies these so the inferlet stays model-agnostic.
+        // `<|vision_end|>`); empty for models that need none. A guest splices
+        // these around the span's tokens so it stays model-agnostic.
         prefix-tokens: func() -> list<u32>;
         suffix-tokens: func() -> list<u32>;
     }
