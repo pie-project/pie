@@ -257,6 +257,184 @@ int main() {
         }
     }
 
+    // ── Kernel 4: fused decode epilogue (PREFIX form) ────────────────
+    // The devwin word is the TAIL {start, len}; the prefix form owns
+    // rows [0, word[0]). Host reference: the plain launcher with
+    // num_requests = prefix count. Covers the warp kernel (head_dim 64)
+    // and the block fallback (head_dim 32), both page layouts.
+    {
+        constexpr int kQH4 = 2, kKH4 = 1;
+        const int prefix_counts[] = {0, 3, kLanes};
+        for (const int hd : {64, 32}) {
+            const int q_dim = kQH4 * hd;
+            const int kv_dim = kKH4 * hd;
+            const int stride = q_dim + 2 * kv_dim;
+            const long long cache_elems =
+                static_cast<long long>(kPages) * kPageSize * kKH4 * hd;
+            std::vector<std::uint16_t> packed_h(kLanes * stride), wq_h(hd),
+                wk_h(hd);
+            for (std::size_t i = 0; i < packed_h.size(); ++i)
+                packed_h[i] = static_cast<std::uint16_t>(0x3900 + i * 13);
+            for (int i = 0; i < hd; ++i) {
+                wq_h[i] = static_cast<std::uint16_t>(0x3f80 - i);
+                wk_h[i] = static_cast<std::uint16_t>(0x3f00 + i);
+            }
+            std::vector<std::int32_t> pos_h(kLanes);
+            for (int i = 0; i < kLanes; ++i) pos_h[i] = 5 + i * 9;
+            std::uint16_t *packed_d{}, *qa{}, *qb{}, *cka{}, *cva{}, *ckb{},
+                *cvb{}, *wq{}, *wk{};
+            std::int32_t* pos_d{};
+            CUDA_CHECK(cudaMalloc(&packed_d, packed_h.size() * 2));
+            CUDA_CHECK(cudaMalloc(&qa, kLanes * q_dim * 2));
+            CUDA_CHECK(cudaMalloc(&qb, kLanes * q_dim * 2));
+            CUDA_CHECK(cudaMalloc(&cka, cache_elems * 2));
+            CUDA_CHECK(cudaMalloc(&cva, cache_elems * 2));
+            CUDA_CHECK(cudaMalloc(&ckb, cache_elems * 2));
+            CUDA_CHECK(cudaMalloc(&cvb, cache_elems * 2));
+            CUDA_CHECK(cudaMalloc(&wq, hd * 2));
+            CUDA_CHECK(cudaMalloc(&wk, hd * 2));
+            CUDA_CHECK(cudaMalloc(&pos_d, kLanes * 4));
+            CUDA_CHECK(cudaMemcpy(packed_d, packed_h.data(),
+                                  packed_h.size() * 2,
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(wq, wq_h.data(), hd * 2,
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(wk, wk_h.data(), hd * 2,
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(pos_d, pos_h.data(), kLanes * 4,
+                                  cudaMemcpyHostToDevice));
+            for (const bool hnd : {false, true}) {
+                for (const int c : prefix_counts) {
+                    CUDA_CHECK(cudaMemset(qa, 0xEE, kLanes * q_dim * 2));
+                    CUDA_CHECK(cudaMemset(qb, 0xEE, kLanes * q_dim * 2));
+                    CUDA_CHECK(cudaMemset(cka, 0xAB, cache_elems * 2));
+                    CUDA_CHECK(cudaMemset(cva, 0xAB, cache_elems * 2));
+                    CUDA_CHECK(cudaMemset(ckb, 0xAB, cache_elems * 2));
+                    CUDA_CHECK(cudaMemset(cvb, 0xAB, cache_elems * 2));
+                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                        packed_d, qa, cka, cva, wq, wk, pos_d,
+                        /*rope_table=*/nullptr,
+                        /*kv_page_indices=*/nullptr,
+                        /*kv_page_indptr=*/nullptr,
+                        /*kv_last_page_lens=*/nullptr,
+                        wp_d, wo_d, /*row_valid=*/nullptr,
+                        c, kQH4, kKH4, hd, kPageSize, hnd,
+                        /*theta=*/10000.f, /*eps=*/1e-6f, s);
+                    const std::uint32_t win_h[2] = {
+                        static_cast<std::uint32_t>(c),
+                        static_cast<std::uint32_t>(kLanes - c)};
+                    CUDA_CHECK(cudaMemcpyAsync(win_d, win_h, 8,
+                                               cudaMemcpyHostToDevice, s));
+                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+                        packed_d, qb, ckb, cvb, wq, wk, pos_d,
+                        nullptr, nullptr, nullptr, nullptr,
+                        wp_d, wo_d, nullptr,
+                        win_d, kLanes, kQH4, kKH4, hd, kPageSize, hnd,
+                        10000.f, 1e-6f, s);
+                    CUDA_CHECK(cudaStreamSynchronize(s));
+                    auto cmp = [](const void* x, const void* y,
+                                  std::size_t n) {
+                        std::vector<std::uint8_t> a(n), b(n);
+                        CUDA_CHECK(cudaMemcpy(a.data(), x, n,
+                                              cudaMemcpyDeviceToHost));
+                        CUDA_CHECK(cudaMemcpy(b.data(), y, n,
+                                              cudaMemcpyDeviceToHost));
+                        return std::memcmp(a.data(), b.data(), n) == 0;
+                    };
+                    const bool eq =
+                        cmp(qa, qb, kLanes * q_dim * 2) &&
+                        cmp(cka, ckb, cache_elems * 2) &&
+                        cmp(cva, cvb, cache_elems * 2);
+                    std::printf("fusedpost hd=%d hnd=%d prefix=%d: %s\n",
+                                hd, hnd ? 1 : 0, c, eq ? "eq" : "NE");
+                    ok = ok && eq;
+                }
+            }
+        }
+    }
+
+    // ── Kernel 5: write_kv_to_pages (TAIL form) ──────────────────────
+    // Host reference: the CSR-derived append with first_token = the
+    // window start (the only host-expressible windows are suffixes).
+    {
+        std::vector<std::uint32_t> qo_h(kLanes + 1), kvpp_h(kLanes + 1),
+            kvpi_h(kLanes), kvlpl_h(kLanes);
+        for (int r = 0; r <= kLanes; ++r) {
+            qo_h[r] = static_cast<std::uint32_t>(r);
+            kvpp_h[r] = static_cast<std::uint32_t>(r);
+        }
+        for (int r = 0; r < kLanes; ++r) {
+            kvpi_h[r] = static_cast<std::uint32_t>((r * 3 + 2) % kPages);
+            kvlpl_h[r] = static_cast<std::uint32_t>(1 + (r % kPageSize));
+        }
+        std::uint32_t *qo_d{}, *kvpp_d{}, *kvpi_d{}, *kvlpl_d{};
+        CUDA_CHECK(cudaMalloc(&qo_d, (kLanes + 1) * 4));
+        CUDA_CHECK(cudaMalloc(&kvpp_d, (kLanes + 1) * 4));
+        CUDA_CHECK(cudaMalloc(&kvpi_d, kLanes * 4));
+        CUDA_CHECK(cudaMalloc(&kvlpl_d, kLanes * 4));
+        CUDA_CHECK(cudaMemcpy(qo_d, qo_h.data(), (kLanes + 1) * 4,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(kvpp_d, kvpp_h.data(), (kLanes + 1) * 4,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(kvpi_d, kvpi_h.data(), kLanes * 4,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(kvlpl_d, kvlpl_h.data(), kLanes * 4,
+                              cudaMemcpyHostToDevice));
+        const int tail_starts[] = {0, 3, kLanes};
+        for (const bool hnd : {false, true}) {
+            for (const int c : tail_starts) {
+                KvCacheLayerView layer{};
+                layer.num_pages = kPages;
+                layer.page_size = kPageSize;
+                layer.num_kv_heads = kHkv;
+                layer.head_dim = kDim;
+                layer.hnd_layout = hnd;
+                layer.native_bf16 = true;
+
+                CUDA_CHECK(cudaMemset(cache_a_k, 0xAB, kCacheElems * 2));
+                CUDA_CHECK(cudaMemset(cache_a_v, 0xAB, kCacheElems * 2));
+                CUDA_CHECK(cudaMemset(cache_b_k, 0xAB, kCacheElems * 2));
+                CUDA_CHECK(cudaMemset(cache_b_v, 0xAB, kCacheElems * 2));
+
+                layer.k_pages = cache_a_k;
+                layer.v_pages = cache_a_v;
+                kernels::launch_write_kv_to_pages(
+                    layer, k_d, v_d, qo_d, kvpi_d, kvpp_d, kvlpl_d,
+                    kLanes, kLanes, s, /*row_valid=*/nullptr,
+                    /*first_token=*/c);
+
+                layer.k_pages = cache_b_k;
+                layer.v_pages = cache_b_v;
+                const std::uint32_t win_h[2] = {
+                    static_cast<std::uint32_t>(c),
+                    static_cast<std::uint32_t>(kLanes - c)};
+                CUDA_CHECK(cudaMemcpyAsync(win_d, win_h, 8,
+                                           cudaMemcpyHostToDevice, s));
+                kernels::launch_write_kv_to_pages_bf16_devwin(
+                    layer, k_d, v_d, qo_d, kvpi_d, kvpp_d, kvlpl_d,
+                    win_d, kLanes, kLanes, s, /*row_valid=*/nullptr);
+
+                CUDA_CHECK(cudaStreamSynchronize(s));
+                std::vector<std::uint16_t> a(kCacheElems), b(kCacheElems);
+                CUDA_CHECK(cudaMemcpy(a.data(), cache_a_k, kCacheElems * 2,
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b.data(), cache_b_k, kCacheElems * 2,
+                                      cudaMemcpyDeviceToHost));
+                bool eq = std::memcmp(a.data(), b.data(),
+                                      kCacheElems * 2) == 0;
+                CUDA_CHECK(cudaMemcpy(a.data(), cache_a_v, kCacheElems * 2,
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(b.data(), cache_b_v, kCacheElems * 2,
+                                      cudaMemcpyDeviceToHost));
+                eq = eq && std::memcmp(a.data(), b.data(),
+                                       kCacheElems * 2) == 0;
+                std::printf("kvtopages hnd=%d tail=(%d,%d): %s\n",
+                            hnd ? 1 : 0, c, kLanes - c, eq ? "eq" : "NE");
+                ok = ok && eq;
+            }
+        }
+    }
+
     std::printf("%s\n", ok ? "PEEL-WINDOW-KERNELS-OK" : "MISMATCH");
     return ok ? 0 : 1;
 }

@@ -479,6 +479,10 @@ void launch_qk_rmsnorm_rope_bf16(
     float eps,
     cudaStream_t stream)
 {
+    // Zero-row guard: a grid.x of 0 is an invalid launch that poisons
+    // the sticky error state (caught by the peel-window A/B harness's
+    // empty-window case; production call sites gate on row counts).
+    if (num_tokens <= 0) return;
     constexpr int BLOCK = 128;
     dim3 grid(num_tokens, num_q_heads + num_kv_heads);
     qk_rmsnorm_rope_bf16_kernel<BLOCK><<<grid, BLOCK, 0, stream>>>(
