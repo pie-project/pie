@@ -54,27 +54,6 @@ using namespace pie::metal::model::contract_detail;
 /// Every name is either mapped or explicitly skipped; an unrecognised one is an
 /// error rather than a pass-through, because a tensor this driver silently
 /// declared under its checkpoint name would never be found by the binder.
-/// The text decoder's member, with whichever wrapper prefix spelled it stripped.
-///
-/// This family ships as a multimodal checkpoint, so its decoder is nested, and
-/// the nesting has two real spellings. The HF release writes
-/// `model.language_model.*` -- the wrapper's `model`, then the language tower.
-/// mlx_lm's repack of the very same checkpoint swaps the two words to
-/// `language_model.model.*`. Neither is a variant of the model; they are two
-/// tools' names for one tensor, so both are read here rather than one being
-/// declared canonical and the other rejected at load.
-///
-/// Only the prefix differs. Everything below this line sees the same member
-/// string either way, which is why this is a strip rather than a second table.
-inline std::optional<std::string_view> decoder_member(std::string_view raw_name) {
-    for (std::string_view prefix : {"model.language_model.", "language_model.model."}) {
-        if (raw_name.rfind(prefix, 0) == 0) {
-            return raw_name.substr(prefix.size());
-        }
-    }
-    return std::nullopt;
-}
-
 /// Whether this checkpoint's `lm_head` IS its embedding table.
 ///
 /// A struct rather than a bare bool so a call site cannot pass it positionally
@@ -89,8 +68,8 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name,
     // decoder does; `mtp.` is the multi-token-prediction head, which this
     // driver does not run. Skipping is a declaration too -- an unlisted tensor
     // is an error below, not a pass-through.
-    for (std::string_view skip : {"model.visual.", "vision_tower.", "mtp."}) {
-        if (raw_name.rfind(skip, 0) == 0) {
+    for (std::string_view skip : {"visual.", "vision_tower.", "mtp."}) {
+        if (has_wrapper_member(raw_name, skip)) {
             return std::nullopt;
         }
     }

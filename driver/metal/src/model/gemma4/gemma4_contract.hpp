@@ -79,9 +79,9 @@ struct KvShare {
 inline std::optional<std::string> runtime_name(std::string_view raw_name,
                                                const KvShare& kv_share) {
     // The towers. Text decode binds none of it.
-    for (std::string_view skip : {"model.audio_tower.", "model.vision_tower.",
-                                  "model.embed_audio.", "model.embed_vision."}) {
-        if (raw_name.rfind(skip, 0) == 0) {
+    for (std::string_view skip : {"audio_tower.", "vision_tower.", "embed_audio.",
+                                  "embed_vision."}) {
+        if (has_wrapper_member(raw_name, skip)) {
             return std::nullopt;
         }
     }
@@ -96,12 +96,12 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name,
                std::string(raw_name.substr(std::string_view("lm_head.").size()));
     }
 
-    constexpr std::string_view kLm = "model.language_model.";
-    if (raw_name.rfind(kLm, 0) != 0) {
+    const std::optional<std::string_view> decoder = decoder_member(raw_name);
+    if (!decoder) {
         contract_detail::fail("Metal Gemma4 schema has no declared mapping or skip for '" +
                               std::string(raw_name) + "'");
     }
-    const std::string_view rest = raw_name.substr(kLm.size());
+    const std::string_view rest = *decoder;
 
     constexpr std::string_view kEmbed = "embed_tokens.";
     if (rest.rfind(kEmbed, 0) == 0) {

@@ -353,6 +353,15 @@ int main(int argc, char** argv) {
             // geometric series, which is the thing this row gates.
             {"Llama-3.2-1B", 16, 0, {12095, 13, 1115, 374, 279, 1890},
              {785, 6722, 315, 9625, 374, 12095}},
+            // Gemma 4 E2B. Its 262144-entry vocabulary reads these ids as
+            // nothing in particular, so the continuation is not a sentence --
+            // and it does not need to be. The gate is on IDS, which is what the
+            // driver and mlx-lm both consume. What this row covers that no
+            // other does: two attention widths in one stack (256 sliding, 512
+            // full), a KV-shared tail, per-layer embeddings, and a softcapped
+            // logit -- none of which any other entry exercises at all.
+            {"Gemma-4-E2B", 35, 0, {56971, 55353, 374, 56971, 55353, 374},
+             {785, 6722, 48352, 6722, 48352, 6722}},
         };
         const Known* ref = nullptr;
         for (const Known& k : known) {

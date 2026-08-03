@@ -43,6 +43,38 @@ inline bool ends_with(std::string_view value, std::string_view tail) {
            value.compare(value.size() - tail.size(), tail.size(), tail) == 0;
 }
 
+/// Whether `raw_name` starts with a wrapper member, under either spelling.
+///
+/// A multimodal checkpoint nests its parts under a wrapper, and the nesting has
+/// two real spellings. The HF release writes the wrapper's own `model.` first:
+/// `model.audio_tower.`, `model.language_model.`. `mlx_lm`'s repack of the very
+/// same checkpoint drops it, leaving the member bare. Neither is a variant of
+/// the model -- they are two tools' names for one tensor.
+///
+/// So a schema names the member (`"audio_tower."`) and this reads both. It is
+/// here and not in a family because it is a fact about `mlx_lm`, not about any
+/// model: every multimodal family meets it, and the first two each met it
+/// separately.
+inline bool has_wrapper_member(std::string_view raw_name, std::string_view member) {
+    if (raw_name.rfind(member, 0) == 0) return true;
+    return raw_name.rfind("model.", 0) == 0 &&
+           raw_name.substr(std::string_view("model.").size()).rfind(member, 0) == 0;
+}
+
+/// The text decoder's member, with whichever wrapper prefix spelled it stripped.
+///
+/// `model.language_model.*` (HF) and `language_model.model.*` (`mlx_lm`) are the
+/// two spellings; note that they SWAP the two words rather than one merely
+/// adding a prefix, so this cannot be expressed as `has_wrapper_member`. Only
+/// the prefix differs -- everything downstream sees the same member string
+/// either way, which is why this is a strip rather than a second name table.
+inline std::optional<std::string_view> decoder_member(std::string_view raw_name) {
+    for (std::string_view prefix : {"model.language_model.", "language_model.model."}) {
+        if (raw_name.rfind(prefix, 0) == 0) return raw_name.substr(prefix.size());
+    }
+    return std::nullopt;
+}
+
 inline PieLoaderEncodingKind kind_of(const PieLoaderEncodingSpec& e) {
     return static_cast<PieLoaderEncodingKind>(e.kind);
 }
