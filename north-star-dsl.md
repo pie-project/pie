@@ -1380,3 +1380,48 @@ NS-2 is therefore LIVE and correct, eager, PIE_SPATIAL_MASK-gated.
 What remains on the ladder: default-on decision after the wide
 battery + sweep; NS-3 (region windows + graphing the split); NS-4
 (union pass); NS-5 (retire the two-path form).
+
+## NS-2 wide batteries green (2026-08-04) — and the all-masked fire
+
+The wide compositions taught three more lessons, each now in the
+tree: the pack serves N masked programs (per-program strides, padded
+to the max; the programs must tile the suffix exactly — seriation
+enforced loudly); split == 0 is the ALL-MASKED composed fire and
+admits everywhere (two masked lanes share one fire where each fired
+solo before — a capability nothing in the system had); and the
+harvested suffix geometry is per-wave state that MUST reset (the
+stale-pointer read produced flashinfer's negative-indptr throw).
+Solo masked fires now route through the same spatial machinery
+(R=1 split=0) with byte-identical outputs — one code path.
+
+Battery state: R=4 split=2 / R=2 both splits / all-masked pairs —
+zero errors, every composition engages, deterministic compositions
+byte-stable, mixed-fire text within the generic co-batch class.
+Default-off regression green (oracle, masked solo, hooks).
+
+Default-on remains deliberately open until: the consolidated sweep
+(all five deployments + supergraph A/B + lora + hooks) runs under
+the gate, and NS-3 decides how spatial fires graph (today they force
+eager — a masked steady-state decode loses graph replay, which is a
+real regression for masked-heavy workloads until NS-3 lands).
+
+## NS-3 v1 design — graphing the split (2026-08-04, pre-implementation)
+
+What a captured spatial fire bakes, walked term by term: the two
+attention dispatches' pointer offsets and both plans' grids are
+functions of SPLIT; the pack runs prepare-side (outside capture) into
+stable pi addresses; the suffix qo identity's CONTENT (0..rs) is a
+prefix of one universal sequence, so ONE buffer serves every split;
+mask indptr/content refresh per fire at stable addresses. Therefore
+v1 keys the exec on the split: variant bits 21-28 carry it (R <= 255
+by the bucket lattice) plus kGvSpatial at bit 29 — at most R execs
+per bucket, the honest 2^k-free form until region windows
+(device-windowed attention needs flashinfer-side work; NOT v1).
+Changes: run_graph stops excluding spatial fires; use_supergraph
+EXCLUDES them (the union's fire-level mask arm is wrong for a split
+fire); capture threads unmasked_prefix_rows + the suffix qo pointer
+into the captured body; the per-fire prepare already rebuilds both
+plans (graph_mode_plan for the suffix mask plan is already true).
+Gates: spatial battery under graphs (engage lines + replays, outputs
+per the numerics contract), default-off regression, then the
+consolidated sweep for the default-on decision.
