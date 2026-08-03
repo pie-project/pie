@@ -669,27 +669,6 @@ pub trait PassWit: Sized + 'static {
 
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
 
-    /// Issue the ONE state-binding call this interface takes. `forward-hybrid`
-    /// binds KV and RS together, so both halves arrive here and each interface
-    /// reports its own missing half.
-    fn bind_state(
-        &self,
-        kv: Option<&KvBind>,
-        rs: &[&crate::working_set::RsWorkingSet],
-        rs_geom: Option<&RsGeometryBind>,
-    ) -> Result<(), String>;
-
-    /// Rebind the recurrent working sets of an already-attached pass (a
-    /// request-set change between fires). Attention-only passes have no
-    /// recurrent state, so the default refuses.
-    fn rebind_recurrent(
-        &self,
-        _rs: &[&crate::working_set::RsWorkingSet],
-        _geom: &RsGeometryBind,
-    ) -> Result<(), String> {
-        Err("an attention-only forward pass has no recurrent state".to_string())
-    }
-
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
 }
 
@@ -709,29 +688,6 @@ impl PassWit for wit_attention::ForwardPass {
     }
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_attention::ForwardPass::program(self, bytes, channels)
-    }
-    fn bind_state(
-        &self,
-        kv: Option<&KvBind>,
-        _rs: &[&crate::working_set::RsWorkingSet],
-        _rs_geom: Option<&RsGeometryBind>,
-    ) -> Result<(), String> {
-        let kv = kv.ok_or("attention must be bound before submit")?;
-        wit_attention::ForwardPass::attention(
-            self,
-            kv.ws.as_ref(),
-            &wit_attention::KvGeometry {
-                readable_pages: kv.readable.wit(),
-                writable_pages: kv.writable.wit(),
-                kv_len: kv.kv_len.as_ref(),
-                pages: kv.pages.as_ref(),
-                page_indptr: kv.page_indptr.as_ref(),
-                w_slot: kv.w_slot.as_ref(),
-                w_off: kv.w_off.as_ref(),
-                positions: kv.positions.as_ref(),
-                mask: kv.mask.as_deref(),
-            },
-        )
     }
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
         wit_attention::submit(on, slots)
@@ -755,22 +711,6 @@ impl PassWit for wit_recurrent::ForwardPass {
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_recurrent::ForwardPass::program(self, bytes, channels)
     }
-    fn bind_state(
-        &self,
-        _kv: Option<&KvBind>,
-        rs: &[&crate::working_set::RsWorkingSet],
-        rs_geom: Option<&RsGeometryBind>,
-    ) -> Result<(), String> {
-        let geom = rs_geom.ok_or("recurrent state must be bound before submit")?;
-        self.rebind_recurrent(rs, geom)
-    }
-    fn rebind_recurrent(
-        &self,
-        rs: &[&crate::working_set::RsWorkingSet],
-        geom: &RsGeometryBind,
-    ) -> Result<(), String> {
-        wit_recurrent::ForwardPass::attention(self, rs, &recurrent_rs_geometry(geom))
-    }
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
         wit_recurrent::submit(on, slots)
     }
@@ -793,37 +733,6 @@ impl PassWit for wit_hybrid::ForwardPass {
     fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
         wit_hybrid::ForwardPass::program(self, bytes, channels)
     }
-    fn bind_state(
-        &self,
-        kv: Option<&KvBind>,
-        rs: &[&crate::working_set::RsWorkingSet],
-        rs_geom: Option<&RsGeometryBind>,
-    ) -> Result<(), String> {
-        let kv = kv.ok_or("attention must be bound before submit")?;
-        let geom = rs_geom.ok_or("recurrent state must be bound before submit")?;
-        let binding = wit_hybrid::KvBinding {
-            working_set: kv.ws.as_ref(),
-            geometry: wit_hybrid::KvGeometry {
-                readable_pages: kv.readable.wit(),
-                writable_pages: kv.writable.wit(),
-                kv_len: kv.kv_len.as_ref(),
-                pages: kv.pages.as_ref(),
-                page_indptr: kv.page_indptr.as_ref(),
-                w_slot: kv.w_slot.as_ref(),
-                w_off: kv.w_off.as_ref(),
-                positions: kv.positions.as_ref(),
-                mask: kv.mask.as_deref(),
-            },
-        };
-        wit_hybrid::ForwardPass::attention(self, Some(&binding), rs, &hybrid_rs_geometry(geom))
-    }
-    fn rebind_recurrent(
-        &self,
-        rs: &[&crate::working_set::RsWorkingSet],
-        geom: &RsGeometryBind,
-    ) -> Result<(), String> {
-        wit_hybrid::ForwardPass::attention(self, None, rs, &hybrid_rs_geometry(geom))
-    }
     fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
         wit_hybrid::submit(on, slots)
     }
@@ -845,17 +754,14 @@ struct ForwardInner {
     page_size: u32,
     attention_ws: Option<Rc<KvWorkingSet>>,
     rs_working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
-    /// The KV half of the state binding, recorded but not yet sent.
-    kv_bind: Option<KvBind>,
-    rs_bind: Option<RsGeometryBind>,
     program_attached: bool,
 }
 
-/// A recorded KV binding. The WIT call is DEFERRED to `attach_program`
-/// because `forward-hybrid.attention` binds KV and RS in one call -- they are
-/// one set of geometry over different layers of the same forward -- while the
-/// guest-facing SDK keeps them as two independent, order-free calls.
-pub struct KvBind {
+/// A [`KvGeometry`] with its ports claimed and its channels resolved to WIT
+/// handles, held only long enough for the caller to issue its own interface's
+/// state-binding call. The handles are `Rc` because [`Channel::wit`] hands
+/// out shared ownership, and the WIT record borrows them.
+struct StagedKv {
     ws: Rc<KvWorkingSet>,
     readable: PageDeclaration,
     writable: PageDeclaration,
@@ -907,18 +813,55 @@ pub struct KvGeometry<'a, R, W> {
     pub mask: Option<&'a Channel>,
 }
 
-/// A recorded `rs-geometry`: where the bound recurrent state lives for this
-/// fire and where its folded boundary lands.
-pub struct RsGeometryBind {
-    /// The fold-len channel as a descriptor port, or `None` for the
-    /// synthesized fold-everything geometry. Claiming it is what lets a stage
-    /// COMPUTE the fold length: the driver resolves the port on device, so a
-    /// speculative decode's accepted count never round-trips through the host.
-    port: Option<(Port, Channel)>,
-    fold_len: Rc<wit_channel::Channel>,
+/// Where the bound recurrent state's folded boundary lands for one fire — a
+/// field-for-field mirror of the WIT `rs-geometry` record
+/// (`forward-recurrent.wit`, `forward-hybrid.wit`).
+///
+/// ```ignore
+/// // Fold everything: the ordinary decode.
+/// RsGeometry { fold_len: None, buffer: .. }
+/// // Fold nothing: buffer this fire's tokens, which is what makes a linear
+/// // model speculatable -- unfolded tokens cost nothing to abandon.
+/// RsGeometry { fold_len: Some(&zero), buffer: ..n }
+/// ```
+pub struct RsGeometry<'a, B> {
+    /// A channel carrying, per request, how far the folded boundary advances
+    /// over `[buffer | this fire's tokens]`, clamped to that tail. `None` is
+    /// the fold-everything channel of `u32::MAX` the SDK would otherwise make
+    /// every caller build by hand.
+    ///
+    /// A channel rather than a scalar so that a device-computed accepted count
+    /// can drive the fold directly, fusing verify and commit into one fire:
+    /// the driver resolves it as a descriptor port, so the count never
+    /// round-trips through the host.
+    pub fold_len: Option<&'a Channel>,
     /// Capacity grant, not an address. The buffer's addressing is derived by
     /// the runtime from its own occupancy; a guest copy of it could only
     /// agree or be refused.
+    pub buffer: B,
+}
+
+/// A KV working set together with the geometry it is read and written
+/// through — a field-for-field mirror of the WIT `kv-binding` record
+/// (`forward-hybrid.wit`), which exists so that the pair can be made optional
+/// as a unit.
+pub struct KvBinding<'a, R, W> {
+    pub working_set: &'a WorkingSet,
+    pub geometry: KvGeometry<'a, R, W>,
+}
+
+thread_local! {
+    /// The `fold-len` of a pass that folds unconditionally: `u32::MAX` clamps
+    /// to "every token of every fire". Degenerate but MEANINGFUL -- the fast
+    /// path stated explicitly, not the dummy geometry this surface avoids.
+    static FOLD_ALL: Channel = Channel::from(vec![u32::MAX]);
+}
+
+/// [`RsGeometry`] with its port claimed and its channel resolved, alongside the
+/// working sets it applies to. See [`StagedKv`].
+struct StagedRs {
+    working_sets: Vec<Rc<crate::working_set::RsWorkingSet>>,
+    fold_len: Rc<wit_channel::Channel>,
     buffer: PageDeclaration,
 }
 
@@ -1005,14 +948,12 @@ impl<W: PassWit> Pass<W> {
         Pass {
             wit: W::new(),
             inner: RefCell::new(ForwardInner {
-                rs_bind: None,
                 ports: Vec::new(),
                 stages: Vec::new(),
                 vocab,
                 page_size,
                 attention_ws: None,
                 rs_working_sets: Vec::new(),
-                kv_bind: None,
                 program_attached: false,
             }),
         }
@@ -1048,13 +989,19 @@ impl<W: PassWit> Pass<W> {
         Ok(())
     }
 
-    /// Bind attention and all of its geometry channels. Reached through the
-    /// per-interface `attention` on the two kinds that have KV.
-    fn bind_attention<R, Wr>(
+    /// Claim the KV geometry ports and resolve its channels. The caller issues
+    /// its own interface's state-binding call with the result: `forward` takes
+    /// the working set and geometry directly, `forward-hybrid` wraps them in a
+    /// `kv-binding` alongside the recurrent half.
+    ///
+    /// After the program is attached this is a REBIND -- a request-set or
+    /// geometry change between fires -- and the ports are already traced into
+    /// the program, so only the WIT-side handles are refreshed.
+    fn stage_kv<R, Wr>(
         &self,
         ws: &WorkingSet,
         geom: KvGeometry<'_, R, Wr>,
-    ) -> Result<(), String>
+    ) -> Result<StagedKv, String>
     where
         R: RangeBounds<u32>,
         Wr: RangeBounds<u32>,
@@ -1070,102 +1017,97 @@ impl<W: PassWit> Pass<W> {
             positions,
             mask,
         } = geom;
-        let mut ports = vec![
-            Port::KvLen,
-            Port::Pages,
-            Port::PageIndptr,
-            Port::WSlot,
-            Port::WOff,
-            Port::Positions,
-        ];
-        if mask.is_some() {
-            ports.push(Port::AttnMask);
+        let rebind = self.inner.borrow().program_attached;
+        if !rebind {
+            let mut ports = vec![
+                Port::KvLen,
+                Port::Pages,
+                Port::PageIndptr,
+                Port::WSlot,
+                Port::WOff,
+                Port::Positions,
+            ];
+            if mask.is_some() {
+                ports.push(Port::AttnMask);
+            }
+            self.ensure_ports_available(&ports)?;
         }
-        self.ensure_ports_available(&ports)?;
-        let readable = PageDeclaration::from_range(readable_pages)?;
-        let writable = PageDeclaration::from_range(writable_pages)?;
-        let kv_len_wit = kv_len.wit();
-        let pages_wit = pages.wit();
-        let page_indptr_wit = page_indptr.wit();
-        let w_slot_wit = w_slot.wit();
-        let w_off_wit = w_off.wit();
-        let positions_wit = positions.wit();
-        let mask_wit = mask.map(Channel::wit);
-        let mut inner = self.inner.borrow_mut();
-        inner.ports.extend([
-            (Port::KvLen, claim_port(Port::KvLen, kv_len)),
-            (Port::Pages, claim_port(Port::Pages, pages)),
-            (Port::PageIndptr, claim_port(Port::PageIndptr, page_indptr)),
-            (Port::WSlot, claim_port(Port::WSlot, w_slot)),
-            (Port::WOff, claim_port(Port::WOff, w_off)),
-            (Port::Positions, claim_port(Port::Positions, positions)),
-        ]);
-        if let Some(mask) = mask {
-            inner
-                .ports
-                .push((Port::AttnMask, claim_port(Port::AttnMask, mask)));
-        }
-        inner.attention_ws = Some(ws.kv.clone());
-        inner.kv_bind = Some(KvBind {
+        let staged = StagedKv {
             ws: ws.kv.clone(),
-            readable,
-            writable,
-            kv_len: kv_len_wit,
-            pages: pages_wit,
-            page_indptr: page_indptr_wit,
-            w_slot: w_slot_wit,
-            w_off: w_off_wit,
-            positions: positions_wit,
-            mask: mask_wit,
-        });
-        Ok(())
+            readable: PageDeclaration::from_range(readable_pages)?,
+            writable: PageDeclaration::from_range(writable_pages)?,
+            kv_len: kv_len.wit(),
+            pages: pages.wit(),
+            page_indptr: page_indptr.wit(),
+            w_slot: w_slot.wit(),
+            w_off: w_off.wit(),
+            positions: positions.wit(),
+            mask: mask.map(Channel::wit),
+        };
+        let mut inner = self.inner.borrow_mut();
+        inner.attention_ws = Some(ws.kv.clone());
+        if !rebind {
+            inner.ports.extend([
+                (Port::KvLen, claim_port(Port::KvLen, kv_len)),
+                (Port::Pages, claim_port(Port::Pages, pages)),
+                (Port::PageIndptr, claim_port(Port::PageIndptr, page_indptr)),
+                (Port::WSlot, claim_port(Port::WSlot, w_slot)),
+                (Port::WOff, claim_port(Port::WOff, w_off)),
+                (Port::Positions, claim_port(Port::Positions, positions)),
+            ]);
+            if let Some(mask) = mask {
+                inner
+                    .ports
+                    .push((Port::AttnMask, claim_port(Port::AttnMask, mask)));
+            }
+        }
+        Ok(staged)
     }
 
-    /// Record the recurrent-state working sets (resolved request order) and,
-    /// optionally, the buffered geometry. Like the KV half, the WIT call is
-    /// deferred to `attach_program`.
-    fn bind_recurrent(
+    /// Claim the fold-len port and resolve the recurrent working sets, in
+    /// resolved request order. See [`Pass::stage_kv`] for the rebind rule.
+    fn stage_rs<B>(
         &self,
         working_sets: &[RsWorkingSet],
-        geom: RsGeometryBind,
-    ) -> Result<(), String> {
+        geom: RsGeometry<'_, B>,
+    ) -> Result<StagedRs, String>
+    where
+        B: RangeBounds<u32>,
+    {
         if working_sets.is_empty() {
             return Err(
                 "forward pass needs one recurrent-state working set per request".to_string(),
             );
         }
-        if self.inner.borrow().program_attached {
-            // Post-attachment this is a REBIND (a request-set change between
-            // fires), which goes straight out over WIT instead of being
-            // recorded for `flush_state_binding`.
-            return self.rebind_recurrent(working_sets, geom);
-        }
-        let mut inner = self.inner.borrow_mut();
-        inner.rs_working_sets = working_sets.iter().map(|rs| rs.rs.clone()).collect();
-        if let Some((port, channel)) = geom.port {
-            inner.ports.push((port, claim_port(port, &channel)));
-        }
-        inner.rs_bind = Some(geom);
-        Ok(())
-    }
-
-    /// Rebind the recurrent-state working sets of an ALREADY-BOUND pass (a
-    /// request-set change between fires). Only legal after the program is
-    /// attached; before that, `bind_recurrent` records instead.
-    fn rebind_recurrent(
-        &self,
-        working_sets: &[RsWorkingSet],
-        geom: RsGeometryBind,
-    ) -> Result<(), String> {
-        let replacement: Vec<Rc<crate::working_set::RsWorkingSet>> =
+        let buffer = PageDeclaration::from_range(geom.buffer)?;
+        let staged = match geom.fold_len {
+            Some(fold_len) => {
+                if !self.inner.borrow().program_attached {
+                    self.ensure_ports_available(&[Port::RsFoldLen])?;
+                    let mut inner = self.inner.borrow_mut();
+                    inner
+                        .ports
+                        .push((Port::RsFoldLen, claim_port(Port::RsFoldLen, fold_len)));
+                }
+                fold_len.wit()
+            }
+            // `u32::MAX` per request clamps to "the whole tail" host-side, so
+            // one broadcast element says fold everything for every request.
+            // Minted once per guest thread: a rebind must not leak a fresh
+            // channel every time the request set changes. No port is claimed
+            // either -- a pass that folds everything unconditionally has
+            // nothing to compute, and a dead port would land in every plain
+            // recurrent trace.
+            None => FOLD_ALL.with(Channel::wit),
+        };
+        let working_sets: Vec<Rc<crate::working_set::RsWorkingSet>> =
             working_sets.iter().map(|rs| rs.rs.clone()).collect();
-        let borrows: Vec<&crate::working_set::RsWorkingSet> =
-            replacement.iter().map(Rc::as_ref).collect();
-        self.wit.rebind_recurrent(&borrows, &geom)?;
-        let mut inner = self.inner.borrow_mut();
-        inner.rs_working_sets = replacement;
-        inner.rs_bind = Some(geom);
-        Ok(())
+        self.inner.borrow_mut().rs_working_sets = working_sets.clone();
+        Ok(StagedRs {
+            working_sets,
+            fold_len: staged,
+            buffer,
+        })
     }
 
     /// Bind readout indexes through a channel, separately from embedding.
@@ -1219,24 +1161,10 @@ impl<W: PassWit> Pass<W> {
         submit_frame(on, &[Some(self)])
     }
 
-    /// Issue the ONE deferred state-binding WIT call. Called once, at the top
-    /// of `attach_program`, so that a hybrid pass -- whose interface binds KV
-    /// and RS together -- still lets the guest record the two halves through
-    /// independent, order-free SDK calls.
-    fn flush_state_binding(&self) -> Result<(), String> {
-        let inner = self.inner.borrow();
-        let rs: Vec<&crate::working_set::RsWorkingSet> =
-            inner.rs_working_sets.iter().map(Rc::as_ref).collect();
-        self.wit
-            .bind_state(inner.kv_bind.as_ref(), &rs, inner.rs_bind.as_ref())
-    }
-
     fn attach_program(&self) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Ok(());
         }
-        self.flush_state_binding()?;
-
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
         for (port, channel) in &inner.ports {
@@ -1552,7 +1480,6 @@ impl Default for Pipeline {
 // prelude
 // ---------------------------------------------------------------------------
 
-
 /// The kind-independent half of every pass prelude: the eDSL vocabulary plus
 /// the wrapper types that mean the same thing in all three interfaces.
 ///
@@ -1561,9 +1488,9 @@ impl Default for Pipeline {
 /// algorithm from silently compiling against a hybrid model.
 pub mod shared_prelude {
     pub use super::{
-        Channel, KvGeometry, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD, WorkingSet,
-        channel_capacity, frame_size, live_slots, max_embed_length, pad_tokens, prefill_chunks,
-        unpad_tokens,
+        Channel, KvBinding, KvGeometry, PageGrant, Pipeline, RsGeometry, RsWorkingSet, TOKEN_PAD,
+        WorkingSet, channel_capacity, frame_size, live_slots, max_embed_length, pad_tokens,
+        prefill_chunks, unpad_tokens,
     };
     pub use std::ops::ControlFlow;
     pub use pie_dsl::dtype;
@@ -1595,13 +1522,29 @@ impl Pass<wit_attention::ForwardPass> {
         self.set_stage(Stage::OnAttn, body);
     }
 
-    /// Bind attention and all of its geometry channels — see [`KvGeometry`].
+    /// `pie:inferlet/forward.attention` — bind the KV working set and all of
+    /// its geometry channels. See [`KvGeometry`]. REQUIRED.
     pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
     where
         R: RangeBounds<u32>,
         W: RangeBounds<u32>,
     {
-        self.bind_attention(ws, geom)
+        let kv = self.stage_kv(ws, geom)?;
+        wit_attention::ForwardPass::attention(
+            &self.wit,
+            kv.ws.as_ref(),
+            &wit_attention::KvGeometry {
+                readable_pages: kv.readable.wit(),
+                writable_pages: kv.writable.wit(),
+                kv_len: kv.kv_len.as_ref(),
+                pages: kv.pages.as_ref(),
+                page_indptr: kv.page_indptr.as_ref(),
+                w_slot: kv.w_slot.as_ref(),
+                w_off: kv.w_off.as_ref(),
+                positions: kv.positions.as_ref(),
+                mask: kv.mask.as_deref(),
+            },
+        )
     }
 }
 
@@ -1615,76 +1558,86 @@ impl Pass<wit_hybrid::ForwardPass> {
         self.set_stage(Stage::OnAttn, body);
     }
 
-    /// Bind the ATTENTION half — see [`KvGeometry`]. The two halves are
-    /// recorded independently and issued as the single
-    /// `forward-hybrid.attention` call on first submit, so their order here
-    /// does not matter -- but both are required.
-    pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
+    /// `pie:inferlet/forward-hybrid.attention` — bind BOTH halves of the state
+    /// this pass fires over. REQUIRED.
+    ///
+    /// One call because they are one binding: the same forward reads paged KV
+    /// in its attention layers and a folded state in its recurrent ones, and
+    /// the runtime has to see them together to place the fire. `kv` is an
+    /// [`Option`] so a recurrent-only commit fire is expressible without
+    /// inventing dummy attention geometry.
+    ///
+    /// Calling it again after the first submit REBINDS -- the request set or
+    /// the fold boundary changed between fires -- which is how a beam fork or
+    /// a speculative commit re-aims an already-traced pass.
+    pub fn attention<R, W, B>(
+        &self,
+        kv: Option<KvBinding<'_, R, W>>,
+        rs: &[RsWorkingSet],
+        rs_geom: RsGeometry<'_, B>,
+    ) -> Result<(), String>
     where
         R: RangeBounds<u32>,
         W: RangeBounds<u32>,
-    {
-        self.bind_attention(ws, geom)
-    }
-
-    /// Bind the RECURRENT half: one working set per request, in resolved
-    /// request order.
-    pub fn recurrent(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-        self.bind_recurrent(working_sets, rs_geometry_fold_all()?)
-    }
-
-    /// Bind the RECURRENT half AND state where its folded boundary lands.
-    ///
-    /// `fold_len` is a channel carrying, per request, how far the folded
-    /// boundary advances over `[buffer | this fire's tokens]`, clamped to
-    /// that tail:
-    ///
-    /// - `u32::MAX` -- fold everything. What [`recurrent`] supplies.
-    /// - `0` -- fold nothing; append every token of this fire to the
-    ///   buffer. This is what makes a linear model speculatable: buffered
-    ///   tokens that are never folded cost nothing to abandon.
-    /// - `n <= buffer_len` -- fold the first `n` buffered tokens and drop
-    ///   the covered head pages. The COMMIT half of speculation.
-    ///
-    /// A channel rather than a scalar so that a device-computed accepted
-    /// count can drive the fold directly, fusing verify and commit into
-    /// one fire.
-    ///
-    /// [`recurrent`]: Pass::recurrent
-    pub fn recurrent_with<B>(
-        &self,
-        working_sets: &[RsWorkingSet],
-        fold_len: &Channel,
-        buffer: B,
-    ) -> Result<(), String>
-    where
         B: RangeBounds<u32>,
     {
-        self.bind_recurrent(working_sets, rs_geometry_bind(fold_len, buffer)?)
+        let kv = kv
+            .map(|kv| self.stage_kv(kv.working_set, kv.geometry))
+            .transpose()?;
+        let rs = self.stage_rs(rs, rs_geom)?;
+        let binding = kv.as_ref().map(|kv| wit_hybrid::KvBinding {
+            working_set: kv.ws.as_ref(),
+            geometry: wit_hybrid::KvGeometry {
+                readable_pages: kv.readable.wit(),
+                writable_pages: kv.writable.wit(),
+                kv_len: kv.kv_len.as_ref(),
+                pages: kv.pages.as_ref(),
+                page_indptr: kv.page_indptr.as_ref(),
+                w_slot: kv.w_slot.as_ref(),
+                w_off: kv.w_off.as_ref(),
+                positions: kv.positions.as_ref(),
+                mask: kv.mask.as_deref(),
+            },
+        });
+        let borrows: Vec<&crate::working_set::RsWorkingSet> =
+            rs.working_sets.iter().map(Rc::as_ref).collect();
+        wit_hybrid::ForwardPass::attention(
+            &self.wit,
+            binding.as_ref(),
+            &borrows,
+            &wit_hybrid::RsGeometry {
+                fold_len: rs.fold_len.as_ref(),
+                buffer: rs.buffer.wit(),
+            },
+        )
     }
 }
 
 impl Pass<wit_recurrent::ForwardPass> {
-    /// Bind the recurrent state: one working set per request, in resolved
-    /// request order. The REQUIRED state binding for this interface, which is
-    /// why it carries the same name the other two give theirs.
-    pub fn attention(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-        self.bind_recurrent(working_sets, rs_geometry_fold_all()?)
-    }
-
-    /// Bind the recurrent state AND state where its folded boundary lands.
-    /// See [`Pass::<wit_hybrid::ForwardPass>::recurrent_with`] -- the surface
-    /// and the semantics are identical.
-    pub fn attention_with<B>(
-        &self,
-        working_sets: &[RsWorkingSet],
-        fold_len: &Channel,
-        buffer: B,
-    ) -> Result<(), String>
+    /// `pie:inferlet/forward-recurrent.attention` — bind the recurrent state:
+    /// one working set per request, in resolved request order, plus where its
+    /// folded boundary lands. REQUIRED.
+    ///
+    /// The mechanism is a recurrence, but the SLOT NAME is `attention` in all
+    /// three interfaces: the role inside a pass is the same regardless of
+    /// mechanism, and only the signature varies.
+    ///
+    /// Calling it again after the first submit REBINDS.
+    pub fn attention<B>(&self, rs: &[RsWorkingSet], geom: RsGeometry<'_, B>) -> Result<(), String>
     where
         B: RangeBounds<u32>,
     {
-        self.bind_recurrent(working_sets, rs_geometry_bind(fold_len, buffer)?)
+        let rs = self.stage_rs(rs, geom)?;
+        let borrows: Vec<&crate::working_set::RsWorkingSet> =
+            rs.working_sets.iter().map(Rc::as_ref).collect();
+        wit_recurrent::ForwardPass::attention(
+            &self.wit,
+            &borrows,
+            &wit_recurrent::RsGeometry {
+                fold_len: rs.fold_len.as_ref(),
+                buffer: rs.buffer.wit(),
+            },
+        )
     }
 }
 
@@ -1753,53 +1706,6 @@ pub mod hybrid {
         pub use super::{ForwardPass, run_ahead, submit_frame};
         pub use crate::ptir::shared_prelude::*;
     }
-}
-
-fn recurrent_rs_geometry(geom: &RsGeometryBind) -> wit_recurrent::RsGeometry<'_> {
-    wit_recurrent::RsGeometry {
-        fold_len: geom.fold_len.as_ref(),
-        buffer: geom.buffer.wit(),
-    }
-}
-
-fn hybrid_rs_geometry(geom: &RsGeometryBind) -> wit_hybrid::RsGeometry<'_> {
-    wit_hybrid::RsGeometry {
-        fold_len: geom.fold_len.as_ref(),
-        buffer: geom.buffer.wit(),
-    }
-}
-
-fn rs_geometry_bind<B>(fold_len: &Channel, buffer: B) -> Result<RsGeometryBind, String>
-where
-    B: RangeBounds<u32>,
-{
-    Ok(RsGeometryBind {
-        port: Some((Port::RsFoldLen, *fold_len)),
-        fold_len: fold_len.wit(),
-        buffer: PageDeclaration::from_range(buffer)?,
-    })
-}
-
-/// The geometry of a pass that never buffers: an empty buffer and a `fold-len`
-/// past the tail, which clamps to "fold every token of every fire".
-///
-/// This is degenerate but MEANINGFUL -- it is the fast path stated explicitly,
-/// not the dummy geometry this surface exists to avoid. The buffer channels are
-/// never dereferenced because `buffer-len` is zero.
-fn rs_geometry_fold_all() -> Result<RsGeometryBind, String> {
-    thread_local! {
-        /// Minted once per guest thread: a rebind must not leak a fresh
-        /// channel every time the request set changes.
-        static FOLD_ALL: Channel = Channel::from(vec![u32::MAX]);
-    }
-    FOLD_ALL.with(|fold_len| {
-        let mut geom = rs_geometry_bind(fold_len, 0..0)?;
-        // A pass that folds everything unconditionally has nothing to compute,
-        // so claiming the port would put a dead one in every plain recurrent
-        // trace.
-        geom.port = None;
-        Ok(geom)
-    })
 }
 
 #[cfg(test)]

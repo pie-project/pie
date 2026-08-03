@@ -12,6 +12,7 @@
 
 use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
+use std::ops::RangeBounds;
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16; // tokens per pool page
@@ -76,8 +77,69 @@ fn advance_hypotheses(
 /// whether to bind recurrent state has moved UP to a `model::pass_kind()`
 /// branch over two monomorphisations. The body is written once and expanded
 /// twice, so the two versions cannot drift.
+/// The state binding this beam search needs, over the two forward interfaces it
+/// runs on. `pie:inferlet` gives them separate `attention` signatures so that
+/// an attention-only algorithm cannot name a folded recurrent state; saying
+/// what the two have IN COMMON for THIS algorithm is the guest's job.
+trait BindBeams {
+    fn bind_beams<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>;
+}
+
+impl BindBeams for inferlet::ptir::attention::ForwardPass {
+    fn bind_beams<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        // A pure-attention model has no recurrent state, and the type system
+        // now proves this set can only be empty.
+        debug_assert!(rs.is_empty());
+        self.attention(ws, geom)
+    }
+}
+
+impl BindBeams for inferlet::ptir::hybrid::ForwardPass {
+    fn bind_beams<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        // Beams never buffer: every fire folds its one token straight into the
+        // recurrence, which is what makes a fork a plain state copy.
+        self.attention(
+            Some(KvBinding {
+                working_set: ws,
+                geometry: geom,
+            }),
+            rs,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
+        )
+    }
+}
+
 macro_rules! define_beam_search {
-    ($name:ident, $kind:ident, $bind_rs:expr) => {
+    ($name:ident, $kind:ident) => {
         async fn $name(input: &Input) -> Result<String> {
             use inferlet::ptir::$kind::{ForwardPass, run_ahead};
 
@@ -189,26 +251,30 @@ macro_rules! define_beam_search {
             Vec::new()
         };
         let fwd = ForwardPass::new();
-        $bind_rs(&fwd, &rs_working_sets)
-            .map_err(|e| format!("bind initial recurrent states: {e}"))?;
-        fwd.embed(&toks, &lanes_b)?;
         // All descriptor ports channel-bound (device-geometry fire wire-form):
         // Pages ← pages, PageIndptr ← page_indptr, KvLen ← klen, WSlot/WOff ← the
         // explicit write descriptor. The pool is fixed so these carry constant values.
-        fwd.attention(
-            &ws,
-            KvGeometry {
-                readable_pages: ..,
-                writable_pages: ..,
-                kv_len: &klen,
-                pages: &pages,
-                page_indptr: &page_indptr,
-                w_slot: &w_slot,
-                w_off: &w_off,
-                positions: &pos,
-                mask: Some(&mask),
-            },
-        )?;
+        // Named once because a beam fork rebinds the same geometry over a new
+        // set of states.
+        let bind_state = |fwd: &ForwardPass, rs: &[RsWorkingSet]| {
+            fwd.bind_beams(
+                &ws,
+                KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &klen,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &pos,
+                    mask: Some(&mask),
+                },
+                rs,
+            )
+        };
+        bind_state(&fwd, &rs_working_sets).map_err(|e| format!("bind initial state: {e}"))?;
+        fwd.embed(&toks, &lanes_b)?;
         fwd.epilogue(move || {
             // 1. top-B over the flattened [B,V] cand block.
             // `intrinsics::logits()` squeezes to rank-1 `[v]` when the fire has a
@@ -361,7 +427,7 @@ macro_rules! define_beam_search {
                     );
                 }
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
-                $bind_rs(&fwd, &next_rs)
+                bind_state(&fwd, &next_rs)
                     .map_err(|e| format!("rebind recurrent states @{step}: {e}"))?;
                 rs_working_sets = next_rs;
             }
@@ -396,27 +462,8 @@ macro_rules! define_beam_search {
     };
 }
 
-define_beam_search!(beam_search_attention, attention, |_fwd: &ForwardPass,
-                                                       rs: &[RsWorkingSet]|
- -> ::std::result::Result<(), String> {
-    // A pure-attention model has no recurrent state, so this is only ever
-    // reached with an empty set -- the `else` arm below is dead code that the
-    // type system now proves cannot bind anything.
-    if rs.is_empty() {
-        Ok(())
-    } else {
-        unreachable!("an attention-only model binds no recurrent state")
-    }
-});
-define_beam_search!(
-    beam_search_hybrid,
-    hybrid,
-    |fwd: &ForwardPass, rs: &[RsWorkingSet]| if rs.is_empty() {
-        Ok(())
-    } else {
-        fwd.recurrent(rs)
-    }
-);
+define_beam_search!(beam_search_attention, attention);
+define_beam_search!(beam_search_hybrid, hybrid);
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {

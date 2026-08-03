@@ -24,6 +24,7 @@
 
 use inferlet::ptir::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model, session};
+use std::ops::RangeBounds;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -180,8 +181,69 @@ struct RunResult {
 /// bind recurrent state has moved UP to a `model::pass_kind()` branch over two
 /// monomorphisations. The body is written once here and expanded twice, so the
 /// two versions cannot drift.
+/// The state binding this benchmark needs, over the two forward interfaces it
+/// runs on. `pie:inferlet` gives them separate `attention` signatures so that
+/// an attention-only algorithm cannot name a folded recurrent state; saying
+/// what the two have IN COMMON for THIS algorithm is the guest's job.
+trait BindState {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>;
+}
+
+impl BindState for inferlet::ptir::attention::ForwardPass {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        // A pure-attention model has no recurrent state, and the type system
+        // now proves this set can only be empty.
+        debug_assert!(rs.is_empty());
+        self.attention(ws, geom)
+    }
+}
+
+impl BindState for inferlet::ptir::hybrid::ForwardPass {
+    fn bind_state<R, W>(
+        &self,
+        ws: &WorkingSet,
+        geom: KvGeometry<'_, R, W>,
+        rs: &[RsWorkingSet],
+    ) -> ::std::result::Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        // The benchmark never buffers: every fire folds straight into the
+        // recurrence.
+        self.attention(
+            Some(KvBinding {
+                working_set: ws,
+                geometry: geom,
+            }),
+            rs,
+            RsGeometry {
+                fold_len: None,
+                buffer: 0..0,
+            },
+        )
+    }
+}
+
 macro_rules! define_run_one {
-    ($name:ident, $kind:ident, $bind_rs:expr) => {
+    ($name:ident, $kind:ident) => {
 async fn $name(
         input: &Input,
         prompt: &str,
@@ -330,23 +392,23 @@ async fn $name(
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    fwd_p.attention(
-        &ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len_p,
-            pages: &pages_p,
-            page_indptr: &page_indptr_p,
-            w_slot: &w_slot_p,
-            w_off: &w_off_p,
-            positions: &positions_p,
-            mask: None,
-        },
-    )?;
-        if !rs_ws.is_empty() {
-            $bind_rs(&fwd_p, &rs_ws).map_err(|e| format!("bind prefill recurrent state: {e}"))?;
-        }
+    fwd_p
+        .bind_state(
+            &ws,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: None,
+            },
+            &rs_ws,
+        )
+        .map_err(|e| format!("bind prefill state: {e}"))?;
     fwd_p.epilogue(move || {
         let t = reshape(
             sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
@@ -372,7 +434,7 @@ async fn $name(
         let w_off = Channel::from(vec![n % page_size]).named("w_off");
         fwd.embed(&tok_in, &embed_indptr)?;
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
-        fwd.attention(
+        fwd.bind_state(
             &ws,
             KvGeometry {
                 readable_pages: ..,
@@ -385,11 +447,9 @@ async fn $name(
                 positions: &positions,
                 mask: None,
             },
-        )?;
-            if !rs_ws.is_empty() {
-                $bind_rs(&fwd, &rs_ws)
-                    .map_err(|e| format!("bind decode recurrent state: {e}"))?;
-            }
+            &rs_ws,
+        )
+        .map_err(|e| format!("bind decode state: {e}"))?;
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = reshape(
@@ -567,16 +627,8 @@ async fn $name(
     };
 }
 
-define_run_one!(run_one_attention, attention, |_fwd: &ForwardPass,
-                                               _rs: &[RsWorkingSet]|
- -> ::std::result::Result<(), String> {
-    unreachable!("an attention-only model binds no recurrent state")
-});
-define_run_one!(
-    run_one_hybrid,
-    hybrid,
-    |fwd: &ForwardPass, rs: &[RsWorkingSet]| fwd.recurrent(rs)
-);
+define_run_one!(run_one_attention, attention);
+define_run_one!(run_one_hybrid, hybrid);
 
 async fn run_one(
     input: &Input,

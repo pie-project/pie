@@ -166,7 +166,7 @@ async fn main(input: Input) -> Result<String> {
             .map_err(|e| format!("g0 take: {e}"))?[0]
     };
 
-    let mut chat_dec = chat::create_decoder();
+    let chat_dec = chat::create_decoder();
     let mut text = String::new();
     let mut done = stop.contains(&(g0 as u32));
     if !stop.contains(&(g0 as u32)) {
