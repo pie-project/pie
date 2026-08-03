@@ -14254,6 +14254,12 @@ const LoraTable* lora,
                            /*tp=*/1, stream);
     }
 
+    {
+        auto __sg_mask = sg.open_cond(4, true);
+        sg.begin_body(__sg_mask.if_body);
+        stream = sg.stream();
+        cublas.set_stream(stream);
+        {
     kernels::launch_embed_bf16(
         token_ids, require(w.embed, "embed")->data(), ws.y.data(),
         N, H, V, stream);
@@ -14268,158 +14274,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c7_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c7_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(0);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c7_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(0);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c7_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(0);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 0u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            0u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c10_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c10_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 0u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                0u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(0);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                0u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c10_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 0u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                0u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(0u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(0);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[0]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                0u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c10_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(0);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            0u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -14468,158 +14372,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c30_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c30_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(1);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c30_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(1);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c30_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(1);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 1u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            1u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c33_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c33_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 1u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                1u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(1);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                1u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c33_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 1u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                1u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(1u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(1);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[1]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                1u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c33_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(1);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            1u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -14668,158 +14470,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c53_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c53_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(2);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c53_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(2);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c53_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(2);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 2u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            2u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c56_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c56_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 2u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                2u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(2);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                2u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c56_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 2u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                2u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(2u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(2);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[2]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                2u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c56_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(2);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            2u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -14868,158 +14568,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c76_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c76_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(3);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c76_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(3);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c76_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(3);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 3u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            3u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c79_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c79_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 3u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                3u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(3);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                3u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c79_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 3u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                3u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(3u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(3);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[3]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                3u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c79_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(3);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            3u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -15068,158 +14666,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c99_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c99_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(4);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c99_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(4);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c99_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(4);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 4u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            4u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c102_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c102_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 4u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                4u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(4);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                4u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c102_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 4u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                4u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(4u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(4);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[4]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                4u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c102_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(4);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            4u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -15268,158 +14764,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c122_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c122_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(5);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c122_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(5);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c122_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(5);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 5u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            5u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c125_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c125_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 5u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                5u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(5);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                5u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c125_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 5u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                5u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(5u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(5);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[5]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                5u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c125_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(5);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            5u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -15468,158 +14862,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c145_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c145_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(6);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c145_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(6);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c145_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(6);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 6u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            6u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c148_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c148_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 6u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                6u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(6);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                6u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c148_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 6u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                6u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(6u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(6);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[6]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                6u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c148_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(6);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            6u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -15668,158 +14960,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c168_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c168_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(7);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c168_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(7);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c168_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(7);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 7u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            7u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c171_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c171_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 7u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                7u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(7);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                7u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c171_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 7u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                7u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(7u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(7);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[7]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                7u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c171_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(7);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            7u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -15868,158 +15058,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c191_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c191_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(8);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c191_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(8);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c191_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(8);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 8u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            8u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c194_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c194_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 8u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                8u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(8);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                8u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c194_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 8u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                8u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(8u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(8);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[8]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                8u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c194_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(8);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            8u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -16068,158 +15156,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c214_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c214_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(9);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c214_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(9);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c214_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(9);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 9u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            9u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c217_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c217_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 9u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                9u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(9);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                9u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c217_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 9u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                9u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(9u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(9);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[9]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                9u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c217_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(9);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            9u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -16268,158 +15254,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c237_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c237_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(10);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c237_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(10);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c237_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(10);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 10u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            10u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c240_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c240_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 10u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                10u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(10);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                10u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c240_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 10u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                10u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(10u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(10);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[10]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                10u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c240_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(10);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            10u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -16468,158 +15352,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c260_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c260_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(11);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c260_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(11);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c260_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(11);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 11u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            11u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c263_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c263_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 11u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                11u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(11);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                11u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c263_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 11u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                11u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(11u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(11);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[11]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                11u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c263_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(11);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            11u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -16668,158 +15450,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c283_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c283_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(12);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c283_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(12);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c283_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(12);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 12u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            12u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c286_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c286_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 12u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                12u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(12);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                12u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c286_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 12u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                12u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(12u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(12);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[12]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                12u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c286_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(12);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            12u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -16868,158 +15548,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c306_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c306_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(13);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c306_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(13);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c306_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(13);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 13u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            13u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c309_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c309_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 13u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                13u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(13);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                13u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c309_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 13u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                13u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(13u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(13);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[13]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                13u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c309_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(13);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            13u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -17068,158 +15646,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c329_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c329_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(14);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c329_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(14);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c329_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(14);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 14u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            14u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c332_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c332_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 14u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                14u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(14);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                14u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c332_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 14u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                14u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(14u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(14);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[14]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                14u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c332_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(14);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            14u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -17268,158 +15744,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c352_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c352_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(15);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c352_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(15);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c352_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(15);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 15u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            15u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c355_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c355_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 15u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                15u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(15);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                15u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c355_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 15u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                15u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(15u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(15);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[15]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                15u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c355_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(15);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            15u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -17468,158 +15842,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c375_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c375_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(16);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c375_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(16);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c375_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(16);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 16u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            16u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c378_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c378_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 16u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                16u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(16);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                16u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c378_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 16u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                16u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(16u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(16);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 16 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[16]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                16u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c378_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(16);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            16u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -17668,158 +15940,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c398_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c398_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(17);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c398_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(17);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c398_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(17);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 17u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            17u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c401_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c401_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 17u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                17u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(17);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                17u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c401_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 17u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                17u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(17u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(17);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 17 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[17]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                17u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c401_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(17);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            17u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -17868,158 +16038,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c421_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c421_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(18);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c421_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(18);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c421_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(18);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 18u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            18u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c424_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c424_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 18u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                18u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(18);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                18u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c424_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 18u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                18u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(18u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(18);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 18 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[18]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                18u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c424_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(18);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            18u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -18068,158 +16136,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c444_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c444_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(19);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c444_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(19);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c444_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(19);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 19u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            19u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c447_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c447_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 19u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                19u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(19);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                19u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c447_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 19u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                19u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(19u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(19);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 19 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[19]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                19u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c447_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(19);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            19u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -18268,158 +16234,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c467_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c467_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(20);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c467_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(20);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c467_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(20);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 20u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            20u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c470_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c470_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 20u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                20u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(20);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                20u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c470_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 20u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                20u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(20u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(20);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 20 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[20]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                20u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c470_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(20);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            20u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -18468,158 +16332,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c490_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c490_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(21);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c490_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(21);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c490_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(21);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 21u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            21u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c493_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c493_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 21u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                21u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(21);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                21u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c493_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 21u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                21u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(21u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(21);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 21 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[21]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                21u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c493_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(21);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            21u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -18668,158 +16430,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c513_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c513_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(22);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c513_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(22);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c513_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(22);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 22u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            22u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c516_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c516_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 22u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                22u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(22);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                22u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c516_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 22u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                22u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(22u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(22);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 22 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[22]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                22u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c516_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(22);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            22u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -18868,158 +16528,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c536_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c536_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(23);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c536_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(23);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c536_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(23);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 23u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            23u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c539_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c539_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 23u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                23u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(23);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                23u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c539_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 23u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                23u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(23u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(23);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 23 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[23]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                23u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c539_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(23);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            23u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -19068,158 +16626,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c559_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c559_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(24);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c559_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(24);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c559_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(24);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 24u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            24u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c562_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c562_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 24u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                24u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(24);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                24u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c562_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 24u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                24u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(24u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(24);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 24 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[24]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                24u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c562_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(24);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            24u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -19268,158 +16724,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c582_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c582_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(25);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c582_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(25);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c582_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(25);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 25u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            25u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c585_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c585_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 25u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                25u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(25);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                25u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c585_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 25u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                25u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(25u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(25);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 25 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[25]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                25u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c585_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(25);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            25u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -19468,158 +16822,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c605_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c605_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(26);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c605_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(26);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c605_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(26);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 26u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            26u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c608_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c608_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 26u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                26u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(26);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                26u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c608_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 26u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                26u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(26u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(26);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 26 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[26]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                26u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c608_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(26);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            26u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -19668,158 +16920,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c628_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c628_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(27);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c628_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(27);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c628_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(27);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 27u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            27u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c631_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c631_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 27u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                27u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(27);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                27u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c631_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 27u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                27u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(27u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(27);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 27 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[27]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                27u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c631_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(27);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            27u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -19868,158 +17018,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c651_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c651_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(28);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c651_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(28);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c651_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(28);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 28u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            28u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c654_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c654_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 28u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                28u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(28);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                28u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c654_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 28u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                28u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(28u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(28);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 28 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[28]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                28u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c654_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(28);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            28u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -20068,158 +17116,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c674_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c674_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(29);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c674_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(29);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c674_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(29);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 29u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            29u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c677_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c677_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 29u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                29u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(29);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                29u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c677_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 29u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                29u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(29u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(29);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 29 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[29]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                29u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c677_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(29);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            29u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -20268,158 +17214,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c697_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c697_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(30);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c697_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(30);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c697_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(30);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 30u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            30u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c700_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c700_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 30u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                30u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(30);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                30u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c700_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 30u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                30u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(30u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(30);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 30 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[30]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                30u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c700_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(30);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            30u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -20468,158 +17312,56 @@ const LoraTable* lora,
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
-    // [supergraph] HasLora arm elided (host-driven apply;
-    // lora fires stay eager until S4).
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
     {
-        auto __sg_c720_0 = sg.open_cond(0, true);
-        sg.begin_body(__sg_c720_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(31);
-            kernels::launch_write_kv_explicit_bf16(
-                kv_view,
-                bf16_row(ws.k.data(), 0, Hk),
-                bf16_row(ws.v.data(), 0, Hk),
-                w_page_d + 0, w_off_d + 0,
-                N, stream,
-                row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c720_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        {
-            auto kv_view = cache.layer_view(31);
-            kernels::launch_write_kv_to_pages(
-                kv_view, ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens,
-                N, R, stream, row_valid_d, /*first_token=*/0);
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c720_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(31);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 31u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            31u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (!plan_state.mask_decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no custom-mask plan");
     }
     {
-        auto __sg_c723_0 = sg.open_cond(4, true);
-        sg.begin_body(__sg_c723_0.if_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 31u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                31u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        if (!plan_state.mask_decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no custom-mask plan");
-        }
-        {
-            auto kv_view = cache.layer_view(31);
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.mask_decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                31u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.begin_body(__sg_c723_0.else_body);
-    stream = sg.stream();
-    cublas.set_stream(stream);
-        if (hooks != nullptr) {
-            attn_page_indices = kv_page_indices;
-            attn_page_indptr = kv_page_indptr;
-            attn_last_page_lens = kv_last_page_lens;
-            page_mask.begin_layer(stream);
-            score_capture.emplace(hooks, 31u,
-                static_cast<std::uint32_t>(num_q_heads),
-                /*capturable=*/true, stream);
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                31u, stream, /*query_is_f32=*/false,
-                {.mask_sink = page_mask.sink()});
-        }
-        // [supergraph] WantsAttnScore arm elided (host-driven
-        // capture machinery; replay-ineligible until S4).
-        if (page_mask.written_for(31u)) {
-            if (!plan_state.decode_plan) {
-                throw std::runtime_error(
-                    "attn_page_mask was written but this layer does "
-                    "not take the paged decode path");
-            }
-            if (!ops::decode_plan_is_page_count_independent(
-                    *plan_state.decode_plan)) {
-                throw std::runtime_error(
-                    "attn_page_mask requires a page-count-independent "
-                    "decode plan; this fire planned split-KV");
-            }
-            page_mask.compact(
-                kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                static_cast<std::uint32_t>(R), stream);
-            attn_page_indices = page_mask.page_indices();
-            attn_page_indptr = page_mask.page_indptr();
-            attn_last_page_lens = page_mask.last_page_lens();
-        }
-        if (!plan_state.decode_plan) {
-            throw std::runtime_error(
-                "generated forward: prepare built no decode plan");
-        }
-        {
-            auto kv_view = cache.layer_view(31);
-            const int layer_window_left =
-                (!fwd_cfg.per_layer_window_left.empty() &&
-                 31 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                    ? fwd_cfg.per_layer_window_left[31]
-                    : fwd_cfg.sliding_window;
-            ops::dispatch_attention_flashinfer_decode(
-                *plan_state.decode_plan,
-                ws.q.data(), kv_view, ws.attn_out.data(),
-                attn_page_indices, attn_page_indptr,
-                attn_last_page_lens,
-                attn_ws, stream, layer_window_left,
-                /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
-        }
-        if (hooks != nullptr) {
-            invoke_stage_hook(
-                hooks, StageHookPoint::OnAttn, ws.q.data(),
-                static_cast<std::uint32_t>(N),
-                static_cast<std::uint32_t>(Hq),
-                31u, stream, /*query_is_f32=*/false,
-                {.scores = score_capture ? score_capture->scores()
-                                         : nullptr});
-        }
-        sg.end_body();
-        sg.close_cond(__sg_c723_0);
-    stream = sg.stream();
-    cublas.set_stream(stream);
+        auto kv_view = cache.layer_view(31);
+        ops::dispatch_attention_flashinfer_prefill_custom(
+            *plan_state.mask_decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr,
+            kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+            attn_ws, stream);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            31u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
     }
     ops::gemm_act_x_w(cublas.handle(),
         ws.attn_out.data(),
@@ -20686,5 +17428,3986 @@ const LoraTable* lora,
         ops::gemm_act_x_w(cublas.handle(),
             lm_head_input, ops::WeightView(*require(w.lm_head, "lm_head")),
             ws.logits.data(), lm_head_rows, V, H);
+    }
+        }
+        sg.end_body();
+        sg.begin_body(__sg_mask.else_body);
+        stream = sg.stream();
+        cublas.set_stream(stream);
+        {
+    kernels::launch_embed_bf16(
+        token_ids, require(w.embed, "embed")->data(), ws.y.data(),
+        N, H, V, stream);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[0].attn_norm, "layer.0.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[0].qkv_proj_fused, "layer.0.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(0);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 0u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            0u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(0u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(0);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[0]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            0u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[0].o_proj, "layer.0.o_proj"), w.layers[0].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_0 =
+        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_0) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[0].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_0) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[1].attn_norm, "layer.1.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[1].qkv_proj_fused, "layer.1.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(1);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 1u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            1u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(1u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(1);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[1]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            1u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[1].o_proj, "layer.1.o_proj"), w.layers[1].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_1 =
+        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_1) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[1].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_1) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[2].attn_norm, "layer.2.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[2].qkv_proj_fused, "layer.2.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(2);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 2u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            2u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(2u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(2);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[2]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            2u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[2].o_proj, "layer.2.o_proj"), w.layers[2].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_2 =
+        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_2) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[2].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_2) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[3].attn_norm, "layer.3.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[3].qkv_proj_fused, "layer.3.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(3);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 3u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            3u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(3u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(3);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[3]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            3u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[3].o_proj, "layer.3.o_proj"), w.layers[3].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_3 =
+        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_3) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[3].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_3) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[4].attn_norm, "layer.4.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[4].qkv_proj_fused, "layer.4.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(4);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 4u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            4u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(4u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(4);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[4]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            4u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[4].o_proj, "layer.4.o_proj"), w.layers[4].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_4 =
+        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_4) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[4].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_4) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[5].attn_norm, "layer.5.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[5].qkv_proj_fused, "layer.5.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(5);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 5u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            5u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(5u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(5);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[5]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            5u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[5].o_proj, "layer.5.o_proj"), w.layers[5].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_5 =
+        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_5) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[5].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_5) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[6].attn_norm, "layer.6.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[6].qkv_proj_fused, "layer.6.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(6);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 6u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            6u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(6u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(6);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[6]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            6u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[6].o_proj, "layer.6.o_proj"), w.layers[6].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_6 =
+        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_6) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[6].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_6) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[7].attn_norm, "layer.7.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[7].qkv_proj_fused, "layer.7.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(7);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 7u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            7u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(7u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(7);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[7]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            7u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[7].o_proj, "layer.7.o_proj"), w.layers[7].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_7 =
+        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_7) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[7].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_7) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[8].attn_norm, "layer.8.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[8].qkv_proj_fused, "layer.8.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(8);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 8u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            8u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(8u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(8);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[8]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            8u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[8].o_proj, "layer.8.o_proj"), w.layers[8].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_8 =
+        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_8) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[8].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_8) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[9].attn_norm, "layer.9.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[9].qkv_proj_fused, "layer.9.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(9);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 9u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            9u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(9u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(9);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[9]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            9u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[9].o_proj, "layer.9.o_proj"), w.layers[9].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_9 =
+        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_9) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[9].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_9) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[10].attn_norm, "layer.10.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[10].qkv_proj_fused, "layer.10.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(10);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 10u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            10u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(10u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(10);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[10]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            10u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[10].o_proj, "layer.10.o_proj"), w.layers[10].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_10 =
+        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_10) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[10].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_10) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[11].attn_norm, "layer.11.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[11].qkv_proj_fused, "layer.11.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(11);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 11u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            11u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(11u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(11);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[11]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            11u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[11].o_proj, "layer.11.o_proj"), w.layers[11].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_11 =
+        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_11) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[11].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_11) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[12].attn_norm, "layer.12.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[12].qkv_proj_fused, "layer.12.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(12);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 12u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            12u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(12u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(12);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[12]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            12u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[12].o_proj, "layer.12.o_proj"), w.layers[12].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_12 =
+        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_12) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[12].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_12) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[13].attn_norm, "layer.13.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[13].qkv_proj_fused, "layer.13.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(13);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 13u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            13u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(13u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(13);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[13]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            13u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[13].o_proj, "layer.13.o_proj"), w.layers[13].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_13 =
+        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_13) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[13].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_13) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[14].attn_norm, "layer.14.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[14].qkv_proj_fused, "layer.14.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(14);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 14u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            14u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(14u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(14);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[14]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            14u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[14].o_proj, "layer.14.o_proj"), w.layers[14].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_14 =
+        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_14) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[14].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_14) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[15].attn_norm, "layer.15.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[15].qkv_proj_fused, "layer.15.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(15);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 15u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            15u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(15u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(15);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[15]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            15u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[15].o_proj, "layer.15.o_proj"), w.layers[15].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_15 =
+        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_15) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[15].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_15) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[16].attn_norm, "layer.16.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[16].qkv_proj_fused, "layer.16.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(16);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 16u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            16u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(16u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(16);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             16 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[16]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            16u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[16].o_proj, "layer.16.o_proj"), w.layers[16].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_16 =
+        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_16) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[16].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_16) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[17].attn_norm, "layer.17.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[17].qkv_proj_fused, "layer.17.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(17);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 17u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            17u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(17u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(17);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             17 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[17]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            17u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[17].o_proj, "layer.17.o_proj"), w.layers[17].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_17 =
+        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_17) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[17].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_17) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[18].attn_norm, "layer.18.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[18].qkv_proj_fused, "layer.18.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(18);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 18u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            18u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(18u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(18);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             18 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[18]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            18u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[18].o_proj, "layer.18.o_proj"), w.layers[18].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_18 =
+        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_18) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[18].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_18) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[19].attn_norm, "layer.19.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[19].qkv_proj_fused, "layer.19.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(19);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 19u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            19u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(19u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(19);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             19 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[19]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            19u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[19].o_proj, "layer.19.o_proj"), w.layers[19].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_19 =
+        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_19) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[19].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_19) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[20].attn_norm, "layer.20.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[20].qkv_proj_fused, "layer.20.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(20);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 20u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            20u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(20u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(20);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             20 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[20]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            20u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[20].o_proj, "layer.20.o_proj"), w.layers[20].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_20 =
+        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_20) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[20].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_20) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[21].attn_norm, "layer.21.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[21].qkv_proj_fused, "layer.21.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(21);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 21u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            21u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(21u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(21);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             21 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[21]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            21u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[21].o_proj, "layer.21.o_proj"), w.layers[21].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_21 =
+        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_21) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[21].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_21) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[22].attn_norm, "layer.22.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[22].qkv_proj_fused, "layer.22.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(22);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 22u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            22u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(22u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(22);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             22 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[22]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            22u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[22].o_proj, "layer.22.o_proj"), w.layers[22].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_22 =
+        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_22) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[22].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_22) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[23].attn_norm, "layer.23.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[23].qkv_proj_fused, "layer.23.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(23);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 23u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            23u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(23u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(23);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             23 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[23]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            23u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[23].o_proj, "layer.23.o_proj"), w.layers[23].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_23 =
+        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_23) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[23].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_23) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[24].attn_norm, "layer.24.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[24].qkv_proj_fused, "layer.24.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(24);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 24u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            24u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(24u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(24);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             24 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[24]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            24u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[24].o_proj, "layer.24.o_proj"), w.layers[24].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_24 =
+        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_24) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[24].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_24) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[25].attn_norm, "layer.25.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[25].qkv_proj_fused, "layer.25.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(25);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 25u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            25u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(25u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(25);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             25 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[25]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            25u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[25].o_proj, "layer.25.o_proj"), w.layers[25].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_25 =
+        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_25) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[25].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_25) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[26].attn_norm, "layer.26.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[26].qkv_proj_fused, "layer.26.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(26);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 26u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            26u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(26u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(26);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             26 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[26]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            26u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[26].o_proj, "layer.26.o_proj"), w.layers[26].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_26 =
+        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_26) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[26].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_26) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[27].attn_norm, "layer.27.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[27].qkv_proj_fused, "layer.27.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(27);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 27u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            27u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(27u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(27);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             27 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[27]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            27u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[27].o_proj, "layer.27.o_proj"), w.layers[27].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_27 =
+        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_27) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[27].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_27) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[28].attn_norm, "layer.28.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[28].qkv_proj_fused, "layer.28.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(28);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 28u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            28u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(28u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(28);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             28 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[28]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            28u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[28].o_proj, "layer.28.o_proj"), w.layers[28].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[28].mlp_norm, "layer.28.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_28 =
+        w.layers[28].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_28) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[28].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[28].gate_proj, "layer.28.gate_up"), w.layers[28].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[28].up_proj, "layer.28.gate_up"), w.layers[28].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_28) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[28].down_proj, "layer.28.down"), w.layers[28].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[29].attn_norm, "layer.29.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[29].qkv_proj_fused, "layer.29.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(29);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 29u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            29u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(29u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(29);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             29 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[29]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            29u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[29].o_proj, "layer.29.o_proj"), w.layers[29].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[29].mlp_norm, "layer.29.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_29 =
+        w.layers[29].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_29) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[29].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[29].gate_proj, "layer.29.gate_up"), w.layers[29].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[29].up_proj, "layer.29.gate_up"), w.layers[29].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_29) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[29].down_proj, "layer.29.down"), w.layers[29].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[30].attn_norm, "layer.30.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[30].qkv_proj_fused, "layer.30.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(30);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 30u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            30u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(30u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(30);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             30 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[30]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            30u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[30].o_proj, "layer.30.o_proj"), w.layers[30].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[30].mlp_norm, "layer.30.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_30 =
+        w.layers[30].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_30) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[30].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[30].gate_proj, "layer.30.gate_up"), w.layers[30].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[30].up_proj, "layer.30.gate_up"), w.layers[30].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_30) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[30].down_proj, "layer.30.down"), w.layers[30].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[31].attn_norm, "layer.31.attn_norm")->data(),
+        ws.norm_x.data(), N, H, eps, stream);
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_x.data(),
+        ops::WeightView(*require(w.layers[31].qkv_proj_fused, "layer.31.qkv")),
+        ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+    kernels::launch_split_qkv_bf16(
+        ws.qkv_fused.data(),
+        ws.q.data(), ws.k.data(), ws.v.data(),
+        N, Hq, Hk, stream);
+    kernels::launch_rope_bf16(
+        ws.q.data(), ws.k.data(), positions,
+        N, num_q_heads, num_kv_heads, d,
+        cfg.rope_theta, stream);
+    {
+        auto kv_view = cache.layer_view(31);
+        kernels::launch_write_kv_explicit_bf16(
+            kv_view,
+            bf16_row(ws.k.data(), 0, Hk),
+            bf16_row(ws.v.data(), 0, Hk),
+            w_page_d + 0, w_off_d + 0,
+            N, stream,
+            row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+    }
+    if (hooks != nullptr) {
+        attn_page_indices = kv_page_indices;
+        attn_page_indptr = kv_page_indptr;
+        attn_last_page_lens = kv_last_page_lens;
+        page_mask.begin_layer(stream);
+        score_capture.emplace(hooks, 31u,
+            static_cast<std::uint32_t>(num_q_heads),
+            /*capturable=*/true, stream);
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            31u, stream, /*query_is_f32=*/false,
+            {.mask_sink = page_mask.sink()});
+    }
+    if (page_mask.written_for(31u)) {
+        if (!plan_state.decode_plan) {
+            throw std::runtime_error(
+                "attn_page_mask was written but this layer does "
+                "not take the paged decode path");
+        }
+        if (!ops::decode_plan_is_page_count_independent(
+                *plan_state.decode_plan)) {
+            throw std::runtime_error(
+                "attn_page_mask requires a page-count-independent "
+                "decode plan; this fire planned split-KV");
+        }
+        page_mask.compact(
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            static_cast<std::uint32_t>(R), stream);
+        attn_page_indices = page_mask.page_indices();
+        attn_page_indptr = page_mask.page_indptr();
+        attn_last_page_lens = page_mask.last_page_lens();
+    }
+    if (!plan_state.decode_plan) {
+        throw std::runtime_error(
+            "generated forward: prepare built no decode plan");
+    }
+    {
+        auto kv_view = cache.layer_view(31);
+        const int layer_window_left =
+            (!fwd_cfg.per_layer_window_left.empty() &&
+             31 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                ? fwd_cfg.per_layer_window_left[31]
+                : fwd_cfg.sliding_window;
+        ops::dispatch_attention_flashinfer_decode(
+            *plan_state.decode_plan,
+            ws.q.data(), kv_view, ws.attn_out.data(),
+            attn_page_indices, attn_page_indptr,
+            attn_last_page_lens,
+            attn_ws, stream, layer_window_left,
+            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+    }
+    if (hooks != nullptr) {
+        invoke_stage_hook(
+            hooks, StageHookPoint::OnAttn, ws.q.data(),
+            static_cast<std::uint32_t>(N),
+            static_cast<std::uint32_t>(Hq),
+            31u, stream, /*query_is_f32=*/false,
+            {.scores = score_capture ? score_capture->scores()
+                                     : nullptr});
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.attn_out.data(),
+        make_weight_view(require(w.layers[31].o_proj, "layer.31.o_proj"), w.layers[31].o_proj_quant),
+        ws.y.data(), N, H, Hq, 1.f);
+    kernels::launch_rmsnorm_bf16(
+        ws.y.data(), require(w.layers[31].mlp_norm, "layer.31.mlp_norm")->data(),
+        ws.norm_y.data(), N, H, eps, stream);
+    const bool gate_up_fused_31 =
+        w.layers[31].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
+    if (gate_up_fused_31) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            ops::WeightView(*w.layers[31].gate_up_proj_fused),
+            ws.gate_up_fused.data(), N, 2 * I, H);
+    } else {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[31].gate_proj, "layer.31.gate_up"), w.layers[31].gate_proj_quant),
+            ws.gate.data(), N, I, H);
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_y.data(),
+            make_weight_view(require(w.layers[31].up_proj, "layer.31.gate_up"), w.layers[31].up_proj_quant),
+            ws.up.data(), N, I, H);
+    }
+    if (gate_up_fused_31) {
+        kernels::launch_chunked_swiglu_bf16(
+            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
+    } else {
+        kernels::launch_swiglu_bf16(
+            ws.gate.data(), ws.up.data(), ws.gate.data(),
+            N * I, stream);
+    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.gate.data(),
+        make_weight_view(require(w.layers[31].down_proj, "layer.31.down"), w.layers[31].down_proj_quant),
+        ws.y.data(), N, H, I, 1.f);
+    // final_norm: deferred into the LmHead epilogue below.
+    if (fwd_cfg.emit_logits) {
+        // The hand-written epilogue, the interpreter's arm verbatim
+        // (compact logits are a per-fire runtime input).
+        const bool compact_logits =
+            logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+            num_logit_rows < N;
+        const void* lm_head_input = nullptr;
+        int lm_head_rows = N;
+        if (compact_logits) {
+            kernels::launch_gather_bf16_rows(
+                static_cast<const std::uint16_t*>(ws.y.data()),
+                logit_row_indices_d,
+                static_cast<std::uint16_t*>(ws.norm_x.data()),
+                num_logit_rows, H, stream);
+            kernels::launch_rmsnorm_bf16(
+                ws.norm_x.data(), w.final_norm->data(),
+                ws.norm_y.data(), num_logit_rows, H, eps, stream);
+            lm_head_input = ws.norm_y.data();
+            lm_head_rows = num_logit_rows;
+        } else {
+            kernels::launch_rmsnorm_bf16(
+                ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
+                N, H, eps, stream);
+            lm_head_input = ws.norm_y.data();
+        }
+        ops::gemm_act_x_w(cublas.handle(),
+            lm_head_input, ops::WeightView(*require(w.lm_head, "lm_head")),
+            ws.logits.data(), lm_head_rows, V, H);
+    }
+        }
+        sg.end_body();
+        sg.close_cond(__sg_mask);
+        stream = sg.stream();
+        cublas.set_stream(stream);
     }
 }

@@ -177,6 +177,7 @@ fn emit_class_fn(
     is_decode: bool,
     sg: bool,
 ) -> String {
+    // (sg: the TWO-PATH supergraph build — see SgValuation.)
     // Post-norm placement (olmo2) emits since the second-deployment
     // rung: the buffer routing below mirrors the interpreter's
     // `post_norm` arms line for line.
@@ -304,7 +305,43 @@ fn emit_class_fn(
         b.line("");
     }
 
-    emit_range(&mut b, plan, facts, cuda, is_decode, sg, 0, plan.ops.len(), None);
+    if sg {
+        // ONE top-level conditional (mask slot 4), TWO fully resolved
+        // walks. One handle, one embedded set kernel (inside
+        // open_cond), no nesting — the replay overhead the per-guard
+        // form paid in ~112 single-thread arms collapses to a single
+        // branch.
+        b.line("    {");
+        b.line("        auto __sg_mask = sg.open_cond(4, true);");
+        b.line("        sg.begin_body(__sg_mask.if_body);");
+        b.line("        stream = sg.stream();");
+        b.line("        cublas.set_stream(stream);");
+        b.line("        {");
+        emit_range(
+            &mut b, plan, facts, cuda, is_decode,
+            Some(SgValuation { has_custom_mask: true }),
+            0, plan.ops.len(), None,
+        );
+        b.line("        }");
+        b.line("        sg.end_body();");
+        b.line("        sg.begin_body(__sg_mask.else_body);");
+        b.line("        stream = sg.stream();");
+        b.line("        cublas.set_stream(stream);");
+        b.line("        {");
+        emit_range(
+            &mut b, plan, facts, cuda, is_decode,
+            Some(SgValuation { has_custom_mask: false }),
+            0, plan.ops.len(), None,
+        );
+        b.line("        }");
+        b.line("        sg.end_body();");
+        b.line("        sg.close_cond(__sg_mask);");
+        b.line("        stream = sg.stream();");
+        b.line("        cublas.set_stream(stream);");
+        b.line("    }");
+    } else {
+        emit_range(&mut b, plan, facts, cuda, is_decode, None, 0, plan.ops.len(), None);
+    }
     b.line("}");
     b.out
 }
@@ -323,13 +360,42 @@ struct Win {
 /// spelled as the fixed condition its closed predicate names. RECURSIVE
 /// since A1 (the class-collapse amendment): a nested guard is an
 /// ordinary op inside a region and recurses into its own chain.
+/// The supergraph's emission-time predicate valuation (the TWO-PATH
+/// form): within the graph-replayable union today, every predicate but
+/// the mask is a CONSTANT of the graph context — eligibility requires
+/// write descriptors, excludes score/lora fires, and keeps hooked rows
+/// out (Peel at its all-fast endpoint) — so each conditional body is a
+/// fully guard-resolved straight-line walk. When hooks/lora join the
+/// union (S4), the k>1 form returns to per-guard conditionals with
+/// per-slot SHARED handles (PoC-2: sibling nodes share a root handle;
+/// nested bodies cannot — the flattened two-path form sidesteps both).
+#[derive(Clone, Copy)]
+struct SgValuation {
+    has_custom_mask: bool,
+}
+
+impl SgValuation {
+    fn resolve(&self, pred: &crate::trace::GuardPred) -> bool {
+        use crate::trace::GuardPred;
+        match pred {
+            GuardPred::HasCustomMask => self.has_custom_mask,
+            GuardPred::HasWriteDesc => true,
+            GuardPred::WantsAttnScore => false,
+            GuardPred::HasLora => false,
+            other => panic!(
+                "emitter: pred {other:?} outside the supergraph union"
+            ),
+        }
+    }
+}
+
 fn emit_range(
     b: &mut Body,
     plan: &ForwardPlan,
     facts: &LlamaLikeFacts,
     cuda: &LlamaLikeCudaFacts,
     is_decode: bool,
-    sg: bool,
+    sg: Option<SgValuation>,
     start: usize,
     end: usize,
     win: Option<Win>,
@@ -342,56 +408,19 @@ fn emit_range(
             tail_ops,
         } = &op.kind
         {
-            if sg {
-                // The Peel endpoints as conditionals (slots 7/8,
-                // supergraph.hpp): fast_rows == N runs the prefix region
-                // FULL-WIDTH, fast_rows == 0 the tail region full-width —
-                // at the endpoints the full-N window IS the peeled
-                // window. A mixed fire (0 < fast_rows < N) sets neither
-                // slot and must not replay this graph (eligibility, S3);
-                // its row split bakes into kernel args the graph cannot
-                // vary (the S4 device-window campaign).
-                let mut region = i + 1;
-                b.stmt(&format!("{{"));
-                b.stmt(&format!(
-                    "    auto __sg_peel_fast_{i} = sg.open_cond(batch::kPredSlotPeelAllFast, false);"
-                ));
-                b.stmt(&format!(
-                    "    sg.begin_body(__sg_peel_fast_{i}.if_body);"
-                ));
-                b.stmt("    stream = sg.stream();");
-                b.stmt("    cublas.set_stream(stream);");
-                b.indent += 1;
+            if sg.is_some() {
+                // Peel, RESOLVED (two-path form): the union's graph
+                // fires carry no hooked rows (eligibility), so
+                // fast_rows == N and the prefix region runs FULL-WIDTH;
+                // the tail region does not exist on this path. A mixed
+                // fire must not replay this graph — the S4 device-window
+                // campaign is what would change that.
+                let region = i + 1;
                 emit_range(
                     b, plan, facts, cuda, is_decode, sg, region,
                     region + *prefix_ops as usize, None,
                 );
-                b.indent -= 1;
-                b.stmt("    sg.end_body();");
-                b.stmt(&format!("    sg.close_cond(__sg_peel_fast_{i});"));
-                b.stmt("    stream = sg.stream();");
-                b.stmt("    cublas.set_stream(stream);");
-                region += *prefix_ops as usize;
-                b.stmt(&format!(
-                    "    auto __sg_peel_hook_{i} = sg.open_cond(batch::kPredSlotPeelAllHooked, false);"
-                ));
-                b.stmt(&format!(
-                    "    sg.begin_body(__sg_peel_hook_{i}.if_body);"
-                ));
-                b.stmt("    stream = sg.stream();");
-                b.stmt("    cublas.set_stream(stream);");
-                b.indent += 1;
-                emit_range(
-                    b, plan, facts, cuda, is_decode, sg, region,
-                    region + *tail_ops as usize, None,
-                );
-                b.indent -= 1;
-                b.stmt("    sg.end_body();");
-                b.stmt(&format!("    sg.close_cond(__sg_peel_hook_{i});"));
-                b.stmt("    stream = sg.stream();");
-                b.stmt("    cublas.set_stream(stream);");
-                b.stmt("}");
-                i = region + *tail_ops as usize;
+                i = region + (*prefix_ops as usize) + (*tail_ops as usize);
                 continue;
             }
             // A3: both regions, complementary row ranges, empty ranges
@@ -419,13 +448,21 @@ fn emit_range(
             continue;
         }
         if let OpKind::Guard { arms, else_ops } = &op.kind {
-            if sg {
-                emit_guard_sg(
-                    b, plan, facts, cuda, is_decode, i, arms, *else_ops, win,
-                );
-                i = i + 1
-                    + arms.iter().map(|a| a.ops as usize).sum::<usize>()
-                    + *else_ops as usize;
+            if let Some(v) = sg {
+                // Two-path form: the valuation picks ONE region at
+                // emission; the chosen arm inlines, the rest vanish.
+                let mut region = i + 1;
+                let mut chosen: Option<(usize, usize)> = None;
+                for arm in arms.iter() {
+                    if chosen.is_none() && v.resolve(&arm.pred) {
+                        chosen = Some((region, region + arm.ops as usize));
+                    }
+                    region += arm.ops as usize;
+                }
+                let (lo, hi) = chosen
+                    .unwrap_or((region, region + *else_ops as usize));
+                emit_range(b, plan, facts, cuda, is_decode, sg, lo, hi, win);
+                i = region + *else_ops as usize;
                 continue;
             }
             let cond_of = |pred: &crate::trace::GuardPred| match pred {
@@ -1312,130 +1349,4 @@ fn emit_launch(
         }
         other => panic!("emitter: stated kernel {other} out of scope"),
     }
-}
-
-/// The Guard's supergraph form (S2): predicates become conditional
-/// nodes over the fire's device predicate word, arm chains nest into
-/// else bodies, and each body boundary rebinds `stream`/cublas to the
-/// capturing stream. Two arms stay OUTSIDE the union — their bodies
-/// are host-driven machinery that throws under capture:
-/// * `WantsAttnScore` emits its ELSE arm only (the plain dispatch);
-///   score-wanting fires are hook-carrying and replay-ineligible
-///   until the S4 hook rework.
-/// * `HasLora` emits nothing (its else is empty by construction);
-///   lora fires stay eager as today.
-fn emit_guard_sg(
-    b: &mut Body,
-    plan: &ForwardPlan,
-    facts: &LlamaLikeFacts,
-    cuda: &LlamaLikeCudaFacts,
-    is_decode: bool,
-    guard_index: usize,
-    arms: &[crate::trace::GuardArm],
-    else_ops: u32,
-    win: Option<Win>,
-) {
-    let rebind = |b: &mut Body| {
-        b.stmt("stream = sg.stream();");
-        b.stmt("cublas.set_stream(stream);");
-    };
-    // Recursive chain: emit arms[idx], nesting the rest in the else body.
-    fn chain(
-        b: &mut Body,
-        plan: &ForwardPlan,
-        facts: &LlamaLikeFacts,
-        cuda: &LlamaLikeCudaFacts,
-        is_decode: bool,
-        guard_index: usize,
-        arms: &[crate::trace::GuardArm],
-        idx: usize,
-        region: usize,
-        else_ops: u32,
-        win: Option<Win>,
-        rebind: &dyn Fn(&mut Body),
-    ) {
-        use crate::trace::GuardPred;
-        if idx == arms.len() {
-            // The chain's tail: the guard's else region, inline (it runs
-            // whenever no armed conditional fired — but conditional
-            // nodes have no "none taken" join, so the else region lives
-            // in the LAST armed conditional's else body; reaching here
-            // with ops means the caller placed us inside one).
-            emit_range(
-                b, plan, facts, cuda, is_decode, true, region,
-                region + else_ops as usize, win,
-            );
-            return;
-        }
-        let arm = &arms[idx];
-        let arm_end = region + arm.ops as usize;
-        match &arm.pred {
-            GuardPred::WantsAttnScore => {
-                // Outside the union (capture-hostile body): the score
-                // arm is SKIPPED and the chain continues as if the
-                // predicate were false. Replay eligibility keeps
-                // score-wanting fires off this graph.
-                b.stmt("// [supergraph] WantsAttnScore arm elided (host-driven");
-                b.stmt("// capture machinery; replay-ineligible until S4).");
-                chain(
-                    b, plan, facts, cuda, is_decode, guard_index, arms,
-                    idx + 1, arm_end, else_ops, win, rebind,
-                );
-            }
-            GuardPred::HasLora => {
-                b.stmt("// [supergraph] HasLora arm elided (host-driven apply;");
-                b.stmt("// lora fires stay eager until S4).");
-                chain(
-                    b, plan, facts, cuda, is_decode, guard_index, arms,
-                    idx + 1, arm_end, else_ops, win, rebind,
-                );
-            }
-            pred => {
-                let slot = match pred {
-                    GuardPred::HasWriteDesc => "0",
-                    GuardPred::HasCustomMask => "4",
-                    other => panic!(
-                        "emitter: pred {other:?} has no supergraph slot \
-                         (TokensLE/GT and retired preds are outside the \
-                         llama decode union)"
-                    ),
-                };
-                let has_tail =
-                    idx + 1 < arms.len() || else_ops > 0;
-                let var = format!("__sg_c{guard_index}_{idx}");
-                b.stmt(&format!("{{"));
-                b.stmt(&format!(
-                    "    auto {var} = sg.open_cond({slot}, {});",
-                    if has_tail { "true" } else { "false" }
-                ));
-                b.stmt(&format!("    sg.begin_body({var}.if_body);"));
-                rebind(b);
-                b.indent += 1;
-                emit_range(
-                    b, plan, facts, cuda, is_decode, true, region, arm_end,
-                    win,
-                );
-                b.indent -= 1;
-                b.stmt("    sg.end_body();");
-                if has_tail {
-                    b.stmt(&format!("    sg.begin_body({var}.else_body);"));
-                    rebind(b);
-                    b.indent += 1;
-                    chain(
-                        b, plan, facts, cuda, is_decode, guard_index, arms,
-                        idx + 1, arm_end, else_ops, win, rebind,
-                    );
-                    b.indent -= 1;
-                    b.stmt("    sg.end_body();");
-                }
-                b.stmt(&format!("    sg.close_cond({var});"));
-                rebind(b);
-                b.stmt("}");
-            }
-        }
-    }
-    chain(
-        b, plan, facts, cuda, is_decode, guard_index, arms, 0,
-        guard_index + 1, else_ops, win, &rebind,
-    );
 }
