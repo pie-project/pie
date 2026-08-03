@@ -53,6 +53,7 @@ enum class PieLoaderExpertPackKind {
   GptOssNativeMarlin = 1,
   GptOssEagerBf16 = 2,
   GptOssRoutedMxfp4 = 3,
+  MixtralTpBf16 = 4,
 };
 
 enum class PieLoaderMxfp4MoePolicy {

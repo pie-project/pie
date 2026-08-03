@@ -653,14 +653,13 @@ impl DefaultAbiBuilder<'_> {
                 self.cfg.model_type
             )));
         };
-        // GPT-OSS packs each rank's TP-local expert slices into a contiguous
-        // on-disk pack. Other arches still need strided HF extents the
-        // streamer cannot page.
-        if self.target.tp_size > 1 && !self.profile().gpt_oss_mxfp4_groups {
+        // Under tp_size>1 the streamer needs contiguous per-rank extents, so
+        // the arch recipe must request an offline pack (GPT-OSS / Mixtral).
+        if self.target.tp_size > 1 && arch.pack_kind == crate::storage::ExpertPackKind::None {
             return Err(CompileError::InvalidInput(
-                "stream_routed_experts with tp_size>1 is only supported for \
-                 gpt_oss (per-rank expert packs); other arches still require \
-                 tp_size=1"
+                "stream_routed_experts with tp_size>1 requires a per-rank \
+                 expert pack (supported: gpt_oss, mixtral); other arches \
+                 still require tp_size=1"
                     .to_string(),
             ));
         }

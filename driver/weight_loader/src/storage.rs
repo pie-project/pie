@@ -181,8 +181,8 @@ pub enum StorageInstr {
 ///
 /// When non-[`Self::None`], the CUDA driver builds (or opens) a transformed
 /// host pack with bounded staging before paging sections through the expert
-/// stream cache. Plain ExtentWrite streams (HF packs / Mixtral BF16) leave
-/// this as `None`.
+/// stream cache. Plain ExtentWrite streams (HF packs / Mixtral BF16 at
+/// `tp_size=1`) leave this as `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u32)]
 pub enum ExpertPackKind {
@@ -192,6 +192,8 @@ pub enum ExpertPackKind {
     GptOssEagerBf16 = 2,
     /// Contiguous TP-local HF MXFP4 sections (RoutedDecode under tp_size>1).
     GptOssRoutedMxfp4 = 3,
+    /// Contiguous TP-local Mixtral BF16 w1/w2/w3 (tp_size>1 densify).
+    MixtralTpBf16 = 4,
 }
 
 /// One deferred source extent for a streamed expert section.

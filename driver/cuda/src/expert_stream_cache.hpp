@@ -18,9 +18,10 @@
 // lives in the weight loader / model forward, not here).
 //
 // Scope (v1): on-demand only — no prefetch, no popularity preload.
-// TP+streaming is GPT-OSS-only via per-rank offline packs (dense local-I
-// sections); other arches remain tp_size=1. The table/slot bookkeeping
-// (`ExpertSlotIndex`) is host-only so it can be unit-tested without a GPU.
+// TP+streaming uses per-rank offline packs (GPT-OSS MXFP4/BF16/Marlin,
+// Mixtral BF16) with dense local-I sections; other arches remain tp_size=1.
+// The table/slot bookkeeping (`ExpertSlotIndex`) is host-only so it can be
+// unit-tested without a GPU.
 
 #include <cstdint>
 #include <filesystem>

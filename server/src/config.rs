@@ -816,8 +816,8 @@ pub struct CudaNativeDriverOptions {
     /// keep routed MoE expert weights on disk and page them into a bounded
     /// LRU GPU cache on demand at forward time instead of materializing
     /// them in VRAM at startup. Combined with `tensor_parallel_size > 1`,
-    /// only GPT-OSS is supported (per-rank packs); other arches fail in the
-    /// CUDA driver after the model type is known.
+    /// GPT-OSS and Mixtral are supported (per-rank packs); other arches fail
+    /// in the CUDA driver after the model type is known.
     pub stream_routed_experts: bool,
     /// Expert stream cache budget in GiB. 0 (default) = auto: half of the
     /// post-weights free VRAM, capped at the full routed expert set. Only

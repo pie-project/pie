@@ -59,17 +59,18 @@ Supported arches today: `deepseek_v4`, `gpt_oss`, `mixtral`, `qwen3_moe`,
 streams a BF16 expert pack; biases stay resident; Qwen shared expert / router
 stay resident).
 
-## Version 6 — GPT-OSS TP + streaming packs
+## Version 6 — TP + streaming packs
 
-`STORAGE_PROGRAM_VERSION = 6` adds `ExpertPackKind::GptOssRoutedMxfp4` and
-sizes GPT-OSS stream sections for TP-local intermediate
-(`I_local = I_full / tp_size`). Under `tp_size > 1`, each rank builds a
-contiguous `{cache_key}.experts` pack (cache key already includes
-`tp_rank`/`tp_size`):
+`STORAGE_PROGRAM_VERSION = 6` adds TP-local expert packs so
+`stream_routed_experts && tp_size > 1` can page contiguous per-rank extents
+(cache key already includes `tp_rank`/`tp_size`):
 
-- Native Marlin / Eager BF16: pack builders apply the same row/column offsets
-  as resident TP.
-- RoutedDecode: switches from HF bindings to a dense local-I MXFP4 pack
-  (down groups are strided in HF and must be gathered).
+- GPT-OSS `GptOssRoutedMxfp4` / Native Marlin / Eager BF16: section sizes use
+  `I_local = I_full / tp_size`; builders apply the same row/column offsets as
+  resident TP (RoutedDecode densifies strided down groups).
+- Mixtral `MixtralTpBf16`: contiguous BF16 `w1`/`w3` row slices and densified
+  `w2` columns under `tp_size > 1`; at `tp_size = 1` Mixtral still pages full
+  HF experts (`pack_kind = None`).
 
-Non–GPT-OSS arches still reject `stream_routed_experts && tp_size > 1`.
+Arches without a per-rank pack still reject `stream_routed_experts &&
+tp_size > 1`.

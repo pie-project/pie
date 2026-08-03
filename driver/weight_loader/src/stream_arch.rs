@@ -644,8 +644,127 @@ pub(crate) const MIXTRAL_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     pack_kind: ExpertPackKind::None,
 };
 
-pub(crate) fn select_mixtral(_target: &StorageTarget) -> Option<StreamArchDesc> {
-    Some(MIXTRAL_STREAM_ARCH)
+fn mixtral_find_tensor<'a>(
+    metadata: &'a CheckpointMetadata,
+    name: &str,
+) -> Result<&'a RawTensor, CompileError> {
+    metadata
+        .tensors
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| {
+            CompileError::InvalidInput(format!(
+                "stream_routed_experts: missing Mixtral expert tensor '{name}'"
+            ))
+        })
+}
+
+/// TP-local BF16 section sizes for Mixtral packs under `tp_size>1`.
+///
+/// HF: w1/w3 `[I, H]`, w2 `[H, I]`. Pack stores dense `I_local` slices so the
+/// streamer can page contiguous extents (w2 columns are strided in HF).
+pub(crate) fn mixtral_tp_section_bytes(
+    w1: &RawTensor,
+    w2: &RawTensor,
+    w3: &RawTensor,
+    target: &StorageTarget,
+) -> Result<[u64; 3], CompileError> {
+    if w1.shape.len() != 2 || w2.shape.len() != 2 || w3.shape.len() != 2 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: Mixtral TP pack expects 2-D w1/w2/w3 tensors"
+                .to_string(),
+        ));
+    }
+    let i_full = w1.shape[0];
+    let hidden = w1.shape[1];
+    if w3.shape != w1.shape {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: Mixtral w3 shape {:?} must match w1 {:?}",
+            w3.shape, w1.shape
+        )));
+    }
+    if w2.shape[0] != hidden || w2.shape[1] != i_full {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: Mixtral w2 expected [{hidden}, {i_full}], got {:?}",
+            w2.shape
+        )));
+    }
+    let (_local_start, local_intermediate) = tp_local_range(i_full, target)?;
+    let i_local = local_intermediate as u64;
+    let h = hidden as u64;
+    let w1_bytes = i_local * h * 2;
+    let w2_bytes = h * i_local * 2;
+    Ok([w1_bytes, w2_bytes, w1_bytes])
+}
+
+fn mixtral_tp_collect_bindings(
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    let e = num_experts as u64;
+    if e == 0 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: Mixtral num_experts must be > 0".to_string(),
+        ));
+    }
+    const SECTION_ALIGN: u64 = 256;
+    let mut bindings = Vec::with_capacity(
+        (num_layers as usize) * (num_experts as usize) * MIXTRAL_EXPERT_SECTIONS.len(),
+    );
+    let mut section_bytes: Option<[u64; 3]> = None;
+    let mut section_offsets = [0u64; 3];
+    let mut slot_bytes = 0u64;
+    for layer in 0..num_layers {
+        let prefix = format!("model.layers.{layer}.block_sparse_moe.experts.0.");
+        let w1 = mixtral_find_tensor(metadata, &format!("{prefix}w1.weight"))?;
+        let w2 = mixtral_find_tensor(metadata, &format!("{prefix}w2.weight"))?;
+        let w3 = mixtral_find_tensor(metadata, &format!("{prefix}w3.weight"))?;
+        let bytes = mixtral_tp_section_bytes(w1, w2, w3, target)?;
+        if let Some(prev) = section_bytes {
+            if prev != bytes {
+                return Err(CompileError::InvalidInput(format!(
+                    "stream_routed_experts: Mixtral TP section sizes differ \
+                     across layers (layer {layer})"
+                )));
+            }
+        } else {
+            let mut off = 0u64;
+            for s in 0..3 {
+                section_offsets[s] = off;
+                off = align_up_u64(off + bytes[s], SECTION_ALIGN);
+            }
+            slot_bytes = off;
+            section_bytes = Some(bytes);
+        }
+        for expert in 0..e {
+            let base = (layer as u64 * e + expert) * slot_bytes;
+            for s in 0..3 {
+                bindings.push(StreamBinding {
+                    file_id: crate::types::FileId(0),
+                    file_offset: base + section_offsets[s],
+                    span_bytes: bytes[s],
+                });
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) const MIXTRAL_TP_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: MIXTRAL_EXPERT_SECTIONS,
+    is_streamed: is_mixtral_routed_expert_tensor,
+    collect_bindings: mixtral_tp_collect_bindings,
+    pack_kind: ExpertPackKind::MixtralTpBf16,
+};
+
+pub(crate) fn select_mixtral(target: &StorageTarget) -> Option<StreamArchDesc> {
+    if target.tp_size > 1 {
+        Some(MIXTRAL_TP_STREAM_ARCH)
+    } else {
+        Some(MIXTRAL_STREAM_ARCH)
+    }
 }
 
 /// Plain Qwen3-MoE per-expert BF16 weights — must match `qwen_moe_expert_sections.hpp`.
