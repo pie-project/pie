@@ -128,7 +128,7 @@ async fn main(input: Input) -> Result<String> {
         .context("read first constrained token")?[0] as u32;
 
     let mut generated = vec![first];
-    constraint.advance(&[first]);
+    constraint.advance(&[first]).context("advance grammar")?;
 
     if !constraint.is_terminated() && generated.len() < input.max_tokens {
         let token_in = Channel::from(vec![first as i32]).named("token_in");
@@ -194,7 +194,7 @@ async fn main(input: Input) -> Result<String> {
                 .await
                 .context("read constrained token")?[0] as u32;
             generated.push(token);
-            constraint.advance(&[token]);
+            constraint.advance(&[token]).context("advance grammar")?;
             if constraint.is_terminated() || generated.len() == input.max_tokens {
                 break;
             }
