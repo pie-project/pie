@@ -544,3 +544,26 @@ dispatch, interpreter and generated. What remains honest: dense DEVICE
 masks stay solo by nature, and no REAL policy inferlet ships a
 non-causal wire mask yet — naive-masked is the measurement instrument
 standing in for one.
+
+Second follow-up — the holed producer swept the full deployment
+matrix (2026-08-03, same session). The composed wire-mask assembly +
+custom-dispatch proof is not a qwen3-0.6b artifact:
+- **OLMo-2-1B** (post-norm, unfused, GENERATED inc): solo == mixed
+  6/6 on interpreter AND generated legs, solo ON == GEN; composed
+  `N=52 R=3 mask=1` ×2 and the three-prefill `N=150 R=3 mask=1`. The
+  post-norm generated custom-mask arm had never run with a real
+  non-causal mask before this.
+- **Phi-3-mini** (interpreter): 6/6, `N=58 R=3 mask=1` ×4 + `N=168
+  R=3 mask=1`. **Mistral-7B** (interpreter): 6/6, `N=56 R=3 mask=1`
+  ×5 + `N=162 R=3 mask=1`. Zero errors anywhere.
+Also probed and closed a question: qwen3_5's recorded custom-mask gap
+(hand-written ignores `mask_d`) is UNREACHABLE today — naive-masked's
+attention shape fails recurrent-state binding on the hybrid model
+before any fire is built, so no current surface can deliver a custom
+mask to qwen3_5. The recorded-gap status (fallback reason + note, the
+same pattern as lora) is the honest state; a fail-loud would be dead
+code. Separately confirmed the two write-descriptor conventions in
+naive-baseline (`p / page_size`) and naive-masked (`pool_ids[...]`)
+are the SAME convention: `reserve()` returns LOGICAL per-working-set
+page indices (0..k for a fresh set), so `pool_ids[i] == i` — no trust
+gap in the parity workhorses.
