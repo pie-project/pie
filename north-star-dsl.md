@@ -402,3 +402,39 @@ kernels); PTIR untouched; planner's divergence lowerings still chosen at
 fire time from candidates. The append-only ABI discipline holds — new op
 kinds append (21+), variant fields ride param slots serde-defaulted so
 every existing golden stays byte-identical.
+
+## Dense-mask compose — the pinned design (2026-08-03, pre-implementation)
+
+The census's one remaining scheduler refusal (`mask-compose`) and the
+masked+hooked arm's missing producer share one capability: let a
+wire-BRLE-masked lane ride a composed device-geometry batch. The seam
+is `frame.cpp`'s composed-path throw ("non-causal wire masks cannot
+ride..."), and the constraint that forces the shape of the fix is that
+a device-resolved lane's TRUE kv length under run-ahead lives in
+`kv_len_device` — device-resident — so host-side causal synthesis for
+those lanes is not generally exact. Therefore a HYBRID DEVICE-SIDE
+pack, extending item A's machinery (`pack_dense_mask.cu`):
+
+1. **Wire lanes**: host-decode their BRLE rows against their (exact,
+   wire) geometry — `brle::decode` restricted to the wire prefix —
+   and stage the bit-packed bytes per lane.
+2. **Device lanes**: structured `Causal` params (item A's vocabulary),
+   packed device-side against the resolved `klen`.
+3. **One `mask_indptr` over all lanes, computed DEVICE-side**: a small
+   prefix-sum kernel over per-lane byte sizes (wire lanes' sizes are
+   host constants passed in; device lanes' derive from klen), with the
+   packed buffer allocated to the page-capacity upper bound.
+4. **A scatter-copy kernel** placing the wire lanes' staged bytes at
+   their device-computed offsets; `launch_pack_structured_mask` (or a
+   variant taking the device indptr) fills the device lanes.
+5. The staged pair feeds the SAME custom dispatch the HasCustomMask
+   arm already states — no trace change, no new dispatch.
+6. **Scheduler relax, LAST** (after the driver path is live-proven on
+   a forced composition): drop `wire_mask_on_device_geometry` and the
+   `has_user_mask × device_geometry` crosses for WIRE-mask lanes;
+   dense DEVICE masks (no BRLE rows, device content) remain solo by
+   nature.
+Verification: the census workload (maskmix + h2o) should then show the
+mask-compose refusals gone and mask=1 hooked=1 fires walking the
+declared/generated paths; stage-2's 1.8–2.3× two-wave penalty is the
+measured stake.
