@@ -907,14 +907,27 @@ impl<'a> Converter<'a> {
 }
 
 /// How many required properties an order-free object will enumerate subsets
-/// of when `additionalProperties` leaves the names open. Each subset is a
-/// parse the matcher may have to carry at once, so this is bounded by its
-/// configuration budget; four covers 96% of the objects in JSONSchemaBench.
-pub const UNORDERED_REQUIRED_BUDGET_OPEN: usize = 4;
+/// of when `additionalProperties` leaves the names open.
+///
+/// This is the single most expensive number in the front end. Past it
+/// `required` is not enforced at all, and `required` is what rejects 92% of
+/// the documents this engine admits and the schema does not - far ahead of
+/// `anyOf` at 10 and `dependencies` at 2.
+///
+/// Seven, not four. Each subset is a parse the matcher carries at once,
+/// because an open object's declared name can also be read as a generic key,
+/// so the ceiling here is the configuration budget rather than grammar size:
+/// 2^7 is 128, which is exactly what a batch carries. Four covered 94.4% of
+/// the objects in JSONSchemaBench but left 10.9% of its *schemas* with at
+/// least one object unenforced; going to seven took over-acceptance from 153
+/// walks to 101 and validity-given-completion from 80.4% to 86.7%, for no
+/// measurable compile time (p50 123.6 ms against 120.7) and 6.7% more table.
+pub const UNORDERED_REQUIRED_BUDGET_OPEN: usize = 7;
 
 /// The same, for objects whose property names are a closed set. Nothing forks
-/// there, so the only cost is grammar size and the budget can be looser.
-pub const UNORDERED_REQUIRED_BUDGET_CLOSED: usize = 6;
+/// there, so the subsets are grammar states rather than live configurations
+/// and the budget is bounded by size alone, which is why it is higher.
+pub const UNORDERED_REQUIRED_BUDGET_CLOSED: usize = 10;
 
 #[derive(Clone)]
 struct Property {

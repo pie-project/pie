@@ -1,36 +1,36 @@
 {
   "engrain": {
-    "compiled": 503,
+    "compiled": 502,
     "attempted": 528,
-    "coverage": 0.9526515151515151,
-    "p50_ms": 123.61713382415473,
-    "p90_ms": 1489.2351559828967,
-    "p99_ms": 4762.459899066016,
-    "max_ms": 1841648.5484039877,
+    "coverage": 0.9507575757575758,
+    "p50_ms": 120.66618748940527,
+    "p90_ms": 1419.3335478194058,
+    "p99_ms": 4462.557139340788,
+    "max_ms": 8150.561254937202,
     "failures": {
       "CompileError: schema uses a construct the front end cannot": 12,
       "CompileError: grammar does not fit the production budget": 10,
-      "CompileError: terminals do not fit the lexer budget": 3
+      "CompileError: terminals do not fit the lexer budget": 4
     }
   },
   "xgrammar": {
     "compiled": 528,
     "attempted": 528,
     "coverage": 1.0,
-    "p50_ms": 3.485416993498802,
-    "p90_ms": 116.5302291046828,
-    "p99_ms": 1239.5371210295707,
-    "max_ms": 2634.3775012064725,
+    "p50_ms": 3.518515732139349,
+    "p90_ms": 115.8265732228756,
+    "p99_ms": 1225.0522579997778,
+    "max_ms": 2604.3036547489464,
     "failures": {}
   },
   "llguidance": {
     "compiled": 444,
     "attempted": 528,
     "coverage": 0.8409090909090909,
-    "p50_ms": 1.1484130518510938,
-    "p90_ms": 4.625106928870082,
-    "p99_ms": 19.9794911313802,
-    "max_ms": 177.25241789594293,
+    "p50_ms": 1.1496031656861305,
+    "p90_ms": 4.342377185821533,
+    "p99_ms": 17.77628529816866,
+    "max_ms": 34.881637431681156,
     "failures": {
       "ValueError: oneOf constraints are not supported. Enable ": 31,
       "ValueError: Unimplemented keys: [\"dependencies\"]": 15,
@@ -224,7 +224,6 @@
     218,
     219,
     220,
-    222,
     225,
     226,
     227,

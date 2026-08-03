@@ -1,13 +1,13 @@
 {
   "schemas": 194,
   "levels": {
-    "Shadowed": 193,
-    "Merged": 1
+    "Shadowed": 188,
+    "Merged": 6
   },
   "walks_per_schema": 8,
   "blame": {
     "engrain": {
-      "required": 141,
+      "required": 89,
       "anyOf": 10,
       "dependencies": 2
     },
@@ -22,13 +22,13 @@
   "budget_bytes": 400,
   "engines": {
     "engrain": {
-      "walks": 1546,
-      "complete": 780,
-      "valid": 627,
-      "over_accepted": 153,
-      "completion_rate": 0.5045278137128072,
-      "validity_given_complete": 0.8038461538461539,
-      "aggregate_validity": 0.4055627425614489
+      "walks": 1545,
+      "complete": 759,
+      "valid": 658,
+      "over_accepted": 101,
+      "completion_rate": 0.4912621359223301,
+      "validity_given_complete": 0.8669301712779973,
+      "aggregate_validity": 0.42588996763754045
     },
     "xgrammar": {
       "walks": 1552,
