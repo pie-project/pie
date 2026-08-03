@@ -1264,6 +1264,47 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   }
 }
 
+// ── The two 4-bit codecs, as one axis ───────────────────────────────────────
+//
+// The same split as in `quantized_qmv.metal`: the FORMAT is shared through
+// `mxfp4_codec.h`, the loop shape is not. What a codec has to say to a tile
+// loader is narrower than what it says to a matvec -- how wide a group is,
+// where its scale comes from, whether there is a zero point, and how to expand
+// `pack_factor` codes into the threadgroup tile.
+#include "mxfp4_codec.h"
+
+template <typename T>
+struct AffineU4 {
+  typedef T scale_t;
+  MLX_MTL_CONST short group_size = 64;
+  MLX_MTL_CONST short bits = 4;
+  MLX_MTL_CONST bool zero_point = true;
+  static METAL_FUNC T scale_of(scale_t s) { return s; }
+  template <short pack_factor>
+  static METAL_FUNC void expand(const device uint8_t* w, T scale, T bias,
+                                threadgroup T* out) {
+    dequantize<T, pack_factor, 4>(w, scale, bias, out);
+  }
+};
+
+template <typename T>
+struct Mxfp4 {
+  typedef uint8_t scale_t;
+  MLX_MTL_CONST short group_size = 32;
+  MLX_MTL_CONST short bits = 4;
+  MLX_MTL_CONST bool zero_point = false;
+  static METAL_FUNC T scale_of(scale_t s) { return T(mxfp4_block_scale(s)); }
+  template <short pack_factor>
+  static METAL_FUNC void expand(const device uint8_t* w, T scale, T,
+                                threadgroup T* out) {
+    for (short i = 0; i < pack_factor / 2; i++) {
+      const uint8_t byte = w[i];
+      out[2 * i] = T(float(scale) * mxfp4_lo(byte));
+      out[2 * i + 1] = T(float(scale) * mxfp4_hi(byte));
+    }
+  }
+};
+
 // ── quantized.h QuantizedBlockLoader ──
 template <
     typename T,
@@ -1272,9 +1313,11 @@ template <
     short dst_ld,
     short reduction_dim,
     short tgp_size,
-    short group_size,
-    short bits>
+    typename Codec>
 struct QuantizedBlockLoader {
+  MLX_MTL_CONST short group_size = Codec::group_size;
+  MLX_MTL_CONST short bits = Codec::bits;
+  typedef typename Codec::scale_t scale_t;
   static_assert(
       BCOLS <= group_size,
       "The group size should be larger than the columns");
@@ -1304,12 +1347,12 @@ struct QuantizedBlockLoader {
 
   threadgroup T* dst;
   const device uint8_t* src;
-  const device T* scales;
+  const device scale_t* scales;
   const device T* biases;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
-      const device T* scales_,
+      const device scale_t* scales_,
       const device T* biases_,
       const int src_ld_,
       threadgroup T* dst_,
@@ -1328,17 +1371,17 @@ struct QuantizedBlockLoader {
         src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
             bj * bytes_per_pack),
         scales(scales_ + bi * src_ld / group_size),
-        biases(biases_ + bi * src_ld / group_size) {}
+        biases(Codec::zero_point ? biases_ + bi * src_ld / group_size : biases_) {}
 
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
     }
 
-    T scale = *scales;
-    T bias = *biases;
+    T scale = Codec::scale_of(*scales);
+    T bias = Codec::zero_point ? *biases : T(0);
     for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits>(
+      Codec::template expand<pack_factor>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
     }
   }
@@ -1362,10 +1405,10 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    T scale = *scales;
-    T bias = *biases;
+    T scale = Codec::scale_of(*scales);
+    T bias = Codec::zero_point ? *biases : T(0);
     for (int i = 0; i < n_reads; i++) {
-      dequantize<T, pack_factor, bits>(
+      Codec::template expand<pack_factor>(
           (device uint8_t*)(src + i * bytes_per_pack),
           scale,
           bias,
@@ -1381,15 +1424,15 @@ struct QuantizedBlockLoader {
         if (group_step_cnt == group_steps) {
           group_step_cnt = 0;
           scales++;
-          biases++;
+          if (Codec::zero_point) biases++;
         }
       } else {
         scales++;
-        biases++;
+        if (Codec::zero_point) biases++;
       }
     } else {
       scales += group_stride;
-      biases += group_stride;
+      if (Codec::zero_point) biases += group_stride;
     }
   }
 };
@@ -1397,11 +1440,11 @@ struct QuantizedBlockLoader {
 // ── pie entry ────────────────────────────────────────────────────────────────
 // Aligned-only form of MLX's qmm_t_impl: every tile is full, so there is no
 // `M`/`num_els`/`num_outs` bookkeeping and no safe-load branch.
-template <typename T, int group_size, int bits, int BM, int BK, int BN,
+template <typename T, typename Codec, int BM, int BK, int BN,
           bool WITH_RESIDUAL, bool WITH_BIAS = false>
 METAL_FUNC void qmm_t_aligned_impl(
     const device uint32_t* w,
-    const device T* scales,
+    const device typename Codec::scale_t* scales,
     const device T* biases,
     const device T* x,
     device T* y,
@@ -1415,6 +1458,8 @@ METAL_FUNC void qmm_t_aligned_impl(
     uint simd_lid) {
   constexpr int WM = 2;
   constexpr int WN = 2;
+  constexpr int group_size = Codec::group_size;
+  constexpr int bits = Codec::bits;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
@@ -1424,7 +1469,7 @@ METAL_FUNC void qmm_t_aligned_impl(
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, Codec>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1435,7 +1480,7 @@ METAL_FUNC void qmm_t_aligned_impl(
   x += y_row * static_cast<int64_t>(K);
   wl += y_col * K_w;
   scales += y_col * K_g;
-  biases += y_col * K_g;
+  if (Codec::zero_point) biases += y_col * K_g;
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
@@ -1504,7 +1549,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false, true>(
+  qmm_t_aligned_impl<T, AffineU4<T>, BM, BK, BN, false, true>(
       w, scales, biases, x, y, bias, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
@@ -1523,7 +1568,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false>(
+  qmm_t_aligned_impl<T, AffineU4<T>, BM, BK, BN, false>(
       w, scales, biases, x, y, nullptr, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
@@ -1543,7 +1588,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, true>(
+  qmm_t_aligned_impl<T, AffineU4<T>, BM, BK, BN, true>(
       w, scales, biases, x, y, residual, Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
@@ -1567,10 +1612,10 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 /// stall, so the spare tiles have to be dispatched and then decline. The return
 /// is uniform across the threadgroup, which is what makes it safe to take
 /// before the barriers inside the impl.
-template <typename T, int group_size, int bits, int BM, int BK, int BN>
-[[kernel]] void affine_qmm_t_routed(
+template <typename T, typename Codec, int BM, int BK, int BN>
+[[kernel]] void qmm_t_routed(
     const device uint32_t* w   [[buffer(0)]],
-    const device T* scales     [[buffer(1)]],
+    const device typename Codec::scale_t* scales [[buffer(1)]],
     const device T* biases     [[buffer(2)]],
     const device T* x          [[buffer(3)]],
     device T* y                [[buffer(4)]],
@@ -1586,6 +1631,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   const int e = tile_expert[tid.y];
   if (e < 0) return;
 
+  constexpr int bits = Codec::bits;
   constexpr int pack_factor = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = (BK + 16 / sizeof(T));
@@ -1594,20 +1640,25 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   // separate allocation.
   const size_t w_bytes = size_t(e) * size_t(N) * size_t(K) *
                          size_t(bytes_per_pack) / size_t(pack_factor);
-  const size_t g_off = size_t(e) * size_t(N) * size_t(K / group_size);
+  const size_t g_off = size_t(e) * size_t(N) * size_t(K / Codec::group_size);
 
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
-  qmm_t_aligned_impl<T, group_size, bits, BM, BK, BN, false>(
+  qmm_t_aligned_impl<T, Codec, BM, BK, BN, false>(
       (const device uint32_t*)((const device uint8_t*)w + w_bytes),
-      scales + g_off, biases + g_off, x, y, nullptr, Xs, Ws, K, N, tid,
-      simd_gid, simd_lid);
+      scales + g_off, Codec::zero_point ? biases + g_off : biases, x, y, nullptr,
+      Xs, Ws, K, N, tid, simd_gid, simd_lid);
 }
 
 #define instantiate_qmm_t(bm, bk, bn)                                          \
   template [[host_name("affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
-  [[kernel]] void affine_qmm_t_routed<bfloat, 64, 4, bm, bk, bn>(              \
+  [[kernel]] void qmm_t_routed<bfloat, AffineU4<bfloat>, bm, bk, bn>(          \
       const device uint32_t*, const device bfloat*, const device bfloat*,      \
+      const device bfloat*, device bfloat*, const constant int&,               \
+      const constant int&, const device int*, uint3, uint, uint);              \
+  template [[host_name("mxfp4_qmm_t_routed_bfloat16_gs_32_b_4_bm_" #bm "_bn_" #bn)]] \
+  [[kernel]] void qmm_t_routed<bfloat, Mxfp4<bfloat>, bm, bk, bn>(             \
+      const device uint32_t*, const device uint8_t*, const device bfloat*,     \
       const device bfloat*, device bfloat*, const constant int&,               \
       const constant int&, const device int*, uint3, uint, uint);              \
   template [[host_name("affine_qmm_t_bfloat16_gs_64_b_4_bm_" #bm "_bn_" #bn)]] \
@@ -1679,7 +1730,7 @@ METAL_FUNC void qmm_t_strided_impl(
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, AffineU4<T>>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1810,7 +1861,7 @@ METAL_FUNC void qmm_t_splitk_impl(
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, AffineU4<T>>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;

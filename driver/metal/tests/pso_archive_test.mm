@@ -8,9 +8,18 @@
 // dominate startup, which took the same batch down to ~9 ms.
 //
 // The risk an archive introduces is serving a stale binary, so the archive is
-// keyed on the batch contents *and* on the size and mtime of each source file.
-// This test covers both halves: a second run must hit the archive, and touching
-// a source must miss it.
+// keyed on the batch contents *and* on the RESOLVED source of every file in it
+// -- resolved because a `.metal` file may `#include` another, and Metal's
+// runtime compiler resolves none of those itself, so the driver splices them in
+// before it compiles. A key built from the includer alone would keep its value
+// when the included file changed and serve a pipeline compiled from the old
+// definition, which is worse than a slow start because it looks like it worked.
+//
+// So the key is the bytes and not the clock. This test states that in the three
+// places it can be observed: a rerun hits, a rewrite misses, and a rewrite of
+// something the source merely INCLUDES misses too. It runs against sources it
+// writes itself, because the alternative is editing a checked-in kernel and
+// putting it back.
 
 #import <Foundation/Foundation.h>
 
@@ -48,9 +57,19 @@ int finish() {
     std::printf("\n==== pso_archive_test: %d passed, %d failed ====\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
+
+/// Write `text` to `path`, failing the test rather than the process.
+bool put(const std::string& path, const std::string& text) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) return false;
+    const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    std::fclose(f);
+    return ok;
+}
+
 }  // namespace
 
-int main(int argc, char** argv) {
+int main() {
     std::printf("[Metal 4 pipeline archives: cache hit + source-change invalidation]\n");
 
     // A private cache directory so the test neither reads nor disturbs the
@@ -61,17 +80,29 @@ int main(int argc, char** argv) {
     expect(RawMetalContext::pso_archive_dir() == cache,
            "PIE_METAL_PSO_CACHE selects the archive directory");
 
-    const std::string dir = argc > 1 ? argv[1] : "src/kernels";
-    // Two entrypoints out of one file is enough to exercise the whole path.
-    const std::string src = dir + "/residual_add.metal";
-    struct stat st {};
-    if (!expect(stat(src.c_str(), &st) == 0, "kernel source found at " + src)) {
+    const std::string dir = "/tmp/pie_pso_archive_test_src";
+    [[NSFileManager defaultManager] removeItemAtPath:@(dir.c_str()) error:nil];
+    [[NSFileManager defaultManager] createDirectoryAtPath:@(dir.c_str())
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+    const std::string header = dir + "/shared.h";
+    const std::string src = dir + "/probe.metal";
+    const std::string kernel =
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "#include \"shared.h\"\n"
+        "[[kernel]] void archive_probe(device float* out [[buffer(0)]],\n"
+        "                              uint i [[thread_position_in_grid]]) {\n"
+        "  out[i] = archive_probe_constant();\n"
+        "}\n";
+    if (!expect(put(header, "inline float archive_probe_constant() { return 1.0f; }\n") &&
+                    put(src, kernel),
+                "a kernel source and the header it includes are written")) {
         return finish();
     }
 
-    std::vector<RawMetalContext::PsoFileRequest> requests = {
-        {src, "residual_add_bfloat16"},
-    };
+    std::vector<RawMetalContext::PsoFileRequest> requests = {{src, "archive_probe"}};
 
     auto build = [&](RawMetalContext& ctx) {
         std::vector<std::string> errors;
@@ -83,7 +114,8 @@ int main(int argc, char** argv) {
 
     {
         auto ctx = RawMetalContext::create(4u << 20);
-        if (!expect(ctx != nullptr && build(*ctx), "first build compiles from source")) {
+        if (!expect(ctx != nullptr && build(*ctx),
+                    "the source compiles, include and all")) {
             return finish();
         }
     }
@@ -96,24 +128,43 @@ int main(int argc, char** argv) {
     expect(count_archives(cache) == 1,
            "the second build reused the archive instead of writing another");
 
-    // Roll the source's mtime forward. The bytes are untouched, but the driver
-    // has no cheap way to know that, and treating any change as a miss is the
-    // safe direction: the alternative is running a stale pipeline.
-    struct utimbuf times {};
-    times.actime = st.st_atime;
-    times.modtime = st.st_mtime + 120;
-    expect(utime(src.c_str(), &times) == 0, "kernel source mtime moved forward");
-
+    // The clock alone is not a change. This is the direction the key USED to
+    // go -- size and mtime -- and it cost a full rebuild on every `touch`, on
+    // every checkout that rewrote a file to the same bytes, and on the `cp` out
+    // of a backup that this repo's own workflow does.
     {
+        struct stat st {};
+        expect(stat(src.c_str(), &st) == 0, "the source can be stat'd");
+        struct utimbuf times {};
+        times.actime = st.st_atime;
+        times.modtime = st.st_mtime + 120;
+        expect(utime(src.c_str(), &times) == 0, "the source's mtime is moved forward");
         auto ctx = RawMetalContext::create(4u << 20);
-        expect(ctx != nullptr && build(*ctx), "build after the source changed succeeds");
+        expect(ctx != nullptr && build(*ctx), "build after the touch succeeds");
+    }
+    expect(count_archives(cache) == 1, "an untouched-content source still hits the archive");
+
+    // Changed bytes must miss.
+    {
+        expect(put(src, kernel + "// a byte that was not there before\n"),
+               "the source's bytes change");
+        auto ctx = RawMetalContext::create(4u << 20);
+        expect(ctx != nullptr && build(*ctx), "build after the rewrite succeeds");
     }
     expect(count_archives(cache) == 2,
            "a changed source invalidates the archive and writes a new one");
 
-    // Restore the mtime so a rerun starts from the same state.
-    times.modtime = st.st_mtime;
-    utime(src.c_str(), &times);
+    // And the whole reason the key is the RESOLVED source: the includer is
+    // untouched here, and what it compiles to is different anyway.
+    {
+        expect(put(header, "inline float archive_probe_constant() { return 2.0f; }\n"),
+               "the INCLUDED header changes and the source does not");
+        auto ctx = RawMetalContext::create(4u << 20);
+        expect(ctx != nullptr && build(*ctx), "build after the header changed succeeds");
+    }
+    expect(count_archives(cache) == 3,
+           "a changed include invalidates the archive too");
+
     [[NSFileManager defaultManager] removeItemAtPath:@(cache.c_str()) error:nil];
 
     // Opting out has to actually skip the cache, since that is the escape hatch
@@ -128,5 +179,6 @@ int main(int argc, char** argv) {
     }
 
     [[NSFileManager defaultManager] removeItemAtPath:@(cache.c_str()) error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:@(dir.c_str()) error:nil];
     return finish();
 }

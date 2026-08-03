@@ -603,6 +603,12 @@ if(APPLE)
   add_metal_linked_test(kv_pool_lifecycle_test tests/kv_pool_lifecycle_test.cpp)
   # `router_topk` past one simdgroup. gpt-oss's 32 experts never exercised the
   # cross-simdgroup path; Qwen3-MoE's 128 do, and the kernel was wrong there.
+  # The MXFP4 codec on the GPU, against the format written out by hand. Only
+  # gpt-oss's experts use it, and its checkpoint is 11 GB, so this is where the
+  # decode is proved -- not in a test that needs the weights.
+  add_metal_linked_test(mxfp4_matvec_test tests/mxfp4_matvec_test.cpp)
+  target_compile_definitions(mxfp4_matvec_test PRIVATE
+    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(router_topk_test tests/router_topk_test.cpp)
   target_compile_definitions(router_topk_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")

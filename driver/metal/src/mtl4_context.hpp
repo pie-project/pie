@@ -37,7 +37,11 @@ struct MetalStorageFacts {
 
 MetalStorageFacts query_metal_storage_facts();
 
-bool read_ptir_msl_source(
+/// A `.metal` source with its `#include "..."` directives spliced in.
+///
+/// Metal's runtime compiler resolves no local includes of its own, so this is
+/// what lets two kernel files share a definition instead of restating it.
+bool read_metal_source(
     const std::string& path,
     std::string& source,
     std::string* error);

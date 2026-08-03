@@ -1251,10 +1251,11 @@ Pso compile_pso_impl(
     return out;
 }
 
-bool read_metal_source(
+bool read_metal_source_at(
     const std::string& path,
     std::string& source,
-    std::string* error) {
+    std::string* error,
+    int depth) {
     NSError* e = nil;
     NSString* src = [NSString
         stringWithContentsOfFile:[NSString stringWithUTF8String:path.c_str()]
@@ -1268,6 +1269,45 @@ bool read_metal_source(
         return false;
     }
     source = src.UTF8String;
+
+    // Metal's runtime shader compiler does no filesystem include lookup, so a
+    // `#include "..."` in a kernel source is spliced in here. That is the only
+    // way two `.metal` files can share a definition: each one is handed to
+    // `newLibraryWithSource:` on its own, so anything they both need would
+    // otherwise have to be written twice. The 4-bit codecs are, which is what
+    // made this general -- it used to resolve one hardcoded filename.
+    //
+    // Angle-bracket includes are the system headers and are left alone.
+    if (depth > 8) {
+        if (error) *error = "include nesting too deep at '" + path + "'";
+        return false;
+    }
+    const std::size_t separator = path.find_last_of("/\\");
+    const std::string dir =
+        separator == std::string::npos ? std::string{} : path.substr(0, separator + 1);
+    constexpr std::string_view kDirective = "#include \"";
+    for (std::size_t at = source.find(kDirective); at != std::string::npos;
+         at = source.find(kDirective, at)) {
+        // Only at the start of a line: the same characters inside a string or a
+        // comment are not a directive.
+        if (at != 0 && source[at - 1] != '\n') {
+            at += kDirective.size();
+            continue;
+        }
+        const std::size_t name_at = at + kDirective.size();
+        const std::size_t close = source.find('"', name_at);
+        if (close == std::string::npos) {
+            if (error) *error = "unterminated #include in '" + path + "'";
+            return false;
+        }
+        std::string included;
+        if (!read_metal_source_at(dir + source.substr(name_at, close - name_at), included, error,
+                                  depth + 1)) {
+            return false;
+        }
+        source.replace(at, close + 1 - at, included);
+        at += included.size();
+    }
     return true;
 }
 
@@ -1282,30 +1322,11 @@ void configure_ptir_math_options(
 
 }  // namespace
 
-bool read_ptir_msl_source(
+bool read_metal_source(
     const std::string& path,
     std::string& source,
     std::string* error) {
-    if (!read_metal_source(path, source, error)) return false;
-    constexpr std::string_view include =
-        "#include \"ptir_rng.generated.metal\"";
-    const std::size_t first = source.find(include);
-    if (first == std::string::npos) return true;
-
-    const std::size_t separator = path.find_last_of("/\\");
-    const std::string preamble_path =
-        (separator == std::string::npos
-             ? std::string{}
-             : path.substr(0, separator + 1)) +
-        "ptir_rng.generated.metal";
-    std::string preamble;
-    if (!read_metal_source(preamble_path, preamble, error)) return false;
-    for (std::size_t position = first;
-         position != std::string::npos;
-         position = source.find(include, position + preamble.size())) {
-        source.replace(position, include.size(), preamble);
-    }
-    return true;
+    return read_metal_source_at(path, source, error, 0);
 }
 
 Pso RawMetalContext::compile_pso(const std::string& src, const std::string& fn,
@@ -1336,8 +1357,9 @@ inline void hash_bytes(std::uint64_t& h, const void* p, size_t n) {
 
 // Names the archive for one batch. Every input that can change the compiled
 // binaries goes into the key: which entrypoints were asked for, out of which
-// files, and the size and mtime of each of those files -- so editing a .metal
-// source invalidates the archive instead of silently serving a stale pipeline.
+// files, and the resolved source of each of those files -- so editing a .metal
+// source, or anything it includes, invalidates the archive instead of silently
+// serving a stale pipeline.
 std::string batch_archive_path(
     const std::vector<RawMetalContext::PsoFileRequest>& requests) {
     const std::string dir = RawMetalContext::pso_archive_dir();
@@ -1350,10 +1372,13 @@ std::string batch_archive_path(
         hash_bytes(h, r.function.data(), r.function.size());
         if (r.path == last_path) continue;
         last_path = r.path;
-        struct stat st {};
-        if (stat(r.path.c_str(), &st) == 0) {
-            hash_bytes(h, &st.st_size, sizeof(st.st_size));
-            hash_bytes(h, &st.st_mtimespec, sizeof(st.st_mtimespec));
+        // The RESOLVED source, not the file's size and mtime. A source that
+        // includes another would otherwise keep its key when the included file
+        // changed, and serve a pipeline compiled from the old definition --
+        // which is worse than a slow start, because it looks like it worked.
+        std::string resolved;
+        if (read_metal_source(r.path, resolved, nullptr)) {
+            hash_bytes(h, resolved.data(), resolved.size());
         }
     }
 
@@ -1542,7 +1567,7 @@ Pso RawMetalContext::compile_ptir_pso_from_file(
     const std::string& fn,
     std::string* error) {
     std::string source;
-    return read_ptir_msl_source(path, source, error)
+    return read_metal_source(path, source, error)
                ? compile_ptir_pso(source, fn, error)
                : Pso{};
 }

@@ -293,6 +293,63 @@ instantiate_qmv_narrow(float32, float, 64, 4)
 instantiate_qmv_narrow(float16, half, 64, 4)
 instantiate_qmv_narrow(bfloat16, bfloat, 64, 4)
 
+// ── The two 4-bit codecs, as one axis ───────────────────────────────────────
+//
+// Affine-U4 and MXFP4 differ in four things and nothing else: the group width,
+// how the group's scale is stored, whether there is a zero point, and what a
+// code means. Everything around them -- the routing, the bounds-checked tail,
+// the simd reduction, the bias epilogue -- is the same arithmetic on the same
+// layout, and it is where the subtlety lives. So the codec is a template
+// parameter rather than a second copy of the matvec.
+#include "mxfp4_codec.h"
+template <typename T>
+struct AffineU4 {
+  typedef T scale_t;
+  MLX_MTL_CONST int group_size = 64;
+  MLX_MTL_CONST bool zero_point = true;
+  static METAL_FUNC float scale_of(scale_t s) { return float(s); }
+  template <typename U, int VPT>
+  static METAL_FUNC U prepare(const device T* x, thread U* x_thread) {
+    return load_vector<T, U, VPT, 4>(x, x_thread);
+  }
+  template <typename U, int VPT>
+  static METAL_FUNC U dot(const device uint8_t* w, const thread U* x_thread, U scale,
+                          U bias, U sum) {
+    return qdot<U, VPT, 4>(w, x_thread, scale, bias, sum);
+  }
+};
+
+// The block exponent is E8M0: an unsigned power of two, 127-biased, with 0xff
+// reserved for NaN. A code is a lookup and not a product, which is why MXFP4
+// cannot borrow the affine dot -- that one multiplies the packed nibbles in
+// place, and only gets away with it because `scale * code + bias` is LINEAR in
+// the code. Nothing here is, so the nibbles are unpacked and the input is left
+// alone rather than pre-divided by 16, 256 and 4096.
+template <typename T>
+struct Mxfp4 {
+  typedef uint8_t scale_t;
+  MLX_MTL_CONST int group_size = 32;
+  MLX_MTL_CONST bool zero_point = false;
+  static METAL_FUNC float scale_of(scale_t s) { return mxfp4_block_scale(s); }
+  template <typename U, int VPT>
+  static METAL_FUNC U prepare(const device T* x, thread U* x_thread) {
+    for (int i = 0; i < VPT; i++) {
+      x_thread[i] = U(x[i]);
+    }
+    return U(0);
+  }
+  template <typename U, int VPT>
+  static METAL_FUNC U dot(const device uint8_t* w, const thread U* x_thread, U scale,
+                          U, U) {
+    U accum = 0;
+    for (int i = 0; i < VPT / 2; i++) {
+      const uint8_t byte = w[i];
+      accum += x_thread[2 * i] * mxfp4_lo(byte) + x_thread[2 * i + 1] * mxfp4_hi(byte);
+    }
+    return scale * accum;
+  }
+};
+
 // ── GPT-OSS matvec: arbitrary K, optional bias, optional expert routing ──────
 //
 // Three things this family needs that `affine_qmv_fast` cannot do.
@@ -313,10 +370,10 @@ instantiate_qmv_narrow(bfloat16, bfloat, 64, 4)
 // stride is derivable from K and N, so routing costs one index buffer and no
 // extra constants. `tid.z` selects which of the k slots this threadgroup serves;
 // all of them read the same x and write disjoint rows of y.
-template <typename T, int group_size, int bits, bool BIASED, bool ROUTED>
+template <typename T, typename Codec, bool BIASED, bool ROUTED>
 METAL_FUNC void qmv_gptoss_impl(
     const device uint32_t* w,
-    const device T* scales,
+    const device typename Codec::scale_t* scales,
     const device T* biases,
     const device T* x,
     device T* y,
@@ -330,6 +387,8 @@ METAL_FUNC void qmv_gptoss_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
+  constexpr int bits = 4;
+  constexpr int group_size = Codec::group_size;
   constexpr int packs_per_thread = 1;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
@@ -337,7 +396,6 @@ METAL_FUNC void qmv_gptoss_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
   constexpr int values_per_thread = pack_factor * packs_per_thread;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int scale_step_per_thread = group_size / values_per_thread;
 
   const device uint8_t* ws = (const device uint8_t*)w;
   typedef float U;
@@ -364,12 +422,14 @@ METAL_FUNC void qmv_gptoss_impl(
     const size_t e = size_t(expert_ids[sel]);
     ws += e * size_t(out_vec_size) * size_t(in_vec_size_w);
     scales += e * size_t(out_vec_size) * size_t(in_vec_size_g);
-    biases += e * size_t(out_vec_size) * size_t(in_vec_size_g);
+    if (Codec::zero_point) {
+      biases += e * size_t(out_vec_size) * size_t(in_vec_size_g);
+    }
   }
 
   const device uint8_t* ws_row = ws + out_row * in_vec_size_w;
-  const device T* sc_row = scales + out_row * in_vec_size_g;
-  const device T* bi_row = biases + out_row * in_vec_size_g;
+  const device typename Codec::scale_t* sc_row = scales + out_row * in_vec_size_g;
+  const device T* bi_row = Codec::zero_point ? biases + out_row * in_vec_size_g : biases;
   // Whether the INPUT is per-expert too. `gate` and `up` read the one shared
   // norm output, so their stride is 0; `down` reads the SwiGLU's `[k,
   // intermediate]` stack, so its stride is K. Reading slot 0 for every expert
@@ -386,13 +446,13 @@ METAL_FUNC void qmv_gptoss_impl(
     if (base + values_per_thread <= in_vec_size) {
       const device uint8_t* wl =
           ws_row + size_t(base) * size_t(bytes_per_pack) / size_t(pack_factor);
-      U sum = load_vector<T, U, values_per_thread, bits>(x_row + base, x_thread);
+      U sum = Codec::template prepare<U, values_per_thread>(x_row + base, x_thread);
       const int g = base / group_size;
       for (int row = 0; row < results_per_simdgroup; row++) {
         const device uint8_t* wr = wl + row * in_vec_size_w;
-        U s = sc_row[row * in_vec_size_g + g];
-        U b = bi_row[row * in_vec_size_g + g];
-        result[row] += qdot<U, values_per_thread, bits>(wr, x_thread, s, b, sum);
+        U s = Codec::scale_of(sc_row[row * in_vec_size_g + g]);
+        U b = Codec::zero_point ? U(bi_row[row * in_vec_size_g + g]) : U(0);
+        result[row] += Codec::template dot<U, values_per_thread>(wr, x_thread, s, b, sum);
       }
     }
   }
@@ -411,11 +471,11 @@ METAL_FUNC void qmv_gptoss_impl(
   }
 }
 
-#define gptoss_qmv_kernel(name, BIASED, ROUTED)                                \
-  template <typename T, int group_size, int bits>                              \
+#define gptoss_qmv_kernel(name, Codec, BIASED, ROUTED)                         \
+  template <typename T>                                                        \
   [[kernel]] void name(                                                        \
       const device uint32_t* w   [[buffer(0)]],                                \
-      const device T* scales     [[buffer(1)]],                                \
+      const device typename Codec<T>::scale_t* scales [[buffer(1)]],           \
       const device T* biases     [[buffer(2)]],                                \
       const device T* x          [[buffer(3)]],                                \
       device T* y                [[buffer(4)]],                                \
@@ -429,32 +489,40 @@ METAL_FUNC void qmv_gptoss_impl(
       uint3 tid       [[threadgroup_position_in_grid]],                        \
       uint simd_gid   [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid   [[thread_index_in_simdgroup]]) {                         \
-    qmv_gptoss_impl<T, group_size, bits, BIASED, ROUTED>(                      \
+    qmv_gptoss_impl<T, Codec<T>, BIASED, ROUTED>(                              \
         w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,  \
         x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid);  \
   }
 
-gptoss_qmv_kernel(affine_qmv_tail, false, false)
-gptoss_qmv_kernel(affine_qmv_tail_bias, true, false)
-gptoss_qmv_kernel(affine_qmv_routed_bias, true, true)
+gptoss_qmv_kernel(affine_qmv_tail, AffineU4, false, false)
+gptoss_qmv_kernel(affine_qmv_tail_bias, AffineU4, true, false)
+gptoss_qmv_kernel(affine_qmv_routed_bias, AffineU4, true, true)
 // Qwen3-MoE's experts carry no bias. Everything else about the routed path --
 // the stacked weights indexed by `expert_ids`, `tid.z` selecting the slot -- is
 // identical, so it is the same template with BIASED off rather than a kernel.
-gptoss_qmv_kernel(affine_qmv_routed, false, true)
+gptoss_qmv_kernel(affine_qmv_routed, AffineU4, false, true)
 
-#define instantiate_gptoss_qmv(fn, name, itype, gs, b)                       \
+// The same matvec against the checkpoint's own MXFP4 experts. Only gpt-oss has
+// them, and only its experts -- attention, router, embedding and head are all
+// published affine -- so the routed-and-biased shape is the only one MXFP4
+// needs.
+gptoss_qmv_kernel(mxfp4_qmv_routed_bias, Mxfp4, true, true)
+
+#define instantiate_gptoss_qmv(fn, codec, name, itype, gs, b)                \
   template [[host_name(#fn "_" #name "_gs_" #gs "_b_" #b)]]                   \
-  [[kernel]] void fn<itype, gs, b>(                                           \
-      const device uint32_t*, const device itype*, const device itype*,       \
+  [[kernel]] void fn<itype>(                                                  \
+      const device uint32_t*, const device codec<itype>::scale_t*,            \
+      const device itype*,                                                    \
       const device itype*, device itype*, const constant int&,                \
       const constant int&, const device itype*, const device int*,            \
       const constant int&, const constant int&, const constant int&,          \
       uint3, uint, uint);
 
-instantiate_gptoss_qmv(affine_qmv_tail, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_tail_bias, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_routed_bias, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_routed, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_tail, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_routed_bias, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_routed, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(mxfp4_qmv_routed_bias, Mxfp4, bfloat16, bfloat, 32, 4)
 
 // ── 8-bit affine matvec (gpt-oss's router) ──────────────────────────────────
 //
