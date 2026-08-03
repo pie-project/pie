@@ -243,6 +243,24 @@ void test_every_name_is_mapped_or_refused() {
     check(!detail::runtime_name("mtp.layers.0.weight").has_value(),
           "the MTP head is skipped");
 
+    // The same checkpoint, spelled by mlx_lm's repack rather than by the HF
+    // release: the wrapper and the language tower swap places. Both are real
+    // and both are this family, and the driver read only the first -- so
+    // authoring against an actual mlx Qwen3.5 stopped on its first tensor.
+    // These are the same six names as above with the prefix swapped, which is
+    // the point: only the prefix may differ.
+    mapped("language_model.model.embed_tokens.weight", "shared_embedding.weight");
+    mapped("language_model.model.embed_tokens.scales", "shared_embedding.scales");
+    mapped("language_model.model.norm.weight", "final_norm.weight");
+    mapped("language_model.model.layers.31.self_attn.q_proj.weight",
+           "layers.31.self_attn.q_proj.weight");
+    mapped("language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+           "layers.0.linear_attn.in_proj_qkv.weight");
+    mapped("language_model.model.layers.3.mlp.switch_mlp.up_proj.weight",
+           "layers.3.mlp.experts.up_proj.weight");
+    check(!detail::runtime_name("vision_tower.blocks.0.attn.qkv.weight").has_value(),
+          "and its vision tower is skipped under that spelling too");
+
     const auto refused = [](std::string_view name) {
         try {
             (void)detail::runtime_name(name);

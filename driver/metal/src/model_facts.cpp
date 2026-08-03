@@ -216,44 +216,44 @@ ModelFacts read_model_facts(const std::string& hf_path) {
                     out = obj[key].get<float>();
                 }
             };
-            gi(j, "num_hidden_layers", facts.q35_num_hidden_layers);
-            gi(j, "hidden_size", facts.q35_hidden_size);
-            gi(j, "vocab_size", facts.q35_vocab_size);
-            gi(j, "num_attention_heads", facts.q35_num_attention_heads);
-            gi(j, "num_key_value_heads", facts.q35_num_key_value_heads);
-            gi(j, "head_dim", facts.q35_head_dim);
-            gi(j, "intermediate_size", facts.q35_intermediate_size);
-            gi(j, "linear_num_key_heads", facts.q35_linear_key_heads);
-            gi(j, "linear_num_value_heads", facts.q35_linear_value_heads);
-            gi(j, "linear_key_head_dim", facts.q35_linear_key_head_dim);
-            gi(j, "linear_value_head_dim", facts.q35_linear_value_head_dim);
-            gi(j, "linear_conv_kernel_dim", facts.q35_linear_conv_kernel);
-            gi(j, "full_attention_interval", facts.q35_full_attn_interval);
-            gi(j, "num_experts", facts.q35_num_experts);
-            gi(j, "num_experts_per_tok", facts.q35_num_experts_per_tok);
-            gi(j, "moe_intermediate_size", facts.q35_moe_intermediate_size);
-            gi(j, "shared_expert_intermediate_size", facts.q35_shared_expert_intermediate);
-            gi(j, "decoder_sparse_step", facts.q35_decoder_sparse_step);
-            gf(j, "rms_norm_eps", facts.q35_rms_norm_eps);
-            if (j.contains("norm_topk_prob") && j["norm_topk_prob"].is_boolean()) {
-                facts.q35_norm_topk_prob = j["norm_topk_prob"].get<bool>();
+            gi(tc, "num_hidden_layers", facts.q35_num_hidden_layers);
+            gi(tc, "hidden_size", facts.q35_hidden_size);
+            gi(tc, "vocab_size", facts.q35_vocab_size);
+            gi(tc, "num_attention_heads", facts.q35_num_attention_heads);
+            gi(tc, "num_key_value_heads", facts.q35_num_key_value_heads);
+            gi(tc, "head_dim", facts.q35_head_dim);
+            gi(tc, "intermediate_size", facts.q35_intermediate_size);
+            gi(tc, "linear_num_key_heads", facts.q35_linear_key_heads);
+            gi(tc, "linear_num_value_heads", facts.q35_linear_value_heads);
+            gi(tc, "linear_key_head_dim", facts.q35_linear_key_head_dim);
+            gi(tc, "linear_value_head_dim", facts.q35_linear_value_head_dim);
+            gi(tc, "linear_conv_kernel_dim", facts.q35_linear_conv_kernel);
+            gi(tc, "full_attention_interval", facts.q35_full_attn_interval);
+            gi(tc, "num_experts", facts.q35_num_experts);
+            gi(tc, "num_experts_per_tok", facts.q35_num_experts_per_tok);
+            gi(tc, "moe_intermediate_size", facts.q35_moe_intermediate_size);
+            gi(tc, "shared_expert_intermediate_size", facts.q35_shared_expert_intermediate);
+            gi(tc, "decoder_sparse_step", facts.q35_decoder_sparse_step);
+            gf(tc, "rms_norm_eps", facts.q35_rms_norm_eps);
+            if (tc.contains("norm_topk_prob") && tc["norm_topk_prob"].is_boolean()) {
+                facts.q35_norm_topk_prob = tc["norm_topk_prob"].get<bool>();
             }
-            if (j.contains("tie_word_embeddings") && j["tie_word_embeddings"].is_boolean()) {
-                facts.q35_tied_embeddings = j["tie_word_embeddings"].get<bool>();
+            if (tc.contains("tie_word_embeddings") && tc["tie_word_embeddings"].is_boolean()) {
+                facts.q35_tied_embeddings = tc["tie_word_embeddings"].get<bool>();
             }
-            if (j.contains("mlp_only_layers") && j["mlp_only_layers"].is_array()) {
-                facts.q35_mlp_only_layer_count = int(j["mlp_only_layers"].size());
+            if (tc.contains("mlp_only_layers") && tc["mlp_only_layers"].is_array()) {
+                facts.q35_mlp_only_layer_count = int(tc["mlp_only_layers"].size());
             }
             // Some releases spell the layer pattern as a list instead of an
             // interval. Reduced to the interval it implies, or to -1 when it
             // implies none -- the geometry refuses -1 rather than rounding an
             // irregular stack to a regular one, which would put full attention
             // on layers that are linear.
-            if (facts.q35_full_attn_interval == 0 && j.contains("layer_types") &&
-                j["layer_types"].is_array()) {
+            if (facts.q35_full_attn_interval == 0 && tc.contains("layer_types") &&
+                tc["layer_types"].is_array()) {
                 std::vector<int> full;
                 int idx = 0;
-                for (const auto& lt : j["layer_types"]) {
+                for (const auto& lt : tc["layer_types"]) {
                     if (lt.is_string() && lt.get<std::string>() == "full_attention") {
                         full.push_back(idx);
                     }

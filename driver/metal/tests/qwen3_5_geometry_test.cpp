@@ -15,6 +15,9 @@
 // avoid elsewhere.
 
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 #include "batch/forward.hpp"
@@ -24,6 +27,7 @@
 #include "model/qwen3_5/decode_step_mb.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
 #include "model/shared_kernels.hpp"
+#include "model_facts.hpp"
 
 using pie::metal::DecodeGeometry;
 using pie::metal::geometry_from_facts;
@@ -533,6 +537,62 @@ void check_the_batched_mixture_becomes_a_matmul() {
     }
 }
 
+// A config.json this driver must read, written to a temp dir and parsed back.
+//
+// The whole family ships multimodal: every real Qwen3.5 release -- 0.8B through
+// 122B-A10B, and the mlx repacks of each -- nests the text decoder's facts
+// under `text_config` and leaves the root to the wrapper. Qwen3-Next, the older
+// sibling, is flat. Both are this family, so both must parse, and reading the
+// wrong scope does not fail loudly: every key is simply absent, so every fact
+// keeps its struct default and the driver runs a checkpoint at some other
+// model's shape. That is the exact failure this file was written for, and it
+// was live -- the block read the root.
+void check_a_real_config_is_read_from_whichever_scope_holds_it() {
+    namespace fs = std::filesystem;
+    const auto parse = [](const std::string& body) {
+        const fs::path dir = fs::temp_directory_path() /
+                             ("q35cfg" + std::to_string(std::rand()));
+        fs::create_directories(dir);
+        { std::ofstream(dir / "config.json") << body; }
+        const auto facts = pie::metal::read_model_facts(dir.string());
+        fs::remove_all(dir);
+        return facts;
+    };
+    // The decoder's facts, verbatim in shape from Qwen3.5-0.8B.
+    const std::string decoder = R"("model_type": "qwen3_5_text",
+        "hidden_size": 1024, "num_hidden_layers": 24, "num_attention_heads": 8,
+        "num_key_value_heads": 2, "head_dim": 256, "intermediate_size": 3584,
+        "vocab_size": 248320, "full_attention_interval": 4,
+        "linear_conv_kernel_dim": 4, "linear_num_key_heads": 16,
+        "linear_num_value_heads": 16, "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128, "rms_norm_eps": 1e-06)";
+
+    const auto nested = parse("{\"model_type\": \"qwen3_5\", \"vision_config\": {\"depth\": 24},"
+                              " \"text_config\": {" + decoder + "}}");
+    expect(nested.q35_hidden_size == 1024 && nested.q35_num_hidden_layers == 24 &&
+               nested.q35_head_dim == 256 && nested.q35_vocab_size == 248320 &&
+               nested.q35_intermediate_size == 3584,
+           "a multimodal config's decoder facts are read from text_config");
+    expect(nested.q35_linear_key_heads == 16 && nested.q35_linear_value_heads == 16 &&
+               nested.q35_linear_conv_kernel == 4 && nested.q35_full_attn_interval == 4,
+           "including the linear-attention geometry, which has no safe default");
+
+    const auto flat = parse("{" + decoder + "}");
+    expect(flat.q35_hidden_size == 1024 && flat.q35_num_hidden_layers == 24 &&
+               flat.q35_linear_key_heads == 16,
+           "and a flat config -- Qwen3-Next's spelling -- still reads from the root");
+
+    // The routed half, which only the MoE members carry.
+    const auto moe = parse("{\"model_type\": \"qwen3_5_moe\", \"text_config\": {" + decoder +
+                           ", \"num_experts\": 256, \"num_experts_per_tok\": 8,"
+                           " \"moe_intermediate_size\": 512,"
+                           " \"shared_expert_intermediate_size\": 512}}");
+    expect(moe.q35_num_experts == 256 && moe.q35_num_experts_per_tok == 8 &&
+               moe.q35_moe_intermediate_size == 512 &&
+               moe.q35_shared_expert_intermediate == 512,
+           "a routed config's mixture is read from the same scope as its shape");
+}
+
 }  // namespace
 
 int main() {
@@ -540,6 +600,7 @@ int main() {
     check_the_shape_comes_from_the_config();
     check_head_dim_is_derived_only_when_it_can_be();
     check_what_is_refused();
+    check_a_real_config_is_read_from_whichever_scope_holds_it();
     check_the_routed_ffn_is_bounded_by_what_the_kernels_do();
     check_the_routed_ffn_replaces_the_dense_one_and_nothing_else();
     check_the_routed_matvecs_know_their_own_width();
