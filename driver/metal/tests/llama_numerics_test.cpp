@@ -1480,6 +1480,24 @@ int main() {
     moe.moe_intermediate = 512;
     run_case("qwen3-moe (routed)", moe, *ctx, kernels_dir, 0.06f);
 
+    // More experts than a simdgroup has lanes.
+    //
+    // The sort's prefix over the experts is a TWO-LEVEL scan -- a simd scan
+    // within each simdgroup, then a residual scan over the simdgroup totals --
+    // and with eight experts the second level is one entry whose offset is
+    // always zero. Every routed case above ran the scan with its second half
+    // inert, so dropping the simdgroup offset entirely broke nothing and
+    // nothing said so.
+    //
+    // Forty, not sixty-four: it puts eight live lanes in the second simdgroup
+    // and leaves the rest dead, so the partial group and the last-lane write
+    // are exercised too rather than only the aligned case.
+    LlamaGeometry moe_wide = moe;
+    moe_wide.n_experts = 40;
+    moe_wide.experts_per_token = 4;
+    run_case("qwen3-moe (40 experts: two simdgroups of prefix)", moe_wide, *ctx, kernels_dir,
+             0.06f, /*rows=*/4, /*paged=*/true);
+
     // ── the paged ABI ──
     //
     // The same arithmetic through a page table. Run at one row first, so that

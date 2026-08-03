@@ -67,6 +67,12 @@ constant constexpr uint kMaxExperts = 1024;
 /// histogram and a second dispatch to scan it, which is more synchronisation
 /// than the work is worth.
 ///
+/// One threadgroup is not the same as one LANE, though, and the difference was
+/// measured: this scan was serial in lane 0 and cost 20 microseconds a layer,
+/// which at 48 layers was most of what the reordering took off decode. There is
+/// one thread per expert, so the prefix over the experts is a two-level simd
+/// scan and each expert writes its own tiles.
+///
 /// Outputs, all indexed by SORTED position:
 ///   perm[p]        the (row, slot) pair at p, or -1 for a padding row
 ///   row_expert[p]  the expert p reads, for the matvec path
@@ -90,6 +96,7 @@ constant constexpr uint kMaxExperts = 1024;
     uint nthreads               [[threads_per_threadgroup]]) {
     threadgroup atomic_uint counts[kMaxExperts];
     threadgroup uint base[kMaxExperts];
+    threadgroup uint sg_sum[32];
 
     const uint E = min(p.n_experts, kMaxExperts);
     const uint tile = p.tile_rows < 1u ? 1u : p.tile_rows;
@@ -115,26 +122,53 @@ constant constexpr uint kMaxExperts = 1024;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // The scan is serial in one lane. `E` is 128 on Qwen3-MoE and the loop body
-    // is an add and a store, so this is a few hundred nanoseconds against the
-    // milliseconds of matmul it makes possible.
+    // Each expert's run, rounded up to a whole tile. An expert nothing routed
+    // to takes no space at all -- the padding is per TOUCHED expert, which is
+    // what keeps the waste bounded when 128 experts see 8 pairs.
+    //
+    // `simd_prefix_exclusive_sum` has to be reached by every lane of the
+    // simdgroup, so the span is computed as zero past `E` rather than branched
+    // around.
+    const uint span = lid < E
+        ? (atomic_load_explicit(&counts[lid], memory_order_relaxed) > 0u
+               ? ((atomic_load_explicit(&counts[lid], memory_order_relaxed) + tile - 1u) / tile) * tile
+               : 0u)
+        : 0u;
+    const uint within = simd_prefix_exclusive_sum(span);
+    const uint sg = lid / 32u;
+    const uint n_sg = (nthreads + 31u) / 32u;
+    // The group total from lane 0 rather than from its last lane. `simd_sum` is
+    // uniform over the whole simdgroup either way, and lane 0 always exists --
+    // where "the last lane" needs a second clause for a partial group that this
+    // dispatch shape can never produce, and so could never be tested.
+    const uint sg_total = simd_sum(span);  // uniform: every lane must reach it
+    if (lid % 32u == 0u) sg_sum[sg] = sg_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // At most 32 simdgroups (1024 threads), so this residual scan is 32 adds in
+    // one lane rather than 1024.
     if (lid == 0) {
         uint at = 0;
-        for (uint e = 0; e < E; ++e) {
-            const uint c = atomic_load_explicit(&counts[e], memory_order_relaxed);
-            base[e] = at;
-            if (c > 0) {
-                const uint span = ((c + tile - 1u) / tile) * tile;
-                for (uint t = at / tile; t < (at + span) / tile && t < tiles; ++t) {
-                    tile_expert[t] = int(e);
-                }
-                at += span;
-            }
-            // Reused as the per-expert write cursor by the scatter below.
-            atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+        for (uint i = 0; i < n_sg && i < 32u; ++i) {
+            const uint t = sg_sum[i];
+            sg_sum[i] = at;
+            at += t;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < E) {
+        const uint at = sg_sum[sg] + within;
+        base[lid] = at;
+        for (uint t = at / tile; t < (at + span) / tile && t < tiles; ++t) {
+            tile_expert[t] = int(lid);
+        }
+        // Reused as the per-expert write cursor by the scatter below.
+        atomic_store_explicit(&counts[lid], 0u, memory_order_relaxed);
+    }
+    // `tile_expert` is device memory but nothing in THIS kernel reads it, and
+    // the device clears above were already published by the first barrier, so
+    // what has to be visible here is `base` and the reset cursors.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint i = lid; i < p.n; i += nthreads) {
         const int e = expert_ids[i];
