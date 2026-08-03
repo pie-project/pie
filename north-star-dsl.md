@@ -705,3 +705,25 @@ serving both arms across replays. CUDA 13.0 / driver 580 — all green.
     (page-count-independent plans — the page-mask compact precedent),
   * lora staging (host-driven apply inside a captured body needs the
     grouped-GEMM form to be capture-safe).
+
+S2 landed (`1acb4ca03`): the emitter's third mode emits
+`..._supergraph_build` for all five llama deployments — guards as
+conditional nodes (mask slot 4, write-desc slot 0, chains nested into
+else bodies), Peel as its endpoint conditionals (7/8), `stream` a
+mutable local rebound per body boundary so launch text stays identical
+to the plain fn's. WantsAttnScore and HasLora arms are explicitly
+OUTSIDE the union (host-driven, capture-hostile — S4 names them);
+their fires stay eager via eligibility. Existing plain emissions
+byte-stable; +31k lines of committed builds; driver compiles; regen
+pins green; live GEN byte-stable. NEXT — S3, driver integration:
+1. a `supergraph_preds` device buffer on the persistent inputs
+   (9 slots, uploaded per fire from the launch's aux/attachment bits +
+   the two Peel endpoint bits);
+2. an IModel/forward-fn hook exposing the build fn to
+   `capture_forward_graph_exec` (the capture wraps
+   cudaStreamBeginCapture around a SupergraphBuilder + the build call);
+3. replay eligibility: supergraph-eligible = decode fire whose
+   attachments ⊆ {mask, write-desc} × Peel endpoints (score/lora/hook
+   fires eager as today);
+4. cache-key collapse: the mask variant bit leaves the key for
+   supergraph-eligible fires (one exec serves masked and unmasked).
