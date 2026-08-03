@@ -139,14 +139,29 @@ inline float e8m0_scale(std::uint8_t code) {
 
 // ── MLX affine quantization ──────────────────────────────────────────────────
 
-/// The (scale, bias) MLX would pick for one group, and the codes that follow.
+/// The (scale, bias) for one group, at the precision they are STORED in.
 ///
-/// Two details are load-bearing and neither is guessable:
+/// Two details of the endpoints are load-bearing and neither is guessable:
 ///   * the scale is NEGATED unless the negative extreme is the larger in
 ///     magnitude, so scales are usually negative;
-///   * the endpoint, not the scale, is snapped — `scale = edge / rint(edge /
-///     scale)` — which keeps the largest-magnitude weight exactly representable
+///   * the endpoint, not the scale, is snapped -- `scale = edge / rint(edge /
+///     scale)` -- which keeps the largest-magnitude weight exactly representable
 ///     and is why a naive `(max - min) / 15` disagrees with MLX on real data.
+///
+/// The third is that both come back ROUNDED TO BF16, because that is the width
+/// they are written at and therefore the only values any matvec will ever
+/// multiply by. Choosing 4-bit codes against an f32 scale the runtime cannot
+/// read is a systematic error the size of the scale's own rounding, and at four
+/// bits that is not small.
+///
+/// This used to round only on store, on the stated grounds that MLX does and
+/// that matching MLX mattered more than being self-consistent. Both halves were
+/// wrong. Measured against `mx.quantize` on real gpt-oss experts, the f32 codes
+/// reproduce 91.8% of MLX's -- so the agreement being traded for was never
+/// there. And measured as reconstruction error through the BF16 scale the
+/// runtime actually reads, rounding first is better on every tensor tried:
+/// 0.0986 against 0.1005 on an MXFP4-derived expert bank, 0.03311 against
+/// 0.03324 on a BF16 attention projection.
 struct AffineGroup {
     float scale = 0.0f;
     float bias = 0.0f;
@@ -169,7 +184,10 @@ inline AffineGroup mlx_affine_group_params(const float* values, std::int64_t cou
         scale = edge / q0;
         bias = edge;
     }
-    return AffineGroup{scale, bias};
+    // At the width they will be stored and read at, not the width they were
+    // computed at. Done here rather than at the call site so a caller cannot
+    // pick codes against a scale that will not survive the write.
+    return AffineGroup{bf16_to_f32(f32_to_bf16(scale)), bf16_to_f32(f32_to_bf16(bias))};
 }
 
 // ── Buffer plumbing ──────────────────────────────────────────────────────────
@@ -297,9 +315,9 @@ inline void encode_mlx_affine_u4(
                 const AffineGroup params = mlx_affine_group_params(group.data(), kAffineGroup);
                 scale_out[r * groups + g] = f32_to_bf16(params.scale);
                 bias_out[r * groups + g] = f32_to_bf16(params.bias);
-                // Codes come from the f32 parameters, not their BF16 rounding:
-                // MLX rounds only on store, and matching it matters more than
-                // being self-consistent with what the runtime will read back.
+                // `params` is already at BF16 precision, so these codes and the
+                // scale written above are the same numbers -- which is the whole
+                // point: a code is only as good as the scale it is redeemed at.
                 for (std::int64_t w = 0; w < kAffineGroup / 8; ++w) {
                     std::uint32_t packed = 0;
                     for (std::int64_t k = 0; k < 8; ++k) {

@@ -363,6 +363,28 @@ int main(int argc, char** argv) {
             {"Gemma-4-E2B", 35, 0, {56971, 55353, 374, 56971, 55353, 374},
              {785, 6722, 48352, 6722, 48352, 6722}},
         };
+        // gpt-oss-20b is deliberately absent, and the reason is a capability
+        // this driver already declares it does not have: `native_mxfp4_moe`
+        // (`context.cpp`). Every published mlx conversion keeps the MoE experts
+        // in openai's MXFP4 -- E2M1 nibbles in blocks of 32 under E8M0
+        // exponents -- and no matvec here reads that, so the loader decodes it
+        // and re-encodes it affine-U4 g64. mlx-lm reads the MXFP4 directly.
+        //
+        // So the two runs do not hold the same expert weights, and no row here
+        // could say they produce the same tokens. Handing the oracle the same
+        // step (`tests/parity/gptoss_requantized_ref.py`) closes most of it --
+        // five of six tokens instead of two -- but not all: mlx's own affine
+        // quantizer disagrees with this one on 8.2% of codes, always by one,
+        // and its weights cannot be replaced with these without passing through
+        // it again. A row gating five tokens would be a row fitted to its
+        // answer.
+        //
+        // What IS checked, and is the evidence for this family, is the tap
+        // comparison under the same re-quantization: no tap collapses, every
+        // cosine decays smoothly with depth, and the logits agree to 0.9937.
+        // That is the signature of quantization drift and not of a defect --
+        // the distinction the checkpoint could not make before, because it did
+        // not load at all.
         const Known* ref = nullptr;
         for (const Known& k : known) {
             if (k.n_layers == shape.n_layers && k.n_experts == shape.n_experts) {

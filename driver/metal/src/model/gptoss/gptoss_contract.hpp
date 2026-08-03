@@ -238,6 +238,61 @@ inline void declare_mxfp4_experts(ModelContract& out, const std::vector<SourceTe
     }
 }
 
+/// Declare an MXFP4 projection the way `mlx_lm` REPACKS it.
+///
+/// Same weights, same bytes, a different container. Where the published
+/// checkpoint writes `X_blocks` as `[experts, rows, groups, 16]` of U8 beside
+/// `X_scales`, `mlx_lm`'s conversion writes `X.weight` as
+/// `[experts, rows, groups*4]` of U32 beside `X.scales` -- eight nibbles to a
+/// word instead of two to a byte, which on a little-endian device is the same
+/// byte stream with a different element width declared over it.
+///
+/// It is also already SPLIT: `gate_proj` and `up_proj` are separate tensors
+/// rather than one interleaved `gate_up_proj`. So none of the striding the
+/// published layout needs applies, and neither do its internal intermediates:
+/// each source is a whole tensor, which is the case a width-changing transmute
+/// is allowed in. This is the simpler half of the same job, which is why it is
+/// a few lines against sixty.
+///
+/// Both spellings end in the same place -- decode to values, re-encode as the
+/// affine-U4 the matvecs read -- because `mxfp4_values` takes expressions and
+/// does not care where they came from.
+inline void declare_mlx_mxfp4(ModelContract& out, const SourceTensor& weight,
+                              const SourceTensor& scales, const std::string& output) {
+    using namespace pie::metal::model::contract_detail;
+    if (weight.shape.size() != 3 || scales.shape.size() != 3 ||
+        weight.shape[0] != scales.shape[0] || weight.shape[1] != scales.shape[1]) {
+        fail("Metal GptOss: MXFP4 tensor '" + std::string(weight.name) +
+             "' is not a stacked [experts, rows, groups] bank against its scales");
+    }
+    if (!is_raw(scales.encoding, PieLoaderDType::U8)) {
+        fail("Metal GptOss: MXFP4 tensor '" + std::string(weight.name) +
+             "' has scales that are not the U8 E8M0 block exponents this decode reads");
+    }
+    // A U32 word holds eight nibbles; a block is 32 elements under one exponent.
+    // Both counts must agree on the column width, or this is not MXFP4 and the
+    // shapes are the only thing that says so.
+    const std::int64_t experts = weight.shape[0];
+    const std::int64_t rows = weight.shape[1];
+    const std::int64_t groups = scales.shape[2];
+    if (weight.shape[2] != groups * 4) {
+        fail("Metal GptOss: MXFP4 tensor '" + std::string(weight.name) + "' packs " +
+             std::to_string(weight.shape[2]) + " words against " + std::to_string(groups) +
+             " blocks, and eight nibbles to a word over 32-element blocks needs " +
+             std::to_string(groups * 4));
+    }
+    const std::int64_t cols = groups * 32;
+    const std::string base = output.substr(0, output.size() - std::string_view(".weight").size());
+    out.define(base + ".dequantized",
+               mxfp4_values(out, out.src(std::string(weight.name)),
+                            out.src(std::string(scales.name)), experts * rows, cols,
+                            base + ".mxfp4_scales"),
+               pie_loader::raw(PieLoaderDType::BF16))
+        .expect(std::vector<std::int64_t>{experts * rows, cols})
+        .internal();
+    push_encoded_affine(out, out.out(base + ".dequantized"), experts * rows, cols, output);
+}
+
 }  // namespace contract_detail
 
 /// The `model_type` strings whose decoder this schema describes.
@@ -278,6 +333,19 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
             ends_with(raw.name, "_bias")) {
             continue;
         }
+        // An MXFP4 `.scales` is the block EXPONENTS, consumed by the weight
+        // beside it -- unlike an affine `.scales`, which is a bound tensor in
+        // its own right. What tells them apart is the third member: affine has
+        // a `.biases` and MXFP4 has none. Declared here it would be a U8 tensor
+        // under a runtime name no dispatch reads, staged into the heap for
+        // nothing.
+        if (ends_with(raw.name, ".scales")) {
+            const std::string base = std::string(
+                raw.name.substr(0, raw.name.size() - std::string_view(".scales").size()));
+            if (find(base + ".weight") != nullptr && find(base + ".biases") == nullptr) {
+                continue;
+            }
+        }
         std::optional<std::string> output = runtime_name(raw.name);
         if (!output.has_value()) {
             continue;
@@ -300,13 +368,17 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                 fail("Metal GptOss: '" + std::string(raw.name) +
                      "' is a packed weight with no scales, which no scheme here describes");
             }
+            // Scales with no zero points is MXFP4, which `mlx_lm convert -q`
+            // leaves the MoE experts in because that is the mode openai shipped
+            // them in. Every published mlx conversion of this family is like
+            // this, so refusing it would refuse the family -- and the loader
+            // decodes MXFP4 already, for exactly this reason (`load_plan.hpp`).
+            // The refusal that used to be here told the user to convert offline
+            // for a transform the driver performs at load.
             if (biases == nullptr) {
-                fail("Metal GptOss: '" + std::string(raw.name) +
-                     "' has scales but no zero points, which is MXFP4 (E2M1 nibbles + E8M0 "
-                     "block scales). `mlx_lm convert -q` leaves the MoE experts in the mode "
-                     "the checkpoint shipped them in; convert with --dequantize first, then "
-                     "quantize, so every module is affine-U4 -- the one scheme this driver's "
-                     "kernels read");
+                contract_detail::declare_mlx_mxfp4(out, raw, *scales, *output);
+                ++declared;
+                continue;
             }
             // Width comes from the tensors, not from the config: `mlx_lm`'s
             // quantization predicate leaves the router at 8 bits while

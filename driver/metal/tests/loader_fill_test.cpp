@@ -47,6 +47,7 @@
 
 #include "heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
+#include "loader/transcode.hpp"
 #include "model/qwen3_5/geometry.hpp"
 #include "mtl4_context.hpp"
 
@@ -306,10 +307,84 @@ bool a_padded_contract_stages_zeros_where_no_source_reaches() {
     return true;
 }
 
+/// A 4-bit code is only as good as the scale it is redeemed at.
+///
+/// `encode_mlx_affine_u4` writes the group's scale and bias as BF16, and every
+/// matvec reads them back at that width. So the codes have to be the ones that
+/// are best AGAINST THOSE VALUES -- not against the f32 parameters they were
+/// computed from, which no kernel will ever see.
+///
+/// This used to be the other way round, on the stated grounds that MLX rounds
+/// only on store. Measured, MLX's codes are reproduced 91.8% either way, so
+/// there was no agreement being bought; and reconstruction through the stored
+/// scale is worse. The check below needs no oracle and no checkpoint: it asks
+/// the encoder's own output whether any code could be moved and reduce the
+/// error, which is exactly the property the f32 parameters cost.
+void every_affine_code_is_optimal_for_the_scale_that_is_stored() {
+    std::printf("[affine encoding]\n");
+    using namespace pie::metal::transcode;
+    constexpr std::int64_t kRows = 8;
+    constexpr std::int64_t kCols = 128;  // two groups of 64
+
+    // Values with awkward magnitudes on purpose: a scale that is exactly
+    // representable in BF16 would make the two behaviours identical and the
+    // check vacuous.
+    std::vector<float> values(static_cast<std::size_t>(kRows * kCols));
+    std::uint32_t seed = 0x9e3779b9u;
+    for (float& v : values) {
+        seed = seed * 1664525u + 1013904223u;
+        v = (float(seed >> 8) / float(1u << 24) - 0.5f) * 0.4711f;
+    }
+
+    std::vector<std::uint32_t> codes(static_cast<std::size_t>(kRows * kCols / 8));
+    std::vector<std::uint16_t> scales(static_cast<std::size_t>(kRows * 2));
+    std::vector<std::uint16_t> biases(scales.size());
+    encode_mlx_affine_u4(
+        reinterpret_cast<const std::uint8_t*>(values.data()), /*input_element_bytes=*/4, kRows,
+        kCols,
+        Region{reinterpret_cast<std::uint8_t*>(codes.data()), codes.size() * 4},
+        Region{reinterpret_cast<std::uint8_t*>(scales.data()), scales.size() * 2},
+        Region{reinterpret_cast<std::uint8_t*>(biases.data()), biases.size() * 2});
+
+    int suboptimal = 0;
+    float worst = 0.0f;
+    for (std::int64_t r = 0; r < kRows; ++r) {
+        for (std::int64_t g = 0; g < 2; ++g) {
+            const float scale = bf16_to_f32(scales[r * 2 + g]);
+            const float bias = bf16_to_f32(biases[r * 2 + g]);
+            for (std::int64_t i = 0; i < 64; ++i) {
+                const std::int64_t at = r * kCols + g * 64 + i;
+                const std::uint32_t word = codes[static_cast<std::size_t>(at / 8)];
+                const auto code = int((word >> (4 * (at % 8))) & 0xf);
+                const float want = std::rint((values[static_cast<std::size_t>(at)] - bias) / scale);
+                const int best = int(std::min(15.0f, std::max(0.0f, want)));
+                if (code != best) {
+                    ++suboptimal;
+                    worst = std::max(worst, std::abs(float(code - best)));
+                }
+            }
+        }
+    }
+    expect(suboptimal == 0, "every code is the best one for the BF16 scale it is redeemed at (" +
+                                std::to_string(suboptimal) + " are not, worst off by " +
+                                std::to_string(int(worst)) + ")");
+
+    // The other half of the same statement: the parameters themselves survive
+    // the write. If they did not, "best for the stored scale" would be a claim
+    // about a scale nobody stores.
+    bool exact = true;
+    for (std::size_t i = 0; i < scales.size(); ++i) {
+        exact = exact && f32_to_bf16(bf16_to_f32(scales[i])) == scales[i] &&
+                f32_to_bf16(bf16_to_f32(biases[i])) == biases[i];
+    }
+    expect(exact, "and the scale and bias are already at the width they are written in");
+}
+
 }  // namespace
 
 int main() {
     std::printf("[loader Fill on Metal]\n");
+    every_affine_code_is_optimal_for_the_scale_that_is_stored();
     heap_storage_is_host_visible_and_slices_are_exact();
     the_heap_arrives_zeroed();
     a_padded_contract_stages_zeros_where_no_source_reaches();
