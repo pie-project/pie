@@ -437,7 +437,7 @@ async fn main(input: String) -> Result<String> {
     };
 
     // Chat-decode the pipelined stream to text (thin WIT `chat::Decoder`).
-    let dec = chat::create_decoder();
+    let dec = chat::Decoder::new();
     let mut text = String::new();
     for t in &tokens_p {
         match dec.feed(core::slice::from_ref(t))? {

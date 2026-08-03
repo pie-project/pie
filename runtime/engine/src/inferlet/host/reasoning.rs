@@ -22,14 +22,15 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl pie::inferlet::reasoning::Host for ProcessCtx {
-    async fn create_decoder(&mut self) -> Result<Resource<Decoder>> {
+}
+
+impl pie::inferlet::reasoning::HostDecoder for ProcessCtx {
+    async fn new(&mut self) -> Result<Resource<Decoder>> {
         let inner = pie_model::model().instruct().reasoning_decoder();
         let decoder = Decoder { inner };
         Ok(self.ctx().table.push(decoder)?)
     }
-}
 
-impl pie::inferlet::reasoning::HostDecoder for ProcessCtx {
     async fn feed(
         &mut self,
         this: Resource<Decoder>,

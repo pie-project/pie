@@ -35,11 +35,6 @@ impl pie::inferlet::tools::Host for ProcessCtx {
         Ok(pie_model::model().instruct().answer(&name, &value))
     }
 
-    async fn create_decoder(&mut self) -> Result<Resource<Decoder>> {
-        let inner = pie_model::model().instruct().tool_decoder();
-        let decoder = Decoder { inner };
-        Ok(self.ctx().table.push(decoder)?)
-    }
 
     async fn format(
         &mut self,
@@ -76,6 +71,12 @@ impl pie::inferlet::tools::Host for ProcessCtx {
 }
 
 impl pie::inferlet::tools::HostDecoder for ProcessCtx {
+    async fn new(&mut self) -> Result<Resource<Decoder>> {
+        let inner = pie_model::model().instruct().tool_decoder();
+        let decoder = Decoder { inner };
+        Ok(self.ctx().table.push(decoder)?)
+    }
+
     async fn feed(
         &mut self,
         this: Resource<Decoder>,
