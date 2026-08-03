@@ -197,15 +197,17 @@ macro_rules! define_beam_search {
         // explicit write descriptor. The pool is fixed so these carry constant values.
         fwd.attention(
             &ws,
-            ..,
-            ..,
-            &klen,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &pos,
-            Some(&mask),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: Some(&mask),
+            },
         )?;
         fwd.epilogue(move || {
             // 1. top-B over the flattened [B,V] cand block.

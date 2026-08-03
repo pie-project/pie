@@ -283,15 +283,17 @@ async fn main(input: Input) -> Result<Output> {
         fwd_c.embed(&toks_c, &embed_indptr_c)?;
         fwd_c.attention(
             &ws,
-            ..,
-            ..,
-            &kv_len_c,
-            &pages_c,
-            &page_indptr_c,
-            &w_slot_c,
-            &w_off_c,
-            &positions_c,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_c,
+                pages: &pages_c,
+                page_indptr: &page_indptr_c,
+                w_slot: &w_slot_c,
+                w_off: &w_off_c,
+                positions: &positions_c,
+                mask: None,
+            },
         )?;
         fwd_c.epilogue(move || {
             let r = rng_c.take();
@@ -351,15 +353,17 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
 
     // ── THE TAP. Fires once per layer, AFTER that layer's attention. During a
@@ -459,15 +463,17 @@ async fn main(input: Input) -> Result<Output> {
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
 
         // ── THE ENFORCEMENT. Fires once per layer, BEFORE that layer's

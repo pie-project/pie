@@ -700,6 +700,45 @@ struct KvBind {
     mask: Option<Rc<wit_channel::Channel>>,
 }
 
+/// The attention geometry of one fire — a field-for-field mirror of the WIT
+/// `kv-geometry` record (`forward.wit`, `forward-hybrid.wit`).
+///
+/// The record exists in WIT so the whole group can be handled as a unit; it
+/// exists here for the same reason, and because six consecutive `&Channel`
+/// arguments carrying five different `u32` meanings is a swap waiting to
+/// happen. Nothing is hidden: every field is exactly the channel the host
+/// binds to that PTIR port.
+///
+/// The two page spans take any `u32` range, which is what `page-span`'s
+/// `{ start, end: option<u32> }` means: `..` is the whole working set,
+/// `first..` is a suffix, `a..b` a window.
+///
+/// ```ignore
+/// fwd.attention(&ws, KvGeometry {
+///     readable_pages: ..,
+///     writable_pages: (n / page_size)..,
+///     kv_len: &kv_len,
+///     pages: &pages,
+///     page_indptr: &page_indptr,
+///     w_slot: &w_slot,
+///     w_off: &w_off,
+///     positions: &positions,
+///     mask: None,
+/// })?;
+/// ```
+pub struct KvGeometry<'a, R, W> {
+    pub readable_pages: R,
+    pub writable_pages: W,
+    pub kv_len: &'a Channel,
+    pub pages: &'a Channel,
+    pub page_indptr: &'a Channel,
+    pub w_slot: &'a Channel,
+    pub w_off: &'a Channel,
+    pub positions: &'a Channel,
+    /// `None` omits PTIR's AttnMask port; `Some` binds that channel to it.
+    pub mask: Option<&'a Channel>,
+}
+
 /// A recorded `rs-geometry`: where the bound recurrent state lives for this
 /// fire and where its folded boundary lands.
 struct RsGeometryBind {
@@ -846,26 +885,27 @@ impl PassCore {
     }
 
     /// Bind attention and all of its geometry channels. This is the only
-    /// attention binding surface; `mask: None` omits PTIR's existing AttnMask
-    /// port, while `Some` binds that channel.
-    #[allow(clippy::too_many_arguments)]
+    /// attention binding surface.
     pub fn attention<R, W>(
         &self,
         ws: &WorkingSet,
-        readable: R,
-        writable: W,
-        kv_len: &Channel,
-        pages: &Channel,
-        page_indptr: &Channel,
-        w_slot: &Channel,
-        w_off: &Channel,
-        positions: &Channel,
-        mask: Option<&Channel>,
+        geom: KvGeometry<'_, R, W>,
     ) -> Result<(), String>
     where
         R: RangeBounds<u32>,
         W: RangeBounds<u32>,
     {
+        let KvGeometry {
+            readable_pages,
+            writable_pages,
+            kv_len,
+            pages,
+            page_indptr,
+            w_slot,
+            w_off,
+            positions,
+            mask,
+        } = geom;
         let mut ports = vec![
             Port::KvLen,
             Port::Pages,
@@ -878,8 +918,8 @@ impl PassCore {
             ports.push(Port::AttnMask);
         }
         self.ensure_ports_available(&ports)?;
-        let readable = PageDeclaration::from_range(readable)?;
-        let writable = PageDeclaration::from_range(writable)?;
+        let readable = PageDeclaration::from_range(readable_pages)?;
+        let writable = PageDeclaration::from_range(writable_pages)?;
         let kv_len_wit = kv_len.wit();
         let pages_wit = pages.wit();
         let page_indptr_wit = page_indptr.wit();
@@ -1436,8 +1476,9 @@ impl Default for Pipeline {
 /// algorithm from silently compiling against a hybrid model.
 pub mod shared_prelude {
     pub use super::{
-        Channel, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD, WorkingSet, channel_capacity,
-        frame_size, live_slots, max_embed_length, pad_tokens, prefill_chunks, unpad_tokens,
+        Channel, KvGeometry, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD, WorkingSet,
+        channel_capacity, frame_size, live_slots, max_embed_length, pad_tokens, prefill_chunks,
+        unpad_tokens,
     };
     pub use std::ops::ControlFlow;
     pub use pie_dsl::dtype;
@@ -1569,38 +1610,18 @@ pub mod attention {
     pass_module_attention_stages!();
 
     impl ForwardPass {
-        /// Bind attention and all of its geometry channels. `mask: None` omits
-        /// PTIR's AttnMask port; `Some` binds that channel to it.
-        #[allow(clippy::too_many_arguments)]
+        /// Bind attention and all of its geometry channels — see
+        /// [`KvGeometry`](crate::ptir::KvGeometry).
         pub fn attention<R, W>(
             &self,
             ws: &WorkingSet,
-            readable: R,
-            writable: W,
-            kv_len: &Channel,
-            pages: &Channel,
-            page_indptr: &Channel,
-            w_slot: &Channel,
-            w_off: &Channel,
-            positions: &Channel,
-            mask: Option<&Channel>,
+            geom: crate::ptir::KvGeometry<'_, R, W>,
         ) -> Result<(), String>
         where
             R: ::std::ops::RangeBounds<u32>,
             W: ::std::ops::RangeBounds<u32>,
         {
-            self.0.attention(
-                ws,
-                readable,
-                writable,
-                kv_len,
-                pages,
-                page_indptr,
-                w_slot,
-                w_off,
-                positions,
-                mask,
-            )
+            self.0.attention(ws, geom)
         }
     }
 
@@ -1685,32 +1706,13 @@ pub mod hybrid {
         pub fn attention<R, W>(
             &self,
             ws: &WorkingSet,
-            readable: R,
-            writable: W,
-            kv_len: &Channel,
-            pages: &Channel,
-            page_indptr: &Channel,
-            w_slot: &Channel,
-            w_off: &Channel,
-            positions: &Channel,
-            mask: Option<&Channel>,
+            geom: crate::ptir::KvGeometry<'_, R, W>,
         ) -> Result<(), String>
         where
             R: ::std::ops::RangeBounds<u32>,
             W: ::std::ops::RangeBounds<u32>,
         {
-            self.0.attention(
-                ws,
-                readable,
-                writable,
-                kv_len,
-                pages,
-                page_indptr,
-                w_slot,
-                w_off,
-                positions,
-                mask,
-            )
+            self.0.attention(ws, geom)
         }
 
         /// Bind the RECURRENT half: one working set per request, in resolved

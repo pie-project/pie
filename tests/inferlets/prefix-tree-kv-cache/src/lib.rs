@@ -63,15 +63,17 @@ async fn append_tokens(
     let kv_len = Channel::from(vec![total]).named("kv_len");
     fwd.attention(
         ws,
-        ..,
-        (start / ws.page_size())..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (start / ws.page_size())..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         next_token.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
@@ -133,15 +135,17 @@ async fn generate(
     let kv_len = Channel::from(vec![seq_len + 1]).named("kv_len");
     fwd.attention(
         ws,
-        ..,
-        (seq_len / page_size)..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (seq_len / page_size)..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         let length = kv_len.take().tensor();

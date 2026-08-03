@@ -139,15 +139,17 @@ async fn main(input: Input) -> Result<String> {
     amateur_prefill.embed(&amateur_prompt, &amateur_prefill_embed_indptr)?;
     amateur_prefill.attention(
         &amateur_ws,
-        ..,
-        ..,
-        &amateur_prefill_klen,
-        &amateur_prefill_pages,
-        &amateur_prefill_indptr,
-        &amateur_prefill_slots,
-        &amateur_prefill_offsets,
-        &amateur_prefill_positions,
-        Some(&amateur_prefill_mask),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &amateur_prefill_klen,
+            pages: &amateur_prefill_pages,
+            page_indptr: &amateur_prefill_indptr,
+            w_slot: &amateur_prefill_slots,
+            w_off: &amateur_prefill_offsets,
+            positions: &amateur_prefill_positions,
+            mask: Some(&amateur_prefill_mask),
+        },
     )?;
     amateur_prefill.epilogue(move || {
         amateur_prefill_out.put(intrinsics::logits());
@@ -196,15 +198,17 @@ async fn main(input: Input) -> Result<String> {
     let expert_prefill_kv_len = Channel::from(vec![n]).named("expert_prefill_kv_len");
     expert_prefill.attention(
         &expert_ws,
-        ..,
-        ..,
-        &expert_prefill_kv_len,
-        &expert_prefill_pages,
-        &expert_prefill_indptr,
-        &expert_prefill_slots,
-        &expert_prefill_offsets,
-        &expert_prefill_positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &expert_prefill_kv_len,
+            pages: &expert_prefill_pages,
+            page_indptr: &expert_prefill_indptr,
+            w_slot: &expert_prefill_slots,
+            w_off: &expert_prefill_offsets,
+            positions: &expert_prefill_positions,
+            mask: None,
+        },
     )?;
     expert_prefill.epilogue(move || {
         let token = contrastive_pick(expert_prefill_amateur.take(), lambda, alpha, vocab);
@@ -249,15 +253,17 @@ async fn main(input: Input) -> Result<String> {
     amateur_decode.embed(&amateur_token, &amateur_embed_indptr)?;
     amateur_decode.attention(
         &amateur_ws,
-        ..,
-        (n / amateur_ws.page_size())..,
-        &amateur_klen,
-        &amateur_pages,
-        &amateur_page_indptr,
-        &amateur_write_slot,
-        &amateur_write_offset,
-        &amateur_position,
-        Some(&amateur_mask),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (n / amateur_ws.page_size())..,
+            kv_len: &amateur_klen,
+            pages: &amateur_pages,
+            page_indptr: &amateur_page_indptr,
+            w_slot: &amateur_write_slot,
+            w_off: &amateur_write_offset,
+            positions: &amateur_position,
+            mask: Some(&amateur_mask),
+        },
     )?;
     amateur_decode.epilogue(move || {
         let base = amateur_fill.take().tensor();
@@ -308,15 +314,17 @@ async fn main(input: Input) -> Result<String> {
     let expert_kv_len = Channel::from(vec![n + 1]).named("expert_kv_len");
     expert_decode.attention(
         &expert_ws,
-        ..,
-        (n / expert_ws.page_size())..,
-        &expert_kv_len,
-        &expert_pages,
-        &expert_page_indptr,
-        &expert_write_slot,
-        &expert_write_offset,
-        &expert_position,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (n / expert_ws.page_size())..,
+            kv_len: &expert_kv_len,
+            pages: &expert_pages,
+            page_indptr: &expert_page_indptr,
+            w_slot: &expert_write_slot,
+            w_off: &expert_write_offset,
+            positions: &expert_position,
+            mask: None,
+        },
     )?;
     expert_decode.epilogue(move || {
         let length = expert_kv_len.take().tensor();

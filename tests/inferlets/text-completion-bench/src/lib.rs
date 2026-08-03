@@ -332,15 +332,17 @@ async fn $name(
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
         if !rs_ws.is_empty() {
             $bind_rs(&fwd_p, &rs_ws).map_err(|e| format!("bind prefill recurrent state: {e}"))?;
@@ -372,15 +374,17 @@ async fn $name(
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
             if !rs_ws.is_empty() {
                 $bind_rs(&fwd, &rs_ws)

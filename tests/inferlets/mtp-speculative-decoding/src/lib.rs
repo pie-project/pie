@@ -103,15 +103,17 @@ async fn main(input: Input) -> Result<String> {
     let prefill_kv_len = Channel::from(vec![n]).named("prefill_kv_len");
     prefill.attention(
         &ws,
-        ..,
-        ..,
-        &prefill_kv_len,
-        &prefill_pages,
-        &prefill_page_indptr,
-        &prefill_w_slot,
-        &prefill_w_off,
-        &prefill_positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &prefill_kv_len,
+            pages: &prefill_pages,
+            page_indptr: &prefill_page_indptr,
+            w_slot: &prefill_w_slot,
+            w_off: &prefill_w_off,
+            positions: &prefill_positions,
+            mask: None,
+        },
     )?;
     prefill.epilogue(move || {
         seed_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
@@ -164,15 +166,17 @@ async fn main(input: Input) -> Result<String> {
     fwd.readout(&readout)?;
     fwd.attention(
         &ws,
-        ..,
-        (n / PAGE_T)..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (n / PAGE_T)..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     let stage_stop_tokens = stop_tokens.clone();
     fwd.epilogue(move || {

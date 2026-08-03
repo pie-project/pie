@@ -98,15 +98,17 @@ async fn main(input: Input) -> Result<String> {
     prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
     prefill.attention(
         &ws,
-        ..,
-        ..,
-        &prefill_klen,
-        &prefill_pages,
-        &prefill_indptr,
-        &prefill_slots,
-        &prefill_offsets,
-        &prefill_positions,
-        Some(&causal),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &prefill_klen,
+            pages: &prefill_pages,
+            page_indptr: &prefill_indptr,
+            w_slot: &prefill_slots,
+            w_off: &prefill_offsets,
+            positions: &prefill_positions,
+            mask: Some(&causal),
+        },
     )?;
     prefill.epilogue(move || {
         first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
@@ -158,15 +160,17 @@ async fn main(input: Input) -> Result<String> {
     decode.embed(&token_in, &decode_indptr)?;
     decode.attention(
         &ws,
-        ..,
-        ..,
-        &klen,
-        &pages,
-        &page_indptr,
-        &write_slot,
-        &write_offset,
-        &position,
-        Some(&mask),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &write_slot,
+            w_off: &write_offset,
+            positions: &position,
+            mask: Some(&mask),
+        },
     )?;
     decode.epilogue(move || {
         let base = fill.take().tensor();

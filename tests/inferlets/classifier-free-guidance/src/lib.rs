@@ -134,15 +134,17 @@ async fn main(input: Input) -> Result<String> {
     uncond_prefill.embed(&u_prompt_ch, &u_pre_indptr)?;
     uncond_prefill.attention(
         &uncond_ws,
-        ..,
-        ..,
-        &u_pre_klen,
-        &u_pre_pages,
-        &u_pre_page_indptr,
-        &u_pre_slot,
-        &u_pre_off,
-        &u_pre_pos,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &u_pre_klen,
+            pages: &u_pre_pages,
+            page_indptr: &u_pre_page_indptr,
+            w_slot: &u_pre_slot,
+            w_off: &u_pre_off,
+            positions: &u_pre_pos,
+            mask: None,
+        },
     )?;
     uncond_prefill.epilogue(move || {
         u_pre_out.put(intrinsics::logits());
@@ -188,15 +190,17 @@ async fn main(input: Input) -> Result<String> {
     cond_prefill.embed(&c_prompt_ch, &c_pre_indptr)?;
     cond_prefill.attention(
         &cond_ws,
-        ..,
-        ..,
-        &c_pre_klen,
-        &c_pre_pages,
-        &c_pre_page_indptr,
-        &c_pre_slot,
-        &c_pre_off,
-        &c_pre_pos,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &c_pre_klen,
+            pages: &c_pre_pages,
+            page_indptr: &c_pre_page_indptr,
+            w_slot: &c_pre_slot,
+            w_off: &c_pre_off,
+            positions: &c_pre_pos,
+            mask: None,
+        },
     )?;
     cond_prefill.epilogue(move || {
         let (token, shift, kl) = guided_pick(c_pre_uncond.take(), gamma);
@@ -241,15 +245,17 @@ async fn main(input: Input) -> Result<String> {
     uncond_decode.embed(&u_token, &u_embed_indptr)?;
     uncond_decode.attention(
         &uncond_ws,
-        ..,
-        (nu / uncond_ws.page_size())..,
-        &u_klen,
-        &u_pages,
-        &u_page_indptr,
-        &u_slot,
-        &u_off,
-        &u_pos,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (nu / uncond_ws.page_size())..,
+            kv_len: &u_klen,
+            pages: &u_pages,
+            page_indptr: &u_page_indptr,
+            w_slot: &u_slot,
+            w_off: &u_off,
+            positions: &u_pos,
+            mask: None,
+        },
     )?;
     uncond_decode.epilogue(move || {
         let length = u_klen.take().tensor();
@@ -289,15 +295,17 @@ async fn main(input: Input) -> Result<String> {
     cond_decode.embed(&c_token, &c_embed_indptr)?;
     cond_decode.attention(
         &cond_ws,
-        ..,
-        (nc / cond_ws.page_size())..,
-        &c_klen,
-        &c_pages,
-        &c_page_indptr,
-        &c_slot,
-        &c_off,
-        &c_pos,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (nc / cond_ws.page_size())..,
+            kv_len: &c_klen,
+            pages: &c_pages,
+            page_indptr: &c_page_indptr,
+            w_slot: &c_slot,
+            w_off: &c_off,
+            positions: &c_pos,
+            mask: None,
+        },
     )?;
     cond_decode.epilogue(move || {
         let length = c_klen.take().tensor();

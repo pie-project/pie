@@ -134,15 +134,17 @@ async fn main(input: Input) -> Result<String> {
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
-            ..,
-            ..,
-            &klen_p,
-            &pages_p,
-            &page_indptr_p,
-            &w_slot_p,
-            &w_off_p,
-            &positions_p,
-            Some(&mask_p),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &klen_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: Some(&mask_p),
+            },
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
@@ -205,15 +207,17 @@ async fn main(input: Input) -> Result<String> {
     fwd.embed(&tok_in, &lane1)?;
     fwd.attention(
         &ws,
-        ..,
-        (n / ws.page_size())..,
-        &klen,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &pos,
-        Some(&mask),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (n / ws.page_size())..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &pos,
+            mask: Some(&mask),
+        },
     )?;
     fwd.epilogue(move || {
         // TAKES + compute first, PUTS last (value-id discipline).

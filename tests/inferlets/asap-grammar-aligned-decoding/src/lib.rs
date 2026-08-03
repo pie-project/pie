@@ -277,15 +277,17 @@ async fn main(input: Input) -> Result<Output> {
         prefill.embed(&prompt_tokens, &pre_indptr)?;
         prefill.attention(
             &ws,
-            ..,
-            ..,
-            &pre_kv_len,
-            &pre_pages,
-            &pre_page_indptr,
-            &pre_w_slot,
-            &pre_w_off,
-            &pre_positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &pre_kv_len,
+                pages: &pre_pages,
+                page_indptr: &pre_page_indptr,
+                w_slot: &pre_w_slot,
+                w_off: &pre_w_off,
+                positions: &pre_positions,
+                mask: None,
+            },
         )?;
         prefill.epilogue(move || {
             let allowed = pre_mask.take().tensor();
@@ -347,15 +349,17 @@ async fn main(input: Input) -> Result<Output> {
             decode.embed(&token_in, &embed_indptr)?;
             decode.attention(
                 &ws,
-                ..,
-                (n / page_size)..,
-                &kv_len,
-                &pages,
-                &page_indptr,
-                &w_slot,
-                &w_off,
-                &positions,
-                None,
+                KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: (n / page_size)..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
             )?;
             decode.epilogue(move || {
                 let length = kv_len.take().tensor();
