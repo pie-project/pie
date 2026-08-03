@@ -551,7 +551,11 @@ cudaGraphExec_t capture_forward_graph_exec(
     // Lora campaign step 3b: non-null captures a LORA-carrying body —
     // the launches read the ENGINE-staged state (the caller must have
     // staged this fire), and the exec lives in the fingerprint store.
-    const model::LoraTable* lora = nullptr);
+    const model::LoraTable* lora = nullptr,
+    // NS-3: the spatial split (UINT32_MAX = not a spatial fire). The
+    // captured body splits its attention and reads the identity qo from
+    // pi.mask_suffix_qo_indptr.
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu);
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
 // (not private to batch/forward.cpp) because `enqueue_step` in

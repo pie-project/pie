@@ -945,6 +945,27 @@ void prepare_llama_like_decode_plan(
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state)
 {
+    // NS-3: a spatial-split fire's captured body bakes BOTH plans' grids
+    // and the split-derived pointer offsets — all three join the layout
+    // (splitmix, the layout hashes' existing posture).
+    if (state.spatial_mask_split >= 0 && state.use_mask_decode_plan &&
+        state.mask_decode_plan) {
+        auto mix = [](std::uint64_t x) {
+            x += 0x9e3779b97f4a7c15ull;
+            x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+            x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+            return x ^ (x >> 31);
+        };
+        std::uint64_t h = mix(
+            0x5350414Cull ^
+            static_cast<std::uint64_t>(state.spatial_mask_split));
+        h = mix(h ^ ops::prefill_plan_graph_layout(
+                        *state.mask_decode_plan));
+        if (state.spatial_mask_split > 0 && state.decode_plan) {
+            h = mix(h ^ ops::decode_plan_graph_layout(*state.decode_plan));
+        }
+        return static_cast<std::uint32_t>(h & 0x00ffffffu);
+    }
     if (state.use_xqa_decode) {
         return ops::xqa_decode_graph_layout(state.xqa_max_pages_per_seq);
     }

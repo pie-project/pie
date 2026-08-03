@@ -294,7 +294,11 @@ cudaGraphExec_t capture_forward_graph_exec(
     int runtime_window_left,
     const model::StageHooks* stage_hooks,
     bool use_supergraph,
-    const model::LoraTable* lora)
+    const model::LoraTable* lora,
+    // NS-3: the spatial split (UINT32_MAX = not a spatial fire). The
+    // captured body splits its attention and reads the identity qo from
+    // pi.mask_suffix_qo_indptr.
+    std::uint32_t unmasked_prefix_rows)
 {
     auto& pi = engine.inputs;
 
@@ -381,6 +385,13 @@ cudaGraphExec_t capture_forward_graph_exec(
         // host windows (their split is degenerate and capture-stable).
         fwd_in.peel_window_d =
             stage_hooks != nullptr ? pi.peel_window.data() : nullptr;
+        if (unmasked_prefix_rows != 0xffffffffu) {
+            fwd_in.unmasked_prefix_rows = unmasked_prefix_rows;
+            fwd_in.mask_suffix_qo_indptr_d =
+                pi.mask_suffix_qo_indptr.data();
+            fwd_in.mask_suffix_kv_page_indptr_d =
+                pi.mask_suffix_kv_page_indptr.data();
+        }
         if (use_supergraph) {
             // The union body: the mask/write-desc data pointers must be
             // the persistent buffers UNCONDITIONALLY — a masked replay
@@ -797,7 +808,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.lora == nullptr &&
         in.unmasked_prefix_rows != 0xffffffffu &&
         in.unmasked_prefix_rows < static_cast<std::uint32_t>(in.forward_R);
-    bool run_graph = graph_eligible && !use_spatial_mask;
+    bool run_graph = graph_eligible;
     if (!use_spatial_mask && in.is_pure_decode && in.have_custom_mask &&
         std::getenv("PIE_SPATIAL_MASK_TRACE")) {
         std::fprintf(stderr,
@@ -839,7 +850,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     // the device predicate word's job.
     const bool use_supergraph = supergraph_enabled() &&
         engine.forward_fn.supports_supergraph && graph_eligible &&
-        in.is_pure_decode && !has_hooks && in.lora == nullptr;
+        in.is_pure_decode && !has_hooks && in.lora == nullptr &&
+        // NS-3: a spatial-split fire must NOT take the union's fire-level
+        // mask arm; it graphs in its own split-keyed partition.
+        !use_spatial_mask;
     ForwardGraphKey key{};
     if (graph_eligible) {
         const std::uint32_t graph_layout = use_supergraph
@@ -853,7 +867,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 graph_layout,
                 /*has_hooks=*/has_hooks) |
             (use_supergraph ? kGvSupergraph : 0u) |
-            (in.lora != nullptr ? kGvLora : 0u);
+            (in.lora != nullptr ? kGvLora : 0u) |
+            (use_spatial_mask ? kGvSpatial : 0u);
         key = ForwardGraphKey{
             in.forward_R,
             in.forward_N,
@@ -1009,7 +1024,9 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.structured_window_left,
                 has_hooks ? in.stage_hooks : nullptr,
                 use_supergraph,
-                in.lora);
+                in.lora,
+                use_spatial_mask ? in.unmasked_prefix_rows
+                                 : 0xffffffffu);
             if (has_hooks) {
                 // The capture is the one moment the model's per-layer hook
                 // coverage is observable; a body that skipped hooks would
@@ -1142,6 +1159,22 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
             CUDA_CHECK(cudaMemcpyAsync(
                 engine.inputs.supergraph_preds.data(), preds,
                 sizeof(preds), cudaMemcpyHostToDevice, cublas.stream()));
+        }
+        if (use_spatial_mask) {
+            // The captured suffix dispatch reads the identity qo from
+            // pi.mask_suffix_qo_indptr; identity content is
+            // split-invariant, but re-upload per fire keeps the buffer
+            // owned by no particular capture (R+1 u32s, trivial).
+            std::vector<std::uint32_t> qo(
+                static_cast<std::size_t>(in.forward_R) + 1);
+            for (int i = 0; i <= in.forward_R; ++i) {
+                qo[static_cast<std::size_t>(i)] =
+                    static_cast<std::uint32_t>(i);
+            }
+            CUDA_CHECK(cudaMemcpy(
+                engine.inputs.mask_suffix_qo_indptr.data(), qo.data(),
+                qo.size() * sizeof(std::uint32_t),
+                cudaMemcpyHostToDevice));
         }
         if (has_hooks) {
             // Arm the fire's Peel window: the captured devwin kernels read
