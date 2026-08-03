@@ -714,12 +714,15 @@ bool forward_graph_replay_eligible(
         !has_lora;
 }
 
-// The unionized supergraph rollout gate (S3): default OFF while the
-// batteries accumulate; PIE_SUPERGRAPH=1 arms it.
+// The unionized supergraph gate: DEFAULT ON since the width batteries
+// (multi-R + all five deployments, byte-identical A/B) went green —
+// PIE_SUPERGRAPH=0 disarms it. Fires outside the union (hooks, lora,
+// score-wanting, windowed, prefill-shaped) take their existing paths
+// untouched; the gate only reroutes union-eligible decode fires.
 static bool supergraph_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_SUPERGRAPH");
-        return v != nullptr && v[0] != '0';
+        return v == nullptr || v[0] != '0';
     }();
     return on;
 }
