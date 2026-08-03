@@ -35,7 +35,7 @@ fn argmax(values: &[f32]) -> usize {
 async fn main(_input: Input) -> Result<String> {
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let mut prompt = model::encode("The capital of France is");
     if prompt.is_empty() {
@@ -45,14 +45,14 @@ async fn main(_input: Input) -> Result<String> {
     let max_pages = n.div_ceil(page_size).max(1);
     ws.reserve(max_pages).context("reserve KV")?;
 
-    let toks = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
-    let w_slot = Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot");
-    let w_off = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off");
-    let kv_len = Channel::from(vec![n]).named("kv_len");
+    let toks = Channel::from_iter(prompt.iter().map(|&token| token as i32));
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(0..n).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot");
+    let w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off");
+    let kv_len = Channel::from([n]).named("kv_len");
     let token_out = Channel::new([1], dtype::i32).named("token");
     let logits_out = Channel::new([vocab], dtype::f32).named("logits");
     let entropy_out = Channel::new([1], dtype::f32).named("entropy");

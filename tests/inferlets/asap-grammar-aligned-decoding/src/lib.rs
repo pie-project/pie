@@ -240,25 +240,22 @@ async fn main(input: Input) -> Result<Output> {
         // WorkingSet permanently claims the first pipeline it fires on, so all
         // rounds share this inferlet's single pipeline.
         let ws = WorkingSet::new();
-        let page_size = ws.page_size();
+        let page_size = kv_page_size();
         let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
         ws.reserve(max_pages).context("reserve KV")?;
 
-        let prompt_tokens = Channel::from(prompt.iter().map(|&t| t as i32).collect::<Vec<_>>());
-        let pre_indptr = Channel::from(vec![0u32, n]).named("pre_indptr");
-        let pre_positions = Channel::from((0..n).collect::<Vec<_>>()).named("pre_positions");
-        let pre_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pre_pages");
-        let pre_page_indptr =
-            Channel::from(vec![0u32, n.div_ceil(page_size)]).named("pre_page_indptr");
-        let pre_w_slot =
-            Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("pre_w_slot");
-        let pre_w_off =
-            Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("pre_w_off");
-        let pre_kv_len = Channel::from(vec![n]).named("pre_kv_len");
+        let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
+        let pre_indptr = Channel::from([0u32, n]).named("pre_indptr");
+        let pre_positions = Channel::from_iter(0..n).named("pre_positions");
+        let pre_pages = Channel::from_iter(0..max_pages).named("pre_pages");
+        let pre_page_indptr = Channel::from([0u32, n.div_ceil(page_size)]).named("pre_page_indptr");
+        let pre_w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("pre_w_slot");
+        let pre_w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("pre_w_off");
+        let pre_kv_len = Channel::from([n]).named("pre_kv_len");
         let pre_mask = Channel::new([vocab], dtype::bool).named("pre_mask");
         let pre_alpha_idx = Channel::new([pairs as u32], dtype::u32).named("pre_alpha_idx");
         let pre_alpha_val = Channel::new([pairs as u32], dtype::f32).named("pre_alpha_val");
-        let pre_rng = Channel::from(vec![input.seed ^ (round as u32 * 0x9E37), 0]).named("pre_rng");
+        let pre_rng = Channel::from([input.seed ^ (round as u32 * 0x9E37), 0]).named("pre_rng");
         let pre_token = Channel::new([1], dtype::i32).named("pre_token");
         let pre_mass = Channel::new([1], dtype::f32).named("pre_mass");
         let pre_prob = Channel::new([1], dtype::f32).named("pre_prob");
@@ -315,20 +312,20 @@ async fn main(input: Input) -> Result<Output> {
         path_nodes.push(node);
 
         if !constraint.is_terminated() && generated.len() < input.max_tokens {
-            let token_in = Channel::from(vec![first]).named("token_in");
-            let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-            let positions = Channel::from(vec![n]).named("positions");
-            let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
+            let token_in = Channel::from([first]).named("token_in");
+            let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+            let positions = Channel::from([n]).named("positions");
+            let pages = Channel::from_iter(0..max_pages).named("pages");
             let page_indptr =
-                Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-            let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-            let w_off = Channel::from(vec![n % page_size]).named("w_off");
-            let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+                Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+            let w_slot = Channel::from([n / page_size]).named("w_slot");
+            let w_off = Channel::from([n % page_size]).named("w_off");
+            let kv_len = Channel::from([n + 1]).named("kv_len");
             let mask_ch = Channel::new([vocab], dtype::bool).named("mask");
             let alpha_idx = Channel::new([pairs as u32], dtype::u32).named("alpha_idx");
             let alpha_val = Channel::new([pairs as u32], dtype::f32).named("alpha_val");
             let rng =
-                Channel::from(vec![input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0]).named("rng");
+                Channel::from([input.seed ^ (round as u32 * 0x9E37) ^ 0x5bd1, 0]).named("rng");
             let token_out = Channel::new([1], dtype::i32).named("token_out");
             let mass_out = Channel::new([1], dtype::f32).named("mass_out");
             let prob_out = Channel::new([1], dtype::f32).named("prob_out");

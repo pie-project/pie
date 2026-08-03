@@ -187,15 +187,14 @@ async fn verify(
     let ws = WorkingSet::new();
     let max_pages = total.div_ceil(page_size);
     ws.reserve(max_pages).context("reserve verification KV")?;
-    let tokens = Channel::from(input.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let embed_indptr = Channel::from(vec![0u32, total]).named("embed_indptr");
-    let positions = Channel::from((0..total).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
-    let w_slot =
-        Channel::from((0..total).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot");
-    let w_off = Channel::from((0..total).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off");
-    let kv_len = Channel::from(vec![total]).named("kv_len");
+    let tokens = Channel::from_iter(input.iter().map(|&token| token as i32));
+    let embed_indptr = Channel::from([0u32, total]).named("embed_indptr");
+    let positions = Channel::from_iter(0..total).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((0..total).map(|p| p / page_size)).named("w_slot");
+    let w_off = Channel::from_iter((0..total).map(|p| p % page_size)).named("w_off");
+    let kv_len = Channel::from([total]).named("kv_len");
     let readout = Channel::from(readout).named("readout");
     // One row of the allowed-token mask per readout row. The SDK reshapes a
     // single-row `logits` to `[vocab]`, so the mask has to follow suit or the
@@ -251,7 +250,7 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let vocab = model::output_vocab_size();
-    let page_size = WorkingSet::new().page_size();
+    let page_size = kv_page_size();
     let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
     let mut committed = chat::system_user(

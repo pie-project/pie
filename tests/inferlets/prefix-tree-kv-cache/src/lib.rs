@@ -32,26 +32,25 @@ async fn append_tokens(
     let total = start + n;
     // The generated geometry spans `max_pages`; extend the (purely logical)
     // lease so it covers the appended extent by fire time.
-    let max_pages = total.div_ceil(ws.page_size()).max(1);
+    let max_pages = total.div_ceil(kv_page_size()).max(1);
     let have = ws.page_len();
     if max_pages > have {
         ws.reserve(max_pages - have).context("reserve append KV")?;
     }
-    let token_input = Channel::from(tokens.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((start..total).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..ws.page_len()).collect::<Vec<_>>()).named("pages");
-    let page_indptr =
-        Channel::from(vec![0u32, total.div_ceil(ws.page_size())]).named("page_indptr");
+    let token_input = Channel::from_iter(tokens.iter().map(|&token| token as i32));
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(start..total).named("positions");
+    let pages = Channel::from_iter(0..ws.page_len()).named("pages");
+    let page_indptr = Channel::from([0u32, total.div_ceil(kv_page_size())]).named("page_indptr");
     let w_slot = Channel::from(
         (start..total)
-            .map(|p| p / ws.page_size())
+            .map(|p| p / kv_page_size())
             .collect::<Vec<_>>(),
     )
     .named("w_slot");
     let w_off = Channel::from(
         (start..total)
-            .map(|p| p % ws.page_size())
+            .map(|p| p % kv_page_size())
             .collect::<Vec<_>>(),
     )
     .named("w_off");
@@ -59,12 +58,12 @@ async fn append_tokens(
 
     let fwd = ForwardPass::new();
     fwd.embed(&token_input, &embed_indptr)?;
-    let kv_len = Channel::from(vec![total]).named("kv_len");
+    let kv_len = Channel::from([total]).named("kv_len");
     fwd.attention(
         ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (start / ws.page_size())..,
+            writable_pages: (start / kv_page_size())..,
             kv_len: &kv_len,
             pages: &pages,
             page_indptr: &page_indptr,
@@ -108,28 +107,27 @@ async fn generate(
     // The generated geometry spans `max_pages`; extend the (purely logical)
     // lease so it covers the whole decode by fire time.
     let max_pages = (seq_len + max_tokens as u32 + 1)
-        .div_ceil(ws.page_size())
+        .div_ceil(kv_page_size())
         .max(1);
     let have = ws.page_len();
     if max_pages > have {
         ws.reserve(max_pages - have).context("reserve leaf KV")?;
     }
-    let token_in = Channel::from(vec![first_token]).named("token_in");
-    let page_size = ws.page_size();
-    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-    let positions = Channel::from(vec![seq_len]).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr =
-        Channel::from(vec![0u32, (seq_len + 1).div_ceil(page_size)]).named("page_indptr");
-    let w_slot = Channel::from(vec![seq_len / page_size]).named("w_slot");
-    let w_off = Channel::from(vec![seq_len % page_size]).named("w_off");
+    let token_in = Channel::from([first_token]).named("token_in");
+    let page_size = kv_page_size();
+    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+    let positions = Channel::from([seq_len]).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, (seq_len + 1).div_ceil(page_size)]).named("page_indptr");
+    let w_slot = Channel::from([seq_len / page_size]).named("w_slot");
+    let w_off = Channel::from([seq_len % page_size]).named("w_off");
     let token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("token_out");
 
     let fwd = ForwardPass::new();
     fwd.embed(&token_in, &embed_indptr)?;
-    let kv_len = Channel::from(vec![seq_len + 1]).named("kv_len");
+    let kv_len = Channel::from([seq_len + 1]).named("kv_len");
     fwd.attention(
         ws,
         KvGeometry {

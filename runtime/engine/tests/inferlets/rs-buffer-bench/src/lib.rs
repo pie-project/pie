@@ -52,7 +52,7 @@ async fn main(input: String) -> Result<String> {
     };
 
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let prompt = wit_model::encode(PROMPT);
     let n = prompt.len() as u32;
@@ -62,13 +62,13 @@ async fn main(input: String) -> Result<String> {
 
     // ── Prefill. Folds, in BOTH arms: a buffer that starts out holding the
     // whole prompt would price the prompt, not the decode.
-    let toks_p = Channel::from(prompt.iter().map(|&t| t as i32).collect::<Vec<_>>());
-    let embed_indptr_p = Channel::from(vec![0u32, n]);
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>());
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>());
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]);
-    let w_slot_p = Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>());
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>());
+    let toks_p = Channel::from_iter(prompt.iter().map(|&t| t as i32));
+    let embed_indptr_p = Channel::from([0u32, n]);
+    let positions_p = Channel::from_iter(0..n);
+    let pages_p = Channel::from_iter(0..max_pages);
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]);
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size));
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size));
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
     // Created BEFORE the prefill so the prefill epilogue can seed it on the
     // DEVICE. That is what lets a decode fire ride in the same frame as the
@@ -77,7 +77,7 @@ async fn main(input: String) -> Result<String> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]);
+    let kv_len_p = Channel::from([n]);
     fwd_p.attention(
         Some(KvBinding {
             working_set: &ws,
@@ -118,16 +118,16 @@ async fn main(input: String) -> Result<String> {
     let out = Channel::new([1], dtype::i32)
         .capacity(capacity as u32)
         .named("out");
-    let lane1 = Channel::from(vec![0u32, 1u32]);
-    let positions = Channel::from(vec![n]);
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>());
-    let page_indptr = Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]);
-    let w_slot = Channel::from(vec![n / page_size]);
-    let w_off = Channel::from(vec![n % page_size]);
+    let lane1 = Channel::from([0u32, 1u32]);
+    let positions = Channel::from([n]);
+    let pages = Channel::from_iter(0..max_pages);
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]);
+    let w_slot = Channel::from([n / page_size]);
+    let w_off = Channel::from([n % page_size]);
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
-    let kv_len = Channel::from(vec![n + 1]);
+    let kv_len = Channel::from([n + 1]);
     let kv = || {
         Some(KvBinding {
             working_set: &ws,
@@ -147,7 +147,7 @@ async fn main(input: String) -> Result<String> {
     // THE ONLY DIFFERENCE BETWEEN THE ARMS: the RS geometry. The KV half and
     // the working sets are identical, so only `RsGeometry` is written twice —
     // its `buffer` type differs per arm, so the two cannot share a binding.
-    let fold_len = Channel::from(vec![0u32]).named("fold_len");
+    let fold_len = Channel::from([0u32]).named("fold_len");
     let rs_ws = std::slice::from_ref(&rs);
     match mode {
         Mode::Fold => fwd.attention(

@@ -78,14 +78,14 @@ async fn forward_logits(
 ) -> Result<Vec<f32>> {
     let n = tokens.len() as u32;
     let end = start + n;
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
     let pool_pages = ws.page_len();
     let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let toks = Channel::from(toks_i32).named("toks");
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((start..end).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr");
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(start..end).named("positions");
+    let pages = Channel::from_iter(0..pool_pages).named("pages");
+    let page_indptr = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr");
     let w_slot = Channel::from(
         (start..end)
             .map(|position| position / page_size)
@@ -102,7 +102,7 @@ async fn forward_logits(
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
-    let kv_len = Channel::from(vec![end]).named("kv_len");
+    let kv_len = Channel::from([end]).named("kv_len");
     fwd.attention(
         ws,
         KvGeometry {
@@ -155,7 +155,7 @@ async fn main(input: String) -> Result<String> {
     // Root working set: reserve the whole logical envelope BEFORE any fork so
     // every CoW child shares one address space sized for prompt + decode.
     let root = WorkingSet::new();
-    let max_pages = (n + max_tokens as u32 + 1).div_ceil(root.page_size());
+    let max_pages = (n + max_tokens as u32 + 1).div_ceil(kv_page_size());
     root.reserve(max_pages)
         .map_err(|e| format!("root reserve: {e}"))?;
 

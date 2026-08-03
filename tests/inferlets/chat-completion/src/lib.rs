@@ -103,8 +103,8 @@ async fn main(input: Input) -> Result<String> {
     let g0 = {
         let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
         let toks_p = Channel::from(prompt_i32).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-        let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+        let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+        let positions_p = Channel::from_iter(0..n).named("positions_p");
 
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
         let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
@@ -125,7 +125,7 @@ async fn main(input: Input) -> Result<String> {
             .flat_map(|i| (0..pool).map(move |j| j <= i))
             .collect();
         let mask_p = Channel::from_shaped([n, pool], mask_pv).named("mask_p");
-        let rng_p = Channel::from(vec![0x51ed_u32, 0]).named("rng_p");
+        let rng_p = Channel::from([0x51ed_u32, 0]).named("rng_p");
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
         let fwd_p = ForwardPass::new();
@@ -192,8 +192,8 @@ async fn main(input: Input) -> Result<String> {
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("out");
-    let rng = Channel::from(vec![0x9e37_u32, 0]).named("rng");
-    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+    let rng = Channel::from([0x9e37_u32, 0]).named("rng");
+    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
@@ -201,7 +201,7 @@ async fn main(input: Input) -> Result<String> {
         &ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (n / ws.page_size())..,
+            writable_pages: (n / kv_page_size())..,
             kv_len: &klen,
             pages: &pages,
             page_indptr: &page_indptr,

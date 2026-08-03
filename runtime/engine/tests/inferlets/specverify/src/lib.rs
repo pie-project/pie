@@ -81,16 +81,14 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
     // Seeded inputs (single fire: the host geometry prefill reads seeds) +
     // terminal [k]-Token reader outputs.
     let toks = Channel::from(input_toks).named("toks");
-    let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
-    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
-    let w_slot =
-        Channel::from((0..n).map(|position| position / PAGE_T).collect::<Vec<_>>()).named("w_slot");
-    let w_off =
-        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>()).named("w_off");
-    let kv_len = Channel::from(vec![n]).named("kv_len");
-    let draft_ch = Channel::from(draft.to_vec()).named("draft");
+    let embed_indptr = Channel::from([0u32, n]).named("embed_indptr");
+    let positions = Channel::from_iter(0..n).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
+    let w_slot = Channel::from_iter((0..n).map(|position| position / PAGE_T)).named("w_slot");
+    let w_off = Channel::from_iter((0..n).map(|position| position % PAGE_T)).named("w_off");
+    let kv_len = Channel::from([n]).named("kv_len");
+    let draft_ch = Channel::from(draft).named("draft");
     let target_out = Channel::new([k], dtype::i32).named("target_out");
     let verify_out = Channel::new([k], dtype::i32).named("verify_out");
 

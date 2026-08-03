@@ -108,17 +108,15 @@ async fn main(input: Input) -> Result<String> {
     let prompt_i32 = prompt.iter().map(|&token| token as i32).collect::<Vec<_>>();
     let amateur_prompt = Channel::from(prompt_i32.clone()).named("amateur_prompt");
     let amateur_prefill_embed_indptr =
-        Channel::from(vec![0u32, n]).named("amateur_prefill_embed_indptr");
-    let amateur_prefill_positions =
-        Channel::from((0..n).collect::<Vec<_>>()).named("amateur_prefill_positions");
+        Channel::from([0u32, n]).named("amateur_prefill_embed_indptr");
+    let amateur_prefill_positions = Channel::from_iter(0..n).named("amateur_prefill_positions");
     let amateur_prefill_slots = Channel::from(
         (0..n)
             .map(|position| amateur_ids[(position / PAGE_T) as usize])
             .collect::<Vec<_>>(),
     );
-    let amateur_prefill_offsets =
-        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
-    let amateur_prefill_klen = Channel::from(vec![n]);
+    let amateur_prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
+    let amateur_prefill_klen = Channel::from([n]);
     let amateur_prefill_pages = Channel::from(amateur_ids.clone());
     // The page CSR is the wire's source of truth for kv_len: the driver derives
     // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
@@ -174,18 +172,15 @@ async fn main(input: Input) -> Result<String> {
     let expert_ws = WorkingSet::new();
     expert_ws.reserve(pool_pages).context("reserve expert KV")?;
     let expert_prompt = Channel::from(prompt_i32).named("expert_prompt");
-    let expert_prefill_embed_indptr =
-        Channel::from(vec![0u32, n]).named("expert_prefill_embed_indptr");
-    let expert_prefill_positions =
-        Channel::from((0..n).collect::<Vec<_>>()).named("expert_prefill_positions");
-    let expert_prefill_pages =
-        Channel::from((0..pool_pages).collect::<Vec<_>>()).named("expert_prefill_pages");
+    let expert_prefill_embed_indptr = Channel::from([0u32, n]).named("expert_prefill_embed_indptr");
+    let expert_prefill_positions = Channel::from_iter(0..n).named("expert_prefill_positions");
+    let expert_prefill_pages = Channel::from_iter(0..pool_pages).named("expert_prefill_pages");
     let expert_prefill_indptr =
-        Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("expert_prefill_indptr");
+        Channel::from([0u32, n.div_ceil(PAGE_T)]).named("expert_prefill_indptr");
     let expert_prefill_slots =
-        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("expert_prefill_slots");
-    let expert_prefill_offsets = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>())
-        .named("expert_prefill_offsets");
+        Channel::from_iter((0..n).map(|p| p / PAGE_T)).named("expert_prefill_slots");
+    let expert_prefill_offsets =
+        Channel::from_iter((0..n).map(|p| p % PAGE_T)).named("expert_prefill_offsets");
     let expert_prefill_amateur = Channel::new([vocab], dtype::f32).named("expert_prefill_amateur");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
     let lambda = input.lambda;
@@ -193,7 +188,7 @@ async fn main(input: Input) -> Result<String> {
 
     let expert_prefill = ForwardPass::new();
     expert_prefill.embed(&expert_prompt, &expert_prefill_embed_indptr)?;
-    let expert_prefill_kv_len = Channel::from(vec![n]).named("expert_prefill_kv_len");
+    let expert_prefill_kv_len = Channel::from([n]).named("expert_prefill_kv_len");
     expert_prefill.attention(
         &expert_ws,
         KvGeometry {
@@ -226,11 +221,11 @@ async fn main(input: Input) -> Result<String> {
     }
 
     let amateur_token = Channel::new([1], dtype::i32).named("amateur_token");
-    let amateur_position = Channel::from(vec![n]).named("amateur_position");
-    let amateur_fill = Channel::from(vec![n + 1]).named("amateur_fill");
-    let amateur_klen = Channel::from(vec![n + 1]).named("amateur_klen");
-    let amateur_write_slot = Channel::from(vec![amateur_ids[(n / PAGE_T) as usize]]);
-    let amateur_write_offset = Channel::from(vec![n % PAGE_T]);
+    let amateur_position = Channel::from([n]).named("amateur_position");
+    let amateur_fill = Channel::from([n + 1]).named("amateur_fill");
+    let amateur_klen = Channel::from([n + 1]).named("amateur_klen");
+    let amateur_write_slot = Channel::from([amateur_ids[(n / PAGE_T) as usize]]);
+    let amateur_write_offset = Channel::from([n % PAGE_T]);
     let amateur_mask = Channel::from_shaped(
         [1, pool_len],
         (0..pool_len)
@@ -245,13 +240,13 @@ async fn main(input: Input) -> Result<String> {
         .named("amateur_logits");
 
     let amateur_decode = ForwardPass::new();
-    let amateur_embed_indptr = Channel::from(vec![0u32, 1]).named("amateur_embed_indptr");
+    let amateur_embed_indptr = Channel::from([0u32, 1]).named("amateur_embed_indptr");
     amateur_decode.embed(&amateur_token, &amateur_embed_indptr)?;
     amateur_decode.attention(
         &amateur_ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (n / amateur_ws.page_size())..,
+            writable_pages: (n / kv_page_size())..,
             kv_len: &amateur_klen,
             pages: &amateur_pages,
             page_indptr: &amateur_page_indptr,
@@ -292,14 +287,14 @@ async fn main(input: Input) -> Result<String> {
         amateur_ids_input.put(&ids);
     });
 
-    let expert_token = Channel::from(vec![first as i32]).named("expert_token");
-    let expert_embed_indptr = Channel::from(vec![0u32, 1]).named("expert_embed_indptr");
-    let expert_position = Channel::from(vec![n]).named("expert_position");
-    let expert_pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("expert_pages");
+    let expert_token = Channel::from([first as i32]).named("expert_token");
+    let expert_embed_indptr = Channel::from([0u32, 1]).named("expert_embed_indptr");
+    let expert_position = Channel::from([n]).named("expert_position");
+    let expert_pages = Channel::from_iter(0..pool_pages).named("expert_pages");
     let expert_page_indptr =
-        Channel::from(vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("expert_page_indptr");
-    let expert_write_slot = Channel::from(vec![n / PAGE_T]).named("expert_write_slot");
-    let expert_write_offset = Channel::from(vec![n % PAGE_T]).named("expert_write_offset");
+        Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]).named("expert_page_indptr");
+    let expert_write_slot = Channel::from([n / PAGE_T]).named("expert_write_slot");
+    let expert_write_offset = Channel::from([n % PAGE_T]).named("expert_write_offset");
     let expert_amateur = Channel::writer([vocab], dtype::f32).named("expert_amateur_logits");
     let expert_token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -307,12 +302,12 @@ async fn main(input: Input) -> Result<String> {
 
     let expert_decode = ForwardPass::new();
     expert_decode.embed(&expert_token, &expert_embed_indptr)?;
-    let expert_kv_len = Channel::from(vec![n + 1]).named("expert_kv_len");
+    let expert_kv_len = Channel::from([n + 1]).named("expert_kv_len");
     expert_decode.attention(
         &expert_ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (n / expert_ws.page_size())..,
+            writable_pages: (n / kv_page_size())..,
             kv_len: &expert_kv_len,
             pages: &expert_pages,
             page_indptr: &expert_page_indptr,

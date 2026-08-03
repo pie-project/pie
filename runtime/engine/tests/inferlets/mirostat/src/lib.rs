@@ -105,7 +105,7 @@ async fn main(input: String) -> Result<String> {
 
     let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let mu0_default = (vocab as f32).ln() + 1.0;
     let mut mu: f32 = json_f32(&params, "mu0", mu0_default);
@@ -125,10 +125,10 @@ async fn main(input: String) -> Result<String> {
     // ── PREFILL FIRE (N-wide) — first mirostat step over the prompt. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
     let w_slot_p = Channel::from(
         (0..n)
             .map(|position| position / page_size)
@@ -142,13 +142,13 @@ async fn main(input: String) -> Result<String> {
     )
     .named("w_off_p");
     let mu_p = Channel::new([1], dtype::f32).named("mu_p");
-    let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
+    let rng_p = Channel::from([0x9e37_u32, 0]).named("rng_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
     let s_out_p = Channel::new([1], dtype::f32).named("s_out_p");
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     fwd_p.attention(
         &ws,
         KvGeometry {
@@ -202,20 +202,19 @@ async fn main(input: String) -> Result<String> {
     if generated.len() < max_tokens {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let mu_ch = Channel::new([1], dtype::f32).named("mu_ch");
-        let rng = Channel::from(vec![0x51ed_u32, 0]).named("rng");
+        let rng = Channel::from([0x51ed_u32, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32).named("tok_out");
         let s_out = Channel::new([1], dtype::f32).named("s_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
         fwd.attention(
             &ws,
             KvGeometry {

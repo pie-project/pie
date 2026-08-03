@@ -96,7 +96,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let full = model::encode(&input.prompt);
     if full.len() <= input.backoff {
@@ -155,17 +155,15 @@ async fn main(input: Input) -> Result<Output> {
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
     ws.reserve(max_pages).context("reserve KV")?;
 
-    let prompt_tokens = Channel::from(prompt.iter().map(|&t| t as i32).collect::<Vec<_>>());
-    let prefill_indptr = Channel::from(vec![0u32, n]).named("prefill_indptr");
-    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>()).named("prefill_positions");
-    let prefill_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("prefill_pages");
+    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&t| t as i32));
+    let prefill_indptr = Channel::from([0u32, n]).named("prefill_indptr");
+    let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
+    let prefill_pages = Channel::from_iter(0..max_pages).named("prefill_pages");
     let prefill_page_indptr =
-        Channel::from(vec![0u32, n.div_ceil(page_size)]).named("prefill_page_indptr");
-    let prefill_w_slot =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("prefill_w_slot");
-    let prefill_w_off =
-        Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("prefill_w_off");
-    let prefill_kv_len = Channel::from(vec![n]).named("prefill_kv_len");
+        Channel::from([0u32, n.div_ceil(page_size)]).named("prefill_page_indptr");
+    let prefill_w_slot = Channel::from_iter((0..n).map(|p| p / page_size)).named("prefill_w_slot");
+    let prefill_w_off = Channel::from_iter((0..n).map(|p| p % page_size)).named("prefill_w_off");
+    let prefill_kv_len = Channel::from([n]).named("prefill_kv_len");
     let heal_mask = Channel::new([vocab], dtype::bool).named("heal_mask");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
 
@@ -202,15 +200,14 @@ async fn main(input: Input) -> Result<Output> {
     let mut generated = vec![first];
 
     if generated.len() < input.max_tokens {
-        let token_in = Channel::from(vec![first as i32]).named("token_in");
-        let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let token_in = Channel::from([first as i32]).named("token_in");
+        let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
         let token_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("token_out");

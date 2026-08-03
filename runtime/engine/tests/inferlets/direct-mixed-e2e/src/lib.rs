@@ -8,7 +8,7 @@ fn geometry() -> Result<(WorkingSet, Channel)> {
     let ws = WorkingSet::new();
     ws.reserve(MAX_PAGES)
         .map_err(|error| format!("ws.reserve: {error}"))?;
-    Ok((ws, Channel::from(vec![1i32]).named("token")))
+    Ok((ws, Channel::from([1i32]).named("token")))
 }
 
 fn bind_geometry(
@@ -17,12 +17,12 @@ fn bind_geometry(
     token: &Channel,
     kv_len: &Channel,
 ) -> Result<()> {
-    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-    let positions = Channel::from(vec![0u32]).named("positions");
-    let pages = Channel::from(vec![0u32]).named("pages");
-    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
-    let w_slot = Channel::from(vec![0u32]).named("w_slot");
-    let w_off = Channel::from(vec![0u32]).named("w_off");
+    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+    let positions = Channel::from([0u32]).named("positions");
+    let pages = Channel::from([0u32]).named("pages");
+    let page_indptr = Channel::from([0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from([0u32]).named("w_slot");
+    let w_off = Channel::from([0u32]).named("w_off");
     pass.embed(token, &embed_indptr)?;
     pass.attention(
         ws,
@@ -43,7 +43,7 @@ fn bind_geometry(
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {
     let (ws, token) = geometry()?;
-    let mixed_kv_len = Channel::from(vec![1u32]).named("mixed_kv_len");
+    let mixed_kv_len = Channel::from([1u32]).named("mixed_kv_len");
     let mixed_token = Channel::new([1], dtype::u32).named("mixed_token");
     let mixed_scalar = Channel::new([1], dtype::f32).named("mixed_scalar");
     let vector = Channel::new([4], dtype::u32).named("vector");
@@ -52,14 +52,14 @@ async fn main(_input: String) -> Result<String> {
     let sampler_b = Channel::new([1], dtype::u32).named("sampler_b");
     let sampler_c = Channel::new([1], dtype::u32).named("sampler_c");
     let sampler_d = Channel::new([1], dtype::u32).named("sampler_d");
-    let mixed_token_source = Channel::from(vec![7u32]).named("mixed_token_source");
-    let mixed_scalar_source = Channel::from(vec![1.25f32]).named("mixed_scalar_source");
-    let vector_source = Channel::from(vec![3u32, 5, 8, 13]).named("vector_source");
-    let prefix_source = Channel::from(vec![0u32]).named("prefix_source");
-    let sampler_a_source = Channel::from(vec![11u32]).named("sampler_a_source");
-    let sampler_b_source = Channel::from(vec![12u32]).named("sampler_b_source");
-    let sampler_c_source = Channel::from(vec![13u32]).named("sampler_c_source");
-    let sampler_d_source = Channel::from(vec![14u32]).named("sampler_d_source");
+    let mixed_token_source = Channel::from([7u32]).named("mixed_token_source");
+    let mixed_scalar_source = Channel::from([1.25f32]).named("mixed_scalar_source");
+    let vector_source = Channel::from([3u32, 5, 8, 13]).named("vector_source");
+    let prefix_source = Channel::from([0u32]).named("prefix_source");
+    let sampler_a_source = Channel::from([11u32]).named("sampler_a_source");
+    let sampler_b_source = Channel::from([12u32]).named("sampler_b_source");
+    let sampler_c_source = Channel::from([13u32]).named("sampler_c_source");
+    let sampler_d_source = Channel::from([14u32]).named("sampler_d_source");
 
     let mixed = ForwardPass::new();
     bind_geometry(&mixed, &ws, &token, &mixed_kv_len)?;
@@ -141,9 +141,9 @@ async fn main(_input: String) -> Result<String> {
     pipeline.close();
 
     let (entropy_ws, entropy_token) = geometry()?;
-    let entropy_kv_len = Channel::from(vec![1u32]).named("entropy_kv_len");
+    let entropy_kv_len = Channel::from([1u32]).named("entropy_kv_len");
     let entropy = Channel::new([1], dtype::f32).named("entropy");
-    let entropy_source = Channel::from(vec![0.5f32]).named("entropy_source");
+    let entropy_source = Channel::from([0.5f32]).named("entropy_source");
     let entropy_pass = ForwardPass::new();
     bind_geometry(&entropy_pass, &entropy_ws, &entropy_token, &entropy_kv_len)?;
     entropy_pass.epilogue(move || {

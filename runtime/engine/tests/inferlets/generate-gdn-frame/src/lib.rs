@@ -29,7 +29,7 @@ async fn main(input: String) -> Result<String> {
     let k = frame_size();
 
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let rs = RsWorkingSet::new();
     let has_rs = rs.state_size() > 0;
@@ -52,10 +52,10 @@ async fn main(input: String) -> Result<String> {
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
     let w_slot_p = Channel::from(
         (0..n)
             .map(|position| position / page_size)
@@ -72,7 +72,7 @@ async fn main(input: String) -> Result<String> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     fwd_p.attention(
         Some(KvBinding {
             working_set: &ws,
@@ -120,17 +120,16 @@ async fn main(input: String) -> Result<String> {
         let out = Channel::new([1], dtype::i32)
             .capacity((k * 2) as u32)
             .named("out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
         fwd.attention(
             Some(KvBinding {
                 working_set: &ws,

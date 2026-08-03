@@ -131,8 +131,8 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     //       read-out row N−1, greedy argmax → g0. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
 
     let w_slot_pv: Vec<u32> = (0..n).map(|c| pool_ids[(c / PAGE_T) as usize]).collect();
     let w_off_pv: Vec<u32> = (0..n).map(|c| c % PAGE_T).collect();
@@ -200,7 +200,7 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let out = Channel::new([1], dtype::i32)
         .capacity(budget as u32 + 1)
         .named("out");
-    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
@@ -208,7 +208,7 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
         &ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (n / ws.page_size())..,
+            writable_pages: (n / kv_page_size())..,
             kv_len: &klen,
             pages: &pages,
             page_indptr: &page_indptr,

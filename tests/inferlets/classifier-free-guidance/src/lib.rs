@@ -121,13 +121,13 @@ async fn main(input: Input) -> Result<String> {
         .collect::<Vec<_>>();
 
     let u_prompt_ch = Channel::from(uncond_prompt_i32).named("uncond_prompt");
-    let u_pre_indptr = Channel::from(vec![0u32, nu]).named("uncond_prefill_embed_indptr");
-    let u_pre_pos = Channel::from((0..nu).collect::<Vec<_>>()).named("uncond_prefill_positions");
-    let u_pre_pages = Channel::from((0..uncond_pages).collect::<Vec<_>>());
-    let u_pre_page_indptr = Channel::from(vec![0u32, nu.div_ceil(PAGE_T)]);
-    let u_pre_slot = Channel::from((0..nu).map(|p| p / PAGE_T).collect::<Vec<_>>());
-    let u_pre_off = Channel::from((0..nu).map(|p| p % PAGE_T).collect::<Vec<_>>());
-    let u_pre_klen = Channel::from(vec![nu]);
+    let u_pre_indptr = Channel::from([0u32, nu]).named("uncond_prefill_embed_indptr");
+    let u_pre_pos = Channel::from_iter(0..nu).named("uncond_prefill_positions");
+    let u_pre_pages = Channel::from_iter(0..uncond_pages);
+    let u_pre_page_indptr = Channel::from([0u32, nu.div_ceil(PAGE_T)]);
+    let u_pre_slot = Channel::from_iter((0..nu).map(|p| p / PAGE_T));
+    let u_pre_off = Channel::from_iter((0..nu).map(|p| p % PAGE_T));
+    let u_pre_klen = Channel::from([nu]);
     let u_pre_out = Channel::new([vocab], dtype::f32).named("uncond_prefill_logits");
 
     let uncond_prefill = ForwardPass::new();
@@ -172,13 +172,13 @@ async fn main(input: Input) -> Result<String> {
         .collect::<Vec<_>>();
 
     let c_prompt_ch = Channel::from(cond_prompt_i32).named("cond_prompt");
-    let c_pre_indptr = Channel::from(vec![0u32, nc]).named("cond_prefill_embed_indptr");
-    let c_pre_pos = Channel::from((0..nc).collect::<Vec<_>>()).named("cond_prefill_positions");
-    let c_pre_pages = Channel::from((0..cond_pages).collect::<Vec<_>>());
-    let c_pre_page_indptr = Channel::from(vec![0u32, nc.div_ceil(PAGE_T)]);
-    let c_pre_slot = Channel::from((0..nc).map(|p| p / PAGE_T).collect::<Vec<_>>());
-    let c_pre_off = Channel::from((0..nc).map(|p| p % PAGE_T).collect::<Vec<_>>());
-    let c_pre_klen = Channel::from(vec![nc]);
+    let c_pre_indptr = Channel::from([0u32, nc]).named("cond_prefill_embed_indptr");
+    let c_pre_pos = Channel::from_iter(0..nc).named("cond_prefill_positions");
+    let c_pre_pages = Channel::from_iter(0..cond_pages);
+    let c_pre_page_indptr = Channel::from([0u32, nc.div_ceil(PAGE_T)]);
+    let c_pre_slot = Channel::from_iter((0..nc).map(|p| p / PAGE_T));
+    let c_pre_off = Channel::from_iter((0..nc).map(|p| p % PAGE_T));
+    let c_pre_klen = Channel::from([nc]);
     let c_pre_uncond = Channel::new([vocab], dtype::f32).named("cond_prefill_uncond");
     let first_out = Channel::new([1], dtype::i32).named("first_token");
     let first_shift = Channel::new([1], dtype::i32).named("first_shift");
@@ -225,14 +225,14 @@ async fn main(input: Input) -> Result<String> {
 
     // ---- decode loop: uncond runs one step ahead, cond consumes it -------
     let u_token = Channel::new([1], dtype::i32).named("uncond_token");
-    let u_embed_indptr = Channel::from(vec![0u32, 1]).named("uncond_embed_indptr");
-    let u_pos = Channel::from(vec![nu]).named("uncond_position");
-    let u_klen = Channel::from(vec![nu + 1]).named("uncond_kv_len");
-    let u_pages = Channel::from((0..uncond_pages).collect::<Vec<_>>()).named("uncond_pages");
+    let u_embed_indptr = Channel::from([0u32, 1]).named("uncond_embed_indptr");
+    let u_pos = Channel::from([nu]).named("uncond_position");
+    let u_klen = Channel::from([nu + 1]).named("uncond_kv_len");
+    let u_pages = Channel::from_iter(0..uncond_pages).named("uncond_pages");
     let u_page_indptr =
-        Channel::from(vec![0u32, (nu + 1).div_ceil(PAGE_T)]).named("uncond_page_indptr");
-    let u_slot = Channel::from(vec![nu / PAGE_T]).named("uncond_write_slot");
-    let u_off = Channel::from(vec![nu % PAGE_T]).named("uncond_write_offset");
+        Channel::from([0u32, (nu + 1).div_ceil(PAGE_T)]).named("uncond_page_indptr");
+    let u_slot = Channel::from([nu / PAGE_T]).named("uncond_write_slot");
+    let u_off = Channel::from([nu % PAGE_T]).named("uncond_write_offset");
     let u_logits_out = Channel::new([vocab], dtype::f32)
         .capacity(channel_capacity() as u32)
         .named("uncond_logits");
@@ -243,7 +243,7 @@ async fn main(input: Input) -> Result<String> {
         &uncond_ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (nu / uncond_ws.page_size())..,
+            writable_pages: (nu / kv_page_size())..,
             kv_len: &u_klen,
             pages: &u_pages,
             page_indptr: &u_page_indptr,
@@ -267,15 +267,14 @@ async fn main(input: Input) -> Result<String> {
         u_page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
     });
 
-    let c_token = Channel::from(vec![first as i32]).named("cond_token");
-    let c_embed_indptr = Channel::from(vec![0u32, 1]).named("cond_embed_indptr");
-    let c_pos = Channel::from(vec![nc]).named("cond_position");
-    let c_klen = Channel::from(vec![nc + 1]).named("cond_kv_len");
-    let c_pages = Channel::from((0..cond_pages).collect::<Vec<_>>()).named("cond_pages");
-    let c_page_indptr =
-        Channel::from(vec![0u32, (nc + 1).div_ceil(PAGE_T)]).named("cond_page_indptr");
-    let c_slot = Channel::from(vec![nc / PAGE_T]).named("cond_write_slot");
-    let c_off = Channel::from(vec![nc % PAGE_T]).named("cond_write_offset");
+    let c_token = Channel::from([first as i32]).named("cond_token");
+    let c_embed_indptr = Channel::from([0u32, 1]).named("cond_embed_indptr");
+    let c_pos = Channel::from([nc]).named("cond_position");
+    let c_klen = Channel::from([nc + 1]).named("cond_kv_len");
+    let c_pages = Channel::from_iter(0..cond_pages).named("cond_pages");
+    let c_page_indptr = Channel::from([0u32, (nc + 1).div_ceil(PAGE_T)]).named("cond_page_indptr");
+    let c_slot = Channel::from([nc / PAGE_T]).named("cond_write_slot");
+    let c_off = Channel::from([nc % PAGE_T]).named("cond_write_offset");
     let c_uncond = Channel::writer([vocab], dtype::f32).named("cond_uncond_logits");
     let c_token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -293,7 +292,7 @@ async fn main(input: Input) -> Result<String> {
         &cond_ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (nc / cond_ws.page_size())..,
+            writable_pages: (nc / kv_page_size())..,
             kv_len: &c_klen,
             pages: &c_pages,
             page_indptr: &c_page_indptr,

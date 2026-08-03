@@ -34,12 +34,12 @@ async fn main(_input: String) -> Result<String> {
     let gmask = Channel::new([kp1, v], dtype::bool).named("gmask");
     // toks: the K+1 verify-window input tokens (seeded per instance).
     let toks = Channel::from(vec![BOS; kp1 as usize]).named("toks");
-    let lanes = Channel::from((0u32..=kp1).collect::<Vec<_>>()).named("embed_indptr");
-    let positions = Channel::from((0..kp1).collect::<Vec<_>>()).named("positions");
+    let lanes = Channel::from_iter(0u32..=kp1).named("embed_indptr");
+    let positions = Channel::from_iter(0..kp1).named("positions");
     let pages = Channel::from(vec![0u32; kp1 as usize]).named("pages");
-    let page_indptr = Channel::from((0u32..=kp1).collect::<Vec<_>>()).named("page_indptr");
+    let page_indptr = Channel::from_iter(0u32..=kp1).named("page_indptr");
     let w_slot = Channel::from(vec![0u32; kp1 as usize]).named("w_slot");
-    let w_off = Channel::from((0..kp1).collect::<Vec<_>>()).named("w_off");
+    let w_off = Channel::from_iter(0..kp1).named("w_off");
     // out: the committed accept-prefix (host-reader).
     let out = Channel::new([kp1], dtype::i32).named("out");
     let ws = WorkingSet::new();
@@ -48,7 +48,7 @@ async fn main(_input: String) -> Result<String> {
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &lanes)?;
-    let kv_len = Channel::from((1..=kp1).collect::<Vec<_>>()).named("kv_len");
+    let kv_len = Channel::from_iter(1..=kp1).named("kv_len");
     fwd.attention(
         &ws,
         KvGeometry {

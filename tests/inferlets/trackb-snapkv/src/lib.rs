@@ -205,7 +205,7 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Err("max_tokens must be at least 1".into());
@@ -262,19 +262,15 @@ async fn main(input: Input) -> Result<Output> {
     // Non-final chunks: plain prefill, no tap, sampled token discarded.
     for &(base, end) in &spans[..spans.len() - 1] {
         let chunk = end - base;
-        let toks_c =
-            Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_c");
-        let embed_indptr_c = Channel::from(vec![0u32, chunk]).named("embed_indptr_c");
-        let positions_c = Channel::from((base..end).collect::<Vec<_>>()).named("positions_c");
-        let pages_c = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_c");
-        let page_indptr_c =
-            Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_c");
-        let w_slot_c =
-            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_c");
-        let w_off_c =
-            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_c");
-        let kv_len_c = Channel::from(vec![end]).named("kv_len_c");
-        let rng_c = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng_c");
+        let toks_c = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_c");
+        let embed_indptr_c = Channel::from([0u32, chunk]).named("embed_indptr_c");
+        let positions_c = Channel::from_iter(base..end).named("positions_c");
+        let pages_c = Channel::from_iter(0..max_pages).named("pages_c");
+        let page_indptr_c = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_c");
+        let w_slot_c = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_c");
+        let w_off_c = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_c");
+        let kv_len_c = Channel::from([end]).named("kv_len_c");
+        let rng_c = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng_c");
         let tok_out_c = Channel::new([1], dtype::i32).named("tok_out_c");
 
         let fwd_c = ForwardPass::new();
@@ -313,21 +309,19 @@ async fn main(input: Input) -> Result<Output> {
     // ── FINAL CHUNK `[base, n)`: the observed one. ──
     let base = spans[spans.len() - 1].0;
     let tail = n - base;
-    let toks_p = Channel::from(prompt_i32[base as usize..n as usize].to_vec()).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, tail]).named("embed_indptr_p");
-    let positions_p = Channel::from((base..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((base..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p =
-        Channel::from((base..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let toks_p = Channel::from(&prompt_i32[base as usize..n as usize]).named("toks_p");
+    let embed_indptr_p = Channel::from([0u32, tail]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(base..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from_iter((base..n).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((base..n).map(|p| p % page_size)).named("w_off_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     // Same salt as `naive-baseline`. The coherence test asks whether a keep-set
     // that keeps everything changes what the model produces, and that question
     // is only answerable if every other input is held fixed -- including the
     // Gumbel stream.
-    let rng_p = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng_p");
+    let rng_p = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
 
     // The observation accumulator. `on_attn` fires once per layer and the
@@ -340,7 +334,7 @@ async fn main(input: Input) -> Result<Output> {
     // lives for exactly one fire and every slot it will be ranked on is written
     // by that fire's capture.
     let acc = Channel::from(vec![0.0f32; kv_max as usize]).named("snapkv_acc");
-    let layer_ct = Channel::from(vec![0u32]).named("snapkv_layers");
+    let layer_ct = Channel::from([0u32]).named("snapkv_layers");
     let scores_out = Channel::new([kv_max], dtype::f32).named("snapkv_scores");
     let layers_out = Channel::new([1], dtype::u32).named("snapkv_layer_count");
     // The device's own fold, drained alongside the position row so the host can
@@ -422,18 +416,17 @@ async fn main(input: Input) -> Result<Output> {
     // ── DECODE LOOP (1-wide, run-ahead), enforcing the fixed keep-set. ──
     if generated.len() < max_tokens {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 2]).named("rng");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 2]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         // The frozen selection. Prompt pages carry the observed mass (with the
         // tie-break ramp folded in far below it); everything past the prompt

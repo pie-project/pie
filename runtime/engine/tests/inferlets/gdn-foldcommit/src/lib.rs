@@ -54,7 +54,7 @@ impl Arm {
     async fn open(prompt: &[u32], max_pages: u32, pipe: &Pipeline) -> Result<(Self, i32)> {
         let ws = WorkingSet::new();
         let rs = RsWorkingSet::new();
-        let page_size = ws.page_size();
+        let page_size = kv_page_size();
         ws.reserve(max_pages)
             .map_err(|e| format!("ws.reserve: {e}"))?;
         let mut arm = Arm {
@@ -97,7 +97,7 @@ impl Arm {
 
         let fwd = ForwardPass::new();
         fwd.embed(
-            &Channel::from(toks.iter().map(|&x| x as i32).collect::<Vec<_>>()),
+            &Channel::from_iter(toks.iter().map(|&x| x as i32)),
             &ch(vec![0, t]),
         )?;
         let kv_len = ch(vec![end]);
@@ -160,7 +160,7 @@ impl Arm {
         let ch = |v: Vec<u32>| Channel::from(v);
 
         let fwd = ForwardPass::new();
-        fwd.embed(&Channel::from(vec![0i32]), &ch(vec![0, 0]))?;
+        fwd.embed(&Channel::from([0i32]), &ch(vec![0, 0]))?;
         let kv_len = ch(vec![base]);
         let pages = ch((0..self.max_pages).collect());
         let page_indptr = ch(vec![0, base.div_ceil(ps)]);
@@ -219,7 +219,7 @@ impl Arm {
 
         let fwd = ForwardPass::new();
         fwd.embed(
-            &Channel::from(toks.iter().map(|&x| x as i32).collect::<Vec<_>>()),
+            &Channel::from_iter(toks.iter().map(|&x| x as i32)),
             &ch(vec![0, t]),
         )?;
         let kv_len = ch(vec![end]);
@@ -349,7 +349,7 @@ struct Duo {
 impl Duo {
     fn new(span: u32) -> Result<Self> {
         let ws = WorkingSet::new();
-        let page_size = ws.page_size();
+        let page_size = kv_page_size();
         ws.reserve(2 * span)
             .map_err(|e| format!("duo reserve: {e}"))?;
         let rs = [RsWorkingSet::new(), RsWorkingSet::new()];
@@ -530,10 +530,7 @@ async fn mixed_positions(prompt: &[u32]) -> Result<String> {
     let n = prompt.len() as u32;
     let pipe = Pipeline::new();
 
-    let span = {
-        let probe = WorkingSet::new();
-        (n + t + 2).div_ceil(probe.page_size()).max(1)
-    };
+    let span = (n + t + 2).div_ceil(kv_page_size()).max(1);
     let buf_pages = |d: &Duo| t.div_ceil(d.rs_page);
 
     // Three duos, identical in every way except what the middle fire asks of
@@ -625,7 +622,7 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
     let n = prompt.len() as u32;
     let pipe = Pipeline::new();
     let probe = WorkingSet::new();
-    let max_pages = (n + 2 * T as u32 + 1).div_ceil(probe.page_size());
+    let max_pages = (n + 2 * T as u32 + 1).div_ceil(kv_page_size());
     drop(probe);
 
     let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
@@ -715,7 +712,7 @@ async fn fold_behind_new_tokens(prompt: &[u32]) -> Result<String> {
     let n = prompt.len() as u32;
     let pipe = Pipeline::new();
     let probe = WorkingSet::new();
-    let max_pages = (n + 3 * (W + T) as u32).div_ceil(probe.page_size());
+    let max_pages = (n + 3 * (W + T) as u32).div_ceil(kv_page_size());
     drop(probe);
 
     let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
@@ -755,7 +752,7 @@ async fn fold_behind_new_tokens(prompt: &[u32]) -> Result<String> {
     a.pos += T as u32;
 
     // ── Arm B: the same two things, in two fires ──────────────────────────
-    b.build_empty_fire(&Channel::from(vec![BEHIND]), "B-commit")?
+    b.build_empty_fire(&Channel::from([BEHIND]), "B-commit")?
         .submit(&pipe)
         .map_err(|e| format!("B-commit submit: {e}"))?;
     let (_, b_ahead) = b.fire(&ahead, Some((0, 0)), &pipe, "B-append").await?;
@@ -834,7 +831,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     let n = prompt.len() as u32;
     let pipe = Pipeline::new();
     let probe = WorkingSet::new();
-    let max_pages = (n + 2 * T as u32 + 2).div_ceil(probe.page_size());
+    let max_pages = (n + 2 * T as u32 + 2).div_ceil(kv_page_size());
     drop(probe);
 
     let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
@@ -891,7 +888,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     // buffered span. Its own token is a placeholder at a position the drain
     // fire immediately overwrites; the recurrence ignores those rows and
     // replays the buffer instead.
-    d.build_empty_fire(&Channel::from(vec![HALF]), "D-commit")?
+    d.build_empty_fire(&Channel::from([HALF]), "D-commit")?
         .submit(&pipe)
         .map_err(|e| format!("D-commit submit: {e}"))?;
 
@@ -967,7 +964,7 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
     let n = prompt.len() as u32;
     let pipe = Pipeline::new();
     let probe = WorkingSet::new();
-    let max_pages = (n + 2 * T as u32 + 4).div_ceil(probe.page_size());
+    let max_pages = (n + 2 * T as u32 + 4).div_ceil(kv_page_size());
     drop(probe);
 
     let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
@@ -989,7 +986,7 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
     c.pos += T as u32;
 
     // The whole point: a fire whose row carries no tokens at all.
-    a.build_empty_fire(&Channel::from(vec![HALF]), "A-commit")?
+    a.build_empty_fire(&Channel::from([HALF]), "A-commit")?
         .submit(&pipe)
         .map_err(|e| format!("A-commit submit: {e}"))?;
     // Arm C folds EVERYTHING through an empty row. `u32::MAX` is the
@@ -998,7 +995,7 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
     // `fold-len <= buffered`, so the value reaching the plan was clamped by
     // construction; a row that carries no tokens is a commit whatever its
     // fold length says, so nothing but an explicit clamp keeps this legal.
-    c.build_empty_fire(&Channel::from(vec![u32::MAX]), "C-commit")?
+    c.build_empty_fire(&Channel::from([u32::MAX]), "C-commit")?
         .submit(&pipe)
         .map_err(|e| format!("C-commit submit: {e}"))?;
     // Arm B does not fold. Folding is a no-op -- it trades optionality for
@@ -1066,7 +1063,7 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     let n = prompt.len() as u32;
     let pipe = Pipeline::new();
     let probe = WorkingSet::new();
-    let max_pages = (n + 2 * W + 4).div_ceil(probe.page_size());
+    let max_pages = (n + 2 * W + 4).div_ceil(kv_page_size());
     drop(probe);
 
     let (mut a, g0) = Arm::open(prompt, max_pages, &pipe).await?;
@@ -1110,7 +1107,7 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
         let raw_sink = raw.clone();
         a.build_fire(
             &window,
-            Some(&Channel::from(vec![0u32])),
+            Some(&Channel::from([0u32])),
             "A-append",
             move || {
                 let t = reduce_argmax(&intrinsics::logits());
@@ -1129,11 +1126,11 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
         .submit(&pipe)
         .map_err(|e| format!("A-append submit: {e}"))?;
 
-    let b_append = b.build_fire(&window, Some(&Channel::from(vec![0u32])), "B-append", || {})?;
+    let b_append = b.build_fire(&window, Some(&Channel::from([0u32])), "B-append", || {})?;
     b_append
         .submit(&pipe)
         .map_err(|e| format!("B-append submit: {e}"))?;
-    let c_append = c.build_fire(&window, Some(&Channel::from(vec![0u32])), "C-append", || {})?;
+    let c_append = c.build_fire(&window, Some(&Channel::from([0u32])), "C-append", || {})?;
     c_append
         .submit(&pipe)
         .map_err(|e| format!("C-append submit: {e}"))?;
@@ -1159,10 +1156,10 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     a_commit
         .submit(&pipe)
         .map_err(|e| format!("A-commit submit: {e}"))?;
-    b.build_empty_fire(&Channel::from(vec![expected]), "B-commit")?
+    b.build_empty_fire(&Channel::from([expected]), "B-commit")?
         .submit(&pipe)
         .map_err(|e| format!("B-commit submit: {e}"))?;
-    c.build_empty_fire(&Channel::from(vec![other]), "C-commit")?
+    c.build_empty_fire(&Channel::from([other]), "C-commit")?
         .submit(&pipe)
         .map_err(|e| format!("C-commit submit: {e}"))?;
     for arm in [&mut a, &mut b, &mut c] {
@@ -1260,7 +1257,7 @@ async fn main(input: String) -> Result<String> {
     }
 
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
     let rs = RsWorkingSet::new();
     let buffer_page = rs.buffer_page_size();
     if buffer_page == 0 {
@@ -1283,18 +1280,17 @@ async fn main(input: String) -> Result<String> {
     // ───────────────── 1. PREFILL — mode `fold` (default) ─────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     let kv = || {
         Some(KvBinding {
             working_set: &ws,
@@ -1338,12 +1334,11 @@ async fn main(input: String) -> Result<String> {
     // One SPEC_TOKENS-wide fire. Its activations land in the buffered slots;
     // the folded state does not move, so nothing here is committed yet.
     let spec_toks = Channel::from(vec![g0; SPEC_TOKENS as usize]).named("spec_toks");
-    let spec_indptr = Channel::from(vec![0u32, SPEC_TOKENS]).named("spec_indptr");
-    let spec_positions =
-        Channel::from((n..n + SPEC_TOKENS).collect::<Vec<_>>()).named("spec_positions");
-    let spec_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("spec_pages");
+    let spec_indptr = Channel::from([0u32, SPEC_TOKENS]).named("spec_indptr");
+    let spec_positions = Channel::from_iter(n..n + SPEC_TOKENS).named("spec_positions");
+    let spec_pages = Channel::from_iter(0..max_pages).named("spec_pages");
     let spec_page_indptr =
-        Channel::from(vec![0u32, (n + SPEC_TOKENS).div_ceil(page_size)]).named("spec_page_indptr");
+        Channel::from([0u32, (n + SPEC_TOKENS).div_ceil(page_size)]).named("spec_page_indptr");
     let spec_w_slot = Channel::from(
         (n..n + SPEC_TOKENS)
             .map(|p| p / page_size)
@@ -1360,7 +1355,7 @@ async fn main(input: String) -> Result<String> {
 
     let fwd_s = ForwardPass::new();
     fwd_s.embed(&spec_toks, &spec_indptr)?;
-    let spec_kv_len = Channel::from(vec![n + SPEC_TOKENS]).named("spec_kv_len");
+    let spec_kv_len = Channel::from([n + SPEC_TOKENS]).named("spec_kv_len");
     let kv = || {
         Some(KvBinding {
             working_set: &ws,
@@ -1381,7 +1376,7 @@ async fn main(input: String) -> Result<String> {
     // page-major from slab zero. `fold_len = 0` holds the folded boundary
     // still, so nothing here is committed -- that is what makes this fire
     // abandonable.
-    let spec_fold_len = Channel::from(vec![0u32]).named("spec_fold_len");
+    let spec_fold_len = Channel::from([0u32]).named("spec_fold_len");
     fwd_s
         .attention(
             kv(),
@@ -1414,22 +1409,19 @@ async fn main(input: String) -> Result<String> {
     let mut committed = 0u32;
     if accepted > 0 {
         let commit_toks = Channel::from(vec![g0; accepted as usize]).named("commit_toks");
-        let commit_indptr = Channel::from(vec![0u32, accepted]).named("commit_indptr");
-        let commit_positions =
-            Channel::from((n..n + accepted).collect::<Vec<_>>()).named("commit_positions");
-        let commit_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("commit_pages");
-        let commit_page_indptr = Channel::from(vec![0u32, (n + accepted).div_ceil(page_size)])
-            .named("commit_page_indptr");
+        let commit_indptr = Channel::from([0u32, accepted]).named("commit_indptr");
+        let commit_positions = Channel::from_iter(n..n + accepted).named("commit_positions");
+        let commit_pages = Channel::from_iter(0..max_pages).named("commit_pages");
+        let commit_page_indptr =
+            Channel::from([0u32, (n + accepted).div_ceil(page_size)]).named("commit_page_indptr");
         let commit_w_slot =
-            Channel::from((n..n + accepted).map(|p| p / page_size).collect::<Vec<_>>())
-                .named("commit_w_slot");
+            Channel::from_iter((n..n + accepted).map(|p| p / page_size)).named("commit_w_slot");
         let commit_w_off =
-            Channel::from((n..n + accepted).map(|p| p % page_size).collect::<Vec<_>>())
-                .named("commit_w_off");
+            Channel::from_iter((n..n + accepted).map(|p| p % page_size)).named("commit_w_off");
 
         let fwd_c = ForwardPass::new();
         fwd_c.embed(&commit_toks, &commit_indptr)?;
-        let commit_kv_len = Channel::from(vec![n + accepted]).named("commit_kv_len");
+        let commit_kv_len = Channel::from([n + accepted]).named("commit_kv_len");
         let kv = || {
             Some(KvBinding {
                 working_set: &ws,
@@ -1449,7 +1441,7 @@ async fn main(input: String) -> Result<String> {
         // The commit replays `accepted` buffered tokens. WHICH tokens is not
         // stated: the replay reaches back over the row's own occupancy, which
         // the runtime tracks.
-        let commit_fold_len = Channel::from(vec![accepted]).named("commit_fold_len");
+        let commit_fold_len = Channel::from([accepted]).named("commit_fold_len");
         fwd_c
             .attention(
                 kv(),
@@ -1487,12 +1479,11 @@ async fn main(input: String) -> Result<String> {
     if chain {
         let base = n + SPEC_TOKENS;
         let c2_toks = Channel::from(vec![drafted; SPEC_TOKENS as usize]).named("c2_toks");
-        let c2_indptr = Channel::from(vec![0u32, SPEC_TOKENS]).named("c2_indptr");
-        let c2_positions =
-            Channel::from((base..base + SPEC_TOKENS).collect::<Vec<_>>()).named("c2_positions");
-        let c2_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("c2_pages");
-        let c2_page_indptr = Channel::from(vec![0u32, (base + SPEC_TOKENS).div_ceil(page_size)])
-            .named("c2_page_indptr");
+        let c2_indptr = Channel::from([0u32, SPEC_TOKENS]).named("c2_indptr");
+        let c2_positions = Channel::from_iter(base..base + SPEC_TOKENS).named("c2_positions");
+        let c2_pages = Channel::from_iter(0..max_pages).named("c2_pages");
+        let c2_page_indptr =
+            Channel::from([0u32, (base + SPEC_TOKENS).div_ceil(page_size)]).named("c2_page_indptr");
         let c2_w_slot = Channel::from(
             (base..base + SPEC_TOKENS)
                 .map(|p| p / page_size)
@@ -1509,7 +1500,7 @@ async fn main(input: String) -> Result<String> {
 
         let fwd2 = ForwardPass::new();
         fwd2.embed(&c2_toks, &c2_indptr)?;
-        let c2_kv_len = Channel::from(vec![base + SPEC_TOKENS]).named("c2_kv_len");
+        let c2_kv_len = Channel::from([base + SPEC_TOKENS]).named("c2_kv_len");
         let kv = || {
             Some(KvBinding {
                 working_set: &ws,
@@ -1530,7 +1521,7 @@ async fn main(input: String) -> Result<String> {
         // the commit left unfolded — which is what makes this the read path
         // rather than a fresh chunk. The guest does not say so; the runtime
         // appends at the tail because there is nowhere else to append.
-        let c2_fold_len = Channel::from(vec![0u32]).named("c2_fold_len");
+        let c2_fold_len = Channel::from([0u32]).named("c2_fold_len");
         fwd2.attention(
             kv(),
             std::slice::from_ref(&rs),

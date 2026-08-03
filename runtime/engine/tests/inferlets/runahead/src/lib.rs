@@ -108,7 +108,7 @@ impl Decoder {
 
         let toks_v: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let toks = Channel::from(toks_v).named("toks_p"); // [N] i32 (seeded)
-        let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr_p");
+        let embed_indptr = Channel::from([0u32, n]).named("embed_indptr_p");
         let pos_v: Vec<u32> = (base..base + n).collect();
         let pos = Channel::from(pos_v).named("pos_p");
         // Explicit N-cell write descriptor: cell c → pool_ids[c/PAGE_T] @ c%PAGE_T.
@@ -134,7 +134,7 @@ impl Decoder {
             &self.ws,
             KvGeometry {
                 readable_pages: ..,
-                writable_pages: (base / self.ws.page_size())..,
+                writable_pages: (base / kv_page_size())..,
                 kv_len: &klen,
                 pages: &pages,
                 page_indptr: &page_indptr,
@@ -184,7 +184,7 @@ impl Decoder {
             .capacity(RING)
             .named("pool_ids");
         let out = Channel::new([1], dtype::i32).capacity(RING).named("out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
@@ -192,7 +192,7 @@ impl Decoder {
             &self.ws,
             KvGeometry {
                 readable_pages: ..,
-                writable_pages: (n / self.ws.page_size())..,
+                writable_pages: (n / kv_page_size())..,
                 kv_len: &klen,
                 pages: &pages,
                 page_indptr: &page_indptr,

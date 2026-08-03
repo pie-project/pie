@@ -24,12 +24,12 @@ async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i
     ws.reserve(max_pages - ws.page_len())
         .map_err(|e| format!("{tag} ws.reserve: {e}"))?;
     let input = &tokens[suffix_start as usize..];
-    let toks = Channel::from(input.to_vec()).named("toks");
+    let toks = Channel::from(input).named("toks");
     let input_len = input.len() as u32;
-    let embed_indptr = Channel::from(vec![0u32, input_len]).named("embed_indptr");
-    let positions = Channel::from((suffix_start..N).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("page_indptr");
+    let embed_indptr = Channel::from([0u32, input_len]).named("embed_indptr");
+    let positions = Channel::from_iter(suffix_start..N).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("page_indptr");
     let w_slot = Channel::from(
         (suffix_start..N)
             .map(|position| position / PAGE_T)
@@ -46,7 +46,7 @@ async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i
 
     let fwd: ForwardPass = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
-    let kv_len = Channel::from(vec![N]).named("kv_len");
+    let kv_len = Channel::from([N]).named("kv_len");
     fwd.attention(
         &ws,
         KvGeometry {
@@ -93,17 +93,17 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
         .map_err(|e| format!("{tag} ws.reserve: {e}"))?;
     let k = PAGE_T as usize;
 
-    let toks_a = Channel::from(tokens[..k].to_vec()).named("toks_a");
-    let embed_indptr_a = Channel::from(vec![0u32, PAGE_T]).named("embed_indptr_a");
-    let positions_a = Channel::from((0..PAGE_T).collect::<Vec<_>>()).named("positions_a");
-    let pages_a = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_a");
-    let page_indptr_a = Channel::from(vec![0u32, 1]).named("page_indptr_a");
+    let toks_a = Channel::from(&tokens[..k]).named("toks_a");
+    let embed_indptr_a = Channel::from([0u32, PAGE_T]).named("embed_indptr_a");
+    let positions_a = Channel::from_iter(0..PAGE_T).named("positions_a");
+    let pages_a = Channel::from_iter(0..max_pages).named("pages_a");
+    let page_indptr_a = Channel::from([0u32, 1]).named("page_indptr_a");
     let w_slot_a = Channel::from(vec![0u32; PAGE_T as usize]).named("w_slot_a");
-    let w_off_a = Channel::from((0..PAGE_T).collect::<Vec<_>>()).named("w_off_a");
+    let w_off_a = Channel::from_iter(0..PAGE_T).named("w_off_a");
     let sink = Channel::new([1], dtype::i32).named("sink");
     let fwd_a: ForwardPass = ForwardPass::new();
     fwd_a.embed(&toks_a, &embed_indptr_a)?;
-    let kv_len_a = Channel::from(vec![PAGE_T]).named("kv_len_a");
+    let kv_len_a = Channel::from([PAGE_T]).named("kv_len_a");
     fwd_a.attention(
         &ws,
         KvGeometry {
@@ -132,12 +132,12 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
         .await
         .map_err(|e| format!("{tag} sink.take: {e}"))?;
 
-    let toks_b = Channel::from(tokens[k..].to_vec()).named("toks_b");
+    let toks_b = Channel::from(&tokens[k..]).named("toks_b");
     let suffix_len = N - PAGE_T;
-    let embed_indptr_b = Channel::from(vec![0u32, suffix_len]).named("embed_indptr_b");
-    let positions_b = Channel::from((PAGE_T..N).collect::<Vec<_>>()).named("positions_b");
-    let pages_b = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_b");
-    let page_indptr_b = Channel::from(vec![0u32, max_pages]).named("page_indptr_b");
+    let embed_indptr_b = Channel::from([0u32, suffix_len]).named("embed_indptr_b");
+    let positions_b = Channel::from_iter(PAGE_T..N).named("positions_b");
+    let pages_b = Channel::from_iter(0..max_pages).named("pages_b");
+    let page_indptr_b = Channel::from([0u32, max_pages]).named("page_indptr_b");
     let w_slot_b = Channel::from(
         (PAGE_T..N)
             .map(|position| position / PAGE_T)
@@ -153,12 +153,12 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
     let out = Channel::new([1], dtype::i32).named("out_b");
     let fwd_b: ForwardPass = ForwardPass::new();
     fwd_b.embed(&toks_b, &embed_indptr_b)?;
-    let kv_len_b = Channel::from(vec![N]).named("kv_len_b");
+    let kv_len_b = Channel::from([N]).named("kv_len_b");
     fwd_b.attention(
         &ws,
         KvGeometry {
             readable_pages: ..,
-            writable_pages: (PAGE_T / ws.page_size())..,
+            writable_pages: (PAGE_T / kv_page_size())..,
             kv_len: &kv_len_b,
             pages: &pages_b,
             page_indptr: &page_indptr_b,

@@ -60,18 +60,17 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
 
     let toks_p = Channel::from(prompt_i32).named("g_toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("g_embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("g_positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("g_pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("g_page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("g_w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("g_w_off_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("g_embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("g_positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("g_pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(PAGE_T)]).named("g_page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / PAGE_T)).named("g_w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % PAGE_T)).named("g_w_off_p");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     fwd_p.attention(
         &ws,
         KvGeometry {
@@ -106,17 +105,16 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     if k > 1 {
         let tok_in = Channel::from(vec![g0; 1]).named("g_tok_in");
         let out = Channel::new([1], dtype::i32).named("g_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("g_embed_indptr");
-        let positions = Channel::from(vec![n]).named("g_positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("g_pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(PAGE_T)]).named("g_page_indptr");
-        let w_slot = Channel::from(vec![n / PAGE_T]).named("g_w_slot");
-        let w_off = Channel::from(vec![n % PAGE_T]).named("g_w_off");
+        let lane1 = Channel::from([0u32, 1u32]).named("g_embed_indptr");
+        let positions = Channel::from([n]).named("g_positions");
+        let pages = Channel::from_iter(0..max_pages).named("g_pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]).named("g_page_indptr");
+        let w_slot = Channel::from([n / PAGE_T]).named("g_w_slot");
+        let w_off = Channel::from([n % PAGE_T]).named("g_w_off");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
         fwd.attention(
             &ws,
             KvGeometry {
@@ -174,12 +172,12 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
     ws.reserve(max_pages)
         .map_err(|e| format!("verify ws.reserve: {e}"))?;
     let toks = Channel::from(inp).named("v_toks");
-    let embed_indptr = Channel::from(vec![0u32, n]).named("v_embed_indptr");
-    let positions = Channel::from((0..n).collect::<Vec<_>>()).named("v_positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("v_pages");
-    let page_indptr = Channel::from(vec![0u32, max_pages]).named("v_page_indptr");
-    let w_slot = Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("v_w_slot");
-    let w_off = Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("v_w_off");
+    let embed_indptr = Channel::from([0u32, n]).named("v_embed_indptr");
+    let positions = Channel::from_iter(0..n).named("v_positions");
+    let pages = Channel::from_iter(0..max_pages).named("v_pages");
+    let page_indptr = Channel::from([0u32, max_pages]).named("v_page_indptr");
+    let w_slot = Channel::from_iter((0..n).map(|p| p / PAGE_T)).named("v_w_slot");
+    let w_off = Channel::from_iter((0..n).map(|p| p % PAGE_T)).named("v_w_off");
     let verify_out = Channel::new([k], dtype::i32).named("v_out");
 
     // k read-out rows (the last k positions, prompt-tail .. prompt-tail+k-1)
@@ -191,7 +189,7 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &embed_indptr)?;
-    let kv_len = Channel::from(vec![n]).named("kv_len");
+    let kv_len = Channel::from([n]).named("kv_len");
     fwd.readout(&readout)?;
     fwd.attention(
         &ws,

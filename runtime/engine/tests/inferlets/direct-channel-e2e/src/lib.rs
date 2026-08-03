@@ -8,15 +8,15 @@ async fn main(_input: String) -> Result<String> {
     ws.reserve(max_pages)
         .map_err(|error| format!("ws.reserve: {error}"))?;
 
-    let token = Channel::from(vec![1i32]).named("token");
-    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-    let positions = Channel::from(vec![0u32]).named("positions");
-    let pages = Channel::from(vec![0u32]).named("pages");
-    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
-    let w_slot = Channel::from(vec![0u32]).named("w_slot");
-    let w_off = Channel::from(vec![0u32]).named("w_off");
-    let kv_len = Channel::from(vec![1u32]).named("kv_len");
-    let state = Channel::from(vec![41u32]).named("state");
+    let token = Channel::from([1i32]).named("token");
+    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+    let positions = Channel::from([0u32]).named("positions");
+    let pages = Channel::from([0u32]).named("pages");
+    let page_indptr = Channel::from([0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from([0u32]).named("w_slot");
+    let w_off = Channel::from([0u32]).named("w_off");
+    let kv_len = Channel::from([1u32]).named("kv_len");
+    let state = Channel::from([41u32]).named("state");
     let increment = Channel::writer([1], dtype::u32).named("late_increment");
     let out = Channel::new([1], dtype::u32).named("out");
 

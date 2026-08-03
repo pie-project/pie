@@ -85,21 +85,19 @@ async fn main(input: Input) -> Result<String> {
     let pipeline = Pipeline::new();
 
     // ── Prefill: host-known prompt, one fire ────────────────────────────
-    let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let prefill_indptr = Channel::from(vec![0u32, n]).named("prefill_indptr");
-    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>()).named("prefill_positions");
-    let prefill_pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("prefill_pages");
+    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
+    let prefill_indptr = Channel::from([0u32, n]).named("prefill_indptr");
+    let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
+    let prefill_pages = Channel::from_iter(0..max_pages).named("prefill_pages");
     let prefill_page_indptr =
-        Channel::from(vec![0u32, n.div_ceil(PAGE_T)]).named("prefill_page_indptr");
-    let prefill_w_slot =
-        Channel::from((0..n).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("prefill_w_slot");
-    let prefill_w_off =
-        Channel::from((0..n).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("prefill_w_off");
+        Channel::from([0u32, n.div_ceil(PAGE_T)]).named("prefill_page_indptr");
+    let prefill_w_slot = Channel::from_iter((0..n).map(|p| p / PAGE_T)).named("prefill_w_slot");
+    let prefill_w_off = Channel::from_iter((0..n).map(|p| p % PAGE_T)).named("prefill_w_off");
     let seed_out = Channel::new([1], dtype::i32).named("seed");
     let drafts_out = Channel::new([k], dtype::i32).named("drafts");
     let prefill = ForwardPass::new();
     prefill.embed(&prompt_tokens, &prefill_indptr)?;
-    let prefill_kv_len = Channel::from(vec![n]).named("prefill_kv_len");
+    let prefill_kv_len = Channel::from([n]).named("prefill_kv_len");
     prefill.attention(
         &ws,
         KvGeometry {
@@ -138,10 +136,10 @@ async fn main(input: Input) -> Result<String> {
     let mut window0 = vec![seed];
     window0.extend_from_slice(&seed_drafts);
     let window = Channel::from(pad_tokens(&window0, w as usize)).named("window");
-    let len = Channel::from(vec![n]).named("len");
-    let kv_len = Channel::from((1..=w).map(|row| n + row).collect::<Vec<_>>()).named("kv_len");
-    let embed_indptr = Channel::from((0..=w).collect::<Vec<_>>()).named("embed_indptr");
-    let positions = Channel::from((n..n + w).collect::<Vec<_>>()).named("positions");
+    let len = Channel::from([n]).named("len");
+    let kv_len = Channel::from_iter((1..=w).map(|row| n + row)).named("kv_len");
+    let embed_indptr = Channel::from_iter(0..=w).named("embed_indptr");
+    let positions = Channel::from_iter(n..n + w).named("positions");
     let tiled_pages: Vec<u32> = (0..w).flat_map(|_| 0..max_pages).collect();
     let pages = Channel::from_shaped([w, max_pages], tiled_pages).named("pages");
     let mut initial_page_indptr = vec![0u32];
@@ -150,9 +148,9 @@ async fn main(input: Input) -> Result<String> {
             .push(initial_page_indptr.last().copied().unwrap() + length.div_ceil(PAGE_T));
     }
     let page_indptr = Channel::from(initial_page_indptr).named("page_indptr");
-    let w_slot = Channel::from((n..n + w).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("w_slot");
-    let w_off = Channel::from((n..n + w).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("w_off");
-    let readout = Channel::from((0..w).collect::<Vec<_>>()).named("readout");
+    let w_slot = Channel::from_iter((n..n + w).map(|p| p / PAGE_T)).named("w_slot");
+    let w_off = Channel::from_iter((n..n + w).map(|p| p % PAGE_T)).named("w_off");
+    let readout = Channel::from_iter(0..w).named("readout");
     let stopped = Channel::from_shaped([1u32], vec![false]).named("stopped");
     let committed_out = Channel::new([w], dtype::i32)
         .capacity(channel_capacity() as u32)

@@ -221,7 +221,7 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Err("max_tokens must be at least 1".into());
@@ -271,19 +271,15 @@ async fn main(input: Input) -> Result<Output> {
     for &(base, end) in &spans {
         let len = end - base;
 
-        let toks_p =
-            Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_p");
-        let embed_indptr_p = Channel::from(vec![0u32, len]).named("embed_indptr_p");
-        let positions_p = Channel::from((base..end).collect::<Vec<_>>()).named("positions_p");
-        let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-        let page_indptr_p =
-            Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot_p =
-            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-        let w_off_p =
-            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-        let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
-        let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+        let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
+        let embed_indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
+        let positions_p = Channel::from_iter(base..end).named("positions_p");
+        let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+        let page_indptr_p = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
+        let w_slot_p = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
+        let w_off_p = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
+        let kv_len_p = Channel::from([end]).named("kv_len_p");
+        let rng_p = Channel::from([input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
 
         let fwd_p = ForwardPass::new();
@@ -337,18 +333,17 @@ async fn main(input: Input) -> Result<Output> {
         // is only answerable if every other input is held fixed -- including
         // the Gumbel stream. A different salt makes the two runs disagree for
         // reasons that have nothing to do with attention.
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         // The heavy-hitter accumulator. `on_attn` fires once per layer and the
         // inferlet cannot ask the model how many layers there are, so the layer
@@ -369,7 +364,7 @@ async fn main(input: Input) -> Result<Output> {
             .map(|i| SEED_SCALE * (kv_max - i) as f32 / kv_max as f32)
             .collect();
         let acc = Channel::from(seed).named("h2o_acc");
-        let layer_ct = Channel::from(vec![0u32]).named("h2o_layers");
+        let layer_ct = Channel::from([0u32]).named("h2o_layers");
 
         // Host drains. Absent entirely when `report` is off -- not merely
         // undrained -- so the epilogue never writes them and the geometry pass

@@ -61,9 +61,8 @@ async fn main(_input: String) -> Result<String> {
     let ws = WorkingSet::new();
 
     let fwd = ForwardPass::new();
-    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
-    let page_rows =
-        Channel::from((0u32..=B).map(|i| i * P).collect::<Vec<_>>()).named("page_indptr");
+    let lanes_b = Channel::from_iter(0u32..=B).named("embed_indptr");
+    let page_rows = Channel::from_iter((0u32..=B).map(|i| i * P)).named("page_indptr");
     fwd.embed(&toks, &lanes_b)?;
     fwd.attention(
         &ws,

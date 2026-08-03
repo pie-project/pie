@@ -67,15 +67,13 @@ fn bind_single_sequence<B>(
 where
     B: std::ops::RangeBounds<u32>,
 {
-    let embed_indptr = Channel::from(vec![0u32, token_count]).named("embed_indptr");
-    let positions = Channel::from((0..token_count).collect::<Vec<_>>()).named("positions");
-    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, token_count.div_ceil(PAGE_T)]).named("page_indptr");
-    let w_slot =
-        Channel::from((0..token_count).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("w_slot");
-    let w_off =
-        Channel::from((0..token_count).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("w_off");
-    let readout = Channel::from(readout.to_vec()).named("readout");
+    let embed_indptr = Channel::from([0u32, token_count]).named("embed_indptr");
+    let positions = Channel::from_iter(0..token_count).named("positions");
+    let pages = Channel::from_iter(0..pool_pages).named("pages");
+    let page_indptr = Channel::from([0u32, token_count.div_ceil(PAGE_T)]).named("page_indptr");
+    let w_slot = Channel::from_iter((0..token_count).map(|p| p / PAGE_T)).named("w_slot");
+    let w_off = Channel::from_iter((0..token_count).map(|p| p % PAGE_T)).named("w_off");
+    let readout = Channel::from(readout).named("readout");
     pass.embed(toks, &embed_indptr)?;
     pass.readout(&readout)?;
     pass.attention(
@@ -115,15 +113,11 @@ fn bind_window<B>(
 where
     B: std::ops::RangeBounds<u32>,
 {
-    let embed_indptr = Channel::from(vec![0u32, count]).named("w_embed_indptr");
-    let positions =
-        Channel::from((first_pos..first_pos + count).collect::<Vec<_>>()).named("w_positions");
-    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("w_pages");
-    let page_indptr = Channel::from(vec![
-        0u32,
-        (first_pos + count).div_ceil(PAGE_T).min(pool_pages),
-    ])
-    .named("w_page_indptr");
+    let embed_indptr = Channel::from([0u32, count]).named("w_embed_indptr");
+    let positions = Channel::from_iter(first_pos..first_pos + count).named("w_positions");
+    let pages = Channel::from_iter(0..pool_pages).named("w_pages");
+    let page_indptr = Channel::from([0u32, (first_pos + count).div_ceil(PAGE_T).min(pool_pages)])
+        .named("w_page_indptr");
     let w_slot = Channel::from(
         (first_pos..first_pos + count)
             .map(|p| p / PAGE_T)
@@ -136,7 +130,7 @@ where
             .collect::<Vec<_>>(),
     )
     .named("w_w_off");
-    let readout = Channel::from(readout.to_vec()).named("w_readout");
+    let readout = Channel::from(readout).named("w_readout");
     pass.readout(&readout)?;
     pass.embed(toks, &embed_indptr)?;
     pass.attention(
@@ -182,7 +176,7 @@ async fn bootstrap(
     let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
 
     let fwd = ForwardPass::new();
-    let kv_len = Channel::from(vec![n]).named("b_kv_len");
+    let kv_len = Channel::from([n]).named("b_kv_len");
     // The prompt is final by construction, so the bootstrap folds all of it.
     bind_single_sequence(
         &fwd,
@@ -247,12 +241,12 @@ async fn verify_window(
     let drafts_out_h = drafts_out.clone();
 
     let fwd = ForwardPass::new();
-    let kv_len = Channel::from(vec![seq_len + kp1]).named("v_kv_len");
+    let kv_len = Channel::from([seq_len + kp1]).named("v_kv_len");
     let readout: Vec<u32> = (0..kp1).collect();
     // Fold BEHIND, never ahead: `fold_len` is the previous window's accepted
     // prefix, whose finality is settled. This fire's own k drafts land in the
     // buffer with the boundary held still, so a rejected tail stays abandonable.
-    let fold_len = Channel::from(vec![fold_len]).named("v_fold_len");
+    let fold_len = Channel::from([fold_len]).named("v_fold_len");
     bind_window(
         &fwd,
         ws,

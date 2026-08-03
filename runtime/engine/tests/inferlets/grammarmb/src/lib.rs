@@ -92,14 +92,14 @@ async fn main(input: String) -> Result<String> {
     // host-writer allowed mask. tok_out: the SOLE host-reader output (no
     // raw-logits reader — mirrors the old single-`[Token]` M-batch-eligible
     // shape).
-    let tok_in = Channel::from(vec![seed_tok]).named("tok_in");
-    let kv_len = Channel::from(vec![1u32]).named("kv_len");
-    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-    let positions = Channel::from(vec![0u32]).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
-    let w_slot = Channel::from(vec![0u32]).named("w_slot");
-    let w_off = Channel::from(vec![0u32]).named("w_off");
+    let tok_in = Channel::from([seed_tok]).named("tok_in");
+    let kv_len = Channel::from([1u32]).named("kv_len");
+    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+    let positions = Channel::from([0u32]).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from([0u32]).named("w_slot");
+    let w_off = Channel::from([0u32]).named("w_off");
     let gmask = Channel::new([vocab], dtype::bool).named("gmask");
     let tok_out = Channel::new([1], dtype::i32).named("tok_out");
 

@@ -11,8 +11,8 @@
 //! instead of compacting dead cells.
 
 use inferlet::ptir::attention::prelude::*;
-use std::ops::RangeBounds;
 use serde::Deserialize;
+use std::ops::RangeBounds;
 
 const PAGE_T: u32 = 16; // tokens per pool page
 const POOL_PAGES: u32 = 8; // shared pool pages (over-allocated; compaction bounds this)
@@ -166,10 +166,10 @@ macro_rules! define_beam_search {
         if max_steps == 0 {
             return Ok(String::new());
         }
-    
+
         let vocab = model::output_vocab_size();
         let v = vocab;
-    
+
         // Allocate a fixed logical page pool. Flat position `wpos` maps to
         // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
         let ws = WorkingSet::new();
@@ -184,12 +184,12 @@ macro_rules! define_beam_search {
             .map(|i| pool_ids[(i % 1) as usize])
             .collect(); // [B*POOL_PAGES]
         let pool0 = pool_ids[0];
-    
+
         // Shared BOS prompt at pool position 0: both beams attend it (mask), and the
         // fire-0 write descriptor lands both BOS at (page pool_ids[0], off 0) — the
         // shared prefix cell. fill = 1 (position 0 filled).
         let init_mask: Vec<bool> = (0..B).flat_map(|_| (0..POOL).map(|p| p == 0)).collect();
-    
+
         // Loop-carried search and page geometry.
         let mask = Channel::from_shaped([B, POOL], init_mask).named("mask"); // [B, POOL] bool
         let mut initial_scores = vec![f32::NEG_INFINITY; B as usize];
@@ -219,8 +219,8 @@ macro_rules! define_beam_search {
         // `pages` must be tiled at THAT stride, not at POOL_PAGES.
         let pidx_const: Vec<u32> = (0..=B).map(|b| b).collect();
         let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
-        let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
-    
+        let lanes_b = Channel::from_iter(0u32..=B).named("embed_indptr");
+
         let pool_ids_ch = Channel::from(pool_ids.clone()).named("pool_ids");
         let out = Channel::new([B], dtype::i32)
             .capacity(channel_capacity() as u32)
@@ -242,7 +242,7 @@ macro_rules! define_beam_search {
         let out_greedy = Channel::new([B], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("out_greedy");
-    
+
         let pipeline = Pipeline::new();
         let mut rs_working_sets = if model::rs_state_size() > 0 {
             (0..B).map(|_| RsWorkingSet::new()).collect::<Vec<_>>()
@@ -287,13 +287,13 @@ macro_rules! define_beam_search {
             let (s, i) = top_k(reshape(cand, [B * v]), B);
             let parent = div(&i, v);
             let tok_i = cast(rem(&i, v), dtype::i32);
-    
+
             // 2. flat tail-append positions: wpos = fill + lane.
             let base = fill.take(); // [1]
             let lane = iota(B); // [B]
             let base_b = broadcast(reshape(&base, [1]), [B]); // [1] -> [B]
             let wpos = add(&base_b, &lane); // [B]
-    
+
             // 3. mask evolution: inherit parent's ancestry, OR the new position.
             let inherited = gather(mask.take(), &parent); // bool [B,POOL]
             let col = broadcast(reshape(iota(POOL), [1, POOL]), [B, POOL]);
@@ -301,7 +301,7 @@ macro_rules! define_beam_search {
             let newpos = eq(col, wpos_b); // bool [B,POOL]
             let new_mask = or(inherited, &newpos);
             mask.put(&new_mask);
-    
+
             // 4. Explicit write descriptor for each surviving beam.
             let pids = pool_ids_ch.take().tensor();
             let logical_slot = div(&wpos, PAGE_T); // [B] index into the pool
@@ -314,12 +314,12 @@ macro_rules! define_beam_search {
             w_slot.put(&w_slot_v);
             w_off.take();
             w_off.put(&w_off_v);
-    
+
             // KV span after this step's appends (the mask restricts attention).
             let filled = add(&base, B); // [1]
             klen.take();
             klen.put(broadcast(reshape(&filled, [1]), [B]));
-    
+
             pos.put(add(pos.take(), 1u32));
             fill.put(&filled);
             scores.put(&s);
@@ -343,14 +343,14 @@ macro_rules! define_beam_search {
             // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
             page_indptr.take();
             page_indptr.put(mul(iota(B + 1), broadcast(&page_count, [B + 1])));
-    
+
             out.put(&tok_i);
             out_par.put(&parent);
             out_scr.put(&s);
             out_greedy.put(&reshape(cast(reduce_argmax(&logits), dtype::i32), [B]));
             pool_ids_ch.put(&pids);
         });
-    
+
         // Beam decode loop: feed the fixed pool ids and reconstruct each surviving
         // hypothesis from the parent permutation emitted by the device.
         let mut hypotheses = vec![Vec::<u32>::new(); B as usize];
@@ -432,7 +432,7 @@ macro_rules! define_beam_search {
             }
         }
         pipeline.close();
-    
+
         let best_lane = final_scores
             .iter()
             .enumerate()
@@ -456,7 +456,7 @@ macro_rules! define_beam_search {
             "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}",
             final_scores[best_lane]
         ))
-    
+
         }
     };
 }

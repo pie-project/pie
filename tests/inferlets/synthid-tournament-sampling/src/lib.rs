@@ -329,7 +329,7 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -381,19 +381,17 @@ async fn main(input: Input) -> Result<Output> {
     let mut nulls: Vec<f32> = Vec::with_capacity(max_tokens);
 
     // ── PREFILL FIRE (N-wide): first sampled token comes off the prompt. ──
-    let toks_p =
-        Channel::from(history.iter().take(n as usize).copied().collect::<Vec<_>>()).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
-    let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+    let toks_p = Channel::from_iter(history.iter().take(n as usize).copied()).named("toks_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
+    let rng_p = Channel::from([input.seed, 0]).named("rng_p");
     let hist_p = Channel::from(history.clone()).named("hist_p");
-    let hlen_p = Channel::from(vec![n]).named("hlen_p");
+    let hlen_p = Channel::from([n]).named("hlen_p");
     let chist_p =
         Channel::from(vec![u32::MAX; cfg.history_size as usize]).named("context_history_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
@@ -453,9 +451,9 @@ async fn main(input: Input) -> Result<Output> {
         history[n as usize] = g0;
 
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let hist_c = Channel::from(history.clone()).named("hist");
-        let hlen_c = Channel::from(vec![n + 1]).named("hlen");
+        let hlen_c = Channel::from([n + 1]).named("hlen");
         // The decode fire gets its own channel, so the ring is seeded with the
         // entry the prefill fire wrote — otherwise the device and the host
         // mirror would disagree about the first context.
@@ -472,14 +470,13 @@ async fn main(input: Input) -> Result<Output> {
         let null_out = Channel::new([1], dtype::f32)
             .capacity(channel_capacity() as u32)
             .named("null_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;

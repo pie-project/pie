@@ -69,17 +69,16 @@ async fn main(input: Input) -> Result<String> {
         .context("reserve attention-sink KV")?;
     let pool_ids = slots.ids().to_vec();
 
-    let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
-    let prefill_embed_indptr = Channel::from(vec![0u32, n]).named("prefill_embed_indptr");
-    let prefill_positions = Channel::from((0..n).collect::<Vec<_>>()).named("prefill_positions");
+    let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
+    let prefill_embed_indptr = Channel::from([0u32, n]).named("prefill_embed_indptr");
+    let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
     let prefill_slots = Channel::from(
         (0..n)
             .map(|position| pool_ids[(position / PAGE_T) as usize])
             .collect::<Vec<_>>(),
     );
-    let prefill_offsets =
-        Channel::from((0..n).map(|position| position % PAGE_T).collect::<Vec<_>>());
-    let prefill_klen = Channel::from(vec![n]);
+    let prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
+    let prefill_klen = Channel::from([n]);
     let prefill_pages = Channel::from(pool_ids.clone());
     // The page CSR is the wire's source of truth for kv_len: the driver derives
     // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
@@ -138,12 +137,12 @@ async fn main(input: Input) -> Result<String> {
         return model::decode(&generated);
     }
 
-    let token_in = Channel::from(vec![first as i32]).named("token_in");
-    let position = Channel::from(vec![n]).named("position");
-    let fill = Channel::from(vec![n + 1]).named("fill");
-    let klen = Channel::from(vec![n + 1]).named("klen");
-    let write_slot = Channel::from(vec![pool_ids[(n / PAGE_T) as usize]]);
-    let write_offset = Channel::from(vec![n % PAGE_T]);
+    let token_in = Channel::from([first as i32]).named("token_in");
+    let position = Channel::from([n]).named("position");
+    let fill = Channel::from([n + 1]).named("fill");
+    let klen = Channel::from([n + 1]).named("klen");
+    let write_slot = Channel::from([pool_ids[(n / PAGE_T) as usize]]);
+    let write_offset = Channel::from([n % PAGE_T]);
     let mask = Channel::from_shaped(
         [1, pool_len],
         host_sink_window_mask(pool_len, n, sink, window),
@@ -156,7 +155,7 @@ async fn main(input: Input) -> Result<String> {
         .named("token_out");
 
     let decode = ForwardPass::new();
-    let decode_indptr = Channel::from(vec![0u32, 1]).named("decode_indptr");
+    let decode_indptr = Channel::from([0u32, 1]).named("decode_indptr");
     decode.embed(&token_in, &decode_indptr)?;
     decode.attention(
         &ws,

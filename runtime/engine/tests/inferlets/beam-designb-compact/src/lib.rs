@@ -95,7 +95,7 @@ async fn main(input: String) -> Result<String> {
 
     let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
     let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
-    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
+    let lanes_b = Channel::from_iter(0u32..=B).named("embed_indptr");
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &lanes_b)?;

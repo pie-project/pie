@@ -24,7 +24,7 @@ const DEPTH: usize = 2;
 async fn main(_input: String) -> Result<String> {
     let vocab = wit_model::output_vocab_size();
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     let prompt_tokens = wit_model::encode("hello world");
     let prompt: Vec<u32> = if prompt_tokens.is_empty() {
@@ -44,21 +44,20 @@ async fn main(_input: String) -> Result<String> {
     // scheduler wait-set after the fixed submission budget is enqueued.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p");
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-    let page_indptr_p = Channel::from(vec![0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p =
-        Channel::from((0..n).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-    let w_off_p = Channel::from((0..n).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-    let rng_p = Channel::from(vec![0x9e37_u32, 0]).named("rng_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+    let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
+    let w_slot_p = Channel::from_iter((0..n).map(|p| p / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|p| p % page_size)).named("w_off_p");
+    let rng_p = Channel::from([0x9e37_u32, 0]).named("rng_p");
     // Device-carried handoff: unseeded, DEVICE-ONLY, attached to both
     // passes — the prefill's put fills it. Host copies ride separate
     // per-pass channels (`g0` for the prefill, `out` for the decode): a
     // host-visible channel cannot attach to two passes.
     let tok_in = Channel::new([1], dtype::i32).named("tok_in");
     let g0_ch = Channel::new([1], dtype::i32).named("g0");
-    let rng = Channel::from(vec![0x51ed_u32, 0]).named("rng");
+    let rng = Channel::from([0x51ed_u32, 0]).named("rng");
     // Host-read ring widened to the submit-ahead window.
     let out = Channel::new([1], dtype::i32)
         .capacity(DEPTH as u32)
@@ -66,7 +65,7 @@ async fn main(_input: String) -> Result<String> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv_len_p = Channel::from([n]).named("kv_len_p");
     fwd_p.attention(
         &ws,
         KvGeometry {
@@ -97,15 +96,15 @@ async fn main(_input: String) -> Result<String> {
     // Built BEFORE the prefill submits (its eager `tok_in` claim must precede
     // the prefill's build, F8) and submitted run-ahead immediately behind it: its geometry needs
     // only KvLen (from n+1, +1/fire); the token value rides `tok_in`.
-    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-    let positions = Channel::from(vec![n]).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-    let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-    let w_off = Channel::from(vec![n % page_size]).named("w_off");
+    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+    let positions = Channel::from([n]).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+    let w_slot = Channel::from([n / page_size]).named("w_slot");
+    let w_off = Channel::from([n % page_size]).named("w_off");
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
-    let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+    let kv_len = Channel::from([n + 1]).named("kv_len");
     fwd.attention(
         &ws,
         KvGeometry {

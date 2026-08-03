@@ -74,9 +74,9 @@ async fn main(_input: String) -> Result<String> {
     // N query rows). positions default to [0..N]; read-out defaults to row N-1.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(prompt_i32).named("toks_p"); // [N] i32
-    let embed_indptr_p = Channel::from(vec![0u32, n]).named("embed_indptr_p");
-    let positions_p = Channel::from((0..n).collect::<Vec<_>>()).named("positions_p");
-    let readout_p = Channel::from(vec![n - 1]).named("readout_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let positions_p = Channel::from_iter(0..n).named("positions_p");
+    let readout_p = Channel::from([n - 1]).named("readout_p");
 
     // Explicit-write descriptor for the N prefill cells: cell c → physical page
     // pool_ids[c / PAGE_T] at offset c % PAGE_T.
@@ -150,7 +150,7 @@ async fn main(_input: String) -> Result<String> {
     let page_indptr = Channel::from_shaped([2], vec![0u32, POOL_PAGES]).named("page_indptr");
     let pool_ids_ch = Channel::new([POOL_PAGES], dtype::u32).named("pool_ids");
     let out = Channel::new([1], dtype::i32).named("out");
-    let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
+    let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
