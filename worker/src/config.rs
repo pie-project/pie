@@ -9,7 +9,7 @@
 //! conversion to `pie_engine::bootstrap::Config` (the runtime's own config)
 //! happens in [`crate::translate`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
 use pie_controller_rpc::Role;
@@ -38,8 +38,55 @@ pub struct Config {
     pub executor: ExecutorConfig,
     #[serde(default)]
     pub offload: OffloadConfig,
+    /// Where on-disk caches live. Process-global, so it sits beside `[model]`
+    /// rather than inside `[model.driver.options]`.
+    #[serde(default)]
+    pub cache: CacheConfig,
     /// The single `[model]` table. Pie serves exactly one model.
     pub model: ModelConfig,
+}
+
+/// On-disk caches the drivers keep between runs.
+///
+/// These are properties of the MACHINE, not of the model: which disk has room,
+/// which one survives a restart, which one is shared between nodes. That is why
+/// they are a top-level section copied into every driver's startup TOML rather
+/// than per-model driver options -- a second model would otherwise have to
+/// restate the same directory, and the answer cannot differ between them.
+///
+/// An empty directory string means "derive it": `$XDG_CACHE_HOME/pie/<kind>`,
+/// else `$HOME/.cache/pie/<kind>`. The drivers own that derivation, because it
+/// is the same rule they applied when they read the environment.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Compiled-PTIR module cache. Both backends keep their own directory
+    /// under this root; they never share module blobs.
+    pub ptir_dir: String,
+    /// Whether the PTIR disk cache is used at all. Off means every process
+    /// recompiles, which is a real choice on a read-only or tiny disk.
+    pub ptir_enabled: bool,
+    /// GEMM autotuning results (CUDA).
+    pub tuning_dir: String,
+    /// Materialized-weight artifact cache (CUDA). Empty disables the feature:
+    /// there is no derived default, because the artifacts are large and
+    /// writing them is opt-in.
+    pub weight_dir: String,
+    /// Verify a weight artifact against its key on hit. Off trades integrity
+    /// for load time on a cache you trust.
+    pub weight_verify: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ptir_dir: String::new(),
+            ptir_enabled: true,
+            tuning_dir: String::new(),
+            weight_dir: String::new(),
+            weight_verify: true,
+        }
+    }
 }
 
 impl Config {
@@ -70,6 +117,35 @@ impl Config {
         self.cluster.validate()?;
         self.executor.validate()?;
         self.offload.validate()?;
+        self.cache.validate()?;
+        Ok(())
+    }
+}
+
+impl CacheConfig {
+    fn validate(&self) -> Result<()> {
+        // A relative cache path resolves against the driver's working
+        // directory, which is not something the operator picked and can differ
+        // between the worker and a driver launched as its own process. Refuse
+        // it rather than silently writing the cache somewhere else.
+        for (name, dir) in [
+            ("cache.ptir_dir", &self.ptir_dir),
+            ("cache.tuning_dir", &self.tuning_dir),
+            ("cache.weight_dir", &self.weight_dir),
+        ] {
+            ensure!(
+                dir.is_empty() || Path::new(dir).is_absolute(),
+                "{name} must be an absolute path (got {dir:?}); \
+                 leave it empty to derive one under $XDG_CACHE_HOME or $HOME"
+            );
+        }
+        // The weight cache has no derived default -- empty means off -- so a
+        // bare `weight_verify = false` is asking to skip verification on a
+        // cache that does not exist. Almost certainly a half-written config.
+        ensure!(
+            self.weight_verify || !self.weight_dir.is_empty(),
+            "cache.weight_verify = false has no effect without cache.weight_dir"
+        );
         Ok(())
     }
 }
@@ -1050,6 +1126,60 @@ device = ["cpu"]
         assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
         assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn cache_defaults_leave_every_directory_derived() {
+        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.validate().unwrap();
+        // Empty is not "no cache" for ptir/tuning -- it is "derive the path".
+        // Only the weight cache treats empty as off.
+        assert_eq!(cfg.cache.ptir_dir, "");
+        assert_eq!(cfg.cache.tuning_dir, "");
+        assert!(cfg.cache.ptir_enabled);
+        assert_eq!(cfg.cache.weight_dir, "");
+        assert!(cfg.cache.weight_verify);
+    }
+
+    #[test]
+    fn cache_section_parses_and_survives_a_round_trip() {
+        let toml = format!(
+            "{MINIMAL_METAL}\n[cache]\nptir_dir = \"/mnt/fast/ptir\"\n\
+             tuning_dir = \"/mnt/fast/tuning\"\nweight_dir = \"/mnt/big/weights\"\n\
+             weight_verify = false\nptir_enabled = false\n"
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.cache.ptir_dir, "/mnt/fast/ptir");
+        assert_eq!(cfg.cache.weight_dir, "/mnt/big/weights");
+        assert!(!cfg.cache.weight_verify);
+        assert!(!cfg.cache.ptir_enabled);
+    }
+
+    #[test]
+    fn rejects_a_relative_cache_directory() {
+        // Relative resolves against the driver's cwd, which the operator did
+        // not choose and which differs between the worker and a spawned driver.
+        let toml = format!("{MINIMAL_METAL}\n[cache]\ntuning_dir = \"cache/tuning\"\n");
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cache.tuning_dir must be an absolute path"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_disabling_verification_of_a_cache_that_is_off() {
+        let toml = format!("{MINIMAL_METAL}\n[cache]\nweight_verify = false\n");
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("has no effect without cache.weight_dir"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_cache_field() {
+        // deny_unknown_fields is what makes a typo loud instead of ignored --
+        // the failure mode the whole promotion exists to remove.
+        let toml = format!("{MINIMAL_METAL}\n[cache]\nptir_directory = \"/tmp/x\"\n");
+        assert!(toml::from_str::<Config>(&toml).is_err());
     }
 
     #[test]

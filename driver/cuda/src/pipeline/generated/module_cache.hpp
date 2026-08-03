@@ -23,6 +23,8 @@
 #include <nvrtc.h>
 
 #include <ptir_abi.h>
+
+#include "config.hpp"
 #include "pipeline/region_support.hpp"
 
 namespace pie_cuda_driver::pipeline::generated {
@@ -420,13 +422,12 @@ class ModuleCache {
 
   private:
     static std::filesystem::path default_cache_directory() {
-        if (std::getenv("PIE_DISABLE_PTIR_DISK_CACHE") != nullptr) {
+        const auto& cache = pie_cuda_driver::cache_config();
+        if (!cache.ptir_enabled) {
             return {};
         }
-        if (const char* configured = std::getenv("PIE_PTIR_CACHE_DIR")) {
-            return *configured == '\0'
-                ? std::filesystem::path{}
-                : std::filesystem::path(configured);
+        if (!cache.ptir_dir.empty()) {
+            return std::filesystem::path(cache.ptir_dir) / "ptir-cuda";
         }
         if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
             if (*xdg != '\0') {

@@ -23,6 +23,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "config.hpp"
+
 namespace pie_cuda_driver::ops {
 
 // Mixes `v` into hash `h`. Callers fold each dimension of a problem shape
@@ -77,9 +79,9 @@ class TuningCache {
 
    private:
     static std::string resolve_path(const char* name) {
-        const char* dir = std::getenv("PIE_TUNING_CACHE_DIR");
-        if (dir != nullptr && dir[0] != '\0') {
-            return std::string(dir) + "/" + name;
+        const std::string& dir = pie_cuda_driver::cache_config().tuning_dir;
+        if (!dir.empty()) {
+            return dir + "/" + name;
         }
         const char* xdg = std::getenv("XDG_CACHE_HOME");
         if (xdg != nullptr && xdg[0] != '\0') {

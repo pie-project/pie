@@ -465,6 +465,11 @@ fn load_model_drivers(
     user_cfg: &config::Config,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<LoadedModelDrivers> {
+    // Install `[cache]` before anything writes a driver startup TOML: the
+    // writers read it from the process-wide slot, and first-writer-wins means
+    // a later model cannot move a cache a live driver is already using.
+    crate::embedded_driver::set_cache_config(user_cfg.cache.clone());
+
     let (driver_groups, snapshot_dir) = {
         let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;

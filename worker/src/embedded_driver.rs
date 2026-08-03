@@ -131,6 +131,47 @@ fn insert_int(table: &mut toml::Table, key: &str, value: impl Into<i64>) {
     table.insert(key.into(), toml::Value::Integer(value.into()));
 }
 
+/// The process-wide `[cache]` section, installed once before any driver is
+/// created and copied into every startup TOML from there.
+///
+/// Install-at-bootstrap rather than a parameter because the writers sit five
+/// call layers below the only place that has the parsed `Config`, and the value
+/// is process-global by construction: the same disks serve every driver in the
+/// process. Same first-writer-wins shape as the scheduler's `OnceLock`s.
+static CACHE_CONFIG: std::sync::OnceLock<crate::config::CacheConfig> = std::sync::OnceLock::new();
+
+/// Install the `[cache]` section. First writer wins; later calls are ignored so
+/// a driver that has already been handed a path cannot see it change.
+pub fn set_cache_config(cache: crate::config::CacheConfig) {
+    let _ = CACHE_CONFIG.set(cache);
+}
+
+fn cache_config() -> crate::config::CacheConfig {
+    CACHE_CONFIG.get().cloned().unwrap_or_default()
+}
+
+/// Emit `[cache]` into a driver's startup TOML.
+///
+/// Empty directories are omitted rather than written as `""`: the driver's
+/// "derive it under XDG_CACHE_HOME" path is keyed on absence, and it is the
+/// same derivation it used when it read the environment.
+fn insert_cache_table(doc: &mut toml::Table) {
+    let cache = cache_config();
+    let mut table = toml::Table::new();
+    if !cache.ptir_dir.is_empty() {
+        insert_str(&mut table, "ptir_dir", cache.ptir_dir.clone());
+    }
+    insert_bool(&mut table, "ptir_enabled", cache.ptir_enabled);
+    if !cache.tuning_dir.is_empty() {
+        insert_str(&mut table, "tuning_dir", cache.tuning_dir.clone());
+    }
+    if !cache.weight_dir.is_empty() {
+        insert_str(&mut table, "weight_dir", cache.weight_dir.clone());
+    }
+    insert_bool(&mut table, "weight_verify", cache.weight_verify);
+    insert_table(doc, "cache", table);
+}
+
 fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
     table.insert(key.into(), toml::Value::String(value.into()));
 }
@@ -274,6 +315,8 @@ pub fn write_metal_startup_toml(
     insert_bool(&mut runtime, "verbose", options.verbose);
     insert_table(&mut doc, "runtime", runtime);
 
+    insert_cache_table(&mut doc);
+
     write_toml_table(out_path, doc)
 }
 
@@ -366,6 +409,8 @@ pub(crate) fn write_cuda_startup_toml(
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", opts.verbose);
     insert_table(&mut doc, "runtime", runtime);
+
+    insert_cache_table(&mut doc);
 
     if let Some(tp) = tp {
         let mut distributed = toml::Table::new();

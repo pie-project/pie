@@ -15,12 +15,12 @@
 // the loader codec's (loader/weight_store_codec.hpp), which this layer drives by
 // path and never looks inside.
 //
-// OFF BY DEFAULT — strictly opt-in via PIE_CUDA_WEIGHT_CACHE_DIR. With the env
-// unset/empty the cache never reads or writes (zero disk). Even when enabled,
-// the write declines if free space < blob size + margin (the artifact is the
-// size of the materialized weights — tens to hundreds of GB). Each owned blob
-// carries a fast checksum verified on reload (skip with
-// PIE_CUDA_WEIGHT_CACHE_NO_VERIFY); key/format-version mismatch => miss.
+// OFF BY DEFAULT — strictly opt-in via `[cache] weight_dir`. Left empty the
+// cache never reads or writes (zero disk). Even when enabled, the write
+// declines if free space < blob size + margin (the artifact is the size of the
+// materialized weights — tens to hundreds of GB). Each owned blob carries a
+// fast checksum verified on reload (skip with `[cache] weight_verify = false`);
+// key/format-version mismatch => miss.
 
 #include <chrono>
 #include <cstdint>
@@ -28,6 +28,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+
+#include "config.hpp"
 
 #include "model/weight_store.hpp"
 #include "loader/weight_store_codec.hpp"
@@ -42,14 +44,11 @@
 namespace pie_cuda_driver {
 
 // Returns the configured artifact cache directory, or empty if the feature is
-// disabled (PIE_CUDA_WEIGHT_CACHE_DIR unset/empty).
+// disabled (`[cache] weight_dir` empty).
 inline std::filesystem::path weight_artifact_cache_dir()
 {
-    const char* dir = std::getenv("PIE_CUDA_WEIGHT_CACHE_DIR");
-    if (dir == nullptr || dir[0] == '\0') {
-        return {};
-    }
-    return std::filesystem::path(dir);
+    const std::string& dir = pie_cuda_driver::cache_config().weight_dir;
+    return dir.empty() ? std::filesystem::path{} : std::filesystem::path(dir);
 }
 
 // Writes a materialized-weight cache file for `store` keyed by `cache_key` into
@@ -78,8 +77,8 @@ inline bool write_weight_artifact_cache(
         if (!space_ec && space.available < need) {
             std::fprintf(stderr,
                 "[pie-driver-cuda] weight cache: declining write — need %.1f GiB "
-                "but only %.1f GiB free in %s (set a dir with more space, or "
-                "unset PIE_CUDA_WEIGHT_CACHE_DIR)\n",
+                "but only %.1f GiB free in %s (point [cache] weight_dir at a "
+                "disk with more space, or clear it to disable the cache)\n",
                 static_cast<double>(need) / (1024.0 * 1024.0 * 1024.0),
                 static_cast<double>(space.available) / (1024.0 * 1024.0 * 1024.0),
                 dir.string().c_str());
@@ -112,8 +111,7 @@ inline bool read_weight_artifact_cache(
         return false;
     }
 
-    const bool verify =
-        std::getenv("PIE_CUDA_WEIGHT_CACHE_NO_VERIFY") == nullptr;
+    const bool verify = pie_cuda_driver::cache_config().weight_verify;
     constexpr bool profile = false;
     const auto t0 = std::chrono::steady_clock::now();
 
