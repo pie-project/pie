@@ -483,3 +483,43 @@ and the generated form buys no wall-clock. The perf claim ledger
 closes: supergraph value on this hardware/scale is structural, and the
 stage-2 wave-count argument (fewer FIRES via co-batching, not cheaper
 walks) remains the only measured throughput stake.
+
+## Dense-mask compose — first live producer, and what it taught (2026-08-03)
+
+The compose relaxation finally met a producer. `naive-masked` grew
+`mask_mode="dense-prefill"`: the semantically-causal host mask moves to
+the PREFILL chunks (wire-geometry fires → wire BRLE rows — the exact
+lane shape the C-relax admits), decode runs unmasked. Live on the L40S:
+
+- **Semantics**: solo `none` vs `dense-prefill`, same seed → BYTE-
+  IDENTICAL text. The prefill mask is proven causal-equivalent.
+- **Compose**: 6 masked lanes raced against 2 decoding baselines —
+  census shows ZERO mask-compose refusals and repeated members=3
+  steps; the composed fire prints `[declared-forward-generated]
+  N=52 R=3 decode=0` (50 wire prefill rows + 2 envelope rows walking
+  the GENERATED path).
+- **BUT the assembly path is still unexercised**: `brle::is_pure_causal`
+  recognizes the causal wire rows and elides the mask before the
+  composed-assembly branch (`frame.cpp`'s else-if) is reached. The
+  composed batch runs the plain path — correct, and exactly what the
+  elision is for. A producer for the ASSEMBLY needs a genuinely
+  non-causal wire mask (e.g. a causal-minus-one-column "holed" mode):
+  the next rung of this thread.
+
+### The three-day-old trap this run sprang: cross-leg text A/B is
+### invalid under composition races
+
+The mixed workload's baseline texts differed OFF vs ON vs GEN —
+deterministic per leg, reproducible across boots. It looked like a
+parity breach in the composed prefill+envelope fire. It is not. The
+census member fingerprint (added this session: per-member
+`logical_fire_id × rows`) shows the legs compose DIFFERENT fires:
+ON's sequential-lane prefill lands at baseline fire ~91, GEN's at ~33
+and ~103 — the interpreter's slower host walk shifts WHEN the racing
+prefill joins the decode stream. Different composition → different
+reduction shapes → legitimate near-tie sampling flips. Solo masked
+lanes: ON == GEN byte-identical. All-lockstep compositions (the prior
+batteries' shape): ON == GEN byte-identical. The rule, recorded for
+every future battery: **a cross-leg byte-parity claim requires equal
+census fingerprints; when a workload races a sequential lane against
+a decode stream, compare fingerprints first and texts second.**

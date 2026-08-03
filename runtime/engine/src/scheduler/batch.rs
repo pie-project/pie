@@ -359,9 +359,24 @@ pub(crate) fn build_frame_submission(
                     .first()
                     .and_then(|req| req.solo_reason())
                     .unwrap_or("-");
+                // Per-member fingerprint (fire id × row count): whether two
+                // runs composed the SAME logical fires is what separates a
+                // composition-timing difference from a numeric one when
+                // their outputs disagree.
+                let members: Vec<String> = group
+                    .iter()
+                    .map(|req| {
+                        format!(
+                            "{}x{}",
+                            req.logical_fire_id,
+                            req.request.token_ids.len()
+                        )
+                    })
+                    .collect();
                 eprintln!(
-                    "[fire-census] step members={} solo={} deferred={:?}",
+                    "[fire-census] step members={} [{}] solo={} deferred={:?}",
                     group.len(),
+                    members.join(","),
                     solo,
                     refusals,
                 );

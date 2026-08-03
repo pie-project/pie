@@ -32,6 +32,12 @@ struct Input {
     ///   "structured" causal mask via the CausalMask opcode sugar — the
     ///                driver recognizes it and takes the window-override
     ///                decode path (structured_window_left = -1)
+    ///   "dense-prefill" causal host mask on the PREFILL chunks instead
+    ///                (decode unmasked) — the chunk fires are
+    ///                wire-geometry, so their BRLE rows are the
+    ///                dense-mask-compose producer: concurrent decode
+    ///                envelopes co-batch with them and the frame
+    ///                assembles wire rows + causal fill host-side
     #[serde(default = "default_mask_mode")]
     mask_mode: String,
 }
@@ -82,11 +88,15 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let mask_mode = input.mask_mode.clone();
-    if !matches!(mask_mode.as_str(), "none" | "dense" | "structured") {
+    if !matches!(
+        mask_mode.as_str(),
+        "none" | "dense" | "structured" | "dense-prefill"
+    ) {
         return Err(format!("unknown mask_mode: {mask_mode}"));
     }
-    let masked = mask_mode != "none";
+    let masked = matches!(mask_mode.as_str(), "dense" | "structured");
     let structured = mask_mode == "structured";
+    let masked_prefill = mask_mode == "dense-prefill";
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
@@ -140,6 +150,16 @@ async fn main(input: Input) -> Result<Output> {
         let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
         let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
+        // dense-prefill: a semantically-causal host mask over the chunk's
+        // query rows (row for position p allows j <= p). The chunk fire is
+        // wire-geometry, so this lowers to wire BRLE rows — the lane shape
+        // the dense-mask compose admits into shared batches.
+        let mask_p = masked_prefill.then(|| {
+            let rows: Vec<bool> = (base..end)
+                .flat_map(|p| (0..pool_len).map(move |j| j <= p))
+                .collect();
+            Channel::from_shaped([len, pool_len], rows).named("mask_p")
+        });
 
         let fwd_p = ForwardPass::new();
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
@@ -153,7 +173,7 @@ async fn main(input: Input) -> Result<Output> {
             &w_slot_p,
             &w_off_p,
             &positions_p,
-            None,
+            mask_p.as_ref(),
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
