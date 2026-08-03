@@ -13,6 +13,8 @@
 
 #include "scratch.hpp"
 
+#include "model/llama/scratch.hpp"
+
 #include "scratch_color.hpp"
 
 #include <algorithm>
@@ -49,6 +51,17 @@ constexpr uint8_t GdnRecMixed = 0, GdnRecCoreOut = 3,
 constexpr uint8_t GatedRmsX = 0, GatedRmsZ = 1, GatedRmsOut = 3;  // bind::GatedRms
 constexpr uint8_t ResidX = 0, ResidR = 1, ResidOut = 2;  // bind::Residual
 constexpr uint8_t SiluGate = 0, SiluUp = 1, SiluOut = 2;  // bind::SiluMul
+// ── the routed FFN ──
+// The routed matvec shares the dense one's activation binds: it is the same
+// kernel with the weight stack indexed per row, so only the routing slots are
+// new. `QmvTileExpert` sits clear of the matvec's eleven because one ordinal
+// serves both the matvec and the matmul pipeline; see `bind::GoQmv`.
+constexpr uint8_t QmvExpertIds = 8, QmvTileExpert = 12;
+constexpr uint8_t RouterLogits = 0, RouterIds = 1, RouterWeights = 2;
+constexpr uint8_t SortIds = 0, SortPerm = llama::kMoeSortPermBind, SortRowExpert = 2,
+                  SortTileExpert = 3, SortInv = 5;
+constexpr uint8_t RowsIn = 0, RowsOut = 1, RowsPerm = 2;
+constexpr uint8_t CombineY = 0, CombineWeights = 1, CombineOut = 2, CombineInv = 4;
 }  // namespace bi
 
 }  // namespace
@@ -68,6 +81,14 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
     int pq = -1, pk = -1, pg = -1;          // GDN prep-dispatch scratch (PIE_GDN_PREP)
     bool prep_pending = false;              // a GdnPrep preceded this layer's GdnCore
     int gp = -1, up = -1, hh = -1, dn = -1;                    // mlp temporaries
+    // The mixture. These are tracked as ordinary values with honest live ranges
+    // rather than pinned, so the shared colouring SEES the extent instead of
+    // being told about it -- `expert_weights` and the sort's outputs are
+    // written once and still read five dispatches later, with three matvecs in
+    // between allocating freely.
+    int router_logits = -1, expert_ids = -1, expert_weights = -1;
+    int perm = -1, row_expert = -1, tile_expert = -1, inv = -1;
+    int sorted_x = -1, sorted_out = -1;
 
     auto rd = [&](int ord, uint8_t b, int val) { uses.push_back({ord, b, val, false}); };
     auto wr = [&](int ord, uint8_t b, int val) { uses.push_back({ord, b, val, true}); };
@@ -222,6 +243,62 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
                 resid = nr;
                 break;
             }
+
+            // ── the routed FFN ──
+            // Mirrors the llama family's dataflow dispatch for dispatch,
+            // because it is the same nine kernels reading the same binds.
+            case Kernel::LlRouter:
+                router_logits = fresh();
+                rd(o, bi::QmvX, normed); wr(o, bi::QmvOut, router_logits);
+                break;
+            case Kernel::GoRouterTopK:
+                // Two outputs, and both outlive the three matvecs that follow:
+                // the ids name each pair's expert and the weights are what the
+                // combine finally sums with.
+                expert_ids = fresh(); expert_weights = fresh();
+                rd(o, bi::RouterLogits, router_logits);
+                wr(o, bi::RouterIds, expert_ids); wr(o, bi::RouterWeights, expert_weights);
+                break;
+            case Kernel::LlMoeSort:
+                // Four outputs: the permutation the gather applies, the
+                // per-row expert the matvec form reads, the per-tile expert
+                // the matmul form reads, and the inverse the combine reads.
+                perm = fresh(); row_expert = fresh(); tile_expert = fresh(); inv = fresh();
+                rd(o, bi::SortIds, expert_ids);
+                wr(o, bi::SortPerm, perm); wr(o, bi::SortRowExpert, row_expert);
+                wr(o, bi::SortTileExpert, tile_expert); wr(o, bi::SortInv, inv);
+                break;
+            case Kernel::LlMoeGather:
+                sorted_x = fresh();
+                rd(o, bi::RowsIn, normed); wr(o, bi::RowsOut, sorted_x);
+                rd(o, bi::RowsPerm, perm);
+                break;
+            case Kernel::LlExpertGate:
+                gp = fresh();
+                rd(o, bi::QmvX, sorted_x); rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert); wr(o, bi::QmvOut, gp);
+                break;
+            case Kernel::LlExpertUp:
+                up = fresh();
+                rd(o, bi::QmvX, sorted_x); rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert); wr(o, bi::QmvOut, up);
+                break;
+            case Kernel::LlExpertDown:
+                // Still sorted: the k results per token are only brought back
+                // together by the combine, which reads them where the sort
+                // left them, through its inverse.
+                sorted_out = fresh();
+                rd(o, bi::QmvX, hh); rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert); wr(o, bi::QmvOut, sorted_out);
+                break;
+            case Kernel::LlMoeCombine:
+                // The mixture's output takes the place a dense `down_proj`
+                // would have written, so the layer's residual add below needs
+                // no case of its own.
+                dn = fresh();
+                rd(o, bi::CombineY, sorted_out); rd(o, bi::CombineWeights, expert_weights);
+                rd(o, bi::CombineInv, inv); wr(o, bi::CombineOut, dn);
+                break;
 
             // tail lm_head: reads normed_final from scratch, writes logits to IO (not scratch).
             case Kernel::QmvLmHead:

@@ -37,6 +37,24 @@ inline int scratch_widest_elems(const DecodeGeometry& g) {
     widest = widest > g.gdn_conv_dim ? widest : g.gdn_conv_dim;    // GDN in-proj out
     const int q = g.n_q_heads * g.head_dim;                        // packed q projection
     widest = widest > q ? widest : q;
+    // The mixture, whose activations are the one place in this family where a
+    // dispatch writes more than one result per token. The sort turns the
+    // (token, slot) pairs into ROWS, so the gathered input is `sorted x hidden`
+    // and the gate/up stack is `sorted x moe_intermediate`. Sized like a dense
+    // activation they would overrun by a factor of `experts_per_token` -- and
+    // the overrun is into the next pool slot, which is another live activation
+    // rather than unmapped memory, so it corrupts instead of faulting.
+    if (g.is_moe()) {
+        const int sorted = moe_sorted_rows(g);
+        const int gathered = sorted * g.hidden;
+        const int stack = sorted * g.moe_intermediate;
+        widest = widest > gathered ? widest : gathered;
+        widest = widest > stack ? widest : stack;
+        // The router's logits are one per expert, which for a 512-expert
+        // mixture is narrower than everything above -- but it is a real
+        // activation and the bound must not depend on that staying true.
+        widest = widest > g.n_experts ? widest : g.n_experts;
+    }
     return widest;
 }
 

@@ -57,8 +57,18 @@ enum class Region : uint8_t {
                     // this; the M=1 HND ring above is UNTOUCHED/reinterpreted)
 };
 
-// Scratch ping-pong pool size (beta, from WAR/WAW chain). 6 max-shape buffers.
-inline constexpr int SCRATCH_POOL = 6;
+// Scratch ping-pong pool size (beta, from WAR/WAW chain).
+//
+// This is the CAP, not the allocation: the executor commits `colors_used`
+// slots, which is six for a dense stack and eight for a routed one. The
+// mixture is what set the number -- its router writes two values and its sort
+// writes four, all of them read after three matvecs have allocated freely in
+// between, so six of the eight live at once where a dense FFN has three.
+//
+// A schedule needing more than this has nowhere to spill: `bind_scratch` skips
+// any buffer id past the end of the pool, so the overflow binds to nothing and
+// every dispatch reading it gets whatever was last there.
+inline constexpr int SCRATCH_POOL = 8;
 
 // ── IO region slots (I1: all GPU-read buffers, never setBytes) ───────────────
 // M=1: scalars are written at [0] only (the sealed single-stream path is unchanged).

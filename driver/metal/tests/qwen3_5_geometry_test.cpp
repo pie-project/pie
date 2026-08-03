@@ -18,6 +18,7 @@
 #include <string>
 
 #include "batch/forward.hpp"
+#include "batch/scratch.hpp"
 #include "model/qwen3_5/decode_consts.hpp"
 #include "model/qwen3_5/decode_step.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
@@ -375,6 +376,75 @@ void check_the_routed_matvecs_know_their_own_width() {
            "a dense projection has a width even then -- which is why the trap was quiet");
 }
 
+// The mixture's activations, and whether they fit.
+void check_the_mixture_fits_the_scratch_pool() {
+    std::printf("\n-- the mixture's activations --\n");
+    using pie::metal::Kernel;
+    std::string err;
+    DecodeGeometry moe{};
+    expect(geometry_from_facts(qwen3_next_routed(), moe, &err), "routed geometry builds");
+    DecodeGeometry dense{};
+    expect(geometry_from_facts(qwen3_next(), dense, &err), "dense geometry builds");
+
+    const auto m_sched =
+        pie::metal::build_scratch_schedule(pie::metal::build_decode_dag(moe), moe);
+    const auto d_sched =
+        pie::metal::build_scratch_schedule(pie::metal::build_decode_dag(dense), dense);
+
+    // The colouring self-checks that no two simultaneously-live activations
+    // share a buffer. The routed block is where that is hardest: the sort's
+    // four outputs and the router's two are written once and still read after
+    // three matvecs have allocated freely between them, so a colouring that
+    // treated them like dense temporaries would recycle one under its reader.
+    expect(m_sched.hazard_free, "the routed schedule is hazard-free");
+    expect(d_sched.hazard_free, "the dense schedule still is");
+    // And it has to fit. There is no spilling here -- a schedule needing more
+    // buffers than the pool has would bind the overflow to nothing and every
+    // dispatch past it would read whatever was last there.
+    expect(m_sched.colors_used <= pie::metal::SCRATCH_POOL,
+           "the routed schedule fits the pool: " + std::to_string(m_sched.colors_used) + " of " +
+               std::to_string(pie::metal::SCRATCH_POOL));
+
+    // The pool slot has to be sized for a SORTED stack, not for a token's
+    // worth. `experts_per_token` rows of `moe_intermediate` is what the gate
+    // and up actually write, and an overrun here runs into the next pool slot
+    // -- another live activation -- rather than into unmapped memory, so it
+    // corrupts silently instead of faulting.
+    const int sorted = pie::metal::moe_sorted_rows(moe);
+    expect(pie::metal::scratch_widest_elems(moe) >= sorted * moe.moe_intermediate,
+           "a scratch slot holds the whole sorted gate/up stack");
+    expect(pie::metal::scratch_widest_elems(moe) >= sorted * moe.hidden,
+           "and the gathered rows the projections read");
+    // The long live range, checked as a specific claim rather than left to the
+    // colouring's global self-check. `RouterTopK` writes the routing weights
+    // and `Combine` is what finally sums with them -- five dispatches and three
+    // matvecs later, every one of which allocates. If the colouring recycled
+    // that buffer under its reader, the mixture would be summed with whatever
+    // the last matvec wrote, which is a plausible-looking blend of the right
+    // experts.
+    {
+        const auto dag = pie::metal::build_decode_dag(moe);
+        int wrote = -1, read = -1;
+        for (std::size_t i = 0; i < dag.size(); ++i) {
+            for (const auto& b : m_sched.per_dispatch[i].binds) {
+                if (dag[i].kind == Kernel::GoRouterTopK && b.bind_index == 2 && wrote < 0) {
+                    wrote = b.buffer_id;
+                } else if (dag[i].kind == Kernel::LlMoeCombine && b.bind_index == 1 &&
+                           read < 0) {
+                    read = b.buffer_id;
+                }
+            }
+            if (read >= 0) break;
+        }
+        expect(wrote >= 0 && read == wrote,
+               "the routing weights survive from the router to the combine");
+    }
+
+    // A dense model pays none of it.
+    expect(pie::metal::scratch_widest_elems(dense) < sorted * moe.hidden,
+           "a dense model's pool is not sized for a mixture it does not have");
+}
+
 }  // namespace
 
 int main() {
@@ -385,6 +455,7 @@ int main() {
     check_the_routed_ffn_is_bounded_by_what_the_kernels_do();
     check_the_routed_ffn_replaces_the_dense_one_and_nothing_else();
     check_the_routed_matvecs_know_their_own_width();
+    check_the_mixture_fits_the_scratch_pool();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
