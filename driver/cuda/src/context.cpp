@@ -388,12 +388,6 @@ void tp_startup_cpu_barrier(const pie_cuda_driver::Config& cfg) {
 }
 
 int configured_mtp_num_drafts(const pie_cuda_driver::Config& cfg) {
-    static const int forced = [] {
-        const char* v = std::getenv("PIE_MTP_DRAFT_TOKENS");
-        if (v == nullptr || v[0] == '\0') return -1;
-        return std::clamp(std::atoi(v), 0, 32);
-    }();
-    if (forced >= 0) return forced;
     return std::clamp(cfg.model.mtp_num_drafts, 0, 32);
 }
 
@@ -1058,13 +1052,8 @@ int Context::Impl::load_model(
         plan_info.has_mtp
             ? mem_plan.max_requests * native_mtp_num_drafts
             : 0;
-    const long kv_page_cap = [&]() -> long {
-        if (const char* e = std::getenv("PIE_KV_PAGE_CAP")) {
-            const long v = std::atol(e);
-            if (v > 0) return v;
-        }
-        return static_cast<long>(cfg.batching.total_pages);
-    }();
+    // 0 = derive from `gpu_mem_utilization`; >0 is the operator's hard cap.
+    const long kv_page_cap = static_cast<long>(cfg.batching.total_pages);
     if (mem_plan.kv_page_bytes == 0) {
         std::cerr << "[pie-driver-cuda] zero KV page byte coefficient\n";
         return PIE_STATUS_UNSUPPORTED;

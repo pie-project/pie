@@ -46,7 +46,7 @@ async fn run_arms(inputs: &[&str]) -> Result<Vec<std::result::Result<String, Str
     common::init_trace();
     let ws = build_inferlet()?;
 
-    let pie = common::boot_4090_mtp().await?;
+    let pie = common::boot_4090_mtp(common::mtp_draft_tokens(3)).await?;
     eprintln!(
         "[rs-buffer-bench] booted Qwen3.5-0.8B, listen_addr={}",
         pie.listen_addr
