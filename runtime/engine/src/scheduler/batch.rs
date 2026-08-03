@@ -419,6 +419,7 @@ pub(crate) fn build_frame_submission(
             .map(|(arrival, req)| fire_plan::MemberFacts {
                 hook_program: req.hook_program,
                 lora: req.lora_program,
+                custom_mask: req.request.has_user_mask,
                 device_resolved_geometry: req.request.device_resolved_geometry,
                 arrival,
             })
@@ -437,7 +438,7 @@ pub(crate) fn build_frame_submission(
         let plan = fire_plan::plan_fire_with_model(&facts, model_sites);
         debug_assert_eq!(
             plan.sites.len(),
-            2 + model_sites.len(),
+            3 + model_sites.len(),
             "the merged plan carries both member-fact sites and every model site"
         );
         debug_assert_eq!(
@@ -448,6 +449,7 @@ pub(crate) fn build_frame_submission(
                     (
                         group[i].request.device_resolved_geometry,
                         group[i].hook_program,
+                        group[i].request.has_user_mask,
                     )
                 });
                 order

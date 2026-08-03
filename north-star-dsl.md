@@ -1088,3 +1088,70 @@ R=3 co-fire ever formed across every battery; new lanes admit only
 after a running lane completes). Pre-existing behavior, possibly the
 kv-contention grant rewrite's policy — not this thread's, but it caps
 composition diversity in every hook battery.
+
+## THE NORTH-STAR SUPERGRAPH DIRECTIVE (2026-08-03, user) — the spatial merge
+
+The user's verdict on the arc so far, recorded verbatim in substance:
+the shipped supergraph is ARTIFACT-sharing (one exec object reused
+across fire variants — temporal; its gain goes to zero if capture
+were free), while the north star is WORK-sharing (N member programs
+merged into ONE execution inside a fire — spatial; 32 adapters read
+the weights once, a gain no capture cache can produce). The wiki's
+measured numbers (46x/14.09x/1.53x, the 1.01x correction floor, the
+250us conditional region floor, SWITCH constant in bodies) all
+belong to the spatial mechanism. The standing order: build THAT.
+
+What pie already holds, mapped to the tart vocabulary
+(concept/supergraph_ir.md + evidence/layout_planning.md):
+- N programs per fire: EXISTS — co-batched lanes with per-lane
+  attachments; the predicate vocabulary (write-desc, score, mask,
+  lora, hooks) is the Program feature space.
+- CORRECTION class: EXISTS at the 1.01x shape — lora's span-grouped
+  additive correction on materialized q/v ("a fused edge cannot be a
+  merge point" is the has_lora term in the fused predicate).
+- Seriation v0: EXISTS — fire_plan.rs stable sort (geometry,
+  hook_program, arrival); its Prefix lowering is consumed as the
+  Peel split.
+- Lowering::Prefix as a REAL spatial mechanism: EXISTS since the
+  device-window campaign — pi.peel_window is a row-range member mask
+  in device memory; one exec serves any split.
+- Conditional machinery: EXISTS (SupergraphBuilder, device preds,
+  capture-time insertion, handle scope rules) — exactly what the
+  STRUCTURAL class needs; only its GRANULARITY is wrong (wired to
+  fire-level bits, must move to region/row-range level).
+What is missing (the user's five-item ladder, in pie terms):
+1. Per-op member masks: predicates become per-REGION row windows
+   (seriation makes member sets contiguous, so a window word per
+   axis — peel_window's generalization — IS the bitmask).
+2. Edge buffers at divergence points (the materialization decision,
+   today implicit in the fused-vs-unfused predicate, becomes
+   plan-owned).
+3. The row layout planner: the sort key generalized so EVERY axis's
+   member set is an interval (lexicographic refinement now; PQ-tree
+   C1P when axes stop nesting — layout_planning.md).
+4. The union pass: N per-class traces -> one merged op list whose
+   divergent ops carry windows; fire-level Guards dissolve into
+   region windows. This kills the 2^k wall at its root: no path
+   enumeration, member masks on nodes.
+5. (Ready.) The admission side already co-batches the programs.
+
+The NS ladder (each rung parity-gated live, per standing practice):
+- NS-1: seriation refinement — MemberFacts gains the mask axis; the
+  sort key nests it under hooks; a SITE_ATTENTION_MASK site with the
+  unmasked-prefix/masked-tail split as plan data (the mask analogue
+  of Stage 1's fast_rows). Engine-side only, consumed later.
+- NS-2: the first spatial mask fire — the masked pure-decode arm
+  stops serving ALL rows with the custom-mask kernel: unmasked
+  window takes the decode kernel, masked window the custom kernel,
+  both device-windowed (the Peel pattern on a second axis). This is
+  the first fire where two attention kernels serve one fire by row
+  range — the real "여러 멤버를 하나의 실행으로".
+- NS-3: window words become a vector (pi.region_windows), one per
+  divergence axis; the emitter's Guard emission takes windows from
+  the plan instead of fire-level bits; conditional nodes gate on
+  window-nonempty at REGION granularity (>=250us bodies).
+- NS-4: the union pass in the forward crate — per-class traces merge
+  by fingerprint (SCS with the blocking rule); goldens pin the
+  merged op lists; the 2^k supergraph key collapses to bucket keys.
+- NS-5: retire the fire-level two-path form once NS-3/4 serve its
+  fires (it remains the fallback until byte-parity holds everywhere).

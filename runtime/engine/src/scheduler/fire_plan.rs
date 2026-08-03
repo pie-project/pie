@@ -193,6 +193,13 @@ pub(crate) const SITE_QKV_POSTPROCESS: &str = "qkv_postprocess";
 /// grouping comment at that site).
 pub(crate) const SITE_PROJECTION_WEIGHTS: &str = "projection_weights";
 
+/// The attention-mask site (NS-1): members carrying a user-authored wire
+/// mask force the custom-mask attention arm. Structural — the attention
+/// kernel differs — and seriated: the unmasked prefix keeps the plain
+/// decode kernel once NS-2 windows the arms; until then the site is plan
+/// data, the mask analogue of Stage 1's `fast_rows`.
+pub(crate) const SITE_ATTENTION_MASK: &str = "attention_mask";
+
 /// The expert-weights site: per-TOKEN weight divergence — an MoE trace's
 /// expert-indexed matmuls (`pie_forward`'s `Matmul { selector }`, the
 /// `layer.{l}.expert.{e}.*` templates whose `{e}` a `TopK` value resolves
@@ -247,6 +254,12 @@ pub(crate) struct MemberFacts {
     pub(crate) hook_program: bool,
     /// The program carries the pass-wide `lora` configuration sink.
     pub(crate) lora: bool,
+    /// The member's wire rows carry a user-authored attention mask
+    /// (`has_user_mask`). NS-1 of the north-star supergraph ladder: the
+    /// seriation key nests this under hooks so the masked members form a
+    /// contiguous tail — the row-window precondition for the spatial mask
+    /// fire (NS-2), exactly as hooks-last was the Peel's precondition.
+    pub(crate) custom_mask: bool,
     /// Device-resolved (chained-decode envelope) geometry: composes as the
     /// ordered suffix sub-batch, never interleaved with wire members.
     pub(crate) device_resolved_geometry: bool,
@@ -259,7 +272,7 @@ pub(crate) struct MemberFacts {
 pub(crate) struct FirePlan {
     /// Indices into the planned members, in submission order. The existing
     /// sort key generalized: `(device_resolved_geometry, hook_program,
-    /// arrival)`, stable. Device-geometry members last is PRIMARY (the
+    /// custom_mask, arrival)`, stable. Device-geometry members last is PRIMARY (the
     /// driver's offset fixed-decode compose needs the envelope lanes as a
     /// contiguous program suffix); hooks-last within each class is what
     /// makes the qkv_postprocess prefix maximal.
@@ -323,6 +336,7 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
         (
             member.device_resolved_geometry,
             member.hook_program,
+            member.custom_mask,
             member.arrival,
         )
     });
@@ -372,7 +386,34 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
         }
     };
 
-    let mut sites = vec![qkv_postprocess, projection_weights];
+    let mask_members = members.iter().filter(|m| m.custom_mask).count();
+    let attention_mask = if mask_members == 0 {
+        Site {
+            name: SITE_ATTENTION_MASK,
+            class: DivClass::Structural,
+            granularity: Granularity::Request,
+            lowering: Lowering::Uniform,
+            note: "no masked lanes; the plain attention arm covers the step".to_string(),
+        }
+    } else {
+        let unmasked_rows = member_order
+            .iter()
+            .take_while(|&&index| !members[index].custom_mask)
+            .count() as u32;
+        Site {
+            name: SITE_ATTENTION_MASK,
+            class: DivClass::Structural,
+            granularity: Granularity::Request,
+            lowering: Lowering::Prefix {
+                fast_rows: unmasked_rows,
+            },
+            note: format!(
+                "{mask_members} masked lane(s) seriated to the tail; the                  unmasked prefix keeps the plain attention arm (NS-2                  consumes the split)"
+            ),
+        }
+    };
+
+    let mut sites = vec![qkv_postprocess, projection_weights, attention_mask];
     sites.extend_from_slice(model_sites);
 
     FirePlan {
@@ -394,9 +435,42 @@ mod tests {
         MemberFacts {
             hook_program,
             lora,
+            custom_mask: false,
             device_resolved_geometry,
             arrival,
         }
+    }
+
+    fn masked_member(arrival: usize) -> MemberFacts {
+        MemberFacts {
+            hook_program: false,
+            lora: false,
+            custom_mask: true,
+            device_resolved_geometry: false,
+            arrival,
+        }
+    }
+
+    /// NS-1: masked members seriate to the tail of their (geometry, hook)
+    /// class and the attention_mask site reports the unmasked prefix.
+    #[test]
+    fn masked_members_seriate_last_and_the_site_counts_the_prefix() {
+        let members = vec![
+            masked_member(0),
+            member(false, false, false, 1),
+            masked_member(2),
+            member(false, false, false, 3),
+        ];
+        let plan = plan_fire(&members);
+        assert_eq!(plan.member_order, vec![1, 3, 0, 2]);
+        let mask_site = site(&plan, SITE_ATTENTION_MASK);
+        assert_eq!(mask_site.class, DivClass::Structural);
+        assert_eq!(mask_site.lowering, Lowering::Prefix { fast_rows: 2 });
+        // Hooks stay OUTSIDE the mask key: a hooked member sorts after
+        // every unhooked one, masked or not.
+        let mixed = vec![masked_member(0), member(true, false, false, 1)];
+        let plan = plan_fire(&mixed);
+        assert_eq!(plan.member_order, vec![0, 1]);
     }
 
     fn site<'a>(plan: &'a FirePlan, name: &str) -> &'a Site {
@@ -535,7 +609,7 @@ mod tests {
     fn planned_sites_are_request_granularity() {
         let members = vec![member(true, true, false, 0), member(false, false, false, 1)];
         let plan = plan_fire(&members);
-        assert_eq!(plan.sites.len(), 2);
+        assert_eq!(plan.sites.len(), 3);
         for site in &plan.sites {
             assert_eq!(site.granularity, Granularity::Request, "{}", site.name);
         }
@@ -627,7 +701,7 @@ mod tests {
         let model_sites = site_table::derive_sites(&traced);
         let members = vec![member(false, false, false, 0), member(true, false, false, 1)];
         let plan = plan_fire_with_model(&members, &model_sites);
-        assert_eq!(plan.sites.len(), 3);
+        assert_eq!(plan.sites.len(), 4);
         let expert = plan
             .sites
             .iter()
