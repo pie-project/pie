@@ -656,3 +656,52 @@ axes it verified live this arc (xqa, dfp, wt/cm, te, and today's
 first-boot matches for qb/fpp/pad). Rung 3's claim — "the declared
 form is statically convertible to C++ at full width" — now has no
 untested deployment in this environment left to test it on.
+
+## The supergraph directive (2026-08-03) — unionized, no compromise
+
+Directive (user, this date): go to the FULL supergraph; the unionized
+supergraph is a non-negotiable condition; fix fallout after. This
+supersedes the measurement-gated stance for this thread — the
+measurement happens after the thing exists.
+
+**What "union" means here.** Today's graph reality fragments on THREE
+axes: the `ForwardGraphKey.variant` bits (mask/layout/spec), the hook
+exec partitions (per program-set, fingerprint-guarded, churn-banned),
+and outright eager fallbacks (lora fires, most attachment combos —
+`forward_graph_replay_eligible`'s exclusion list). The supergraph
+folds ALL of that into ONE conditional graph per (R, N) bucket: the
+guard vocabulary (HasWriteDesc / WantsAttnScore / HasCustomMask /
+HasLora, nested) becomes CUDA conditional IF/ELSE nodes whose
+predicates a graph-embedded kernel reads from a DEVICE-resident aux
+word, and every attachment combination replays through the same exec.
+The (R, N) bucketing stays — kernel grid dims and scalar args are
+baked at capture, which is CUDA-graph physics, and the request lattice
+already handles it; the union axis is ATTACHMENTS, exactly the axis
+the class-collapse amendment (A) reduced to five predicates.
+
+**Proven premises** (tools/supergraph-poc, run on this box):
+conditional IF/ELSE insertion during stream capture; device-read
+predicates via `cudaGraphSetConditional` inside the graph; one exec
+serving both arms across replays. CUDA 13.0 / driver 580 — all green.
+
+**The ladder:**
+- S1 ✓ — PoC + this design.
+- S2 — the emitter's third mode: `..._supergraph_build(...)` per
+  deployment × Decode class — the generated text emitted AS a capture
+  builder (straight-line segments captured; each Guard emitted as
+  conditional-node insertion + body-graph capture of its arms; the
+  set_cond kernels at graph head consuming the device aux word).
+- S3 — driver integration: the fire's aux/pred word moves to a device
+  buffer the replay path updates; `capture_forward_graph_exec` gains
+  the supergraph variant; the graph cache key drops the folded axes
+  (variant mask bit, hook partitions) for supergraph-eligible fires.
+- S4 — batteries (every attachment combo × every deployment, replay
+  vs eager byte-parity) and the fallout-repair pass the directive
+  orders LAST, including the axes the union cannot yet eat:
+  * Peel row windows (`fast_rows` bakes into kernel args — device-read
+    row windows are a kernel-surgery campaign; until then a mixed
+    hooked fire replays the all-hooked arm or falls out),
+  * flashinfer plan stability inside conditional bodies
+    (page-count-independent plans — the page-mask compact precedent),
+  * lora staging (host-driven apply inside a captured body needs the
+    grouped-GEMM form to be capture-safe).
