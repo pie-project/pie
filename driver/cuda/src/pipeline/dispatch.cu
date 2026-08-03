@@ -7719,7 +7719,7 @@ int Dispatch::dense_mask_scope_violation(const pie_native::LaunchView& view,
     // the frame's pack; admission only answers the scope question.
     static const bool spatial_on = [] {
         const char* v = std::getenv("PIE_SPATIAL_MASK");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        return v == nullptr || v[0] != '0';
     }();
     if (spatial_on &&
         view.planned_unmasked_prefix_rows != PIE_UNMASKED_PREFIX_UNPLANNED) {

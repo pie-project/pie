@@ -699,7 +699,7 @@ void prepare_llama_like_decode_plan(
     // never reach here with a split).
     static const bool spatial_mask_on = [] {
         const char* v = std::getenv("PIE_SPATIAL_MASK");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        return v == nullptr || v[0] != '0';
     }();
     if (spatial_mask_on && have_custom_mask && is_pure_decode &&
         unmasked_prefix_rows != 0xffffffffu &&

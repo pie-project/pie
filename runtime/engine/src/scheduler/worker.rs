@@ -457,7 +457,7 @@ pub(crate) struct LaunchGrouping {
 fn spatial_mask_compose_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("PIE_SPATIAL_MASK").is_ok_and(|v| !v.is_empty() && v != "0")
+        !std::env::var("PIE_SPATIAL_MASK").is_ok_and(|v| v == "0")
     })
 }
 
@@ -7625,11 +7625,15 @@ mod tests {
             !grouping.push(&host_on_device, limits, 16),
             "wire rows distinguish a host-derived mask from dense device lowering"
         );
+        // NS-2 (spatial mask, default ON): a wire-BRLE-masked
+        // device-geometry decode lane COMPOSES — the split body serves the
+        // masked suffix and the unmasked prefix needs no mask rows, which
+        // is what dissolved the old solo rule.
         let mut ordinary_group = LaunchGrouping::default();
         ordinary_group.push(&dummy_launch_request(ProcessId::new_v4(), 5), limits, 16);
         assert!(
-            !ordinary_group.accepts(&host_on_device, limits, 16),
-            "resolved-geometry host masks remain incompatible with reordered wire rows"
+            ordinary_group.accepts(&host_on_device, limits, 16),
+            "the spatial split composes resolved-geometry host masks"
         );
     }
 
@@ -7685,34 +7689,33 @@ mod tests {
             request
         };
 
-        for host_lowered in [true, false] {
-            // Masked fire first: no wire fire, prefill chunk, or envelope
-            // decode lane may join behind it.
-            let masked = pooled_masked(1, host_lowered);
+        // NS-2 (spatial mask, default ON): the HOST-lowered pooled masked
+        // fire (wire BRLE rows) now COMPOSES with wire decode fires and
+        // envelope lanes — the split body's contract — while chunk
+        // prefills stay refused (multi-token) and the DEVICE-lowered
+        // (dense channel, no wire rows) shape stays fully solo.
+        {
+            let masked = pooled_masked(1, true);
             let mut grouping = LaunchGrouping::default();
             assert!(grouping.accepts(&masked, limits, 16));
             grouping.push(&masked, limits, 16);
             assert!(
-                !grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 2), limits, 16),
-                "a wire decode fire must not join a pooled masked \
-                 device-geometry fire (host_lowered={host_lowered})"
+                grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 2), limits, 16),
+                "a wire decode fire composes with a host-lowered masked \
+                 device-geometry fire (the spatial split)"
             );
             let mut prefill = dummy_launch_request(ProcessId::new_v4(), 3);
             prefill.request = dummy_prefill(64);
             assert!(
                 !grouping.accepts(&prefill, limits, 16),
-                "a chunk-prefill fire must not join a pooled masked \
-                 device-geometry fire (host_lowered={host_lowered})"
+                "a chunk-prefill fire still must not join a masked \
+                 device-geometry fire"
             );
             assert!(
-                !grouping.accepts(&envelope_decode(4), limits, 16),
-                "an envelope decode lane must not join a pooled masked \
-                 device-geometry fire (host_lowered={host_lowered})"
+                grouping.accepts(&envelope_decode(4), limits, 16),
+                "an envelope decode lane composes with a host-lowered \
+                 masked device-geometry fire (the spatial split)"
             );
-
-            // Wire fire first: the masked fire defers instead of joining —
-            // the exact composition observed live (mixed load, a plain
-            // lane's wire fire already grouped).
             let mut grouping = LaunchGrouping::default();
             grouping.push(
                 &dummy_launch_request(ProcessId::new_v4(), 5),
@@ -7720,17 +7723,37 @@ mod tests {
                 16,
             );
             assert!(
-                !grouping.accepts(&pooled_masked(6, host_lowered), limits, 16),
-                "a pooled masked device-geometry fire must not join wire \
-                 fires (host_lowered={host_lowered})"
+                grouping.accepts(&pooled_masked(6, true), limits, 16),
+                "a host-lowered masked device-geometry fire joins wire \
+                 fires (the spatial split)"
             );
-
-            // Liveness: the deferred fire still heads its own fresh group.
+        }
+        {
+            // The DEVICE-lowered dense mask: no wire rows, nothing to
+            // pack at composed positions — solo in both directions,
+            // exactly as before.
+            let masked = pooled_masked(11, false);
+            let mut grouping = LaunchGrouping::default();
+            assert!(grouping.accepts(&masked, limits, 16));
+            grouping.push(&masked, limits, 16);
+            assert!(
+                !grouping.accepts(&dummy_launch_request(ProcessId::new_v4(), 12), limits, 16),
+                "a wire decode fire must not join a dense-device-masked fire"
+            );
+            let mut grouping = LaunchGrouping::default();
+            grouping.push(
+                &dummy_launch_request(ProcessId::new_v4(), 13),
+                limits,
+                16,
+            );
+            assert!(
+                !grouping.accepts(&pooled_masked(14, false), limits, 16),
+                "a dense-device-masked fire must not join wire fires"
+            );
             let fresh = LaunchGrouping::default();
             assert!(
-                fresh.accepts(&pooled_masked(7, host_lowered), limits, 16),
-                "the refused masked fire stays schedulable solo \
-                 (host_lowered={host_lowered})"
+                fresh.accepts(&pooled_masked(15, false), limits, 16),
+                "the refused masked fire stays schedulable solo"
             );
         }
     }

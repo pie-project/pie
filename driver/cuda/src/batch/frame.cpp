@@ -948,7 +948,7 @@ void prepare_step(
             // the whole frame.
             static const bool spatial_mask_on = [] {
                 const char* v = std::getenv("PIE_SPATIAL_MASK");
-                return v != nullptr && v[0] != '\0' && v[0] != '0';
+                return v == nullptr || v[0] != '0';
             }();
             const bool spatial_planned = spatial_mask_on &&
                 view.planned_unmasked_prefix_rows !=
@@ -1695,7 +1695,7 @@ void prepare_step(
         !use_structured_mask && !s.have_custom_mask) {
         static const bool spatial_mask_on2 = [] {
             const char* v = std::getenv("PIE_SPATIAL_MASK");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
+            return v == nullptr || v[0] != '0';
         }();
         struct MaskedProgram {
             int program = 0;

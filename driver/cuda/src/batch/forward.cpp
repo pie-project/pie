@@ -757,7 +757,7 @@ bool forward_graph_replay_eligible(
 static bool spatial_mask_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_SPATIAL_MASK");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        return v == nullptr || v[0] != '0';
     }();
     return on;
 }
