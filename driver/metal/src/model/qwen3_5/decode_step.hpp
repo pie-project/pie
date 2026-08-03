@@ -64,15 +64,19 @@ struct DecodeStepPsos {
     const Pso& operator[](Kernel k) const { return by_kind[static_cast<int>(k)]; }
 };
 
-/// Rows the mixture's sort produces for one token.
+/// Rows the mixture's sort produces for a batch of `n_tokens`.
 ///
-/// One per (token, slot) pair, plus whatever padding the tile costs. It is the
-/// extent of every routed projection, of the SiluMul between them, and of the
-/// gather that fills them, so it is asked in ONE place: three call sites each
-/// deriving it would be three chances to disagree, and a disagreement here is
-/// a read off the end of the routing rather than a wrong answer.
-inline int moe_sorted_rows(const DecodeGeometry& g) {
-    return shared_kernels::moe_sorted_rows(g.experts_per_token, g.n_experts);
+/// One per (token, slot) pair, plus whatever padding the tile costs -- which
+/// is none at M=1, where the sort is a pure grouping, and up to `tile - 1` per
+/// touched expert once the batch is big enough to make the projections
+/// matmuls. It is the extent of every routed projection, of the SiluMul
+/// between them, of the gather that fills them and of the pool slot that holds
+/// them, so it is asked in ONE place: five call sites each deriving it would
+/// be five chances to disagree, and a disagreement here is a read off the end
+/// of the routing rather than a wrong answer.
+inline int moe_sorted_rows(const DecodeGeometry& g, int n_tokens = 1) {
+    const int n = n_tokens > 0 ? n_tokens : 1;
+    return shared_kernels::moe_sorted_rows(n * g.experts_per_token, g.n_experts);
 }
 
 // Build the ordered per-token DAG (~393 raw dispatches; 363 are golden-tapped) from

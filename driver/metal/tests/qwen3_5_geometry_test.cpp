@@ -21,6 +21,7 @@
 #include "batch/scratch.hpp"
 #include "model/qwen3_5/decode_consts.hpp"
 #include "model/qwen3_5/decode_step.hpp"
+#include "model/qwen3_5/decode_step_mb.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
 #include "model/shared_kernels.hpp"
 
@@ -445,6 +446,93 @@ void check_the_mixture_fits_the_scratch_pool() {
            "a dense model's pool is not sized for a mixture it does not have");
 }
 
+// The mixture on the batched path, where the sort starts to pay.
+void check_the_batched_mixture_becomes_a_matmul() {
+    std::printf("\n-- the mixture, batched --\n");
+    using pie::metal::Kernel;
+    std::string err;
+    DecodeGeometry moe{};
+    expect(geometry_from_facts(qwen3_next_routed(), moe, &err), "routed geometry builds");
+
+    // The batched builder derives from the M=1 one, so the mixture is already
+    // in it -- what it needed was a launch shape. Before this it threw
+    // "missing multi-batch launch geometry", which was at least loud.
+    // Wide enough that the sort pays. The threshold is not a token count: it
+    // is `n_experts * tile / 2` PAIRS, so a 512-expert mixture needs 4096 of
+    // them before a tile is half full, which at ten experts per token is 410
+    // tokens. A 128-expert mixture would cross it at 103. The number below is
+    // chosen from that arithmetic rather than guessed.
+    const int wide = 512;
+    const auto dag = pie::metal::build_decode_dag_mb(moe, wide, 0);
+    int routed_dispatches = 0;
+    for (const auto& d : dag) {
+        if (d.kind == Kernel::LlExpertGate || d.kind == Kernel::LlExpertUp ||
+            d.kind == Kernel::LlExpertDown) {
+            ++routed_dispatches;
+        }
+    }
+    expect(routed_dispatches == 3 * moe.n_layers, "the batched DAG routes every layer");
+
+    // A single-token decode routes ten pairs over five hundred and twelve
+    // experts, where every tile would be one live row in sixteen -- so the
+    // matvec wins outright and `qmm_bn` must stay zero. Once the batch is wide
+    // enough the projections become matmuls. Getting this backwards is not a
+    // crash either way: the matvec form re-reads the whole expert bank per
+    // row, which at width is the difference between amortizing the weights and
+    // not.
+    const auto one = pie::metal::build_decode_dag_mb(moe, 1, 0);
+    for (const auto& d : one) {
+        if (d.kind != Kernel::LlExpertGate) continue;
+        expect(d.qmm_bn == 0, "at M=1 the mixture stays matvecs");
+        break;
+    }
+    for (const auto& d : dag) {
+        if (d.kind != Kernel::LlExpertGate) continue;
+        expect(d.qmm_bn > 0, "at width the mixture becomes matmuls");
+        // And the tile must be what the sort padded to. A block spanning two
+        // experts reads one expert's weights for the other's rows.
+        expect(d.qmm_bm == pie::metal::shared_kernels::kMoeTileRows,
+               "a routed tile is the tile the sort padded every run to");
+        // Split-K would sum partial products across a K the routing already
+        // split by expert, so it must stay off.
+        expect(d.qmm_split == 1, "a routed projection is never split along K");
+        break;
+    }
+
+    // The projections run over the SORTED rows, which once the sort batches is
+    // neither the token count nor `tokens * k`: it pads every touched expert's
+    // run to a whole tile. Launched over the tokens instead, the tail of the
+    // stack keeps the previous layer's output.
+    const int sorted = pie::metal::moe_sorted_rows(moe, wide);
+    expect(sorted > wide * moe.experts_per_token,
+           "a batched sort pads, where the M=1 sort did not");
+    for (const auto& d : dag) {
+        if (d.kind != Kernel::LlMoeGather) continue;
+        expect(d.grid.y == static_cast<std::uint32_t>(sorted),
+               "the gather fills the whole padded stack");
+        break;
+    }
+    // The pool slot has to hold that padded stack. Every other activation in
+    // this family is `n` rows of its M=1 footprint, and the mixture is the one
+    // that is not: a linear bound says 5120 rows here and the sort produces
+    // 12800. The extra lands in the next pool slot, which is another live
+    // activation, so it corrupts rather than faults.
+    expect(pie::metal::scratch_slot_elems(moe, wide) >= std::size_t(sorted) * moe.hidden,
+           "a batched pool slot holds the sort's padding too");
+    expect(pie::metal::scratch_slot_elems(moe, wide) >
+               std::size_t(pie::metal::scratch_widest_elems(moe)) * wide,
+           "which is strictly more than n rows of the M=1 footprint");
+
+    // And the combine comes back to one row per TOKEN -- the k results per
+    // token are only summed here.
+    for (const auto& d : dag) {
+        if (d.kind != Kernel::LlMoeCombine) continue;
+        expect(d.grid.y == static_cast<std::uint32_t>(wide),
+               "the combine returns one row per token");
+        break;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -456,6 +544,7 @@ int main() {
     check_the_routed_ffn_replaces_the_dense_one_and_nothing_else();
     check_the_routed_matvecs_know_their_own_width();
     check_the_mixture_fits_the_scratch_pool();
+    check_the_batched_mixture_becomes_a_matmul();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

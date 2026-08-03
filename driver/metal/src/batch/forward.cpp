@@ -898,7 +898,8 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         return false;
     }
     if (g_.paged_kv_enabled &&
-        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, /*with_d512=*/false, &load_err)) {
+        !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, /*with_d512=*/false, &load_err,
+                              g_.is_moe())) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -2361,14 +2362,28 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             if (err != nullptr) *err = gerr;
             return false;
         }
-        // The routed FFN this family's own checkpoints ship is not built yet.
-        // Refused here rather than left to the dense DAG, which would ask the
-        // binder for an `mlp.gate_proj` a routed checkpoint does not have and
-        // report a missing tensor instead of a missing feature.
+        // The routed FFN is built -- DAG, kernels, launch shapes, constants,
+        // names and pool -- and one thing is not, so the refusal now names
+        // that one thing rather than the feature.
+        //
+        // The mixture's routing constants depend on the TOKEN COUNT: the sort
+        // is told how many (token, slot) pairs to place and how many rows its
+        // padding produced, and both scale with the batch. Every other
+        // constant in this family is N-invariant, which is why `setup` binds
+        // them once and the batched path reuses that binding for whatever
+        // width a step happens to arrive at. A mixture cannot: bound at
+        // `max_tokens` and run at eight, the sort places pairs that were never
+        // routed and the projections read rows the gather never filled.
+        //
+        // Fixing it is a decision, not a port -- rebind the routing params per
+        // step, or let the kernels read the pair count from a buffer the way
+        // the CSR lengths already are -- and guessing at it is exactly the
+        // kind of fluent wrongness the rest of this file is arranged against.
         if (geom.is_moe()) {
             if (err != nullptr) {
-                *err = "qwen3.5 geometry: this config has a routed FFN and the family's "
-                       "decode DAG builds a dense one";
+                *err = "qwen3.5 geometry: this config has a routed FFN, whose routing "
+                       "constants depend on the batch width, and this family binds its "
+                       "constants once";
             }
             return false;
         }

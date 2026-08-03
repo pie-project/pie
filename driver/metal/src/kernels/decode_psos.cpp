@@ -132,7 +132,8 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           const std::string& kernels_dir,
                           MultiBatchPsos& out,
                           bool with_d512,
-                          std::string* err) {
+                          std::string* err,
+                          bool routed) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
     struct MbSpec { const char* file; const char* fn; Pso* dst; bool required; };
@@ -183,6 +184,19 @@ bool load_multibatch_psos(RawMetalContext& ctx,
              "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_" + std::to_string(bm) +
                  "_bn_" + std::to_string(pie::metal::kQmmSplitBN),
              &out.qmm_t_splitk[w]);
+    }
+    if (routed) {
+        // `bm` is spelled from `kMoeTileRows` rather than restated: it is the
+        // number the sort padded every expert's run to, and a tile that
+        // disagreed with the padding would read one expert's weights for
+        // another's rows.
+        for (int i = 0; i < 3; ++i) {
+            want(qmm,
+                 "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" +
+                     std::to_string(shared_kernels::kMoeTileRows) + "_bn_" +
+                     std::to_string(16 << i),
+                 &out.qmm_routed[i]);
+        }
     }
     want(qmm, "qmm_splitk_reduce_bfloat16", &out.qmm_splitk_reduce);
     want(qmm, "qmm_splitk_reduce_residual_bfloat16", &out.qmm_splitk_reduce_residual);

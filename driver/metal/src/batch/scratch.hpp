@@ -64,7 +64,21 @@ inline int scratch_widest_elems(const DecodeGeometry& g) {
 // heap's scratch_slot_bytes = scratch_slot_elems(g, caps.max_tokens) * act_dtype_bytes; the
 // schedule itself is reused unchanged for M=1 and M>1.
 inline size_t scratch_slot_elems(const DecodeGeometry& g, int max_tokens = 1) {
-    return size_t(scratch_widest_elems(g)) * size_t(max_tokens < 1 ? 1 : max_tokens);
+    const int n = max_tokens < 1 ? 1 : max_tokens;
+    size_t elems = size_t(scratch_widest_elems(g)) * size_t(n);
+    // The mixture does NOT scale with the token count, and this is the one
+    // place in the pool where "n rows of the M=1 footprint" is the wrong
+    // answer. The sort pads every touched expert's run to a whole tile, so a
+    // batch of `n` tokens produces more than `n * experts_per_token` rows --
+    // for a 512-expert mixture at 512 tokens it is 12800 rows where the linear
+    // bound says 5120, a factor of two and a half. The overrun lands in the
+    // next pool slot, which is another live activation.
+    if (g.is_moe()) {
+        const int wide = g.hidden > g.moe_intermediate ? g.hidden : g.moe_intermediate;
+        const size_t sorted = size_t(moe_sorted_rows(g, n)) * size_t(wide);
+        if (sorted > elems) elems = sorted;
+    }
+    return elems;
 }
 
 // One scratch activation slot a dispatch binds: bind_index <- pool buffer `buffer_id`.

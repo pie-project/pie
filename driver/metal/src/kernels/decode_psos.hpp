@@ -60,6 +60,12 @@ struct MultiBatchPsos {
     // rather than packed at `K`.
     // Split-K: [bm_wide] x {gemm, reduce}.  MLX sends every transposed
     // non-batched decode down this path; the split is chosen per shape.
+    /// The mixture's batched form: the same GEMM with the weight stack indexed
+    /// per TILE rather than per dispatch. `bm` is fixed at `kMoeTileRows`,
+    /// because that is what the sort padded every expert's run to -- a tile
+    /// that spanned two experts would read one expert's weights for the
+    /// other's rows. Three column tiles, as elsewhere.
+    Pso qmm_routed[3]{};
     Pso qmm_t_splitk[2]{};
     Pso qmm_splitk_reduce{};
     Pso qmm_splitk_reduce_residual{};
@@ -92,6 +98,9 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           const std::string& kernels_dir,
                           MultiBatchPsos& out,
                           bool with_d512 = false,
-                          std::string* err = nullptr);
+                          std::string* err = nullptr,
+                          /// Compile the mixture's batched projections. Only a
+                          /// checkpoint whose geometry has experts runs them.
+                          bool routed = false);
 
 }  // namespace pie::metal

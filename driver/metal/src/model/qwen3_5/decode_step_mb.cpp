@@ -38,6 +38,13 @@ int qmv_out_size(Kernel k, const DecodeGeometry& g) {
         case Kernel::QmvGate:
         case Kernel::QmvUp: return g.intermediate;
         case Kernel::QmvLmHead: return g.vocab;
+        // The router is a DENSE matvec into one logit per expert: it runs over
+        // the tokens like any other projection, and only what follows it is
+        // routed. The three expert projections are deliberately absent -- they
+        // run over the SORTED rows, and answering here would launch them over
+        // the token count instead, computing the first `n` sorted rows and
+        // leaving the rest of the stack holding the previous layer's output.
+        case Kernel::LlRouter: return g.n_experts;
         default: return 0;
     }
 }
@@ -123,7 +130,49 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LayerOut:
             elementwise_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
         case Kernel::SiluMul:
-            elementwise_mb_dispatch(g.intermediate, n, d.grid, d.tg); break;
+            // Routed, the slot axis is gone -- a sorted row IS a slot -- so
+            // this is the same elementwise shape over a taller batch.
+            if (g.is_moe())
+                elementwise_mb_dispatch(g.moe_intermediate, moe_sorted_rows(g, n), d.grid, d.tg);
+            else
+                elementwise_mb_dispatch(g.intermediate, n, d.grid, d.tg);
+            break;
+
+        // ── the mixture ──
+        // The three expert projections first, because `qmv_out_size` does not
+        // answer for them: they run over the sorted rows, which is neither `n`
+        // nor `n * k`, because the sort pads every expert's run to a whole
+        // tile. Once the batch fills a tile they become matmuls, and the tile
+        // is `kMoeTileRows` -- the same number the sort padded to, spelled from
+        // the constant rather than restated.
+        case Kernel::LlExpertGate:
+        case Kernel::LlExpertUp:
+        case Kernel::LlExpertDown: {
+            const int N = d.kind == Kernel::LlExpertDown ? g.hidden : g.moe_intermediate;
+            const int sorted = moe_sorted_rows(g, n);
+            if (const int bn = qmm_bn(N, sorted);
+                bn > 0 && shared_kernels::moe_should_batch(n * g.experts_per_token, g.n_experts)) {
+                d.qmm_bn = bn;
+                d.qmm_bm = shared_kernels::kMoeTileRows;
+                d.qmm_split = 1;
+                qmm_t_dispatch(N, sorted, bn, shared_kernels::kMoeTileRows, d.grid, d.tg);
+            } else {
+                // One sorted row per (token, slot) pair and no expert axis: the
+                // pair's expert is `row_expert[p]`, not `tid.z`.
+                shared_kernels::routed_qmv_dispatch(N, 1, d.grid, d.tg, sorted);
+            }
+            break;
+        }
+        case Kernel::GoRouterTopK:
+            shared_kernels::router_topk_dispatch(g.n_experts, d.grid, d.tg, n); break;
+        case Kernel::LlMoeSort:
+            shared_kernels::moe_route_sort_dispatch(g.n_experts, d.grid, d.tg); break;
+        case Kernel::LlMoeGather:
+            shared_kernels::moe_route_rows_dispatch(g.hidden, moe_sorted_rows(g, n),
+                                                    d.grid, d.tg); break;
+        case Kernel::LlMoeCombine:
+            shared_kernels::expert_combine_dispatch(g.hidden, d.grid, d.tg, n); break;
+
         default:
             throw std::runtime_error("missing multi-batch launch geometry");
     }
@@ -144,6 +193,21 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
         case Kernel::GdnCoreSlotted: return mb.gdn_recurrent_slotted;
         case Kernel::KvAppendPaged: return mb.kv_append_paged;
         case Kernel::SdpaPaged: return mb.sdpa_paged;
+        // The mixture's projections, asked BEFORE the shared GEMM below and
+        // for the same reason `qmv_out_size` declines to answer for them: they
+        // carry a `qmm_bn` like any batched projection, so the default arm
+        // would hand them the DENSE GEMM -- which indexes one weight for the
+        // whole dispatch and would run every expert's rows through expert 0's
+        // slice. Fluent, and wrong.
+        case Kernel::LlExpertGate:
+        case Kernel::LlExpertUp:
+        case Kernel::LlExpertDown: {
+            if (d.qmm_bn > 0) {
+                const int slot = d.qmm_bn == 64 ? 2 : (d.qmm_bn == 32 ? 1 : 0);
+                if (mb.qmm_routed[slot].valid()) return mb.qmm_routed[slot];
+            }
+            return base[d.kind];
+        }
         default: {
             const int wide_ = d.qmm_bm == kQmmBMWide ? 1 : 0;
             if (d.qmm_split > 1 && mb.qmm_t_splitk[wide_].valid())
