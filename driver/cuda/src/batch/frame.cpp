@@ -1341,9 +1341,25 @@ void prepare_step(
         // layout: pure causal decodes to nothing and the structured pack
         // covers the batch. Anything non-causal here is a scheduler breach
         // — fail loud below rather than silently dropping a mask.
-        const bool resolved_custom_wire =
+        // NS-2 (the spatial mask fire): a COMPOSED all-envelope decode
+        // batch whose masked lanes were admitted under the spatial-mask
+        // relax. The wire placeholder rows map 1:1 onto the resolved rows
+        // (the same alignment the solo path below relies on), so the BRLE
+        // rows decode against the RESOLVED spans directly: plain lanes'
+        // elided rows decode empty — which is correct, because the split
+        // body serves them with the DECODE kernel and never reads their
+        // indptr entries. An unplanned masked compose is a scheduler
+        // breach (the relax admits only plannable groups) — fail loud.
+        const bool spatial_masked_compose =
             s.dg_resolved && view.has_user_mask &&
-            view.ptir_program_hashes.size() == 1;
+            view.ptir_program_hashes.size() > 1 &&
+            view.planned_unmasked_prefix_rows !=
+                PIE_UNMASKED_PREFIX_UNPLANNED &&
+            view.planned_unmasked_prefix_rows > 0;
+        const bool resolved_custom_wire =
+            (s.dg_resolved && view.has_user_mask &&
+             view.ptir_program_hashes.size() == 1) ||
+            spatial_masked_compose;
         const auto qo_span = std::span<const std::uint32_t>(
             resolved_custom_wire ? qo_view.data() : qo_view_orig.data(),
             resolved_custom_wire ? qo_view.size() : qo_view_orig.size());

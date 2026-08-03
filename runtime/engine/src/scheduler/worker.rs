@@ -438,6 +438,27 @@ pub(crate) struct LaunchGrouping {
     /// A member carries a qo row spanning more than one token (chunk
     /// prefill / multi-token step).
     has_multi_token: bool,
+    /// NS-2: a member is a wire-BRLE-masked DEVICE-GEOMETRY decode lane
+    /// admitted under the spatial-mask compose relax. Such a group must
+    /// stay pure single-token decode with no hooks, no lora, and no
+    /// structured mask — the split body is the only correct consumer.
+    has_wire_masked_envelope: bool,
+    /// NS-2: a member carries hooks or a lora sink (the planner sends
+    /// UNPLANNED for such fires, so a wire-masked envelope must not join).
+    has_hook_or_lora: bool,
+}
+
+/// NS-2 (the spatial mask fire): engine-side mirror of the driver's
+/// PIE_SPATIAL_MASK gate. When armed, wire-BRLE-masked DEVICE-GEOMETRY
+/// decode lanes may compose with plain envelope lanes — the split body
+/// needs no mask rows for the unmasked prefix, which is what forced the
+/// solo rule (the fire-level arm demanded a mask row per lane, and an
+/// envelope lane's causal row cannot be host-synthesized).
+fn spatial_mask_compose_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("PIE_SPATIAL_MASK").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
 }
 
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
@@ -524,13 +545,57 @@ impl LaunchGrouping {
         let wire_masked = request.request.has_user_mask
             && !request.request.masks.is_empty()
             && !request.request.device_resolved_geometry;
+        // NS-2 relax: a wire-BRLE-masked envelope DECODE lane composes when
+        // the gate is armed and the group can take the split body — pure
+        // single-token decode, no hooks/lora (the planner sends UNPLANNED
+        // for those and the frame refuses an unplanned spatial compose),
+        // no structured mask (one custom-mask source per fire), no dense
+        // device mask. Both join directions are checked.
+        let spatial_composable_masked_envelope = spatial_mask_compose_enabled()
+            && wire_mask_on_device_geometry
+            && request.request.token_ids.len() <= 1
+            && !request.has_multi_token_row()
+            && !request.hook_program
+            && !request.lora_program;
+        let wire_mask_on_device_geometry_blocks =
+            wire_mask_on_device_geometry && !spatial_composable_masked_envelope;
         if self.count != 0
             && (masked_device_geometry
-                || wire_mask_on_device_geometry
+                || (wire_mask_on_device_geometry_blocks)
+                || (spatial_composable_masked_envelope
+                    && (self.has_multi_token
+                        || self.has_structured_mask
+                        || self.has_hook_or_lora
+                        || self.has_masked_device_geometry))
                 || self.has_masked_device_geometry
+                || (self.has_wire_masked_envelope
+                    && (request.has_multi_token_row()
+                        || request.request.structured_device_mask
+                        || request.hook_program
+                        || request.lora_program))
                 || (wire_masked && self.has_structured_mask)
                 || (request.request.structured_device_mask && self.has_user_mask))
         {
+            if spatial_mask_compose_enabled() {
+                eprintln!(
+                    "[spatial-compose] REFUSE: req(mask={} dg={} stm={} \
+                     ntok={} hook={} lora={} structured={}) group(mde={} \
+                     wme={} hl={} mt={} sm={} um={})",
+                    request.request.has_user_mask,
+                    request.request.device_resolved_geometry,
+                    request.request.single_token_mode,
+                    request.request.token_ids.len(),
+                    request.hook_program,
+                    request.lora_program,
+                    request.request.structured_device_mask,
+                    self.has_masked_device_geometry,
+                    self.has_wire_masked_envelope,
+                    self.has_hook_or_lora,
+                    self.has_multi_token,
+                    self.has_structured_mask,
+                    self.has_user_mask,
+                );
+            }
             return Some("mask-compose");
         }
         // Invariant: a batch containing an `attn_page_mask`-writing program
@@ -586,10 +651,19 @@ impl LaunchGrouping {
         self.has_device_geometry |= request.request.device_resolved_geometry;
         self.has_page_mask |= request.page_mask_program;
         self.has_structured_mask |= request.request.structured_device_mask;
+        let wire_masked_envelope = request.request.has_user_mask
+            && !request.request.masks.is_empty()
+            && request.request.device_resolved_geometry;
+        let spatial_relaxed = spatial_mask_compose_enabled()
+            && wire_masked_envelope
+            && request.request.token_ids.len() <= 1
+            && !request.has_multi_token_row()
+            && !request.hook_program
+            && !request.lora_program;
         self.has_masked_device_geometry |= has_dense_device_mask(&request.request)
-            || (request.request.has_user_mask
-                && !request.request.masks.is_empty()
-                && request.request.device_resolved_geometry);
+            || (wire_masked_envelope && !spatial_relaxed);
+        self.has_wire_masked_envelope |= spatial_relaxed;
+        self.has_hook_or_lora |= request.hook_program || request.lora_program;
         self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)

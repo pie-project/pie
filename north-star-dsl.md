@@ -1278,3 +1278,36 @@ The unblocking campaign (next, in order):
 4. Gates: masked-solo unchanged; the mixed fire engages ([spatial-
    mask] R>1 lines); masked lane byte-equal to solo; plain lanes
    byte-equal to solo-plain; then the wide battery and the sweep.
+
+## The compose relax, first live contact — the mask is device-carried (2026-08-03)
+
+The engine grouping relax works: with PIE_SPATIAL_MASK armed on both
+sides, the masked+plain pure-decode group FORMS (census mask-compose
+deferrals gone). The composed step then fails at the DRIVER's
+admission: "program carries a dense device mask in a multi-program
+batch (v1 mask scope is solo only)". The lesson: naive-masked's
+decode-phase mask is NOT wire BRLE at all — it is DEVICE-CARRIED,
+a `kPortAttnMask` channel the program writes, resolved per fire by
+RV-6 descriptor resolution (`dense_mask_scope_violation` walks the
+trace PORTS, not the wire rows). The wire-mask frame extension I
+built this cycle serves the wire-BRLE flavors (prefill-phase masks,
+future wire producers) but the live decode subject rides the device
+channel.
+
+Remaining surgery, pinned for the next stretch:
+1. `Dispatch::dense_mask_scope_violation` admits the dense-masked
+   program in a multi-program batch WHEN
+   `view.planned_unmasked_prefix_rows` is a valid split and the
+   masked program's rows are exactly the suffix (the seriation
+   guarantee).
+2. The dense pack (`resolve_attention_mask` → pi.dense_mask →
+   launch_pack_dense_mask → pi.custom_mask) packs the masked
+   program's rows AT THEIR COMPOSED SUFFIX POSITIONS: indptr entries
+   for the prefix rows stay empty (the split body never reads them),
+   the suffix rows carry the device-resolved mask content.
+3. Then the battery: [spatial-mask] R=2 engage lines, masked lane
+   byte-equal to solo, plain lane byte-equal to solo — the FIRST
+   spatial merge fire.
+Current state is safe to ship gated: default-off changes nothing;
+gate-on forms the group and fails LOUD at admission (no corruption
+path), which is exactly where the next stretch picks up.
