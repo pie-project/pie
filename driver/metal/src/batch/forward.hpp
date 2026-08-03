@@ -352,6 +352,13 @@ struct SetupConfig {
     // Which storage schema to author against. It selects a contract on this
     // side of the loader call and never crosses it (§10.4).
     std::string model_type;
+
+    /// `config.json`'s `quantization` block. Not per-family, because it
+    /// describes the FILE and not the architecture -- and not recoverable from
+    /// the tensors, because 8 bits in groups of 64 and 4 bits in groups of 128
+    /// pack identically. Zero means the config declared none.
+    int quant_bits = 0;
+    int quant_group_size = 0;
     /// Gemma 4's shape, when `model_type` says so. Zero means "not gemma4", so
     /// a config that never mentions this family cannot accidentally select it.
     struct Gemma4Facts {

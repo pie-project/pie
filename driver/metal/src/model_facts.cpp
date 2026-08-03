@@ -34,6 +34,17 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             (j.contains("text_config") && j["text_config"].is_object())
                 ? j["text_config"]
                 : j;
+        // `quantization` stays at the ROOT even for a multimodal release: it
+        // describes the file's tensors, not the text decoder's architecture.
+        if (j.contains("quantization") && j["quantization"].is_object()) {
+            const nlohmann::json& q = j["quantization"];
+            if (q.contains("bits") && q["bits"].is_number_integer()) {
+                facts.quant_bits = q["bits"].get<int>();
+            }
+            if (q.contains("group_size") && q["group_size"].is_number_integer()) {
+                facts.quant_group_size = q["group_size"].get<int>();
+            }
+        }
         const auto u32_of = [](const nlohmann::json& obj, const char* key,
                                std::uint32_t& out) {
             if (obj.contains(key) && obj[key].is_number_integer()) {
@@ -404,6 +415,8 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
     cfg.llama.norm_topk_prob = facts.ll_norm_topk_prob;
     cfg.llama.qk_norm = facts.ll_qk_norm;
     cfg.llama.tied_embeddings = facts.ll_tied_embeddings;
+    cfg.quant_bits = facts.quant_bits;
+    cfg.quant_group_size = facts.quant_group_size;
     cfg.qwen35.n_layers = facts.q35_num_hidden_layers;
     cfg.qwen35.hidden = facts.q35_hidden_size;
     cfg.qwen35.vocab = facts.q35_vocab_size;

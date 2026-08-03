@@ -135,7 +135,7 @@ inline void push_direct(ModelContract& out, const SourceTensor& raw, std::string
 /// describing a checkpoint that does not exist.
 inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
                                     const SourceTensor& scales, const SourceTensor& biases,
-                                    int bits, std::string output) {
+                                    int bits, int declared_group_size, std::string output) {
     if (raw.shape.size() < 2 || scales.shape.size() != raw.shape.size() ||
         biases.shape.size() != scales.shape.size() ||
         !std::equal(biases.shape.begin(), biases.shape.end(), scales.shape.begin())) {
@@ -160,6 +160,17 @@ inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
     }
     const std::uint32_t group_size =
         u32_dim(logical_cols / groups, "MLX affine group size");
+    // The width came from the config and the group falls out of the shapes, so
+    // this is two sources meeting. They can only disagree if the width is
+    // wrong, and then the group is wrong by the same factor -- which is exactly
+    // how an 8-bit checkpoint read as 4-bit reports "g128".
+    if (declared_group_size > 0 && group_size != declared_group_size) {
+        fail("MLX affine triplet '" + std::string(raw.name) + "' is " + std::to_string(bits) +
+             "-bit in groups of " + std::to_string(group_size) + ", but config.json declares " +
+             "groups of " + std::to_string(declared_group_size) +
+             ". The tensors cannot tell these apart on their own: the same bytes are " +
+             "8-bit g64 or 4-bit g128, so one of the two numbers is being assumed.");
+    }
 
     PieLoaderQuantSpecView quant = pie_loader::quant_spec(
         bits == 4 ? PieLoaderQuantScheme::MlxAffineU4 : PieLoaderQuantScheme::Int8Asymmetric,
@@ -229,17 +240,26 @@ inline void push_mlx_mxfp4_stacked(ModelContract& out, const SourceTensor& raw,
         .expect(std::vector<std::int64_t>{rows, cols});
 }
 
-/// The 4-bit case, under the name the families already call.
+/// The case where `config.json` states the quantization, which is every family
+/// but gpt-oss: one `quantization` block covers the whole file, so the width is
+/// read rather than assumed and the group it implies is checked against it.
 ///
 /// This used to be a second implementation that accepted rank 2 only, which is
 /// why a routed llama checkpoint -- whose experts arrive as `[n_experts, out,
 /// in/8]` -- was refused by a driver that had supported stacked weights for
 /// gpt-oss all along. Rank 2 IS the stacked case with an empty stack, so there
 /// is one implementation and the special case is gone rather than doubled.
-inline void push_mlx_affine_u4(ModelContract& out, const SourceTensor& raw,
-                               const SourceTensor& scales, const SourceTensor& biases,
-                               std::string output) {
-    push_mlx_affine_stacked(out, raw, scales, biases, 4, std::move(output));
+inline void push_mlx_affine_declared(ModelContract& out, const SourceTensor& raw,
+                                     const SourceTensor& scales, const SourceTensor& biases,
+                                     int declared_bits, int declared_group_size,
+                                     std::string output) {
+    // A config that declares nothing is a checkpoint whose tensors are dense,
+    // and reaching here at all means it is not -- so 4 is the historical
+    // default kept for exactly that case, and the group check is skipped
+    // because there is nothing to check it against.
+    const int bits = declared_bits > 0 ? declared_bits : 4;
+    push_mlx_affine_stacked(out, raw, scales, biases, bits, declared_group_size,
+                            std::move(output));
 }
 
 /// The encoding this driver's quantized matvecs read.

@@ -746,14 +746,29 @@ StagedWeights stage_plan_weights(
     const auto load_plan = load.view();
     for (std::size_t i = 0; i < load_plan.tensors.len; ++i) {
         const auto& tensor = load_plan.tensors.ptr[i];
-        if (tensor.quant_scheme ==
-                pie_loader::PieLoaderQuantScheme::MlxAffineU4 &&
-            (tensor.quant_bits_per_element != 4 ||
-             tensor.quant_group_size != 64)) {
+        // Every quantized encoding SOME kernel here reads, listed rather than
+        // pattern-matched. This is a necessary condition and not a sufficient
+        // one: 8-bit g64 is on the list because gpt-oss's router is 8-bit and
+        // has its own matvec, which does not mean an 8-bit llama has one. That
+        // second question is about which kernel a family names for a width, so
+        // it is asked where the width chooses a kernel and not here.
+        const auto scheme = tensor.quant_scheme;
+        const int bits = int(tensor.quant_bits_per_element);
+        const int group = int(tensor.quant_group_size);
+        const bool readable =
+            scheme == pie_loader::PieLoaderQuantScheme::None ||
+            (scheme == pie_loader::PieLoaderQuantScheme::MlxAffineU4 && bits == 4 &&
+             group == 64) ||
+            (scheme == pie_loader::PieLoaderQuantScheme::Int8Asymmetric && bits == 8 &&
+             group == 64) ||
+            (scheme == pie_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0 && bits == 4 &&
+             group == 32);
+        if (!readable) {
             throw std::runtime_error(
-                "metal qmv kernels require MLX affine-U4 g64/b4; plan requested g" +
-                std::to_string(tensor.quant_group_size) + "/b" +
-                std::to_string(tensor.quant_bits_per_element));
+                "no metal kernel here reads '" + std::string(reinterpret_cast<const char*>(tensor.name.ptr), tensor.name.len) +
+                "': scheme " + std::to_string(int(scheme)) + " at g" + std::to_string(group) +
+                "/b" + std::to_string(bits) +
+                ". The kernels read MLX affine-U4 g64/b4, MXFP4 g32/b4, and 8-bit g64.");
         }
     }
     std::unordered_map<std::uint32_t, SlotHandle> buffers;

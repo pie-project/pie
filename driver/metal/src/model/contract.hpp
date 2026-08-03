@@ -33,6 +33,19 @@ struct ContractFacts {
     /// it, because mapping a real tensor onto `shared_embedding` declares that
     /// name twice and fails the load.
     bool tied_embeddings = true;
+
+    /// `config.json`'s `quantization` width and group. A contract sees only
+    /// tensors, and the tensors of an 8-bit g64 weight are indistinguishable
+    /// from those of a 4-bit g128 one: same packed u32 count, same number of
+    /// scales. Solving for the group while assuming the width is how a
+    /// published 8-bit llama checkpoint was refused as "g128/b4".
+    ///
+    /// Zero means the config declared no quantization. gpt-oss deliberately
+    /// does NOT read these: its `quantization` block sets a global mxfp4 g32
+    /// and then overrides nearly every module back to affine g64, so the global
+    /// pair is wrong for most of its tensors and that schema solves per tensor.
+    int quant_bits = 0;
+    int quant_group_size = 0;
 };
 
 /// Which storage schema and decode DAG a checkpoint asks for.
@@ -62,7 +75,8 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                                   const ContractFacts& facts = {}) {
     if (gemma4::is_supported_model_type(model_type)) {
         gemma4::author_model_contract(checkpoint, model_type, target, out,
-                                      facts.first_kv_shared_layer);
+                                      facts.first_kv_shared_layer, facts.quant_bits,
+                                      facts.quant_group_size);
         return;
     }
     if (gptoss::is_supported_model_type(model_type)) {
@@ -71,13 +85,14 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
     }
     if (llama::is_supported_model_type(model_type)) {
         llama::author_model_contract(checkpoint, model_type, target, out,
-                                     facts.tied_embeddings);
+                                     facts.tied_embeddings, facts.quant_bits,
+                                     facts.quant_group_size);
         return;
     }
     // Refusal for an unknown family belongs to the schema that would have
     // handled it, so the message names the schema that was actually consulted.
-    qwen3_5::author_model_contract(checkpoint, model_type, target, out,
-                                   facts.tied_embeddings);
+    qwen3_5::author_model_contract(checkpoint, model_type, target, out, facts.tied_embeddings,
+                                   facts.quant_bits, facts.quant_group_size);
 }
 
 }  // namespace pie::metal::model

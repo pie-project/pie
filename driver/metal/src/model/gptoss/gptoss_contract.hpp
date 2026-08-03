@@ -356,7 +356,8 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                 fail("Metal GptOss: '" + std::string(raw.name) + "' is " +
                      std::to_string(bits) + "-bit, and only 4 and 8 are described here");
             }
-            push_mlx_affine_stacked(out, raw, *scales, *biases, bits, std::move(*output));
+            push_mlx_affine_stacked(out, raw, *scales, *biases, bits, /*declared_group_size=*/64,
+                                    std::move(*output));
         } else if (ends_with(raw.name, ".weight") && raw.shape.size() == 2 &&
                    is_raw(raw.encoding, PieLoaderDType::BF16)) {
             // A projection the published checkpoint left in BF16. gpt-oss ships

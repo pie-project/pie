@@ -164,7 +164,7 @@ inline bool is_supported_model_type(std::string_view model_type) {
 /// `out`, which must outlive the compile call that consumes its `view()`.
 inline void author_model_contract(const Checkpoint& checkpoint, std::string_view model_type,
                                   const pie_loader::DeviceTarget& target, ModelContract& out,
-                                  bool tied_embeddings = true) {
+                                  bool tied_embeddings, int quant_bits, int quant_group_size) {
     using namespace pie::metal::model::contract_detail;
     using namespace contract_detail;
     if (!is_supported_model_type(model_type)) {
@@ -210,7 +210,8 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
                 fail("Metal affine-U4 weight '" + std::string(raw.name) +
                      "' is missing scales or biases");
             }
-            push_mlx_affine_u4(out, raw, *scales, *biases, std::move(*output));
+            push_mlx_affine_declared(out, raw, *scales, *biases, quant_bits, quant_group_size,
+                                     std::move(*output));
         } else {
             push_direct(out, raw, std::move(*output));
         }

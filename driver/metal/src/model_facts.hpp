@@ -35,6 +35,18 @@ namespace pie::metal {
 // recurrent-state slot bookkeeping (rs_slot_id/rs_reset) is unrelated to
 // device-geometry classification and always comes from the wire.
 struct ModelFacts {
+    /// The `quantization` block's width and group, which the SHAPES cannot
+    /// recover: a weight quantized 8-bit in groups of 64 and one quantized
+    /// 4-bit in groups of 128 pack to exactly the same u32 count against
+    /// exactly the same number of scales. Assuming one of them is how an 8-bit
+    /// llama checkpoint was refused as "g128/b4" -- a quantization it does not
+    /// have and nobody ships.
+    ///
+    /// Zero means the config declared none, which is a checkpoint whose tensors
+    /// are dense.
+    int quant_bits = 0;
+    int quant_group_size = 0;
+
     std::uint32_t vocab_size = 32000;
     std::uint32_t max_model_len = 8192;
     std::string arch_name = "llama";

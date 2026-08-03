@@ -98,7 +98,7 @@ void test_affine_u4_authors_the_quant_spec_the_kernels_need() {
                                   pie_loader::raw(pie_loader::PieLoaderDType::BF16));
 
     pie_loader::ModelContract c;
-    pie::metal::model::contract_detail::push_mlx_affine_u4(c, raw, scales, biases, "layers.0.w");
+    pie::metal::model::contract_detail::push_mlx_affine_declared(c, raw, scales, biases, 4, 0, "layers.0.w");
     const auto v = c.view();
 
     check(v.tensors.len == 1, "the triplet is one declaration");
@@ -167,7 +167,7 @@ void test_the_derived_group_size_is_what_heap_bind_demands() {
         const auto biases = tensor_of("w.biases", group_shape,
                                       pie_loader::raw(pie_loader::PieLoaderDType::BF16));
         pie_loader::ModelContract contract;
-        pie::metal::model::contract_detail::push_mlx_affine_u4(contract, raw, scales, biases, "w");
+        pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales, biases, 4, 0, "w");
         const auto v = contract.view();
         check(v.tensors.len == 1 && v.tensors.ptr[0].encoding.quant.group_size == c.expected,
               "group size " + std::to_string(c.expected) + " derived from " +
@@ -176,11 +176,56 @@ void test_the_derived_group_size_is_what_heap_bind_demands() {
     }
 }
 
+// The one thing the tensors cannot say.
+//
+// A weight quantized 8-bit in groups of 64 and one quantized 4-bit in groups of
+// 128 have identical shapes: the same u32 count against the same number of
+// scales. So a schema that assumes the width and solves for the group cannot be
+// wrong in a way the shapes reveal -- it just names a group nobody used, and
+// mlx-community's 8-bit Llama-3.2-1B was refused as "g128/b4", a quantization
+// that does not exist. The width has to come from `config.json`, and this is
+// what says the two are then cross-checked rather than one being trusted.
+void test_the_declared_width_is_checked_against_the_shapes() {
+    // 4096 logical columns at 8 bits is 1024 u32 words; at 4 bits it is 512.
+    const std::vector<std::int64_t> packed8{8, 1024};
+    const std::vector<std::int64_t> groups64{8, 64};
+    const auto bf16 = pie_loader::raw(pie_loader::PieLoaderDType::BF16);
+    const auto raw = tensor_of("w.weight", packed8, pie_loader::raw(pie_loader::PieLoaderDType::U32));
+    const auto scales = tensor_of("w.scales", groups64, bf16);
+    const auto biases = tensor_of("w.biases", groups64, bf16);
+
+    {
+        pie_loader::ModelContract contract;
+        pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales, biases,
+                                                                     8, 64, "w");
+        const auto v = contract.view();
+        check(v.tensors.len == 1 && v.tensors.ptr[0].encoding.quant.group_size == 64 &&
+                  v.tensors.ptr[0].encoding.quant.bits_per_element == 8,
+              "an 8-bit g64 triplet is described as 8-bit g64 when the config says 8 bits");
+    }
+    {
+        // The same bytes, read at the width nobody declared. Without the
+        // config's word this is indistinguishable, and the shapes agree with
+        // it -- 4096 * 2 columns over 64 groups is g128 -- which is precisely
+        // why the check has to be against the DECLARED group and not against
+        // anything derivable here.
+        pie_loader::ModelContract contract;
+        bool threw = false;
+        try {
+            pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales,
+                                                                         biases, 4, 64, "w");
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        check(threw, "reading an 8-bit g64 triplet as 4-bit is refused, not silently called g128");
+    }
+}
+
 bool authoring_throws(const pie_loader::SourceTensor& raw, const pie_loader::SourceTensor& scales,
                       const pie_loader::SourceTensor& biases) {
     pie_loader::ModelContract contract;
     try {
-        pie::metal::model::contract_detail::push_mlx_affine_u4(contract, raw, scales, biases, "w");
+        pie::metal::model::contract_detail::push_mlx_affine_declared(contract, raw, scales, biases, 4, 0, "w");
     } catch (const std::exception&) {
         return true;
     }
@@ -456,6 +501,7 @@ void author_real_contract(const std::string& snapshot, const std::string& model_
 int main() {
     test_affine_u4_authors_the_quant_spec_the_kernels_need();
     test_the_derived_group_size_is_what_heap_bind_demands();
+    test_the_declared_width_is_checked_against_the_shapes();
     test_a_malformed_triplet_is_refused();
     test_every_name_is_mapped_or_refused();
     test_the_schema_owns_its_model_types();
