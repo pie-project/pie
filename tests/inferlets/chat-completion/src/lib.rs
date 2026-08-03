@@ -7,9 +7,9 @@
 //! The host reads each sampled token for streaming detokenization and stop-token
 //! handling; the sampled token itself remains device-carried into the next pass.
 
+use inferlet::chat;
 use inferlet::ptir::Taken;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16; // tokens per pool page
@@ -69,7 +69,7 @@ async fn main(input: Input) -> Result<String> {
         return Err("temperature must be finite".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
 
     let temperature = input.temperature;
     let top_p = input.top_p;

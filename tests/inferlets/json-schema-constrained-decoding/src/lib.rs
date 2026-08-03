@@ -5,7 +5,7 @@
 
 use inferlet::mask::bit_allowed;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Constrain, JsonSchema, Result, Schema, chat, model as wit_model};
+use inferlet::{Constrain, JsonSchema, Schema, chat};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -60,7 +60,7 @@ async fn main(input: Input) -> Result<String> {
         return Err("max_tokens must be at least 1".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
     let mut constraint = JsonSchema(&input.schema).build_constraint()?;
@@ -215,7 +215,7 @@ async fn main(input: Input) -> Result<String> {
         ));
     }
 
-    let text = wit_model::decode(&generated)?;
+    let text = model::decode(&generated)?;
     serde_json::from_str::<Value>(&text)
         .map_err(|e| format!("constraint terminated with invalid JSON: {e}; output={text:?}"))?;
     Ok(text)

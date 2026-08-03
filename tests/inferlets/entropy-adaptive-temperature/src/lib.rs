@@ -56,7 +56,6 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -182,7 +181,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err("min_temperature must be finite and greater than 0".into());
     }
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let cfg = Cfg {
         t0: input.t0,
         theta: input.theta,
@@ -206,7 +205,7 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -386,7 +385,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "entropy-adaptive-temperature",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         t0: cfg.t0,
         theta: cfg.theta,

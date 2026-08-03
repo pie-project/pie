@@ -11,7 +11,6 @@
 //! instead of compacting dead cells.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use std::ops::RangeBounds;
 use serde::Deserialize;
 
@@ -168,7 +167,7 @@ macro_rules! define_beam_search {
             return Ok(String::new());
         }
     
-        let vocab = wit_model::output_vocab_size();
+        let vocab = model::output_vocab_size();
         let v = vocab;
     
         // Allocate a fixed logical page pool. Flat position `wpos` maps to
@@ -245,7 +244,7 @@ macro_rules! define_beam_search {
             .named("out_greedy");
     
         let pipeline = Pipeline::new();
-        let mut rs_working_sets = if wit_model::rs_state_size() > 0 {
+        let mut rs_working_sets = if model::rs_state_size() > 0 {
             (0..B).map(|_| RsWorkingSet::new()).collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -452,7 +451,7 @@ macro_rules! define_beam_search {
             "beam-search: width={B} steps={max_steps} best_score={:.4}",
             final_scores[best_lane]
         );
-        let text = wit_model::decode(&hypotheses[best_lane])?;
+        let text = model::decode(&hypotheses[best_lane])?;
         Ok(format!(
             "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}",
             final_scores[best_lane]
@@ -467,10 +466,10 @@ define_beam_search!(beam_search_hybrid, hybrid);
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
-    match inferlet::model::pass_kind() {
-        inferlet::model::ForwardKind::Attention => beam_search_attention(&input).await,
-        inferlet::model::ForwardKind::Hybrid => beam_search_hybrid(&input).await,
-        inferlet::model::ForwardKind::Recurrent => Err(
+    match model::pass_kind() {
+        model::ForwardKind::Attention => beam_search_attention(&input).await,
+        model::ForwardKind::Hybrid => beam_search_hybrid(&input).await,
+        model::ForwardKind::Recurrent => Err(
             "beam-search has no recurrent-only path (no registered model reports that kind)"
                 .to_string()
                 .into(),

@@ -4,8 +4,8 @@
 //! into a green and red list. Green-token logits receive a configurable bias
 //! before Gumbel-max sampling.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -76,7 +76,7 @@ async fn main(input: Input) -> Result<String> {
         return Ok(String::new());
     }
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
@@ -233,5 +233,5 @@ async fn main(input: Input) -> Result<String> {
     }
     pipeline.close();
 
-    wit_model::decode(&generated)
+    model::decode(&generated)
 }

@@ -4,8 +4,8 @@
 //! working set, append distinct text, and are each forked again into two leaves.
 //! Generation then continues independently from all four shared-prefix leaves.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -190,7 +190,7 @@ struct Branch {
 async fn main(input: Input) -> Result<String> {
     let root = WorkingSet::new();
 
-    let root_tokens = wit_model::encode("Write a short scene set");
+    let root_tokens = model::encode("Write a short scene set");
     if root_tokens.is_empty() {
         return Err("tokenizer produced an empty root prompt".into());
     }
@@ -202,7 +202,7 @@ async fn main(input: Input) -> Result<String> {
     let mut first_level = Vec::new();
     for suffix in [" in a city", " in a forest"] {
         let child = root.fork(&tree_pipeline)?;
-        let tokens = wit_model::encode(suffix);
+        let tokens = model::encode(suffix);
         append_tokens(&child, &tree_pipeline, root_len, &tokens, false).await?;
         first_level.push(Branch {
             label: suffix.trim().into(),
@@ -217,7 +217,7 @@ async fn main(input: Input) -> Result<String> {
     for (pi, parent) in first_level.into_iter().enumerate() {
         for (si, suffix) in leaf_suffixes.into_iter().enumerate() {
             let leaf = parent.ws.fork(&tree_pipeline)?;
-            let tokens = wit_model::encode(suffix);
+            let tokens = model::encode(suffix);
             // The last leaf's append is the build stream's final submission.
             let last = pi + 1 == num_parents && si + 1 == leaf_suffixes.len();
             let first = append_tokens(&leaf, &tree_pipeline, parent.seq_len, &tokens, last).await?;
@@ -235,7 +235,7 @@ async fn main(input: Input) -> Result<String> {
     let mut outputs = Vec::with_capacity(leaves.len());
     for (label, ws, seq_len, first) in leaves {
         let generated = generate(&ws, &tree_pipeline, seq_len, first, input.num_tokens).await?;
-        outputs.push(format!("{label}: {}", wit_model::decode(&generated)?));
+        outputs.push(format!("{label}: {}", model::decode(&generated)?));
     }
     tree_pipeline.close();
     Ok(outputs.join("\n"))

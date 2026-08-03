@@ -23,7 +23,7 @@
 //! the submitted tail is drained.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model, session};
+use inferlet::{chat, session};
 use std::ops::RangeBounds;
 use serde::{Deserialize, Serialize};
 
@@ -289,7 +289,7 @@ async fn $name(
     // harness's client-side clock reset on `start`.
     let run_start = std::time::Instant::now();
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let sampled_rng =
         (input.temperature > 0.0).then(|| Channel::from(vec![rng_seed, 0u32]).named("rng"));
     let prefill_rng = (input.temperature > 0.0)
@@ -383,7 +383,7 @@ async fn $name(
     // reading rs-state-size() as a class flag"): true iff the model folds a
     // recurrent state, which is exactly when the driver requires one
     // rs-working-set per request row.
-    let rs_ws: Vec<RsWorkingSet> = if wit_model::is_linear() {
+    let rs_ws: Vec<RsWorkingSet> = if model::is_linear() {
         vec![RsWorkingSet::new()]
     } else {
         Vec::new()
@@ -639,8 +639,8 @@ async fn run_one(
     rng_seed: u32,
     main_pre_us: Option<u64>,
 ) -> Result<RunResult> {
-    match inferlet::model::pass_kind() {
-        inferlet::model::ForwardKind::Attention => {
+    match model::pass_kind() {
+        model::ForwardKind::Attention => {
             run_one_attention(
                 input,
                 prompt,
@@ -652,7 +652,7 @@ async fn run_one(
             )
             .await
         }
-        inferlet::model::ForwardKind::Hybrid => {
+        model::ForwardKind::Hybrid => {
             run_one_hybrid(
                 input,
                 prompt,
@@ -664,7 +664,7 @@ async fn run_one(
             )
             .await
         }
-        inferlet::model::ForwardKind::Recurrent => Err(
+        model::ForwardKind::Recurrent => Err(
             "this benchmark has no recurrent-only path (no registered model reports that kind)"
                 .to_string()
                 .into(),
@@ -762,7 +762,7 @@ async fn main(input: Input) -> Result<Output> {
             offset = end;
         }
         let text = if input.return_text {
-            wit_model::decode(&first_tokens).unwrap_or_default()
+            model::decode(&first_tokens).unwrap_or_default()
         } else {
             String::new()
         };
@@ -791,7 +791,7 @@ async fn main(input: Input) -> Result<Output> {
     )
     .await?;
     let text = if input.return_text {
-        wit_model::decode(&result.tokens).unwrap_or_default()
+        model::decode(&result.tokens).unwrap_or_default()
     } else {
         String::new()
     };

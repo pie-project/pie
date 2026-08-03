@@ -6,8 +6,8 @@
 //! `log p_expert - lambda * log p_amateur`, restricted to tokens whose expert
 //! probability is at least `alpha` times the expert's maximum probability.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
@@ -75,7 +75,7 @@ async fn main(input: Input) -> Result<String> {
 
     let max_tokens =
         u32::try_from(input.max_tokens).map_err(|_| "max_tokens exceeds the u32 range")?;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
     prompt.extend(chat::cue());
@@ -226,7 +226,7 @@ async fn main(input: Input) -> Result<String> {
         generated.push(first);
     }
     if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
-        return wit_model::decode(&generated);
+        return model::decode(&generated);
     }
 
     let amateur_token = Channel::new([1], dtype::i32).named("amateur_token");
@@ -378,7 +378,7 @@ async fn main(input: Input) -> Result<String> {
     // Every submitted fire was drained above.
     pipeline.close();
 
-    wit_model::decode(&generated)
+    model::decode(&generated)
 }
 
 async fn read_expert_token(channel: &Channel) -> Result<u32> {

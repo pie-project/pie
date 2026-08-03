@@ -1515,6 +1515,10 @@ pub mod shared_prelude {
         WorkingSet, channel_capacity, frame_size, live_slots, max_embed_length, pad_tokens,
         prefill_chunks, unpad_tokens,
     };
+    /// Every inferlet returns `inferlet::Result` from `#[inferlet::main]` and
+    /// asks the model for its tokenizer and vocabulary, so both come with the
+    /// prelude rather than being imported by hand 34 times over.
+    pub use crate::{Result, model};
     pub use std::ops::ControlFlow;
     pub use pie_dsl::dtype;
     pub use pie_dsl::intrinsics;

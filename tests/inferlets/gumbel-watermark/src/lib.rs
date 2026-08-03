@@ -71,7 +71,6 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -276,7 +275,7 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
@@ -295,7 +294,7 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -529,7 +528,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "gumbel-watermark",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         secret: cfg.secret,
         context_width: cfg.context_width,

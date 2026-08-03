@@ -4,8 +4,8 @@
 //! each query can attend only to the most recent `window_size` positions. The
 //! example masks old KV cells but does not evict their backing pages.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -36,7 +36,7 @@ async fn main(input: Input) -> Result<String> {
         return Ok(String::new());
     }
 
-    let page_t = wit_model::kv_page_size();
+    let page_t = model::kv_page_size();
     let window = input.window_size.max(1);
 
     let mut prompt = chat::system_user("You are a helpful assistant.", &input.prompt);
@@ -123,7 +123,7 @@ async fn main(input: Input) -> Result<String> {
     if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
         // The only fire has settled (its take succeeded), so dropping the
         // pipeline here (drop == close) cancels nothing.
-        return wit_model::decode(&generated);
+        return model::decode(&generated);
     }
 
     let token_in = Channel::from(vec![first as i32]).named("token_in");
@@ -210,5 +210,5 @@ async fn main(input: Input) -> Result<String> {
     })
     .await?;
     pipeline.close();
-    wit_model::decode(&generated)
+    model::decode(&generated)
 }

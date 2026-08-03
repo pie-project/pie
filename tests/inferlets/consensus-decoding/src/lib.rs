@@ -8,8 +8,8 @@
 //! while per-lane attention masks isolate their divergent continuations.
 //! Independent Gumbel noise drives top-p sampling in each lane.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 use std::time::Instant;
 
@@ -78,7 +78,7 @@ async fn main(input: Input) -> Result<String> {
     let b = num_candidates as u32;
 
     let start = Instant::now();
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let stop = chat::stop_tokens();
 
     // Shared prefix: system + question via the deferred-system `system_user`

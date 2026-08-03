@@ -4,8 +4,8 @@
 //! each query attends to the first `sink_size` positions and the most recent
 //! `window_size` positions. Masked KV pages remain allocated in this example.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
@@ -135,7 +135,7 @@ async fn main(input: Input) -> Result<String> {
     }
     if generated.len() >= input.max_tokens || stop_tokens.contains(&first) {
         pipeline.close();
-        return wit_model::decode(&generated);
+        return model::decode(&generated);
     }
 
     let token_in = Channel::from(vec![first as i32]).named("token_in");
@@ -225,5 +225,5 @@ async fn main(input: Input) -> Result<String> {
     // Any fire still in flight after an early stop is left untaken; close
     // releases the scheduler wait-set and reclaims them.
     pipeline.close();
-    wit_model::decode(&generated)
+    model::decode(&generated)
 }

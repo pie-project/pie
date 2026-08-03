@@ -21,8 +21,8 @@
 //! sequence must come out **identical**. If the per-window KV rebuild ever
 //! stopped isolating rejected drafts, the two would diverge.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -243,7 +243,7 @@ async fn main(input: Input) -> Result<Output> {
     };
     Ok(Output {
         sampler: "cacheback-speculative",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         prompt_tokens: prompt_len,
         count: generated.len(),
         draft_length: input.draft_length,

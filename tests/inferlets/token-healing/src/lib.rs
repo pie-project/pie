@@ -36,7 +36,6 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -95,11 +94,11 @@ async fn main(input: Input) -> Result<Output> {
         return Err("backoff must satisfy 1 <= backoff <= 4".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
-    let full = wit_model::encode(&input.prompt);
+    let full = model::encode(&input.prompt);
     if full.len() <= input.backoff {
         return Err("prompt is too short to roll back that many tokens".into());
     }
@@ -107,7 +106,7 @@ async fn main(input: Input) -> Result<Output> {
     // The fragment is the *bytes* the rolled-back tokens covered, not their
     // text: a prefix test on decoded strings would break on tokens whose bytes
     // are not valid UTF-8 on their own, which is most multi-byte tokens.
-    let (ids, byte_sequences) = wit_model::vocabs();
+    let (ids, byte_sequences) = model::vocabs();
     let mut token_bytes: Vec<&[u8]> = vec![&[]; vocab as usize];
     for (&id, bytes) in ids.iter().zip(byte_sequences.iter()) {
         if (id as usize) < token_bytes.len() {
@@ -283,7 +282,7 @@ async fn main(input: Input) -> Result<Output> {
         healed_token: first,
         healed_token_bytes: healed_bytes.len(),
         prompt_preserved,
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
     })
 }

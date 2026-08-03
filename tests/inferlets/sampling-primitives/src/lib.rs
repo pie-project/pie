@@ -15,7 +15,6 @@
 //! order.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::Deserialize;
 
 const TOP_P: f32 = 0.9;
@@ -34,11 +33,11 @@ fn argmax(values: &[f32]) -> usize {
 
 #[inferlet::main]
 async fn main(_input: Input) -> Result<String> {
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
-    let mut prompt = wit_model::encode("The capital of France is");
+    let mut prompt = model::encode("The capital of France is");
     if prompt.is_empty() {
         prompt.push(0);
     }

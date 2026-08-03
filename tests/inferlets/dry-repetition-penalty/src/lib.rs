@@ -78,7 +78,6 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -308,7 +307,7 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
@@ -327,7 +326,7 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -543,7 +542,7 @@ async fn main(input: Input) -> Result<Output> {
     full.extend_from_slice(&generated);
     Ok(Output {
         sampler: "dry",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         multiplier: cfg.multiplier,
         base: cfg.base,

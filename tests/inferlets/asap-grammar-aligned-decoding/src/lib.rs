@@ -62,7 +62,7 @@
 
 use inferlet::mask::bit_allowed;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Constrain, JsonSchema, Result, Schema, chat, model as wit_model};
+use inferlet::{Constrain, JsonSchema, Schema, chat};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -220,7 +220,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err("rounds must satisfy 1 <= rounds <= 16".into());
     }
 
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     // Exact, not truncated: a node gains at most one explored child per round.
     let pairs = input.rounds;
 
@@ -444,7 +444,7 @@ async fn main(input: Input) -> Result<Output> {
             })
             .sum::<f32>();
 
-        let text = wit_model::decode(&generated)?;
+        let text = model::decode(&generated)?;
         if !distinct.contains(&text) {
             distinct.push(text.clone());
         }

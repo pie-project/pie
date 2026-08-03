@@ -38,7 +38,6 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -172,13 +171,13 @@ async fn main(input: Input) -> Result<Output> {
     if !input.temperature.is_finite() || input.temperature <= 0.0 {
         return Err("temperature must be finite and greater than 0".into());
     }
-    let vocab_probe = wit_model::output_vocab_size();
+    let vocab_probe = model::output_vocab_size();
     // Three points are the minimum for a second difference.
     if input.k_max < 3 || input.k_max > vocab_probe {
         return Err(format!("k_max must be in 3..={vocab_probe}"));
     }
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let cfg = Cfg {
         z: input.z,
         k_max: input.k_max,
@@ -200,7 +199,7 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -377,7 +376,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "tail-free",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         z: cfg.z,
         k_max: cfg.k_max,

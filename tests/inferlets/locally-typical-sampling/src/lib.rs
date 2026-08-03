@@ -43,7 +43,6 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -163,7 +162,7 @@ async fn main(input: Input) -> Result<Output> {
     if !input.temperature.is_finite() || input.temperature <= 0.0 {
         return Err("temperature must be finite and greater than 0".into());
     }
-    let vocab_probe = wit_model::output_vocab_size();
+    let vocab_probe = model::output_vocab_size();
     if input.k_max == 0 || input.k_max > vocab_probe {
         return Err(format!("k_max must be in 1..={vocab_probe}"));
     }
@@ -172,7 +171,7 @@ async fn main(input: Input) -> Result<Output> {
     let mass = input.mass;
     let temperature = input.temperature;
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
@@ -189,7 +188,7 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -368,7 +367,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "locally-typical",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         mass,
         k_max,

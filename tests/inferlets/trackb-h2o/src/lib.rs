@@ -76,7 +76,6 @@
 //!    cache, not of H2O.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -228,7 +227,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err("max_tokens must be at least 1".into());
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -565,7 +564,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "trackb-h2o",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         kv_max,
         kv_len: last_kv_len,

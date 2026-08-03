@@ -22,8 +22,8 @@
 //! round after a partial acceptance drafts from a stale tail and typically
 //! re-corrects in one round; correctness always comes from verification.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
@@ -301,5 +301,5 @@ async fn main(input: Input) -> Result<String> {
         "mtp-speculative-decoding: rounds={rounds} drafted={drafted} accepted={accepted} \
          acceptance_rate={acceptance_rate:.3}"
     );
-    wit_model::decode(&generated)
+    model::decode(&generated)
 }

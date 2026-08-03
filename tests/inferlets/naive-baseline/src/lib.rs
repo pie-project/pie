@@ -14,7 +14,6 @@
 //! extra host round-trip channels from the cost of the algorithm itself.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -86,7 +85,7 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -283,7 +282,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "naive-baseline",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         stats: want_stats,
     })

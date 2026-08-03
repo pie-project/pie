@@ -28,8 +28,8 @@
 //! constant that cancels in the softmax. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
+use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
@@ -98,7 +98,7 @@ async fn main(input: Input) -> Result<String> {
 
     let max_tokens =
         u32::try_from(input.max_tokens).map_err(|_| "max_tokens exceeds the u32 range")?;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let alpha = input.alpha;
     let stop_tokens = chat::stop_tokens();
 
@@ -385,7 +385,7 @@ fn report(
     scored: u64,
     kl_total: f64,
 ) -> Result<String> {
-    let text = wit_model::decode(generated)?;
+    let text = model::decode(generated)?;
     let mean_kl = if scored == 0 {
         0.0
     } else {

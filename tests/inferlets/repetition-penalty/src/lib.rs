@@ -53,7 +53,6 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -203,7 +202,7 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let max_tokens = input.max_tokens;
-    let vocab = wit_model::output_vocab_size();
+    let vocab = model::output_vocab_size();
     let cfg = Cfg {
         frequency_penalty: input.frequency_penalty,
         presence_penalty: input.presence_penalty,
@@ -227,7 +226,7 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -437,7 +436,7 @@ async fn main(input: Input) -> Result<Output> {
     let unique: HashSet<u32> = generated.iter().copied().collect();
     Ok(Output {
         sampler: "repetition-penalty",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         frequency_penalty: cfg.frequency_penalty,
         presence_penalty: cfg.presence_penalty,
