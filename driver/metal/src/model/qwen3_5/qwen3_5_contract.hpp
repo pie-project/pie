@@ -85,9 +85,15 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
             return std::nullopt;
         }
     }
-    if (raw_name.rfind("lm_head.", 0) == 0) {
-        return "shared_embedding." +
-               std::string(raw_name.substr(std::string_view("lm_head.").size()));
+    // The untied output projection. Spelled bare by the HF release, which puts
+    // it outside `model`, and under the wrapper by the mlx repack -- the same
+    // two-tools-one-tensor split as the decoder prefix. Only the tied members
+    // of this family avoid it: 0.8B ships tied and has no `lm_head` at all,
+    // 35B-A3B ships untied and has one.
+    for (std::string_view head : {"lm_head.", "language_model.lm_head."}) {
+        if (raw_name.rfind(head, 0) == 0) {
+            return "shared_embedding." + std::string(raw_name.substr(head.size()));
+        }
     }
     const std::optional<std::string_view> decoder = decoder_member(raw_name);
     if (!decoder) {

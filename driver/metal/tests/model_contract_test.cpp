@@ -228,6 +228,11 @@ void test_every_name_is_mapped_or_refused() {
               std::string(from) + " -> " + std::string(to));
     };
     mapped("lm_head.weight", "shared_embedding.weight");
+    // The untied member of the same family, spelled by the repack. 0.8B ships
+    // tied and has no `lm_head`; 35B-A3B ships untied and has one, under the
+    // wrapper. Authoring stopped on this name.
+    mapped("language_model.lm_head.weight", "shared_embedding.weight");
+    mapped("language_model.lm_head.biases", "shared_embedding.biases");
     // The tied half: this family ships tied, so its checkpoint has an
     // `embed_tokens` and no `lm_head`, and both land in the one shared slot
     // `EmbedGather` and `QmvLmHead` bind.
