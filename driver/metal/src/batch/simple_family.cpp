@@ -351,7 +351,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             return false;
         }
 
-        if (!gemma4::build_gemma4_psos(ctx, kernels_dir, psos_, err)) return false;
+        if (!gemma4::build_gemma4_psos(ctx, kernels_dir, g_, psos_, err)) return false;
         if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
         if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/true, err)) return false;
 
@@ -715,7 +715,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
             return false;
         }
 
-        if (!gptoss::build_gptoss_psos(ctx, kernels_dir, g_.router_bits, psos_, err)) return false;
+        if (!gptoss::build_gptoss_psos(ctx, kernels_dir, g_, psos_, err)) return false;
         if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
         if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err)) return false;
 

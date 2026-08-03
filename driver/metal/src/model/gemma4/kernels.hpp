@@ -17,6 +17,7 @@
 #include "../../batch/decode_abi.hpp"
 #include "../../mtl4_context.hpp"
 #include "../shared_kernels.hpp"
+#include "geometry.hpp"
 
 namespace pie::metal::gemma4 {
 
@@ -98,8 +99,15 @@ struct Gemma4Psos {
 
 /// Compile them. `err` names the first one that failed, so a missing kernel is
 /// reported as itself rather than as a generic setup failure.
-bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gemma4Psos& out,
-                       std::string* err);
+///
+/// The two attention widths come from the geometry, not from literals. This
+/// family is the one where that matters most: it has TWO of them --
+/// `head_dim` for the sliding layers and `global_head_dim` for the full ones --
+/// so a checkpoint that moved either would have run one width's pipeline over
+/// the other's heads, which strides past the end of each head and writes zeros
+/// rather than failing.
+bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir,
+                       const Gemma4Geometry& g, Gemma4Psos& out, std::string* err);
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
 

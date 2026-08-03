@@ -90,12 +90,21 @@ struct GptOssPsos {
 /// Compile them. `err` names the first one that failed, so a missing kernel is
 /// reported as itself rather than as a generic setup failure.
 ///
-/// `router_bits` selects the router's matvec: 8 for the width `mlx_lm`'s
-/// quantization predicate usually leaves it at, 4 for a uniformly-quantized
-/// checkpoint. It is refused rather than defaulted, because either kernel over
-/// the other's packing produces fluent wrong text instead of an error.
-bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int router_bits,
-                       GptOssPsos& out, std::string* err);
+/// The geometry decides two things here, and both are refused rather than
+/// defaulted because either wrong answer runs.
+///
+///  * `router_bits` selects the router's matvec: 8 for the width `mlx_lm`'s
+///    quantization predicate usually leaves it at, 4 for a uniformly-quantized
+///    checkpoint. Either kernel over the other's packing produces fluent wrong
+///    text instead of an error.
+///  * `head_dim` names the attention instantiation. This used to be the literal
+///    64 that every released gpt-oss happens to use, while the geometry read the
+///    width from the config -- so a variant that shipped any other width would
+///    have run a d=64 pipeline over its heads, striding past the end of each one
+///    and writing zeros. Spelled from the geometry, an uninstantiated width
+///    fails to build a pipeline BY NAME at load.
+bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
+                       const GptOssGeometry& g, GptOssPsos& out, std::string* err);
 
 /// The YaRN frequency table, `head_dim/2` entries.
 ///

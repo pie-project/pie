@@ -4,8 +4,13 @@
 
 namespace pie::metal::gemma4 {
 
-bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gemma4Psos& out,
-                       std::string* err) {
+bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir,
+                       const Gemma4Geometry& g, Gemma4Psos& out, std::string* err) {
+    // Both widths are the geometry's, not literals: see the header.
+    const std::string swa_name =
+        "sdpa_vector_decode_swa_bfloat16_d_" + std::to_string(g.head_dim);
+    const std::string swa_global_name =
+        "sdpa_vector_decode_swa_bfloat16_d_" + std::to_string(g.global_head_dim);
     const std::string dir =
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
     struct Spec {
@@ -15,8 +20,8 @@ bool build_gemma4_psos(RawMetalContext& ctx, const std::string& kernels_dir, Gem
     };
     // bf16 throughout: the activation dtype every ported M=1 kernel already uses.
     const Spec specs[] = {
-        {"sdpa_sliding.metal", "sdpa_vector_decode_swa_bfloat16_d_256", &out.sdpa_swa_d256},
-        {"sdpa_sliding.metal", "sdpa_vector_decode_swa_bfloat16_d_512", &out.sdpa_swa_d512},
+        {"sdpa_sliding.metal", swa_name.c_str(), &out.sdpa_swa_d256},
+        {"sdpa_sliding.metal", swa_global_name.c_str(), &out.sdpa_swa_d512},
         {"geglu_tanh.metal", "geglu_tanh_bfloat16", &out.geglu_tanh},
         {"logit_softcap.metal", "logit_softcap_bfloat16", &out.logit_softcap},
         {"layer_scalar.metal", "layer_scalar_mul_bfloat16", &out.layer_scalar},

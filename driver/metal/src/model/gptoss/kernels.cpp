@@ -5,8 +5,13 @@
 
 namespace pie::metal::gptoss {
 
-bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int router_bits,
-                       GptOssPsos& out, std::string* err) {
+bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
+                       const GptOssGeometry& g, GptOssPsos& out, std::string* err) {
+    const int router_bits = g.router_bits;
+    // The attention width is the geometry's, not a literal: see the header.
+    const std::string d = "_d_" + std::to_string(g.head_dim);
+    const std::string sink_name = "sdpa_vector_decode_sink_bfloat16" + d;
+    const std::string sink_paged_name = "sdpa_paged_decode_sink_bfloat16" + d;
     const std::string dir =
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
     struct Spec {
@@ -24,8 +29,8 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int
         {"gptoss.metal", "router_topk_bfloat16", &out.router_topk},
         {"gptoss.metal", "gptoss_swiglu_bfloat16", &out.swiglu},
         {"gptoss.metal", "expert_combine_bfloat16", &out.expert_combine},
-        {"sdpa_sliding.metal", "sdpa_vector_decode_sink_bfloat16_d_64", &out.sdpa_sink},
-        {"sdpa_paged.metal", "sdpa_paged_decode_sink_bfloat16_d_64", &out.sdpa_sink_paged},
+        {"sdpa_sliding.metal", sink_name.c_str(), &out.sdpa_sink},
+        {"sdpa_paged.metal", sink_paged_name.c_str(), &out.sdpa_sink_paged},
         {"rope.metal", "rope_neox_freqs_mb_bfloat16", &out.rope_freqs_mb},
         {"row_gather.metal", "row_gather_bfloat16", &out.row_gather},
         {"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs},
