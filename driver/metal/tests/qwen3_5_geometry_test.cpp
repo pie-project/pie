@@ -18,6 +18,7 @@
 #include <string>
 
 #include "batch/forward.hpp"
+#include "model/qwen3_5/decode_consts.hpp"
 #include "model/qwen3_5/decode_step.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
 #include "model/shared_kernels.hpp"
@@ -335,6 +336,45 @@ void check_the_routed_ffn_replaces_the_dense_one_and_nothing_else() {
     }
 }
 
+// The widths the mixture's matvecs are bound at, and the trap under them.
+void check_the_routed_matvecs_know_their_own_width() {
+    std::printf("\n-- the mixture's matvec widths --\n");
+    using pie::metal::Kernel;
+    using pie::metal::qmv_kn;
+
+    std::string err;
+    DecodeGeometry g{};
+    expect(geometry_from_facts(qwen3_next_routed(), g, &err), "routed geometry builds");
+
+    // The router is one logit per expert; an expert's gate and up are
+    // `moe_intermediate` wide and its down comes back to hidden. Bound from
+    // `intermediate` instead -- the DENSE width, which a routed checkpoint
+    // still carries a value for in some configs -- every expert would read
+    // seven times its own slice and stride off the end of the bank.
+    expect(qmv_kn(Kernel::LlRouter, g).K == g.hidden &&
+               qmv_kn(Kernel::LlRouter, g).N == g.n_experts,
+           "the router projects hidden to one logit per expert");
+    expect(qmv_kn(Kernel::LlExpertGate, g).N == g.moe_intermediate &&
+               qmv_kn(Kernel::LlExpertUp, g).N == g.moe_intermediate,
+           "an expert's gate and up are the MoE width, not the dense one");
+    expect(qmv_kn(Kernel::LlExpertDown, g).K == g.moe_intermediate &&
+               qmv_kn(Kernel::LlExpertDown, g).N == g.hidden,
+           "an expert's down comes back to hidden");
+
+    // And the trap. `qmv_kn` answers off the geometry it is GIVEN, and the
+    // predicate that decides whether a dispatch gets a K and an N at all used
+    // to ask a default-constructed one. Every dense projection's width is
+    // nonzero whatever the numbers are, so it worked -- but a default geometry
+    // has no experts, so the mixture's matvecs would have answered "not a
+    // matvec", skipped the binding, and run against whatever the pool held at
+    // those ordinals. This assertion is what makes that mistake loud.
+    const DecodeGeometry none{};
+    expect(qmv_kn(Kernel::LlExpertGate, none).N == 0 && qmv_kn(Kernel::LlRouter, none).N == 0,
+           "a geometry with no experts gives the mixture no width at all");
+    expect(qmv_kn(Kernel::QmvQ, none).N != 0,
+           "a dense projection has a width even then -- which is why the trap was quiet");
+}
+
 }  // namespace
 
 int main() {
@@ -344,6 +384,7 @@ int main() {
     check_what_is_refused();
     check_the_routed_ffn_is_bounded_by_what_the_kernels_do();
     check_the_routed_ffn_replaces_the_dense_one_and_nothing_else();
+    check_the_routed_matvecs_know_their_own_width();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

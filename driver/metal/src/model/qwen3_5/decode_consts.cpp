@@ -17,7 +17,10 @@ namespace pie::metal {
 namespace {
 
 // ── Kernel param structs, replicated EXACTLY from the .metal sources ──
+using shared_kernels::ExpertCombineParams;
+using shared_kernels::MoeRouteParams;
 using shared_kernels::RmsParams;
+using shared_kernels::RouterParams;
 struct GatedRmsParams {  // gated_rms.metal:20  (buffer 4)
     float eps;
     uint32_t vd;         // value-head dim (reduction axis)
@@ -34,7 +37,20 @@ inline void bind_const(RawMetalContext& ctx, int ord, uint8_t idx, const V& val,
 }
 
 
-bool is_qmv(Kernel k) { return qmv_kn(k, DecodeGeometry{}).N != 0; }
+/// Whether a kind is a matvec, asked of THIS model's geometry.
+///
+/// It used to ask a default-constructed one, which worked only because every
+/// dense projection's width is nonzero whatever the numbers are. A routed
+/// projection's is not: `moe_intermediate` and `n_experts` are zero in a
+/// default geometry, so the mixture's matvecs would answer "not a matvec",
+/// skip the K/N binding entirely, and run against whatever the pool held at
+/// those ordinals.
+bool is_qmv(Kernel k, const DecodeGeometry& g) { return qmv_kn(k, g).N != 0; }
+
+/// The three projections that read one expert's slice per row.
+bool is_routed(Kernel k) {
+    return k == Kernel::LlExpertGate || k == Kernel::LlExpertUp || k == Kernel::LlExpertDown;
+}
 
 }  // namespace
 
@@ -56,6 +72,14 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
         case Kernel::QmvUp:     return {H, g.intermediate};   // 1024 → 3584
         case Kernel::QmvDown:   return {g.intermediate, H};   // 3584 → 1024
         case Kernel::QmvLmHead: return {H, g.vocab};          // 1024 → 248320
+        // The mixture. The router is an ordinary matvec into one logit per
+        // expert; the three expert projections have a K and an N like any
+        // other, and what makes them routed is which slice of the weight a row
+        // reads, not their shape.
+        case Kernel::LlRouter:     return {H, g.n_experts};
+        case Kernel::LlExpertGate: return {H, g.moe_intermediate};
+        case Kernel::LlExpertUp:   return {H, g.moe_intermediate};
+        case Kernel::LlExpertDown: return {g.moe_intermediate, H};
         default:                return {0, 0};
     }
 }
@@ -80,10 +104,22 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         const int ord = d.ordinal;
         const Kernel k = d.kind;
 
-        if (is_qmv(k)) {
+        if (is_qmv(k, g)) {
             const KN kn = qmv_kn(k, g);
             bind_const<int>(ctx, ord, (uint8_t)bind::Qmv::K, kn.K, &count);
             bind_const<int>(ctx, ord, (uint8_t)bind::Qmv::N, kn.N, &count);
+            if (is_routed(k)) {
+                using Q = bind::GoQmv;
+                // The routed matvec reads the SORTED stack: one row per
+                // (token, slot) pair rather than k slots hanging off a token
+                // row. The sort is what made the pair axis disappear, so all
+                // three of these collapse to the dense answer -- no slot
+                // stride, a row pitch that is just the input width, and one
+                // expert per row, named by `row_expert` rather than by `tid.z`.
+                bind_const<int>(ctx, ord, (uint8_t)Q::XSlotStride, 0, &count);
+                bind_const<int>(ctx, ord, (uint8_t)Q::XRowStride, kn.K, &count);
+                bind_const<int>(ctx, ord, (uint8_t)Q::SlotsPerRow, 1, &count);
+            }
             continue;
         }
 
@@ -224,9 +260,49 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                 g.n_q_heads * g.head_dim, &count);
                 break;
             case Kernel::SiluMul:
-                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width, g.intermediate, &count);
+                // The routed stack's gate and up are `moe_intermediate` wide
+                // and there is one row per sorted (token, slot) pair, padding
+                // included -- the padding rows are real rows of the buffers
+                // this reads. A dense model has neither, and the two never
+                // coexist: a model is one shape or the other.
+                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
+                                g.is_moe() ? moe_sorted_rows(g) * g.moe_intermediate : g.intermediate,
+                                &count);
                 break;
             case Kernel::Residual:
+            // ── the mixture's routing ──
+            case Kernel::GoRouterTopK:
+                bind_const<RouterParams>(
+                    ctx, ord, (uint8_t)bind::GoRouterTopK::Params,
+                    RouterParams{(uint32_t)g.n_experts, (uint32_t)g.experts_per_token}, &count);
+                break;
+            case Kernel::LlMoeSort:
+            case Kernel::LlMoeGather: {
+                // One params struct for both, so the sort's padding and the
+                // gather's bounds cannot disagree about how many rows exist.
+                // `width` is read only by the gather, which moves hidden-wide
+                // rows.
+                const MoeRouteParams p{(uint32_t)g.experts_per_token,
+                                       (uint32_t)g.n_experts,
+                                       (uint32_t)g.experts_per_token,
+                                       (uint32_t)shared_kernels::moe_tile_rows(
+                                           g.experts_per_token, g.n_experts),
+                                       (uint32_t)moe_sorted_rows(g),
+                                       (uint32_t)g.hidden};
+                bind_const<MoeRouteParams>(ctx, ord,
+                                           k == Kernel::LlMoeSort
+                                               ? (uint8_t)bind::MoeRouteSort::Params
+                                               : (uint8_t)bind::MoeRouteRows::Params,
+                                           p, &count);
+                break;
+            }
+            case Kernel::LlMoeCombine:
+                bind_const<ExpertCombineParams>(
+                    ctx, ord, (uint8_t)bind::GoExpertCombine::Params,
+                    ExpertCombineParams{(uint32_t)g.hidden, (uint32_t)g.experts_per_token},
+                    &count);
+                break;
+
             case Kernel::LayerOut:
                 bind_const<int>(ctx, ord, (uint8_t)bind::Residual::Width, g.hidden, &count);
                 break;

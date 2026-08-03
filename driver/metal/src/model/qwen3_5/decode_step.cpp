@@ -126,8 +126,7 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             // driver already has. At M=1 it is a grouping with no padding and
             // the projections stay matvecs, which is deliberate: one dataflow
             // for both, so the batched path is not a second implementation.
-            const int pairs = g.experts_per_token;
-            const int sorted = shared_kernels::moe_sorted_rows(pairs, g.n_experts);
+            const int sorted = moe_sorted_rows(g);
             emit(Kernel::LlRouter, L, qmv(g.n_experts));
             { LD l; shared_kernels::router_topk_dispatch(g.n_experts, l.grid, l.tg);
               emit(Kernel::GoRouterTopK, L, l); }
