@@ -1287,13 +1287,25 @@ impl FramePolicy {
                 return FramePlan::Terminate(expired);
             }
             let joining = engine_owes;
-            // Holding the seal for a joiner is a density optimisation, never
-            // correctness: a joiner is by definition NOT a member yet — it
-            // has no lane in the wait-set — so sealing without it excludes
-            // nobody. It merely starts the next epoch one process short of
-            // what it could have carried.
+            // Holding the seal for a joiner is never correctness: a joiner is
+            // by definition NOT a member yet — it has no lane in the wait-set
+            // — so sealing without it excludes nobody.
             //
-            // So the hold is only worth taking when the boundary is otherwise
+            // What it buys, measured by A/B on the same binary (the hold
+            // engages ~10x per epoch under `churn_extreme`):
+            //   - epoch density +6% (20.2 vs 19.0 members/epoch at a matched
+            //     epoch count); ~0% on `admission_tail`, `mixed_head`,
+            //     `allshared_noswap`, `soak`, `onefits`.
+            //   - wall time and tok/s: NO measurable difference anywhere.
+            //   - submit deadline breaches under 1024-way turnover: reliably
+            //     fewer with the hold (11 vs 32, 63 vs 99 across an
+            //     order-balanced pair of runs).
+            // So this is a tail mechanism for extreme turnover, not the
+            // throughput win the density framing suggests: a joiner that
+            // misses a boundary waits a whole epoch, and at that turnover
+            // rate the wait is what pushes stragglers past their deadline.
+            //
+            // The hold is only worth taking when the boundary is otherwise
             // finished: every lane it actually waits on has submitted and
             // nothing is executing to re-decide it. Anywhere else, waiting
             // would trade real work for a speculative passenger.
