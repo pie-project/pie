@@ -334,31 +334,34 @@ int main(int argc, char** argv) {
             /// the prompt as a different sentence because its weights are
             /// different. Keyed on shape alone it inherited the 4-bit row and
             /// failed while being right.
-            int n_layers, n_experts, quant_bits;
+            /// `hidden` joined them when Llama-3.2-3B arrived: 28 layers and
+            /// no experts is also Qwen3-1.7B, and the 3B ran that row's
+            /// answer and failed while being right.
+            int n_layers, n_experts, quant_bits, hidden;
             std::vector<int> want;
             /// The continuation of `long_gate_prompt()`, empty if unknown.
             std::vector<int> want_long;
         };
         const std::vector<Known> known{
             // " Tokyo. The capital of the", then "The capital of France is Paris"
-            {"Qwen3-1.7B", 28, 0, 4, {26194, 13, 576, 6722, 315, 279},
+            {"Qwen3-1.7B", 28, 0, 4, 2048, {26194, 13, 576, 6722, 315, 279},
              {785, 6722, 315, 9625, 374, 12095}},
             // " Tokyo. The capital of Brazil", then the sentence again
-            {"Qwen3-30B-A3B", 48, 128, 4, {26194, 13, 576, 6722, 315, 15948},
+            {"Qwen3-30B-A3B", 48, 128, 4, 2048, {26194, 13, 576, 6722, 315, 15948},
              {785, 6722, 315, 9625, 374, 12095}},
             // Qwen3.5 tokenizes these ids differently -- its vocabulary is
             // 248320, not Qwen3's 151936 -- so the continuation is a different
             // sentence in the same shape. The gate is on IDS, which is what the
             // driver and mlx-lm both consume, so the disagreement about what
             // they spell is not the gate's business.
-            {"Qwen3.5-0.8B", 24, 0, 4, {12095, 13, 576, 6722, 315, 198},
+            {"Qwen3.5-0.8B", 24, 0, 4, 1024, {12095, 13, 576, 6722, 315, 198},
              {785, 6722, 315, 9625, 374, 12095}},
             // Llama-3.2-1B reads these ids as its own vocabulary's text, not
             // the sentence Qwen spells, so the continuation is a different
             // sentence -- and it is the only entry here whose rotation comes
             // from a TABLE (`rope_scaling: llama3`, factor 32) rather than a
             // geometric series, which is the thing this row gates.
-            {"Llama-3.2-1B", 16, 0, 4, {12095, 13, 1115, 374, 279, 1890},
+            {"Llama-3.2-1B", 16, 0, 4, 2048, {12095, 13, 1115, 374, 279, 1890},
              {785, 6722, 315, 9625, 374, 12095}},
             // Gemma 4 E2B. Its 262144-entry vocabulary reads these ids as
             // nothing in particular, so the continuation is not a sentence --
@@ -367,7 +370,7 @@ int main(int argc, char** argv) {
             // other does: two attention widths in one stack (256 sliding, 512
             // full), a KV-shared tail, per-layer embeddings, and a softcapped
             // logit -- none of which any other entry exercises at all.
-            {"Gemma-4-E2B", 35, 0, 4, {56971, 55353, 374, 56971, 55353, 374},
+            {"Gemma-4-E2B", 35, 0, 4, 1536, {56971, 55353, 374, 56971, 55353, 374},
              {785, 6722, 48352, 6722, 48352, 6722}},
             // gpt-oss-20b. The only MXFP4 checkpoint here, and the row that
             // says the driver reads openai's format rather than converting it:
@@ -376,14 +379,21 @@ int main(int argc, char** argv) {
             // re-quantized it affine-U4, and no row could exist -- mlx's
             // quantizer and this one disagree on 8.2% of codes, always by one,
             // so the two runs did not hold the same weights. They do now.
-            {"gpt-oss-20b", 24, 32, 4, {13, 279, 410, 12038, 410, 25},
+            {"gpt-oss-20b", 24, 32, 4, 2880, {13, 279, 410, 12038, 410, 25},
              {785, 6722, 315, 9625, 1455, 12095}},
             // The same Llama-3.2-1B at 8 bits. It is here because it is the
             // only row that exercises a width other than 4 across a WHOLE
             // model -- the embedding gather, every projection, the batched
             // prefill matmul and the untied head. gpt-oss's 8-bit router
             // covers one dense matvec and nothing else.
-            {"Llama-3.2-1B-8bit", 16, 0, 8, {12095, 13, 420, 6722, 315, 6323},
+            {"Llama-3.2-1B-8bit", 16, 0, 8, 2048, {12095, 13, 420, 6722, 315, 6323},
+             {785, 6722, 315, 9625, 374, 12095}},
+            // Llama-3.2-3B. Same family and the same llama3 rope table as the
+            // 1B, at 24 query heads over 8 kv heads with head_dim 128 -- the
+            // 1B is 32/8 at 64 -- so it is the row that says the geometry is
+            // read rather than assumed. It reads these ids as version numbers,
+            // and " 1.0.0" is what mlx-lm produces too.
+            {"Llama-3.2-3B", 28, 0, 4, 3072, {220, 16, 13, 15, 13, 15},
              {785, 6722, 315, 9625, 374, 12095}},
         };
         //
@@ -396,6 +406,7 @@ int main(int argc, char** argv) {
         const Known* ref = nullptr;
         for (const Known& k : known) {
             if (k.n_layers == shape.n_layers && k.n_experts == shape.n_experts &&
+                k.hidden == shape.hidden &&
                 k.quant_bits == (cfg.quant_bits != 0 ? cfg.quant_bits : 4)) {
                 ref = &k;
                 break;
@@ -452,21 +463,41 @@ int main(int argc, char** argv) {
         // is arithmetic on the geometry, and the day it moves this check would
         // quietly become a third run of the matvec path it was added to stop
         // covering for.
-        if (ref != nullptr && cfg.llama.n_experts > 0) {
+        // It used to be gated on `n_experts > 0`, which meant every dense
+        // checkpoint here carried a VERIFIED `want_long` that nothing ever
+        // read. The batched mixture is not the only thing 192 rows reach: a
+        // twelve-token prompt runs the dense projections as matvecs too, so
+        // `affine_qmm_t` -- the whole prefill -- was covered by synthetic
+        // numerics and by no checkpoint at all. The precondition below is
+        // still checked, but only where it means something.
+        if (ref != nullptr && !ref->want_long.empty()) {
             const std::vector<std::uint32_t> lp = long_gate_prompt();
-            llama::LlamaGeometry lg;
-            std::string ignore;
-            const bool have_geo = llama::geometry_from_facts(cfg.llama, lg, &ignore);
-            const bool batched =
-                have_geo && llama::llama_moe_tile_rows(lg, int(lp.size())) > 1;
-            if (!batched) {
-                std::printf("  FAIL  the long gate reaches the batched mixture "
-                            "(%zu rows is still the matvec path)\n", lp.size());
-                return 1;
+            // The precondition can only be CHECKED for the llama family --
+            // `llama_moe_tile_rows` reads a `LlamaGeometry`, and gpt-oss's
+            // experts live in a different sub-config with a different
+            // threshold. So this asks it where it can be asked, and elsewhere
+            // says what it is running rather than claiming more.
+            if (cfg.llama.n_experts > 0) {
+                llama::LlamaGeometry lg;
+                std::string ignore;
+                const bool have_geo = llama::geometry_from_facts(cfg.llama, lg, &ignore);
+                const bool batched =
+                    have_geo && llama::llama_moe_tile_rows(lg, int(lp.size())) > 1;
+                if (!batched) {
+                    std::printf("  FAIL  the long gate reaches the batched mixture "
+                                "(%zu rows is still the matvec path)\n", lp.size());
+                    return 1;
+                }
+                std::printf("  ....  long gate: %zu rows, batched mixture\n", lp.size());
+            } else {
+                std::printf("  ....  long gate: %zu rows%s\n", lp.size(),
+                            shape.n_experts > 0 ? ", mixture threshold unchecked here"
+                                                : ", batched projections");
             }
-            std::printf("  ....  long gate: %zu rows, batched mixture\n", lp.size());
-            if (!gate(lp, ref->want_long,
-                      "batched-mixture continuation matches mlx-lm") && !dumping) {
+            const char* what = shape.n_experts > 0
+                                   ? "batched-mixture continuation matches mlx-lm"
+                                   : "batched-prefill continuation matches mlx-lm";
+            if (!gate(lp, ref->want_long, what) && !dumping) {
                 return 1;
             }
         }
