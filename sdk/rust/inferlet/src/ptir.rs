@@ -648,25 +648,193 @@ impl Default for RsWorkingSet {
 
 type StageClosure = Box<dyn Fn()>;
 
-/// The one WIT forward-pass resource, whichever interface it came from.
+/// The forward-pass resource of one `pie:inferlet` forward interface.
 ///
-/// `pie:inferlet` exposes three forward interfaces (`forward`,
-/// `forward-recurrent`, `forward-hybrid`) so that attention-only state
-/// algorithms cannot be named against a folded recurrent state. wit-bindgen
-/// generates three unrelated Rust resource types for them; this enum is where
-/// that three-way split stops, so the tracing/bookkeeping below exists once.
-enum PassWit {
-    Attention(wit_attention::ForwardPass),
-    Recurrent(wit_recurrent::ForwardPass),
-    Hybrid(wit_hybrid::ForwardPass),
+/// `pie:inferlet` exposes three of them (`forward`, `forward-recurrent`,
+/// `forward-hybrid`) so that attention-only state algorithms cannot be named
+/// against a folded recurrent state, and wit-bindgen generates three unrelated
+/// Rust resource types to match. This trait is the shape those three share, so
+/// [`Pass`]'s tracing and bookkeeping is written once WITHOUT collapsing them
+/// into a single type: `Pass<W>` stays as distinct per interface as `W` is.
+pub trait PassWit: Sized + 'static {
+    fn new() -> Self;
+
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String>;
+
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String>;
+
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
+
+    /// Issue the ONE state-binding call this interface takes. `forward-hybrid`
+    /// binds KV and RS together, so both halves arrive here and each interface
+    /// reports its own missing half.
+    fn bind_state(
+        &self,
+        kv: Option<&KvBind>,
+        rs: &[&crate::working_set::RsWorkingSet],
+        rs_geom: Option<&RsGeometryBind>,
+    ) -> Result<(), String>;
+
+    /// Rebind the recurrent working sets of an already-attached pass (a
+    /// request-set change between fires). Attention-only passes have no
+    /// recurrent state, so the default refuses.
+    fn rebind_recurrent(
+        &self,
+        _rs: &[&crate::working_set::RsWorkingSet],
+        _geom: &RsGeometryBind,
+    ) -> Result<(), String> {
+        Err("an attention-only forward pass has no recurrent state".to_string())
+    }
+
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
 }
 
-/// The shared forward-pass builder. Never public: guests always hold one of
-/// the three newtypes in [`attention`] / [`recurrent`] / [`hybrid`], which is
-/// what makes a cross-kind helper a COMPILE error rather than a silent
+impl PassWit for wit_attention::ForwardPass {
+    fn new() -> Self {
+        wit_attention::ForwardPass::new()
+    }
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String> {
+        wit_attention::ForwardPass::embed(self, tokens, indptr)
+    }
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
+        wit_attention::ForwardPass::readout(self, indices)
+    }
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
+        wit_attention::ForwardPass::program(self, bytes, channels)
+    }
+    fn bind_state(
+        &self,
+        kv: Option<&KvBind>,
+        _rs: &[&crate::working_set::RsWorkingSet],
+        _rs_geom: Option<&RsGeometryBind>,
+    ) -> Result<(), String> {
+        let kv = kv.ok_or("attention must be bound before submit")?;
+        wit_attention::ForwardPass::attention(
+            self,
+            kv.ws.as_ref(),
+            &wit_attention::KvGeometry {
+                readable_pages: kv.readable.wit(),
+                writable_pages: kv.writable.wit(),
+                kv_len: kv.kv_len.as_ref(),
+                pages: kv.pages.as_ref(),
+                page_indptr: kv.page_indptr.as_ref(),
+                w_slot: kv.w_slot.as_ref(),
+                w_off: kv.w_off.as_ref(),
+                positions: kv.positions.as_ref(),
+                mask: kv.mask.as_deref(),
+            },
+        )
+    }
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
+        wit_attention::submit(on, slots)
+    }
+}
+
+impl PassWit for wit_recurrent::ForwardPass {
+    fn new() -> Self {
+        wit_recurrent::ForwardPass::new()
+    }
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String> {
+        wit_recurrent::ForwardPass::embed(self, tokens, indptr)
+    }
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
+        wit_recurrent::ForwardPass::readout(self, indices)
+    }
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
+        wit_recurrent::ForwardPass::program(self, bytes, channels)
+    }
+    fn bind_state(
+        &self,
+        _kv: Option<&KvBind>,
+        rs: &[&crate::working_set::RsWorkingSet],
+        rs_geom: Option<&RsGeometryBind>,
+    ) -> Result<(), String> {
+        let geom = rs_geom.ok_or("recurrent state must be bound before submit")?;
+        self.rebind_recurrent(rs, geom)
+    }
+    fn rebind_recurrent(
+        &self,
+        rs: &[&crate::working_set::RsWorkingSet],
+        geom: &RsGeometryBind,
+    ) -> Result<(), String> {
+        wit_recurrent::ForwardPass::attention(self, rs, &recurrent_rs_geometry(geom))
+    }
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
+        wit_recurrent::submit(on, slots)
+    }
+}
+
+impl PassWit for wit_hybrid::ForwardPass {
+    fn new() -> Self {
+        wit_hybrid::ForwardPass::new()
+    }
+    fn embed(
+        &self,
+        tokens: &wit_channel::Channel,
+        indptr: &wit_channel::Channel,
+    ) -> Result<(), String> {
+        wit_hybrid::ForwardPass::embed(self, tokens, indptr)
+    }
+    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
+        wit_hybrid::ForwardPass::readout(self, indices)
+    }
+    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String> {
+        wit_hybrid::ForwardPass::program(self, bytes, channels)
+    }
+    fn bind_state(
+        &self,
+        kv: Option<&KvBind>,
+        rs: &[&crate::working_set::RsWorkingSet],
+        rs_geom: Option<&RsGeometryBind>,
+    ) -> Result<(), String> {
+        let kv = kv.ok_or("attention must be bound before submit")?;
+        let geom = rs_geom.ok_or("recurrent state must be bound before submit")?;
+        let binding = wit_hybrid::KvBinding {
+            working_set: kv.ws.as_ref(),
+            geometry: wit_hybrid::KvGeometry {
+                readable_pages: kv.readable.wit(),
+                writable_pages: kv.writable.wit(),
+                kv_len: kv.kv_len.as_ref(),
+                pages: kv.pages.as_ref(),
+                page_indptr: kv.page_indptr.as_ref(),
+                w_slot: kv.w_slot.as_ref(),
+                w_off: kv.w_off.as_ref(),
+                positions: kv.positions.as_ref(),
+                mask: kv.mask.as_deref(),
+            },
+        };
+        wit_hybrid::ForwardPass::attention(self, Some(&binding), rs, &hybrid_rs_geometry(geom))
+    }
+    fn rebind_recurrent(
+        &self,
+        rs: &[&crate::working_set::RsWorkingSet],
+        geom: &RsGeometryBind,
+    ) -> Result<(), String> {
+        wit_hybrid::ForwardPass::attention(self, None, rs, &hybrid_rs_geometry(geom))
+    }
+    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
+        wit_hybrid::submit(on, slots)
+    }
+}
+
+/// The forward-pass builder over the `W` interface. Guests name it through the
+/// per-interface aliases in [`attention`] / [`recurrent`] / [`hybrid`], which
+/// is what makes a cross-kind helper a COMPILE error rather than a silent
 /// semantic bug.
-struct PassCore {
-    wit: PassWit,
+pub struct Pass<W: PassWit> {
+    wit: W,
     inner: RefCell<ForwardInner>,
 }
 
@@ -687,7 +855,7 @@ struct ForwardInner {
 /// because `forward-hybrid.attention` binds KV and RS in one call -- they are
 /// one set of geometry over different layers of the same forward -- while the
 /// guest-facing SDK keeps them as two independent, order-free calls.
-struct KvBind {
+pub struct KvBind {
     ws: Rc<KvWorkingSet>,
     readable: PageDeclaration,
     writable: PageDeclaration,
@@ -741,7 +909,7 @@ pub struct KvGeometry<'a, R, W> {
 
 /// A recorded `rs-geometry`: where the bound recurrent state lives for this
 /// fire and where its folded boundary lands.
-struct RsGeometryBind {
+pub struct RsGeometryBind {
     /// The fold-len channel as a descriptor port, or `None` for the
     /// synthesized fold-everything geometry. Claiming it is what lets a stage
     /// COMPUTE the fold length: the driver resolves the port on device, so a
@@ -830,12 +998,12 @@ mod page_declaration_tests {
     }
 }
 
-impl PassCore {
-    fn new(wit: PassWit) -> PassCore {
+impl<W: PassWit> Pass<W> {
+    pub fn new() -> Pass<W> {
         let vocab = crate::model::output_vocab_size();
         let page_size = crate::model::kv_page_size();
-        PassCore {
-            wit,
+        Pass {
+            wit: W::new(),
             inner: RefCell::new(ForwardInner {
                 rs_bind: None,
                 ports: Vec::new(),
@@ -872,11 +1040,7 @@ impl PassCore {
         self.ensure_ports_available(&[Port::EmbedTokens, Port::EmbedIndptr])?;
         let token_wit = tokens.wit();
         let indptr_wit = indptr.wit();
-        match &self.wit {
-            PassWit::Attention(w) => w.embed(token_wit.as_ref(), indptr_wit.as_ref()),
-            PassWit::Recurrent(w) => w.embed(token_wit.as_ref(), indptr_wit.as_ref()),
-            PassWit::Hybrid(w) => w.embed(token_wit.as_ref(), indptr_wit.as_ref()),
-        }?;
+        self.wit.embed(token_wit.as_ref(), indptr_wit.as_ref())?;
         self.inner.borrow_mut().ports.extend([
             (Port::EmbedTokens, claim_port(Port::EmbedTokens, tokens)),
             (Port::EmbedIndptr, claim_port(Port::EmbedIndptr, indptr)),
@@ -884,16 +1048,16 @@ impl PassCore {
         Ok(())
     }
 
-    /// Bind attention and all of its geometry channels. This is the only
-    /// attention binding surface.
-    pub fn attention<R, W>(
+    /// Bind attention and all of its geometry channels. Reached through the
+    /// per-interface `attention` on the two kinds that have KV.
+    fn bind_attention<R, Wr>(
         &self,
         ws: &WorkingSet,
-        geom: KvGeometry<'_, R, W>,
+        geom: KvGeometry<'_, R, Wr>,
     ) -> Result<(), String>
     where
         R: RangeBounds<u32>,
-        W: RangeBounds<u32>,
+        Wr: RangeBounds<u32>,
     {
         let KvGeometry {
             readable_pages,
@@ -997,13 +1161,7 @@ impl PassCore {
             working_sets.iter().map(|rs| rs.rs.clone()).collect();
         let borrows: Vec<&crate::working_set::RsWorkingSet> =
             replacement.iter().map(Rc::as_ref).collect();
-        match &self.wit {
-            PassWit::Recurrent(w) => w.attention(&borrows, &recurrent_rs_geometry(&geom)),
-            PassWit::Hybrid(w) => w.attention(None, &borrows, &hybrid_rs_geometry(&geom)),
-            PassWit::Attention(_) => {
-                Err("an attention-only forward pass has no recurrent state".to_string())
-            }
-        }?;
+        self.wit.rebind_recurrent(&borrows, &geom)?;
         let mut inner = self.inner.borrow_mut();
         inner.rs_working_sets = replacement;
         inner.rs_bind = Some(geom);
@@ -1014,11 +1172,7 @@ impl PassCore {
     pub fn readout(&self, indices: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::Readout])?;
         let indices_wit = indices.wit();
-        match &self.wit {
-            PassWit::Attention(w) => w.readout(indices_wit.as_ref()),
-            PassWit::Recurrent(w) => w.readout(indices_wit.as_ref()),
-            PassWit::Hybrid(w) => w.readout(indices_wit.as_ref()),
-        }?;
+        self.wit.readout(indices_wit.as_ref())?;
         self.inner
             .borrow_mut()
             .ports
@@ -1029,14 +1183,6 @@ impl PassCore {
     /// Attach the `prologue` stage (overview §5.3).
     pub fn prologue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Prologue, body);
-    }
-    /// Attach the `on_attn_proj` stage (per layer, before attention).
-    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttnProj, body);
-    }
-    /// Attach the `on_attn` stage (per layer, after attention).
-    pub fn on_attn(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttn, body);
     }
     /// Attach the `epilogue` stage (sampling programs; after the forward).
     pub fn epilogue(&self, body: impl Fn() + 'static) {
@@ -1069,8 +1215,8 @@ impl PassCore {
     /// A decode loop should NOT call this. Use [`run_ahead`], which fills
     /// [`live_slots`] per frame and sizes its window from
     /// [`channel_capacity`], or [`submit_frame`] to drive frames by hand.
-    fn submit(&self, on: &Pipeline) -> Result<(), String> {
-        submit_core_frame(on, &[Some(self)])
+    pub fn submit(&self, on: &Pipeline) -> Result<(), String> {
+        submit_frame(on, &[Some(self)])
     }
 
     /// Issue the ONE deferred state-binding WIT call. Called once, at the top
@@ -1081,54 +1227,8 @@ impl PassCore {
         let inner = self.inner.borrow();
         let rs: Vec<&crate::working_set::RsWorkingSet> =
             inner.rs_working_sets.iter().map(Rc::as_ref).collect();
-        match &self.wit {
-            PassWit::Attention(w) => {
-                let Some(kv) = inner.kv_bind.as_ref() else {
-                    return Err("attention must be bound before submit".to_string());
-                };
-                let geom = wit_attention::KvGeometry {
-                        readable_pages: kv.readable.wit(),
-                        writable_pages: kv.writable.wit(),
-                        kv_len: kv.kv_len.as_ref(),
-                        pages: kv.pages.as_ref(),
-                        page_indptr: kv.page_indptr.as_ref(),
-                        w_slot: kv.w_slot.as_ref(),
-                        w_off: kv.w_off.as_ref(),
-                        positions: kv.positions.as_ref(),
-                    mask: kv.mask.as_deref(),
-                };
-                w.attention(kv.ws.as_ref(), &geom)
-            }
-            PassWit::Recurrent(w) => {
-                let Some(geom) = inner.rs_bind.as_ref() else {
-                    return Err("recurrent state must be bound before submit".to_string());
-                };
-                w.attention(&rs, &recurrent_rs_geometry(geom))
-            }
-            PassWit::Hybrid(w) => {
-                let Some(kv) = inner.kv_bind.as_ref() else {
-                    return Err("attention must be bound before submit".to_string());
-                };
-                let binding = wit_hybrid::KvBinding {
-                        working_set: kv.ws.as_ref(),
-                        geometry: wit_hybrid::KvGeometry {
-                            readable_pages: kv.readable.wit(),
-                            writable_pages: kv.writable.wit(),
-                            kv_len: kv.kv_len.as_ref(),
-                            pages: kv.pages.as_ref(),
-                            page_indptr: kv.page_indptr.as_ref(),
-                            w_slot: kv.w_slot.as_ref(),
-                            w_off: kv.w_off.as_ref(),
-                            positions: kv.positions.as_ref(),
-                            mask: kv.mask.as_deref(),
-                        },
-                    };
-                let Some(geom) = inner.rs_bind.as_ref() else {
-                    return Err("recurrent state must be bound before submit".to_string());
-                };
-                w.attention(Some(&binding), &rs, &hybrid_rs_geometry(geom))
-            }
-        }
+        self.wit
+            .bind_state(inner.kv_bind.as_ref(), &rs, inner.rs_bind.as_ref())
     }
 
     fn attach_program(&self) -> Result<(), String> {
@@ -1154,14 +1254,16 @@ impl PassCore {
             .collect();
         let borrows: Vec<&wit_channel::Channel> = handles.iter().map(Rc::as_ref).collect();
         let bytes = traced.encode();
-        match &self.wit {
-            PassWit::Attention(w) => w.program(&bytes, &borrows),
-            PassWit::Recurrent(w) => w.program(&bytes, &borrows),
-            PassWit::Hybrid(w) => w.program(&bytes, &borrows),
-        }?;
+        self.wit.program(&bytes, &borrows)?;
         drop(inner);
         self.inner.borrow_mut().program_attached = true;
         Ok(())
+    }
+}
+
+impl<W: PassWit> Default for Pass<W> {
+    fn default() -> Self {
+        Pass::new()
     }
 }
 
@@ -1297,7 +1399,10 @@ fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
 /// in every slot) and slots may be heterogeneous (prefill chunks first, then
 /// decode). First submit of a pass traces and attaches its program;
 /// attachment, bind, and frame-validation errors surface here.
-fn submit_core_frame(on: &Pipeline, slots: &[Option<&PassCore>]) -> Result<(), String> {
+///
+/// A frame is monomorphic in its slot type by construction: `W` is one
+/// interface, so a mixed frame does not typecheck.
+pub fn submit_frame<W: PassWit>(on: &Pipeline, slots: &[Option<&Pass<W>>]) -> Result<(), String> {
     let k = frame_size();
     if slots.len() > k {
         return Err(format!(
@@ -1308,32 +1413,12 @@ fn submit_core_frame(on: &Pipeline, slots: &[Option<&PassCore>]) -> Result<(), S
     for pass in slots.iter().flatten() {
         pass.attach_program()?;
     }
-    // A frame is monomorphic in its slot type. The public entry points take
-    // `&[Option<&ForwardPass>]` of ONE module, so a mixed frame is already
-    // unrepresentable; this match just picks the matching WIT `submit`.
-    let kind = slots.iter().flatten().next();
-    let Some(kind) = kind else {
+    if slots.iter().flatten().next().is_none() {
         return Ok(());
-    };
-    macro_rules! dispatch {
-        ($variant:ident, $wit:path) => {{
-            let mut borrows: Vec<Option<&_>> = slots
-                .iter()
-                .map(|slot| match slot.map(|pass| &pass.wit) {
-                    Some(PassWit::$variant(w)) => Some(w),
-                    Some(_) => unreachable!("frames are monomorphic in their pass kind"),
-                    None => None,
-                })
-                .collect();
-            borrows.resize(k, None);
-            $wit(&on.wit, &borrows)
-        }};
     }
-    match &kind.wit {
-        PassWit::Attention(_) => dispatch!(Attention, wit_attention::submit),
-        PassWit::Recurrent(_) => dispatch!(Recurrent, wit_recurrent::submit),
-        PassWit::Hybrid(_) => dispatch!(Hybrid, wit_hybrid::submit),
-    }
+    let mut borrows: Vec<Option<&W>> = slots.iter().map(|slot| slot.map(|p| &p.wit)).collect();
+    borrows.resize(k, None);
+    W::submit(&on.wit, &borrows)
 }
 
 /// Keeps the engine's run-ahead window full while `on_token` consumes results,
@@ -1363,9 +1448,9 @@ fn submit_core_frame(on: &Pipeline, slots: &[Option<&PassCore>]) -> Result<(), S
 /// [`Pipeline::close`] reclaims them.
 ///
 /// Returns the number of times `on_token` ran.
-async fn run_ahead_core(
+pub async fn run_ahead<W: PassWit>(
     on: &Pipeline,
-    pass: &PassCore,
+    pass: &Pass<W>,
     budget: usize,
     mut on_token: impl AsyncFnMut() -> Result<std::ops::ControlFlow<()>, String>,
 ) -> Result<usize, String> {
@@ -1390,8 +1475,8 @@ async fn run_ahead_core(
         if live == 0 {
             return Ok(());
         }
-        let slots: Vec<Option<&PassCore>> = vec![Some(pass); live];
-        submit_core_frame(on, &slots)?;
+        let slots: Vec<Option<&Pass<W>>> = vec![Some(pass); live];
+        submit_frame(on, &slots)?;
         *submitted += live;
         Ok(())
     };
@@ -1499,98 +1584,118 @@ pub mod shared_prelude {
 // The three author-facing pass modules
 // ---------------------------------------------------------------------------
 
-/// Everything the three pass modules share, generated once. The DUPLICATION is
-/// the product: three unrelated `ForwardPass` types mean a helper written for
-/// attention-only KV eviction (H2O, SnapKV, TOVA, Quest) cannot even name a
-/// hybrid model's pass, which is the correctness gate this split exists for.
-macro_rules! pass_module {
-    ($variant:ident, $wit:path, $doc:expr) => {
-        #[doc = $doc]
-        pub struct ForwardPass(::std::rc::Rc<$crate::ptir::PassCore>);
-
-        impl ForwardPass {
-            pub fn new() -> Self {
-                Self(::std::rc::Rc::new($crate::ptir::PassCore::new(
-                    $crate::ptir::PassWit::$variant(<$wit>::new()),
-                )))
-            }
-
-            /// Bind token ids and CSR row indptr. Both are channels.
-            pub fn embed(
-                &self,
-                tokens: &$crate::ptir::Channel,
-                indptr: &$crate::ptir::Channel,
-            ) -> Result<(), String> {
-                self.0.embed(tokens, indptr)
-            }
-
-            /// Bind readout indexes through a channel, separately from embedding.
-            pub fn readout(&self, indices: &$crate::ptir::Channel) -> Result<(), String> {
-                self.0.readout(indices)
-            }
-
-            /// Attach the `prologue` stage.
-            pub fn prologue(&self, body: impl Fn() + 'static) {
-                self.0.prologue(body)
-            }
-            /// Attach the `epilogue` stage (sampling programs; after the forward).
-            pub fn epilogue(&self, body: impl Fn() + 'static) {
-                self.0.epilogue(body)
-            }
-
-            /// Enqueue this pass as a SINGLE-SLOT FRAME on `on`.
-            pub fn submit(&self, on: &$crate::ptir::Pipeline) -> Result<(), String> {
-                self.0.submit(on)
-            }
-        }
-
-        impl Default for ForwardPass {
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        /// Submit ONE FRAME on `on`: up to `frame_size()` ordered slots, slot i
-        /// executing in wave i; missing trailing slots are padded with no-ops.
-        pub fn submit_frame(
-            on: &$crate::ptir::Pipeline,
-            slots: &[Option<&ForwardPass>],
-        ) -> Result<(), String> {
-            let cores: Vec<Option<&$crate::ptir::PassCore>> = slots
-                .iter()
-                .map(|slot| slot.map(|pass| pass.0.as_ref()))
-                .collect();
-            $crate::ptir::submit_core_frame(on, &cores)
-        }
-
-        /// Keeps the engine's run-ahead window full while `on_token` consumes
-        /// results. See the crate-level `run_ahead` documentation.
-        pub async fn run_ahead(
-            on: &$crate::ptir::Pipeline,
-            pass: &ForwardPass,
-            budget: usize,
-            on_token: impl AsyncFnMut() -> Result<::std::ops::ControlFlow<()>, String>,
-        ) -> Result<usize, String> {
-            $crate::ptir::run_ahead_core(on, pass.0.as_ref(), budget, on_token).await
-        }
-    };
-}
-
 /// Attention taps, legal only where attention layers exist.
-macro_rules! pass_module_attention_stages {
-    () => {
-        impl ForwardPass {
-            /// Attach the `on_attn_proj` stage (per layer, before attention).
-            pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
-                self.0.on_attn_proj(body)
-            }
-            /// Attach the `on_attn` stage (per layer, after attention).
-            pub fn on_attn(&self, body: impl Fn() + 'static) {
-                self.0.on_attn(body)
-            }
-        }
-    };
+impl Pass<wit_attention::ForwardPass> {
+    /// Attach the `on_attn_proj` stage (per layer, before attention).
+    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttnProj, body);
+    }
+    /// Attach the `on_attn` stage (per layer, after attention).
+    pub fn on_attn(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttn, body);
+    }
+
+    /// Bind attention and all of its geometry channels — see [`KvGeometry`].
+    pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        self.bind_attention(ws, geom)
+    }
 }
+
+impl Pass<wit_hybrid::ForwardPass> {
+    /// Attach the `on_attn_proj` stage (per attention layer, before attention).
+    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttnProj, body);
+    }
+    /// Attach the `on_attn` stage (per attention layer, after attention).
+    pub fn on_attn(&self, body: impl Fn() + 'static) {
+        self.set_stage(Stage::OnAttn, body);
+    }
+
+    /// Bind the ATTENTION half — see [`KvGeometry`]. The two halves are
+    /// recorded independently and issued as the single
+    /// `forward-hybrid.attention` call on first submit, so their order here
+    /// does not matter -- but both are required.
+    pub fn attention<R, W>(&self, ws: &WorkingSet, geom: KvGeometry<'_, R, W>) -> Result<(), String>
+    where
+        R: RangeBounds<u32>,
+        W: RangeBounds<u32>,
+    {
+        self.bind_attention(ws, geom)
+    }
+
+    /// Bind the RECURRENT half: one working set per request, in resolved
+    /// request order.
+    pub fn recurrent(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
+        self.bind_recurrent(working_sets, rs_geometry_fold_all()?)
+    }
+
+    /// Bind the RECURRENT half AND state where its folded boundary lands.
+    ///
+    /// `fold_len` is a channel carrying, per request, how far the folded
+    /// boundary advances over `[buffer | this fire's tokens]`, clamped to
+    /// that tail:
+    ///
+    /// - `u32::MAX` -- fold everything. What [`recurrent`] supplies.
+    /// - `0` -- fold nothing; append every token of this fire to the
+    ///   buffer. This is what makes a linear model speculatable: buffered
+    ///   tokens that are never folded cost nothing to abandon.
+    /// - `n <= buffer_len` -- fold the first `n` buffered tokens and drop
+    ///   the covered head pages. The COMMIT half of speculation.
+    ///
+    /// A channel rather than a scalar so that a device-computed accepted
+    /// count can drive the fold directly, fusing verify and commit into
+    /// one fire.
+    ///
+    /// [`recurrent`]: Pass::recurrent
+    pub fn recurrent_with<B>(
+        &self,
+        working_sets: &[RsWorkingSet],
+        fold_len: &Channel,
+        buffer: B,
+    ) -> Result<(), String>
+    where
+        B: RangeBounds<u32>,
+    {
+        self.bind_recurrent(working_sets, rs_geometry_bind(fold_len, buffer)?)
+    }
+}
+
+impl Pass<wit_recurrent::ForwardPass> {
+    /// Bind the recurrent state: one working set per request, in resolved
+    /// request order. The REQUIRED state binding for this interface, which is
+    /// why it carries the same name the other two give theirs.
+    pub fn attention(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
+        self.bind_recurrent(working_sets, rs_geometry_fold_all()?)
+    }
+
+    /// Bind the recurrent state AND state where its folded boundary lands.
+    /// See [`Pass::<wit_hybrid::ForwardPass>::recurrent_with`] -- the surface
+    /// and the semantics are identical.
+    pub fn attention_with<B>(
+        &self,
+        working_sets: &[RsWorkingSet],
+        fold_len: &Channel,
+        buffer: B,
+    ) -> Result<(), String>
+    where
+        B: RangeBounds<u32>,
+    {
+        self.bind_recurrent(working_sets, rs_geometry_bind(fold_len, buffer)?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The three author-facing pass aliases
+// ---------------------------------------------------------------------------
+//
+// One alias per `pie:inferlet` forward interface. They are DISTINCT types --
+// `Pass<A>` and `Pass<H>` share no impl -- which is the correctness gate this
+// split exists for: a helper written for attention-only KV eviction (H2O,
+// SnapKV, TOVA, Quest) cannot even name a hybrid model's pass.
 
 /// `pie:inferlet/forward` — paged, per-token, reversibly discardable KV only.
 ///
@@ -1600,30 +1705,9 @@ macro_rules! pass_module_attention_stages {
 ///
 /// [`ForwardKind::Attention`]: crate::model::ForwardKind
 pub mod attention {
-    use super::*;
-
-    pass_module!(
-        Attention,
-        wit_attention::ForwardPass,
-        "An attention-only forward pass."
-    );
-    pass_module_attention_stages!();
-
-    impl ForwardPass {
-        /// Bind attention and all of its geometry channels — see
-        /// [`KvGeometry`](crate::ptir::KvGeometry).
-        pub fn attention<R, W>(
-            &self,
-            ws: &WorkingSet,
-            geom: crate::ptir::KvGeometry<'_, R, W>,
-        ) -> Result<(), String>
-        where
-            R: ::std::ops::RangeBounds<u32>,
-            W: ::std::ops::RangeBounds<u32>,
-        {
-            self.0.attention(ws, geom)
-        }
-    }
+    /// An attention-only forward pass.
+    pub type ForwardPass = super::Pass<super::wit_attention::ForwardPass>;
+    pub use super::{run_ahead, submit_frame};
 
     /// Glob-import surface for attention-only inferlet authors.
     pub mod prelude {
@@ -1640,41 +1724,9 @@ pub mod attention {
 ///
 /// [`ForwardKind::Recurrent`]: crate::model::ForwardKind
 pub mod recurrent {
-    use super::*;
-
-    pass_module!(
-        Recurrent,
-        wit_recurrent::ForwardPass,
-        "A recurrent-only forward pass."
-    );
-
-    impl ForwardPass {
-        /// Bind the recurrent-state working sets in resolved request order.
-        /// The mechanism is a recurrence, but the SLOT is the same one
-        /// `attention` names in the other two interfaces.
-        pub fn attention(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-            self.0
-                .bind_recurrent(working_sets, rs_geometry_fold_all()?)
-        }
-
-        /// Bind the recurrent state AND state where its folded boundary
-        /// lands. See [`hybrid::ForwardPass::recurrent_with`] -- the surface
-        /// and the semantics are identical.
-        ///
-        /// [`hybrid::ForwardPass::recurrent_with`]: crate::ptir::hybrid::ForwardPass::recurrent_with
-        pub fn attention_with<B>(
-            &self,
-            working_sets: &[RsWorkingSet],
-            fold_len: &Channel,
-            buffer: B,
-        ) -> Result<(), String>
-        where
-            B: RangeBounds<u32>,
-        {
-            let geom = rs_geometry_bind(fold_len, buffer)?;
-            self.0.bind_recurrent(working_sets, geom)
-        }
-    }
+    /// A recurrent-only forward pass.
+    pub type ForwardPass = super::Pass<super::wit_recurrent::ForwardPass>;
+    pub use super::{run_ahead, submit_frame};
 
     /// Glob-import surface for recurrent-only inferlet authors.
     pub mod prelude {
@@ -1692,67 +1744,9 @@ pub mod recurrent {
 ///
 /// [`ForwardKind::Hybrid`]: crate::model::ForwardKind
 pub mod hybrid {
-    use super::*;
-
-    pass_module!(Hybrid, wit_hybrid::ForwardPass, "A hybrid forward pass.");
-    pass_module_attention_stages!();
-
-    impl ForwardPass {
-        /// Bind the ATTENTION half. The two halves are recorded independently
-        /// and issued as the single `forward-hybrid.attention` call on first
-        /// submit, so their order here does not matter -- but both are
-        /// required.
-        #[allow(clippy::too_many_arguments)]
-        pub fn attention<R, W>(
-            &self,
-            ws: &WorkingSet,
-            geom: crate::ptir::KvGeometry<'_, R, W>,
-        ) -> Result<(), String>
-        where
-            R: ::std::ops::RangeBounds<u32>,
-            W: ::std::ops::RangeBounds<u32>,
-        {
-            self.0.attention(ws, geom)
-        }
-
-        /// Bind the RECURRENT half: one working set per request, in resolved
-        /// request order.
-        pub fn recurrent(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-            self.0
-                .bind_recurrent(working_sets, rs_geometry_fold_all()?)
-        }
-
-        /// Bind the RECURRENT half AND state where its folded boundary lands.
-        ///
-        /// `fold_len` is a channel carrying, per request, how far the folded
-        /// boundary advances over `[buffer | this fire's tokens]`, clamped to
-        /// that tail:
-        ///
-        /// - `u32::MAX` -- fold everything. What [`recurrent`] supplies.
-        /// - `0` -- fold nothing; append every token of this fire to the
-        ///   buffer. This is what makes a linear model speculatable: buffered
-        ///   tokens that are never folded cost nothing to abandon.
-        /// - `n <= buffer_len` -- fold the first `n` buffered tokens and drop
-        ///   the covered head pages. The COMMIT half of speculation.
-        ///
-        /// A channel rather than a scalar so that a device-computed accepted
-        /// count can drive the fold directly, fusing verify and commit into
-        /// one fire.
-        ///
-        /// [`recurrent`]: ForwardPass::recurrent
-        pub fn recurrent_with<B>(
-            &self,
-            working_sets: &[RsWorkingSet],
-            fold_len: &Channel,
-            buffer: B,
-        ) -> Result<(), String>
-        where
-            B: RangeBounds<u32>,
-        {
-            let geom = rs_geometry_bind(fold_len, buffer)?;
-            self.0.bind_recurrent(working_sets, geom)
-        }
-    }
+    /// A hybrid forward pass.
+    pub type ForwardPass = super::Pass<super::wit_hybrid::ForwardPass>;
+    pub use super::{run_ahead, submit_frame};
 
     /// Glob-import surface for hybrid inferlet authors.
     pub mod prelude {
