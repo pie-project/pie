@@ -328,31 +328,37 @@ int main(int argc, char** argv) {
         // benchmark starts measuring how fast the driver can be wrong.
         struct Known {
             const char* name;
-            int n_layers, n_experts;
+            /// Shape alone stopped being a key the day a second quantization of
+            /// the SAME model was gated: mlx-community's 8-bit Llama-3.2-1B is
+            /// 16 layers and 0 experts, exactly like the 4-bit one, and reads
+            /// the prompt as a different sentence because its weights are
+            /// different. Keyed on shape alone it inherited the 4-bit row and
+            /// failed while being right.
+            int n_layers, n_experts, quant_bits;
             std::vector<int> want;
             /// The continuation of `long_gate_prompt()`, empty if unknown.
             std::vector<int> want_long;
         };
         const std::vector<Known> known{
             // " Tokyo. The capital of the", then "The capital of France is Paris"
-            {"Qwen3-1.7B", 28, 0, {26194, 13, 576, 6722, 315, 279},
+            {"Qwen3-1.7B", 28, 0, 4, {26194, 13, 576, 6722, 315, 279},
              {785, 6722, 315, 9625, 374, 12095}},
             // " Tokyo. The capital of Brazil", then the sentence again
-            {"Qwen3-30B-A3B", 48, 128, {26194, 13, 576, 6722, 315, 15948},
+            {"Qwen3-30B-A3B", 48, 128, 4, {26194, 13, 576, 6722, 315, 15948},
              {785, 6722, 315, 9625, 374, 12095}},
             // Qwen3.5 tokenizes these ids differently -- its vocabulary is
             // 248320, not Qwen3's 151936 -- so the continuation is a different
             // sentence in the same shape. The gate is on IDS, which is what the
             // driver and mlx-lm both consume, so the disagreement about what
             // they spell is not the gate's business.
-            {"Qwen3.5-0.8B", 24, 0, {12095, 13, 576, 6722, 315, 198},
+            {"Qwen3.5-0.8B", 24, 0, 4, {12095, 13, 576, 6722, 315, 198},
              {785, 6722, 315, 9625, 374, 12095}},
             // Llama-3.2-1B reads these ids as its own vocabulary's text, not
             // the sentence Qwen spells, so the continuation is a different
             // sentence -- and it is the only entry here whose rotation comes
             // from a TABLE (`rope_scaling: llama3`, factor 32) rather than a
             // geometric series, which is the thing this row gates.
-            {"Llama-3.2-1B", 16, 0, {12095, 13, 1115, 374, 279, 1890},
+            {"Llama-3.2-1B", 16, 0, 4, {12095, 13, 1115, 374, 279, 1890},
              {785, 6722, 315, 9625, 374, 12095}},
             // Gemma 4 E2B. Its 262144-entry vocabulary reads these ids as
             // nothing in particular, so the continuation is not a sentence --
@@ -361,7 +367,7 @@ int main(int argc, char** argv) {
             // other does: two attention widths in one stack (256 sliding, 512
             // full), a KV-shared tail, per-layer embeddings, and a softcapped
             // logit -- none of which any other entry exercises at all.
-            {"Gemma-4-E2B", 35, 0, {56971, 55353, 374, 56971, 55353, 374},
+            {"Gemma-4-E2B", 35, 0, 4, {56971, 55353, 374, 56971, 55353, 374},
              {785, 6722, 48352, 6722, 48352, 6722}},
             // gpt-oss-20b. The only MXFP4 checkpoint here, and the row that
             // says the driver reads openai's format rather than converting it:
@@ -370,8 +376,15 @@ int main(int argc, char** argv) {
             // re-quantized it affine-U4, and no row could exist -- mlx's
             // quantizer and this one disagree on 8.2% of codes, always by one,
             // so the two runs did not hold the same weights. They do now.
-            {"gpt-oss-20b", 24, 32, {13, 279, 410, 12038, 410, 25},
+            {"gpt-oss-20b", 24, 32, 4, {13, 279, 410, 12038, 410, 25},
              {785, 6722, 315, 9625, 1455, 12095}},
+            // The same Llama-3.2-1B at 8 bits. It is here because it is the
+            // only row that exercises a width other than 4 across a WHOLE
+            // model -- the embedding gather, every projection, the batched
+            // prefill matmul and the untied head. gpt-oss's 8-bit router
+            // covers one dense matvec and nothing else.
+            {"Llama-3.2-1B-8bit", 16, 0, 8, {12095, 13, 420, 6722, 315, 6323},
+             {785, 6722, 315, 9625, 374, 12095}},
         };
         //
         // What IS checked, and is the evidence for this family, is the tap
@@ -382,7 +395,8 @@ int main(int argc, char** argv) {
         // not load at all.
         const Known* ref = nullptr;
         for (const Known& k : known) {
-            if (k.n_layers == shape.n_layers && k.n_experts == shape.n_experts) {
+            if (k.n_layers == shape.n_layers && k.n_experts == shape.n_experts &&
+                k.quant_bits == (cfg.quant_bits != 0 ? cfg.quant_bits : 4)) {
                 ref = &k;
                 break;
             }

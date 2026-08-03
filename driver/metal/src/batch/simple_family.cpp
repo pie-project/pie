@@ -58,6 +58,7 @@ bool gemma4_geometry(const SetupConfig& cfg, gemma4::Gemma4Geometry& g, int max_
                      std::string* err) {
     if (!gemma4::geometry_from_facts(cfg.gemma4, g, err)) return false;
     if (cfg.vocab_size != 0) g.vocab = static_cast<int>(cfg.vocab_size);
+    if (cfg.quant_bits != 0) g.quant_bits = cfg.quant_bits;
     g.kv_max_ctx = max_ctx;
     return true;
 }
@@ -79,6 +80,7 @@ bool llama_geometry(const SetupConfig& cfg, llama::LlamaGeometry& g, int max_ctx
                     std::string* err) {
     if (!llama::geometry_from_facts(cfg.llama, g, err)) return false;
     if (cfg.vocab_size != 0) g.vocab = static_cast<int>(cfg.vocab_size);
+    if (cfg.quant_bits != 0) g.quant_bits = cfg.quant_bits;
     g.kv_max_ctx = max_ctx;
     return true;
 }
@@ -352,8 +354,15 @@ class Gemma4Engine final : public SimpleFamilyEngine {
         }
 
         if (!gemma4::build_gemma4_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/true, err)) return false;
+        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err,
+                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
+                              /*untied=*/false, g_.quant_bits)) {
+            return false;
+        }
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/true, err,
+                                  /*routed=*/false, g_.quant_bits)) {
+            return false;
+        }
 
         gemma4::bind_gemma4_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true, /*head_rows=*/1);
         bound_rows_ = 1;
@@ -1071,8 +1080,15 @@ class LlamaEngine final : public SimpleFamilyEngine {
         }
 
         if (!llama::build_llama_psos(ctx, kernels_dir, g_, psos_, err)) return false;
-        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err)) return false;
-        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err)) return false;
+        if (!load_decode_psos(ctx, kernels_dir, base_, /*with_argmax=*/false, err,
+                              /*fuse_residual=*/false, /*gdn_prep=*/false, /*routed=*/false,
+                              /*untied=*/false, g_.quant_bits)) {
+            return false;
+        }
+        if (!load_multibatch_psos(ctx, kernels_dir, mb_, /*with_d512=*/false, err,
+                                  /*routed=*/false, g_.quant_bits)) {
+            return false;
+        }
 
         llama::bind_llama_consts(ctx, dag_, g_, /*rows=*/1, /*paged=*/true);
         bound_rows_ = 1;

@@ -40,6 +40,12 @@ struct Gemma4Geometry {
     int n_kv_heads = 1;
     /// Sliding layers. Full layers use `global_head_dim`.
     int head_dim = 256;
+    /// The affine quantization width every kernel name here is spelled with.
+    /// The checkpoint's `config.json` states it; g64/b8 and g128/b4 pack to
+    /// identical shapes, so the tensors cannot. A width with no instantiation
+    /// fails to build a pipeline BY NAME rather than reading the bytes at the
+    /// wrong stride and returning a fluent wrong answer.
+    int quant_bits = 4;
     int global_head_dim = 512;
     /// Full layers rotate a quarter of their head; sliding layers rotate all of it.
     float full_partial_rotary = 0.25f;

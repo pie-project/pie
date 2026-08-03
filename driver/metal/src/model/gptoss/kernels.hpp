@@ -55,13 +55,11 @@ struct GptOssPsos {
     Pso qmv_routed_bias{};
     /// The router's matvec, at whatever width the checkpoint quantized it to.
     /// `mlx_lm`'s predicate usually keeps it at 8 bits while everything else
-    /// goes to 4, but a uniformly-quantized checkpoint ships a 4-bit one --
-    /// `build_gptoss_psos` picks between `qmv_u8_bias` and `qmv_tail_bias` from
-    /// the width the staged tensors state.
+    /// goes to 4, but a uniformly-quantized checkpoint ships a 4-bit one. Same
+    /// kernel either way -- `build_gptoss_psos` names the b=4 or b=8
+    /// instantiation of the dense biased matvec -- so it needs no launch
+    /// geometry of its own.
     Pso qmv_router{};
-    /// The 8-bit router matvec; mlx's predicate keeps it wider than everything
-    /// else. Held separately from `qmv_router` so the choice stays inspectable.
-    Pso qmv_u8_bias{};
     Pso router_topk{};
     Pso swiglu{};
     Pso expert_combine{};
@@ -81,7 +79,7 @@ struct GptOssPsos {
 
     bool valid() const {
         return qmv_tail.valid() && qmv_tail_bias.valid() && qmv_routed_bias.valid() &&
-               qmv_u8_bias.valid() && qmv_router.valid() && router_topk.valid() &&
+               qmv_router.valid() && router_topk.valid() &&
                swiglu.valid() && expert_combine.valid() && sdpa_sink.valid() &&
                rope_freqs.valid();
     }
@@ -119,13 +117,7 @@ float yarn_mscale(const GptOssGeometry& g);
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
 
-/// `affine_qmv_u8_bias`: one simdgroup per output row.
-inline void qmv_u8_dispatch(int N, Grid& g, Threadgroup& tg, int rows = 1) {
-    g = Grid{32u, std::uint32_t(N > 0 ? N : 1), std::uint32_t(rows < 1 ? 1 : rows)};
-    tg = Threadgroup{32, 1, 1};
-}
-
-/// The 4-bit matvec. `slots` is 1 for an ordinary projection and
+/// The quantized matvec, at either width. `slots` is 1 for an ordinary projection and
 /// `experts_per_token` for a routed one, on the third grid axis.
 /// `rows` folds onto the x axis, which the kernel already reads as the token
 /// row: the grid is in THREADS, so one threadgroup of 32 per row.

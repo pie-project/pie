@@ -31,16 +31,27 @@ inline constexpr short get_bytes_per_pack() {
   return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
 }
 
+// The pre-division is how the 4-bit dot gets away with never unpacking: it
+// multiplies the packed u16 word's nibbles in place, so the input carries the
+// shift instead. At 8 bits a code already occupies a whole byte, so there is
+// nothing to undo and the input is passed through.
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector(const device T* x, thread U* x_thread) {
-  static_assert(bits == 4, "Phase-0 port specialized for 4-bit");
+  static_assert(bits == 4 || bits == 8, "port covers the two widths mlx_lm ships");
   U sum = 0;
-  for (int i = 0; i < values_per_thread; i += 4) {
-    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-    x_thread[i] = x[i];
-    x_thread[i + 1] = x[i + 1] / 16.0f;
-    x_thread[i + 2] = x[i + 2] / 256.0f;
-    x_thread[i + 3] = x[i + 3] / 4096.0f;
+  if (bits == 4) {
+    for (int i = 0; i < values_per_thread; i += 4) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 16.0f;
+      x_thread[i + 2] = x[i + 2] / 256.0f;
+      x_thread[i + 3] = x[i + 3] / 4096.0f;
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      sum += x[i];
+      x_thread[i] = x[i];
+    }
   }
   return sum;
 }
@@ -52,15 +63,21 @@ inline U qdot(
     U scale,
     U bias,
     U sum) {
-  static_assert(bits == 4, "Phase-0 port specialized for 4-bit");
+  static_assert(bits == 4 || bits == 8, "port covers the two widths mlx_lm ships");
   U accum = 0;
-  const device uint16_t* ws = (const device uint16_t*)w;
-  for (int i = 0; i < (values_per_thread / 4); i++) {
-    accum +=
-        (x_thread[4 * i] * (ws[i] & 0x000f) +
-         x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-         x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-         x_thread[4 * i + 3] * (ws[i] & 0xf000));
+  if (bits == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      accum +=
+          (x_thread[4 * i] * (ws[i] & 0x000f) +
+           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+           x_thread[4 * i + 3] * (ws[i] & 0xf000));
+    }
+  } else {
+    for (int i = 0; i < values_per_thread; i++) {
+      accum += x_thread[i] * w[i];
+    }
   }
   return scale * accum + sum * bias;
 }
@@ -248,6 +265,7 @@ template <typename T, int group_size, int bits>
 instantiate_qmv_fast(float32, float, 64, 4)
 instantiate_qmv_fast(float16, half, 64, 4)
 instantiate_qmv_fast(bfloat16, bfloat, 64, 4)
+instantiate_qmv_fast(bfloat16, bfloat, 64, 8)
 
 #define instantiate_qmv_fast_residual(name, itype, gs, b)                       \
   template [[host_name("affine_qmv_fast_residual_" #name "_gs_" #gs "_b_" #b)]] \
@@ -259,6 +277,7 @@ instantiate_qmv_fast(bfloat16, bfloat, 64, 4)
 instantiate_qmv_fast_residual(float32, float, 64, 4)
 instantiate_qmv_fast_residual(float16, half, 64, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 4)
+instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 8)
 
 // ── Narrow-K variant (gemma4) ────────────────────────────────────────────────
 // Identical math and identical launch shape; one pack per thread instead of two,
@@ -292,6 +311,7 @@ template <typename T, int group_size, int bits>
 instantiate_qmv_narrow(float32, float, 64, 4)
 instantiate_qmv_narrow(float16, half, 64, 4)
 instantiate_qmv_narrow(bfloat16, bfloat, 64, 4)
+instantiate_qmv_narrow(bfloat16, bfloat, 64, 8)
 
 // ── The two 4-bit codecs, as one axis ───────────────────────────────────────
 //
@@ -302,22 +322,28 @@ instantiate_qmv_narrow(bfloat16, bfloat, 64, 4)
 // layout, and it is where the subtlety lives. So the codec is a template
 // parameter rather than a second copy of the matvec.
 #include "mxfp4_codec.h"
-template <typename T>
-struct AffineU4 {
+template <typename T, int BITS>
+struct AffineQ {
   typedef T scale_t;
+  MLX_MTL_CONST int bits = BITS;
   MLX_MTL_CONST int group_size = 64;
   MLX_MTL_CONST bool zero_point = true;
   static METAL_FUNC float scale_of(scale_t s) { return float(s); }
   template <typename U, int VPT>
   static METAL_FUNC U prepare(const device T* x, thread U* x_thread) {
-    return load_vector<T, U, VPT, 4>(x, x_thread);
+    return load_vector<T, U, VPT, BITS>(x, x_thread);
   }
   template <typename U, int VPT>
   static METAL_FUNC U dot(const device uint8_t* w, const thread U* x_thread, U scale,
                           U bias, U sum) {
-    return qdot<U, VPT, 4>(w, x_thread, scale, bias, sum);
+    return qdot<U, VPT, BITS>(w, x_thread, scale, bias, sum);
   }
 };
+// The width is a third point on the same axis, not a third codec. `scale * code
+// + bias` is linear at either width; only the unpacking differs, and that lives
+// in `qdot`.
+template <typename T> using AffineU4 = AffineQ<T, 4>;
+template <typename T> using AffineU8 = AffineQ<T, 8>;
 
 // The block exponent is E8M0: an unsigned power of two, 127-biased, with 0xff
 // reserved for NaN. A code is a lookup and not a product, which is why MXFP4
@@ -328,6 +354,7 @@ struct AffineU4 {
 template <typename T>
 struct Mxfp4 {
   typedef uint8_t scale_t;
+  MLX_MTL_CONST int bits = 4;
   MLX_MTL_CONST int group_size = 32;
   MLX_MTL_CONST bool zero_point = false;
   static METAL_FUNC float scale_of(scale_t s) { return mxfp4_block_scale(s); }
@@ -387,7 +414,7 @@ METAL_FUNC void qmv_gptoss_impl(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int bits = 4;
+  constexpr int bits = Codec::bits;
   constexpr int group_size = Codec::group_size;
   constexpr int packs_per_thread = 1;
   constexpr int num_simdgroups = 2;
@@ -471,8 +498,12 @@ METAL_FUNC void qmv_gptoss_impl(
   }
 }
 
-#define gptoss_qmv_kernel(name, Codec, BIASED, ROUTED)                         \
-  template <typename T>                                                        \
+// The codec is a template-template parameter rather than baked in by the
+// macro, so a kernel's SHAPE (biased? routed?) and its ENCODING are chosen
+// independently. That is what lets the same `qmv_bias` serve the 4-bit
+// attention projections and the 8-bit router.
+#define gptoss_qmv_kernel(name, BIASED, ROUTED)                                \
+  template <typename T, template <typename> class Codec>                       \
   [[kernel]] void name(                                                        \
       const device uint32_t* w   [[buffer(0)]],                                \
       const device typename Codec<T>::scale_t* scales [[buffer(1)]],           \
@@ -494,23 +525,17 @@ METAL_FUNC void qmv_gptoss_impl(
         x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid);  \
   }
 
-gptoss_qmv_kernel(affine_qmv_tail, AffineU4, false, false)
-gptoss_qmv_kernel(affine_qmv_tail_bias, AffineU4, true, false)
-gptoss_qmv_kernel(affine_qmv_routed_bias, AffineU4, true, true)
+gptoss_qmv_kernel(qmv_tail, false, false)
+gptoss_qmv_kernel(qmv_tail_bias, true, false)
 // Qwen3-MoE's experts carry no bias. Everything else about the routed path --
 // the stacked weights indexed by `expert_ids`, `tid.z` selecting the slot -- is
 // identical, so it is the same template with BIASED off rather than a kernel.
-gptoss_qmv_kernel(affine_qmv_routed, AffineU4, false, true)
+gptoss_qmv_kernel(qmv_routed_bias, true, true)
+gptoss_qmv_kernel(qmv_routed, false, true)
 
-// The same matvec against the checkpoint's own MXFP4 experts. Only gpt-oss has
-// them, and only its experts -- attention, router, embedding and head are all
-// published affine -- so the routed-and-biased shape is the only one MXFP4
-// needs.
-gptoss_qmv_kernel(mxfp4_qmv_routed_bias, Mxfp4, true, true)
-
-#define instantiate_gptoss_qmv(fn, codec, name, itype, gs, b)                \
-  template [[host_name(#fn "_" #name "_gs_" #gs "_b_" #b)]]                   \
-  [[kernel]] void fn<itype>(                                                  \
+#define instantiate_gptoss_qmv(host, fn, codec, name, itype, gs, b)           \
+  template [[host_name(#host "_" #name "_gs_" #gs "_b_" #b)]]                 \
+  [[kernel]] void fn<itype, codec>(                                           \
       const device uint32_t*, const device codec<itype>::scale_t*,            \
       const device itype*,                                                    \
       const device itype*, device itype*, const constant int&,                \
@@ -518,63 +543,21 @@ gptoss_qmv_kernel(mxfp4_qmv_routed_bias, Mxfp4, true, true)
       const constant int&, const constant int&, const constant int&,          \
       uint3, uint, uint);
 
-instantiate_gptoss_qmv(affine_qmv_tail, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_routed_bias, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(affine_qmv_routed, AffineU4, bfloat16, bfloat, 64, 4)
-instantiate_gptoss_qmv(mxfp4_qmv_routed_bias, Mxfp4, bfloat16, bfloat, 32, 4)
+instantiate_gptoss_qmv(affine_qmv_tail, qmv_tail, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_tail_bias, qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU4, bfloat16, bfloat, 64, 4)
+instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU4, bfloat16, bfloat, 64, 4)
 
-// ── 8-bit affine matvec (gpt-oss's router) ──────────────────────────────────
-//
-// `mlx_lm`'s quantization predicate leaves the router at 8 bits while
-// everything around it goes to 4 -- it is 32 x 2880, small enough that the
-// width costs nothing and sensitive enough that it matters. Rather than
-// generalise the 4-bit dot product, this is the straightforward shape: one
-// simdgroup per output row, lanes striding K.
-template <typename T, int group_size>
-[[kernel]] void affine_qmv_u8_bias(
-    const device uint32_t* w   [[buffer(0)]],
-    const device T* scales     [[buffer(1)]],
-    const device T* biases     [[buffer(2)]],
-    const device T* x          [[buffer(3)]],
-    device T* y                [[buffer(4)]],
-    const constant int& in_vec_size  [[buffer(5)]],
-    const constant int& out_vec_size [[buffer(6)]],
-    const device T* bias       [[buffer(7)]],
-    uint3 tid       [[threadgroup_position_in_grid]],
-    uint simd_lid   [[thread_index_in_simdgroup]]) {
-  const int row = int(tid.y);
-  if (row >= out_vec_size) return;
-  // `tid.z` is the token row: one router per token, and the batch's rows are
-  // independent of one another. Zero at M=1.
-  const int token = int(tid.z);
-  x += size_t(token) * size_t(in_vec_size);
-  y += size_t(token) * size_t(out_vec_size);
-  const int words = in_vec_size / 4;        // four u8 per u32
-  const int groups = in_vec_size / group_size;
-  float acc = 0;
-  for (int i = int(simd_lid); i < words; i += SIMD_SIZE) {
-    const uint32_t word = w[row * words + i];
-    for (int j = 0; j < 4; ++j) {
-      const int col = i * 4 + j;
-      const uint q = (word >> (8 * j)) & 0xff;
-      const int g = col / group_size;
-      const float s = float(scales[row * groups + g]);
-      const float b = float(biases[row * groups + g]);
-      acc += (s * float(q) + b) * float(x[col]);
-    }
-  }
-  acc = simd_sum(acc);
-  if (simd_lid == 0) {
-    y[row] = static_cast<T>(acc + float(bias[row]));
-  }
-}
+// The same matvec against the checkpoint's own MXFP4 experts. Only gpt-oss has
+// them, and only its experts -- attention, router, embedding and head are all
+// published affine -- so the routed-and-biased shape is the only one MXFP4
+// needs.
+instantiate_gptoss_qmv(mxfp4_qmv_routed_bias, qmv_routed_bias, Mxfp4, bfloat16, bfloat, 32, 4)
 
-#define instantiate_qmv_u8(name, itype, gs)                                  \
-  template [[host_name("affine_qmv_u8_bias_" #name "_gs_" #gs)]]              \
-  [[kernel]] void affine_qmv_u8_bias<itype, gs>(                              \
-      const device uint32_t*, const device itype*, const device itype*,       \
-      const device itype*, device itype*, const constant int&,                \
-      const constant int&, const device itype*, uint3, uint);
-
-instantiate_qmv_u8(bfloat16, bfloat, 64)
+// gpt-oss's router. `mlx_lm`'s predicate leaves it at 8 bits while everything
+// around it goes to 4 -- 32 x 2880, small enough that the width costs nothing
+// and sensitive enough that it matters. It used to be a hand-written kernel
+// with its own launch geometry and its own special case in two dispatchers;
+// once the width is a codec parameter it is the dense biased matvec at b=8,
+// and all of that goes away.
+instantiate_gptoss_qmv(affine_qmv_tail_bias, qmv_tail_bias, AffineU8, bfloat16, bfloat, 64, 8)

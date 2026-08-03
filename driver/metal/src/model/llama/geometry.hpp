@@ -46,6 +46,12 @@ struct LlamaGeometry {
     int n_q_heads = 32;
     int n_kv_heads = 8;
     int head_dim = 128;
+    /// The affine quantization width every kernel name here is spelled with.
+    /// The checkpoint's `config.json` states it; g64/b8 and g128/b4 pack to
+    /// identical shapes, so the tensors cannot. A width with no instantiation
+    /// fails to build a pipeline BY NAME rather than reading the bytes at the
+    /// wrong stride and returning a fluent wrong answer.
+    int quant_bits = 4;
 
     /// Qwen3 RMS-normalises q and k per head before the rotation. Not a scale
     /// difference -- the norm is over `head_dim` with its own learned weight,

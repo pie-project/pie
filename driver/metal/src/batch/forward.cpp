@@ -922,14 +922,14 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     std::string load_err;
     if (!load_decode_psos(*ctx_, kernels_dir, psos_, /*with_argmax=*/false, &load_err,
                           fuse_residual_, gdn_prep_, g_.is_moe(),
-                          /*untied=*/!g_.tied_embeddings)) {
+                          /*untied=*/!g_.tied_embeddings, g_.quant_bits)) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
     }
     if (g_.paged_kv_enabled &&
         !load_multibatch_psos(*ctx_, kernels_dir, mb_psos_, /*with_d512=*/false, &load_err,
-                              g_.is_moe())) {
+                              g_.is_moe(), g_.quant_bits)) {
         if (err) *err = "multi-batch PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -2349,21 +2349,6 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             model::model_family_of(cfg.model_type) == model::ModelFamily::Qwen35
                 ? cfg.qwen35.tied_embeddings
                 : cfg.llama.tied_embeddings;
-        // Only gpt-oss has a matvec for a width other than 4, and only for its
-        // router. Every other family names 4-bit entrypoints for every
-        // projection it dispatches, so a checkpoint quantized to any other
-        // width would be READ at 4 bits -- which is not a crash. A published
-        // 8-bit Llama-3.2-1B loaded and answered `80874 67793 81216 16713`,
-        // and the only thing wrong was that nobody had said this.
-        if (model::model_family_of(cfg.model_type) != model::ModelFamily::GptOss &&
-            cfg.quant_bits != 0 && cfg.quant_bits != 4) {
-            if (err != nullptr) {
-                *err = "this checkpoint is quantized to " + std::to_string(cfg.quant_bits) +
-                       " bits, and the " + std::string(cfg.model_type) +
-                       " kernels here are 4-bit throughout";
-            }
-            return false;
-        }
         contract_facts.quant_bits = cfg.quant_bits;
         contract_facts.quant_group_size = cfg.quant_group_size;
         load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type,
@@ -2391,6 +2376,7 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // geometry from its own facts.
     if (family == model::ModelFamily::Qwen35) {
         std::string gerr;
+        if (cfg.quant_bits != 0) geom.quant_bits = cfg.quant_bits;
         if (!geometry_from_facts(cfg.qwen35, geom, &gerr)) {
             if (err != nullptr) *err = gerr;
             return false;

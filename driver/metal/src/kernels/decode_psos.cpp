@@ -17,17 +17,17 @@ namespace {
 // serves. Entrypoints are the bf16 (`bfloat16`) instantiations (activation dtype T = bf16);
 // 4-bit kernels are g64/b4, sdpa is head_dim 256.
 struct PsoSpec {
-    const char*         file;
-    const char*         fn;
+    std::string         file;
+    std::string         fn;
     std::vector<Kernel> kinds;
 };
 
-const std::vector<PsoSpec>& specs() {
-    static const std::vector<PsoSpec> s = {
-        {"embed_gather.metal", "embed_gather_4bit_bfloat16_gs_64_b_4", {Kernel::EmbedGather}},
+std::vector<PsoSpec> specs(const std::string& embed_gather_fn, const std::string& qmv_fast_fn) {
+    return {
+        {"embed_gather.metal", embed_gather_fn, {Kernel::EmbedGather}},
         {"rms_norm.metal",     "rms_single_row_bfloat16",
             {Kernel::Rms, Kernel::FfnRms, Kernel::QNorm, Kernel::KNorm, Kernel::FinalRms}},
-        {"quantized_qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4",
+        {"quantized_qmv.metal", qmv_fast_fn,
             {Kernel::QmvIn, Kernel::QmvInZ, Kernel::QmvOut, Kernel::QmvQ, Kernel::QmvK,
              Kernel::QmvV, Kernel::QmvO, Kernel::QmvGate, Kernel::QmvUp, Kernel::QmvDown,
              Kernel::QmvLmHead, Kernel::GdnInA, Kernel::GdnInB}},
@@ -41,7 +41,6 @@ const std::vector<PsoSpec>& specs() {
         {"sdpa_vector.metal",  "sdpa_vector_decode_bfloat16_d_256", {Kernel::Sdpa}},
         {"silu_mul.metal",     "silu_mul_bfloat16",     {Kernel::SiluMul}},
     };
-    return s;
 }
 
 }  // namespace
@@ -54,9 +53,18 @@ bool load_decode_psos(RawMetalContext& ctx,
                       bool fuse_residual,
                       bool gdn_prep,
                       bool routed,
-                      bool untied) {
+                      bool untied,
+                      int quant_bits) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
+    // Every quantized entrypoint is `<base>_bfloat16_gs_64_b_<width>`. The
+    // width is the checkpoint's, not a literal, for the same reason the head
+    // width is: a pipeline built for the wrong one does not fail, it answers.
+    const std::string q = "_bfloat16_gs_64_b_" + std::to_string(quant_bits);
+    const std::string embed_gather_fn = "embed_gather_4bit" + q;
+    const std::string qmv_fast_fn = "affine_qmv_fast" + q;
+    const std::string qmv_residual_fn = "affine_qmv_fast_residual" + q;
+    const std::string qmv_routed_fn = "affine_qmv_routed" + q;
 
     // Every entrypoint this configuration needs, gathered first so the whole
     // set compiles as one concurrent batch (and files shared by several
@@ -64,15 +72,17 @@ bool load_decode_psos(RawMetalContext& ctx,
     // into a library exactly once).
     std::vector<RawMetalContext::PsoFileRequest> requests;
     std::vector<std::vector<Kernel>> targets;
-    auto want = [&](const char* file, const char* fn, std::vector<Kernel> kinds) {
+    auto want = [&](const std::string& file, const std::string& fn, std::vector<Kernel> kinds) {
         requests.push_back({dir + file, fn});
         targets.push_back(std::move(kinds));
     };
 
-    for (const PsoSpec& spec : specs()) want(spec.file, spec.fn, spec.kinds);
+    for (const PsoSpec& spec : specs(embed_gather_fn, qmv_fast_fn)) {
+        want(spec.file.c_str(), spec.fn.c_str(), spec.kinds);
+    }
     if (fuse_residual) {
         // Residual-epilogue GEMV variant for QmvO/QmvOut/QmvDown (adds buffer(7) residual).
-        want("quantized_qmv.metal", "affine_qmv_fast_residual_bfloat16_gs_64_b_4", {});
+        want("quantized_qmv.metal", qmv_residual_fn.c_str(), {});
     }
     const size_t residual_at = fuse_residual ? requests.size() - 1 : SIZE_MAX;
     if (gdn_prep) {
@@ -94,9 +104,9 @@ bool load_decode_psos(RawMetalContext& ctx,
         // Claiming them unconditionally handed it a valid gs_64/b_4 PSO for a
         // checkpoint that is neither -- not a load failure, just wrong numbers,
         // and it took the numerics test to say so.
-        want("embed_gather.metal", "embed_gather_4bit_bfloat16_gs_64_b_4",
+        want("embed_gather.metal", embed_gather_fn.c_str(),
              {Kernel::EmbedUntied});
-        want("quantized_qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4",
+        want("quantized_qmv.metal", qmv_fast_fn.c_str(),
              {Kernel::LmHeadUntied});
     }
     if (routed) {
@@ -119,18 +129,18 @@ bool load_decode_psos(RawMetalContext& ctx,
         // table is a kind every checkpoint is expected to have: a dense model
         // has no `mlp.gate`, and claiming the kind for it makes the loader
         // demand a tensor that does not exist.
-        want("quantized_qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4", {Kernel::LlRouter});
+        want("quantized_qmv.metal", qmv_fast_fn.c_str(), {Kernel::LlRouter});
         want("gptoss.metal", "router_topk_bfloat16", {Kernel::GoRouterTopK});
         want("moe_route.metal", "moe_route_sort", {Kernel::LlMoeSort});
         want("moe_route.metal", "moe_route_gather", {Kernel::LlMoeGather});
         want("moe_route.metal", "moe_combine_sorted", {Kernel::LlMoeCombine});
-        want("quantized_qmv.metal", "affine_qmv_routed_bfloat16_gs_64_b_4",
+        want("quantized_qmv.metal", qmv_routed_fn.c_str(),
              {Kernel::LlExpertGate, Kernel::LlExpertUp, Kernel::LlExpertDown});
         // The shared expert. Dense projections on the dense kernel -- they are
         // separate KINDS only because a kind is a weight name here, and these
         // read `mlp.shared_expert.*`. The gate projection is the same kernel
         // producing a single output row.
-        want("quantized_qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4",
+        want("quantized_qmv.metal", qmv_fast_fn.c_str(),
              {Kernel::LlSharedGate, Kernel::LlSharedUp, Kernel::LlSharedDown,
               Kernel::LlSharedGateProj});
         want("moe_route.metal", "shared_expert_combine", {Kernel::LlSharedCombine});
@@ -160,12 +170,15 @@ bool load_multibatch_psos(RawMetalContext& ctx,
                           MultiBatchPsos& out,
                           bool with_d512,
                           std::string* err,
-                          bool routed) {
+                          bool routed,
+                          int quant_bits) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
-    struct MbSpec { const char* file; const char* fn; Pso* dst; bool required; };
+    const std::string q = "_bfloat16_gs_64_b_" + std::to_string(quant_bits);
+    const std::string embed_mb_fn = "embed_gather_mb_4bit" + q;
+    struct MbSpec { std::string file; std::string fn; Pso* dst; bool required; };
     const MbSpec specs[] = {
-        {"embed_gather.metal", "embed_gather_mb_4bit_bfloat16_gs_64_b_4", &out.embed_mb,        true},
+        {"embed_gather.metal", embed_mb_fn, &out.embed_mb,        true},
         {"rope.metal",         "rope_neox_mb_bfloat16",                   &out.rope_mb,         true},
         {"gdn_core.metal",     "gdn_core_slotted_bfloat16",               &out.gdn_slotted,     true},
         {"gdn_prep.metal",     "gdn_prep_slotted_bfloat16",               &out.gdn_prep_slotted, true},
@@ -196,7 +209,7 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         for (int i = 0; i < 3; ++i) {
             const int bn = 16 << i;
             const int bm = w == 0 ? pie::metal::kQmmBM : pie::metal::kQmmBMWide;
-            const std::string suffix = "_bfloat16_gs_64_b_4_bm_" + std::to_string(bm) +
+            const std::string suffix = q + "_bm_" + std::to_string(bm) +
                                        "_bn_" + std::to_string(bn);
             want(qmm, "affine_qmm_t" + suffix, &out.qmm_t[w][i]);
             want(qmm, "affine_qmm_t_residual" + suffix, &out.qmm_t_residual[w][i]);
@@ -206,7 +219,7 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     for (int w = 0; w < 2; ++w) {
         const int bm = w == 0 ? pie::metal::kQmmBM : pie::metal::kQmmBMWide;
         want(qmm,
-             "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_" + std::to_string(bm) +
+             "affine_qmm_t_splitk" + q + "_bm_" + std::to_string(bm) +
                  "_bn_" + std::to_string(pie::metal::kQmmSplitBN),
              &out.qmm_t_splitk[w]);
     }
@@ -217,7 +230,7 @@ bool load_multibatch_psos(RawMetalContext& ctx,
         // another's rows.
         for (int i = 0; i < 3; ++i) {
             want(qmm,
-                 "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" +
+                 "affine_qmm_t_routed" + q + "_bm_" +
                      std::to_string(shared_kernels::kMoeTileRows) + "_bn_" +
                      std::to_string(16 << i),
                  &out.qmm_routed[i]);
@@ -225,11 +238,11 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     }
     want(qmm, "qmm_splitk_reduce_bfloat16", &out.qmm_splitk_reduce);
     want(qmm, "qmm_splitk_reduce_residual_bfloat16", &out.qmm_splitk_reduce_residual);
-    want(qmm, "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_16_bn_32", &out.qmm_t_strided);
-    want(qmm, "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_16_bn_32",
+    want(qmm, "affine_qmm_t_strided" + q + "_bm_16_bn_32", &out.qmm_t_strided);
+    want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_16_bn_32",
          &out.qmm_t_strided_residual);
-    want(qmm, "affine_qmm_t_strided_bfloat16_gs_64_b_4_bm_32_bn_32", &out.qmm_t_strided_wide);
-    want(qmm, "affine_qmm_t_strided_residual_bfloat16_gs_64_b_4_bm_32_bn_32",
+    want(qmm, "affine_qmm_t_strided" + q + "_bm_32_bn_32", &out.qmm_t_strided_wide);
+    want(qmm, "affine_qmm_t_strided_residual" + q + "_bm_32_bn_32",
          &out.qmm_t_strided_wide_residual);
     for (const MbSpec& s : specs) {
         if (!s.required && !with_d512) continue;

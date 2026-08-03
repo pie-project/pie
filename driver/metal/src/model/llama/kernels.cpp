@@ -12,7 +12,7 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
     struct Spec {
         const char* file;
-        const char* fn;
+        std::string fn;
         Pso* dst;
     };
     // bf16 throughout: the activation dtype every ported M=1 kernel already uses.
@@ -20,13 +20,16 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // A width with no instantiation fails here, by name, instead of running a
     // pipeline built for a different one.
     const std::string d = "_d_" + std::to_string(g.head_dim);
+    // Likewise the quantization width: the config states it, and a pipeline
+    // built for the wrong one reads the bytes at the wrong stride.
+    const std::string q = "_bfloat16_gs_64_b_" + std::to_string(g.quant_bits);
     const std::string sdpa_name = "sdpa_vector_decode_bfloat16" + d;
     const std::string paged_name = "sdpa_paged_decode_bfloat16" + d;
     const std::string tiled_name = "sdpa_paged_tiled_bfloat16" + d;
     std::vector<Spec> specs = {
-        {"sdpa_vector.metal", sdpa_name.c_str(), &out.sdpa},
-        {"sdpa_paged.metal", paged_name.c_str(), &out.sdpa_paged},
-        {"sdpa_paged.metal", tiled_name.c_str(), &out.sdpa_paged_tiled},
+        {"sdpa_vector.metal", sdpa_name, &out.sdpa},
+        {"sdpa_paged.metal", paged_name, &out.sdpa_paged},
+        {"sdpa_paged.metal", tiled_name, &out.sdpa_paged_tiled},
         {"row_gather.metal", "row_gather_bfloat16", &out.row_gather},
     };
     if (g.rope_freq_table) {
@@ -38,8 +41,7 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     // that would otherwise have worked.
     if (g.is_moe()) {
         specs.push_back({"gptoss.metal", "router_topk_bfloat16", &out.router_topk});
-        specs.push_back({"quantized_qmv.metal", "affine_qmv_routed_bfloat16_gs_64_b_4",
-                         &out.qmv_routed});
+        specs.push_back({"quantized_qmv.metal", "affine_qmv_routed" + q, &out.qmv_routed});
         specs.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});
         specs.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});
         specs.push_back({"moe_route.metal", "moe_combine_sorted", &out.moe_combine});
@@ -47,24 +49,20 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         // is what the sort padded every expert's run to -- naming it here would
         // be a second statement of the same number, so it is spelled from the
         // constant.
-        static const std::string routed[3] = {
-            "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" +
-                std::to_string(shared_kernels::kMoeTileRows) + "_bn_16",
-            "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" +
-                std::to_string(shared_kernels::kMoeTileRows) + "_bn_32",
-            "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" +
-                std::to_string(shared_kernels::kMoeTileRows) + "_bn_64",
-        };
+        const std::string routed_bm =
+            "affine_qmm_t_routed" + q + "_bm_" + std::to_string(shared_kernels::kMoeTileRows);
         for (int i = 0; i < 3; ++i) {
-            specs.push_back({"quantized_qmm_t.metal", routed[i].c_str(), &out.qmm_routed[i]});
+            specs.push_back({"quantized_qmm_t.metal",
+                             routed_bm + "_bn_" + std::to_string(16 << i),
+                             &out.qmm_routed[i]});
         }
     }
     for (const Spec& spec : specs) {
         std::string compile_error;
-        *spec.dst = ctx.compile_pso_from_file(dir + spec.file, spec.fn, &compile_error);
+        *spec.dst = ctx.compile_pso_from_file(dir + spec.file, spec.fn.c_str(), &compile_error);
         if (!spec.dst->valid()) {
             if (err != nullptr) {
-                *err = std::string("llama PSO '") + spec.fn + "' (" + spec.file +
+                *err = "llama PSO '" + spec.fn + "' (" + spec.file +
                        "): " + compile_error;
             }
             return false;
