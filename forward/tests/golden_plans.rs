@@ -26,7 +26,7 @@ use pie_forward::family::{
     qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block,
 };
 use pie_forward::{
-    FireClass, ForwardPlan, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
+    FireClass, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
@@ -260,8 +260,10 @@ fn qwen3_5_hybrid_0_8b_cuda_commit_advance() {
     let plan = qwen3_5_hybrid_cuda(&facts, &cuda, FireClass::CommitAdvance);
     assert_eq!(plan.family, "qwen3_5_hybrid.cuda.commit_advance");
 
-    // 18 linear layers x 4 ops; 1 input value + 18 x (3 + 1 + 5) fresh.
-    assert_eq!(plan.ops.len(), 18 * 4);
+    // 18 linear layers x (4 ops + the two hook sites the hand-written
+    // replay passes through, A4); 1 input value + 18 x (3 + 1 + 5)
+    // fresh (sites produce nothing).
+    assert_eq!(plan.ops.len(), 18 * 6);
     assert_eq!(plan.values.len(), 1 + 18 * 9);
     // The root is a placeholder no op produces.
     assert!(!plan.ops.iter().any(|op| op.outputs.contains(&0)));
@@ -272,6 +274,10 @@ fn qwen3_5_hybrid_0_8b_cuda_commit_advance() {
             .map(|op| match &op.kind {
                 OpKind::Launch { kernel, .. } => kernel.as_str(),
                 OpKind::GdnPrep { .. } => "GdnPrep",
+                OpKind::HookSite { stage, .. } => match stage {
+                    HookStage::OnAttnProj => "HookSite(OnAttnProj)",
+                    HookStage::OnAttn => "HookSite(OnAttn)",
+                },
                 other => panic!("foreign op in the commit pass: {other:?}"),
             })
             .collect();
@@ -281,7 +287,9 @@ fn qwen3_5_hybrid_0_8b_cuda_commit_advance() {
                 "qwen35_verify_stash_load",
                 "launch_causal_conv1d_prefill_batched_bf16",
                 "GdnPrep",
+                "HookSite(OnAttnProj)",
                 "launch_chunk_gated_delta_prefill_batched_state_bf16",
+                "HookSite(OnAttn)",
             ],
             "layer {l}"
         );

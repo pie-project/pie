@@ -1694,6 +1694,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        5
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -1708,6 +1721,19 @@
         7,
         8,
         9
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        5
       ],
       "outputs": [],
       "layer": 0
@@ -1774,6 +1800,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        14
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -1788,6 +1827,19 @@
         16,
         17,
         18
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        14
       ],
       "outputs": [],
       "layer": 1
@@ -1854,6 +1906,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        23
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -1868,6 +1933,19 @@
         25,
         26,
         27
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        23
       ],
       "outputs": [],
       "layer": 2
@@ -1934,6 +2012,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        32
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -1948,6 +2039,19 @@
         34,
         35,
         36
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        32
       ],
       "outputs": [],
       "layer": 4
@@ -2014,6 +2118,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        41
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2028,6 +2145,19 @@
         43,
         44,
         45
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        41
       ],
       "outputs": [],
       "layer": 5
@@ -2094,6 +2224,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        50
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2108,6 +2251,19 @@
         52,
         53,
         54
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        50
       ],
       "outputs": [],
       "layer": 6
@@ -2174,6 +2330,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        59
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2188,6 +2357,19 @@
         61,
         62,
         63
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        59
       ],
       "outputs": [],
       "layer": 8
@@ -2254,6 +2436,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        68
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2268,6 +2463,19 @@
         70,
         71,
         72
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        68
       ],
       "outputs": [],
       "layer": 9
@@ -2334,6 +2542,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        77
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2348,6 +2569,19 @@
         79,
         80,
         81
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        77
       ],
       "outputs": [],
       "layer": 10
@@ -2414,6 +2648,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        86
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2428,6 +2675,19 @@
         88,
         89,
         90
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        86
       ],
       "outputs": [],
       "layer": 12
@@ -2494,6 +2754,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        95
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2508,6 +2781,19 @@
         97,
         98,
         99
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        95
       ],
       "outputs": [],
       "layer": 13
@@ -2574,6 +2860,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        104
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2588,6 +2887,19 @@
         106,
         107,
         108
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        104
       ],
       "outputs": [],
       "layer": 14
@@ -2654,6 +2966,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        113
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2668,6 +2993,19 @@
         115,
         116,
         117
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        113
       ],
       "outputs": [],
       "layer": 16
@@ -2734,6 +3072,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        122
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2748,6 +3099,19 @@
         124,
         125,
         126
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        122
       ],
       "outputs": [],
       "layer": 17
@@ -2814,6 +3178,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        131
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2828,6 +3205,19 @@
         133,
         134,
         135
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        131
       ],
       "outputs": [],
       "layer": 18
@@ -2894,6 +3284,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        140
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2908,6 +3311,19 @@
         142,
         143,
         144
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        140
       ],
       "outputs": [],
       "layer": 20
@@ -2974,6 +3390,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        149
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -2988,6 +3417,19 @@
         151,
         152,
         153
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        149
       ],
       "outputs": [],
       "layer": 21
@@ -3054,6 +3496,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        158
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_chunk_gated_delta_prefill_batched_state_bf16",
           "state": {
@@ -3068,6 +3523,19 @@
         160,
         161,
         162
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        158
       ],
       "outputs": [],
       "layer": 22

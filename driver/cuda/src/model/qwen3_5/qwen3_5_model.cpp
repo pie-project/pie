@@ -78,9 +78,10 @@ void Qwen35Model::body(Workspace& ws,
         const int qgkv_dim =
             2 * hf_config_.num_attention_heads * hf_config_.head_dim +
             2 * hf_config_.num_key_value_heads * hf_config_.head_dim;
-        if (in.stage_hooks != nullptr) {
-            fallback_reason = "stage hooks attached";
-        } else if (in.lora != nullptr) {
+        // (Stage hooks are IN scope since A4: the class traces carry the
+        // HookSite ops — qwen3_5's observation-only sites — and the walk
+        // invokes them with the hand-written buffers.)
+        if (in.lora != nullptr) {
             // The plan has no correction op; running the walk would
             // silently drop the adapter (llama_like's reasoning). The
             // hand-written qwen3_5 body ignores lora too, but the honest
@@ -134,7 +135,8 @@ void Qwen35Model::body(Workspace& ws,
                 in.w_page_d, in.w_off_d, in.row_valid_d, in.has_write_desc,
                 in.slot_ids_h, in.is_fresh_h, in.slot_ids_d, in.is_fresh_d,
                 in.logit_row_indices_d, in.num_logit_rows,
-                in.commit_advance_gather_d);
+                in.commit_advance_gather_d,
+                in.stage_hooks);
             if (handled) return;
             // No class for this fire (rung 5): the hand-written path
             // below serves it, exactly as before the declared gate.

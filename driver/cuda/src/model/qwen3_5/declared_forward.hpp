@@ -52,6 +52,7 @@
 #include "model/qwen3_5/declared_facts.hpp"
 #include "model/qwen3_5/qwen3_5.hpp"
 #include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "model/stage_hooks.hpp"
 
 namespace pie_cuda_driver::model {
 
@@ -113,6 +114,10 @@ bool qwen3_5_forward_declared(
     // [R] confirmed-prefix lengths — the hand-written `commit_len`
     // threading (`in.commit_advance_gather_d`; the rs_buffer_fold flavor
     // stays gate-excluded, so this is always the verify-stash replay).
-    const std::int32_t* commit_lens);
+    const std::int32_t* commit_lens,
+    // A4: the fire's attached stage-hook programs (null = none). The
+    // class traces carry the HookSite ops; qwen3_5's sites are
+    // observation-only, so nothing else crosses.
+    const StageHooks* stage_hooks);
 
 }  // namespace pie_cuda_driver::model

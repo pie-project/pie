@@ -61,6 +61,6 @@ pub use facts::{
     Qwen35HybridFacts, Qwen35MlpKind, Qwen35MoeMlpFacts,
 };
 pub use trace::{
-    DType, Dim, DynAxis, FireClass, ForwardPlan, Op, OpKind, Shape, StateRef, StateStore,
-    TraceBuilder, ValueId,
+    DType, Dim, DynAxis, FireClass, ForwardPlan, HookStage, Op, OpKind, Shape, StateRef,
+    StateStore, TraceBuilder, ValueId,
 };

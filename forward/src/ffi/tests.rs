@@ -992,9 +992,12 @@ fn service_class_traces_round_trip_through_the_arena() {
         "qwen3_5_hybrid.cuda.commit_advance"
     );
     let ops = view::ops(&out);
-    assert_eq!(ops.len(), 18 * 4);
+    // Per linear layer: stash load, conv, prep, recurrence + the two
+    // hook sites the hand-written replay passes through (A4).
+    assert_eq!(ops.len(), 18 * 6);
     assert!(ops.iter().all(|op| op.kind == PieForwardOpKind::Launch
-        || op.kind == PieForwardOpKind::GdnPrep));
+        || op.kind == PieForwardOpKind::GdnPrep
+        || op.kind == PieForwardOpKind::HookSite));
     // Nothing on the full-attention layers (3, 7, ... are skipped).
     assert!(!ops.iter().any(|op| op.layer == 3));
 

@@ -4211,6 +4211,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        7
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -4229,6 +4242,19 @@
       "outputs": [
         12
       ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        7
+      ],
+      "outputs": [],
       "layer": 0
     },
     {
@@ -4441,6 +4467,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -4459,6 +4498,19 @@
       "outputs": [
         30
       ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        25
+      ],
+      "outputs": [],
       "layer": 1
     },
     {
@@ -4671,6 +4723,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -4689,6 +4754,19 @@
       "outputs": [
         48
       ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        43
+      ],
+      "outputs": [],
       "layer": 2
     },
     {
@@ -4909,6 +4987,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        63
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
         "Guard": {
           "arms": [
             {
@@ -4984,6 +5075,19 @@
       "outputs": [
         66
       ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        63
+      ],
+      "outputs": [],
       "layer": 3
     },
     {
@@ -5181,6 +5285,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        78
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -5199,6 +5316,19 @@
       "outputs": [
         83
       ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        78
+      ],
+      "outputs": [],
       "layer": 4
     },
     {
@@ -5411,6 +5541,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        96
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -5429,6 +5572,19 @@
       "outputs": [
         101
       ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        96
+      ],
+      "outputs": [],
       "layer": 5
     },
     {
@@ -5641,6 +5797,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        114
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -5659,6 +5828,19 @@
       "outputs": [
         119
       ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        114
+      ],
+      "outputs": [],
       "layer": 6
     },
     {
@@ -5879,6 +6061,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 7
+        }
+      },
+      "inputs": [
+        134
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
         "Guard": {
           "arms": [
             {
@@ -5954,6 +6149,19 @@
       "outputs": [
         137
       ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 7
+        }
+      },
+      "inputs": [
+        134
+      ],
+      "outputs": [],
       "layer": 7
     },
     {
@@ -6151,6 +6359,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        149
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -6169,6 +6390,19 @@
       "outputs": [
         154
       ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        149
+      ],
+      "outputs": [],
       "layer": 8
     },
     {
@@ -6381,6 +6615,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        167
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -6399,6 +6646,19 @@
       "outputs": [
         172
       ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        167
+      ],
+      "outputs": [],
       "layer": 9
     },
     {
@@ -6611,6 +6871,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        185
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -6629,6 +6902,19 @@
       "outputs": [
         190
       ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        185
+      ],
+      "outputs": [],
       "layer": 10
     },
     {
@@ -6849,6 +7135,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 11
+        }
+      },
+      "inputs": [
+        205
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
         "Guard": {
           "arms": [
             {
@@ -6924,6 +7223,19 @@
       "outputs": [
         208
       ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 11
+        }
+      },
+      "inputs": [
+        205
+      ],
+      "outputs": [],
       "layer": 11
     },
     {
@@ -7121,6 +7433,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        220
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -7139,6 +7464,19 @@
       "outputs": [
         225
       ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        220
+      ],
+      "outputs": [],
       "layer": 12
     },
     {
@@ -7351,6 +7689,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        238
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -7369,6 +7720,19 @@
       "outputs": [
         243
       ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        238
+      ],
+      "outputs": [],
       "layer": 13
     },
     {
@@ -7581,6 +7945,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        256
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -7599,6 +7976,19 @@
       "outputs": [
         261
       ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        256
+      ],
+      "outputs": [],
       "layer": 14
     },
     {
@@ -7819,6 +8209,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 15
+        }
+      },
+      "inputs": [
+        276
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
         "Guard": {
           "arms": [
             {
@@ -7894,6 +8297,19 @@
       "outputs": [
         279
       ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 15
+        }
+      },
+      "inputs": [
+        276
+      ],
+      "outputs": [],
       "layer": 15
     },
     {
@@ -8091,6 +8507,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        291
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -8109,6 +8538,19 @@
       "outputs": [
         296
       ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        291
+      ],
+      "outputs": [],
       "layer": 16
     },
     {
@@ -8321,6 +8763,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        309
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -8339,6 +8794,19 @@
       "outputs": [
         314
       ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        309
+      ],
+      "outputs": [],
       "layer": 17
     },
     {
@@ -8551,6 +9019,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        327
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -8569,6 +9050,19 @@
       "outputs": [
         332
       ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        327
+      ],
+      "outputs": [],
       "layer": 18
     },
     {
@@ -8789,6 +9283,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 19
+        }
+      },
+      "inputs": [
+        347
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
         "Guard": {
           "arms": [
             {
@@ -8864,6 +9371,19 @@
       "outputs": [
         350
       ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 19
+        }
+      },
+      "inputs": [
+        347
+      ],
+      "outputs": [],
       "layer": 19
     },
     {
@@ -9061,6 +9581,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        362
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -9079,6 +9612,19 @@
       "outputs": [
         367
       ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        362
+      ],
+      "outputs": [],
       "layer": 20
     },
     {
@@ -9291,6 +9837,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        380
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -9309,6 +9868,19 @@
       "outputs": [
         385
       ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        380
+      ],
+      "outputs": [],
       "layer": 21
     },
     {
@@ -9521,6 +10093,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        398
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_recurrent_gated_delta_step_batched_state_bf16",
           "state": {
@@ -9539,6 +10124,19 @@
       "outputs": [
         403
       ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        398
+      ],
+      "outputs": [],
       "layer": 22
     },
     {
@@ -9759,6 +10357,19 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 23
+        }
+      },
+      "inputs": [
+        418
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
         "Guard": {
           "arms": [
             {
@@ -9834,6 +10445,19 @@
       "outputs": [
         421
       ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 23
+        }
+      },
+      "inputs": [
+        418
+      ],
+      "outputs": [],
       "layer": 23
     },
     {

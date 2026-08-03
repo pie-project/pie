@@ -325,8 +325,24 @@ peepholes, eligibility predicates, thresholds.
      compositions are not batch-deterministic, so the mixed gate is
      engagement + liveness + the solo byte-parities, the stage-2
      discipline); engine 394; metal 8/8.
-   - **A4**: qwen3_5's attention arms gain the same guards (its
-     masked/hooked fires are guard arms from birth, never classes).
+   - **A4 — DONE (2026-08-03)**: qwen3_5's hooks are in scope —
+     narrower than the sketch, because recon narrowed the target:
+     qwen3_5's hand-written sites are OBSERVATION-only (all four
+     `invoke_stage_hook` calls pass no mask sink and no score
+     sideband: GDN layers observe the prep's fp32 q_pre, full-attn
+     layers the roped bf16 q), so no guard is needed at all — the
+     sites ride the lowered class bodies directly (argument no-ops,
+     null-hooks early-out), including the commit-advance replay
+     (which passes through both invokes before its early return).
+     The hooks fallback term is deleted from the qwen3_5 gate. And
+     custom masks turn out NOT to exist for qwen3_5: the hand-written
+     body IGNORES `mask_d` entirely (commented-out params — a masked
+     qwen3_5 fire runs unmasked today), so there is no semantics to
+     declare; the mask fallback term stays as the honest record of
+     that gap. Parity: qwen3.5-0.8B live A/B short+long
+     byte-identical across the gate (51 declared fires, 0 fallbacks);
+     llama 3-leg parity re-green; forward 54+16+regen; engine 394;
+     metal 8/8.
    End state: `FireClass` = fire SHAPE × SERVICE only (Decode,
    Prefill, CommitAdvance, StateOnly, FrozenVerify) — the axes that
    change the pass wholesale; per-fire attachments (masks, hooks,

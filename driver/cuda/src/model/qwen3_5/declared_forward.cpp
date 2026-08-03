@@ -200,7 +200,8 @@ bool qwen3_5_forward_declared(
     const std::uint8_t* is_fresh_d,
     const std::int32_t* logit_row_indices_d,
     int num_logit_rows,
-    const std::int32_t* commit_lens)
+    const std::int32_t* commit_lens,
+    const StageHooks* stage_hooks)
 {
     // Rung 4c-iii: normal decode/prefill fires walk the CLASS trace, in
     // which the declaration stated every kernel; the MTP/verify/legacy
@@ -1127,6 +1128,38 @@ case PieForwardOpKind::Launch: {
                 ws.y.data(), ws.norm_x.data(),
                 static_cast<std::size_t>(N) * H * sizeof(std::uint16_t),
                 cudaMemcpyDeviceToDevice, stream));
+            break;
+        }
+        case PieForwardOpKind::HookSite: {
+            // A4: qwen3_5's sites are OBSERVATION-only (the hand-written
+            // invokes pass no mask sink and no score sideband). The
+            // observed buffer follows the layer KIND: linear-attention
+            // layers expose the prep's q_pre (fp32, compact K_h heads),
+            // full-attention layers the roped q (bf16) — the
+            // hand-written calls verbatim. A fire with no attached
+            // programs passes by argument.
+            if (stage_hooks == nullptr) break;
+            const int L = static_cast<int>(op.param1);
+            const StageHookPoint point = op.param0 == 0
+                ? StageHookPoint::OnAttnProj
+                : StageHookPoint::OnAttn;
+            const bool full_attn =
+                L >= 0 && L < static_cast<int>(w.layers.size()) &&
+                w.layers[L].kind == Qwen3_5LayerWeights::Kind::FullAttn;
+            if (full_attn) {
+                invoke_stage_hook(
+                    stage_hooks, point, ws.q.data(),
+                    static_cast<std::uint32_t>(N),
+                    static_cast<std::uint32_t>(Hq),
+                    static_cast<std::uint32_t>(L), stream);
+            } else {
+                invoke_stage_hook(
+                    stage_hooks, point, la.q_pre.data(),
+                    static_cast<std::uint32_t>(N),
+                    static_cast<std::uint32_t>(K_dim),
+                    static_cast<std::uint32_t>(L), stream,
+                    /*query_is_f32=*/true);
+            }
             break;
         }
         default:

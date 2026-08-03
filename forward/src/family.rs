@@ -644,6 +644,16 @@ fn gdn_attn_body(
         facts.value_heads,
         facts.value_head_dim,
     );
+    // The OnAttnProj site (A4): the hand-written GDN body invokes the
+    // fire's programs here observing q_pre (fp32; qwen3_5's sites are
+    // OBSERVATION-only — no page-mask sink, no score capture). Lowered
+    // traces only; a fire with nothing attached passes by argument.
+    // (The hand-written invoke sits after the cached family's GQA
+    // repeats; the repeats read q_pre and never write it, so observing
+    // before the recurrence guard sees the same bytes.)
+    if lower.is_some() {
+        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+    }
     // GQA (value heads sharing fewer key heads) picks the `_gqa` decode
     // step; the prefill kernels state their own layout handling.
     let gqa = facts.value_heads != facts.key_heads;
@@ -697,6 +707,11 @@ fn gdn_attn_body(
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
     };
+    // The OnAttn site: after the recurrence core, before the gated norm
+    // — the hand-written invoke's position (observing q_pre again).
+    if lower.is_some() {
+        dsl::hook_site(HookStage::OnAttn, &q, l);
+    }
 
     // Gated norm (z-gated, per-head, plain fold) → o_proj landed on
     // the residual (`+=` of a fresh matmul IS the beta=1 fold).
@@ -860,6 +875,12 @@ fn full_attn_body(
     let q = rmsnorm(&q, &w.q_norm);
     let k = rmsnorm(&k, &w.k_norm);
     let (q, k) = rope_partial(&q, &k, RopeKind::Standard, facts.rotary_dim);
+    // The OnAttnProj site (A4): post-rope, pre-KV-write — the
+    // hand-written full-attn invoke's position, observing the roped q
+    // (bf16). Observation-only, like the GDN sites.
+    if lower.is_some() {
+        dsl::hook_site(HookStage::OnAttnProj, &q, l);
+    }
 
     // KV write. Lowered: the mechanism is a per-fire runtime input
     // (explicit descriptors when the fire steers a graph replay,
@@ -895,6 +916,11 @@ fn full_attn_body(
         }
     };
     let gated = sigmoid_gate_mul(&attn, &gate);
+    // The OnAttn site: after the output gate, before the o_proj — the
+    // hand-written invoke's position (observing q).
+    if lower.is_some() {
+        dsl::hook_site(HookStage::OnAttn, &q, l);
+    }
     y += matmul(&gated, &w.o_proj);
     y
 }
@@ -1120,7 +1146,13 @@ fn commit_advance_body(t: &Trace, facts: &Qwen35HybridFacts, cuda: &Qwen35CudaFa
             gdn.value_heads,
             gdn.value_head_dim,
         );
+        // The hand-written commit replay passes through both hook
+        // invokes (they precede its early return), so the commit trace
+        // mirrors them (A4) — argument no-ops on every commit fire
+        // today, stated because the contract is the body's.
+        dsl::hook_site(HookStage::OnAttnProj, &q, l);
         cuda::gdn_prefill_fla(&q, &k, &v, &g, &beta, &w.rs, cuda.state_bf16);
+        dsl::hook_site(HookStage::OnAttn, &q, l);
     }
     // Nothing after the loop: no final norm, no lm_head — the pass ends
     // with the last linear layer's recurrence.
