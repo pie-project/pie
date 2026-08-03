@@ -75,8 +75,7 @@ async fn main(input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
     let prefill_indptr = Channel::from(vec![0u32, n]).named("prefill_indptr");
@@ -119,16 +118,14 @@ async fn main(input: Input) -> Result<String> {
     // sequential stream. The host round-trip on `first` stays — the grammar
     // matcher advances on it before decode is built.
     let pipeline = Pipeline::new();
-    prefill
-        .submit(&pipeline)
-        .map_err(|e| format!("JSON-schema prefill: {e}"))?;
+    prefill.submit(&pipeline).context("JSON-schema prefill")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
     let first = first_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read first constrained token: {e}"))?[0] as u32;
+        .context("read first constrained token")?[0] as u32;
 
     let mut generated = vec![first];
     constraint.advance(&[first]);
@@ -189,16 +186,13 @@ async fn main(input: Input) -> Result<String> {
 
         while submitted < budget {
             grammar_mask.put(unpack_mask(&constraint.mask(), vocab));
-            decode
-                .submit(&pipeline)
-                .map_err(|e| format!("JSON-schema decode: {e}"))?;
+            decode.submit(&pipeline).context("JSON-schema decode")?;
             submitted += 1;
             let token = token_out
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("read constrained token: {e}"))?[0]
-                as u32;
+                .context("read constrained token")?[0] as u32;
             generated.push(token);
             constraint.advance(&[token]);
             if constraint.is_terminated() || generated.len() == input.max_tokens {

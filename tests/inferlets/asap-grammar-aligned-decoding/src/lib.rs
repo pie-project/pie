@@ -250,8 +250,7 @@ async fn main(input: Input) -> Result<Output> {
         let ws = WorkingSet::new();
         let page_size = ws.page_size();
         let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-        ws.reserve(max_pages)
-            .map_err(|e| format!("reserve KV: {e}"))?;
+        ws.reserve(max_pages).context("reserve KV")?;
 
         let prompt_tokens = Channel::from(prompt.iter().map(|&t| t as i32).collect::<Vec<_>>());
         let pre_indptr = Channel::from(vec![0u32, n]).named("pre_indptr");
@@ -306,9 +305,7 @@ async fn main(input: Input) -> Result<Output> {
         pre_mask.put(unpack_mask(&constraint.mask(), vocab));
         pre_alpha_idx.put(idx0);
         pre_alpha_val.put(val0);
-        prefill
-            .submit(&pipeline)
-            .map_err(|e| format!("ASAp prefill: {e}"))?;
+        prefill.submit(&pipeline).context("ASAp prefill")?;
 
         let first = read_i32(&pre_token).await?;
         let mut path_nodes = vec![0usize];
@@ -321,7 +318,7 @@ async fn main(input: Input) -> Result<Output> {
         let mut generated = vec![first as u32];
         constraint
             .advance(&[first as u32])
-            .map_err(|e| format!("grammar rejected the prefill token: {e}"))?;
+            .context("grammar rejected the prefill token")?;
         let mut node = trie.child(0, first as u32);
         path_nodes.push(node);
 
@@ -393,9 +390,7 @@ async fn main(input: Input) -> Result<Output> {
                 mask_ch.put(unpack_mask(&constraint.mask(), vocab));
                 alpha_idx.put(idx);
                 alpha_val.put(val);
-                decode
-                    .submit(&pipeline)
-                    .map_err(|e| format!("ASAp decode: {e}"))?;
+                decode.submit(&pipeline).context("ASAp decode")?;
 
                 let token = read_i32(&token_out).await? as u32;
                 masses.push(read_f32(&mass_out).await?);
@@ -554,10 +549,10 @@ async fn read_i32(channel: &Channel) -> Result<i32> {
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read i32 channel: {e}"))?
+        .context("read i32 channel")?
         .first()
         .copied()
-        .ok_or_else(|| "empty i32 channel".into())
+        .context("empty i32 channel")
 }
 
 async fn read_f32(channel: &Channel) -> Result<f32> {
@@ -565,8 +560,8 @@ async fn read_f32(channel: &Channel) -> Result<f32> {
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("read f32 channel: {e}"))?
+        .context("read f32 channel")?
         .first()
         .copied()
-        .ok_or_else(|| "empty f32 channel".into())
+        .context("empty f32 channel")
 }

@@ -80,8 +80,7 @@ async fn main(input: Input) -> Result<String> {
     let ws = WorkingSet::new();
     let max_extent = n + input.max_tokens as u32 + (channel_capacity() as u32 + 1) * w;
     let max_pages = max_extent.div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let pipeline = Pipeline::new();
 
@@ -119,20 +118,18 @@ async fn main(input: Input) -> Result<String> {
         seed_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
         drafts_out.put(reduce_argmax(intrinsics::mtp_logits(k)));
     });
-    prefill
-        .submit(&pipeline)
-        .map_err(|e| format!("prefill: {e}"))?;
+    prefill.submit(&pipeline).context("prefill")?;
 
     let seed = seed_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read prefill seed: {e}"))?[0] as u32;
+        .context("read prefill seed")?[0] as u32;
     let seed_drafts = drafts_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read prefill drafts: {e}"))?
+        .context("read prefill drafts")?
         .into_iter()
         .map(|token| token as u32)
         .collect::<Vec<_>>();
@@ -270,7 +267,7 @@ async fn main(input: Input) -> Result<String> {
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("read committed round: {e}"))?;
+            .context("read committed round")?;
         let live = unpad_tokens(&round);
         if live.is_empty() {
             return Ok(ControlFlow::Continue(()));

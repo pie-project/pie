@@ -66,7 +66,7 @@ async fn main(input: Input) -> Result<String> {
     let ws = WorkingSet::new();
     let slots = ws
         .reserve(pool_pages)
-        .map_err(|e| format!("reserve attention-sink KV: {e}"))?;
+        .context("reserve attention-sink KV")?;
     let pool_ids = slots.ids().to_vec();
 
     let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
@@ -120,14 +120,14 @@ async fn main(input: Input) -> Result<String> {
     let pipeline = Pipeline::new();
     prefill
         .submit(&pipeline)
-        .map_err(|e| format!("attention-sink prefill: {e}"))?;
+        .context("attention-sink prefill")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
     let first = first_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read first token: {e}"))?[0] as u32;
+        .context("read first token")?[0] as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -214,7 +214,7 @@ async fn main(input: Input) -> Result<String> {
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("read generated token: {e}"))?[0] as u32;
+            .context("read generated token")?[0] as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

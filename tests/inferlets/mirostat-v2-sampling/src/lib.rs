@@ -158,8 +158,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut surprises: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -212,21 +211,11 @@ async fn main(input: Input) -> Result<Output> {
     // sequential stream. The host round-trip on g0/s0 stays — the host mu
     // update seeds the decode channels below.
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let s0 = s_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("s0 take: {e}"))?[0];
+    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
+    let s0 = s_out_p.take().get::<f32>().await.context("s0 take")?[0];
 
     generated.push(g0 as u32);
     surprises.push(s0);
@@ -300,12 +289,12 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             let s = s_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("s_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("s_out.take @{}", generated.len()))?[0];
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

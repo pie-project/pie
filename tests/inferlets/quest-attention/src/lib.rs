@@ -192,8 +192,7 @@ async fn main(input: Input) -> Result<Output> {
     let max_pages = (n + reserve as u32 + 1).div_ceil(page_size).max(1);
     let p_max = max_pages;
     let budget = input.page_budget.min(p_max);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
@@ -267,7 +266,7 @@ async fn main(input: Input) -> Result<Output> {
 
         fwd_p
             .submit(&pipe)
-            .map_err(|e| format!("prefill submit @{base}: {e}"))?;
+            .with_context(|| format!("prefill submit @{base}"))?;
 
         // Every chunk samples; only the last chunk's token is the prompt's
         // continuation. The intermediate takes are not waste that can be
@@ -276,7 +275,7 @@ async fn main(input: Input) -> Result<Output> {
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
+            .with_context(|| format!("g0 take @{base}"))?[0];
     }
     generated.push(g0 as u32);
 
@@ -420,20 +419,20 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             if let Some(ch) = scores_out.as_ref() {
                 last_scores = ch
                     .take()
                     .get::<f32>()
                     .await
-                    .map_err(|e| format!("quest_scores.take @{}: {e}", generated.len()))?;
+                    .with_context(|| format!("quest_scores.take @{}", generated.len()))?;
             }
             layers_observed = match layers_out.as_ref() {
                 Some(ch) => ch
                     .take()
                     .get::<u32>()
                     .await
-                    .map_err(|e| format!("quest_layer_count.take @{}: {e}", generated.len()))?[0],
+                    .with_context(|| format!("quest_layer_count.take @{}", generated.len()))?[0],
                 None => layers_observed,
             };
             kv_len_last = match kvlen_out.as_ref() {
@@ -441,7 +440,7 @@ async fn main(input: Input) -> Result<Output> {
                     .take()
                     .get::<u32>()
                     .await
-                    .map_err(|e| format!("quest_kv_len.take @{}: {e}", generated.len()))?[0],
+                    .with_context(|| format!("quest_kv_len.take @{}", generated.len()))?[0],
                 None => kv_len_last,
             };
             generated.push(t as u32);

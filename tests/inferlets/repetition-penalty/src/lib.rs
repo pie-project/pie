@@ -232,8 +232,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     // The repetition penalty's scope includes the prompt, so seed the presence
     // vector on the host — one pass over the prompt beats a device scatter that
@@ -299,25 +298,11 @@ async fn main(input: Input) -> Result<Output> {
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let p0 = pen_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("pen take: {e}"))?[0];
-    let k0 = peak_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("peak take: {e}"))?[0];
+    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
+    let p0 = pen_out_p.take().get::<f32>().await.context("pen take")?[0];
+    let k0 = peak_out_p.take().get::<f32>().await.context("peak take")?[0];
     generated.push(g0 as u32);
     penalized.push(p0);
     peaks.push(k0);
@@ -403,17 +388,17 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             let p = pen_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("pen_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("pen_out.take @{}", generated.len()))?[0];
             let k = peak_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("peak_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("peak_out.take @{}", generated.len()))?[0];
             generated.push(t as u32);
             penalized.push(p);
             peaks.push(k);

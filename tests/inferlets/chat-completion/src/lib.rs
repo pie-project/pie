@@ -92,9 +92,7 @@ async fn main(input: Input) -> Result<String> {
     let pool = pool_pages * PAGE_T;
 
     let ws = WorkingSet::new();
-    let slots = ws
-        .reserve(pool_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    let slots = ws.reserve(pool_pages).context("ws.reserve")?;
     let pool_ids = slots.ids().to_vec();
 
     // ── ONE PIPELINE (R4-4): prefill and decode are one sequential stream.
@@ -154,16 +152,10 @@ async fn main(input: Input) -> Result<String> {
             rng_p.put(&r_next);
         });
 
-        fwd_p
-            .submit(&pipe)
-            .map_err(|e| format!("prefill submit: {e}"))?;
+        fwd_p.submit(&pipe).context("prefill submit")?;
         // max_tokens == 1: the prefill spends the whole budget, so it was
         // the stream's last submit — finish() right after it (F7).
-        g0_ch
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("g0 take: {e}"))?[0]
+        g0_ch.take().get::<i32>().await.context("g0 take")?[0]
     };
 
     let chat_dec = chat::create_decoder();
@@ -274,11 +266,7 @@ async fn main(input: Input) -> Result<String> {
         max_tokens.saturating_sub(1) // g0 already emitted
     };
     run_ahead(&pipe, &fwd, budget, async || {
-        let t = out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("out.take: {e}"))?;
+        let t = out.take().get::<i32>().await.context("out.take")?;
         let token = *t.first().unwrap_or(&0) as u32;
         if stop.contains(&token) {
             return Ok(ControlFlow::Break(()));

@@ -89,8 +89,7 @@ async fn main(input: Input) -> Result<String> {
     let stop_tokens = chat::stop_tokens();
     let delta = input.delta;
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
     let prefill_indptr = Channel::from(vec![0u32, n]).named("prefill_indptr");
@@ -136,16 +135,14 @@ async fn main(input: Input) -> Result<String> {
     // sequential stream. The host round-trip on `first` stays — it seeds the
     // decode channels and the first green mask below.
     let pipeline = Pipeline::new();
-    prefill
-        .submit(&pipeline)
-        .map_err(|e| format!("watermark prefill: {e}"))?;
+    prefill.submit(&pipeline).context("watermark prefill")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
     let first = first_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read first token: {e}"))?[0] as u32;
+        .context("read first token")?[0] as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -214,16 +211,13 @@ async fn main(input: Input) -> Result<String> {
 
         while submitted < budget {
             green.put(green_mask(vocab, previous, input.gamma));
-            decode
-                .submit(&pipeline)
-                .map_err(|e| format!("watermark decode: {e}"))?;
+            decode.submit(&pipeline).context("watermark decode")?;
             submitted += 1;
             let token = token_out
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("read generated token: {e}"))?[0]
-                as u32;
+                .context("read generated token")?[0] as u32;
             previous = token;
             if stop_tokens.contains(&token) {
                 break;

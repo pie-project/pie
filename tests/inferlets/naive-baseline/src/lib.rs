@@ -91,8 +91,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
@@ -165,7 +164,7 @@ async fn main(input: Input) -> Result<Output> {
 
         fwd_p
             .submit(&pipe)
-            .map_err(|e| format!("prefill submit @{base}: {e}"))?;
+            .with_context(|| format!("prefill submit @{base}"))?;
 
         // Every chunk samples; only the last chunk's token continues the
         // prompt. The intermediate takes cannot be skipped -- an epilogue put
@@ -174,18 +173,18 @@ async fn main(input: Input) -> Result<Output> {
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
+            .with_context(|| format!("g0 take @{base}"))?[0];
         if want_stats {
             s1_out_p
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("s1 take @{base}: {e}"))?;
+                .with_context(|| format!("s1 take @{base}"))?;
             s2_out_p
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("s2 take @{base}: {e}"))?;
+                .with_context(|| format!("s2 take @{base}"))?;
         }
     }
     generated.push(g0 as u32);
@@ -260,18 +259,18 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             if want_stats {
                 s1_out
                     .take()
                     .get::<f32>()
                     .await
-                    .map_err(|e| format!("s1_out.take @{}: {e}", generated.len()))?;
+                    .with_context(|| format!("s1_out.take @{}", generated.len()))?;
                 s2_out
                     .take()
                     .get::<f32>()
                     .await
-                    .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?;
+                    .with_context(|| format!("s2_out.take @{}", generated.len()))?;
             }
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))

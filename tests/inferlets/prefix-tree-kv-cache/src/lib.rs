@@ -35,8 +35,7 @@ async fn append_tokens(
     let max_pages = total.div_ceil(ws.page_size()).max(1);
     let have = ws.page_len();
     if max_pages > have {
-        ws.reserve(max_pages - have)
-            .map_err(|e| format!("reserve append KV: {e}"))?;
+        ws.reserve(max_pages - have).context("reserve append KV")?;
     }
     let token_input = Channel::from(tokens.iter().map(|&token| token as i32).collect::<Vec<_>>());
     let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
@@ -78,13 +77,12 @@ async fn append_tokens(
     fwd.epilogue(move || {
         next_token.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
-    fwd.submit(pipeline)
-        .map_err(|e| format!("append shared prefix: {e}"))?;
+    fwd.submit(pipeline).context("append shared prefix")?;
     Ok(next_token
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read branch token: {e}"))?[0])
+        .context("read branch token")?[0])
 }
 
 async fn generate(
@@ -114,8 +112,7 @@ async fn generate(
         .max(1);
     let have = ws.page_len();
     if max_pages > have {
-        ws.reserve(max_pages - have)
-            .map_err(|e| format!("reserve leaf KV: {e}"))?;
+        ws.reserve(max_pages - have).context("reserve leaf KV")?;
     }
     let token_in = Channel::from(vec![first_token]).named("token_in");
     let page_size = ws.page_size();
@@ -169,7 +166,7 @@ async fn generate(
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("read leaf token: {e}"))?[0] as u32;
+            .context("read leaf token")?[0] as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

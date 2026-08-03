@@ -205,8 +205,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut s1: Vec<f32> = Vec::with_capacity(max_tokens);
@@ -256,25 +255,11 @@ async fn main(input: Input) -> Result<Output> {
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let a0 = s1_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("s1 take: {e}"))?[0];
-    let b0 = s2_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("s2 take: {e}"))?[0];
+    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
+    let a0 = s1_out_p.take().get::<f32>().await.context("s1 take")?[0];
+    let b0 = s2_out_p.take().get::<f32>().await.context("s2 take")?[0];
     generated.push(g0 as u32);
     s1.push(a0);
     s2.push(b0);
@@ -347,17 +332,17 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             let a = s1_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("s1_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("s1_out.take @{}", generated.len()))?[0];
             let b = s2_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("s2_out.take @{}", generated.len()))?[0];
             generated.push(t as u32);
             s1.push(a);
             s2.push(b);

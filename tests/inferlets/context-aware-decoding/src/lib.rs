@@ -131,7 +131,7 @@ async fn main(input: Input) -> Result<String> {
     let uncond_ws = WorkingSet::new();
     uncond_ws
         .reserve(uncond_pages)
-        .map_err(|error| format!("reserve unconditional KV: {error}"))?;
+        .context("reserve unconditional KV")?;
     let uncond_prompt_i32 = uncond_prompt
         .iter()
         .map(|&token| token as i32)
@@ -171,20 +171,18 @@ async fn main(input: Input) -> Result<String> {
     // pipeline it fires on and never migrates, so prefill and decode for both
     // streams must share a single scope.
     let pipeline = Pipeline::new();
-    uncond_prefill
-        .submit(&pipeline)
-        .map_err(|error| format!("uncond prefill: {error}"))?;
+    uncond_prefill.submit(&pipeline).context("uncond prefill")?;
     let first_uncond_logits = u_pre_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|error| format!("read uncond prefill logits: {error}"))?;
+        .context("read uncond prefill logits")?;
 
     // ---- conditional stream ---------------------------------------------
     let cond_ws = WorkingSet::new();
     cond_ws
         .reserve(cond_pages)
-        .map_err(|error| format!("reserve conditional KV: {error}"))?;
+        .context("reserve conditional KV")?;
     let cond_prompt_i32 = cond_prompt
         .iter()
         .map(|&token| token as i32)
@@ -227,9 +225,7 @@ async fn main(input: Input) -> Result<String> {
     });
 
     c_pre_uncond.put(first_uncond_logits);
-    cond_prefill
-        .submit(&pipeline)
-        .map_err(|error| format!("cond prefill: {error}"))?;
+    cond_prefill.submit(&pipeline).context("cond prefill")?;
     let first = read_i32(&first_out).await? as u32;
     let mut shifts = read_i32(&first_shift).await? as u64;
     let mut kl_total = read_f32(&first_kl).await? as f64;
@@ -349,19 +345,15 @@ async fn main(input: Input) -> Result<String> {
     let mut previous = first;
     for _ in 0..budget {
         u_token.put(vec![previous as i32]);
-        uncond_decode
-            .submit(&pipeline)
-            .map_err(|error| format!("uncond decode: {error}"))?;
+        uncond_decode.submit(&pipeline).context("uncond decode")?;
         let uncond_logits = u_logits_out
             .take()
             .get::<f32>()
             .await
-            .map_err(|error| format!("read uncond logits: {error}"))?;
+            .context("read uncond logits")?;
 
         c_uncond.put(uncond_logits);
-        cond_decode
-            .submit(&pipeline)
-            .map_err(|error| format!("cond decode: {error}"))?;
+        cond_decode.submit(&pipeline).context("cond decode")?;
         let token = read_i32(&c_token_out).await? as u32;
         shifts += read_i32(&c_shift_out).await? as u64;
         kl_total += read_f32(&c_kl_out).await? as f64;
@@ -407,10 +399,10 @@ async fn read_i32(channel: &Channel) -> Result<i32> {
         .take()
         .get::<i32>()
         .await
-        .map_err(|error| format!("read i32 channel: {error}"))?
+        .context("read i32 channel")?
         .first()
         .copied()
-        .ok_or_else(|| "empty i32 channel".into())
+        .context("empty i32 channel")
 }
 
 async fn read_f32(channel: &Channel) -> Result<f32> {
@@ -418,8 +410,8 @@ async fn read_f32(channel: &Channel) -> Result<f32> {
         .take()
         .get::<f32>()
         .await
-        .map_err(|error| format!("read f32 channel: {error}"))?
+        .context("read f32 channel")?
         .first()
         .copied()
-        .ok_or_else(|| "empty f32 channel".into())
+        .context("empty f32 channel")
 }

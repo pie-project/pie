@@ -358,8 +358,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let cfg = Cfg {
         secret: input.secret,
@@ -436,25 +435,15 @@ async fn main(input: Input) -> Result<Output> {
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
     let s0 = score_out_p
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("score take: {e}"))?[0];
-    let n0 = null_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("null take: {e}"))?[0];
+        .context("score take")?[0];
+    let n0 = null_out_p.take().get::<f32>().await.context("null take")?[0];
     generated.push(g0 as u32);
     scores.push(s0);
     nulls.push(n0);
@@ -545,17 +534,17 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             let s = score_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("score_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("score_out.take @{}", generated.len()))?[0];
             let z = null_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("null_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("null_out.take @{}", generated.len()))?[0];
             generated.push(t as u32);
             scores.push(s);
             nulls.push(z);

@@ -194,8 +194,7 @@ async fn verify(
 
     let ws = WorkingSet::new();
     let max_pages = total.div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve verification KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve verification KV")?;
     let tokens = Channel::from(input.iter().map(|&token| token as i32).collect::<Vec<_>>());
     let embed_indptr = Channel::from(vec![0u32, total]).named("embed_indptr");
     let positions = Channel::from((0..total).collect::<Vec<_>>()).named("positions");
@@ -240,13 +239,12 @@ async fn verify(
 
     allowed.put(masks.concat());
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline)
-        .map_err(|e| format!("verify constrained draft: {e}"))?;
+    fwd.submit(&pipeline).context("verify constrained draft")?;
     let target = target_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read verification result: {e}"))?
+        .context("read verification result")?
         .into_iter()
         .map(|token| token as u32)
         .collect();
@@ -299,7 +297,7 @@ async fn main(input: Input) -> Result<Output> {
             }
             constraint
                 .advance(&[token])
-                .map_err(|e| format!("grammar rejected a drafted token: {e}"))?;
+                .context("grammar rejected a drafted token")?;
             draft.push(token);
             if constraint.is_terminated() {
                 // Nothing follows a completed document; the bonus row would
@@ -362,7 +360,7 @@ async fn main(input: Input) -> Result<Output> {
         for token in accepted {
             constraint
                 .advance(&[token])
-                .map_err(|e| format!("accepted token violates the grammar: {e}"))?;
+                .context("accepted token violates the grammar")?;
             committed.push(token);
             generated.push(token);
             if constraint.is_terminated() || generated.len() == input.max_tokens {

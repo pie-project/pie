@@ -43,8 +43,7 @@ async fn main(_input: Input) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let max_pages = n.div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let toks = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
     let embed_indptr = Channel::from(vec![0u32, n]).named("embed_indptr");
@@ -98,38 +97,34 @@ async fn main(_input: Input) -> Result<String> {
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline)
-        .map_err(|e| format!("sampling-primitives submit: {e}"))?;
+        .context("sampling-primitives submit")?;
 
-    let token = token_out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("read token: {e}"))?[0] as usize;
+    let token = token_out.take().get::<i32>().await.context("read token")?[0] as usize;
     let logits = logits_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("read logits: {e}"))?;
+        .context("read logits")?;
     let entropy = entropy_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("read entropy: {e}"))?[0];
+        .context("read entropy")?[0];
     let probabilities = probs_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("read probabilities: {e}"))?;
+        .context("read probabilities")?;
     let log_probabilities = logprobs_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("read log-probabilities: {e}"))?;
+        .context("read log-probabilities")?;
     let keep_mask = keep_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read nucleus keep-mask: {e}"))?;
+        .context("read nucleus keep-mask")?;
     pipeline.close();
 
     if token != argmax(&logits) || token != argmax(&probabilities) {

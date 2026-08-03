@@ -1518,8 +1518,10 @@ pub mod shared_prelude {
     /// Every inferlet returns `inferlet::Result` from `#[inferlet::main]` and
     /// asks the model for its tokenizer and vocabulary, so both come with the
     /// prelude rather than being imported by hand 34 times over.
-    pub use crate::{Result, model};
-    pub use std::ops::ControlFlow;
+    pub use crate::{Context, Result, model};
+    /// Only `Stage`: dtypes are spelled `dtype::f32` and friends, one
+    /// lowercase spelling for the one thing they name.
+    pub use pie_dsl::Stage;
     pub use pie_dsl::dtype;
     pub use pie_dsl::intrinsics;
     pub use pie_dsl::value::{
@@ -1531,9 +1533,7 @@ pub mod shared_prelude {
         row_membership, scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
         sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
     };
-    /// Only `Stage`: dtypes are spelled `dtype::f32` and friends, one
-    /// lowercase spelling for the one thing they name.
-    pub use pie_dsl::Stage;
+    pub use std::ops::ControlFlow;
 }
 
 // ---------------------------------------------------------------------------

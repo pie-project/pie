@@ -167,8 +167,7 @@ async fn main(input: Input) -> Result<Output> {
     // geometry the driver derives its own length from.
     let kv_max = max_pages * page_size;
     let cache_size = input.cache_size.min(kv_max);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
@@ -237,13 +236,13 @@ async fn main(input: Input) -> Result<Output> {
 
         fwd_p
             .submit(&pipe)
-            .map_err(|e| format!("prefill submit @{base}: {e}"))?;
+            .with_context(|| format!("prefill submit @{base}"))?;
 
         g0 = tok_out_p
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
+            .with_context(|| format!("g0 take @{base}"))?[0];
     }
     generated.push(g0 as u32);
 
@@ -350,17 +349,17 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             last_scores = scores_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("tova_scores.take @{}: {e}", generated.len()))?;
+                .with_context(|| format!("tova_scores.take @{}", generated.len()))?;
             layers_observed = layers_out
                 .take()
                 .get::<u32>()
                 .await
-                .map_err(|e| format!("tova_layer_count.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tova_layer_count.take @{}", generated.len()))?[0];
             // The fire that produced this row had `n + generated.len()` KV
             // positions live: the prompt plus every token committed before it.
             last_kv_len = n + generated.len() as u32;

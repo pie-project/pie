@@ -6,6 +6,52 @@
 /// Result type for inferlet operations (compatible with WIT bindings).
 pub type Result<T> = std::result::Result<T, String>;
 
+/// Add context to a failure on its way up.
+///
+/// `pie:inferlet` declares `type error = string`, so every fallible call
+/// across the ABI already fails with a message and there is no error type to
+/// introduce. What is missing is the standard way of saying WHERE the message
+/// came from, which is why the inferlets were writing
+/// `map_err(|e| format!("reserve KV: {e}"))` by hand.
+///
+/// ```ignore
+/// ws.reserve(pages).context("reserve KV")?;
+/// tok_out
+///     .take()
+///     .get::<i32>()
+///     .await
+///     .with_context(|| format!("tok_out.take @{}", generated.len()))?;
+/// ```
+pub trait Context<T> {
+    /// Prefix the error with `what`, as `"{what}: {error}"`.
+    fn context(self, what: &str) -> Result<T>;
+
+    /// Same, but the prefix is only built if there is an error to prefix.
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, what: F) -> Result<T>;
+}
+
+impl<T, E: std::fmt::Display> Context<T> for std::result::Result<T, E> {
+    fn context(self, what: &str) -> Result<T> {
+        self.map_err(|error| format!("{what}: {error}"))
+    }
+
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, what: F) -> Result<T> {
+        self.map_err(|error| format!("{}: {error}", what()))
+    }
+}
+
+/// The same, for an absent value: `Option` has no error to prefix, so `what`
+/// becomes the whole message.
+impl<T> Context<T> for Option<T> {
+    fn context(self, what: &str) -> Result<T> {
+        self.ok_or_else(|| what.to_string())
+    }
+
+    fn with_context<C: std::fmt::Display, F: FnOnce() -> C>(self, what: F) -> Result<T> {
+        self.ok_or_else(|| what().to_string())
+    }
+}
+
 // Re-export wit_bindgen so the macro-generated inline WIT can reference it
 pub use wit_bindgen;
 
@@ -82,9 +128,9 @@ pub mod chat;
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        ForwardKind, architecture, arena_block_size, channel_capacity,
-        default_system_speculation, frame_size, is_linear, kv_page_size, max_embed_length, name,
-        output_vocab_size, pass_kind, rs_buffer_page_size, rs_fold_granularity, rs_state_size,
+        ForwardKind, architecture, arena_block_size, channel_capacity, default_system_speculation,
+        frame_size, is_linear, kv_page_size, max_embed_length, name, output_vocab_size, pass_kind,
+        rs_buffer_page_size, rs_fold_granularity, rs_state_size,
     };
     // Tokenizer functions split into the `tokenizer` interface (§2.2); re-exported
     // here so `model::encode`/`model::decode`/… keep working for inferlet source.
@@ -147,4 +193,3 @@ pub use crate::pie::inferlet::grammar::Matcher;
 // `session::receive().await` — so no SDK-side pollable/future polling shim
 // is needed (the old `ForwardPassExt`, `FutureStringExt`, `FutureBlobExt` and the `wstd`
 // executor have been removed); the host event loop drives all of it.
-

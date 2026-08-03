@@ -310,7 +310,7 @@ async fn $name(
         Ok(())
     };
     step(&mut prologue_us, input.report_timing); // [2] setup (vocab/rng/ws)
-    reserve_to_tokens(n.max(1)).map_err(|e| format!("ws.reserve prompt: {e}"))?;
+    reserve_to_tokens(n.max(1)).context("ws.reserve prompt")?;
     step(&mut prologue_us, input.report_timing); // [3] reserve
 
     // ── ONE PIPELINE, ONE STREAM (R4-4): prefill then decode, in order.
@@ -408,7 +408,7 @@ async fn $name(
             },
             &rs_ws,
         )
-        .map_err(|e| format!("bind prefill state: {e}"))?;
+        .context("bind prefill state")?;
     fwd_p.epilogue(move || {
         let t = reshape(
             sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
@@ -449,7 +449,7 @@ async fn $name(
             },
             &rs_ws,
         )
-        .map_err(|e| format!("bind decode state: {e}"))?;
+        .context("bind decode state")?;
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
             let t = reshape(
@@ -479,13 +479,13 @@ async fn $name(
     // (`submit` IS a single-slot frame); trailing slots pad to no-ops.
     let first_decodes = budget.min(live_slots - 1);
     reserve_to_tokens(n + first_decodes as u32 + 1)
-        .map_err(|e| format!("reserve first frame: {e}"))?;
+        .context("reserve first frame")?;
     let mut first_slots: Vec<Option<&ForwardPass>> = Vec::with_capacity(k);
     first_slots.push(Some(&fwd_p));
     for _ in 0..first_decodes {
         first_slots.push(Some(fwd_d.as_ref().expect("decode pass exists")));
     }
-    submit_frame(&pipe, &first_slots).map_err(|e| format!("first frame submit: {e}"))?;
+    submit_frame(&pipe, &first_slots).context("first frame submit")?;
     let mut submitted = first_decodes;
 
     // Unified run-ahead discipline (ONE rule for every k): submit frames of
@@ -527,10 +527,10 @@ async fn $name(
                     break;
                 }
                 reserve_to_tokens(n + (submitted + s) as u32 + 1)
-                    .map_err(|e| format!("reserve decode frame: {e}"))?;
+                    .context("reserve decode frame")?;
                 let fwd = fwd_d.as_ref().expect("decode pass exists while budget > 0");
                 let slots: Vec<Option<&ForwardPass>> = (0..s).map(|_| Some(fwd)).collect();
-                submit_frame(&pipe, &slots).map_err(|e| format!("decode frame submit: {e}"))?;
+                submit_frame(&pipe, &slots).context("decode frame submit")?;
                 submitted += s;
             }
             Ok(submitted)
@@ -547,7 +547,7 @@ async fn $name(
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+        .context("g0 take")?[0];
 
     let ttft_us = input
         .report_timing
@@ -579,7 +579,7 @@ async fn $name(
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("out.take: {e}"))?;
+            .context("out.take")?;
         taken += 1;
         let Some(&t0) = t.first() else {
             return Err("out.take: empty tensor".into());

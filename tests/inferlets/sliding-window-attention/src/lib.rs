@@ -52,7 +52,7 @@ async fn main(input: Input) -> Result<String> {
     let ws = WorkingSet::new();
     let slots = ws
         .reserve(pool_pages)
-        .map_err(|e| format!("reserve sliding-window KV: {e}"))?;
+        .context("reserve sliding-window KV")?;
     let pool_ids = slots.ids().to_vec();
 
     let prompt_tokens = Channel::from(prompt.iter().map(|&token| token as i32).collect::<Vec<_>>());
@@ -106,7 +106,7 @@ async fn main(input: Input) -> Result<String> {
     let pipeline = Pipeline::new();
     prefill
         .submit(&pipeline)
-        .map_err(|e| format!("sliding-window prefill: {e}"))?;
+        .context("sliding-window prefill")?;
     if input.max_tokens == 1 {
         pipeline.close();
     }
@@ -114,7 +114,7 @@ async fn main(input: Input) -> Result<String> {
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read first token: {e}"))?[0] as u32;
+        .context("read first token")?[0] as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -201,7 +201,7 @@ async fn main(input: Input) -> Result<String> {
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("read generated token: {e}"))?[0] as u32;
+            .context("read generated token")?[0] as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

@@ -175,7 +175,7 @@ macro_rules! define_beam_search {
         let ws = WorkingSet::new();
         let pool = ws
             .reserve(POOL_PAGES)
-            .map_err(|e| format!("ws.reserve pool: {e}"))?;
+            .context("ws.reserve pool")?;
         let pool_ids = pool.ids().to_vec();
         // Seeded at klen = 1 ⇒ one live page per lane, so lane b's single page sits at
         // flat slot b. `pages` keeps its [B*POOL_PAGES] capacity; only the first
@@ -272,7 +272,7 @@ macro_rules! define_beam_search {
                 rs,
             )
         };
-        bind_state(&fwd, &rs_working_sets).map_err(|e| format!("bind initial state: {e}"))?;
+        bind_state(&fwd, &rs_working_sets).context("bind initial state")?;
         fwd.embed(&toks, &lanes_b)?;
         fwd.epilogue(move || {
             // 1. top-B over the flattened [B,V] cand block.
@@ -363,22 +363,22 @@ macro_rules! define_beam_search {
                     .take()
                     .get::<i32>()
                     .await
-                    .map_err(|e| format!("out.take @{step}: {e}"))?;
+                    .with_context(|| format!("out.take @{step}"))?;
                 let parents = out_par
                     .take()
                     .get::<u32>()
                     .await
-                    .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+                    .with_context(|| format!("out_par.take @{step}"))?;
                 final_scores = out_scr
                     .take()
                     .get::<f32>()
                     .await
-                    .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+                    .with_context(|| format!("out_scr.take @{step}"))?;
                 let greedy = out_greedy
                     .take()
                     .get::<i32>()
                     .await
-                    .map_err(|e| format!("out_greedy.take @{step}: {e}"))?;
+                    .with_context(|| format!("out_greedy.take @{step}"))?;
                 greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
                 step += 1;
@@ -388,27 +388,27 @@ macro_rules! define_beam_search {
         } else {
             for step in 0..max_steps {
                 fwd.submit(&pipeline)
-                    .map_err(|e| format!("submit @{step}: {e}"))?;
+                    .with_context(|| format!("submit @{step}"))?;
                 let picked = out
                     .take()
                     .get::<i32>()
                     .await
-                    .map_err(|e| format!("out.take @{step}: {e}"))?;
+                    .with_context(|| format!("out.take @{step}"))?;
                 let parents = out_par
                     .take()
                     .get::<u32>()
                     .await
-                    .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+                    .with_context(|| format!("out_par.take @{step}"))?;
                 final_scores = out_scr
                     .take()
                     .get::<f32>()
                     .await
-                    .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+                    .with_context(|| format!("out_scr.take @{step}"))?;
                 let greedy = out_greedy
                     .take()
                     .get::<i32>()
                     .await
-                    .map_err(|e| format!("out_greedy.take @{step}: {e}"))?;
+                    .with_context(|| format!("out_greedy.take @{step}"))?;
                 greedy_mismatches += count_greedy_mismatches(&picked, &greedy, B);
                 let mut next_rs = Vec::with_capacity(B as usize);
                 for lane in 0..B as usize {
@@ -422,12 +422,12 @@ macro_rules! define_beam_search {
                     next_rs.push(
                         parent_rs
                             .fork(&pipeline)
-                            .map_err(|e| format!("rs fork beam {lane} from parent {parent}: {e}"))?,
+                            .with_context(|| format!("rs fork beam {lane} from parent {parent}"))?,
                     );
                 }
                 hypotheses = advance_hypotheses(&hypotheses, &picked, &parents, B)?;
                 bind_state(&fwd, &next_rs)
-                    .map_err(|e| format!("rebind recurrent states @{step}: {e}"))?;
+                    .with_context(|| format!("rebind recurrent states @{step}"))?;
                 rs_working_sets = next_rs;
             }
         }

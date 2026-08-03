@@ -194,8 +194,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut kept_sizes: Vec<f32> = Vec::with_capacity(max_tokens);
@@ -245,25 +244,11 @@ async fn main(input: Input) -> Result<Output> {
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let k0 = kept_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("k0 take: {e}"))?[0];
-    let m0 = mass_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("m0 take: {e}"))?[0];
+    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
+    let k0 = kept_out_p.take().get::<f32>().await.context("k0 take")?[0];
+    let m0 = mass_out_p.take().get::<f32>().await.context("m0 take")?[0];
     generated.push(g0 as u32);
     kept_sizes.push(k0);
     kept_mass.push(m0);
@@ -336,17 +321,17 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             let k = kept_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("kept_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("kept_out.take @{}", generated.len()))?[0];
             let m = mass_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("mass_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("mass_out.take @{}", generated.len()))?[0];
             generated.push(t as u32);
             kept_sizes.push(k);
             kept_mass.push(m);

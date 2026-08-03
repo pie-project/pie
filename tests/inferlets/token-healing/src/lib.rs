@@ -153,8 +153,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let n = prompt.len() as u32;
     let max_pages = (n + input.max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let prompt_tokens = Channel::from(prompt.iter().map(|&t| t as i32).collect::<Vec<_>>());
     let prefill_indptr = Channel::from(vec![0u32, n]).named("prefill_indptr");
@@ -193,14 +192,12 @@ async fn main(input: Input) -> Result<Output> {
 
     heal_mask.put(first_mask);
     let pipeline = Pipeline::new();
-    prefill
-        .submit(&pipeline)
-        .map_err(|e| format!("token-healing prefill: {e}"))?;
+    prefill.submit(&pipeline).context("token-healing prefill")?;
     let first = first_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("read healed token: {e}"))?[0] as u32;
+        .context("read healed token")?[0] as u32;
 
     let mut generated = vec![first];
 
@@ -252,11 +249,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let budget = input.max_tokens - 1;
         run_ahead(&pipeline, &decode, budget as usize, async || {
-            let token = token_out
-                .take()
-                .get::<i32>()
-                .await
-                .map_err(|e| format!("read token: {e}"))?[0] as u32;
+            let token = token_out.take().get::<i32>().await.context("read token")?[0] as u32;
             generated.push(token);
             Ok(ControlFlow::Continue(()))
         })

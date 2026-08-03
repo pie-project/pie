@@ -102,7 +102,7 @@ async fn main(input: Input) -> Result<String> {
     let amateur_ws = WorkingSet::new();
     let amateur_slots = amateur_ws
         .reserve(pool_pages)
-        .map_err(|error| format!("reserve amateur KV: {error}"))?;
+        .context("reserve amateur KV")?;
     let amateur_ids = amateur_slots.ids().to_vec();
 
     let prompt_i32 = prompt.iter().map(|&token| token as i32).collect::<Vec<_>>();
@@ -162,19 +162,17 @@ async fn main(input: Input) -> Result<String> {
     let pipeline = Pipeline::new();
     amateur_prefill
         .submit(&pipeline)
-        .map_err(|error| format!("amateur prefill: {error}"))?;
+        .context("amateur prefill")?;
     let first_amateur_logits = amateur_prefill_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|error| format!("read amateur prefill logits: {error}"))?;
+        .context("read amateur prefill logits")?;
 
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
     let expert_ws = WorkingSet::new();
-    expert_ws
-        .reserve(pool_pages)
-        .map_err(|error| format!("reserve expert KV: {error}"))?;
+    expert_ws.reserve(pool_pages).context("reserve expert KV")?;
     let expert_prompt = Channel::from(prompt_i32).named("expert_prompt");
     let expert_prefill_embed_indptr =
         Channel::from(vec![0u32, n]).named("expert_prefill_embed_indptr");
@@ -216,9 +214,7 @@ async fn main(input: Input) -> Result<String> {
     });
 
     expert_prefill_amateur.put(first_amateur_logits);
-    expert_prefill
-        .submit(&pipeline)
-        .map_err(|error| format!("expert prefill: {error}"))?;
+    expert_prefill.submit(&pipeline).context("expert prefill")?;
     let first = read_expert_token(&first_out).await?;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
@@ -348,21 +344,17 @@ async fn main(input: Input) -> Result<String> {
     // the Writer channel the fire takes.
     let budget = input.max_tokens.saturating_sub(generated.len());
     amateur_token.put(vec![first as i32]);
-    amateur_decode
-        .submit(&pipeline)
-        .map_err(|error| format!("amateur decode: {error}"))?;
+    amateur_decode.submit(&pipeline).context("amateur decode")?;
 
     for step in 0..budget {
         let amateur_logits = amateur_logits_out
             .take()
             .get::<f32>()
             .await
-            .map_err(|error| format!("read amateur logits: {error}"))?;
+            .context("read amateur logits")?;
 
         expert_amateur.put(amateur_logits);
-        expert_decode
-            .submit(&pipeline)
-            .map_err(|error| format!("expert decode: {error}"))?;
+        expert_decode.submit(&pipeline).context("expert decode")?;
         let token = read_expert_token(&expert_token_out).await?;
         if stop_tokens.contains(&token) {
             break;
@@ -370,9 +362,7 @@ async fn main(input: Input) -> Result<String> {
         generated.push(token);
         if step + 1 < budget {
             amateur_token.put(vec![token as i32]);
-            amateur_decode
-                .submit(&pipeline)
-                .map_err(|error| format!("amateur decode: {error}"))?;
+            amateur_decode.submit(&pipeline).context("amateur decode")?;
         }
     }
     // Every submitted fire was drained above.
@@ -386,9 +376,9 @@ async fn read_expert_token(channel: &Channel) -> Result<u32> {
         .take()
         .get::<i32>()
         .await
-        .map_err(|error| format!("read expert token: {error}"))?
+        .context("read expert token")?
         .first()
         .copied()
         .map(|token| token as u32)
-        .ok_or_else(|| "expert returned no token".into())
+        .context("expert returned no token")
 }

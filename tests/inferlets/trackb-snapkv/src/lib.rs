@@ -226,8 +226,7 @@ async fn main(input: Input) -> Result<Output> {
     let p_max = max_pages;
     let prompt_pages = n.div_ceil(page_size).min(p_max);
     let page_budget = input.page_budget.min(prompt_pages);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
@@ -303,12 +302,12 @@ async fn main(input: Input) -> Result<Output> {
         });
         fwd_c
             .submit(&pipe)
-            .map_err(|e| format!("prefill chunk submit @{base}: {e}"))?;
+            .with_context(|| format!("prefill chunk submit @{base}"))?;
         tok_out_c
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("prefill chunk take @{base}: {e}"))?;
+            .with_context(|| format!("prefill chunk take @{base}"))?;
     }
 
     // ── FINAL CHUNK `[base, n)`: the observed one. ──
@@ -399,30 +398,26 @@ async fn main(input: Input) -> Result<Output> {
 
     fwd_p
         .submit(&pipe)
-        .map_err(|e| format!("prefill submit @{base}: {e}"))?;
+        .with_context(|| format!("prefill submit @{base}"))?;
 
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
     generated.push(g0 as u32);
 
     let prefill_scores = scores_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("snapkv_scores.take: {e}"))?;
+        .context("snapkv_scores.take")?;
     let layers_observed = layers_out
         .take()
         .get::<u32>()
         .await
-        .map_err(|e| format!("snapkv_layer_count.take: {e}"))?[0];
+        .context("snapkv_layer_count.take")?[0];
     let device_page_mass = page_mass_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("snapkv_page_mass.take: {e}"))?;
+        .context("snapkv_page_mass.take")?;
 
     // ── DECODE LOOP (1-wide, run-ahead), enforcing the fixed keep-set. ──
     if generated.len() < max_tokens {
@@ -515,7 +510,7 @@ async fn main(input: Input) -> Result<Output> {
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("tok_out.take @{}", generated.len()))?[0];
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
         })
