@@ -275,7 +275,8 @@ void* tp_buffer_ptr(PersistentInputs& pi, TpBuf id) {
 // bounds, so the two ranks could pick different attention kernels for the same
 // fire. Both now plan from identical values.
 // One published fire. The mailbox holds a RING of these: rank 0 runs ahead by
-// up to `PIE_SCHED_MAX_IN_FLIGHT` frames, so it can be publishing fire N+1
+// up to `[model.scheduler] frame_dispatch_depth` frames, so it can be
+// publishing fire N+1
 // while the follower is still reading fire N. A single shared slot let the two
 // overlap and handed the follower a half-overwritten `qo_indptr`, which
 // FlashInfer's scheduler rejected ("should be non-negative") and killed the
@@ -288,7 +289,7 @@ struct TpFireSlot {
     std::vector<std::uint32_t> kv_page_indices;
 };
 
-// Depth is a throughput buffer, NOT a correctness bound: `MAX_IN_FLIGHT`
+// Depth is a throughput buffer, NOT a correctness bound: the dispatch depth
 // counts FRAMES while this ring is indexed per FIRE, and one frame can carry
 // an unbounded number of steps (and one step an unbounded number of MTP
 // drafts), so rank 0 can lap any fixed depth inside a single `launch()`.

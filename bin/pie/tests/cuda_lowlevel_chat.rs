@@ -79,7 +79,7 @@ async fn lowlevel_chat_runahead_rollback_on_real_driver() -> Result<()> {
     );
     // DEEP carrier token-identity: the depth-k pre-submission stream (the production
     // lever for co-batch residency + reduce-R) == the sequential one. Run with
-    // `PIE_SCHED_MAX_IN_FLIGHT=4` to exercise true 4-in-flight residency (the
+    // `[model.scheduler] frame_dispatch_depth = 4` to exercise true 4-in-flight residency (the
     // byte-identity holds at any cap; the residency is exercised at cap≥depth).
     anyhow::ensure!(
         json.contains("DEEP_MATCH=true"),

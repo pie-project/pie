@@ -271,14 +271,16 @@ SCENARIOS: list[Scenario] = [
         contract=Contract(max_wall_s=300, min_completed=4096, max_failed=0),
         repeat=4,
     ),
-    # ---- restore path: retries exhausted -----------------------------------
+    # ---- restore path: heavy restore traffic, every one must land ----------
+    # Named for the `PIE_KV_RESTORE_RETRIES=1` it used to set, which never
+    # bought it anything: with `max_failed=0` it asserts that no restore fails
+    # under a deep swap pool, so it never reached an exhausted retry.
     Scenario(
-        name="restore1",
-        target="restore retry exhaustion",
+        name="restore",
+        target="restore under a deep swap pool",
         args=["--total-pages", "96", "--swap-pool-size", "512",
               "--num-requests", "256", "--concurrency", "128",
               "--max-tokens", "128"],
-        env={"PIE_KV_RESTORE_RETRIES": "1"},
         contract=Contract(max_wall_s=180, min_completed=256, max_failed=0),
     ),
     # ---- pool holds ~one resident: every admission needs a full eviction ---

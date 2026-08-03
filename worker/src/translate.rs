@@ -137,6 +137,9 @@ fn build_model(
             request_timeout_secs: m.scheduler.request_timeout_secs,
             submit_deadline_us: m.scheduler.submit_deadline_us,
             silence_timeout_secs: m.scheduler.silence_timeout_secs,
+            frame_size: m.scheduler.frame_size,
+            frame_submit_depth: m.scheduler.frame_submit_depth,
+            frame_dispatch_depth: m.scheduler.frame_dispatch_depth,
         },
     })
 }

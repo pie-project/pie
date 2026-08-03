@@ -133,6 +133,21 @@ pub async fn boot_4090() -> Result<pie_bin::StandaloneHandle> {
     run_standalone(controller, gateway, worker, Mode::Local).await
 }
 
+/// [`boot_4090`] at an explicit `[model.scheduler] frame_dispatch_depth` — the
+/// engine's enqueue horizon in frames. `cuda_deep_coverify` needs the engine's
+/// depth to MATCH the chain depth its carrier submits, and config is the only
+/// way to say so: the depth used to be an env var the engine silently clamped,
+/// so a test asking for 4 quietly ran the engine at 3.
+pub async fn boot_4090_dispatch_depth(depth: u32) -> Result<pie_bin::StandaloneHandle> {
+    let snapshot = resolve_qwen3_snapshot()?;
+    let toml = format!(
+        "{}\n[worker.model.scheduler]\nframe_dispatch_depth = {depth}\n",
+        cuda_standalone_toml(&snapshot)
+    );
+    let (controller, gateway, worker) = derive_standalone(&toml)?;
+    run_standalone(controller, gateway, worker, Mode::Local).await
+}
+
 /// [`boot_4090`] with a SMALL KV pool (low `gpu_mem_utilization`) so a modest
 /// fleet over-fills it — the Task-B preempt/restore over-capacity e2e
 /// (`cuda_contention`). Contention is now forced by the explicit KV-page cap

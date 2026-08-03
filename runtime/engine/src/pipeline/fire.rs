@@ -1101,19 +1101,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // FIFO carries it; NOT synchronous like the deleted host-replay beam
         // branch).
         if ctx.resources().get(&fwd)?.devgeo.is_some() {
-            let metered = crate::scheduler::phase_start();
-            let out = fire_device_geometry(ctx, this, fwd, frame).await;
-            crate::scheduler::cpu_phase_add(
-                crate::scheduler::CpuPhase::DeviceGeometrySubmit,
-                metered,
-            );
-            return out;
+            return fire_device_geometry(ctx, this, fwd, frame).await;
         }
         // Contention-probe marker: when the guest's WIT call reached the
         // host (vs `hp-acquire` below — the delta is the build preamble,
         // including the settlement drain).
-        crate::planner::trace_mark!("build", ctx.process_id(), "hp-enter");
-        let preamble_cpu = crate::scheduler::phase_start();
         // W3.1: the PIPELINE owns the in-flight FIFO. Point each of this
         // pass's channels at this pipeline's queue so their `take`/`read`
         // await the right FIFO — enforcing the same-pipeline constraint
@@ -1142,10 +1134,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // An RS-binding pass needs no extra serialization here: its mapping
         // publishes at prepare, in submission order, so it runs ahead like
         // any other pass.
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Preamble, preamble_cpu);
-        let timing_enabled = ctx.fire_timing_requested();
-        let submit_cpu = crate::scheduler::phase_start();
-        let mut phase_cpu = submit_cpu;
         let (
             geometry,
             cells,
@@ -1244,8 +1232,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 p.dense_mask,
             )
         };
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::BindGeometry, phase_cpu);
-        phase_cpu = crate::scheduler::phase_start();
         let mut req = crate::driver::LaunchPlan::default();
         let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
@@ -1337,10 +1323,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
         };
         suppress_defaulted_readout_for_fold(&mut req, readout_defaulted, &rs_plan);
-        crate::planner::trace_mark!("build", pid, "hp-acquire");
         let mut attempts = 0;
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Declare, phase_cpu);
-        phase_cpu = crate::scheduler::phase_start();
         let (ws_guard, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
             let kv_demand = match host_kv_demand(
                 &stores,
@@ -1425,8 +1408,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 Err(ReservedError::Fatal(error)) => return Ok(Err(error)),
             }
         };
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Grant, phase_cpu);
-        phase_cpu = crate::scheduler::phase_start();
         rs_prepared.apply_to(&mut req);
         let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
         let rstxns = RsTxnsGuard::new(model, driver, rs_prepared.txn);
@@ -1464,7 +1445,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             rs_copy_src,
             rs_copy_dst,
             frame,
-            timing_enabled,
         )
         .err()
         .map(|error| format!("{error:#}"));
@@ -1474,9 +1454,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
             return Ok(Err(reason));
         }
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::Launch, phase_cpu);
-        crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::SubmitTotal, submit_cpu);
-        ctx.commit_fire_timing(timing_enabled);
         ticket_reservation.commit();
 
         {
@@ -2253,17 +2230,6 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
     let device_geometry = matches!(&kv, FireKv::DeviceGeom { .. });
     let prior_failure = failure.lock().unwrap().clone();
     let result = completion.await;
-    if crate::scheduler::fire_timing_enabled() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let resolved = crate::scheduler::LAST_RESOLVE_US.load(Relaxed);
-        if resolved > 0 {
-            let resume = crate::scheduler::fire_timing_now_us().saturating_sub(resolved) * 1_000;
-            let acc = &crate::scheduler::GUEST_PHASES;
-            acc.resume_ns.fetch_add(resume, Relaxed);
-            acc.resume_max_ns.fetch_max(resume, Relaxed);
-            acc.resume_n.fetch_add(1, Relaxed);
-        }
-    }
     let success = result.is_ok() && prior_failure.is_none();
 
     let (kv_failure, rs_failure) = {
@@ -2389,7 +2355,6 @@ async fn fire_device_geometry<C: FireContext>(
     // Contention-probe marker: when the guest's WIT call reached the host
     // (vs when its build reaches `acquire` — the delta is the build
     // preamble, including the settlement drain below).
-    crate::planner::trace_mark!("build", ctx.process_id(), "dg-enter");
     // Wire each of this pass's channels at this pipeline's FIFO (§3.4: all
     // passes binding a channel must submit on ONE pipeline — the entire
     // ordering/FIFO correctness argument).
@@ -2414,7 +2379,6 @@ async fn fire_device_geometry<C: FireContext>(
     }
     // No RS serialization: the mapping publishes at prepare (submission
     // order), so a recurrent-state device-geometry pass runs ahead too.
-    let timing_enabled = ctx.fire_timing_requested();
 
     let (ws_rep, rs_reps, rs_fold_len) = {
         let pass = ctx.resources().get(&fwd)?;
@@ -2540,7 +2504,6 @@ async fn fire_device_geometry<C: FireContext>(
     // Phase B: acquire the one grant (KV pages + RS slots) — the only
     // awaits in this build; nothing physical is held. Phase C: prepare from
     // it; on stale demand recompute both figures and re-acquire, bounded.
-    crate::planner::trace_mark!("build", pid, "dg-acquire");
     let mut attempts = 0;
     let (ws_guard, pages, (copy_src, copy_dst), kv_translation, kvtxn, rs_prepared) = loop {
         let kv_demand =
@@ -2762,7 +2725,6 @@ async fn fire_device_geometry<C: FireContext>(
         rs_copy_src,
         rs_copy_dst,
         frame,
-        timing_enabled,
     )
     .err()
     .map(|error| format!("{error:#}"));
@@ -2773,7 +2735,6 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
-    ctx.commit_fire_timing(timing_enabled);
     ticket_reservation.commit();
     {
         let p = ctx.resources().get_mut(&fwd)?;

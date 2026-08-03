@@ -175,6 +175,14 @@ pub struct SchedulerConfig {
     /// How long a lane may stay silent in total before its process is
     /// terminated. See `crate::scheduler::configured_silence_timeout`.
     pub silence_timeout_secs: u64,
+    /// Waves per frame (k). See `crate::scheduler::configured_frame_size`.
+    pub frame_size: u32,
+    /// Frames a guest keeps submitted into the engine. See
+    /// `crate::scheduler::configured_submit_depth`.
+    pub frame_submit_depth: u32,
+    /// Frames the engine keeps posted to the driver. See
+    /// `crate::scheduler::frame::configured_dispatch_depth`.
+    pub frame_dispatch_depth: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -214,9 +222,6 @@ pub async fn bootstrap_with_listener(
 }
 
 async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
-    // The bootstrap edge is the ONLY place planner knobs leave the
-    // environment; everything downstream receives this value explicitly.
-    let planner_config = crate::planner::PlannerConfig::from_env();
     verify_config(&config)?;
     let mut active_guard = ActiveRuntimeGuard::acquire()?;
 
@@ -388,7 +393,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 0,
                 kv_swap_capable,
             )),
-            planner_config,
         ),
     );
     // Opt-in stall sampler: `PIE_CONTENTION_TRACE_MS=500` emits one line
@@ -476,6 +480,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
         scheduler.silence_timeout_secs,
     ));
+    // Both are read once into a `OnceLock` and are guest-visible through
+    // `model.frame-size()` / `model.channel-capacity()`, so they must be
+    // installed before anything touches the scheduler.
+    crate::scheduler::set_frame_size(scheduler.frame_size as usize);
+    crate::scheduler::set_submit_depth(scheduler.frame_submit_depth as usize);
+    crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(
         &drivers,
         kv_page_size as u32,

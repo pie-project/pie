@@ -25,15 +25,6 @@ pub trait FireContext {
     /// type directly so this trait need not name either module).
     fn process_id(&self) -> uuid::Uuid;
 
-    /// Whether this fire should carry request-level timing. Process contexts
-    /// claim compact-ledger timing once locally; teardown contexts never do.
-    fn fire_timing_requested(&self) -> bool {
-        false
-    }
-
-    /// Commit a compact-ledger claim only after scheduler queue admission.
-    fn commit_fire_timing(&mut self, _enabled: bool) {}
-
     /// Settle this process's own pipeline tail (finalize every pending op,
     /// device-geometry included — only the owning guest task can, since the
     /// finalization needs its ResourceTable). Called when the planner yields

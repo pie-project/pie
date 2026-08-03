@@ -94,7 +94,7 @@ struct TpFireCommit {
 // Bounded TP fire pipeline.
 //
 // Rank 0 may NOT run arbitrarily far ahead of the follower: `pi.*` and the
-// NCCL communicator are one shared set, and with `PIE_FRAME_SIZE` > 1 a frame's
+// NCCL communicator are one shared set, and with k > 1 a frame's
 // steps are enqueued back to back with no rendezvous, so rank 0 would post fire
 // N+1's payload group while the follower is still inside fire N's forward on
 // that same communicator. That deadlocked the pair (the follower's decode
@@ -102,7 +102,7 @@ struct TpFireCommit {
 //
 // Debug lever, disabled by default. Before posting fire N's collectives, wait
 // for fire N-D to have retired; D=0 means no bound. This existed to work around
-// a TP hang at `PIE_FRAME_SIZE` > 1 that turned out to be the follower skipping
+// a TP hang at k > 1 that turned out to be the follower skipping
 // the attention plan-staging protocol — fixed there instead. Retained because
 // forcing D=1 collapses a whole class of cross-rank overlap bug into a clean
 // yes/no answer, which is how that one was isolated.
@@ -2333,7 +2333,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         // One TP fire in flight on the device at a time.
         //
         // The persistent input buffers (`pi.*`) and the NCCL communicator are
-        // a SINGLE set shared by every fire. With `PIE_FRAME_SIZE` > 1 a frame
+        // a SINGLE set shared by every fire. With k > 1 a frame
         // holds several steps and `launch` enqueues them back to back with no
         // rendezvous between them, so rank 0 would post fire N+1's payload
         // group while the follower is still executing fire N's forward — whose

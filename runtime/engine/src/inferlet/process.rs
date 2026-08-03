@@ -509,7 +509,6 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     // conveyor only buys the next arrival the right to instantiate work
     // nothing is waiting for. The conveyor is one cohort wide, so a
     // turnover still hands its whole successor cohort through in one go.
-    let started = Instant::now();
     let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => Some(
             Arc::clone(semaphore)
@@ -521,16 +520,6 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     };
     ctx.release_prewarm_permit();
     ctx.admit_bind(permit);
-    if crate::scheduler::fire_timing_enabled() {
-        crate::scheduler::fire_timing_write(&serde_json::json!({
-            "schema": 1,
-            "source": "runtime",
-            "event": "process_bind_admitted",
-            "process_id": ctx.id(),
-            "bind_admitted_us": crate::scheduler::fire_timing_now_us(),
-            "bind_admission_wait_us": duration_us(started.elapsed()),
-        }));
-    }
 }
 
 /// Strict-admission gate: acquire the execution permit lazily at fire
@@ -538,7 +527,6 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
 /// same order everywhere: bind, then execution — permits are only ever
 /// acquired in that order, so the two gates cannot deadlock).
 pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
-    let entered = Instant::now();
     ensure_bind_admitted(ctx).await;
     if ctx.execution_admitted() {
         return;
@@ -575,29 +563,13 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         }
         None => None,
     };
-    let sem_done = Instant::now();
     ctx.admit_execution(permit, duration_us(started.elapsed()));
     // The planner registers at spawn (registration order is the FCFS clock),
     // but only from here on can this process hold pooled pages. Its wedge
     // predicate needs that distinction: an unadmitted process is neither
     // running nor able to free anything.
-    let note_started = Instant::now();
     if let Some(planner) = crate::planner::planner() {
         planner.note_admitted(ctx.id());
-    }
-    if crate::scheduler::fire_timing_enabled() {
-        crate::scheduler::fire_timing_write(&serde_json::json!({
-            "schema": 1,
-            "source": "runtime",
-            "event": "process_admitted",
-            "process_id": ctx.id(),
-            "admitted_us": crate::scheduler::fire_timing_now_us(),
-            "admission_wait_us": ctx.admission_wait_us(),
-            "bind_wait_us": duration_us(started.duration_since(entered)),
-            "sem_us": duration_us(sem_done.duration_since(started)),
-            "note_us": duration_us(note_started.elapsed()),
-            "tid": os_thread_id(),
-        }));
     }
 }
 
@@ -641,16 +613,6 @@ fn spawn_inner(
     inherit_client_pid: Option<ProcessId>,
 ) -> Result<ProcessId> {
     let id = Uuid::new_v4();
-    if crate::scheduler::fire_timing_enabled() {
-        crate::scheduler::fire_timing_write(&serde_json::json!({
-            "schema": 1,
-            "source": "runtime",
-            "event": "process_spawned",
-            "process_id": id,
-            "spawned_us": crate::scheduler::fire_timing_now_us(),
-            "spawned_unix_us": crate::scheduler::fire_timing_unix_us(),
-        }));
-    }
     if let Some(planner) = crate::planner::planner() {
         match inherit_seq {
             Some(seq) => planner.register_with_seq(id, seq),
@@ -839,14 +801,7 @@ impl Process {
             capture_outputs,
             result_tx.clone(),
         );
-        let handle = if crate::scheduler::fire_timing_enabled() {
-            tokio::spawn(crate::scheduler::CpuMetered::new(
-                crate::scheduler::CpuClass::Process,
-                task,
-            ))
-        } else {
-            tokio::spawn(task)
-        };
+        let handle = tokio::spawn(task);
 
         Process {
             process_id,
@@ -913,12 +868,6 @@ impl Process {
         // executes. The REAL concurrency permit is acquired lazily by
         // `ensure_execution_admitted` at the first per-instance driver or
         // pooled-resource operation, and held for the rest of the run.
-        let launch_timing = crate::scheduler::fire_timing_enabled().then(|| {
-            (
-                crate::scheduler::fire_timing_now_us(),
-                crate::scheduler::fire_timing_unix_us(),
-            )
-        });
         let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
             Some(sem) => Some(
                 Arc::clone(sem)
@@ -928,19 +877,6 @@ impl Process {
             ),
             None => None,
         };
-        if let Some((launched_us, launched_unix_us)) = launch_timing {
-            let acquired_us = crate::scheduler::fire_timing_now_us();
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "runtime",
-                "event": "process_launch",
-                "process_id": process_id,
-                "launched_us": launched_us,
-                "launched_unix_us": launched_unix_us,
-                "prewarm_admitted_us": acquired_us,
-                "prewarm_wait_us": acquired_us.saturating_sub(launched_us),
-            }));
-        }
         let mut admission_wait_us = 0u64;
         let mut instantiate_us = 0u64;
         let context_register_us = 0u64;
@@ -985,22 +921,9 @@ impl Process {
                 .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
                 .map_err(|e| format!("Failed to get 'run' function: {e:?}"))?;
 
-            if crate::scheduler::fire_timing_enabled() {
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "runtime",
-                    "event": "guest_main_entered",
-                    "process_id": process_id,
-                    "entered_us": crate::scheduler::fire_timing_now_us(),
-                }));
-            }
             let wasm_run_start = Instant::now();
             let call = run_func.call_async(&mut store, (&input,));
-            let called = if crate::scheduler::fire_timing_enabled() {
-                crate::scheduler::CpuMetered::new(crate::scheduler::CpuClass::Guest, call).await
-            } else {
-                call.await
-            };
+            let called = call.await;
             let result = match called {
                 Ok((Ok(output),)) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
@@ -1015,36 +938,12 @@ impl Process {
                     Err(format!("Call error: {call_err}"))
                 }
             };
-            if crate::scheduler::fire_timing_enabled() {
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "runtime",
-                    "event": "guest_main_returned",
-                    "process_id": process_id,
-                    "returned_us": crate::scheduler::fire_timing_now_us(),
-                }));
-            }
             admission_wait_us = store.data().admission_wait_us();
             // Drop the store HERE rather than at the end of this block, so
             // the wasmtime teardown it triggers (`ProcessCtx::drop` and the
             // instance's own memory) is visible: at a cohort boundary 512 of
             // these run at once and the record is the only way to see them.
-            if crate::scheduler::fire_timing_enabled() {
-                let store_drop_started_us = crate::scheduler::fire_timing_now_us();
-                drop(store);
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "runtime",
-                    "event": "process_store_drop",
-                    "process_id": process_id,
-                    "started_us": store_drop_started_us,
-                    "store_drop_us":
-                        crate::scheduler::fire_timing_now_us() - store_drop_started_us,
-                    "tid": os_thread_id(),
-                }));
-            } else {
-                drop(store);
-            }
+            drop(store);
             result
         }
         .await;
@@ -1070,19 +969,7 @@ impl Process {
             let _ = tx.send(result.clone());
         }
 
-        let terminate_started_us =
-            crate::scheduler::fire_timing_enabled().then(crate::scheduler::fire_timing_now_us);
         terminate(process_id, result);
-        if let Some(started_us) = terminate_started_us {
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "runtime",
-                "event": "process_terminate",
-                "process_id": process_id,
-                "started_us": started_us,
-                "terminate_us": crate::scheduler::fire_timing_now_us() - started_us,
-            }));
-        }
     }
 
     /// Re-run this program from the beginning, carrying the caller's reply

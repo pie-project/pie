@@ -379,7 +379,8 @@ async fn generate(prompt: &[u32], max_tokens: usize, stop: &[u32], mode: Mode) -
 async fn main(input: String) -> Result<String> {
     // Input: "<max_tokens> [depth=<k>] [no-rollback-probe]". `depth` is the
     // deep carrier's pre-submission window; align it to the scheduler cap
-    // (`PIE_SCHED_MAX_IN_FLIGHT=k`) so the co-verify is turnkey (default 4).
+    // (`[model.scheduler] frame_dispatch_depth = k`) so the co-verify is
+    // turnkey (default 3, the engine's own default being 2).
     let max_tokens: usize = input
         .split_whitespace()
         .next()

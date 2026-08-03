@@ -124,16 +124,6 @@ pub fn coalesce_direct_row_shards(
         return Ok(contract.clone());
     }
 
-    if crate::planner_debug_enabled() {
-        let coalesced = groups.iter().map(Vec::len).sum::<usize>();
-        eprintln!(
-            "[pie-loader] row-shard coalescing groups={} tensors={} max_bank_bytes={}",
-            groups.len(),
-            coalesced,
-            max_bank_bytes
-        );
-    }
-
     let mut emitted_groups = vec![false; groups.len()];
     let mut new_tensors = Vec::with_capacity(contract.tensors.len() + groups.len());
 

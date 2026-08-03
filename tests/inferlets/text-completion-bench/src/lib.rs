@@ -438,8 +438,9 @@ async fn $name(
     // what gives that straggler time, and it is counted in WAVES, not
     // frames — a 2-frame window gives only k waves, so k = 1 got a single
     // ~7 ms wave and a cohort that fell behind never caught back up
-    // (see §20.10). That is why the engine's `HOST_TURNAROUND_WAVES` is
-    // k-independent and the frame count is derived from it.
+    // (see §20.10). The engine's own `[model.scheduler] frame_submit_depth`
+    // is a flat frame count sized for the default k = 2, so a deployment that
+    // moves k has to re-measure it against the numbers below.
     //
     // Measured, Qwen3-0.6B / L40S / conc 256, median of 6-8 trials:
     //   k=1 cover 1 (old 2*k rule)  multimodal 18.8k / 22k / 28.5k

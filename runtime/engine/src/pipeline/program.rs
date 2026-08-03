@@ -238,12 +238,6 @@ impl Registry {
         let channel_accesses = Self::channel_accesses(&decoded);
         let bound = bind(decoded, profile.clone()).map_err(RegisterError::Bind)?;
         let compiled_stages = pie_plan::compile_bound(&bound);
-        if std::env::var_os("PIE_PTIR_DUMP_PLAN").is_some() {
-            for stage in &compiled_stages {
-                eprintln!("{}", pie_plan::debug_stage_plan(stage));
-                eprintln!("  metrics={:?}", stage.metrics());
-            }
-        }
         let launch = std::sync::OnceLock::new();
         let entry = Arc::new(RegisteredProgram {
             bytes,

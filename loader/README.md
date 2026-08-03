@@ -66,7 +66,7 @@ contract), and quantized *output* encodings outside {MXFP4, FP8, INT8}
 Four optional positional arguments follow, in order: `BACKEND` (`cuda`|`metal`|
 `host`), `FUSION` (`fused`|`unfused`), `TP` (`RANK/SIZE`), and a JSON
 `StorageTarget`. `CONTRACT` is a JSON `ModelContract` — see
-`tests/golden/contracts/`. `PIE_LOAD_PLANNER_DEBUG=1` prints per-pass timings.
+`tests/golden/contracts/`.
 
 ## Design documents
 

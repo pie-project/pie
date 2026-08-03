@@ -443,8 +443,8 @@ pub struct SchedulerConfig {
     /// nothing submitted — it is stopped by run-ahead (a lane with a queued
     /// frame is not blocking), by an unretired dispatch (the engine owes it a
     /// result, so the whole GPU wave is free), by a bind in flight, and by
-    /// `forward.park()`. The host resubmit turnaround already has its own
-    /// headroom in `HOST_TURNAROUND_WAVES`.
+    /// `forward.park()`. The host resubmit round trip already has its own
+    /// headroom in [`SchedulerConfig::frame_submit_depth`].
     ///
     /// Measured: on the contention suite a breach happens roughly once in
     /// several thousand requests, and when it does the lane is 0.1-3ms over
@@ -464,6 +464,62 @@ pub struct SchedulerConfig {
     /// but a genuinely abandoned process ever reaches this.
     #[serde(default = "default_silence_timeout_secs")]
     pub silence_timeout_secs: u64,
+    /// Waves per frame (*k*): how many token steps the wait-all quorum admits
+    /// before it runs. A deployment constant, fixed at engine start exactly
+    /// like the KV page size — never renegotiated per frame, never adapted
+    /// from runtime timing. Guests read it as `model.frame-size()` and size
+    /// their frames and channels to it, so it is part of the guest contract.
+    ///
+    /// Two. At k=1 the quorum runs once per token, and above ~64 concurrent
+    /// processes the fleet stops overlapping batches entirely: measured duty
+    /// collapses from 1.7 to 1.0 and goes bimodal, costing 29% throughput and
+    /// 28% latency at concurrency 256. k=2 halves the number of quorum
+    /// boundaries and holds duty at 1.6 with no regression at any lower
+    /// concurrency. k=3 and k=4 measure the same as k=2 while costing more
+    /// driver staging depth (CONTENTION_FOLLOWUP §20.8).
+    ///
+    /// Bounded above by the CUDA driver, not by taste — see [`Self::validate`].
+    #[serde(default = "default_frame_size")]
+    pub frame_size: u32,
+    /// Frames a guest keeps submitted into the engine: one running, plus the
+    /// rest queued behind it so the device always has work while the guest is
+    /// back on the host deciding what to submit next. Too few and the pipeline collapses
+    /// to lockstep — submit, wait, submit, wait — because the host resubmit
+    /// round trip lands squarely in the critical path.
+    ///
+    /// Three, sized for the default `frame_size = 2`, where it covers the
+    /// round trip with one frame to spare. **A frame is k waves of device
+    /// time, so this and `frame_size` are not independent: a deployment that
+    /// moves k must re-measure this.** Three frames at k=1 cover half the real
+    /// time they cover at k=2, and undersizing this window is what collapsed
+    /// k=1 throughput (CONTENTION_FOLLOWUP §20.11).
+    ///
+    /// Guests never read this directly — they get `model.channel-capacity()`,
+    /// which is derived from it — so it can move without touching the guest
+    /// contract. Not to be confused with `frame_dispatch_depth`, which is the
+    /// engine running ahead of the DRIVER rather than the guest running ahead
+    /// of the engine.
+    #[serde(default = "default_frame_submit_depth")]
+    pub frame_submit_depth: u32,
+    /// Frames the engine keeps POSTED to the driver but not yet retired: the
+    /// dispatch loop's enqueue horizon. Where `frame_submit_depth` is the
+    /// guest running ahead of the engine, this is the engine running ahead of
+    /// the device, and it is what keeps the GPU from idling between frames —
+    /// at 2 one frame executes while the next is already uploaded.
+    ///
+    /// **This is a real two-sided trade-off, not a value with one right
+    /// answer.** Dispatching is the allocation-credit gate, so each frame of
+    /// depth commits physical KV pages early; and a frame's contents freeze
+    /// when it is sealed, so deeper dispatch executes batches that were packed
+    /// against a staler queue. On hardware with headroom the idle it removes
+    /// wins and 2 is right — that is where the default was tuned. On a fully
+    /// batched, zero-headroom fleet there is no idle left to remove and the
+    /// two costs dominate: measured 610ms at depth 1 against 1034ms at depth 2
+    /// on a pure-attention model, 8 lanes, ~29 of 32 rows per launch.
+    ///
+    /// Bounded jointly with `frame_size` by the driver — see [`Self::validate`].
+    #[serde(default = "default_frame_dispatch_depth")]
+    pub frame_dispatch_depth: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -472,9 +528,29 @@ impl Default for SchedulerConfig {
             request_timeout_secs: default_request_timeout_secs(),
             submit_deadline_us: default_submit_deadline_us(),
             silence_timeout_secs: default_silence_timeout_secs(),
+            frame_size: default_frame_size(),
+            frame_submit_depth: default_frame_submit_depth(),
+            frame_dispatch_depth: default_frame_dispatch_depth(),
         }
     }
 }
+
+/// Pinned upload staging slots the CUDA driver allocates, mirroring
+/// `kUploadStagingDepth` in `driver/cuda/src/runahead.hpp` (there:
+/// `kSchedulerMaxInFlight * kMaxPipelinedFrameSize + 1` = 3 * 4 + 1).
+///
+/// The driver stages per STEP, not per frame, and one frame carries up to
+/// `frame_size` steps — so the engine's steps in flight are
+/// `frame_dispatch_depth * frame_size` and the pool must strictly EXCEED
+/// them. A pool sized exactly to peak occupancy has every slot pending when
+/// the next submit arrives, so the acquire blocks in `cudaEventSynchronize`
+/// for a full GPU step (~1.6ms measured on the 4090 c64 decode workload).
+///
+/// Exceeding it is never a memory error — the pools are fixed arrays, so a
+/// submit simply waits for a slot and every submit re-serializes with no
+/// diagnostic at all. That silence is why this is rejected here rather than
+/// clamped: the config layer is the only place it can be caught.
+const UPLOAD_STAGING_DEPTH: u32 = 13;
 
 impl SchedulerConfig {
     fn validate(&self) -> Result<()> {
@@ -495,6 +571,32 @@ impl SchedulerConfig {
             "scheduler.silence_timeout_secs must not be shorter than submit_deadline_us: \
              a kill that lands before the leash would fail guests the leash exists to spare"
         );
+        ensure!(self.frame_size >= 1, "scheduler.frame_size must be >= 1");
+        ensure!(
+            self.frame_dispatch_depth >= 1,
+            "scheduler.frame_dispatch_depth must be >= 1"
+        );
+        ensure!(
+            self.frame_submit_depth >= 2,
+            "scheduler.frame_submit_depth must be at least 2: one frame runs while the rest \
+             stay queued, so a value of 1 leaves nothing queued and puts the host resubmit \
+             round trip back in the critical path — the lockstep this window exists to prevent"
+        );
+        // The driver coupling. Checked as the product rather than as a cap on
+        // each factor, which is both correct and less restrictive: what the
+        // staging pool sees is steps, and it cannot tell 2 frames of 3 steps
+        // from 3 frames of 2.
+        let steps_in_flight = self.frame_dispatch_depth * self.frame_size;
+        ensure!(
+            steps_in_flight < UPLOAD_STAGING_DEPTH,
+            "scheduler.frame_dispatch_depth * frame_size must be < {UPLOAD_STAGING_DEPTH} \
+             (got {} * {} = {steps_in_flight}): the CUDA driver stages one pinned upload slot \
+             per STEP and allocates {UPLOAD_STAGING_DEPTH} of them, so at or above that every \
+             submit blocks waiting for a slot and re-serializes with no error reported \
+             (kUploadStagingDepth in driver/cuda/src/runahead.hpp)",
+            self.frame_dispatch_depth,
+            self.frame_size
+        );
         Ok(())
     }
 }
@@ -509,6 +611,18 @@ fn default_submit_deadline_us() -> u64 {
 
 fn default_silence_timeout_secs() -> u64 {
     30
+}
+
+fn default_frame_size() -> u32 {
+    2
+}
+
+fn default_frame_submit_depth() -> u32 {
+    3
+}
+
+fn default_frame_dispatch_depth() -> u32 {
+    2
 }
 
 // -----------------------------------------------------------------------------
@@ -936,6 +1050,82 @@ device = ["cpu"]
         assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
         assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn scheduler_frame_defaults_are_the_shipped_deployment() {
+        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.model.scheduler.frame_size, 2);
+        assert_eq!(cfg.model.scheduler.frame_submit_depth, 3);
+        assert_eq!(cfg.model.scheduler.frame_dispatch_depth, 2);
+    }
+
+    #[test]
+    fn rejects_a_run_ahead_window_that_leaves_nothing_queued() {
+        let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        // One frame submitted is the running frame alone — no run-ahead at
+        // all, so the host round trip returns to the critical path.
+        cfg.model.scheduler.frame_submit_depth = 1;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("scheduler.frame_submit_depth must be at least 2")
+        );
+
+        cfg.model.scheduler.frame_submit_depth = 2;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_more_steps_in_flight_than_the_driver_stages() {
+        let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        let steps = |c: &Config| {
+            c.model.scheduler.frame_dispatch_depth * c.model.scheduler.frame_size
+        };
+
+        // The pool must strictly exceed steps in flight; equality is the case
+        // that blocks in `cudaEventSynchronize` on every submit.
+        cfg.model.scheduler.frame_dispatch_depth = 13;
+        cfg.model.scheduler.frame_size = 1;
+        assert_eq!(steps(&cfg), UPLOAD_STAGING_DEPTH);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must be < 13")
+        );
+
+        cfg.model.scheduler.frame_dispatch_depth = 12;
+        assert_eq!(steps(&cfg), UPLOAD_STAGING_DEPTH - 1);
+        cfg.validate().unwrap();
+
+        // The product is what matters, not either factor: 3 x 4 and 4 x 3 are
+        // the same 12 steps to the staging pool, and both are legal even
+        // though each exceeds the other field's historical clamp.
+        cfg.model.scheduler.frame_dispatch_depth = 3;
+        cfg.model.scheduler.frame_size = 4;
+        cfg.validate().unwrap();
+        cfg.model.scheduler.frame_dispatch_depth = 4;
+        cfg.model.scheduler.frame_size = 3;
+        cfg.validate().unwrap();
+
+        // ...and 2 x 7 = 14 is refused even though each factor looks modest.
+        cfg.model.scheduler.frame_dispatch_depth = 2;
+        cfg.model.scheduler.frame_size = 7;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_frame_geometry() {
+        let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.model.scheduler.frame_size = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.model.scheduler.frame_dispatch_depth = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
