@@ -69,9 +69,9 @@ enum class Kind : std::uint8_t {
     /// SwiGLU over the sorted `[sorted_rows, moe_intermediate]` stack.
     ExpertSiluMul,
     ExpertDown,
-    /// Undo the sort, back into the `[rows, k, hidden]` stack.
-    ExpertScatter,
-    /// Sum the k experts' outputs, weighted by the router's softmax.
+    /// Sum the k experts' outputs, weighted by the router's softmax, reading
+    /// them through the sort's inverse permutation rather than after a kernel
+    /// has put them back.
     ExpertCombine,
 
     /// hidden += ffn_out.
@@ -145,7 +145,6 @@ inline std::vector<Dispatch> build_llama_dag(const LlamaGeometry& g, bool with_a
             emit(Kind::ExpertUp, L);
             emit(Kind::ExpertSiluMul, L);
             emit(Kind::ExpertDown, L);
-            emit(Kind::ExpertScatter, L);
             emit(Kind::ExpertCombine, L);
         } else {
             emit(Kind::QmvGate, L);

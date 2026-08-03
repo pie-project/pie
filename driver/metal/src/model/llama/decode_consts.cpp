@@ -228,11 +228,10 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                 break;
             }
             case Kind::ExpertSort:
-            case Kind::ExpertGather:
-            case Kind::ExpertScatter: {
-                // One params struct for all three, so the sort's padding and
-                // the row movers' bounds cannot disagree. `width` is only read
-                // by the two row movers, and both move hidden-wide rows.
+            case Kind::ExpertGather: {
+                // One params struct for both, so the sort's padding and the
+                // gather's bounds cannot disagree. `width` is only read by the
+                // gather, which moves hidden-wide rows.
                 const int sorted = llama_moe_sorted_rows(g, int(R));
                 const MoeRouteParams p{
                     std::uint32_t(int(R) * int(K)),

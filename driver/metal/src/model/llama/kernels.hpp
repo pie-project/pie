@@ -59,14 +59,13 @@ struct LlamaPsos {
 
     // Routed FFN. Left invalid on a dense checkpoint -- see `valid()`.
     Pso router_topk{};
-    Pso expert_combine{};
     /// The routed matvec. Unbiased: Qwen's experts carry no bias, unlike
     /// gpt-oss's.
     Pso qmv_routed{};
     /// The expert-major reordering the batched form runs on.
     Pso moe_sort{};
     Pso moe_gather{};
-    Pso moe_scatter{};
+    Pso moe_combine{};
     /// The routed matmul, one column tile per entry: bn 16, 32, 64. The row
     /// tile does not vary -- `kMoeTileRows` is what the sort padded to, and a
     /// second row tile would be a second thing for the sort to agree with.
@@ -76,8 +75,8 @@ struct LlamaPsos {
         return sdpa_d128.valid() && sdpa_paged_d128.valid() && row_gather.valid();
     }
     bool moe_valid() const {
-        return router_topk.valid() && expert_combine.valid() && qmv_routed.valid() &&
-               moe_sort.valid() && moe_gather.valid() && moe_scatter.valid() &&
+        return router_topk.valid() && qmv_routed.valid() &&
+               moe_sort.valid() && moe_gather.valid() && moe_combine.valid() &&
                qmm_routed[0].valid() && qmm_routed[1].valid() && qmm_routed[2].valid();
     }
     /// A dense checkpoint must not be held to the MoE PSOs: compiling them for

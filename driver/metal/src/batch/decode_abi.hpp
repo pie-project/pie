@@ -383,11 +383,21 @@ enum class GoQmv : uint8_t {
     TileExpert = 12,
 };
 
-// moe_route_sort / moe_route_gather / moe_route_scatter: the expert-major
-// reordering a batched mixture runs on. The sort's four outputs and the two
-// row-movers share no layout, so they get their own tables.
-enum class MoeRouteSort : uint8_t { ExpertIds = 0, Perm = 1, RowExpert = 2, TileExpert = 3, Params = 4 };
+// moe_route_sort / moe_route_gather / moe_combine_sorted: the expert-major
+// reordering a batched mixture runs on. The sort's outputs and the row-mover
+// share no layout, so they get their own tables.
+//
+// `Inv` sits after `Params` because it was added later and these ordinals are
+// an ABI. It is the sort's own inverse -- the position it gave each pair --
+// which is what lets the combine read the sorted results in place instead of a
+// fourth kernel putting them back first.
+enum class MoeRouteSort : uint8_t {
+    ExpertIds = 0, Perm = 1, RowExpert = 2, TileExpert = 3, Params = 4, Inv = 5
+};
 enum class MoeRouteRows : uint8_t { In = 0, Out = 1, Perm = 2, Params = 3 };
+
+// moe_combine_sorted: `GoExpertCombine` plus the sort's inverse permutation.
+enum class MoeCombineSorted : uint8_t { Y = 0, Weights = 1, Out = 2, Params = 3, Inv = 4 };
 
 // router_topk: top-k over the router's logits, then a softmax over the k that
 // survive. Emits both halves of the routing decision.
@@ -520,7 +530,7 @@ enum class Kernel : uint8_t {
     // fall-through value and hide a real gap behind it.
     LlMoeSort,
     LlMoeGather,
-    LlMoeScatter
+    LlMoeCombine
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

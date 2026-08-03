@@ -17,10 +17,16 @@
 //   sort    -- a counting sort of the (row, slot) pairs by expert id, laid out
 //              so each expert's run starts on a tile boundary.
 //   gather  -- copy each sorted position's source row into that order.
-//   scatter -- put the results back where the combine step expects them.
 //
-// The same three run at M=1. A decode sorts eight pairs, gathers eight rows and
-// scatters eight back, which is microseconds -- and it means the routed
+// There is no third kernel putting the results back. The sort emits the INVERSE
+// permutation alongside the forward one -- it knows both, at no cost, at the
+// moment it places a pair -- and the combine step reads its k slots through it.
+// Undoing a permutation to feed a kernel that is about to gather anyway is a
+// dispatch and a full-width buffer spent to make an index arithmetic look
+// simpler.
+//
+// Both run at M=1. A decode sorts eight pairs and gathers eight rows, which is
+// microseconds -- and it means the routed
 // dataflow has ONE shape rather than a decode shape and a prefill shape that
 // have to be kept agreeing. The batched and unbatched paths differ in exactly
 // one number, `tile_rows`: 1 leaves the sort a pure grouping with no padding
@@ -66,6 +72,10 @@ constant constexpr uint kMaxExperts = 1024;
 ///   row_expert[p]  the expert p reads, for the matvec path
 ///   tile_expert[t] the expert tile t reads, or -1 for a tile past the end
 ///
+/// and, indexed by PAIR rather than by position, the inverse:
+///
+///   inv[i]         the sorted position of pair i, or -1 if it has no expert
+///
 /// `perm` is a permutation of `[0, n)` followed by padding, never a truncation:
 /// every pair the router chose gets a position, because a pair silently dropped
 /// here is an expert contribution silently zeroed later.
@@ -75,6 +85,7 @@ constant constexpr uint kMaxExperts = 1024;
     device int* row_expert      [[buffer(2)]],
     device int* tile_expert     [[buffer(3)]],
     constant MoeRouteParams& p  [[buffer(4)]],
+    device int* inv             [[buffer(5)]],
     uint lid                    [[thread_position_in_threadgroup]],
     uint nthreads               [[threads_per_threadgroup]]) {
     threadgroup atomic_uint counts[kMaxExperts];
@@ -93,6 +104,7 @@ constant constexpr uint kMaxExperts = 1024;
         row_expert[i] = 0;
     }
     for (uint t = lid; t < tiles; t += nthreads) tile_expert[t] = -1;
+    for (uint i = lid; i < p.n; i += nthreads) inv[i] = -1;
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     for (uint i = lid; i < p.n; i += nthreads) {
@@ -131,6 +143,7 @@ constant constexpr uint kMaxExperts = 1024;
         if (at < p.padded) {
             perm[at] = int(i);
             row_expert[at] = e;
+            inv[i] = int(at);
         }
     }
 }
@@ -158,19 +171,40 @@ constant constexpr uint kMaxExperts = 1024;
         sel < 0 ? bfloat(0) : x[(uint(sel) / k) * p.width + gid.x];
 }
 
-/// Undo the sort, into the [rows, k, width] stack the combine step reads.
+/// Sum a token's k expert outputs, weighted by the router's softmax, reading
+/// them where the SORT left them.
 ///
-/// Every live sorted position has a distinct `perm[p]` in `[0, n)`, so this
-/// writes each destination row exactly once and leaves none unwritten -- which
-/// is the reason the sort must be a permutation and not a filter.
-[[kernel]] void moe_route_scatter(
-    const device bfloat* in    [[buffer(0)]],
-    device bfloat* out         [[buffer(1)]],
-    const device int* perm     [[buffer(2)]],
-    constant MoeRouteParams& p [[buffer(3)]],
-    uint2 gid                  [[thread_position_in_grid]]) {
-    if (gid.x >= p.width || gid.y >= p.padded) return;
-    const int sel = perm[gid.y];
-    if (sel < 0) return;
-    out[uint(sel) * p.width + gid.x] = in[uint(gid.y) * p.width + gid.x];
+/// The same arithmetic as `expert_combine`, and deliberately a separate kernel
+/// rather than that one taught an optional index: gpt-oss does not sort, so
+/// giving it a buffer it must bind and never reads would be the bias slot
+/// problem again.
+///
+/// A slot whose pair never got a position contributes zero. That cannot happen
+/// for a routing the geometry accepted -- every id is in range and every pair
+/// is placed -- but reading `y` at -1 if it ever did would be a wild load, and
+/// the whole reason the sort is a permutation rather than a filter is that a
+/// silently dropped expert is a silently wrong answer.
+struct ExpertCombineParams {
+    uint width;
+    uint experts_per_token;
+};
+
+[[kernel]] void moe_combine_sorted(
+    const device bfloat* y              [[buffer(0)]],
+    const device bfloat* expert_weights [[buffer(1)]],
+    device bfloat* out                  [[buffer(2)]],
+    constant ExpertCombineParams& p     [[buffer(3)]],
+    const device int* inv               [[buffer(4)]],
+    uint2 gid                           [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  if (c >= p.width) return;
+  const uint row = gid.y;
+  const uint k = p.experts_per_token;
+  float acc = 0;
+  for (uint e = 0; e < k; ++e) {
+    const int at = inv[row * k + e];
+    if (at < 0) continue;
+    acc += float(expert_weights[row * k + e]) * float(y[uint(at) * p.width + c]);
+  }
+  out[row * p.width + c] = static_cast<bfloat>(acc);
 }

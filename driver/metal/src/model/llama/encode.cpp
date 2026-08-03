@@ -92,7 +92,6 @@ Kernel shared_kind(Kind k, const LlamaGeometry& g) {
         // point -- the reordering moves rows and indices, not parameters.
         case Kind::ExpertSort:      return Kernel::LlMoeSort;
         case Kind::ExpertGather:    return Kernel::LlMoeGather;
-        case Kind::ExpertScatter:   return Kernel::LlMoeScatter;
     }
     return Kernel::Rms;
 }
@@ -133,8 +132,7 @@ Kernel pso_kind(Kind k) {
         // meaning "nothing claimed this kind".
         case Kind::ExpertSort:    return Kernel::LlMoeSort;
         case Kind::ExpertGather:  return Kernel::LlMoeGather;
-        case Kind::ExpertScatter: return Kernel::LlMoeScatter;
-        case Kind::ExpertCombine: return Kernel::GoExpertCombine;
+        case Kind::ExpertCombine: return Kernel::LlMoeCombine;
         case Kind::EmbedGather: return Kernel::EmbedGather;
         case Kind::KvAppend:    return Kernel::KvAppend;
         case Kind::Sdpa:        return Kernel::Sdpa;
@@ -196,10 +194,9 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
             break;
         case Kind::RowGather:     return ll.row_gather;
         case Kind::RouterTopK:    return ll.router_topk;
-        case Kind::ExpertCombine: return ll.expert_combine;
         case Kind::ExpertSort:    return ll.moe_sort;
         case Kind::ExpertGather:  return ll.moe_gather;
-        case Kind::ExpertScatter: return ll.moe_scatter;
+        case Kind::ExpertCombine: return ll.moe_combine;
         case Kind::ExpertGate:
         case Kind::ExpertUp:
         case Kind::ExpertDown: {
@@ -462,12 +459,6 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
             moe_route_sort_dispatch(g.n_experts, grid, tg);
             return;
         case Kind::ExpertGather:
-            moe_route_rows_dispatch(g.hidden, llama_moe_sorted_rows(g, R), grid, tg);
-            return;
-        case Kind::ExpertScatter:
-            // Over the SORTED rows, not the slot stack: the padding rows are
-            // the ones that must be skipped, and only the sorted side knows
-            // which they are.
             moe_route_rows_dispatch(g.hidden, llama_moe_sorted_rows(g, R), grid, tg);
             return;
         case Kind::ExpertSiluMul:
