@@ -248,10 +248,21 @@ inline pie_loader::Node mxfp4_values(ModelContract& out, pie_loader::Node blocks
 /// user sees and "which driver said no" is the first thing they need.
 inline std::optional<std::string> routed_expert_member(std::string_view raw_name,
                                                        std::string_view member,
-                                                       std::string_view schema) {
+                                                       std::string_view schema,
+                                                       bool has_shared_expert = false) {
     constexpr std::string_view kSwitch = "mlp.switch_mlp.";
     if (member.rfind(kSwitch, 0) == 0) {
         return "mlp.experts." + std::string(member.substr(kSwitch.size()));
+    }
+    // A family that DISPATCHES a shared expert takes its two blocks through
+    // unchanged -- `mlp.shared_expert.*` and `mlp.shared_expert_gate.*` are
+    // already the names `weights_for_kind` asks for. The plural spelling is
+    // refused either way: `mlp.shared_experts.` is DeepSeek's, where several
+    // shared experts are stacked, and this is one dense FFN.
+    if (has_shared_expert) {
+        for (std::string_view ok : {"mlp.shared_expert.", "mlp.shared_expert_gate."}) {
+            if (member.rfind(ok, 0) == 0) return std::string(member);
+        }
     }
     for (std::string_view shared : {"mlp.shared_expert.", "mlp.shared_expert_gate.",
                                     "mlp.shared_experts."}) {

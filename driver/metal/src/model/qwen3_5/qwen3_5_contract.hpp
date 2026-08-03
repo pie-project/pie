@@ -138,7 +138,8 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
     // pass-through below answered for it, which meant a Qwen3-Next MoE
     // checkpoint's experts were declared under names no dispatch reads: the
     // driver loaded a mixture and ran nothing with it.
-    if (auto renamed = routed_expert_member(raw_name, member, "Qwen3.5")) {
+    if (auto renamed = routed_expert_member(raw_name, member, "Qwen3.5",
+                                            /*has_shared_expert=*/true)) {
         return "layers." + std::string(layer) + "." + *renamed;
     }
     return "layers." + std::string(layer) + "." + std::string(member);

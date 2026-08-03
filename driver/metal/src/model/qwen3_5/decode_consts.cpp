@@ -80,6 +80,13 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
         case Kernel::LlExpertGate: return {H, g.moe_intermediate};
         case Kernel::LlExpertUp:   return {H, g.moe_intermediate};
         case Kernel::LlExpertDown: return {g.moe_intermediate, H};
+        // The shared expert: an ordinary dense FFN, so ordinary dense shapes.
+        // The gate is the odd one -- `hidden -> 1`, one logit a token -- and it
+        // is a matvec only in the sense that everything with a K and an N is.
+        case Kernel::LlSharedGate: return {H, g.shared_intermediate};
+        case Kernel::LlSharedUp:   return {H, g.shared_intermediate};
+        case Kernel::LlSharedDown: return {g.shared_intermediate, H};
+        case Kernel::LlSharedGateProj: return {H, 1};
         default:                return {0, 0};
     }
 }
@@ -112,15 +119,15 @@ int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     for (const auto& d : dag) {
         const int ord = d.ordinal;
         switch (d.kind) {
-            case Kernel::SiluMul:
+            case Kernel::LlExpertSiluMul:
                 // The routed stack's gate and up are `moe_intermediate` wide
                 // and there is one row per sorted (token, slot) pair, padding
                 // included -- the padding rows are real rows of the buffers
-                // this reads. A dense model has neither, and the two never
-                // coexist: a model is one shape or the other.
+                // this reads. This is the one SwiGLU whose extent moves with
+                // the batch; the shared expert's does not, which is why only
+                // this one is here.
                 bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
-                                g.is_moe() ? sorted * g.moe_intermediate : g.intermediate,
-                                &count);
+                                sorted * g.moe_intermediate, &count);
                 break;
 
             case Kernel::LlMoeSort:
@@ -328,6 +335,13 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                 g.n_q_heads * g.head_dim, &count);
                 break;
             case Kernel::SiluMul:
+                // Dense, the FFN's own SwiGLU; routed, the SHARED expert's --
+                // one row per token either way, so the width does not move
+                // with the batch and this stays out of `bind_token_consts`.
+                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
+                                g.is_moe() ? g.shared_intermediate : g.intermediate, &count);
+                break;
+            case Kernel::LlExpertSiluMul:
             case Kernel::LlMoeSort:
             case Kernel::LlMoeGather:
                 // Bound above, by `bind_token_consts`: these are the only
@@ -349,6 +363,12 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     ctx, ord, (uint8_t)bind::GoExpertCombine::Params,
                     ExpertCombineParams{(uint32_t)g.hidden, (uint32_t)g.experts_per_token},
                     &count);
+                break;
+            case Kernel::LlSharedCombine:
+                // The gate is one value per ROW, so this needs the row WIDTH
+                // and not the element count -- the kernel indexes `gate[row]`.
+                bind_const<uint32_t>(ctx, ord, (uint8_t)bind::SharedCombine::Width,
+                                     (uint32_t)g.hidden, &count);
                 break;
 
             // Both residual adds. `LayerOut` is the fused one and `Residual`

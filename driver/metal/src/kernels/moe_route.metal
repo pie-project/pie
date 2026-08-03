@@ -242,3 +242,41 @@ struct ExpertCombineParams {
   }
   out[row * p.width + c] = static_cast<bfloat>(acc);
 }
+
+// ── The shared expert ────────────────────────────────────────────────────────
+//
+// Every routed member of this family -- Qwen3-Next-80B, Qwen3.5-35B-A3B,
+// Qwen3.5-122B-A10B -- runs one DENSE FFN beside the routed bank on every
+// token, and adds it to the mixture's output under a learned gate:
+//
+//   y = routed + sigmoid(shared_expert_gate(x)) * shared_expert(x)
+//
+// The FFN half needs nothing new -- it is the same three projections and the
+// same SwiGLU the dense members of this family already run, at
+// `shared_expert_intermediate_size`. Only this last line is new, and it is new
+// for one reason: the gate is ONE number per token, broadcast across the whole
+// hidden row. `attn_gate` looks like it would serve and does not; its gate is
+// full width, so it would read `hidden` gate values where there is one.
+//
+// Fused rather than a multiply and an add, because the alternative writes the
+// scaled shared output to a full-width scratch buffer that the very next
+// dispatch consumes and nothing else ever reads.
+//
+// The sigmoid is computed in float from a bf16 logit. That matters at the
+// tails: bf16 has eight mantissa bits, so rounding the logit BEFORE the
+// nonlinearity moves the gate by up to a few parts in a thousand, on a term
+// that is added to every token's residual in every routed layer.
+[[kernel]] void shared_expert_combine(
+    const device bfloat* routed [[buffer(0)]],   // [rows, width]
+    const device bfloat* shared [[buffer(1)]],   // [rows, width]
+    const device bfloat* gate   [[buffer(2)]],   // [rows, 1]
+    device bfloat* out          [[buffer(3)]],   // [rows, width] (may alias routed)
+    constant uint& width        [[buffer(4)]],
+    uint2 gid                   [[thread_position_in_grid]]) {
+  const uint c = gid.x;
+  if (c >= width) return;
+  const uint row = gid.y;
+  const float g = 1.0f / (1.0f + metal::exp(-float(gate[row])));
+  const uint at = row * width + c;
+  out[at] = static_cast<bfloat>(float(routed[at]) + g * float(shared[at]));
+}

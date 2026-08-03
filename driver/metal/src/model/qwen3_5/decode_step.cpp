@@ -142,11 +142,37 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
               emit(Kernel::LlExpertUp, L, l); }
             { LD l; shared_kernels::moe_route_rows_dispatch(g.moe_intermediate, sorted,
                                                             l.grid, l.tg);
-              emit(Kernel::SiluMul, L, l); }
+              emit(Kernel::LlExpertSiluMul, L, l); }
             { LD l; shared_kernels::routed_qmv_dispatch(g.hidden, 1, l.grid, l.tg, sorted);
               emit(Kernel::LlExpertDown, L, l); }
             { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
               emit(Kernel::LlMoeCombine, L, l); }
+            // The shared expert. A dense FFN over the SAME `FfnRms` output the
+            // router read, at its own width, added to the mixture under a gate
+            // that is one number per token.
+            //
+            // It is emitted after the mixture rather than before only because
+            // the combine has to see both; nothing here depends on the routed
+            // half, and `parallel_groups` says so, so the two halves overlap on
+            // the GPU. Keeping them textually apart would have hidden that they
+            // are one FFN in two pieces.
+            if (g.has_shared_expert()) {
+                emit(Kernel::LlSharedGate, L, qmv(g.shared_intermediate));
+                emit(Kernel::LlSharedUp,   L, qmv(g.shared_intermediate));
+                { LD l; silu_mul_dispatch(g.shared_intermediate, l.grid, l.tg);
+                  emit(Kernel::SiluMul, L, l); }
+                emit(Kernel::LlSharedDown, L, qmv(g.hidden));
+                // The gate is emitted LAST of the five, immediately before its
+                // only reader. It reads `normed`, which is live the whole way
+                // through, so it could have gone first -- and going first cost
+                // a ninth scratch colour on a pool of eight, because a value
+                // written five dispatches before it is read is live across all
+                // five. It is `hidden -> 1`: the cheapest dispatch in the
+                // layer, and the one with the least to gain from overlapping.
+                emit(Kernel::LlSharedGateProj, L, qmv(1));
+                { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
+                  emit(Kernel::LlSharedCombine, L, l); }
+            }
         } else {
             emit(Kernel::QmvGate,  L, qmv(g.intermediate));
             emit(Kernel::QmvUp,    L, qmv(g.intermediate));

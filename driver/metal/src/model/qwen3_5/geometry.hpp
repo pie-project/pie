@@ -34,6 +34,11 @@ struct DecodeGeometry {
     int n_experts = 0;
     int experts_per_token = 0;
     int moe_intermediate = 0;
+    /// The dense FFN every routed member runs BESIDE the bank, on every token,
+    /// added to the mixture under a one-scalar-per-token sigmoid gate. Zero
+    /// only for a routing that has none -- and no member of this family
+    /// actually ships that way, which is why it is not optional in practice.
+    int shared_intermediate = 0;
 
     int q_group = 64;
     int q_bits = 4;
@@ -66,6 +71,7 @@ struct DecodeGeometry {
     }
 
     bool is_moe() const { return n_experts > 0 && experts_per_token > 0; }
+    bool has_shared_expert() const { return is_moe() && shared_intermediate > 0; }
     /// The width one expert's gate/up produce, or the dense width.
     int ffn_width() const { return is_moe() ? moe_intermediate : intermediate; }
 };

@@ -113,15 +113,13 @@ inline bool geometry_from_facts(const Facts& f, DecodeGeometry& out, std::string
             return refuse("norm_topk_prob is false; the router normalizes over the "
                           "selected experts only");
         }
-        // A shared expert runs beside the routed bank on every token. This
-        // driver has no such block, and running the mixture without it is the
-        // checkpoint's weights producing a different model -- fluent, wrong,
-        // and invisible. The llama schema refuses the tensors; this refuses
-        // the config that implies them, so the diagnosis arrives before the
-        // load rather than during it.
-        if (f.shared_expert_intermediate > 0) {
-            return refuse("shared_expert_intermediate_size is set and this driver has no "
-                          "shared expert; the routed bank alone is a different model");
+        // A shared expert runs beside the routed bank on every token. Every
+        // released routed member of this family has one, so it is carried
+        // rather than refused. A shared width that is not a multiple of the
+        // quantization group is still refused, for the same reason the routed
+        // width is: the packed weights would not line up.
+        if (f.shared_expert_intermediate < 0) {
+            return refuse("shared_expert_intermediate_size is negative");
         }
         if (f.decoder_sparse_step != 1) {
             return refuse("decoder_sparse_step " + std::to_string(f.decoder_sparse_step) +
@@ -134,6 +132,7 @@ inline bool geometry_from_facts(const Facts& f, DecodeGeometry& out, std::string
         out.n_experts = f.n_experts;
         out.experts_per_token = f.experts_per_token;
         out.moe_intermediate = f.moe_intermediate;
+        out.shared_intermediate = f.shared_expert_intermediate;
     } else if (f.intermediate <= 0) {
         return refuse("a dense FFN needs intermediate_size");
     }

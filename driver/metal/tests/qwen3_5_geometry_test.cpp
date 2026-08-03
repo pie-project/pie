@@ -180,6 +180,10 @@ Facts qwen3_next_routed() {
     f.n_experts = 512;
     f.experts_per_token = 10;
     f.moe_intermediate = 512;
+    // Qwen3-Next-80B really ships this, and so does every other routed member
+    // of the family. A routed fixture without one would be a model no release
+    // is, and the whole point of these fixtures is that they are the configs.
+    f.shared_expert_intermediate = 512;
     return f;
 }
 
@@ -229,16 +233,26 @@ void check_the_routed_ffn_is_bounded_by_what_the_kernels_do() {
         expect(contains(refusal(f), "norm_topk_prob"),
                "weights normalized over all experts are refused, not approximated");
     }
-    // A shared expert runs beside the routed bank on every token, and this
-    // driver has no such block. Running the mixture without it is the
-    // checkpoint's weights producing a different model: fluent, wrong, and
-    // invisible. Refused from the CONFIG so the diagnosis arrives before the
-    // load rather than as a missing tensor during it.
+    // A shared expert runs beside the routed bank on every token. It is CARRIED
+    // now, not refused -- but it has to arrive in the geometry, because a
+    // shared width that silently defaulted to zero would drop the block and run
+    // the routed mixture alone, which is the failure the refusal used to
+    // prevent.
     {
+        DecodeGeometry g{};
+        std::string err;
+        expect(geometry_from_facts(routed(), g, &err), "a shared expert is accepted: " + err);
+        expect(g.shared_intermediate == 512 && g.has_shared_expert(),
+               "and its width reaches the geometry");
+    }
+    {
+        // A routing that genuinely has none is still a routing.
         Facts f = routed();
-        f.shared_expert_intermediate = 512;
-        expect(contains(refusal(f), "shared expert"),
-               "a config implying a shared expert is refused");
+        f.shared_expert_intermediate = 0;
+        DecodeGeometry g{};
+        std::string err;
+        expect(geometry_from_facts(f, g, &err) && g.is_moe() && !g.has_shared_expert(),
+               "a mixture with no shared expert is still accepted");
     }
     // Routing only some layers is a third FFN shape in the same stack, and
     // this family's DAG emits one shape per model.
@@ -302,12 +316,61 @@ void check_the_routed_ffn_replaces_the_dense_one_and_nothing_else() {
         expect(count(d_dag, k) == dense.n_layers, "a dense stack keeps its own projections");
         expect(count(m_dag, k) == 0, "a routed stack drops the dense projections");
     }
-    // `SiluMul` is shared: one per layer either way, over a different extent.
-    // It is the one kernel the two shapes have in common, and the reason the
-    // routed PSO table does not compile a second copy of it.
+    // `SiluMul` is shared: one per layer either way -- dense it is the FFN's,
+    // routed it is the SHARED expert's, and both are one row per token. The
+    // mixture's own SwiGLU is a different kind precisely because it is a
+    // different extent, and a routed layer runs BOTH.
     expect(count(d_dag, Kernel::SiluMul) == dense.n_layers &&
                count(m_dag, Kernel::SiluMul) == moe.n_layers,
-           "both shapes run one SiluMul per layer");
+           "both shapes run one dense-shaped SiluMul per layer");
+    expect(count(d_dag, Kernel::LlExpertSiluMul) == 0 &&
+               count(m_dag, Kernel::LlExpertSiluMul) == moe.n_layers,
+           "only the routed shape runs a SwiGLU over the sorted stack");
+
+    // The shared expert. Five dispatches beside the mixture, every layer, on
+    // every token -- and none of them in a dense stack, which has no such
+    // block because its whole FFN is the dense one.
+    for (Kernel k : {Kernel::LlSharedGate, Kernel::LlSharedUp, Kernel::LlSharedDown,
+                     Kernel::LlSharedGateProj, Kernel::LlSharedCombine}) {
+        expect(count(d_dag, k) == 0, "a dense stack dispatches no shared expert");
+        expect(count(m_dag, k) == moe.n_layers, "a routed stack runs one every layer");
+    }
+    // And it is dropped when the config says there is none -- otherwise the
+    // load would demand `mlp.shared_expert.*` from a checkpoint without them.
+    {
+        Facts f = qwen3_next_routed();
+        f.shared_expert_intermediate = 0;
+        DecodeGeometry bare{};
+        std::string e2;
+        expect(geometry_from_facts(f, bare, &e2), "a bare mixture builds: " + e2);
+        const auto b_dag = pie::metal::build_decode_dag(bare);
+        expect(count(b_dag, Kernel::LlSharedCombine) == 0 &&
+                   count(b_dag, Kernel::SiluMul) == 0,
+               "a mixture with no shared expert emits neither it nor its SwiGLU");
+        expect(count(b_dag, Kernel::LlExpertSiluMul) == bare.n_layers,
+               "but still runs the mixture's own");
+    }
+
+    // The shared expert's shapes, which are the thing a silent default would
+    // get wrong. Its gate produces ONE logit a token -- bound as `hidden -> 1`,
+    // not as a width -- and its projections are its own width, not the routed
+    // one, which happens to be the same number in this fixture and is not in
+    // Qwen3.5-122B-A10B.
+    expect(pie::metal::qmv_kn(Kernel::LlSharedGateProj, moe).N == 1,
+           "the shared expert's gate is one number a token");
+    // Asked at a width that is NOT the routed one. Every released member of
+    // this family happens to set the two equal, so the fixture cannot tell
+    // `shared_intermediate` from `moe_intermediate` -- and a projection wired
+    // to the wrong one would pass on all four checkpoints and then read past
+    // the end of the first one that separates them.
+    DecodeGeometry skew = moe;
+    skew.shared_intermediate = 3072;
+    expect(pie::metal::qmv_kn(Kernel::LlSharedGate, skew).N == 3072 &&
+               pie::metal::qmv_kn(Kernel::LlSharedUp, skew).N == 3072 &&
+               pie::metal::qmv_kn(Kernel::LlSharedDown, skew).K == 3072,
+           "and its SwiGLU runs at the SHARED width, not the routed one");
+    expect(pie::metal::qmv_kn(Kernel::LlSharedDown, skew).N == skew.hidden,
+           "landing back in the hidden it will be added to");
 
     // Everything above the FFN is untouched. Attention is where this family
     // differs from every other one, and the mixture is not allowed to perturb

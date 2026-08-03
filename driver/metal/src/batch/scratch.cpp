@@ -62,6 +62,9 @@ constexpr uint8_t SortIds = 0, SortPerm = llama::kMoeSortPermBind, SortRowExpert
                   SortTileExpert = 3, SortInv = 5;
 constexpr uint8_t RowsIn = 0, RowsOut = 1, RowsPerm = 2;
 constexpr uint8_t CombineY = 0, CombineWeights = 1, CombineOut = 2, CombineInv = 4;
+// bind::SharedCombine -- the routed output, the shared expert's, its
+// one-per-row gate, and where the sum goes.
+constexpr uint8_t ShRouted = 0, ShShared = 1, ShGate = 2, ShOut = 3;
 }  // namespace bi
 
 }  // namespace
@@ -87,6 +90,12 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
     // written once and still read five dispatches later, with three matvecs in
     // between allocating freely.
     int router_logits = -1, expert_ids = -1, expert_weights = -1;
+    // The shared expert's two values that outlive a single dispatch. Its
+    // gate/up/silu deliberately reuse `gp`/`up`/`hh`: by the time it runs, the
+    // mixture's expert projections have consumed theirs, and it IS the same
+    // three-stage SwiGLU dataflow. Giving it private handles would have said
+    // the two are different shapes, which they are not.
+    int shared_gate = -1, shared_out = -1;
     int perm = -1, row_expert = -1, tile_expert = -1, inv = -1;
     int sorted_x = -1, sorted_out = -1;
 
@@ -226,6 +235,7 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
                 up = fresh(); rd(o, bi::QmvX, normed); wr(o, bi::QmvOut, up);
                 break;
             case Kernel::SiluMul:
+            case Kernel::LlExpertSiluMul:
                 hh = fresh(); rd(o, bi::SiluGate, gp); rd(o, bi::SiluUp, up); wr(o, bi::SiluOut, hh);
                 break;
             case Kernel::QmvDown:
@@ -299,6 +309,34 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
                 rd(o, bi::CombineY, sorted_out); rd(o, bi::CombineWeights, expert_weights);
                 rd(o, bi::CombineInv, inv); wr(o, bi::CombineOut, dn);
                 break;
+
+            // ── the shared expert ──
+            // A dense SwiGLU off the same `normed` the router read, added to
+            // the mixture under a gate that is ONE number per token. The three
+            // projections read `normed` and not `sorted_x`: the shared expert
+            // sees every token whole, which is the whole point of it.
+            case Kernel::LlSharedGateProj:
+                shared_gate = fresh();
+                rd(o, bi::QmvX, normed); wr(o, bi::QmvOut, shared_gate);
+                break;
+            case Kernel::LlSharedGate:
+                gp = fresh(); rd(o, bi::QmvX, normed); wr(o, bi::QmvOut, gp);
+                break;
+            case Kernel::LlSharedUp:
+                up = fresh(); rd(o, bi::QmvX, normed); wr(o, bi::QmvOut, up);
+                break;
+            case Kernel::LlSharedDown:
+                shared_out = fresh(); rd(o, bi::QmvX, hh); wr(o, bi::QmvOut, shared_out);
+                break;
+            case Kernel::LlSharedCombine: {
+                // Takes `dn`'s place, so the layer's residual add below still
+                // reads one value and does not know a mixture happened.
+                int nd = fresh();
+                rd(o, bi::ShRouted, dn); rd(o, bi::ShShared, shared_out);
+                rd(o, bi::ShGate, shared_gate); wr(o, bi::ShOut, nd);
+                dn = nd;
+                break;
+            }
 
             // tail lm_head: reads normed_final from scratch, writes logits to IO (not scratch).
             case Kernel::QmvLmHead:

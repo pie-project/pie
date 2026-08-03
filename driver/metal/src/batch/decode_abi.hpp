@@ -60,15 +60,22 @@ enum class Region : uint8_t {
 // Scratch ping-pong pool size (beta, from WAR/WAW chain).
 //
 // This is the CAP, not the allocation: the executor commits `colors_used`
-// slots, which is six for a dense stack and eight for a routed one. The
-// mixture is what set the number -- its router writes two values and its sort
-// writes four, all of them read after three matvecs have allocated freely in
-// between, so six of the eight live at once where a dense FFN has three.
+// slots, which is six for a dense stack, eight for a routed one, and nine for
+// a routed one with a shared expert. The mixture is what set the number -- its
+// router writes two values and its sort writes four, all of them read after
+// three matvecs have allocated freely in between, so six of the eight live at
+// once where a dense FFN has three. The shared expert added the ninth without
+// adding a sixth of its own: it reads the pre-FFN norm, which the mixture used
+// to finish with at the gather, so that ONE value is now live across the
+// mixture's whole peak. Emitting the shared block earlier does not help --
+// then its own two outputs are what span the peak instead, which is worse.
 //
 // A schedule needing more than this has nowhere to spill: `bind_scratch` skips
 // any buffer id past the end of the pool, so the overflow binds to nothing and
-// every dispatch reading it gets whatever was last there.
-inline constexpr int SCRATCH_POOL = 8;
+// every dispatch reading it gets whatever was last there. The cap is deliberately
+// the current peak and not a round number above it, so the next value that does
+// not fit says so.
+inline constexpr int SCRATCH_POOL = 9;
 
 // ── IO region slots (I1: all GPU-read buffers, never setBytes) ───────────────
 // M=1: scalars are written at [0] only (the sealed single-stream path is unchanged).
@@ -417,6 +424,12 @@ enum class MoeRouteRows : uint8_t { In = 0, Out = 1, Perm = 2, Params = 3 };
 // moe_combine_sorted: `GoExpertCombine` plus the sort's inverse permutation.
 enum class MoeCombineSorted : uint8_t { Y = 0, Weights = 1, Out = 2, Params = 3, Inv = 4 };
 
+// shared_expert_combine: routed + sigmoid(gate) * shared. The gate is one
+// value per ROW, not per column, which is why this is not `AttnGate`.
+enum class SharedCombine : uint8_t {
+    Routed = 0, Shared = 1, Gate = 2, Out = 3, Width = 4
+};
+
 // router_topk: top-k over the router's logits, then a softmax over the k that
 // survive. Emits both halves of the routing decision.
 enum class GoRouterTopK : uint8_t { Logits = 0, Ids = 1, Weights = 2, Params = 3 };
@@ -548,7 +561,27 @@ enum class Kernel : uint8_t {
     // fall-through value and hide a real gap behind it.
     LlMoeSort,
     LlMoeGather,
-    LlMoeCombine
+    LlMoeCombine,
+    // ── The shared expert, which every routed member of the Qwen3.5 family
+    // runs beside the routed bank. APPEND ONLY, same rule as above.
+    //
+    // The three projections and the SwiGLU between them are an ordinary dense
+    // FFN, and they would have reused `QmvGate`/`QmvUp`/`QmvDown` -- except
+    // that a kind IS a weight name here (`weights_for_kind` switches on it and
+    // nothing else), and these are `mlp.shared_expert.*`. So the projections
+    // get names and the ACTIVATION kinds do not: `SiluMul` still means the
+    // dense one, because in a routed layer the only dense SwiGLU there is is
+    // this one.
+    LlSharedGate,        // mlp.shared_expert.gate_proj
+    LlSharedUp,          // mlp.shared_expert.up_proj
+    LlSharedDown,        // mlp.shared_expert.down_proj
+    LlSharedGateProj,    // mlp.shared_expert_gate -- hidden -> ONE logit a token
+    LlSharedCombine,     // routed + sigmoid(gate) * shared
+    // The mixture's own SwiGLU, over the SORTED stack. Split from `SiluMul`
+    // when the shared expert arrived: a routed layer now runs both, at
+    // different widths and over different buffers, and one kind cannot answer
+    // for two extents.
+    LlExpertSiluMul
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

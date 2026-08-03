@@ -91,9 +91,12 @@ bool load_decode_psos(RawMetalContext& ctx,
         // compiling them anyway would let an unrelated shader error fail a load
         // that would otherwise have worked.
         //
-        // `SiluMul` is deliberately absent. The routed path runs it over the
-        // SORTED rows, which is the same kernel over a different extent, so the
-        // dense entry above already serves it.
+        // `SiluMul` is deliberately absent. Routed, it is the SHARED expert's
+        // SwiGLU -- the same kernel over a different extent -- so the dense
+        // entry above already serves it. The mixture's own SwiGLU, over the
+        // sorted stack, is `LlExpertSiluMul` and is served by that same entry
+        // for the same reason: what differs is the launch shape, not the code.
+        want("silu_mul.metal", "silu_mul_bfloat16", {Kernel::LlExpertSiluMul});
         // The routing logits are an ordinary dense matvec -- one weight, one
         // output row per expert, no routing to speak of yet. It is loaded HERE
         // and not alongside the dense projections above because a kind in that
@@ -107,6 +110,14 @@ bool load_decode_psos(RawMetalContext& ctx,
         want("moe_route.metal", "moe_combine_sorted", {Kernel::LlMoeCombine});
         want("quantized_qmv.metal", "affine_qmv_routed_bfloat16_gs_64_b_4",
              {Kernel::LlExpertGate, Kernel::LlExpertUp, Kernel::LlExpertDown});
+        // The shared expert. Dense projections on the dense kernel -- they are
+        // separate KINDS only because a kind is a weight name here, and these
+        // read `mlp.shared_expert.*`. The gate projection is the same kernel
+        // producing a single output row.
+        want("quantized_qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4",
+             {Kernel::LlSharedGate, Kernel::LlSharedUp, Kernel::LlSharedDown,
+              Kernel::LlSharedGateProj});
+        want("moe_route.metal", "shared_expert_combine", {Kernel::LlSharedCombine});
     }
     if (with_argmax) {
         // Device argmax + EOS-compare (I3 sampling substrate). bf16 logits = lm_head out.

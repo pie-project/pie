@@ -1264,6 +1264,30 @@ std::vector<WeightBind> weight_binds(
         push_quant(weights, prefix + "mlp.experts.down_proj");
         break;
 
+    // ── The Qwen3.5 mixture's shared expert ──
+    // A dense FFN under its own names. These are separate kinds from
+    // `QmvGate`/`QmvUp`/`QmvDown` for exactly this switch's sake: a kind is a
+    // weight name, and reusing the dense kinds would have made the contract
+    // rename `mlp.shared_expert.gate_proj` to `mlp.gate_proj` -- true of the
+    // shape, false of the model, and unreadable in any dump.
+    case Kernel::LlSharedGate:
+        push_quant(weights, prefix + "mlp.shared_expert.gate_proj");
+        break;
+    case Kernel::LlSharedUp:
+        push_quant(weights, prefix + "mlp.shared_expert.up_proj");
+        break;
+    case Kernel::LlSharedDown:
+        push_quant(weights, prefix + "mlp.shared_expert.down_proj");
+        break;
+    case Kernel::LlSharedGateProj:
+        push_quant(weights, prefix + "mlp.shared_expert_gate");
+        break;
+    // Weightless, like the mixture's own combine: it reads two activations and
+    // a gate, all produced this layer.
+    case Kernel::LlSharedCombine:
+    case Kernel::LlExpertSiluMul:
+        break;
+
     case Kernel::G4PleResidualScaled:
         weights.push_back(
             {(std::uint8_t)bind::RmsResidual::W, prefix + "post_per_layer_input_norm.weight"});

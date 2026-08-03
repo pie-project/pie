@@ -294,19 +294,30 @@ void test_every_name_is_mapped_or_refused() {
     check(refused("model.embed_tokens.weight"), "an unmapped name is an error, not a pass-through");
     check(refused("model.language_model.layers.x.weight"), "a non-numeric layer index is an error");
     check(refused("model.language_model.layers.7"), "a layer tensor with no suffix is an error");
-    // Two mixtures this driver cannot run, refused at load with the tensor's
-    // name on them rather than loaded and ignored. A stock HF checkpoint ships
-    // the experts unstacked, and binding those would need a load-time gather
-    // this driver does not do -- guessing gives every token expert 0, which is
-    // fluent. Qwen3-Next also ships a SHARED expert beside the routed mixture,
-    // and nothing in this driver computes one; skipping it runs the routed
-    // mixture alone, which is also fluent. Both were passing through before.
+    // A mixture this driver cannot run, refused at load with the tensor's name
+    // on it rather than loaded and ignored: a stock HF checkpoint ships the
+    // experts unstacked, and binding those would need a load-time gather this
+    // driver does not do -- guessing gives every token expert 0, which is
+    // fluent.
     check(refused("model.language_model.layers.3.mlp.experts.0.gate_proj.weight"),
           "an unstacked expert bank is refused, not silently bound to expert 0");
-    check(refused("model.language_model.layers.3.mlp.shared_expert.gate_proj.weight"),
-          "a shared expert is refused, not loaded and never read");
-    check(refused("model.language_model.layers.3.mlp.shared_expert_gate.weight"),
-          "the shared expert's gate is refused with it");
+    // The shared expert, which this driver now DISPATCHES. Its four tensors
+    // pass through under their own names -- `weights_for_kind` asks for exactly
+    // these -- and the assertion is that they are mapped and not merely
+    // tolerated, because a name that reaches the heap under a spelling no
+    // dispatch reads is the failure the refusal used to prevent.
+    for (const char* n : {"mlp.shared_expert.gate_proj.weight",
+                          "mlp.shared_expert.up_proj.scales",
+                          "mlp.shared_expert.down_proj.biases",
+                          "mlp.shared_expert_gate.weight"}) {
+        mapped(std::string("model.language_model.layers.3.") + n,
+               std::string("layers.3.") + n);
+    }
+    // The PLURAL spelling is still refused. `mlp.shared_experts.` is DeepSeek's,
+    // where several shared experts are stacked on an axis this block has no
+    // index for; taking the first would be one expert of several, silently.
+    check(refused("model.language_model.layers.3.mlp.shared_experts.gate_proj.weight"),
+          "a STACK of shared experts is still refused");
 }
 
 void test_the_schema_owns_its_model_types() {

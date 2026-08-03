@@ -54,6 +54,11 @@ inline int scratch_widest_elems(const DecodeGeometry& g) {
         // mixture is narrower than everything above -- but it is a real
         // activation and the bound must not depend on that staying true.
         widest = widest > g.n_experts ? widest : g.n_experts;
+        // The shared expert's SwiGLU stack. One row per token like any dense
+        // activation, so it is almost certainly narrower than the sorted stack
+        // above -- but it is a real activation and the bound must not rest on
+        // a checkpoint's choice of widths.
+        widest = widest > g.shared_intermediate ? widest : g.shared_intermediate;
     }
     return widest;
 }

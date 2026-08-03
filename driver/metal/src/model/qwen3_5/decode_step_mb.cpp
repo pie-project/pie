@@ -31,7 +31,8 @@ int qmv_out_size(Kernel k, const DecodeGeometry& g) {
         case Kernel::QmvInZ: return g.gdn_v_total;
         case Kernel::QmvOut:
         case Kernel::QmvO:
-        case Kernel::QmvDown: return g.hidden;
+        case Kernel::QmvDown:
+        case Kernel::LlSharedDown: return g.hidden;
         case Kernel::QmvQ: return 2 * g.n_q_heads * g.head_dim;
         case Kernel::QmvK:
         case Kernel::QmvV: return g.n_kv_heads * g.head_dim;
@@ -45,6 +46,11 @@ int qmv_out_size(Kernel k, const DecodeGeometry& g) {
         // the token count instead, computing the first `n` sorted rows and
         // leaving the rest of the stack holding the previous layer's output.
         case Kernel::LlRouter: return g.n_experts;
+        // The shared expert is dense in every sense -- it runs over the tokens,
+        // one row each, so it answers here like any other projection.
+        case Kernel::LlSharedGate:
+        case Kernel::LlSharedUp: return g.shared_intermediate;
+        case Kernel::LlSharedGateProj: return 1;
         default: return 0;
     }
 }
@@ -130,12 +136,17 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         case Kernel::LayerOut:
             elementwise_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
         case Kernel::SiluMul:
-            // Routed, the slot axis is gone -- a sorted row IS a slot -- so
-            // this is the same elementwise shape over a taller batch.
-            if (g.is_moe())
-                elementwise_mb_dispatch(g.moe_intermediate, moe_sorted_rows(g, n), d.grid, d.tg);
-            else
-                elementwise_mb_dispatch(g.intermediate, n, d.grid, d.tg);
+            // Routed, the dense SwiGLU that remains is the SHARED expert's --
+            // one row a token, at its own width. The mixture's own SwiGLU is
+            // `LlExpertSiluMul` below, over the sorted stack, and the two were
+            // split precisely because this line cannot say both.
+            elementwise_mb_dispatch(g.is_moe() ? g.shared_intermediate : g.intermediate,
+                                    n, d.grid, d.tg);
+            break;
+        case Kernel::LlExpertSiluMul:
+            // The slot axis is gone -- a sorted row IS a slot -- so this is the
+            // same elementwise shape over a taller batch.
+            elementwise_mb_dispatch(g.moe_intermediate, moe_sorted_rows(g, n), d.grid, d.tg);
             break;
 
         // ── the mixture ──
@@ -172,6 +183,8 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
                                                     d.grid, d.tg); break;
         case Kernel::LlMoeCombine:
             shared_kernels::expert_combine_dispatch(g.hidden, d.grid, d.tg, n); break;
+        case Kernel::LlSharedCombine:
+            elementwise_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
 
         default:
             throw std::runtime_error("missing multi-batch launch geometry");
