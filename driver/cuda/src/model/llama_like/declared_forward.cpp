@@ -410,7 +410,11 @@ void llama_like_forward_declared(
     // class — the decode/prefill traces carry it as their HasCustomMask
     // guard arm, so the generated static form serves masked fires too
     // (the mask data crosses as arguments).
-    if (stage_hooks == nullptr && lora == nullptr &&
+    // The static form covers the lora arms too (the emitter constructs
+    // the fire staging and spells the corrections with constant layers);
+    // only hooked fires stay on the interpreter walk — the hook
+    // sideband machinery is the remaining refusal transliteration.
+    if (stage_hooks == nullptr &&
         generated_forward_enabled() &&
         declared.facts_digest == kGeneratedForDigest) {
         (is_pure_decode ? generated_llama_like_decode

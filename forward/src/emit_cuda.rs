@@ -163,6 +163,22 @@ fn emit_class_fn(
     b.line("    }");
     b.line("");
 
+    // A stated lora correction obligates the fire staging: the emitter
+    // saw the op, so the generated file constructs the handle (the
+    // interpreter's lora_state, hoisted here statically).
+    let states_lora = plan.ops.iter().any(|op| {
+        matches!(&op.kind, OpKind::Launch { kernel, .. }
+                 if kernel == "pie_lora_qkv_correction")
+    });
+    if states_lora {
+        b.line("    std::optional<LoraFireStateHandle> lora_state;");
+        b.line("    if (lora != nullptr && lora->usable()) {");
+        b.line("        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,");
+        b.line("                           /*tp=*/1, stream);");
+        b.line("    }");
+        b.line("");
+    }
+
     // A stated Peel obligates the split derivation: the hook-free prefix
     // row count, the interpreter's `fast_rows` binding verbatim (a
     // runtime INPUT of the stated op, not a choice).
@@ -770,13 +786,20 @@ fn emit_launch(
             b.stmt("}");
         }
         "pie_lora_qkv_correction" => {
-            // The lora arm transliterates to a refusal like the hook
-            // machinery: the static form does not carry LoraFireState,
-            // and the dispatch keeps lora fires on the interpreter walk.
-            b.stmt("throw std::runtime_error(");
-            b.stmt("    \"generated forward: lora fire reached the static \"");
-            b.stmt("    \"form (the dispatch gate routes lora to the \"");
-            b.stmt("    \"interpreter walk)\");");
+            // The §5.1 correction, statically: the layer is the op's own
+            // tag (a constant here), the buffers the interpreter's.
+            let layer = op
+                .layer
+                .expect("lora correction carries its layer tag");
+            b.stmt("if (!lora_state) {");
+            b.stmt("    throw std::runtime_error(");
+            b.stmt("        \"generated forward: lora correction stated but no \"");
+            b.stmt("        \"usable lora table (guard/pred drift)\");");
+            b.stmt("}");
+            b.stmt("lora_state->apply(");
+            b.stmt(&format!("    cublas.handle(), {layer}, ws.norm_x.data(),"));
+            b.stmt("    H, Hq, Hk,");
+            b.stmt("    ws.q.data(), ws.v.data(), ws.gate.data());");
         }
         "dispatch_attention_flashinfer_decode_capture"
         | "dispatch_attention_flashinfer_prefill_capture_bf16" => {
