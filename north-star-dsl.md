@@ -753,3 +753,14 @@ S4 board (fallout repair, ordered): hook fires into the union
 safety, Peel mixed fires (device-read row windows), multi-R sweep +
 batteries at width (all deployments × attachment combos ×
 buckets), then default-on.
+
+S4 batteries, first tier (2026-08-03): the union holds at WIDTH.
+- Multi-R: 4 plain + 2 masked-dense lanes concurrent — lane outputs
+  identical ON vs OFF; the R=4 group and the R=1 solos each share one
+  supergraph exec per bucket (2 captures total, the bucketing physics).
+- All five deployments (qwen3-0.6b, olmo2, qwen2.5, phi3, mistral):
+  baseline + masked-dense + masked-none A/B byte-identical with the
+  supergraph on — the union survives bias, padded-head, post-norm, 7B
+  scale and the force-prefill deployment's captured PLAN-LESS decode.
+Remaining S4: hooks into the union, lora capture-safety, Peel mixed
+fires, then default-on.
