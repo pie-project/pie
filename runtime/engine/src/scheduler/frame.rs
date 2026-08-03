@@ -21,14 +21,15 @@
 //!   arrival-complete — the infinite wait-all rule: membership changes only
 //!   through explicit close/leave/first-fire events, and the 1 s watchdog
 //!   only REPORTS a non-responsive lane, never evicts it;
-//! - holds while a JOIN is in flight: a process in bring-up (bind
+//! - tracks the COHORT-BOUNDARY WINDOW: a process in bring-up (bind
 //!   accepted, no fire yet) is staged; once it acquires a contended
-//!   execution permit it is a join-in-flight the seal waits for by
-//!   identity, and while a freed slot has a staged taker the seal waits
-//!   for that handoff — so a cohort turnover gathers the incoming herd
-//!   instead of sealing narrow epochs. A bind alone holds nothing: a
-//!   live rebinder is already wait-set-held through its lane, and an
-//!   unadmitted process cannot fire;
+//!   execution permit it is a join-in-flight, and a freed slot is matched
+//!   by position against the FIFO-fair admission queue to name its taker.
+//!   A joiner is NOT a wait-set member and never holds the seal — sealing
+//!   without it excludes nobody, it only starts the next epoch one process
+//!   short. The window instead stops the submit-deadline clock and defers
+//!   returned bind permits, so bring-up does not compete with the boundary
+//!   it is joining;
 //! - seals from every ready lane (deterministic first-fit in lane-id order
 //!   against the per-wave token/row budgets — pure arithmetic over declared
 //!   demand, never timing). A lane deferred by capacity is served in the
@@ -180,8 +181,8 @@ struct LaneState {
     owner: Option<ProcessId>,
     /// Wait-set membership: joined on the lane's first stamped fire, held
     /// through every later frame (an idle lane between frames is a missing
-    /// member the seal waits on), released only by close/terminate, or by
-    /// the guest itself through `forward.park()`.
+    /// member the seal waits on), released by close/terminate, by the guest
+    /// itself through `forward.park()`, or by the leash below.
     awaited: bool,
     /// Left the wait-set through `forward.park()` rather than close/terminate.
     /// Distinguished from a cleared `awaited` so that rejoin can be implicit
@@ -194,12 +195,14 @@ struct LaneState {
     /// silence clock keeps running, because a lane that never comes back has
     /// broken the contract `forward.park()` exists to honour.
     leashed: bool,
-    /// Start of this lane's submit deadline: the instant its own last frame
-    /// was dispatched (or, for a lane that has never been dispatched, its
-    /// first arrival). Per lane and absolute on purpose — a global "is
-    /// anything executing?" clock is reset by OTHER lanes' traffic, which is
-    /// exactly the case a dead member has to be detected in. `None` means the
-    /// lane owes nothing and is not being waited on.
+    /// Start of this lane's silence: the instant it was first seen blocking
+    /// the boundary with nothing owed to it. Per lane and absolute on purpose
+    /// — a global "is anything executing?" clock is reset by OTHER lanes'
+    /// traffic, which is exactly the case a silent member has to be found in.
+    /// Cleared by any accepted fire and by any debt the engine owes the lane;
+    /// deliberately NOT restarted by the leash, so a lane cannot buy silence
+    /// budget by being dropped from the wait-set. `None` means the lane is
+    /// not being timed.
     clock_from: Option<Instant>,
     frames: VecDeque<PendingFrame>,
 }
@@ -226,7 +229,9 @@ pub(super) enum FramePlan {
     Hold(Duration),
     /// No sealed work and no seal candidates: park until an arrival.
     Park,
-    /// These processes blew the submit deadline while holding the wait-set.
+    /// These processes were silent past the silence timeout without ever
+    /// parking: abandoned, not merely slow (a lane that only misses the
+    /// submit deadline is leashed out of the wait-set and rejoins on its own).
     /// The worker terminates them; the policy has already dropped their
     /// lanes, so re-planning proceeds without them.
     Terminate(Vec<ProcessId>),
@@ -294,13 +299,12 @@ pub(super) struct FramePolicy {
     /// Feeds [`FramePolicy::has_pending_binds`] (the worker defers teardown
     /// closes while bring-up owns the driver lane); binds do NOT hold the
     /// seal — a lane's own wait-set membership covers a live rebinder, and
-    /// bring-up lanes are gathered through `staged`/`pending_joins`.
+    /// a bring-up lane joins on its own first fire.
     pending_binds: BTreeMap<ProcessId, usize>,
     /// Successor pool: processes in bring-up (first bind control accepted)
     /// whose lane has not yet submitted its first stamped fire. While a
     /// free execution slot exists (`pending_slots > 0`), one of these is
-    /// about to take it — the seal waits so the join lands in this
-    /// boundary instead of a narrow epoch.
+    /// about to take it, which is what opens the cohort-boundary window.
     staged: BTreeSet<ProcessId>,
     /// Released execution slots not yet re-consumed by an admission:
     /// +1 on `on_execution_slot_released`, saturating -1 on EVERY
@@ -310,8 +314,8 @@ pub(super) struct FramePolicy {
     /// saturation absorbs initial-pool consumptions, and a release is
     /// always mailed before its consumer can acquire, so a release-paired
     /// drain is never lost to the clamp). A positive balance with a
-    /// non-empty `staged` pool means a successor's admission is imminent:
-    /// the seal waits. Multi-driver note: consume/release broadcasts reach
+    /// non-empty `staged` pool means a successor's admission is imminent,
+    /// which opens the cohort-boundary window. Multi-driver note: consume/release broadcasts reach
     /// every driver's policy, and it is the GLOBAL admission semaphore
     /// (one pool across drivers) that bounds outstanding consumes to
     /// capacity — that is what keeps each policy's balance from going
@@ -319,8 +323,8 @@ pub(super) struct FramePolicy {
     pending_slots: u64,
     /// Identity-paired in-flight joins: a parked process that ACQUIRED its
     /// execution permit but whose first stamped fire has not arrived yet.
-    /// The seal waits for exactly these lanes (removed by first fire and
-    /// by every leave path, so a joiner that dies cannot wedge the seal).
+    /// Cleared by the first fire and by every leave path, so a joiner that
+    /// dies cannot pin the window open.
     joins_in_flight: BTreeSet<ProcessId>,
     /// Processes blocked on an execution permit, in the order the FIFO-fair
     /// semaphore will hand them one. A slot that is free or about to be free
@@ -689,10 +693,10 @@ impl FramePolicy {
         }
     }
 
-    /// A bind control entered the scheduler. A bind does not hold the seal:
-    /// a live rebinder is already wait-set-held through its lane, and a
-    /// bring-up process (no lane yet) enters the `staged` successor pool —
-    /// the seal waits for it only once a slot opens for it
+    /// A bind control entered the scheduler. A bind on its own means
+    /// nothing to the boundary: a live rebinder is already wait-set-held
+    /// through its lane, and a bring-up process (no lane yet) only enters
+    /// the `staged` successor pool, which counts once a slot opens for it
     /// ([`FramePolicy::on_execution_slot_released`]) or it acquires one
     /// ([`FramePolicy::on_execution_slot_consumed`]).
     pub fn on_bind_enqueued(&mut self, pid: Option<ProcessId>) {
@@ -732,8 +736,8 @@ impl FramePolicy {
 
     /// A retiring process's deferred teardown dropped its execution permit
     /// (capped deployments only). While the freed slot stays unconsumed and
-    /// a successor is staged, the seal holds — the successor's admission and
-    /// first fire are imminent. Resolves the holder's departure by identity
+    /// a successor is staged, the cohort-boundary window is open — the
+    /// successor's admission and first fire are imminent. Resolves the holder's departure by identity
     /// (its terminate leave always precedes this broadcast: both are sent
     /// by the teardown task, in that order).
     pub fn on_execution_slot_released(&mut self, pid: ProcessId) {
@@ -793,10 +797,15 @@ impl FramePolicy {
         !self.pending_binds.is_empty()
     }
 
-    /// Whether the seal is waiting on a successor's arrival: a swap is
-    /// earmarked (a slot is free or about to be, and the process that will
-    /// take it is identified) or an admitted successor's first fire is still
-    /// in flight. This is exactly the cohort-boundary window.
+    /// The cohort-boundary window: a swap is earmarked (a slot is free or
+    /// about to be, and the process that will take it is identified) or an
+    /// admitted successor's first fire is still in flight.
+    ///
+    /// This never held the seal and no longer pretends to. A joiner is not a
+    /// wait-set member, so sealing without it excludes nobody. What the
+    /// window is for is that the engine is visibly mid-handover: it stops the
+    /// submit-deadline clock (members idle for reasons that are ours, not
+    /// theirs) and defers the bind permits a retiring process returns.
     ///
     /// The earmark used to be `(pending_slots > 0 || !departing.is_empty())
     /// && !staged.is_empty()`: a cross product, not a matching. It never
@@ -810,7 +819,7 @@ impl FramePolicy {
     /// `admission_queue` closes that gap. `tokio::Semaphore` is FIFO-fair,
     /// so the processes blocked on a permit ARE the takers of the next slots
     /// to free, in order. Matching the two by position earmarks named
-    /// processes, and the hold now lasts only from a release until its
+    /// processes, and the window now lasts only from a release until its
     /// identified taker wakes -- microseconds -- instead of standing
     /// permanently true.
     pub fn earmarked(&self) -> impl Iterator<Item = ProcessId> + '_ {
@@ -1956,7 +1965,7 @@ mod tests {
     /// a Terminate for a never-admitted pid (or a duplicate leave from the
     /// exit funnel's two notification paths) leaves no phantom hold, and a
     /// staged successor whose predecessor's release was already consumed
-    /// elsewhere does not re-hold the seal.
+    /// elsewhere does not re-open the window.
     #[test]
     fn terminate_arms_only_live_slot_holders() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);

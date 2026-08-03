@@ -217,11 +217,16 @@ interface forward-recurrent {
     /// dispatch until every member has submitted, so membership is a promise
     /// to keep submitting. A pipeline that stops — it is blocked on a user
     /// turn, waiting on a peer, or simply idle — would otherwise hold the
-    /// frame, and `model.submit-deadline-us` bounds that promise: hold the
-    /// wait-set that long with nothing owed to you and the instance is
-    /// terminated for breach of contract. `park` is how a pipeline stops
-    /// WITHOUT breaking the promise — it states the intent the engine cannot
-    /// infer, leaves the wait-set, and stops that clock.
+    /// frame. `model.submit-deadline-us` bounds that promise: hold the
+    /// wait-set that long with nothing owed to you and the engine stops
+    /// waiting for you — the slot is dropped from the frame, work you already
+    /// submitted still runs, and your next submit rejoins. That costs you a
+    /// boundary, not your instance. Staying silent much longer than that
+    /// WITHOUT parking is a different matter: it reads as an abandoned
+    /// pipeline and the instance is terminated. `park` is how a pipeline
+    /// stops without breaking the promise — it states the intent the engine
+    /// cannot infer, leaves the wait-set, and stops that clock entirely, for
+    /// as long as you like.
     ///
     /// Ordered against this pipeline's own submits, not against the call: it
     /// takes effect once every frame submitted before it has sealed, so it is

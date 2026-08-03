@@ -1047,14 +1047,14 @@ impl PassCore {
                     return Err("attention must be bound before submit".to_string());
                 };
                 let geom = wit_attention::KvGeometry {
-                        readable_pages: kv.readable.wit(),
-                        writable_pages: kv.writable.wit(),
-                        kv_len: kv.kv_len.as_ref(),
-                        pages: kv.pages.as_ref(),
-                        page_indptr: kv.page_indptr.as_ref(),
-                        w_slot: kv.w_slot.as_ref(),
-                        w_off: kv.w_off.as_ref(),
-                        positions: kv.positions.as_ref(),
+                    readable_pages: kv.readable.wit(),
+                    writable_pages: kv.writable.wit(),
+                    kv_len: kv.kv_len.as_ref(),
+                    pages: kv.pages.as_ref(),
+                    page_indptr: kv.page_indptr.as_ref(),
+                    w_slot: kv.w_slot.as_ref(),
+                    w_off: kv.w_off.as_ref(),
+                    positions: kv.positions.as_ref(),
                     mask: kv.mask.as_deref(),
                 };
                 w.attention(kv.ws.as_ref(), &geom)
@@ -1070,19 +1070,19 @@ impl PassCore {
                     return Err("attention must be bound before submit".to_string());
                 };
                 let binding = wit_hybrid::KvBinding {
-                        working_set: kv.ws.as_ref(),
-                        geometry: wit_hybrid::KvGeometry {
-                            readable_pages: kv.readable.wit(),
-                            writable_pages: kv.writable.wit(),
-                            kv_len: kv.kv_len.as_ref(),
-                            pages: kv.pages.as_ref(),
-                            page_indptr: kv.page_indptr.as_ref(),
-                            w_slot: kv.w_slot.as_ref(),
-                            w_off: kv.w_off.as_ref(),
-                            positions: kv.positions.as_ref(),
-                            mask: kv.mask.as_deref(),
-                        },
-                    };
+                    working_set: kv.ws.as_ref(),
+                    geometry: wit_hybrid::KvGeometry {
+                        readable_pages: kv.readable.wit(),
+                        writable_pages: kv.writable.wit(),
+                        kv_len: kv.kv_len.as_ref(),
+                        pages: kv.pages.as_ref(),
+                        page_indptr: kv.page_indptr.as_ref(),
+                        w_slot: kv.w_slot.as_ref(),
+                        w_off: kv.w_off.as_ref(),
+                        positions: kv.positions.as_ref(),
+                        mask: kv.mask.as_deref(),
+                    },
+                };
                 let Some(geom) = inner.rs_bind.as_ref() else {
                     return Err("recurrent state must be bound before submit".to_string());
                 };
@@ -1136,11 +1136,16 @@ pub fn frame_size() -> usize {
 }
 
 /// How long a pipeline may hold a frame's wait-set without submitting before
-/// the engine terminates it (cached; static, like `frame_size`).
+/// the engine stops waiting for it (cached; static, like `frame_size`).
 ///
 /// Measures consecutive silence while actually blocking a seal, and stops
 /// while the engine is what you are waiting on — so a pipeline that keeps
 /// submitting can never trip it. To stop legitimately, call `Pipeline::park`.
+///
+/// Overrunning it is not fatal: the slot leaves the frame, work already
+/// submitted still runs, and the next submit rejoins. It costs a boundary,
+/// not the instance. (Going silent for orders of magnitude longer without
+/// parking is read as an abandoned pipeline and is terminated.)
 ///
 /// Note that work between receiving a result and submitting the next fire is
 /// on this clock: the fleet is stalled on you and nothing is owed back. Park
@@ -1439,7 +1444,8 @@ impl Pipeline {
 
     /// Leave the frame wait-set until this pipeline submits again — the way
     /// to go idle, block on a user turn, or wait on a peer without holding
-    /// the frame and without breaching `submit_deadline`.
+    /// the frame, without running down `submit_deadline`, and without ever
+    /// looking abandoned however long you stay away.
     ///
     /// Ordered against this pipeline's own submits, so outstanding fires are
     /// fine: their results still arrive, and the exit follows them. The next
@@ -1463,7 +1469,6 @@ impl Default for Pipeline {
 // prelude
 // ---------------------------------------------------------------------------
 
-
 /// The kind-independent half of every pass prelude: the eDSL vocabulary plus
 /// the wrapper types that mean the same thing in all three interfaces.
 ///
@@ -1475,7 +1480,6 @@ pub mod shared_prelude {
         Channel, PageGrant, Pipeline, RsWorkingSet, TOKEN_PAD, WorkingSet, channel_capacity,
         frame_size, live_slots, max_embed_length, pad_tokens, prefill_chunks, unpad_tokens,
     };
-    pub use std::ops::ControlFlow;
     pub use pie_dsl::dtype;
     pub use pie_dsl::intrinsics;
     pub use pie_dsl::value::{
@@ -1488,6 +1492,7 @@ pub mod shared_prelude {
         sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
     };
     pub use pie_dsl::{DType, Stage};
+    pub use std::ops::ControlFlow;
 }
 
 // ---------------------------------------------------------------------------
@@ -1668,8 +1673,7 @@ pub mod recurrent {
         /// The mechanism is a recurrence, but the SLOT is the same one
         /// `attention` names in the other two interfaces.
         pub fn attention(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-            self.0
-                .bind_recurrent(working_sets, rs_geometry_fold_all()?)
+            self.0.bind_recurrent(working_sets, rs_geometry_fold_all()?)
         }
 
         /// Bind the recurrent state AND state where its folded boundary
@@ -1752,8 +1756,7 @@ pub mod hybrid {
         /// Bind the RECURRENT half: one working set per request, in resolved
         /// request order.
         pub fn recurrent(&self, working_sets: &[RsWorkingSet]) -> Result<(), String> {
-            self.0
-                .bind_recurrent(working_sets, rs_geometry_fold_all()?)
+            self.0.bind_recurrent(working_sets, rs_geometry_fold_all()?)
         }
 
         /// Bind the RECURRENT half AND state where its folded boundary lands.

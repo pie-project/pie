@@ -201,7 +201,8 @@ pub(crate) fn notify_process_quiesced(pid: ProcessId) {
 }
 
 /// A parked process acquired its execution permit: its first fire is
-/// imminent, and the frame seal waits for it by identity. Sent BEFORE the
+/// imminent, so it is a named join in flight and the cohort-boundary window
+/// stays open until it lands. Sent BEFORE the
 /// process's first fire enters the mailbox (same producer), so the policy
 /// sees consume-then-fire; a reordered arrival is harmless (the policy's
 /// staged guard skips a lane that already fired).
@@ -2614,8 +2615,8 @@ impl BatchScheduler {
                 break;
             }
 
-            // Cohort-boundary bind deferral: while the seal waits on a
-            // successor's arrival, hold back the bind permits that retiring
+            // Cohort-boundary bind deferral: while a successor's arrival is
+            // imminent, hold back the bind permits that retiring
             // processes return, so the staged cohort's working-set
             // declaration and prefill construction do not compete with the
             // boundary's own bring-up. Cleared the moment this pass has
@@ -3473,8 +3474,9 @@ impl BatchScheduler {
         // the planner's suspend/restore copies are in flight almost
         // continuously under churn, so every bind waited out the whole
         // strict-watchdog window, its process sat in `staged` for the
-        // duration, and `is_joining()` therefore held the seal that would
-        // have retired the traffic the copy is waiting behind. Measured on
+        // duration, and the cohort-boundary window it therefore held open
+        // (which then still held the seal) stalled the very traffic the copy
+        // was waiting behind. Measured on
         // `churn`: every one of 270 binds took 1.0-2.4 s end to end against
         // a 59 us driver bind, and the probe found the slot held by a
         // tracked KV copy in 100% of the samples.
@@ -7648,8 +7650,9 @@ mod tests {
     /// blocking the front. Under churn the planner's suspend/restore copies
     /// are in flight nearly continuously, and gating binds on them made
     /// every bind wait out the strict-watchdog window: the process stayed
-    /// in `staged`, `is_joining()` held the seal, and the seal held back
-    /// the very traffic the copy was settling behind.
+    /// in `staged`, which pinned the cohort-boundary window open (back when
+    /// that still held the seal) and stalled the very traffic the copy was
+    /// settling behind.
     #[test]
     fn a_bind_dispatches_past_an_in_flight_and_a_queued_standalone_copy() {
         let mut pending: PendingQueue = VecDeque::from([

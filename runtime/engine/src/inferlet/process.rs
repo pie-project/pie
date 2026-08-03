@@ -568,8 +568,8 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
             // policy's slot balance must see each consumed permit whether it
             // came from a retirement or the initial pool (the semaphore
             // launders them together); the notification precedes the first
-            // fire on this same task, so the frame seal waits for exactly
-            // this lane's join instead of sealing a narrow boundary epoch.
+            // fire on this same task, so the policy sees consume-then-fire
+            // and can name this lane as the join that is in flight.
             crate::scheduler::worker::notify_execution_slot_consumed(ctx.id());
             Some(permit)
         }
