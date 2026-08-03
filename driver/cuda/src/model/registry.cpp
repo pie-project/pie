@@ -601,9 +601,7 @@ std::unique_ptr<IModel> create_qwen3_5_model(
     const bool force_prefill_path = !flashinfer_decode_supports_gqa(
         hf.num_attention_heads / std::max(1, hf.num_key_value_heads));
     const int small_spec_tokens = qwen35_small_spec_graph_tokens();
-    const bool graph_safe =
-        res.kv_cache->format().is_native_bf16() &&
-        !qwen35_forward_profile_enabled();
+    const bool graph_safe = res.kv_cache->format().is_native_bf16();
     const bool supports_small_prefill_graph =
         res.kv_cache->format().is_native_bf16() &&
         !res.kv_cache->hnd_layout() && small_spec_tokens > 0;
@@ -618,7 +616,7 @@ std::unique_ptr<IModel> create_qwen3_5_model(
             *res.system_drafter, res.native_mtp_num_drafts,
             qwen35_mtp_draft_position_offset(),
             qwen35_mtp_prefix_global_cache(),
-            qwen35_mtp_fused_gemv_enabled());
+            false);
     }
     return model;
 }
