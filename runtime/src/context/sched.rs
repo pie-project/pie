@@ -871,10 +871,44 @@ impl ContextManager {
     // Eviction
     // =========================================================================
 
+    /// "Newer" for the FCFS eviction tiebreaker — total, and deterministic.
+    ///
+    /// `None` means the context has no owning process, which is the case for a
+    /// saved snapshot. Previously such a context got `Instant::now()`, evaluated
+    /// freshly *inside* the victim-selection loop: every ownerless context
+    /// therefore received a distinct, monotonically increasing timestamp in
+    /// `HashMap` iteration order, and "prefer later spawn" handed the win to
+    /// whichever one happened to be visited last. `HashMap` iteration order is
+    /// randomised per process, so the victim varied between runs on identical
+    /// state.
+    ///
+    /// `None` still sorts as newest, so the eviction *policy* is unchanged — an
+    /// ownerless context remains the preferred victim. The only difference is
+    /// that ties now resolve on `ContextId` instead of on iteration order.
+    ///
+    /// Whether ownerless contexts *should* be preferred victims at all is a
+    /// separate policy question, deliberately not addressed here.
+    fn newer_for_eviction(
+        a_time: Option<Instant>,
+        b_time: Option<Instant>,
+        a_id: ContextId,
+        b_id: ContextId,
+    ) -> bool {
+        match (a_time, b_time) {
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) if a != b => a > b,
+            // Equal timestamps, or both ownerless: break the tie on the stable
+            // context id so repeated calls on unchanged state agree.
+            _ => a_id > b_id,
+        }
+    }
+
     /// Find the best eviction victim context on a driver.
     ///
     /// Priority: defaulted contexts first (regardless of bid), then by
-    /// lowest bid, then by most-recently-spawned process (FCFS tiebreaker).
+    /// lowest bid, then by most-recently-spawned process (FCFS tiebreaker),
+    /// then by context id so the result is deterministic.
     ///
     /// Non-defaulted victims must have bid ≤ requester_bid.
     /// Defaulted victims are always eligible (they can't pay rent).
@@ -885,8 +919,9 @@ impl ContextManager {
         requester: Option<ContextId>,
     ) -> Option<ContextId> {
         // (defaulted, bid, spawn_time, ctx_id) — best victim has highest
-        // defaulted, lowest bid, latest spawn_time.
-        let mut best: Option<(bool, f64, Instant, ContextId)> = None;
+        // defaulted, lowest bid, latest spawn_time. `spawn_time` is `None` for a
+        // context with no owning process; see `newer_for_eviction`.
+        let mut best: Option<(bool, f64, Option<Instant>, ContextId)> = None;
 
         for (&ctx_id, ctx) in &self.contexts {
             if requester == Some(ctx_id) {
@@ -916,16 +951,17 @@ impl ContextManager {
             let spawn_time = ctx
                 .owner
                 .and_then(|pid| self.processes.get(&pid))
-                .map(|p| p.created_at)
-                .unwrap_or_else(Instant::now);
+                .map(|p| p.created_at);
 
-            let dominated = if let Some((best_def, best_bid, best_time, _)) = best {
+            let dominated = if let Some((best_def, best_bid, best_time, best_id)) = best {
                 // Prefer defaulted over non-defaulted
                 (ctx.defaulted && !best_def)
                 // Same default status: prefer lower bid
                 || (ctx.defaulted == best_def && ctx.bid < best_bid)
-                // Same default + bid: prefer later spawn (FCFS)
-                || (ctx.defaulted == best_def && ctx.bid == best_bid && spawn_time > best_time)
+                // Same default + bid: prefer later spawn (FCFS), ties on ctx_id
+                || (ctx.defaulted == best_def
+                    && ctx.bid == best_bid
+                    && Self::newer_for_eviction(spawn_time, best_time, ctx_id, best_id))
             } else {
                 true
             };
@@ -976,7 +1012,7 @@ impl ContextManager {
     ///
     /// Iterates all **Stashed** contexts (CPU-resident pages) on the driver.
     /// Returns the context with the lowest bid, using FCFS (latest spawn
-    /// time first) as tiebreaker.
+    /// time first) as tiebreaker, then context id for determinism.
     ///
     /// The requester is excluded. Only victims with bid ≤ `requester_bid`
     /// are eligible (a higher-bid context should not be evicted to make
@@ -987,7 +1023,9 @@ impl ContextManager {
         requester_bid: f64,
         requester: Option<ContextId>,
     ) -> Option<ContextId> {
-        let mut best: Option<(f64, Instant, ContextId)> = None;
+        // `spawn_time` is `None` for a context with no owning process; see
+        // `newer_for_eviction` for why this is not `Instant::now()`.
+        let mut best: Option<(f64, Option<Instant>, ContextId)> = None;
 
         for (&ctx_id, ctx) in &self.contexts {
             if requester == Some(ctx_id) {
@@ -1017,11 +1055,12 @@ impl ContextManager {
             let spawn_time = ctx
                 .owner
                 .and_then(|pid| self.processes.get(&pid))
-                .map(|p| p.created_at)
-                .unwrap_or_else(Instant::now);
+                .map(|p| p.created_at);
 
-            let dominated = if let Some((best_bid, best_time, _)) = best {
-                ctx.bid < best_bid || (ctx.bid == best_bid && spawn_time > best_time)
+            let dominated = if let Some((best_bid, best_time, best_id)) = best {
+                ctx.bid < best_bid
+                    || (ctx.bid == best_bid
+                        && Self::newer_for_eviction(spawn_time, best_time, ctx_id, best_id))
             } else {
                 true
             };
@@ -1197,6 +1236,7 @@ impl ContextManager {
 mod tests {
     use super::*;
     use crate::context::{Context, RestoreEntry, State};
+    use std::time::Duration;
 
     /// Build a ContextManager with one driver and `num_pages` GPU pages.
     /// Installs one process (`pid`) and one GPU-resident context (`ctx_id`)
@@ -1777,5 +1817,117 @@ mod tests {
             mgr.register_process(ProcessId::new_v4(), Some(16)).unwrap();
         }
         assert!(mgr.register_process(ProcessId::new_v4(), Some(16)).is_err());
+    }
+
+    // =========================================================================
+    // Eviction victim selection — determinism
+    // =========================================================================
+
+    /// Build a manager holding `n` ownerless, GPU-resident contexts with ids
+    /// `1..=n`, each on driver 0 with one working page and a zero bid. This is
+    /// the shape a *saved snapshot* has: `owner: None`, so no process backs it.
+    fn ownerless_ctx_fixture(n: u64) -> ContextManager {
+        let mut mgr = ContextManager::new(
+            0,
+            16,
+            &[100],
+            &[100],
+            1,
+            &[0],
+            &[false],
+            10,
+            None,
+            10000.0,
+            0.85,
+        );
+        for ctx_id in 1..=n {
+            let pages = mgr.gpu_stores[0].alloc(1).expect("alloc");
+            let mut ctx = Context::new(None);
+            ctx.driver = Some(0);
+            ctx.working_pages = pages;
+            ctx.bid = 0.0;
+            ctx.state = State::Active;
+            mgr.contexts.insert(ctx_id, ctx);
+        }
+        mgr
+    }
+
+    /// The FCFS tiebreaker must be a total, deterministic order.
+    ///
+    /// Regression: `spawn_time` used to fall back to `Instant::now()` evaluated
+    /// *inside* the victim-selection loop. Because `Instant::now()` increases
+    /// monotonically, every ownerless context dominated the previous best, so
+    /// the winner was simply whichever the `HashMap` happened to visit last —
+    /// and Rust randomises that order per process.
+    #[test]
+    fn newer_for_eviction_is_total_and_deterministic() {
+        let early = Instant::now();
+        let late = early + Duration::from_secs(1);
+
+        // A context with no owning process sorts as "newest", preserving the
+        // previous eviction policy.
+        assert!(ContextManager::newer_for_eviction(None, Some(late), 1, 2));
+        assert!(!ContextManager::newer_for_eviction(Some(late), None, 1, 2));
+
+        // Real timestamps still dominate the comparison.
+        assert!(ContextManager::newer_for_eviction(
+            Some(late),
+            Some(early),
+            1,
+            2
+        ));
+        assert!(!ContextManager::newer_for_eviction(
+            Some(early),
+            Some(late),
+            1,
+            2
+        ));
+
+        // Ties — both ownerless, or identical timestamps — resolve on ctx_id,
+        // and the relation is antisymmetric rather than order-dependent.
+        assert!(ContextManager::newer_for_eviction(None, None, 2, 1));
+        assert!(!ContextManager::newer_for_eviction(None, None, 1, 2));
+        assert!(ContextManager::newer_for_eviction(
+            Some(early),
+            Some(early),
+            2,
+            1
+        ));
+        assert!(!ContextManager::newer_for_eviction(
+            Some(early),
+            Some(early),
+            1,
+            2
+        ));
+    }
+
+    /// With every other key equal, the victim is a stable function of state.
+    ///
+    /// Asserting the *identity* of the winner matters: repeatedly calling on one
+    /// manager would iterate the same `HashMap` in the same order and so pass
+    /// even with the bug present. Under the old code the winner was the
+    /// last-visited context, which coincides with the highest id only by chance.
+    #[test]
+    fn eviction_victim_among_ownerless_snapshots_is_stable() {
+        let mgr = ownerless_ctx_fixture(8);
+        assert_eq!(
+            mgr.find_eviction_victim(0, 1.0, None),
+            Some(8),
+            "all keys tie except ctx_id, so the highest id must win"
+        );
+    }
+
+    /// Independent managers built from identical logical state must agree,
+    /// even though each `HashMap` seeds its own iteration order.
+    #[test]
+    fn eviction_victim_agrees_across_independent_managers() {
+        let expected = ownerless_ctx_fixture(8).find_eviction_victim(0, 1.0, None);
+        for _ in 0..16 {
+            assert_eq!(
+                ownerless_ctx_fixture(8).find_eviction_victim(0, 1.0, None),
+                expected,
+                "victim must not depend on per-map hash seeding"
+            );
+        }
     }
 }
