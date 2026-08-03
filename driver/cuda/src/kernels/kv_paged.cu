@@ -827,6 +827,100 @@ void launch_write_kv_to_pages_at_positions_bf16(
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Peel device-window variant (the device-window campaign,
+// north-star-dsl.md): the row window rides in DEVICE memory
+// (win[0]=start, win[1]=len) so a captured launch replays across
+// row splits — the launch shape is the FULL lane count and rows
+// outside the window early-out. The host-window form above remains
+// the eager path (no wasted blocks where no capture needs stability).
+template <bool HND_LAYOUT>
+__global__ void write_kv_explicit_devwin_kernel(
+    const __nv_bfloat16* __restrict__ k_curr,
+    const __nv_bfloat16* __restrict__ v_curr,
+    __nv_bfloat16* __restrict__ k_pages,
+    __nv_bfloat16* __restrict__ v_pages,
+    const std::uint32_t* __restrict__ w_page,
+    const std::uint32_t* __restrict__ w_off,
+    const std::uint8_t* __restrict__ row_valid,
+    const std::uint32_t* __restrict__ win,  // {start, len} device word
+    int n_max,
+    int page_size,
+    int h_kv,
+    int d)
+{
+    const int b = blockIdx.x;
+    if (b >= n_max) return;
+    const int w0 = static_cast<int>(win[0]);
+    const int w1 = static_cast<int>(win[1]);
+    if (b < w0 || b >= w0 + w1) return;
+    if (row_valid != nullptr && row_valid[b] == 0) return;
+    const int actual_page = static_cast<int>(w_page[b]);
+    const int offset_in_page = static_cast<int>(w_off[b]);
+    if (offset_in_page < 0 || offset_in_page >= page_size) return;
+
+    const long long row = static_cast<long long>(h_kv) * d;
+    const long long src = static_cast<long long>(b) * row;
+    for (int i = threadIdx.x; i < row; i += blockDim.x) {
+        long long dst;
+        if constexpr (HND_LAYOUT) {
+            const int h = i / d;
+            const int j = i - h * d;
+            dst = ((static_cast<long long>(actual_page) * h_kv + h) *
+                   page_size + offset_in_page) * d + j;
+        } else {
+            dst = ((static_cast<long long>(actual_page) * page_size) +
+                   offset_in_page) * row + i;
+        }
+        k_pages[dst] = k_curr[src + i];
+        v_pages[dst] = v_curr[src + i];
+    }
+}
+
+void launch_write_kv_explicit_bf16_devwin(
+    KvCacheLayerView layer,
+    const void* k_curr,
+    const void* v_curr,
+    const std::uint32_t* w_page,
+    const std::uint32_t* w_off,
+    const std::uint32_t* win_d,
+    int n_max,
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
+{
+    if (!layer.is_native_bf16()) {
+        throw std::runtime_error(
+            "write_kv_explicit_bf16_devwin requires native bf16 KV cache");
+    }
+    if (n_max <= 0) return;
+    // Envelope maintenance (quest) is NOT wired on this variant yet —
+    // the campaign converts it when a windowed producer needs it; until
+    // then a caller with envelopes must stay on the host-window form.
+    if (layer.has_envelopes()) {
+        throw std::runtime_error(
+            "write_kv_explicit_bf16_devwin: envelope maintenance not yet "
+            "windowed — use the host-window form");
+    }
+    constexpr int BLOCK = 256;
+    if (layer.hnd_layout) {
+        write_kv_explicit_devwin_kernel<true><<<n_max, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            w_page, w_off, row_valid, win_d, n_max, layer.page_size,
+            layer.num_kv_heads, layer.head_dim);
+    } else {
+        write_kv_explicit_devwin_kernel<false><<<n_max, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            w_page, w_off, row_valid, win_d, n_max, layer.page_size,
+            layer.num_kv_heads, layer.head_dim);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_write_kv_explicit_bf16(
     KvCacheLayerView layer,
     const void* k_curr,                 // [LANES, h_kv, d]

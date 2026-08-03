@@ -80,6 +80,21 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
 // lane → shared-page-safe (a sibling's mask hides this cell). Requires a
 // native-bf16 KV cache. `w_page` must already be PHYSICAL page ids (resolve
 // slot→physical before the call).
+// Peel device-window variant: the {start, len} row window rides in
+// device memory so a captured launch replays across row splits; grid
+// is the full lane count, out-of-window rows early-out. Envelope
+// (quest) maintenance is not wired on this variant yet.
+void launch_write_kv_explicit_bf16_devwin(
+    KvCacheLayerView layer,
+    const void* k_curr,
+    const void* v_curr,
+    const std::uint32_t* w_page,
+    const std::uint32_t* w_off,
+    const std::uint32_t* win_d,
+    int n_max,
+    cudaStream_t stream,
+    const std::uint8_t* row_valid = nullptr);
+
 void launch_write_kv_explicit_bf16(
     KvCacheLayerView layer,
     const void* k_curr,                 // [LANES, h_kv, d]
