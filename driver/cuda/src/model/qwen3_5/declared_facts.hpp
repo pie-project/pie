@@ -92,6 +92,11 @@ struct Qwen35DeclaredPlan {
     // cross-checks `verify_hidden_stash_enabled()` per commit fire and
     // falls back to the semantic walk on mismatch.
     bool cuda_verify_stash = false;
+    // What the class traces were taken from, in the format the future
+    // generated .inc embeds (`emit_qwen35::facts_digest`, the llama
+    // mechanism's port); the static-form dispatch runs only on exact
+    // match, and the live boot corrects any guessed emission fact.
+    std::string facts_digest;
 
     explicit operator bool() const noexcept {
         return static_cast<bool>(plan);

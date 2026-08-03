@@ -51,6 +51,7 @@
 
 pub mod dsl;
 pub mod emit_cuda;
+pub mod emit_qwen35;
 pub mod facts;
 pub mod family;
 pub mod ffi;

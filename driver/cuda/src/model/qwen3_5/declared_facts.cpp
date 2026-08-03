@@ -588,6 +588,35 @@ Qwen35DeclaredPlan build_impl(const HfConfig& cfg, const W& w, int tp_size) {
     cuda.verify_stash = 1;
     out.cuda_verify_stash = true;
 
+    // The digest naming what these traces were taken from — one format,
+    // two printers (this and `emit_qwen35::facts_digest`); the live
+    // static-form gate is what holds them together, llama's mechanism.
+    out.facts_digest =
+        "qwen3_5/l" + std::to_string(facts.layers) +
+        "/int" + std::to_string(facts.full_attn_interval) +
+        "/v" + std::to_string(facts.vocab) +
+        "/te" + std::to_string(facts.tied_embeddings) +
+        "/nv" + std::to_string(facts.norm_variant) +
+        "/ah" + std::to_string(facts.attn.hidden) +
+        "/aqh" + std::to_string(facts.attn.q_heads) +
+        "/akvh" + std::to_string(facts.attn.kv_heads) +
+        "/ahd" + std::to_string(facts.attn.head_dim) +
+        "/arot" + std::to_string(facts.attn.rotary_dim) +
+        "/afq" + std::to_string(facts.attn.fused_qkv) +
+        "/gkh" + std::to_string(facts.gdn.key_heads) +
+        "/gvh" + std::to_string(facts.gdn.value_heads) +
+        "/gkd" + std::to_string(facts.gdn.key_head_dim) +
+        "/gvd" + std::to_string(facts.gdn.value_head_dim) +
+        "/gck" + std::to_string(facts.gdn.conv_kernel) +
+        "/gfi" + std::to_string(facts.gdn.fused_in_proj) +
+        "/moe" + std::to_string(facts.mlp_is_moe) +
+        "/di" + std::to_string(facts.dense_intermediate) +
+        "/sb" + std::to_string(cuda.state_bf16) +
+        "/wt" + std::to_string(cuda.warp_tiled) +
+        "/wtm" + std::to_string(cuda.warp_tiled_max) +
+        "/cm" + std::to_string(cuda.cached_max) +
+        "/vs" + std::to_string(cuda.verify_stash);
+
     out.decode = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
     out.prefill = pie_forward::ForwardPlan::trace_qwen3_5_hybrid_cuda(
