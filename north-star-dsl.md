@@ -991,3 +991,52 @@ cases for kernels 4+5; the mixed-hook battery proving one exec
 replays across compositions ([hook-graph] replay counts where
 captures used to churn); byte parity of hooked fires against the
 pre-campaign tip; the full consolidated sweep.
+
+## Peel campaign — the deferred gates ran, and what they taught (2026-08-03)
+
+Gate results (all on the L40S, debug, Qwen3-0.6B):
+1. Kernel A/B: test_peel_window grew kernels 4+5 — 33/33 byte-equal
+   (fused epilogue prefix at head_dim 64 warp + 32 block, both
+   layouts; windowed to-pages suffix tails). The empty-window case
+   flushed out a LATENT zero-grid launch in the host
+   launch_qk_rmsnorm_rope_bf16 (sticky invalid-argument nobody ever
+   checked) — zero-row guard added.
+2. Solo oracle parity: snapkv/h2o/snapkv-tight/plain outputs
+   byte-identical across the pre-campaign tip (e30d24d78) and the
+   campaign tip — the cross-build deterministic-solo instrument.
+3. Mixed batteries (single long snapkv instance, plain lanes joining
+   and leaving around it, identical-args lanes to hold the ps hash):
+   ONE R=2 capture, 37+38 and 57+59 replay runs across the phases,
+   ZERO fingerprint recaptures, coherent returns. The captured
+   DEVICE-WINDOW body is what replayed — its live correctness is
+   proven, not just its kernel-level byte equality.
+
+The finding the flip choreography forced: at a FIXED (R, N) key on
+pure decode, `hook_free_prefix_rows` ≡ the first hooked lane's row ≡
+that lane's `token_start`. The two fingerprint terms were REDUNDANT —
+so dropping the prefix term alone cannot change replay behavior for
+single-hook fires: a genuine split flip moves the hooked lane, and
+the RETAINED token_start term recaptures. That retention is not
+timidity — the prepared hook launches bake `token_start *
+query_columns` query offsets and the sideband row layout
+(dispatch.cu), so replaying across a lane move without device
+indirection would read the wrong rows.
+
+Terminal statement of the endpoint, revised: "mixed hooked fires
+replay one exec across compositions" = (a) model body reads the split
+from the device word — DONE, live-proven; (b) the hook side's
+lane-row-derived baked args (query offsets, score sideband rows) go
+device-indirected so token_start can leave the fingerprint — the NEXT
+campaign, surgery in dispatch.cu's prepared-launch path. Until (b),
+recaptures happen exactly when a hooked lane MOVES (composition churn
+that preserves hooked-lane placement replays clean — the batteries'
+demonstrated stability, which the old prefix term would have broken
+only in lockstep with token_start anyway).
+
+Environment note (not campaign fallout, verified on the pre-campaign
+tip): concurrent lanes multiplexed on ONE python client connection
+hang at completion delivery (engine finishes, Return events lost);
+one connection per lane works. All batteries here use separate
+connections. The a3-era mixed_fire_test passed this morning on a
+shared connection, so something in the client/event path regressed
+today — external to this thread, worth a board entry.
