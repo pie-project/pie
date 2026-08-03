@@ -108,7 +108,10 @@ pub fn from_file(path: &Path) -> Result<Tokenizer> {
         bpe,
         Pipeline::ByteLevelRegex {
             nfc: false,
-            splitters: vec![split_regex],
+            splitters: vec![crate::Splitter {
+                regex: split_regex,
+                keep_gaps: true,
+            }],
             bpe_mode: BpeMode::PreferWholeToken,
         },
         added_tokens,

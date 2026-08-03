@@ -67,13 +67,26 @@ pub(crate) enum DummyPrefix {
     FirstSegment,
 }
 
+/// One pre-tokenizer split stage: the regex whose MATCHES become pieces,
+/// and whether the text BETWEEN matches survives as pieces too (HF
+/// `Split { behavior: Isolated }`) or is dropped (HF `Split { behavior:
+/// Removed, invert: true }` — the GPT-2/OLMo-2 tokenizer.json encoding,
+/// where the pattern matches the pieces themselves and the gaps are
+/// removed; the classic exhaustive patterns leave no gaps in practice,
+/// but the semantics are honored exactly rather than assumed away).
+#[derive(Debug)]
+pub(crate) struct Splitter {
+    pub(crate) regex: fancy_regex::Regex,
+    pub(crate) keep_gaps: bool,
+}
+
 /// Compiled tokenizer behavior for the modern model families supported by Pie.
 #[derive(Debug)]
 pub(crate) enum Pipeline {
-    /// Optional NFC, one or more isolated regex splitters, then byte-level BPE.
+    /// Optional NFC, one or more regex splitters, then byte-level BPE.
     ByteLevelRegex {
         nfc: bool,
-        splitters: Vec<fancy_regex::Regex>,
+        splitters: Vec<Splitter>,
         bpe_mode: BpeMode,
     },
     /// Sentencepiece-style space marker normalization with byte fallback on
@@ -380,19 +393,19 @@ impl Tokenizer {
     fn split_regex_sequence(
         &self,
         text: &str,
-        splitters: &[fancy_regex::Regex],
+        splitters: &[Splitter],
         ids: &mut Vec<u32>,
     ) {
-        if let [regex] = splitters {
+        if let [splitter] = splitters {
             let output_start = ids.len();
             let mut last_end = 0;
-            for result in regex.find_iter(text) {
+            for result in splitter.regex.find_iter(text) {
                 let Ok(matched) = result else {
                     ids.truncate(output_start);
                     self.encode_piece(text, ids);
                     return;
                 };
-                if matched.start() > last_end {
+                if splitter.keep_gaps && matched.start() > last_end {
                     self.encode_piece(&text[last_end..matched.start()], ids);
                 }
                 if matched.start() < matched.end() {
@@ -400,7 +413,7 @@ impl Tokenizer {
                 }
                 last_end = matched.end();
             }
-            if last_end < text.len() {
+            if splitter.keep_gaps && last_end < text.len() {
                 self.encode_piece(&text[last_end..], ids);
             }
             return;
@@ -409,18 +422,18 @@ impl Tokenizer {
         let mut pieces: SmallVec<[&str; 32]> = SmallVec::new();
         pieces.push(text);
 
-        for regex in splitters {
+        for splitter in splitters {
             let mut next: SmallVec<[&str; 32]> = SmallVec::new();
             for piece in pieces.iter().copied() {
                 let mut last_end = 0;
-                for result in regex.find_iter(piece) {
+                for result in splitter.regex.find_iter(piece) {
                     let Ok(matched) = result else {
                         // Profiles contain trusted static/model regexes. Preserve
                         // input rather than returning a partially encoded result.
                         self.encode_piece(text, ids);
                         return;
                     };
-                    if matched.start() > last_end {
+                    if splitter.keep_gaps && matched.start() > last_end {
                         next.push(&piece[last_end..matched.start()]);
                     }
                     if matched.start() < matched.end() {
@@ -428,7 +441,7 @@ impl Tokenizer {
                     }
                     last_end = matched.end();
                 }
-                if last_end < piece.len() {
+                if splitter.keep_gaps && last_end < piece.len() {
                     next.push(&piece[last_end..]);
                 }
             }
@@ -548,7 +561,7 @@ impl Tokenizer {
     pub fn get_split_regex(&self) -> String {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { splitters, .. } if splitters.len() == 1 => {
-                splitters[0].as_str().to_string()
+                splitters[0].regex.as_str().to_string()
             }
             _ => String::new(),
         }
@@ -558,7 +571,10 @@ impl Tokenizer {
     pub fn split_regexes(&self) -> Vec<&str> {
         match &self.pipeline {
             Pipeline::ByteLevelRegex { splitters, .. } => {
-                splitters.iter().map(fancy_regex::Regex::as_str).collect()
+                splitters
+                    .iter()
+                    .map(|splitter| splitter.regex.as_str())
+                    .collect()
             }
             _ => Vec::new(),
         }
@@ -894,7 +910,10 @@ mod tests {
                 nfc,
                 splitters: splitters
                     .iter()
-                    .map(|pattern| fancy_regex::Regex::new(pattern).unwrap())
+                    .map(|pattern| Splitter {
+                        regex: fancy_regex::Regex::new(pattern).unwrap(),
+                        keep_gaps: true,
+                    })
                     .collect(),
                 bpe_mode,
             },
@@ -980,6 +999,35 @@ mod tests {
         assert_eq!(tok.encode("a12b"), vec![0, 4, 3]);
         assert!(tok.get_split_regex().is_empty());
         assert_eq!(tok.split_regexes(), vec![r"\d+", r"[a-z]+"]);
+    }
+
+    /// `Split { behavior: Removed, invert: true }` (the GPT-2/OLMo-2
+    /// encoding): matches become pieces and the text BETWEEN matches is
+    /// DROPPED — pinned here so the loader's `keep_gaps: false` lowering
+    /// stays exact rather than an assumed-exhaustive-pattern shortcut.
+    #[test]
+    fn byte_level_removed_invert_split_drops_gaps() {
+        let vocab: HashMap<String, u32> =
+            [("a".to_string(), 0), ("b".to_string(), 1), ("1".to_string(), 2)]
+                .into_iter()
+                .collect();
+        let bpe = bpe::BpeTable::from_vocab_and_merges(&vocab, &[], false).unwrap();
+        let tok = Tokenizer::new(
+            bpe,
+            Pipeline::ByteLevelRegex {
+                nfc: false,
+                splitters: vec![Splitter {
+                    regex: fancy_regex::Regex::new(r"[a-z]+").unwrap(),
+                    keep_gaps: false,
+                }],
+                bpe_mode: BpeMode::Merge,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        // The digit gap between the two letter runs is removed, exactly
+        // as HF's Removed+invert split does.
+        assert_eq!(tok.encode("a1b"), vec![0, 1]);
     }
 
     #[test]

@@ -262,19 +262,29 @@ fn compile_byte_level_profile(hf: &HfTokenizerJson) -> Result<CompiledProfile> {
             "unsupported pre-tokenizer: {}",
             node_type(node)
         );
-        ensure!(
-            node.get("behavior").and_then(serde_json::Value::as_str) == Some("Isolated"),
-            "only isolated regex splits are supported"
-        );
-        ensure!(
-            node.get("invert").and_then(serde_json::Value::as_bool) == Some(false),
-            "inverted regex splits are unsupported"
-        );
+        // Two encodings of a match-driven split ship in the wild:
+        //   * `Isolated` + `invert: false` (qwen/llama-3): pattern matches
+        //     become pieces AND the text between them survives;
+        //   * `Removed` + `invert: true` (GPT-2 lineage, OLMo-2): the
+        //     pattern matches the pieces THEMSELVES and the gaps are
+        //     dropped. The classic exhaustive patterns leave no gaps, but
+        //     the drop is honored exactly rather than assumed away.
+        let behavior = node.get("behavior").and_then(serde_json::Value::as_str);
+        let invert =
+            node.get("invert").and_then(serde_json::Value::as_bool) == Some(true);
+        let keep_gaps = match (behavior, invert) {
+            (Some("Isolated"), false) => true,
+            (Some("Removed"), true) => false,
+            _ => bail!(
+                "unsupported Split profile: behavior={behavior:?} invert={invert}"
+            ),
+        };
         let pattern = regex_pattern(node).context("Split must contain a Regex pattern")?;
-        splitters.push(
-            fancy_regex::Regex::new(pattern)
+        splitters.push(crate::Splitter {
+            regex: fancy_regex::Regex::new(pattern)
                 .with_context(|| format!("compiling Split regex: {pattern}"))?,
-        );
+            keep_gaps,
+        });
     }
 
     let decoder = hf.decoder.as_ref().context("missing byte-level decoder")?;
