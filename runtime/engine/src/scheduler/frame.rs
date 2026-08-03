@@ -139,21 +139,6 @@ const STRICT_WATCHDOG_US: u64 = 1_000_000;
 /// the two is worth 2x on a sixteen-request fleet (206 -> 422 tok/s).
 const GATHER_POLL_US: u64 = 500;
 
-/// How long an identified successor may keep an otherwise fully-submitted
-/// boundary waiting for its first fire. A healthy join lands in microseconds,
-/// so this is three orders of magnitude of slack, and it is still fifty times
-/// under the strict watchdog — a join that misses it was never "imminent" in
-/// any sense the epoch benefits from.
-///
-/// This is the ONLY timer the join gate needs, and it is not a heuristic: the
-/// interval from permit to first fire is guest time and has no upper bound,
-/// so the boundary must be able to give up. The earmark used to need a
-/// second, shorter one to apologise for guessing, and that one is gone —
-/// instrumented over `churn`, `admission_tail` and `allshared_noswap`, the
-/// gate is entered thousands of times and this deadline expires zero times,
-/// because a named earmark resolves the moment its taker wakes.
-const JOIN_SETTLE_US: u64 = 20_000;
-
 struct ArrivedFire {
     slot: u32,
     /// `None` when the fire was rejected at scheduler admission — it counts
@@ -203,6 +188,12 @@ struct LaneState {
     /// (the next accepted fire) without disturbing the suspend path, which
     /// clears membership for a reason the guest cannot revoke.
     parked: bool,
+    /// Parked by the LEASH rather than by the guest: it went silent while
+    /// holding the boundary, so the seal stopped waiting for it. Rejoin is
+    /// identical to a voluntary park (the next accepted fire), but the
+    /// silence clock keeps running, because a lane that never comes back has
+    /// broken the contract `forward.park()` exists to honour.
+    leashed: bool,
     /// Start of this lane's submit deadline: the instant its own last frame
     /// was dispatched (or, for a lane that has never been dispatched, its
     /// first arrival). Per lane and absolute on purpose — a global "is
@@ -369,8 +360,6 @@ pub(super) struct FramePolicy {
     truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
-    /// Deadline for the join gate's hold ([`JOIN_SETTLE_US`]).
-    join_hold_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
     /// Lanes with fires the engine has dispatched but not yet retired: the
     /// engine owes them a result, so the submit deadline's clock must not run
@@ -379,20 +368,50 @@ pub(super) struct FramePolicy {
     /// without it an aggressive deadline would kill exactly the guests that
     /// are behaving, since they cannot submit until the engine answers.
     in_flight_lanes: BTreeSet<ProcessId>,
-    /// Contract bound on a wait-set member's silence; see
+    /// How long a silent member may hold the boundary before the LEASH drops
+    /// it from the wait-set. Not a verdict and not a failure: the lane parks,
+    /// its queued frames still dispatch, and its next fire rejoins. Purely a
+    /// density bound — how long the fleet waits for a straggler. See
     /// [`crate::scheduler::configured_submit_deadline`].
     submit_deadline: Duration,
+    /// How long a lane may stay silent in total — through the leash and
+    /// beyond — before the process is terminated. This IS a verdict: a
+    /// pipeline that intends to stop must call `forward.park()`, which ends
+    /// the silence and is never killed. Generous on purpose; the leash
+    /// already protects the fleet, so nothing but a genuinely abandoned
+    /// process reaches this.
+    silence_timeout: Duration,
     ever_sealed: bool,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
     stats: Option<Arc<SchedulerStats>>,
 }
 
 impl FramePolicy {
+    /// Whether any lane of `owner` is currently held by the leash. Tests
+    /// only: the leash is deliberately invisible to the guest, so this is the
+    /// only way to assert on it.
+    #[cfg(test)]
+    fn leashed(&self, owner: ProcessId) -> bool {
+        self.lanes
+            .values()
+            .any(|lane| lane.owner == Some(owner) && lane.leashed)
+    }
+
+    /// Override the silence timeout. Tests only.
+    #[cfg(test)]
+    fn with_silence_timeout(mut self, timeout: Duration) -> Self {
+        self.silence_timeout = timeout;
+        self
+    }
+
     /// Override the submit deadline. Tests only — in a live engine the value
     /// comes from config once and must not move afterwards.
     #[cfg(test)]
     fn with_submit_deadline(mut self, deadline: Duration) -> Self {
         self.submit_deadline = deadline;
+        // Out of the way unless a test asks for it: these cases exercise the
+        // leash, and a default 30s kill would fire on the same driven clock.
+        self.silence_timeout = Duration::from_secs(86_400);
         self
     }
 
@@ -418,10 +437,10 @@ impl FramePolicy {
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
-            join_hold_deadline: None,
             cold_hold_deadline: None,
             in_flight_lanes: BTreeSet::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
+            silence_timeout: crate::scheduler::configured_silence_timeout(),
             ever_sealed: false,
             stats,
         }
@@ -529,6 +548,7 @@ impl FramePolicy {
             owner,
             awaited: !suspended,
             parked: false,
+            leashed: false,
             clock_from: None,
             frames: VecDeque::new(),
         });
@@ -545,6 +565,7 @@ impl FramePolicy {
         }
         // Any accepted arrival is proof of life: the deadline measures
         // consecutive silence while blocking a seal, not elapsed lifetime.
+        lane.leashed = false;
         lane.clock_from = None;
         let frame = match lane.frames.iter_mut().find(|frame| frame.seq == stamp.seq) {
             Some(frame) => frame,
@@ -965,7 +986,6 @@ impl FramePolicy {
         self.ever_sealed = false;
         self.cold_hold_deadline = None;
         self.strict_watchdog_deadline = None;
-        self.join_hold_deadline = None;
     }
 
     fn have_seal_candidate(&self) -> bool {
@@ -1080,7 +1100,10 @@ impl FramePolicy {
             });
         }
         self.lanes
-            .retain(|_, lane| lane.awaited || !lane.frames.is_empty());
+            // A leashed lane is kept even with nothing queued: its silence
+            // clock is the only thing that can still terminate an abandoned
+            // pipeline, and dropping the entry would lose it.
+            .retain(|_, lane| lane.awaited || lane.leashed || !lane.frames.is_empty());
         sealed_any.then(|| FramePlan::Dispatch(Vec::new()))
     }
 
@@ -1213,7 +1236,6 @@ impl FramePolicy {
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
-                self.join_hold_deadline = None;
                 return FramePlan::Park;
             }
             // `missing` counts awaited lanes whose next frame is not fully
@@ -1247,14 +1269,21 @@ impl FramePolicy {
             // would be reset by their traffic forever.
             let engine_owes = self.is_joining();
             let mut expired: Vec<ProcessId> = Vec::new();
-            let deadline = self.submit_deadline;
+            let leash = self.submit_deadline;
+            let silence = self.silence_timeout;
             for (lane_id, lane) in self.lanes.iter_mut() {
                 let owes = engine_owes
                     || self.in_flight_lanes.contains(lane_id)
                     || lane
                         .owner
                         .is_some_and(|owner| self.pending_binds.contains_key(&owner));
-                if !lane.awaited || lane.frames.front().is_some_and(PendingFrame::is_complete) {
+                // Blocking: a member whose next frame is not fully submitted.
+                // Leashed: already dropped by the leash below and still
+                // silent — it blocks nobody, but the clock keeps running
+                // because only a submit or a park ends the silence.
+                let blocking =
+                    lane.awaited && !lane.frames.front().is_some_and(PendingFrame::is_complete);
+                if !blocking && !lane.leashed {
                     lane.clock_from = None;
                     continue;
                 }
@@ -1262,22 +1291,37 @@ impl FramePolicy {
                     lane.clock_from = None;
                 } else {
                     match lane.clock_from {
-                        Some(from) if now.saturating_duration_since(from) >= deadline => {
-                            // Contract breach: this member has held the seal
-                            // for the whole deadline with nothing owed to it.
-                            // Drop it from the wait-set NOW so the same lane
-                            // cannot be reported again on the next pass while
-                            // the terminate is still in flight.
+                        Some(from) if now.saturating_duration_since(from) >= silence => {
+                            // The guest has neither submitted nor parked for
+                            // the whole silence timeout with nothing owed to
+                            // it. `forward.park()` is how a pipeline says it
+                            // is going away; skipping it while holding a
+                            // process's resources is the contract breach.
                             lane.awaited = false;
+                            lane.leashed = false;
                             lane.clock_from = None;
                             expired.push(lane.owner.unwrap_or(*lane_id));
+                            continue;
+                        }
+                        Some(from) if blocking && now.saturating_duration_since(from) >= leash => {
+                            // LEASH, not a verdict. The lane stops being
+                            // waited on so the boundary seals immediately —
+                            // frames it already submitted still dispatch, and
+                            // its next fire rejoins the wait-set through the
+                            // ordinary parked path. A guest that simply lost
+                            // a race for the CPU is delayed, never failed.
+                            lane.awaited = false;
+                            lane.parked = true;
+                            lane.leashed = true;
                             continue;
                         }
                         Some(_) => {}
                         None => lane.clock_from = Some(now),
                     }
                 }
-                missing += 1;
+                if blocking {
+                    missing += 1;
+                }
             }
             if !expired.is_empty() {
                 // One process can own several lanes, so the same owner can
@@ -1286,39 +1330,17 @@ impl FramePolicy {
                 expired.dedup();
                 return FramePlan::Terminate(expired);
             }
-            let joining = engine_owes;
-            // Holding the seal for a joiner is never correctness: a joiner is
-            // by definition NOT a member yet — it has no lane in the wait-set
-            // — so sealing without it excludes nobody.
-            //
-            // A/B on the same binary, with the hold isolated from the clock
-            // pause above and the host quiet: NO difference in wall time,
-            // tok/s or submit deadline breaches, on any scenario. The only
-            // effect it has is +6% epoch density on `churn_extreme` (20.2 vs
-            // 19.0 members/epoch at a matched epoch count), and that does not
-            // reach throughput. Everything the join predicate actually earns
-            // is earned by `engine_owes` disarming the deadline clock, not by
-            // this hold. Kept because it is measured-neutral and already
-            // proven under the suite, but it is NOT load-bearing — a future
-            // simplification pass can drop it as long as `is_joining()`
-            // survives for the clock.
-            //
-            // The hold is only taken when the boundary is otherwise finished:
-            // every lane it actually waits on has submitted and nothing is
-            // executing to re-decide it.
-            let joining = if joining && missing == 0 && !executing {
-                // The joiner is named (see `earmarked`), so the only thing
-                // left between it and the boundary is guest time, which has
-                // no upper bound. Bound it and move on.
-                let deadline = *self
-                    .join_hold_deadline
-                    .get_or_insert(now + Duration::from_micros(JOIN_SETTLE_US));
-                now < deadline
-            } else {
-                self.join_hold_deadline = None;
-                joining
-            };
-            if joining || missing > 0 {
+            // A joiner never holds the seal. It is by definition NOT a
+            // member yet — no lane in the wait-set — so sealing without it
+            // excludes nobody; it only starts the next epoch one process
+            // short. A/B on the same binary, with the hold isolated from the
+            // deadline clock above (the two are disjoint: the hold needed
+            // `missing == 0`, the clock only runs for missing lanes) and the
+            // host quiet: NO difference in wall time, tok/s or submit
+            // deadline breaches on any scenario. It bought +6% epoch density
+            // on `churn_extreme` alone, which never reached throughput — not
+            // worth a 20ms timer and an admission earmark to guess at.
+            if missing > 0 {
                 let mut stalled = false;
                 if executing {
                     // An epoch is executing: its retirements re-decide and
@@ -1358,7 +1380,6 @@ impl FramePolicy {
                 return plan;
             }
             self.strict_watchdog_deadline = None;
-            self.join_hold_deadline = None;
             // EARLY seal: the gate held (every awaited lane's next frame is
             // fully submitted, no earmarked successor assembling), so seal NOW — normally
             // while the previous frame still executes. Sealing early is
@@ -1453,22 +1474,6 @@ mod tests {
         let now = Instant::now();
         match plan(policy, queued, now) {
             FramePlan::Hold(hold) => plan(policy, queued, now + hold + Duration::from_micros(1)),
-            plan => plan,
-        }
-    }
-
-    /// The join gate arms its deadline on the first blocked plan and only
-    /// seals without the joiner once [`JOIN_SETTLE_US`] has passed, which is
-    /// longer than the gather poll one [`drive_past_cold_hold`] step
-    /// advances by.
-    fn drive_past_join_settle(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
-        let now = Instant::now();
-        match plan(policy, queued, now) {
-            FramePlan::Hold(_) => plan(
-                policy,
-                queued,
-                now + Duration::from_micros(JOIN_SETTLE_US + 1),
-            ),
             plan => plan,
         }
     }
@@ -1931,157 +1936,6 @@ mod tests {
         assert_eq!(fires(&sealed), vec![95]);
     }
 
-    /// REGRESSION (the join-gate wedge). A `bind -> dispatch -> seal -> bind`
-    /// cycle reached through [`FramePolicy::is_joining`] rather than through
-    /// `missing`: the holder is a staged successor, not a wait-set member.
-    ///
-    /// Every awaited lane's front frame is COMPLETE, so the quorum is
-    /// ready; the seal is held solely by staged successors that are still
-    /// behind their binds, and those binds need the control slot this
-    /// dispatch holds. Observed under open-loop arrivals as `lanes=29
-    /// awaited=29 sealed=0 pending_binds=99 staged=99 pending_slots=99
-    /// joins_in_flight=0` with nothing executing: the GPU went to 0% and
-    /// the fleet never moved again.
-    #[test]
-    fn staged_successors_stuck_behind_their_binds_do_not_hold_the_seal() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let runner = pid();
-        let successor = pid();
-
-        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 10, 1, 1);
-        let queued: QueuedFireIds = [10].into_iter().collect();
-        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![10]);
-
-        // A slot is free and a successor is staged for it, but the
-        // successor has not bound yet: `is_joining()` holds the seal.
-        policy.on_execution_slot_released(runner);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_admission_queued(successor);
-        assert!(policy.is_joining());
-
-        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 11, 1, 1);
-        let queued: QueuedFireIds = [11].into_iter().collect();
-        let sealed = drive_past_join_settle(&mut policy, &queued);
-        assert_eq!(
-            fires(&sealed),
-            vec![11],
-            "the boundary must seal without the staged successor, whose bind \
-             cannot commit until this dispatch releases the control slot"
-        );
-
-        // Scoped to the bind: once the bind
-        // commits, the successor's admission is imminent again and the seal
-        // waits for it.
-        policy.on_bind_completed(Some(successor));
-        policy.on_fire_enqueued(stamp(runner, 2, 0, 1), Some(runner), 12, 1, 1);
-        let queued: QueuedFireIds = [12].into_iter().collect();
-        match plan(&mut policy, &queued, Instant::now()) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("a bound staged successor must hold the seal, got {plan:?}"),
-        }
-    }
-
-    /// A successor that already holds its execution slot is genuinely about
-    /// to fire, so the join gate must still wait for it even though it has
-    /// a bind outstanding. Without this the escape would fire on every
-    /// ordinary cohort turnover and shred epoch density.
-    #[test]
-    fn a_slotted_successor_still_holds_the_seal() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let runner = pid();
-        let successor = pid();
-
-        policy.on_fire_enqueued(stamp(runner, 0, 0, 1), Some(runner), 10, 1, 1);
-        let queued: QueuedFireIds = [10].into_iter().collect();
-        assert_eq!(fires(&drive_past_cold_hold(&mut policy, &queued)), vec![10]);
-
-        policy.on_execution_slot_released(runner);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_execution_slot_consumed(successor);
-        assert!(!policy.joins_in_flight.is_empty());
-
-        policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 11, 1, 1);
-        let queued: QueuedFireIds = [11].into_iter().collect();
-        match plan(&mut policy, &queued, Instant::now()) {
-            FramePlan::Hold(_) | FramePlan::Park => {}
-            plan => panic!("an admitted successor's first fire must be waited for, got {plan:?}"),
-        }
-        // ...but the wait is bounded: permit-to-first-fire is guest time, so
-        // the boundary seals dense-minus-one rather than idle on a promise.
-        assert_eq!(
-            fires(&drive_past_join_settle(&mut policy, &queued)),
-            vec![11],
-            "a joiner that misses the settle window stops holding the boundary"
-        );
-    }
-
-    /// A freed slot with a staged taker holds the seal; the successor's
-    /// admission converts the hold to an identity-paired join-in-flight,
-    /// and its first fire releases it — the incoming lane lands in the
-    /// same epoch as the fleet.
-    #[test]
-    fn freed_slot_with_staged_taker_gathers_the_join() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        let successor = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_bind_completed(Some(successor));
-        policy.on_admission_queued(successor);
-        policy.on_execution_slot_released(pid());
-        let queued: QueuedFireIds = [95].into_iter().collect();
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("a freed slot with a staged taker must hold, got {plan:?}"),
-        }
-        policy.on_execution_slot_consumed(successor);
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("an admitted-but-unfired join must hold, got {plan:?}"),
-        }
-        policy.on_fire_enqueued(stamp(successor, 0, 0, 1), Some(successor), 96, 1, 1);
-        let queued: QueuedFireIds = [95, 96].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
-        let mut wave0 = fires(&sealed);
-        wave0.sort_unstable();
-        assert_eq!(wave0, vec![95, 96], "both lanes gathered into one epoch");
-    }
-
-    /// REGRESSION (the frame-seal wedge). A joined-but-unfired successor that
-    /// parks in KV allocation must release the seal — and it has NO lane yet,
-    /// so the only thing that identifies it is the owner travelling with the
-    /// leave. `lanes` is keyed by pipeline scope while `staged` /
-    /// `joins_in_flight` are keyed by process; cleaning the latter with the
-    /// lane id silently matched nothing, so the gather waited forever for a
-    /// join that could not arrive while the fleet held every KV page.
-    #[test]
-    fn a_parked_join_releases_the_seal_even_though_it_has_no_lane() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        let successor = pid();
-        let successor_scope = pid(); // distinct id space from the process
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_bind_completed(Some(successor));
-        policy.on_execution_slot_released(pid());
-        policy.on_execution_slot_consumed(successor);
-        let queued: QueuedFireIds = [95].into_iter().collect();
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("an admitted-but-unfired join must hold, got {plan:?}"),
-        }
-
-        // It blocks on KV before ever firing: leave carries the scope id it
-        // waits under AND the owning process.
-        policy.on_lane_leave(successor_scope, Some(successor), false);
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
-        assert_eq!(
-            fires(&sealed),
-            vec![95],
-            "the fleet must seal without the parked join"
-        );
-    }
-
     /// The owner is still recovered from the lane when the caller does not
     /// supply one, so pipeline-scoped closes keep working unchanged.
     #[test]
@@ -2096,51 +1950,6 @@ mod tests {
             !policy.staged.contains(&owner),
             "the lane's recorded owner must clear the process-keyed staging"
         );
-    }
-
-    /// Regression: between a slot holder's Terminate leave and its
-    /// teardown's release broadcast the balance reads zero, and a seal
-    /// check in that window closed on the partial cohort — splitting the
-    /// fleet into two sub-cohorts that never re-merge (run-ahead lead is
-    /// hysteretic). The departure itself must hold: a leaving holder's
-    /// release is in flight, so its staged successor is gathered.
-    #[test]
-    fn departed_slot_holder_holds_the_seal_until_release_lands() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        let predecessor = pid();
-        let successor = pid();
-        // Predecessor consumed its slot from the initial pool and ran.
-        policy.on_execution_slot_consumed(predecessor);
-        // The survivor's next fire is queued; the successor is staged.
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_bind_completed(Some(successor));
-        policy.on_admission_queued(successor);
-        // Terminate leave lands pass-granular, release still in flight.
-        policy.on_slotted_terminate(predecessor);
-        policy.on_lane_leave(predecessor, None, true);
-        policy.on_process_leave(predecessor);
-        let queued: QueuedFireIds = [95].into_iter().collect();
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("a departed slot holder's in-flight release must hold, got {plan:?}"),
-        }
-        // The release lands (paired by the holder's identity): the hold
-        // converts to the freed-slot form, then to the identity-paired
-        // join, then the fire seals dense.
-        policy.on_execution_slot_released(predecessor);
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("freed slot with staged taker must keep holding, got {plan:?}"),
-        }
-        policy.on_execution_slot_consumed(successor);
-        policy.on_fire_enqueued(stamp(successor, 0, 0, 1), Some(successor), 96, 1, 1);
-        let queued: QueuedFireIds = [95, 96].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
-        let mut wave = fires(&sealed);
-        wave.sort_unstable();
-        assert_eq!(wave, vec![95, 96], "cohort gathered across the departure");
     }
 
     /// The departure hold arms only for actual slot holders, exactly once:
@@ -2174,34 +1983,6 @@ mod tests {
         );
     }
 
-    /// Preloaded free capacity gathers the initial fleet: while a free
-    /// slot has a staged taker, the first seal waits — the co-launched
-    /// herd lands in one aligned epoch instead of a ragged ramp.
-    #[test]
-    fn preloaded_free_slots_gather_the_initial_fleet() {
-        let mut policy = FramePolicy::new(1, 64, 4096, None);
-        policy.preload_free_slots(2);
-        let (a, b) = (pid(), pid());
-        policy.on_bind_enqueued(Some(a));
-        policy.on_bind_enqueued(Some(b));
-        policy.on_admission_queued(a);
-        policy.on_admission_queued(b);
-        policy.on_execution_slot_consumed(a);
-        policy.on_fire_enqueued(stamp(a, 10, 0, 1), Some(a), 10, 1, 1);
-        let queued: QueuedFireIds = [10].into_iter().collect();
-        match drive_past_cold_hold(&mut policy, &queued) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("free slot with staged taker must gather, got {plan:?}"),
-        }
-        policy.on_execution_slot_consumed(b);
-        policy.on_fire_enqueued(stamp(b, 11, 0, 1), Some(b), 11, 1, 1);
-        let queued: QueuedFireIds = [10, 11].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
-        let mut wave = fires(&sealed);
-        wave.sort_unstable();
-        assert_eq!(wave, vec![10, 11]);
-    }
-
     /// Regression (fleet-wide stall): released permits launder into
     /// the semaphore's free pool, so a consumer may admit UNCONTENDED — if
     /// only parked admissions notified, the balance stayed positive forever
@@ -2233,44 +2014,6 @@ mod tests {
             ),
             "a drained release must not hold for a staged bystander"
         );
-    }
-
-    /// Holds never outlive the successors they wait for: a joiner that
-    /// dies before firing (and a slot release with nobody staged) can
-    /// never wedge the seal.
-    #[test]
-    fn holds_never_outlive_departed_successors() {
-        let mut policy = FramePolicy::new(2, 64, 4096, None);
-        let lane = pid();
-        let successor = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
-        let queued: QueuedFireIds = [95].into_iter().collect();
-
-        // Slot released with an empty staged pool: no earmark, no hold.
-        policy.on_execution_slot_released(pid());
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
-        assert_eq!(fires(&sealed), vec![95]);
-
-        // Stage a successor (freed slot pending from above), admit it,
-        // then let it die before firing: the leave releases the hold.
-        policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 96, 1, 1);
-        policy.on_bind_enqueued(Some(successor));
-        policy.on_admission_queued(successor);
-        let queued: QueuedFireIds = [96].into_iter().collect();
-        match plan(&mut policy, &queued, Instant::now()) {
-            FramePlan::Hold(_) | FramePlan::Park => {}
-            plan => panic!("freed slot with staged taker must hold, got {plan:?}"),
-        }
-        policy.on_execution_slot_consumed(successor);
-        match plan(&mut policy, &queued, Instant::now()) {
-            FramePlan::Hold(_) | FramePlan::Park => {}
-            plan => panic!("join in flight must hold, got {plan:?}"),
-        }
-        policy.on_process_leave(successor);
-        assert!(matches!(
-            plan(&mut policy, &queued, Instant::now()),
-            FramePlan::Dispatch(_)
-        ));
     }
 
     #[test]
@@ -2432,11 +2175,13 @@ mod tests {
         );
     }
 
-    /// A member that stops submitting without parking is terminated once the
-    /// deadline elapses — this is the enforcement that makes wait-all's
-    /// "membership is a promise" a contract rather than a hope.
+    /// A member that stops submitting is dropped from the wait-set once the
+    /// deadline elapses, so the boundary seals without it — but it is NOT
+    /// failed. The leash is an involuntary `forward.park()`: the lane's next
+    /// fire rejoins it through the ordinary parked path. A guest that merely
+    /// lost a race for the CPU costs the fleet one epoch, not its request.
     #[test]
-    fn silent_member_is_terminated_at_the_submit_deadline() {
+    fn silent_member_is_leashed_at_the_submit_deadline() {
         let deadline = Duration::from_millis(50);
         let mut policy = FramePolicy::new(2, 64, 4096, None).with_submit_deadline(deadline);
         let (a, b) = (pid(), pid());
@@ -2456,15 +2201,82 @@ mod tests {
             "the clock arms on this pass; nothing is due yet"
         );
         assert_eq!(
-            plan(&mut policy, &queued, now + deadline),
-            FramePlan::Terminate(vec![a]),
-            "a held the seal for the whole deadline owing nothing"
+            fires(&plan(&mut policy, &queued, now + deadline)),
+            vec![210, 211],
+            "a leaves the wait-set at the deadline and b seals in the same pass"
         );
-        // The breaching lane is out of the wait-set already, so the very next
-        // plan seals b without waiting for the terminate to round-trip.
+        assert!(policy.leashed(a), "a left involuntarily, not by parking");
+
+        // Nothing was killed: a's next fire puts it back in the quorum.
+        policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 220, 1, 1);
+        assert!(!policy.leashed(a), "the submit ended the silence");
+        policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 221, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 1, 0, 2), Some(b), 230, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 1, 1, 2), Some(b), 231, 1, 1);
+        retire(&mut policy, [a, b]);
+        let queued: QueuedFireIds = [220, 221, 230, 231].into_iter().collect();
+        let mut sealed = fires(&drive_past_cold_hold(&mut policy, &queued));
+        sealed.sort_unstable();
+        assert_eq!(sealed, vec![220, 221, 230, 231], "a is a full member again");
+    }
+
+    /// The leash spares a slow guest; it does not spare an abandoned one. A
+    /// pipeline that means to stop calls `forward.park()`, which ends the
+    /// silence and is never killed. Staying silent through the leash and on
+    /// past the silence timeout is the breach the terminate answers.
+    #[test]
+    fn an_abandoned_lane_is_terminated_at_the_silence_timeout() {
+        let deadline = Duration::from_millis(50);
+        let silence = Duration::from_secs(30);
+        let mut policy = FramePolicy::new(2, 64, 4096, None)
+            .with_submit_deadline(deadline)
+            .with_silence_timeout(silence);
+        let (a, b) = (pid(), pid());
+        policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 240, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 241, 1, 1);
+        let queued: QueuedFireIds = [240, 241].into_iter().collect();
+        drive_past_cold_hold(&mut policy, &queued);
+        retire(&mut policy, [a]);
+
+        policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 250, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 251, 1, 1);
+        let queued: QueuedFireIds = [250, 251].into_iter().collect();
+        let now = Instant::now();
+        plan(&mut policy, &queued, now);
         assert_eq!(
-            fires(&drive_past_cold_hold(&mut policy, &queued)),
-            vec![210, 211]
+            fires(&plan(&mut policy, &queued, now + deadline)),
+            vec![250, 251]
+        );
+        assert!(policy.leashed(a));
+        retire(&mut policy, [b]);
+
+        // The scan rides the gather, so the fleet has to still be working for
+        // an abandoned lane to be noticed: b keeps submitting while a stays
+        // silent. (An engine with nothing at all to do parks and reaps
+        // nobody — there is no fleet to protect at that point.)
+        let mut tick = |policy: &mut FramePolicy, seq: u64, at: Instant| -> FramePlan {
+            let base = 260u64 + seq * 2;
+            policy.on_fire_enqueued(stamp(b, seq, 0, 2), Some(b), base, 1, 1);
+            policy.on_fire_enqueued(stamp(b, seq, 1, 2), Some(b), base + 1, 1, 1);
+            let queued: QueuedFireIds = [base, base + 1].into_iter().collect();
+            let out = plan(policy, &queued, at);
+            retire(policy, [b]);
+            out
+        };
+
+        // The clock does NOT restart at the leash: silence is measured from
+        // when it began, so a lane cannot buy time by being dropped.
+        assert!(
+            !matches!(
+                tick(&mut policy, 1, now + silence - deadline),
+                FramePlan::Terminate(_)
+            ),
+            "still inside the budget"
+        );
+        assert_eq!(
+            tick(&mut policy, 2, now + silence),
+            FramePlan::Terminate(vec![a]),
+            "silent through the leash and past the timeout, without parking"
         );
     }
 
@@ -2496,27 +2308,22 @@ mod tests {
         let queued: QueuedFireIds = [310].into_iter().collect();
         let now = Instant::now();
         for elapsed in [Duration::ZERO, deadline, deadline * 100] {
-            if let FramePlan::Terminate(ids) = plan(&mut policy, &queued, now + elapsed) {
-                assert!(
-                    !ids.contains(&a),
-                    "a is waiting on the engine, not the other way round"
-                );
-            }
+            plan(&mut policy, &queued, now + elapsed);
+            assert!(
+                !policy.leashed(a),
+                "a is waiting on the engine, not the other way round"
+            );
         }
 
         // The result lands. Only now does a's silence become its own, and it
         // is charged from that moment — not retroactively for the wait.
         policy.on_frame_retired([a]);
         let armed = now + deadline * 100;
-        assert!(!matches!(
-            plan(&mut policy, &queued, armed),
-            FramePlan::Terminate(_)
-        ));
-        let FramePlan::Terminate(expired) = plan(&mut policy, &queued, armed + deadline) else {
-            panic!("a owed nothing for a full deadline: it must be terminated");
-        };
+        plan(&mut policy, &queued, armed);
+        assert!(!policy.leashed(a));
+        plan(&mut policy, &queued, armed + deadline);
         assert!(
-            expired.contains(&a),
+            policy.leashed(a),
             "the clock starts at retirement and runs its full budget from there"
         );
     }
@@ -2598,7 +2405,8 @@ mod tests {
 
     /// The engine's own debts hold the clock: a lane whose rebind the engine
     /// has not finished cannot submit, so the deadline must not run against
-    /// it. Without this the deadline would kill guests for engine latency.
+    /// it. Without this the leash would drop guests for engine latency, and
+    /// the silence timeout would eventually kill them for it.
     #[test]
     fn engine_debt_suspends_the_deadline_clock() {
         let deadline = Duration::from_millis(50);
@@ -2627,13 +2435,9 @@ mod tests {
         // Bind done: now the clock runs, and only from here.
         policy.on_bind_completed(Some(a));
         let armed = now + deadline * 10;
-        assert!(!matches!(
-            plan(&mut policy, &queued, armed),
-            FramePlan::Terminate(_)
-        ));
-        assert_eq!(
-            plan(&mut policy, &queued, armed + deadline),
-            FramePlan::Terminate(vec![a])
-        );
+        plan(&mut policy, &queued, armed);
+        assert!(!policy.leashed(a));
+        plan(&mut policy, &queued, armed + deadline);
+        assert!(policy.leashed(a));
     }
 }

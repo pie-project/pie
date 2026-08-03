@@ -136,6 +136,7 @@ fn build_model(
         scheduler: pie_engine::bootstrap::SchedulerConfig {
             request_timeout_secs: m.scheduler.request_timeout_secs,
             submit_deadline_us: m.scheduler.submit_deadline_us,
+            silence_timeout_secs: m.scheduler.silence_timeout_secs,
         },
     })
 }

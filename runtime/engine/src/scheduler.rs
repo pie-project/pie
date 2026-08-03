@@ -156,10 +156,10 @@ pub async fn debug_dump(driver_id: usize) -> Result<String> {
 // Frame size (`PIE_FRAME_SIZE`) — the Vesuvius deployment constant k
 // =============================================================================
 
-/// How long a lane that is holding the frame wait-set may go without
-/// HARD-BLOCKING a frame's seal may go without submitting before the engine
-/// terminates it (`[model.scheduler] submit_deadline_us`, default 50ms).
-/// Guests read it as `model.submit-deadline-us()`.
+/// How long a lane that is hard-blocking a frame's seal may go without
+/// submitting before the engine stops waiting for it
+/// (`[model.scheduler] submit_deadline_us`, default 50ms). Guests read it as
+/// `model.submit-deadline-us()`.
 ///
 /// Small enough to be a real bound on fleet exposure because it measures a
 /// much narrower interval than its size suggests: the clock runs only while
@@ -168,8 +168,12 @@ pub async fn debug_dump(driver_id: usize) -> Result<String> {
 /// bind in flight, and by `forward.park()`. Host turnaround has its own
 /// headroom in `HOST_TURNAROUND_WAVES`.
 ///
-/// Static, deliberately: a number that can kill must not move, so unlike
-/// `channel-capacity` this is never adapted from runtime timing.
+/// This number can no longer kill: at the deadline the lane is dropped from
+/// the wait-set (an involuntary `forward.park()`), its queued frames still
+/// dispatch, and its next fire rejoins. It is a density bound — how long the
+/// fleet waits for a straggler — so a value that is too small costs a little
+/// epoch density and never a request. Termination is a separate, far longer
+/// verdict; see [`configured_silence_timeout`].
 pub fn configured_submit_deadline() -> Duration {
     *SUBMIT_DEADLINE.get_or_init(|| Duration::from_micros(50_000))
 }
@@ -181,6 +185,25 @@ pub fn set_submit_deadline(deadline: Duration) {
 }
 
 static SUBMIT_DEADLINE: OnceLock<Duration> = OnceLock::new();
+
+/// How long a lane may stay silent in total before its process is
+/// terminated. Unlike the leash above this IS a verdict, so it is generous:
+/// the leash already keeps a straggler from holding the fleet, which means
+/// nothing but an abandoned pipeline ever reaches this. A guest that means to
+/// go quiet calls `forward.park()`, which ends the silence and is never
+/// killed — that is exactly the contract this enforces.
+///
+/// Configured by `[model.scheduler] silence_timeout_secs` (default 30s).
+pub fn configured_silence_timeout() -> Duration {
+    *SILENCE_TIMEOUT.get_or_init(|| Duration::from_secs(30))
+}
+
+/// Install the configured silence timeout at bootstrap. First writer wins.
+pub fn set_silence_timeout(timeout: Duration) {
+    let _ = SILENCE_TIMEOUT.set(timeout);
+}
+
+static SILENCE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
 /// Waves per frame (k): a static deployment constant, fixed at engine start
 /// exactly like the KV page size — never renegotiated per frame and never

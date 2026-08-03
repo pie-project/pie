@@ -4023,22 +4023,28 @@ impl BatchScheduler {
                     }
                     FramePlan::Park => break,
                     FramePlan::Terminate(pids) => {
-                        // Submit-deadline breach. The policy has already
-                        // dropped these lanes from the wait-set, so the
+                        // Abandoned pipeline. This is NOT the submit
+                        // deadline: that one only leashes (drops the lane
+                        // from the wait-set and lets it rejoin), so a guest
+                        // that is merely slow never lands here. Reaching this
+                        // means the lane was silent for the whole silence
+                        // timeout without ever calling `forward.park()`, so
+                        // nothing but a wedged process is being reclaimed.
+                        // The policy has already dropped these lanes, so the
                         // `continue` re-plans a gather that no longer waits
-                        // on them; the terminate itself is asynchronous and
-                        // arrives back as the usual leave.
+                        // on them; the terminate is asynchronous and arrives
+                        // back as the usual leave.
                         for pid in pids {
                             tracing::error!(
                                 pid = %pid,
-                                "scheduler: terminating process for submit-deadline breach \
-                                 (held the frame wait-set without submitting; a pipeline that \
-                                 intends to stop must call forward.park())"
+                                "scheduler: terminating abandoned pipeline (silent for the \
+                                 whole silence timeout without submitting and without \
+                                 calling forward.park())"
                             );
                             crate::inferlet::process::terminate(
                                 pid,
-                                Err("submit deadline exceeded: the pipeline held a frame's \
-                                     wait-set without submitting and without parking"
+                                Err("pipeline abandoned: silent past the silence timeout \
+                                     without submitting and without parking"
                                     .to_string()),
                             );
                         }
