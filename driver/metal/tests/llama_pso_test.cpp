@@ -81,6 +81,52 @@ int main() {
     expect(!dense_psos.valid_for(moe),
            "the dense set does NOT satisfy a routed geometry");
 
+    // Llama-3.2-1B is 32 query heads of 64, not 8 of 128, and a set compiled
+    // for 128 handed 64-wide heads does not fail -- it strides past the end of
+    // every head and writes zeros, which is a model that runs and says nothing.
+    // So the width has to be an instantiation that is actually ASKED for.
+    LlamaGeometry narrow = dense;
+    narrow.head_dim = 64;
+    narrow.n_q_heads = 32;
+    narrow.n_kv_heads = 8;
+    LlamaPsos narrow_psos;
+    err.clear();
+    expect(build_llama_psos(*ctx, kernels_dir, narrow, narrow_psos, &err),
+           "a 64-wide head compiles its own attention: " + err);
+    expect(narrow_psos.valid_for(narrow), "and satisfies the geometry that asked for it");
+    expect(narrow_psos.sdpa.obj != dense_psos.sdpa.obj,
+           "which is a DIFFERENT pipeline from the 128-wide one");
+    expect(narrow_psos.sdpa_paged.obj != dense_psos.sdpa_paged.obj,
+           "paged too");
+    expect(narrow_psos.sdpa_paged_tiled.obj != dense_psos.sdpa_paged_tiled.obj,
+           "and tiled");
+
+    // A width nothing instantiates is a named compile failure at load, not a
+    // pipeline built for some other width.
+    LlamaGeometry unknown = dense;
+    unknown.head_dim = 96;
+    LlamaPsos unknown_psos;
+    err.clear();
+    expect(!build_llama_psos(*ctx, kernels_dir, unknown, unknown_psos, &err),
+           "an uninstantiated head width is refused, not approximated");
+    expect(err.find("_d_96") != std::string::npos,
+           "and the refusal names the width it could not find [" + err + "]");
+
+    // Llama 3.1's rope is a frequency TABLE, and the two kernels that read one
+    // are compiled only for a geometry that says so.
+    LlamaGeometry tabled = dense;
+    tabled.rope_freq_table = true;
+    expect(!dense_psos.valid_for(tabled),
+           "the base set does NOT satisfy a table-driven rope");
+    LlamaPsos tabled_psos;
+    err.clear();
+    expect(build_llama_psos(*ctx, kernels_dir, tabled, tabled_psos, &err),
+           "the table-driven rope compiles: " + err);
+    expect(tabled_psos.rope_table_valid() && tabled_psos.valid_for(tabled),
+           "and satisfies the geometry that asked for it");
+    expect(!dense_psos.rope_table_valid(),
+           "while a geometric-series checkpoint compiles neither");
+
     LlamaPsos moe_psos;
     err.clear();
     expect(build_llama_psos(*ctx, kernels_dir, moe, moe_psos, &err),

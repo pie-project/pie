@@ -1186,6 +1186,23 @@ void RawMetalContext::release_argtable_ordinal(int ordinal) {
 
 namespace {
 
+/// Whether `lib` really exports `fn`.
+///
+/// Asked BEFORE building a pipeline descriptor, because a
+/// `MTL4LibraryFunctionDescriptor` naming a function the library does not have
+/// is not an error the compiler returns -- Metal asserts inside
+/// `setComputeFunction:` and kills the process. That is the wrong outcome for a
+/// name this driver derives: `sdpa_paged_decode_bfloat16_d_96` is what a
+/// checkpoint with an uninstantiated head width asks for, and the honest answer
+/// is a refusal that names the width, not a crash with no context.
+bool library_has_function(id<MTLLibrary> lib, const std::string& fn) {
+    NSString* want = [NSString stringWithUTF8String:fn.c_str()];
+    for (NSString* have in lib.functionNames) {
+        if ([have isEqualToString:want]) return true;
+    }
+    return false;
+}
+
 Pso compile_pso_impl(
     RawMetalContext::Impl& I,
     const std::string& src,
@@ -1209,6 +1226,10 @@ Pso compile_pso_impl(
                               error:&e];
     if (lib == nil) {
         if (error) *error = e.localizedDescription.UTF8String;
+        return out;
+    }
+    if (!library_has_function(lib, fn)) {
+        if (error) *error = "the library compiled but exports no '" + fn + "'";
         return out;
     }
     MTL4LibraryFunctionDescriptor* fd = [MTL4LibraryFunctionDescriptor new];
@@ -1439,6 +1460,11 @@ std::vector<Pso> RawMetalContext::compile_psos_from_files(
         const size_t li = request_library[i];
         if (libraries[li] == nil) {
             pso_errors[i] = library_errors[li];
+            continue;
+        }
+        if (!library_has_function(libraries[li], requests[i].function)) {
+            pso_errors[i] =
+                "the library compiled but exports no '" + requests[i].function + "'";
             continue;
         }
         MTL4LibraryFunctionDescriptor* fd = [MTL4LibraryFunctionDescriptor new];

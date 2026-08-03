@@ -16,6 +16,7 @@
 //   mixtral-shaped   routed, no qk-norm    — proving the two axes are independent
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -23,6 +24,7 @@
 
 #include "batch/forward.hpp"
 #include "model/llama/decode_step.hpp"
+#include "model/llama/kernels.hpp"
 #include "model/llama/llama_contract.hpp"
 #include "model/llama/bind.hpp"
 #include "model/llama/decode_consts.hpp"
@@ -608,6 +610,80 @@ void check_shared_experts_are_refused_rather_than_dropped() {
            "and the sigmoid gate that scales it");
 }
 
+/// Llama 3.1's rope schedule, on Llama-3.2-1B's own numbers.
+///
+/// Three bands, and the whole point of the schedule is that they differ. The
+/// fast channels are left alone so short-range structure is unchanged; the slow
+/// ones are divided by the whole factor so the context stretches; between them
+/// a ramp. A table that scaled everything -- which is what approximating this
+/// with `rope_scale` does -- would fail the first and third of these together.
+void check_llama3_schedule() {
+    using Facts = pie::metal::batch::SetupConfig::LlamaFacts;
+    Facts f;
+    f.n_layers = 16; f.hidden = 2048; f.vocab = 128256;
+    f.n_q_heads = 32; f.n_kv_heads = 8; f.head_dim = 64;
+    f.intermediate = 8192;
+    f.rope_theta = 500000.0f;
+    f.rope_scaling_kind = "llama3";
+    f.rope_scale = 32.0f;
+    f.rope_low_freq_factor = 1.0f;
+    f.rope_high_freq_factor = 4.0f;
+    f.rope_original_max_position = 8192;
+
+    LlamaGeometry g;
+    std::string err;
+    if (!pie::metal::llama::geometry_from_facts(f, g, &err)) {
+        expect(false, "Llama-3.2-1B's llama3 geometry builds [" + err + "]");
+        return;
+    }
+    expect(g.rope_freq_table, "llama3 asks for a frequency table");
+    // The factor divides frequencies inside the table. Leaving it in
+    // `rope_scale` too would divide the position by it as well.
+    expect(g.rope_scaling_factor == 32.0f, "the factor is carried as the schedule's own");
+    expect(g.rope_scale == 1.0f, "and is NOT left in the linear position scale");
+
+    const std::vector<float> table = pie::metal::llama::llama3_inv_freq(g);
+    expect(int(table.size()) == g.rotary_dims() / 2,
+           "the table has one entry per rotated pair");
+
+    const auto base_inv = [&](int i) {
+        return 1.0f / std::pow(g.rope_theta, float(2 * i) / float(g.rotary_dims()));
+    };
+    const auto close = [](float a, float b) {
+        return std::abs(a - b) <= 1e-4f * std::max(1.0f, std::abs(b));
+    };
+
+    // i = 0: wavelength 2*pi, far below orig/high_freq_factor = 2048. Untouched.
+    expect(close(table[0], base_inv(0)), "the fastest channel is left alone");
+    // The last channel's wavelength is 2*pi*500000^(62/64) ~ 2.6e6, far above
+    // orig/low_freq_factor = 8192. Divided by the whole factor.
+    const int last = int(table.size()) - 1;
+    expect(close(table[std::size_t(last)], base_inv(last) / 32.0f),
+           "the slowest channel is divided by the whole factor");
+
+    // And somewhere between them a channel that is neither: strictly slower
+    // than untouched, strictly faster than fully scaled. Without the ramp this
+    // would have to be one or the other.
+    int ramped = -1;
+    for (int i = 0; i <= last; ++i) {
+        const float t = table[std::size_t(i)];
+        if (!close(t, base_inv(i)) && !close(t, base_inv(i) / 32.0f)) { ramped = i; break; }
+    }
+    expect(ramped > 0, "a band between them is interpolated, not switched");
+    if (ramped > 0) {
+        const float t = table[std::size_t(ramped)];
+        expect(t < base_inv(ramped) && t > base_inv(ramped) / 32.0f,
+               "and it lands between the two bands it interpolates");
+    }
+
+    // The table is monotone: a slower channel is never given a faster rate.
+    bool monotone = true;
+    for (int i = 1; i <= last; ++i) {
+        if (table[std::size_t(i)] > table[std::size_t(i - 1)]) monotone = false;
+    }
+    expect(monotone, "and no channel is turned faster than a faster one");
+}
+
 void check_refusals() {
     using Facts = pie::metal::batch::SetupConfig::LlamaFacts;
     const auto moe = [] {
@@ -657,10 +733,32 @@ void check_refusals() {
     refused(wide_n, "single threadgroup can rank",
             "n_experts past a threadgroup is refused");
 
-    // Llama 3.1's piecewise schedule, which `rope_neox` does not implement.
+    // Llama 3.1's piecewise schedule IS implemented, as a frequency table.
     Facts llama3_rope = moe();
     llama3_rope.rope_scaling_kind = "llama3";
-    refused(llama3_rope, "rope_scaling", "an unimplemented rope_scaling is refused");
+    accepted(llama3_rope, "llama3 rope_scaling is accepted");
+    // Anything else still is not. Approximating a per-channel schedule with the
+    // linear scale runs, and is wrong past the original context length.
+    Facts longrope = moe();
+    longrope.rope_scaling_kind = "longrope";
+    refused(longrope, "rope_scaling", "an unimplemented rope_scaling is still refused");
+
+    // The two degenerate schedules. `lo == hi` divides by zero in the ramp;
+    // a non-positive original context makes every wavelength comparison
+    // vacuous. Both produce a table of plausible-looking wrong angles.
+    Facts flat_band = moe();
+    flat_band.rope_scaling_kind = "llama3";
+    flat_band.rope_low_freq_factor = 4.0f;
+    flat_band.rope_high_freq_factor = 4.0f;
+    refused(flat_band, "low_freq_factor != high_freq_factor",
+            "llama3 with no ramp between its bands is refused");
+    Facts no_orig = moe();
+    no_orig.rope_scaling_kind = "llama3";
+    no_orig.rope_original_max_position = 0;
+    refused(no_orig, "positive original_max_position",
+            "llama3 without an original context length is refused");
+
+    check_llama3_schedule();
 
     // A routed config missing the half of itself the router needs.
     Facts no_k = moe();

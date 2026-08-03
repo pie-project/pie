@@ -54,9 +54,26 @@ struct LlamaGeometry {
     bool qk_norm = false;
 
     float rope_theta = 500000.0f;
-    /// Linear position scale, 1.0 for none. Llama 3.1's piecewise `llama3`
-    /// scaling is NOT this, and is refused rather than approximated by it.
+    /// Linear position scale, 1.0 for none. Under `llama3` this is that
+    /// schedule's `factor` instead, and it divides FREQUENCIES rather than
+    /// positions -- which is why the two cannot share a code path and why
+    /// approximating one with the other runs and is wrong past the original
+    /// context.
     float rope_scale = 1.0f;
+    /// Llama 3.1's piecewise schedule, when `rope_freq_table` is true.
+    /// `rope_scaling_factor` is its `factor` -- kept apart from `rope_scale`
+    /// because the two act on different things: this one divides the
+    /// frequencies inside the table, that one divides the position outside it,
+    /// and letting one field mean both applies the factor twice.
+    float rope_scaling_factor = 1.0f;
+    float rope_low_freq_factor = 1.0f;
+    float rope_high_freq_factor = 4.0f;
+    int rope_original_max_position = 8192;
+    /// Whether the rotary frequencies are a TABLE rather than a geometric
+    /// series in `rope_theta`. One predicate, asked by the PSO choice, the
+    /// constant binding and the kernel's ABI alike -- they must agree, and a
+    /// disagreement is a rotation by the wrong angle rather than a crash.
+    bool rope_freq_table = false;
 
     /// Dense SwiGLU width. Unused when `is_moe()`.
     int intermediate = 14336;
@@ -113,14 +130,14 @@ inline bool geometry_from_facts(const Facts& f, LlamaGeometry& out, std::string*
                       " is not a multiple of n_kv_heads " + std::to_string(f.n_kv_heads) +
                       ", which GQA requires");
     }
-    // A `rope_scaling` other than a plain linear factor changes the frequency
-    // schedule per channel, which `rope_neox` does not implement. Refusing is
-    // the honest outcome: approximating it with the linear scale runs, and is
-    // wrong past the original context length.
+    // `llama3` is a table (see `llama3_inv_freq`); linear and default are the
+    // plain geometric series. Anything else -- longrope, dynamic -- is refused,
+    // because approximating a per-channel schedule with the linear scale runs
+    // and is wrong past the original context length.
     if (!f.rope_scaling_kind.empty() && f.rope_scaling_kind != "linear" &&
-        f.rope_scaling_kind != "default") {
+        f.rope_scaling_kind != "default" && f.rope_scaling_kind != "llama3") {
         return refuse("rope_scaling type '" + f.rope_scaling_kind +
-                      "' is not implemented; only an absent or linear scaling is");
+                      "' is not implemented; only an absent, linear or llama3 scaling is");
     }
 
     out.n_layers = f.n_layers;
@@ -134,6 +151,25 @@ inline bool geometry_from_facts(const Facts& f, LlamaGeometry& out, std::string*
     out.tied_embeddings = f.tied_embeddings;
     out.rope_theta = f.rope_theta;
     out.rope_scale = f.rope_scale > 0.0f ? f.rope_scale : 1.0f;
+    out.rope_freq_table = f.rope_scaling_kind == "llama3";
+    out.rope_low_freq_factor = f.rope_low_freq_factor;
+    out.rope_high_freq_factor = f.rope_high_freq_factor;
+    out.rope_original_max_position = f.rope_original_max_position;
+    if (out.rope_freq_table) {
+        // The table divides frequencies; the kernel's own `scale` divides
+        // positions. Leaving `factor` in both applies it twice, which is a
+        // rope that runs at a plausible-looking wrong rate.
+        out.rope_scaling_factor = out.rope_scale;
+        if (out.rope_low_freq_factor == out.rope_high_freq_factor) {
+            return refuse("llama3 rope_scaling needs low_freq_factor != high_freq_factor; "
+                          "both are " + std::to_string(out.rope_low_freq_factor));
+        }
+        if (out.rope_original_max_position <= 0) {
+            return refuse("llama3 rope_scaling needs a positive "
+                          "original_max_position_embeddings");
+        }
+        out.rope_scale = 1.0f;
+    }
     out.intermediate = f.intermediate;
     out.n_experts = f.n_experts;
     out.experts_per_token = f.experts_per_token;

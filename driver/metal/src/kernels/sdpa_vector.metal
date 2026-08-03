@@ -139,3 +139,6 @@ instantiate_sdpa_decode(bfloat16, bfloat, 256, 256)
 // 128-wide head. The template is parameterised on D precisely so a new head
 // width is an instantiation and not a kernel.
 instantiate_sdpa_decode(bfloat16, bfloat, 128, 128)
+// Llama 3.2's small sizes halve the head instead of the head count: 1B and 3B
+// are 32 query heads of 64. Same template, one more width.
+instantiate_sdpa_decode(bfloat16, bfloat, 64, 64)

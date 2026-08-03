@@ -1,5 +1,6 @@
 #include "kernels.hpp"
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -15,12 +16,23 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         Pso* dst;
     };
     // bf16 throughout: the activation dtype every ported M=1 kernel already uses.
+    // The head width is the geometry's, not a literal: see `LlamaPsos::sdpa`.
+    // A width with no instantiation fails here, by name, instead of running a
+    // pipeline built for a different one.
+    const std::string d = "_d_" + std::to_string(g.head_dim);
+    const std::string sdpa_name = "sdpa_vector_decode_bfloat16" + d;
+    const std::string paged_name = "sdpa_paged_decode_bfloat16" + d;
+    const std::string tiled_name = "sdpa_paged_tiled_bfloat16" + d;
     std::vector<Spec> specs = {
-        {"sdpa_vector.metal", "sdpa_vector_decode_bfloat16_d_128", &out.sdpa_d128},
-        {"sdpa_paged.metal", "sdpa_paged_decode_bfloat16_d_128", &out.sdpa_paged_d128},
-        {"sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_128", &out.sdpa_paged_tiled_d128},
+        {"sdpa_vector.metal", sdpa_name.c_str(), &out.sdpa},
+        {"sdpa_paged.metal", paged_name.c_str(), &out.sdpa_paged},
+        {"sdpa_paged.metal", tiled_name.c_str(), &out.sdpa_paged_tiled},
         {"row_gather.metal", "row_gather_bfloat16", &out.row_gather},
     };
+    if (g.rope_freq_table) {
+        specs.push_back({"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs});
+        specs.push_back({"rope.metal", "rope_neox_freqs_mb_bfloat16", &out.rope_freqs_mb});
+    }
     // Only for a routed checkpoint. A dense one never dispatches these, and
     // compiling them anyway would let an unrelated shader error fail a load
     // that would otherwise have worked.
@@ -59,6 +71,41 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         }
     }
     return true;
+}
+
+std::vector<float> llama3_inv_freq(const LlamaGeometry& g) {
+    const int dims = g.rotary_dims();
+    const int half = dims / 2;
+    std::vector<float> inv_freq(std::size_t(half < 1 ? 1 : half), 0.0f);
+    if (half < 1) return inv_freq;
+
+    const float base = g.rope_theta;
+    const float factor = g.rope_scaling_factor > 0.0f ? g.rope_scaling_factor : 1.0f;
+    const float lo = g.rope_low_freq_factor;
+    const float hi = g.rope_high_freq_factor;
+    const float orig = float(g.rope_original_max_position);
+    const float low_wavelen = orig / lo;
+    const float high_wavelen = orig / hi;
+
+    for (int i = 0; i < half; ++i) {
+        // mlx's `_freqs` is base^(2i/dims) -- a WAVELENGTH-like quantity, the
+        // reciprocal of the usual inv_freq. The schedule is expressed on it,
+        // so it is computed on it and inverted once at the end.
+        const float freq = std::pow(base, float(2 * i) / float(dims));
+        const float wavelen = 2.0f * float(M_PI) * freq;
+        float scaled = freq;
+        if (wavelen > low_wavelen) {
+            // Turns too slowly to extrapolate: interpolate by the whole factor.
+            scaled = freq * factor;
+        } else if (wavelen > high_wavelen) {
+            // The ramp. Below `high_wavelen` the dimension is left alone, which
+            // is the untouched `scaled = freq` this branch falls past.
+            const float smooth = (orig / wavelen - lo) / (hi - lo);
+            scaled = freq / ((1.0f - smooth) / factor + smooth);
+        }
+        inv_freq[std::size_t(i)] = scaled != 0.0f ? 1.0f / scaled : 0.0f;
+    }
+    return inv_freq;
 }
 
 }  // namespace pie::metal::llama

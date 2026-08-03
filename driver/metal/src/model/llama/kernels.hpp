@@ -52,14 +52,27 @@ using shared_kernels::router_topk_dispatch;
 
 /// The PSOs this family needs beyond the shared decode set.
 struct LlamaPsos {
-    /// 128-wide heads, decode and paged.
-    Pso sdpa_d128{};
-    Pso sdpa_paged_d128{};
+    /// Attention at the geometry's OWN head width, decode and paged.
+    ///
+    /// These used to be named `_d128` and compiled from a literal 128, which is
+    /// the width llama, mistral, qwen2, qwen3 and the Qwen MoEs all happen to
+    /// use. Llama-3.2-1B is 32 heads of 64, and a d=128 pipeline handed 64-wide
+    /// heads does not fail -- it strides past the end of every head and writes
+    /// zeros. The width is now spelled from `g.head_dim`, so a checkpoint whose
+    /// width has no instantiation fails to COMPILE a pipeline, by name, at load.
+    Pso sdpa{};
+    Pso sdpa_paged{};
     /// The same paged attention with the query rows tiled -- one row per
     /// simdgroup, K/V staged per threadgroup. Chosen by row count, not by
     /// model: see `sdpa_should_tile`.
-    Pso sdpa_paged_tiled_d128{};
+    Pso sdpa_paged_tiled{};
     Pso row_gather{};
+    /// RoPE from a supplied frequency table, decode and batched. Compiled only
+    /// when `g.rope_freq_table` -- a checkpoint whose frequencies really are a
+    /// geometric series runs the base form, and compiling a kernel it never
+    /// dispatches would let an unrelated shader error fail a load that works.
+    Pso rope_freqs{};
+    Pso rope_freqs_mb{};
 
     // Routed FFN. Left invalid on a dense checkpoint -- see `valid()`.
     Pso router_topk{};
@@ -76,8 +89,11 @@ struct LlamaPsos {
     Pso qmm_routed[3]{};
 
     bool dense_valid() const {
-        return sdpa_d128.valid() && sdpa_paged_d128.valid() &&
-               sdpa_paged_tiled_d128.valid() && row_gather.valid();
+        return sdpa.valid() && sdpa_paged.valid() &&
+               sdpa_paged_tiled.valid() && row_gather.valid();
+    }
+    bool rope_table_valid() const {
+        return rope_freqs.valid() && rope_freqs_mb.valid();
     }
     bool moe_valid() const {
         return router_topk.valid() && qmv_routed.valid() &&
@@ -88,13 +104,31 @@ struct LlamaPsos {
     /// a model that never dispatches them would make an unrelated shader error
     /// fail a load that would otherwise work.
     bool valid_for(const LlamaGeometry& g) const {
-        return dense_valid() && (!g.is_moe() || moe_valid());
+        return dense_valid() && (!g.is_moe() || moe_valid()) &&
+               (!g.rope_freq_table || rope_table_valid());
     }
 };
 
 /// Compile them. `g` decides whether the routed set is requested at all.
 bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
                       const LlamaGeometry& g, LlamaPsos& out, std::string* err);
+
+/// Llama 3.1's rotary frequencies, ported from
+/// `mlx_lm/models/rope_utils.py::Llama3RoPE`.
+///
+/// A rotary dimension's WAVELENGTH decides what happens to it. Dimensions
+/// whose wavelength is longer than the original context could hold (they turn
+/// less than `low_freq_factor` times in it) are interpolated by the full
+/// factor; those short enough to turn more than `high_freq_factor` times are
+/// left alone, because extrapolating them is safe; between the two the
+/// schedule ramps smoothly. That is a closed form over `rotary_dims/2` values
+/// with no dependence on position, so the host computes it once at setup
+/// rather than every head recomputing it every token -- which is exactly what
+/// `rope_neox_freqs_*` was built to consume.
+///
+/// Returns `inv_freq`, the RECIPROCAL of mlx's `_freqs`: `mx.fast.rope` divides
+/// the position by its table and this kernel multiplies by its own.
+std::vector<float> llama3_inv_freq(const LlamaGeometry& g);
 
 // ── Launch geometry ─────────────────────────────────────────────────────────
 

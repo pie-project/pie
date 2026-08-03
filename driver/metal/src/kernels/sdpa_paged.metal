@@ -364,6 +364,7 @@ template <typename T, int D, int V = D, bool WITH_SINK = false>
       uint3, uint3, uint, uint);
 
 instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 128, 128, false)
+instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 64, 64, false)
 
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
@@ -387,4 +388,5 @@ instantiate_sdpa_paged(float16, half, 256, 256)
 instantiate_sdpa_paged(bfloat16, bfloat, 256, 256)
 instantiate_sdpa_paged(bfloat16, bfloat, 512, 512)  // gemma4 full-attn (head_dim 512)
 instantiate_sdpa_paged(bfloat16, bfloat, 128, 128)  // llama / qwen (head_dim 128)
+instantiate_sdpa_paged(bfloat16, bfloat, 64, 64)  // llama 3.2 1B/3B (head_dim 64)
 instantiate_sdpa_paged_sink(bfloat16, bfloat, 64, 64)  // gpt-oss (head_dim 64)

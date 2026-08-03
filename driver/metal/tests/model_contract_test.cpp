@@ -34,6 +34,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "model_facts.hpp"
 #include "pie_loader.h"
 #include "pie_loader/model_contract.hpp"
 #include "pie_loader/plan.hpp"
@@ -406,12 +407,14 @@ void check_well_formed(const pie_loader::Checkpoint& checkpoint,
                   std::string("Src '") + std::string(view_of(n.name)) +
                       "' names a tensor the checkpoint has");
         }
-        // This driver renames and reinterprets; it shards nothing and packs
-        // nothing. Anything else appearing here is a schema that grew a
-        // transform the Metal binder has no kernel for.
+        // This driver renames, reinterprets, and narrows a float that is not
+        // already BF16; it shards nothing and packs nothing. Anything else
+        // appearing here is a schema that grew a transform the Metal binder has
+        // no kernel for.
         check(kind_of(n) == pie_loader::PieLoaderExprKind::Src ||
-                  kind_of(n) == pie_loader::PieLoaderExprKind::Transmute,
-              "the Metal schema authors only Src and Transmute");
+                  kind_of(n) == pie_loader::PieLoaderExprKind::Transmute ||
+                  kind_of(n) == pie_loader::PieLoaderExprKind::Cast,
+              "the Metal schema authors only Src, Transmute and Cast");
     }
     check(sources > 0, "the contract reads the checkpoint");
 }
@@ -459,8 +462,20 @@ int main() {
 
     const char* snapshot = std::getenv("PIE_TEST_SNAPSHOT");
     if (snapshot != nullptr && *snapshot != '\0') {
-        const char* model_type = std::getenv("PIE_TEST_MODEL_TYPE");
-        author_real_contract(snapshot, model_type != nullptr ? model_type : "qwen3_5");
+        // Read from the checkpoint, not defaulted. This used to fall back to
+        // "qwen3_5", so pointing it at a Llama snapshot ran the WRONG schema and
+        // reported "Qwen3.5 schema has no mapping for model.embed_tokens.biases"
+        // -- a true sentence about a question nobody asked. `PIE_TEST_MODEL_TYPE`
+        // still overrides, for the case where the point is to run a schema
+        // against a checkpoint it does not claim.
+        const char* forced = std::getenv("PIE_TEST_MODEL_TYPE");
+        std::string model_type = forced != nullptr ? forced
+                                                   : pie::metal::read_model_facts(snapshot).model_type;
+        if (model_type.empty()) {
+            check(false, "the snapshot's config.json names no model_type");
+        } else {
+            author_real_contract(snapshot, model_type);
+        }
     }
 
     if (failures != 0) {

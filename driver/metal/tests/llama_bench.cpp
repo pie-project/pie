@@ -346,6 +346,13 @@ int main(int argc, char** argv) {
             // they spell is not the gate's business.
             {"Qwen3.5-0.8B", 24, 0, {12095, 13, 576, 6722, 315, 198},
              {785, 6722, 315, 9625, 374, 12095}},
+            // Llama-3.2-1B reads these ids as its own vocabulary's text, not
+            // the sentence Qwen spells, so the continuation is a different
+            // sentence -- and it is the only entry here whose rotation comes
+            // from a TABLE (`rope_scaling: llama3`, factor 32) rather than a
+            // geometric series, which is the thing this row gates.
+            {"Llama-3.2-1B", 16, 0, {12095, 13, 1115, 374, 279, 1890},
+             {785, 6722, 315, 9625, 374, 12095}},
         };
         const Known* ref = nullptr;
         for (const Known& k : known) {
@@ -393,7 +400,12 @@ int main(int argc, char** argv) {
             return true;
         };
 
-        if (!gate(p, want, "greedy continuation matches mlx-lm")) return 1;
+        // A failing gate is exactly when the taps are wanted, so under
+        // `PIE_METAL_GOLDEN_DIR` the failure is remembered and the dump below
+        // still runs. Without it, stop: the numbers after a wrong answer are
+        // the speed of computing the wrong thing.
+        const bool dumping = std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr;
+        if (!gate(p, want, "greedy continuation matches mlx-lm") && !dumping) return 1;
 
         // The same check again on a prompt long enough to take the BATCHED
         // mixture. Stated as a precondition rather than assumed: the threshold
@@ -414,7 +426,7 @@ int main(int argc, char** argv) {
             }
             std::printf("  ....  long gate: %zu rows, batched mixture\n", lp.size());
             if (!gate(lp, ref->want_long,
-                      "batched-mixture continuation matches mlx-lm")) {
+                      "batched-mixture continuation matches mlx-lm") && !dumping) {
                 return 1;
             }
         }
@@ -426,7 +438,7 @@ int main(int argc, char** argv) {
         // when taps are asked for, this is the whole run -- and the dump then
         // corresponds to exactly the token list printed here, rather than to
         // whichever synthetic fire happened to go last.
-        if (std::getenv("PIE_METAL_GOLDEN_DIR") != nullptr) {
+        if (dumping) {
             // One more prefill, on its own pages, so what lands in the dump is
             // the PROMPT's fire rather than the last of the gate's one-row
             // decodes. The gate above has already run; this only re-publishes.

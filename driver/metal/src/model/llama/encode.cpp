@@ -172,6 +172,13 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
                     break;
                 case Kind::RopeQ:
                 case Kind::RopeK:
+                    // The table form first: a llama3 checkpoint's frequencies
+                    // are not a geometric series, and the base kernel would
+                    // rotate every dimension by the wrong angle past the
+                    // original context while running perfectly well.
+                    if (g.rope_freq_table && ll.rope_freqs_mb.valid()) {
+                        return ll.rope_freqs_mb;
+                    }
                     if (mb->rope_mb.valid()) return mb->rope_mb;
                     break;
                 default:
@@ -181,14 +188,23 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
     }
 
     switch (d.kind) {
+        case Kind::RopeQ:
+        case Kind::RopeK:
+            if (g.rope_freq_table && ll.rope_freqs.valid()) return ll.rope_freqs;
+            break;
+        default:
+            break;
+    }
+
+    switch (d.kind) {
         // The family's own PSOs: a 128-wide head, and the routed set.
         case Kind::Sdpa:
             // Asked with the same row count `launch_shape` uses, because the
             // two answers must agree: the tiled kernel's grid is N/32 tall and
             // the per-row kernel's is N, so choosing one here and shaping the
             // other there launches a thirty-second of the attention.
-            if (!g.paged_kv_enabled) return ll.sdpa_d128;
-            return sdpa_should_tile(R) ? ll.sdpa_paged_tiled_d128 : ll.sdpa_paged_d128;
+            if (!g.paged_kv_enabled) return ll.sdpa;
+            return sdpa_should_tile(R) ? ll.sdpa_paged_tiled : ll.sdpa_paged;
         // The append follows attention. Both KV kinds must agree on the ABI:
         // the binder writes page tables into slots the ring kernel reads as a
         // head stride, so a mismatch here is a scatter through a pointer made

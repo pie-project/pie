@@ -19,10 +19,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
 
 #include "../../batch/decode_abi.hpp"
 #include "../shared_kernels.hpp"
 #include "encode.hpp"
+#include "kernels.hpp"
 #include "scratch.hpp"
 
 namespace pie::metal::llama {
@@ -83,6 +87,19 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
     const std::uint32_t K = std::uint32_t(g.experts_per_token > 0 ? g.experts_per_token : 1);
     int count = 0;
 
+    // Llama 3.1's frequency table: computed once, and the same buffer serves
+    // every rope dispatch in the model. Left invalid on a checkpoint whose
+    // frequencies really are a geometric series, where nothing reads it.
+    SlotHandle freqs;
+    if (g.rope_freq_table) {
+        const std::vector<float> inv_freq = llama3_inv_freq(g);
+        freqs = ctx.heap_alloc(inv_freq.size() * sizeof(float));
+        if (!freqs.valid()) {
+            throw std::runtime_error("llama consts: heap_alloc failed for the llama3 rope table");
+        }
+        std::memcpy(freqs.contents(), inv_freq.data(), inv_freq.size() * sizeof(float));
+    }
+
     for (const Dispatch& d : dag) {
         const int ord = d.ordinal;
 
@@ -125,9 +142,33 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             // ── rope ──
             case Kind::RopeQ:
             case Kind::RopeK:
-                // `rope_scale` is the linear position divisor. `geometry_from_facts`
-                // refuses any non-linear scaling, so there is nothing else to
-                // express here.
+                if (g.rope_freq_table) {
+                    // A DIFFERENT ABI, not a different value: the table form
+                    // reads a buffer where the base form reads a log2(theta),
+                    // and buffer 3 means `inv_freq` to one and `base` to the
+                    // other. Binding the base form's slots to the table
+                    // kernel would hand it a float where it expects a
+                    // pointer, so the two arms bind nothing in common.
+                    bind_const<float>(ctx, ord, (std::uint8_t)bind::RopeFreqs::Scale,
+                                      1.0f, &count);
+                    ctx.arg_bind_ordinal(ord, (std::uint8_t)bind::RopeFreqs::InvFreq, freqs);
+                    ++count;
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::RopeFreqs::HeadDim,
+                                             g.head_dim, &count);
+                    // llama3 has no attention-temperature correction; YaRN's
+                    // `mscale` is 1 here, and the kernel multiplies by it
+                    // unconditionally.
+                    bind_const<float>(ctx, ord, (std::uint8_t)bind::RopeFreqs::MScale,
+                                      1.0f, &count);
+                    // The batched form's row pitch. q and k have different head
+                    // counts and share the kernel, so its grid cannot supply it.
+                    bind_const<std::int32_t>(ctx, ord,
+                                             (std::uint8_t)bind::RopeFreqs::RowStride,
+                                             d.kind == Kind::RopeQ ? g.q_width() : g.kv_width(),
+                                             &count);
+                    break;
+                }
+                // `rope_scale` is the linear position divisor.
                 bind_const<float>(ctx, ord, (std::uint8_t)bind::Rope::Scale,
                                   g.rope_scale != 0.0f ? 1.0f / g.rope_scale : 1.0f, &count);
                 // `base` is log2(theta), not theta -- the kernel raises 2 to it.

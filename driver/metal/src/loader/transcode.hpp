@@ -89,6 +89,38 @@ inline std::uint16_t f32_to_bf16(float value) {
     return static_cast<std::uint16_t>(rounded >> 16);
 }
 
+/// IEEE-754 binary16 as a float.
+///
+/// Written out rather than leaned on `_Float16` because this runs on the host
+/// for whole tensors and the whole point is that the bit layout is EXPLICIT:
+/// F16 and BF16 differ in where the exponent ends, which is precisely the
+/// confusion that reading one as the other produces.
+inline float f16_to_f32(std::uint16_t bits) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16;
+    const std::uint32_t exp = (bits >> 10) & 0x1fu;
+    const std::uint32_t mant = bits & 0x3ffu;
+    std::uint32_t wide = 0;
+    if (exp == 0x1fu) {
+        wide = sign | 0x7f800000u | (mant << 13);
+    } else if (exp == 0) {
+        if (mant != 0) {
+            // Subnormal: renormalise into binary32, which has the range for it.
+            std::uint32_t m = mant;
+            std::int32_t e = -1;
+            while ((m & 0x400u) == 0) { m <<= 1; --e; }
+            m &= 0x3ffu;
+            wide = sign | (static_cast<std::uint32_t>(e + 127 - 14) << 23) | (m << 13);
+        } else {
+            wide = sign;
+        }
+    } else {
+        wide = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float out;
+    std::memcpy(&out, &wide, sizeof(out));
+    return out;
+}
+
 /// One MXFP4 nibble as a float. E2M1: sign, two exponent bits, one mantissa
 /// bit, with the all-zero exponent denormal at ±0.5.
 inline float mxfp4_nibble(std::uint8_t code) {
@@ -152,6 +184,39 @@ inline void require(bool condition, const char* what) {
     if (!condition) {
         throw std::runtime_error(std::string("metal transcode: ") + what);
     }
+}
+
+/// Rewrite `count` F16 or F32 elements as BF16.
+///
+/// The narrowing every checkpoint that is not already BF16 needs, and the one
+/// that cannot be skipped: `mlx-community` publishes some conversions in F16
+/// and some in BF16, the two are the same width, and a driver that transmuted
+/// rather than cast would read one as the other without a single byte moving.
+/// The result is not noise -- it is a model that loads, runs and says the same
+/// token forever.
+///
+/// Widths are 2 and 4 rather than a dtype enum because this file has no
+/// dependency on the loader's ABI and does not want one; the caller has the
+/// dtype and this wants only how wide it is.
+inline void cast_float_to_bf16(const std::uint8_t* src, std::uint32_t src_bytes,
+                               std::int64_t count, Region dst) {
+    require(src_bytes == 2 || src_bytes == 4, "a float cast reads 2 or 4 bytes per element");
+    require(dst.bytes >= static_cast<std::uint64_t>(count) * 2,
+            "a float cast has no room for its output");
+    auto* out = reinterpret_cast<std::uint16_t*>(dst.data);
+    parallel_ranges(count, [&](std::int64_t begin, std::int64_t end) {
+        for (std::int64_t i = begin; i < end; ++i) {
+            float value;
+            if (src_bytes == 2) {
+                std::uint16_t bits;
+                std::memcpy(&bits, src + i * 2, 2);
+                value = f16_to_f32(bits);
+            } else {
+                std::memcpy(&value, src + i * 4, 4);
+            }
+            out[i] = f32_to_bf16(value);
+        }
+    });
 }
 
 /// Multiply `payload` by per-block factors, writing BF16.

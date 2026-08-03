@@ -422,6 +422,10 @@ struct SetupConfig {
         /// all -- is REFUSED by the geometry rather than approximated by
         /// `rope_scale`, which runs and is wrong past the original context.
         std::string rope_scaling_kind;
+        /// Llama 3.1's three extra knobs. `rope_scale` carries its `factor`.
+        float rope_low_freq_factor = 1.0f;
+        float rope_high_freq_factor = 4.0f;
+        int rope_original_max_position = 8192;
         /// Set when the checkpoint ships `self_attn.q_norm`. A config fact
         /// rather than a model_type one: `qwen3` has it and `qwen2` does not,
         /// and both are this family.

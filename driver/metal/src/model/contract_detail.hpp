@@ -63,8 +63,28 @@ inline std::uint32_t u32_dim(std::int64_t value, std::string_view context) {
     return static_cast<std::uint32_t>(value);
 }
 
-/// Declare a tensor as it sits on disk, under its runtime name.
+/// Declare a tensor under its runtime name, in the float format the kernels read.
+///
+/// Every kernel in this driver reads BF16 -- norm weights, affine scales and
+/// biases alike -- so a checkpoint that ships F16 or F32 is CAST here rather
+/// than transmuted. This is not a nicety. `mlx-community/Llama-3.2-1B-Instruct-4bit`
+/// ships all 259 of its unpacked tensors as F16, and reinterpreting an F16 bit
+/// pattern as BF16 is not an approximation -- the exponent field is a different
+/// width and in a different place, so `0.0385` reads as `1.6e-12`. It does not
+/// crash and it does not warn: the model loads, runs at full speed, and emits
+/// the same token forever.
+///
+/// A cast is a load-time kernel and the heap then holds BF16, so nothing
+/// downstream -- no bind, no PSO, no dispatch -- learns that the checkpoint was
+/// ever anything else. One conversion, in the one place every family declares
+/// its unpacked tensors.
 inline void push_direct(ModelContract& out, const SourceTensor& raw, std::string output) {
+    if (is_raw(raw.encoding, PieLoaderDType::F16) || is_raw(raw.encoding, PieLoaderDType::F32)) {
+        const PieLoaderEncodingSpec bf16 = pie_loader::raw(PieLoaderDType::BF16);
+        out.define(std::move(output), out.cast(out.src(std::string(raw.name)), bf16), bf16)
+            .expect(shape_of(raw));
+        return;
+    }
     out.define(std::move(output), out.src(std::string(raw.name)), raw.encoding)
         .expect(shape_of(raw));
 }

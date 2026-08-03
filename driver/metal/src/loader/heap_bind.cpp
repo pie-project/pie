@@ -426,6 +426,70 @@ void run_tile_map(
     };
 
     switch (op.tile_kind) {
+    case pie_loader::PieLoaderTileMapKind::Cast: {
+        // Raw to raw, and only ever narrowing to BF16 -- the one float format
+        // every kernel in this driver reads. `push_direct` emits this whenever
+        // a checkpoint ships F16 or F32, which `mlx-community`'s Llama
+        // conversions do for every unpacked tensor they have.
+        if (op.output_buffers.len != 1) {
+            throw std::runtime_error(
+                "metal storage executor: a Cast writes exactly one buffer");
+        }
+        const auto& out_decl = index.buffer(op.output_buffers.ptr[0]);
+        if (!out_decl.has_tensor) {
+            throw std::runtime_error("metal storage executor: Cast output has no tensor type");
+        }
+        const auto& out_tensor = index.tensor(out_decl.tensor_id);
+        if (out_tensor.encoding_kind != pie_loader::PieLoaderEncodingKind::Raw ||
+            out_tensor.dtype != pie_loader::PieLoaderDType::BF16) {
+            throw std::runtime_error(
+                "metal storage executor: Cast is implemented for raw BF16 outputs only");
+        }
+        // The input's width comes from whichever side supplied it, so a fused
+        // read off disk and a transform of a resident buffer answer the same
+        // question in the same units.
+        pie_loader::PieLoaderDType from{};
+        if (op.has_source) {
+            from = index.source(op.source.tensor_id).dtype;
+        } else {
+            if (op.input_buffers.len == 0) {
+                throw std::runtime_error(
+                    "metal storage executor: Cast has neither a source nor an operand");
+            }
+            const auto& in_decl = index.buffer(op.input_buffers.ptr[0]);
+            if (!in_decl.has_tensor) {
+                throw std::runtime_error(
+                    "metal storage executor: Cast operand has no tensor type");
+            }
+            from = index.tensor(in_decl.tensor_id).dtype;
+        }
+        std::uint32_t src_bytes = 0;
+        switch (from) {
+        case pie_loader::PieLoaderDType::F16:
+        case pie_loader::PieLoaderDType::BF16: src_bytes = 2; break;
+        case pie_loader::PieLoaderDType::F32: src_bytes = 4; break;
+        default:
+            throw std::runtime_error(
+                "metal storage executor: Cast reads F16, BF16 or F32 only");
+        }
+        const auto [bytes, size] = payload(0);
+        if (src_bytes == 0 || size % src_bytes != 0) {
+            throw std::runtime_error(
+                "metal storage executor: Cast operand is not a whole number of elements");
+        }
+        const SlotHandle& out = slot(op.output_buffers.ptr[0]);
+        const std::uint64_t at = op.has_dest ? op.dest.offset + op.dest.stride.base_offset : 0;
+        if (at > out.size) {
+            throw std::runtime_error(
+                "metal storage executor: Cast destination is out of bounds");
+        }
+        trace.scale_out_bytes += size;
+        const auto _span = trace.span(&trace.scale_ms);
+        tc::cast_float_to_bf16(
+            bytes, src_bytes, static_cast<std::int64_t>(size / src_bytes),
+            tc::Region{static_cast<std::uint8_t*>(out.contents()) + at, out.size - at});
+        return;
+    }
     case pie_loader::PieLoaderTileMapKind::Scale: {
         if (op.output_buffers.len != 1 || op.transform_scale_blocks.len == 0) {
             throw std::runtime_error(

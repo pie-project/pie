@@ -14,7 +14,12 @@
 #include <cstdint>
 #include <string>
 
-#include "batch/forward.hpp"
+// `SetupConfig` is forward-declared rather than included. This header used to
+// pull in `batch/forward.hpp` -- the whole executor -- for one function
+// signature, which meant anything that wanted to know a checkpoint's
+// `model_type` had to be able to link the driver. Reading config.json is the
+// smaller question and now has the smaller dependency.
+namespace pie::metal::batch { struct SetupConfig; }
 
 namespace pie::metal {
 
@@ -104,6 +109,13 @@ struct ModelFacts {
     float ll_rope_theta = 500000.0f;
     float ll_rope_scale = 1.0f;
     std::string ll_rope_scaling_kind;
+    // Llama 3.1's piecewise schedule. `factor` is `ll_rope_scale`, shared with
+    // the linear kind; these three are its own. Defaults are HF's, so a config
+    // that names the type but omits a knob gets the schedule everyone else
+    // gets rather than a division by zero.
+    float ll_rope_low_freq_factor = 1.0f;
+    float ll_rope_high_freq_factor = 4.0f;
+    int ll_rope_original_max_position = 8192;
     bool ll_qk_norm = false;
     bool ll_tied_embeddings = true;
     bool ll_norm_topk_prob = true;

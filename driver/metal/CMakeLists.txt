@@ -436,12 +436,19 @@ endif()
 # CUDA-free and Metal-free, so this runs on Linux too — which is what stops the
 # Metal *contract* layer from depending on someone owning a Mac.
 if(PIE_LOADER_STATICLIB)
-  add_executable(model_contract_test tests/model_contract_test.cpp)
+  # `model_facts.cpp` is compiled in rather than linked from the driver lib:
+  # this target deliberately does not depend on Metal, and reading config.json
+  # does not either.
+  add_executable(model_contract_test tests/model_contract_test.cpp src/model_facts.cpp)
   target_compile_features(model_contract_test PRIVATE cxx_std_20)
   target_include_directories(model_contract_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/batch
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_DRIVER_ABI_INCLUDE_DIR}
     ${PIE_LOADER_INCLUDE_DIR})
   target_link_libraries(model_contract_test PRIVATE
+    nlohmann_json::nlohmann_json
     ${PIE_LOADER_STATICLIB} Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME model_contract_test COMMAND model_contract_test)
 else()

@@ -1,5 +1,7 @@
 #include "model_facts.hpp"
 
+#include "batch/forward.hpp"
+
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -182,6 +184,13 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             if (j.contains("rope_scaling") && j["rope_scaling"].is_object()) {
                 const auto& rs = j["rope_scaling"];
                 gf(rs, "factor", facts.ll_rope_scale);
+                gf(rs, "low_freq_factor", facts.ll_rope_low_freq_factor);
+                gf(rs, "high_freq_factor", facts.ll_rope_high_freq_factor);
+                if (rs.contains("original_max_position_embeddings") &&
+                    rs["original_max_position_embeddings"].is_number_integer()) {
+                    facts.ll_rope_original_max_position =
+                        rs["original_max_position_embeddings"].get<int>();
+                }
                 // `rope_type` is the current key and `type` the older one. The
                 // KIND is carried verbatim rather than reduced to a bool here,
                 // because the geometry refuses the schedules it cannot run and
@@ -389,6 +398,9 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
     cfg.llama.rope_theta = facts.ll_rope_theta;
     cfg.llama.rope_scale = facts.ll_rope_scale;
     cfg.llama.rope_scaling_kind = facts.ll_rope_scaling_kind;
+    cfg.llama.rope_low_freq_factor = facts.ll_rope_low_freq_factor;
+    cfg.llama.rope_high_freq_factor = facts.ll_rope_high_freq_factor;
+    cfg.llama.rope_original_max_position = facts.ll_rope_original_max_position;
     cfg.llama.norm_topk_prob = facts.ll_norm_topk_prob;
     cfg.llama.qk_norm = facts.ll_qk_norm;
     cfg.llama.tied_embeddings = facts.ll_tied_embeddings;
