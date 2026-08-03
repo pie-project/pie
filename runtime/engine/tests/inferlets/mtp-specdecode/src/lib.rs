@@ -252,7 +252,7 @@ async fn verify_window(
 #[inferlet::main]
 async fn main(input: String) -> Result<String> {
     let k: u32 = input.trim().parse().unwrap_or(4).max(2);
-    if !wit_model::is_linear() {
+    if wit_model::pass_kind() == wit_model::ForwardKind::Attention {
         // Same guard as `mtp-native-verify`: the buffer this decoder's accept
         // step depends on only exists on a linear model.
         return Ok("skipped: mtp-specdecode needs a linear model".to_string());

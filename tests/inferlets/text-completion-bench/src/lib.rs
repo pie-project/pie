@@ -177,7 +177,7 @@ struct RunResult {
 /// `pie:inferlet` now exposes three forward interfaces, so `ForwardPass` is
 /// three unrelated types and this benchmark -- which drives BOTH a
 /// pure-attention model and a hybrid GDN model -- can no longer be one
-/// function. The runtime `is_linear()` branch that used to decide whether to
+/// function. The runtime `pass_kind()` branch that used to decide whether to
 /// bind recurrent state has moved UP to a `model::pass_kind()` branch over two
 /// monomorphisations. The body is written once here and expanded twice, so the
 /// two versions cannot drift.
@@ -379,11 +379,10 @@ async fn $name(
     // request rows. One row per fire here, so one set — reused by BOTH passes
     // so the decode continues the prefill's state rather than starting cold.
     // `rs_state_size() == 0` on pure-attention models, which bind none.
-    // `is_linear()` is the documented class flag (model.wit: "Prefer this over
-    // reading rs-state-size() as a class flag"): true iff the model folds a
-    // recurrent state, which is exactly when the driver requires one
+    // `pass_kind() != Attention` is the class predicate: true iff the model
+    // folds a recurrent state, which is exactly when the driver requires one
     // rs-working-set per request row.
-    let rs_ws: Vec<RsWorkingSet> = if model::is_linear() {
+    let rs_ws: Vec<RsWorkingSet> = if model::pass_kind() != model::ForwardKind::Attention {
         vec![RsWorkingSet::new()]
     } else {
         Vec::new()

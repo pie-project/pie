@@ -1,5 +1,5 @@
 //! **FOLD-COMMIT on a linear model** — the speculative-commit shape
-//! `model.wit`'s `is-linear()` exists to select.
+//! `model.wit`'s `pass-kind()` exists to select.
 //!
 //! A linear/SSM model folds tokens into its recurrent state IRREVERSIBLY, so
 //! the KV trick of discarding rejected slots does not exist for it. The
@@ -1122,7 +1122,7 @@ async fn main(input: String) -> Result<String> {
     };
     let chunks: u32 = if chain { 2 } else { 1 };
 
-    if !wit_model::is_linear() {
+    if wit_model::pass_kind() == wit_model::ForwardKind::Attention {
         return Ok("skipped: fold-commit needs a linear model".to_string());
     }
 

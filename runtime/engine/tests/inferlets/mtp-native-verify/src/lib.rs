@@ -381,7 +381,7 @@ async fn main(input: String) -> Result<String> {
         _ => (input.trim(), false),
     };
     let k: u32 = k_str.trim().parse().unwrap_or(4).max(2);
-    if !wit_model::is_linear() {
+    if wit_model::pass_kind() == wit_model::ForwardKind::Attention {
         // The buffer this inferlet's accept step depends on only exists on a
         // linear model. On a pure-attention model a rejected tail is discarded
         // by dropping KV slots and none of the fold-commit machinery applies.

@@ -1313,7 +1313,7 @@ pub fn live_slots() -> usize {
     }
     LIVE.with(|live| {
         *live.get_or_init(|| {
-            if crate::model::is_linear() {
+            if crate::model::pass_kind() != crate::model::ForwardKind::Attention {
                 1
             } else {
                 frame_size()

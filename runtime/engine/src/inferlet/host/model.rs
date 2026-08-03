@@ -21,21 +21,11 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(false)
     }
 
-    /// Whether the bound model is linear/recurrent (carries a fused recurrent
-    /// state that folds tokens irreversibly). TRUE iff the model has recurrent
-    /// state — the same predicate the CUDA executor keys fold-commit on
-    /// (`use_slots` / `rs_cache` present). Derived from the driver-handshake RS
-    /// caps: a non-zero folded-state size means the model has recurrent state.
-    /// The runtime uses this to select fold-commit (linear) vs KV-slot discard
-    /// (attention) for speculative decode, so the inferlet stays model-agnostic.
-    async fn is_linear(&mut self) -> Result<bool> {
-        Ok(model::model().rs_caps().state_size > 0)
-    }
-
     /// Which forward-pass interface the bound model requires, over STATE
     /// SEMANTICS rather than architecture name. Recurrent state is present iff
-    /// the driver handshake reports a non-zero folded-state size (the same
-    /// predicate `is_linear` uses); paged KV is present iff the model has a KV
+    /// the driver handshake reports a non-zero folded-state size — the same
+    /// predicate the CUDA executor keys fold-commit on (`use_slots` /
+    /// `rs_cache` present); paged KV is present iff the model has a KV
     /// page size. Today every registered linear model (Qwen3.5 GDN dense/MoE,
     /// Nemotron-H Mamba2) interleaves attention layers and therefore reports
     /// `hybrid`; `recurrent` is reachable only for a model with no KV at all.
