@@ -660,6 +660,14 @@ impl Qwen35CudaFacts {
     /// constructor makes no such claim — every consumer of these goldens
     /// must treat the arm structure as the artifact under review, not the
     /// deployment's truth.
+    ///
+    /// And the digest DID catch this one too (its fourth catch): the
+    /// LIVE L40S default-env derivation is
+    /// `warp_tiled: false, cached_max: 0` (both env-gated off), which is
+    /// what the emission fact set in `bin/emit-cuda.rs` uses. This
+    /// fixture keeps the synthetic values deliberately: the goldens pin
+    /// the guard-chain STRUCTURE (a warp arm that exists, a cached arm
+    /// with a real threshold), which the live-default set would erase.
     pub fn qwen3_5_0_8b_synthetic() -> Self {
         Self {
             state_bf16: true,

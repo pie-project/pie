@@ -438,3 +438,36 @@ Verification: the census workload (maskmix + h2o) should then show the
 mask-compose refusals gone and mask=1 hooked=1 fires walking the
 declared/generated paths; stage-2's 1.8–2.3× two-wave penalty is the
 measured stake.
+
+## Release-build A/B measurement — the walk overhead note (2026-08-03)
+
+Question: does the declared-forward host walk (interpreter) or the
+generated static form cost or save measurable wall-clock vs the
+hand-written path, in an OPTIMIZED build? All prior parity work ran
+debug builds, where host overhead is exaggerated and no perf claim is
+honest.
+
+Protocol: release build (`cargo build --release -p pie-bin --features
+driver-cuda`), Qwen3-0.6B on the L40S, `mixed_fire_perf.py` (4
+concurrent naive decode lanes × 48 tokens = pure; + hooked lane =
+mixed), 3 reps per leg, three legs: OFF (hand-written), ON
+(interpreter), GEN (generated .inc, digest-gated).
+
+Result: **indistinguishable within rep noise.** Pure walls span
+0.22–0.35 s across ALL legs with no leg-correlated ordering (each leg
+contains both the fastest and the slowest reps); the mixed-lane
+"naive slowdown" ratios scatter 0.74–1.31× with no leg trend.
+
+Reading, honestly bounded:
+- At this scale (0.6B, N≤5 rows, 48-token decode legs) kernel time
+  dominates; the per-fire host walk — even the interpreter's
+  guard-skip/window bookkeeping — is not the bottleneck, and the
+  generated form's compile-time fact resolution buys no measurable
+  wall-clock here.
+- Therefore the generated form's PROVEN value is structural (the
+  digest-gated static form, four caught fact-lies, the emitted code as
+  reviewable artifact), not throughput. Any "supergraph saves X%"
+  claim stays unearned until a workload where host walk shows up
+  (many small fires, large N with short legs) is measured.
+- What this DOES retire: the standing worry that the interpreter walk
+  taxes the hot path. In release, on this hardware, it doesn't.
