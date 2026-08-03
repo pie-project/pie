@@ -764,3 +764,15 @@ S4 batteries, first tier (2026-08-03): the union holds at WIDTH.
   scale and the force-prefill deployment's captured PLAN-LESS decode.
 Remaining S4: hooks into the union, lora capture-safety, Peel mixed
 fires, then default-on.
+
+Default ON (same day): the interference battery (hook workloads
+byte-identical to the off leg across 12 runs, lora exit criterion
+holding, holed masked-prefill unchanged, small+wide A/Bs
+byte-identical) proved the gate only reroutes union-eligible decode
+fires. PIE_SUPERGRAPH=0 disarms. The supergraph is now the DEFAULT
+serving configuration for eligible fires on every deployment in this
+environment. Remaining S4: hooks and lora INTO the union (their
+machinery must become capture-safe first), Peel mixed fires
+(device-read row windows), and the perf measurement of what the union
+bought (capture-count deltas; the masked-fire graph coverage that
+eager fallbacks previously cost).
