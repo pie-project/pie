@@ -101,6 +101,9 @@ pub fn emit_qwen35_cuda_inc(
 ) -> String {
     let decode = qwen3_5_hybrid_cuda(facts, cuda, FireClass::Decode);
     let prefill = qwen3_5_hybrid_cuda(facts, cuda, FireClass::Prefill);
+    let commit = qwen3_5_hybrid_cuda(facts, cuda, FireClass::CommitAdvance);
+    let state_only = qwen3_5_hybrid_cuda(facts, cuda, FireClass::StateOnly);
+    let frozen = qwen3_5_hybrid_cuda(facts, cuda, FireClass::FrozenVerify);
     let digest = facts_digest(facts, cuda);
     let mut out = String::new();
     out.push_str(&format!(
@@ -128,6 +131,26 @@ pub fn emit_qwen35_cuda_inc(
         facts,
         &format!("generated_qwen35_prefill_{tag}"),
         false,
+    ));
+    out.push('\n');
+    out.push_str(&emit_class_fn(
+        &state_only,
+        facts,
+        &format!("generated_qwen35_state_only_{tag}"),
+        false,
+    ));
+    out.push('\n');
+    out.push_str(&emit_class_fn(
+        &frozen,
+        facts,
+        &format!("generated_qwen35_frozen_verify_{tag}"),
+        false,
+    ));
+    out.push('\n');
+    out.push_str(&emit_class_fn_commit(
+        &commit,
+        facts,
+        &format!("generated_qwen35_commit_advance_{tag}"),
     ));
     out
 }
@@ -168,8 +191,35 @@ fn emit_class_fn(
     fn_name: &str,
     is_decode: bool,
 ) -> String {
+    emit_class_fn_impl(plan, facts, fn_name, is_decode, false)
+}
+
+/// The commit-advance variant: the signature gains `commit_lens` and the
+/// conv/FLA emissions thread it; the reset stage is skipped (advancing
+/// the existing committed state — the interpreter's arm).
+fn emit_class_fn_commit(
+    plan: &ForwardPlan,
+    facts: &Qwen35HybridFacts,
+    fn_name: &str,
+) -> String {
+    emit_class_fn_impl(plan, facts, fn_name, false, true)
+}
+
+fn emit_class_fn_impl(
+    plan: &ForwardPlan,
+    facts: &Qwen35HybridFacts,
+    fn_name: &str,
+    is_decode: bool,
+    commit: bool,
+) -> String {
     let mut b = Body::default();
-    b.line(&format!("inline void {fn_name}(\n{PARAMS})\n{{"));
+    if commit {
+        b.line(&format!(
+            "inline void {fn_name}(\n{PARAMS},\n    const std::int32_t* commit_lens)\n{{"
+        ));
+    } else {
+        b.line(&format!("inline void {fn_name}(\n{PARAMS})\n{{"));
+    }
     b.line("    // Locals mirror the interpreter's preamble.");
     b.line("    const int N = total_tokens;");
     b.line("    const int R = num_requests;");
@@ -201,6 +251,10 @@ fn emit_class_fn(
     b.line("                     N, R);");
     b.line("    }");
     b.line("");
+    if commit {
+        b.line("    // No reset: the commit replay advances the existing");
+        b.line("    // committed state (the interpreter's commit arm).");
+    } else {
     b.line("    // Per-slot reset for freshly (re)assigned rs slots — the");
     b.line("    // interpreter's reset stage, verbatim (no commit-advance");
     b.line("    // arm: the service classes stay on the interpreter walk).");
@@ -218,12 +272,13 @@ fn emit_class_fn(
     b.line("                }");
     b.line("            }");
     b.line("        }");
-    if !is_decode {
+    if !is_decode && !commit {
         b.line("    } else {");
         b.line("        // Legacy null-slot prefill: reset all.");
         b.line("        state_cache.reset(stream);");
     }
     b.line("    }");
+    }
     b.line("");
     b.line("    const ops::DecodePlanCache* decode_plan =");
     b.line("        plan_state.decode_plan ? plan_state.decode_plan.get() : nullptr;");
@@ -253,6 +308,7 @@ fn emit_class_fn(
         plan,
         facts,
         is_decode,
+        commit,
         0,
         plan.ops.len(),
         &mut repeat_next_is_k,
@@ -266,6 +322,7 @@ fn emit_range(
     plan: &ForwardPlan,
     facts: &Qwen35HybridFacts,
     is_decode: bool,
+    commit: bool,
     start: usize,
     end: usize,
     repeat_next_is_k: &mut bool,
@@ -286,7 +343,8 @@ fn emit_range(
                 b.stmt(&format!("{kw} ({}) {{", cond_of(&arm.pred)));
                 b.indent += 1;
                 emit_range(
-                    b, plan, facts, is_decode, region, region + arm.ops as usize,
+                    b, plan, facts, is_decode, commit,
+                    region, region + arm.ops as usize,
                     repeat_next_is_k,
                 );
                 b.indent -= 1;
@@ -295,7 +353,8 @@ fn emit_range(
             b.stmt("} else {");
             b.indent += 1;
             emit_range(
-                b, plan, facts, is_decode, region, region + *else_ops as usize,
+                b, plan, facts, is_decode, commit,
+                region, region + *else_ops as usize,
                 repeat_next_is_k,
             );
             b.indent -= 1;
@@ -303,7 +362,7 @@ fn emit_range(
             i = region + *else_ops as usize;
             continue;
         }
-        emit_op(b, op, plan, facts, is_decode, repeat_next_is_k);
+        emit_op(b, op, plan, facts, is_decode, commit, repeat_next_is_k);
         i += 1;
     }
 }
@@ -314,6 +373,7 @@ fn emit_op(
     plan: &ForwardPlan,
     facts: &Qwen35HybridFacts,
     is_decode: bool,
+    commit: bool,
     repeat_next_is_k: &mut bool,
 ) {
     let _ = (plan, is_decode);
@@ -591,7 +651,7 @@ fn emit_op(
             b.stmt("    cudaMemcpyDeviceToDevice, stream));");
         }
         OpKind::Launch { kernel, weights, state } => {
-            emit_launch(b, kernel, weights, state.as_ref(), op, repeat_next_is_k)
+            emit_launch(b, kernel, weights, state.as_ref(), op, facts, commit, repeat_next_is_k)
         }
         other => panic!("emitter(q35): op kind {other:?} out of scope"),
     }
@@ -603,9 +663,12 @@ fn emit_launch(
     weights: &[String],
     state: Option<&crate::trace::StateRef>,
     op: &crate::trace::Op,
+    facts: &Qwen35HybridFacts,
+    commit: bool,
     repeat_next_is_k: &mut bool,
 ) {
     let _ = op;
+    let commit_arg = if commit { "commit_lens" } else { "/*commit_lens=*/nullptr" };
     let sl = state.map(|s| s.layer).unwrap_or(0);
     // The interpreter's binding lambdas, emitted per site with the layer
     // constant: the conv weight bank and the model-layer→kv-slot map.
@@ -644,7 +707,7 @@ fn emit_launch(
             b.stmt("      static_cast<long long>(state_cache.conv_kernel()) *");
             b.stmt("          state_cache.conv_dim(),");
             b.stmt("      R, conv_dim, conv_K, stream, write_state,");
-            b.stmt("      /*commit_lens=*/nullptr); }");
+            b.stmt(&format!("      {commit_arg}); }}"));
         }
         k @ ("launch_recurrent_gated_delta_step_batched"
         | "launch_recurrent_gated_delta_step_batched_state_bf16"
@@ -697,7 +760,7 @@ fn emit_launch(
             if k.contains("_gqa") || fla {
                 if fla {
                     b.stmt("    R, K_h, V_h, K_d, V_d, stream, write_state,");
-                    b.stmt("    /*commit_lens=*/nullptr);");
+                    b.stmt(&format!("    {commit_arg});"));
                 } else {
                     b.stmt("    R, K_h, V_h, K_d, V_d, stream, write_state);");
                 }
@@ -754,6 +817,47 @@ fn emit_launch(
             b.stmt("      kv_view, ws.k.data(), ws.v.data(),");
             b.stmt("      qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("      kv_last_page_lens, N, R, stream); }");
+        }
+        k @ ("qwen35_verify_stash_load" | "qwen35_verify_stash_store") => {
+            // The pseudo-symbols: a cudaMemcpyAsync trio against the
+            // layer's stash slab, with the COMPACT linear index a
+            // compile-time constant here (the interpreter derives it by
+            // counting; the emitter counts at emission).
+            let load = k.ends_with("load");
+            let linear_idx = (0..sl).filter(|&l| !facts.is_full_attn(l)).count();
+            b.stmt("if (!state_cache.verify_hidden_stash_enabled()) {");
+            b.stmt("    throw std::runtime_error(");
+            b.stmt("        \"generated qwen35: stated stash op but the live \"");
+            b.stmt("        \"stash is disabled (cross-check drift)\");");
+            b.stmt("}");
+            b.stmt("{");
+            b.stmt(&format!(
+                "    auto* stash = static_cast<std::uint16_t*>(\n        state_cache.verify_hidden_stash_layer({linear_idx}));"
+            ));
+            b.stmt("    const std::size_t stash_stride =");
+            b.stmt("        static_cast<std::size_t>(state_cache.verify_stash_max_tokens());");
+            b.stmt("    const std::size_t a_off = stash_stride * conv_dim;");
+            b.stmt("    const std::size_t b_off =");
+            b.stmt("        a_off + stash_stride * static_cast<std::size_t>(V_h);");
+            b.stmt("    const std::size_t n_qkv =");
+            b.stmt("        static_cast<std::size_t>(N) * conv_dim * sizeof(std::uint16_t);");
+            b.stmt("    const std::size_t n_ab =");
+            b.stmt("        static_cast<std::size_t>(N) * V_h * sizeof(std::uint16_t);");
+            let (d1, s1, d2, s2, d3, s3) = if load {
+                ("la.mixed_qkv.data()", "stash",
+                 "la.a.data()", "stash + a_off",
+                 "la.b.data()", "stash + b_off")
+            } else {
+                ("stash", "la.mixed_qkv.data()",
+                 "stash + a_off", "la.a.data()",
+                 "stash + b_off", "la.b.data()")
+            };
+            for (dst, src, n) in [(d1, s1, "n_qkv"), (d2, s2, "n_ab"), (d3, s3, "n_ab")] {
+                b.stmt("    CUDA_CHECK(cudaMemcpyAsync(");
+                b.stmt(&format!("        {dst}, {src}, {n},"));
+                b.stmt("        cudaMemcpyDeviceToDevice, stream));");
+            }
+            b.stmt("}");
         }
         other => panic!("emitter(q35): stated kernel {other} out of scope"),
     }
