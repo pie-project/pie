@@ -27,6 +27,7 @@
 #include "model/llama/decode_consts.hpp"
 #include "model/llama/encode.hpp"
 #include "model/llama/scratch.hpp"
+#include "batch/simple_family.hpp"
 
 using pie::metal::llama::Dispatch;
 using pie::metal::llama::Kind;
@@ -628,6 +629,37 @@ void check_refusals() {
     refused(ragged, "multiple", "n_q_heads not a multiple of n_kv_heads is refused");
 }
 
+/// The llama family has BOTH FFN shapes, so its streaming predicate must name
+/// both banks.
+///
+/// It named only the dense one. A routed llama publishes `mlp.experts.gate_proj`
+/// and the clause tested for `mlp.gate_proj`, which is not a substring of it, so
+/// Qwen3-MoE streamed nothing at all -- while gpt-oss, whose experts have the
+/// same name and the same sparse access, streamed most of its checkpoint. The
+/// symptom was a 16 GB copy at load and no failure anywhere, because streaming
+/// is a residency decision and a model that copies everything still answers.
+///
+/// Stated against the names the CONTRACT publishes, not against invented ones:
+/// `llama_contract.hpp` normalises both `mlp.switch_mlp.` and the fused HF form
+/// onto `mlp.experts.`, and `heap_bind.cpp` hands this predicate the finalized
+/// runtime name.
+void check_streaming_covers_both_ffn_shapes() {
+    using pie::metal::batch::SimpleFamilyEngine;
+    using pie::metal::model::ModelFamily;
+    const auto llama = SimpleFamilyEngine::stream_predicate(ModelFamily::Llama, true);
+    expect(bool(llama), "llama offers a streaming predicate when asked");
+    if (!llama) return;
+    expect(llama("layers.3.mlp.experts.gate_proj"), "a routed llama streams its expert bank");
+    expect(llama("layers.3.mlp.experts.down_proj"), "including the down projection");
+    expect(llama("layers.3.mlp.gate_proj"), "a dense llama still streams its FFN");
+    expect(!llama("layers.3.mlp.experts.gate_proj.bias"),
+           "the bias beside an expert stays resident");
+    expect(!llama("layers.3.mlp.gate.weight"), "the router itself stays resident");
+    expect(!llama("layers.3.self_attn.q_proj"), "attention stays resident");
+    expect(!SimpleFamilyEngine::stream_predicate(ModelFamily::Llama, false),
+           "and nothing streams unless the config asks");
+}
+
 int main() {
     std::printf("llama_decode_step_test — one family, four configurations\n");
 
@@ -687,6 +719,7 @@ int main() {
               "with_argmax=false drops exactly one dispatch");
 
     check_refusals();
+    check_streaming_covers_both_ffn_shapes();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

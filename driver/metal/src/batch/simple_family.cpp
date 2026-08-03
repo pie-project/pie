@@ -1271,8 +1271,25 @@ std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
             // three projections rather than by "mlp." so the per-layer
             // embedding tensors beside them -- small, and read every token --
             // stay resident.
+            //
+            // AND the routed bank, which the llama arm used to miss. A routed
+            // llama publishes `mlp.experts.gate_proj`, and `mlp.gate_proj` is
+            // not a substring of it, so Qwen3-MoE fell through every clause and
+            // streamed nothing -- while gpt-oss, whose experts carry the same
+            // name and the same access pattern, streamed 10.75 GB. That is the
+            // SPARSE half of the trade, the free one: a token reads 8 experts
+            // of 128 per layer, so an eighth of the bank faults in and the
+            // kernel evicts the rest. It went missing because this predicate is
+            // written per FAMILY while the thing it describes -- how a bank is
+            // read -- is per LAYER SHAPE, and the llama family is the only one
+            // that has both shapes.
+            //
+            // The two patterns are disjoint by construction: a routed layer has
+            // no dense `mlp.gate_proj` and a dense one has no experts, so one
+            // predicate serves both without being told which model it is.
             return [is_bias](const std::string& n) {
                 if (is_bias(n)) return false;
+                if (n.find("mlp.experts.") != std::string::npos) return true;
                 return n.find("mlp.gate_proj") != std::string::npos ||
                        n.find("mlp.up_proj") != std::string::npos ||
                        n.find("mlp.down_proj") != std::string::npos;

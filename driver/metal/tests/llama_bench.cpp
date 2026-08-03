@@ -179,6 +179,11 @@ int main(int argc, char** argv) {
     // for one request would refuse it rather than answer it wrongly.
     cfg.max_forward_requests = 2;
     cfg.kv_page_size = 32;
+    // Off by default, so the numbers below stay comparable with every earlier
+    // run. Turned on it maps the routed expert bank instead of copying it, and
+    // the interesting question -- whether a sparsely read bank costs anything
+    // to stream -- is only answerable by running the SAME stopwatch both ways.
+    cfg.stream_routed_experts = std::getenv("PIE_METAL_TEST_STREAM_EXPERTS") != nullptr;
     // One sequence, so one sequence's worth of ring. The default is sized for a
     // 64-request fleet and does not scale with the model: at 48 layers it is
     // 13 GiB of KV, which beside a 17 GiB checkpoint does not fit a 32 GiB
