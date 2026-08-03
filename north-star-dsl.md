@@ -567,3 +567,28 @@ naive-baseline (`p / page_size`) and naive-masked (`pool_ids[...]`)
 are the SAME convention: `reserve()` returns LOGICAL per-working-set
 page indices (0..k for a fresh set), so `pool_ids[i] == i` — no trust
 gap in the parity workhorses.
+
+## HasStageHooks (wire 5) — the retirement disposition (2026-08-03)
+
+Question recurring on the hygiene list: the pred is retired vocabulary
+(A3 moved hooks to Peel row windows + sites), yet the emitter and the
+interpreter both still carry an arm for it. Keep or remove?
+
+**Keep, deliberately.** Both arms evaluate `hooks != nullptr` — the
+semantics a trace stating the pred would want are still exactly what
+the arms answer, so a resurrected or replayed old trace gets a CORRECT
+walk, not drift. Removal breaks wire compatibility for zero payload;
+converting the arms to throws would turn a correct answer into an
+error. The discriminant stays reserved, the arms stay correct, the
+comments already say "retired since A3". This closes the last item on
+the residual-hygiene list; the vocabulary is stable as documented.
+
+## Consolidated sweep at tip `5a17d4fac` (2026-08-03)
+
+Unit tier: forward lib 54, goldens 18, regen pins, engine 395,
+tokenizer, ABI layout — all green. Live tier (release build,
+Qwen3-0.6B): fresh OFF vs GEN short+long BYTE-IDENTICAL;
+trackb-snapkv + trackb-h2o hook workloads on GEN clean (28 layers
+observed per fire, zero NaN, page masses sane). Everything since the
+last consolidated stamp (census fingerprints, the two naive-masked
+producer modes, doc notes) holds together.
