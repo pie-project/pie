@@ -258,7 +258,15 @@ public:
         int intermediate,
         int tp_size,
         cudaStream_t stream,
-        Workspace& ws);
+        Workspace& ws,
+        // The fire-constant buffers the STAGE phase bakes into the
+        // pointer slab (campaign step 2): the projection input the
+        // correction reads (placement-dependent: ws.y post-norm,
+        // ws.norm_x pre-norm), the q/v outputs, and the xA^T scratch.
+        const void* qkv_in,
+        void* q_out,
+        void* v_out,
+        void* xa_scratch);
     ~LoraFireStateHandle();
     LoraFireStateHandle(const LoraFireStateHandle&) = delete;
     LoraFireStateHandle& operator=(const LoraFireStateHandle&) = delete;

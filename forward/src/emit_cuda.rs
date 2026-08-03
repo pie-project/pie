@@ -267,8 +267,18 @@ fn emit_class_fn(
         b.line("    std::optional<LoraFireStateHandle> lora_state;");
         b.line("    if (lora != nullptr && lora->usable()) {");
         b.line("        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,");
-        // (campaign step 1: the staging arena rides on the workspace)
-        b.line("                           /*tp=*/1, stream, ws);");
+        // Campaign steps 1-2: the staging arena rides on the workspace,
+        // and the stage phase bakes the fire-constant buffer pointers
+        // (placement resolved at emission).
+        let lora_qkv_in = if facts.norm_placement == NormPlacement::Post {
+            "ws.y.data()"
+        } else {
+            "ws.norm_x.data()"
+        };
+        b.line("                           /*tp=*/1, stream, ws,");
+        b.line(&format!("                           {lora_qkv_in},"));
+        b.line("                           ws.q.data(), ws.v.data(),");
+        b.line("                           ws.gate.data());");
         b.line("    }");
         b.line("");
     }

@@ -548,7 +548,11 @@ void llama_like_forward_declared(
     std::optional<LoraFireStateHandle> lora_state;
     if (has_lora) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, /*tp=*/1, stream,
-                           ws);
+                           ws,
+                           post_norm ? static_cast<const void*>(ws.y.data())
+                                     : static_cast<const void*>(
+                                           ws.norm_x.data()),
+                           ws.q.data(), ws.v.data(), ws.gate.data());
         if (std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
             std::fprintf(stderr,
                          "[lora-fire] declared R=%d lanes=%u grouping=%s\n",

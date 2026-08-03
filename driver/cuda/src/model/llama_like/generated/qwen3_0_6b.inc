@@ -71,7 +71,10 @@ const LoraTable* lora)
     std::optional<LoraFireStateHandle> lora_state;
     if (lora != nullptr && lora->usable()) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
-                           /*tp=*/1, stream, ws);
+                           /*tp=*/1, stream, ws,
+                           ws.norm_x.data(),
+                           ws.q.data(), ws.v.data(),
+                           ws.gate.data());
     }
 
     const int fast_rows = hooks == nullptr
@@ -12838,7 +12841,10 @@ const LoraTable* lora)
     std::optional<LoraFireStateHandle> lora_state;
     if (lora != nullptr && lora->usable()) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
-                           /*tp=*/1, stream, ws);
+                           /*tp=*/1, stream, ws,
+                           ws.norm_x.data(),
+                           ws.q.data(), ws.v.data(),
+                           ws.gate.data());
     }
 
     kernels::launch_embed_bf16(
@@ -18789,7 +18795,10 @@ const LoraTable* lora,
     std::optional<LoraFireStateHandle> lora_state;
     if (lora != nullptr && lora->usable()) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
-                           /*tp=*/1, stream, ws);
+                           /*tp=*/1, stream, ws,
+                           ws.norm_x.data(),
+                           ws.q.data(), ws.v.data(),
+                           ws.gate.data());
     }
 
     const int fast_rows = hooks == nullptr

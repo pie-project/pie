@@ -127,6 +127,10 @@ struct LoraFireState {
         // grouped GEMM's per-site calls).
         int nq = 0;
         int nv = 0;
+        // Per-member token spans, precomputed at STAGE time (campaign
+        // step 2): the grouped calls read them per layer, and computing
+        // them in apply() was the last per-layer host work.
+        std::vector<int> m, mq, mv;
         // This group's slot offset (in pointer slots) within one layer's
         // slice of `ptr_slab`; layout below.
         std::size_t slab_off = 0;
@@ -151,7 +155,11 @@ struct LoraFireState {
                   const HfConfig& cfg,
                   int N, int H, int Hq, int Hk, int I, int T,
                   cudaStream_t s,
-                  LoraStageArena& arena)
+                  LoraStageArena& arena,
+                  const void* qkv_in,
+                  void* q_out,
+                  void* v_out,
+                  void* xa_scratch)
         : stream(s)
     {
         // Campaign step 1: every buffer below comes from the per-fire
@@ -355,6 +363,90 @@ struct LoraFireState {
                 ptr_slab = arena.alloc(
                     static_cast<std::size_t>(cfg.num_hidden_layers) *
                     slab_stride * sizeof(void*));
+                // ── The STAGE phase proper (campaign step 2): the whole
+                // slab — every layer, every group — is computed here and
+                // uploaded ONCE. Everything a slot holds is a fire
+                // constant: arena addresses, layer-strided adapter
+                // slices, and the ws buffer rows the caller passed in.
+                // apply() is left with launches only, which is what a
+                // captured body requires.
+                std::vector<const void*> slab_host;
+                slab_host.resize(
+                    static_cast<std::size_t>(cfg.num_hidden_layers) *
+                    slab_stride, nullptr);
+                for (int layer = 0;
+                     layer < cfg.num_hidden_layers; ++layer) {
+                    for (Group& g : groups) {
+                        std::vector<const void*> staged;
+                        std::vector<const void*> a_run, xa_run;
+                        std::vector<const void*> q_act, q_w, q_y;
+                        std::vector<const void*> v_act, v_w, v_y;
+                        if (layer == 0) {
+                            g.m.clear(); g.mq.clear(); g.mv.clear();
+                        }
+                        for (std::size_t idx : g.members) {
+                            const Lane& lane = lanes[idx];
+                            const LoraLaneView& v = *lane.view;
+                            const auto* a_l = static_cast<
+                                const std::uint16_t*>(lane.a_bf16) +
+                                static_cast<std::size_t>(layer) *
+                                    g.rank * g.d_in;
+                            const auto* b_l = static_cast<
+                                const std::uint16_t*>(lane.b_bf16) +
+                                static_cast<std::size_t>(layer) *
+                                    g.d_out * g.rank;
+                            void* xa = static_cast<std::uint16_t*>(
+                                           xa_scratch) + lane.xa_offset;
+                            staged.push_back(bf16_row(
+                                qkv_in,
+                                static_cast<int>(v.token_start), H));
+                            a_run.push_back(a_l);
+                            xa_run.push_back(xa);
+                            if (layer == 0) {
+                                g.m.push_back(
+                                    static_cast<int>(v.token_count));
+                            }
+                            if ((v.sites_bits & kLoraSiteQ) != 0) {
+                                q_act.push_back(xa);
+                                q_w.push_back(b_l);
+                                q_y.push_back(bf16_row(
+                                    q_out,
+                                    static_cast<int>(v.token_start),
+                                    Hq));
+                                if (layer == 0) {
+                                    g.mq.push_back(static_cast<int>(
+                                        v.token_count));
+                                }
+                            }
+                            if ((v.sites_bits & kLoraSiteV) != 0) {
+                                v_act.push_back(xa);
+                                v_w.push_back(b_l);
+                                v_y.push_back(bf16_row(
+                                    v_out,
+                                    static_cast<int>(v.token_start),
+                                    Hk));
+                                if (layer == 0) {
+                                    g.mv.push_back(static_cast<int>(
+                                        v.token_count));
+                                }
+                            }
+                        }
+                        const void** slot = slab_host.data() +
+                            static_cast<std::size_t>(layer) *
+                                slab_stride + g.slab_off;
+                        auto put = [&slot](
+                            const std::vector<const void*>& run) {
+                            for (const void* ptr : run) *slot++ = ptr;
+                        };
+                        put(staged); put(a_run); put(xa_run);
+                        put(q_act); put(q_w); put(q_y);
+                        put(v_act); put(v_w); put(v_y);
+                    }
+                }
+                CUDA_CHECK(cudaMemcpyAsync(
+                    ptr_slab, slab_host.data(),
+                    slab_host.size() * sizeof(void*),
+                    cudaMemcpyHostToDevice, stream));
             }
         }
     }
@@ -469,70 +561,20 @@ struct LoraFireState {
         }
         for (const Group& g : groups) {
             const std::size_t n = g.members.size();
-            // Host staging in slab order: [x(n) a(n) xa(n)] [q_act q_w
-            // q_y](nq each) [v_act v_w v_y](nv each). Uploaded into this
-            // (layer, group)'s device slot; the grouped calls then read
-            // the arrays from device memory (see the `ptr_slab` note).
-            std::vector<const void*> staged;
-            staged.reserve(3 * n + 3 * (g.nq + g.nv));
-            std::vector<const void*> a_run, xa_run;
-            std::vector<const void*> q_act, q_w, q_y, v_act, v_w, v_y;
-            std::vector<int> m;
-            m.reserve(n);
-            for (std::size_t idx : g.members) {
-                const Lane& lane = lanes[idx];
-                const LoraLaneView& v = *lane.view;
-                const int t = static_cast<int>(v.token_count);
-                const auto* a_l =
-                    static_cast<const std::uint16_t*>(lane.a_bf16) +
-                    static_cast<std::size_t>(layer) * g.rank * g.d_in;
-                const auto* b_l =
-                    static_cast<const std::uint16_t*>(lane.b_bf16) +
-                    static_cast<std::size_t>(layer) * g.d_out * g.rank;
-                void* xa = static_cast<std::uint16_t*>(xa_scratch) +
-                           lane.xa_offset;
-                staged.push_back(bf16_row(
-                    qkv_in, static_cast<int>(v.token_start), H));
-                a_run.push_back(a_l);
-                xa_run.push_back(xa);
-                m.push_back(t);
-                if ((v.sites_bits & kLoraSiteQ) != 0) {
-                    q_act.push_back(xa);
-                    q_w.push_back(b_l);
-                    q_y.push_back(bf16_row(
-                        q_out, static_cast<int>(v.token_start), Hq));
-                }
-                if ((v.sites_bits & kLoraSiteV) != 0) {
-                    v_act.push_back(xa);
-                    v_w.push_back(b_l);
-                    v_y.push_back(bf16_row(
-                        v_out, static_cast<int>(v.token_start), Hk));
-                }
-            }
-            auto append = [&staged](const std::vector<const void*>& run) {
-                staged.insert(staged.end(), run.begin(), run.end());
-            };
-            append(a_run); append(xa_run);
-            append(q_act); append(q_w); append(q_y);
-            append(v_act); append(v_w); append(v_y);
-
+            // Campaign step 2: the slab was fully staged at fire setup —
+            // this is slot arithmetic and launches, nothing else (what a
+            // captured body requires). The per-member M arrays were
+            // precomputed there too.
             void** slot = static_cast<void**>(ptr_slab) +
                           static_cast<std::size_t>(layer) * slab_stride +
                           g.slab_off;
-            // Pageable-source cudaMemcpyAsync returns only after the
-            // source has been staged, so `staged` may die at scope exit;
-            // the device slot is (layer, group)-exclusive, so no later
-            // upload can overwrite it while these calls still read it.
-            CUDA_CHECK(cudaMemcpyAsync(
-                slot, staged.data(), staged.size() * sizeof(void*),
-                cudaMemcpyHostToDevice, stream));
             const void* const* x_ptrs = slot;
             const void* const* a_ptrs = x_ptrs + n;
             const auto* xa_ptrs = x_ptrs + 2 * n;
             ops::gemm_grouped_act_x_wt_bf16(
                 handle, x_ptrs, a_ptrs,
                 const_cast<void* const*>(xa_ptrs),
-                m.data(), static_cast<int>(n), g.rank, g.d_in);
+                g.m.data(), static_cast<int>(n), g.rank, g.d_in);
             // (xA^T)B^T per site subset: shared N=d_out, K=rank, beta=1.
             // A lane contributes to the q call, the v call, or both, per
             // its SITES bits; d_out is shared across the group by the
@@ -540,34 +582,18 @@ struct LoraFireState {
             // Per-site M arrays: the site subsets preserve member order,
             // so the span list is the same prefix-free filter of `m`.
             if (g.nq > 0) {
-                std::vector<int> mq;
-                mq.reserve(g.nq);
-                for (std::size_t i = 0; i < n; ++i) {
-                    if ((lanes[g.members[i]].view->sites_bits &
-                         kLoraSiteQ) != 0) {
-                        mq.push_back(m[i]);
-                    }
-                }
                 const auto* base = x_ptrs + 3 * n;
                 ops::gemm_grouped_act_x_wt_bf16(
                     handle, base, base + g.nq,
                     const_cast<void* const*>(base + 2 * g.nq),
-                    mq.data(), g.nq, g.d_out, g.rank, /*beta=*/1.f);
+                    g.mq.data(), g.nq, g.d_out, g.rank, /*beta=*/1.f);
             }
             if (g.nv > 0) {
-                std::vector<int> mv;
-                mv.reserve(g.nv);
-                for (std::size_t i = 0; i < n; ++i) {
-                    if ((lanes[g.members[i]].view->sites_bits &
-                         kLoraSiteV) != 0) {
-                        mv.push_back(m[i]);
-                    }
-                }
                 const auto* base = x_ptrs + 3 * n + 3 * g.nq;
                 ops::gemm_grouped_act_x_wt_bf16(
                     handle, base, base + g.nv,
                     const_cast<void* const*>(base + 2 * g.nv),
-                    mv.data(), g.nv, g.d_out, g.rank, /*beta=*/1.f);
+                    g.mv.data(), g.nv, g.d_out, g.rank, /*beta=*/1.f);
             }
         }
     }
@@ -940,8 +966,12 @@ void llama_like_forward_paged(
     const bool has_lora = lora != nullptr && lora->usable();
     std::optional<LoraFireState> lora_state;
     if (has_lora) {
-        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, T, stream,
-                           ws.lora_arena);
+        lora_state.emplace(
+            *lora, cfg, N, H, Hq, Hk, I, T, stream, ws.lora_arena,
+            fwd_cfg.norm_placement == NormPlacement::Post
+                ? static_cast<const void*>(ws.y.data())
+                : static_cast<const void*>(ws.norm_x.data()),
+            ws.q.data(), ws.v.data(), ws.gate.data());
         // Co-batch evidence, PIE_HOOK_PREFIX_TRACE's pattern: one line per
         // fire proving how many request rows this fire carries (R) and how
         // many of them are adapter lanes with which token spans. R > lanes'
@@ -1795,10 +1825,15 @@ LoraFireStateHandle::LoraFireStateHandle(
     int intermediate,
     int tp_size,
     cudaStream_t stream,
-    Workspace& ws)
+    Workspace& ws,
+    const void* qkv_in,
+    void* q_out,
+    void* v_out,
+    void* xa_scratch)
     : impl_(new LoraFireState(
           table, cfg, total_tokens, hidden, q_width, kv_width,
-          intermediate, tp_size, stream, ws.lora_arena)) {}
+          intermediate, tp_size, stream, ws.lora_arena,
+          qkv_in, q_out, v_out, xa_scratch)) {}
 
 LoraFireStateHandle::~LoraFireStateHandle() {
     delete static_cast<LoraFireState*>(impl_);
