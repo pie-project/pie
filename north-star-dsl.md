@@ -592,3 +592,29 @@ trackb-snapkv + trackb-h2o hook workloads on GEN clean (28 layers
 observed per fire, zero NaN, page masses sane). Everything since the
 last consolidated stamp (census fingerprints, the two naive-masked
 producer modes, doc notes) holds together.
+
+## The qwen2_5 rung — attention biases enter the vocabulary (2026-08-03)
+
+The blocked-board watch found an unused checkpoint in the cache
+(Qwen2.5-1.5B-Instruct) carrying a fact axis no deployment had
+exercised: attention biases. The rung, landed at `5c08a3e5e`:
+- `OpKind::AddBias` (wire 27): broadcast bias add on the raw
+  projections, stated after the lora guard and before norms/rope (the
+  hand-written `maybe_add_bias` position; the lora-vs-bias ORDER
+  matters — the adapter delta lands on base, not base + bias).
+- `LlamaLikeFacts.qkv_bias` (serde-defaulted, append-only); digest
+  grows the `qb` term in BOTH printers; existing incs regenerated.
+- The build gate's bias refusal became a bound-tensor check;
+  `decode_fused_post` carries `!use_qkv_bias` explicitly in both the
+  family predicate and the driver derivation.
+- Surprise second axis: qwen2_5 is the first FORCE-PREFILL deployment
+  through the walk (GQA 6 outside the flashinfer decode set, XQA off
+  live). The hand-written body's final else runs a PLAN-LESS prefill
+  launcher; the executor's stated-prefill case now mirrors that
+  fallback instead of throwing ("prepare built no plan" was the
+  first live failure — caught at model load by the stated-kernel
+  validation, exactly where the design wants drift caught).
+Live: OFF vs ON byte-identical short+long, 53 declared fires. Goldens
+pin semantic + lowered forms (xqa0/dfp0/rt1/fpp1). NEXT: the generated
+inc (emitter AddBias arm + plan-less prefill fallback emission +
+qwen2_5_1_5b write_inc + digest dispatch + GEN parity).
