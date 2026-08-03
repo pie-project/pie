@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <cstdlib>
 #include <cstring>
@@ -312,11 +313,14 @@ struct Reference {
     /// runs different experts, which is a property of the weights rather than
     /// a fault in the driver.
     float last_margin = 0.0f;
-    /// The SMALLEST margin any layer of the current step decided on. A routing
-    /// tie anywhere in the stack makes every dispatch after it on that row
-    /// incomparable, and it is layer 0's tie that matters most -- its
-    /// consequences reach the whole rest of the step.
-    float step_min_margin = 3.0e38f;
+    /// Every margin the current step decided on, against the DAG position of
+    /// the selection that decided it. Kept in full rather than reduced,
+    /// because the reduction threw away the one thing the reader needs: a tie
+    /// makes the dispatches AFTER it incomparable and leaves the ones before
+    /// it as sound as any other row's. Minimising over the stack lost that
+    /// boundary, and worse, produced a number from one layer that was then
+    /// weighed against a threshold measured at another.
+    std::vector<std::pair<int, float>> step_margins;
     /// The most recent layer's router logits, as the reference computed them.
     /// Compared against the device's to MEASURE how far apart the two routers
     /// are, instead of assuming a number for it.
@@ -325,6 +329,7 @@ struct Reference {
     /// Run one token, recording every dispatch's output by DAG position.
     Trace step(const std::vector<Dispatch>& dag, int token, int position) {
         Trace t;
+        step_margins.clear();
         const int hd = g.head_dim, nq = g.n_q_heads, nkv = g.n_kv_heads;
         Vec resid, normed, q, k, v, attn, gate, up, act, block, logits;
         Vec expert_w;
@@ -525,7 +530,7 @@ struct Reference {
                     }
                     last_router_logits = logits;
                     last_margin = worst_selected - best_rejected;
-                    step_min_margin = std::min(step_min_margin, last_margin);
+                    step_margins.push_back({at, last_margin});
                     last_ids = expert_ids;
                     last_w = expert_w;
                     break;  // two outputs of different types; checked via the combine
@@ -1038,8 +1043,10 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         return out;
     };
 
-    auto compare_all = [&](const Trace& want, int row, int label, bool skip_slots = false) {
+    auto compare_all = [&](const Trace& want, int row, int label, bool skip_slots = false,
+                           int cut = std::numeric_limits<int>::max()) {
         for (std::size_t i = 0; i < dag.size(); ++i) {
+            if (int(i) >= cut) break;
             const auto it = want.find(int(i));
             if (it == want.end()) continue;
             if (skip_slots && is_slot_stacked(dag[i].kind)) continue;
@@ -1168,18 +1175,32 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     // reduction order -- and a gap narrower than that is a gap neither
     // implementation can be said to have resolved. Writing a constant here
     // instead would be picking the number that makes today's run pass.
+    //
+    // What comes back is not a yes/no but a CUT: the DAG position from which
+    // this row stops being comparable. The two facts available are of
+    // different kinds and are used for different things. The device's ids say
+    // WHETHER a selection came apart -- but only the last layer's, since every
+    // layer writes that one value and the pool is read once. The reference's
+    // margins say WHERE it could have: a layer that decided at a margin wider
+    // than the routers' own disagreement cannot have flipped, so the earliest
+    // flip is at the first layer that decided inside it. Everything before
+    // that point ran the same arithmetic as the reference and is held to the
+    // same tolerance as any other row; only from there on is the row set
+    // aside. Discarding the whole row -- which is what a boolean did -- threw
+    // away every layer beneath the tie for a tie that happened above them.
     auto route_skips = [&](const std::vector<std::vector<int>>& want_ids,
-                           const std::vector<float>& want_margin,
+                           const std::vector<std::vector<std::pair<int, float>>>& want_margins,
                            const std::vector<Vec>& want_logits, int n_rows, int& ambiguous,
                            std::vector<bool>& permuted) {
-        std::vector<bool> skip(std::size_t(n_rows), false);
+        const int kAll = int(dag.size());
+        std::vector<int> cut(std::size_t(n_rows), kAll);
         permuted.assign(std::size_t(n_rows), false);
         ambiguous = 0;
-        if (!g.is_moe() || plan.expert_ids_value < 0) return skip;
+        if (!g.is_moe() || plan.expert_ids_value < 0) return cut;
         const auto& ids_slot =
             b.pool[std::size_t(col.color_of_value[std::size_t(plan.expert_ids_value)])];
         const auto* ids = static_cast<const std::int32_t*>(ids_slot.contents());
-        if (ids == nullptr) return skip;
+        if (ids == nullptr) return cut;
         // The device's own router logits, for the last layer -- the same layer
         // whose selection `ids` holds.
         int router_disp = -1;
@@ -1253,20 +1274,39 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
             }
             // Two logits within 2d of each other are a coin flip: shifting
             // either by the error already observed reverses the order.
+            //
+            // `d` is measured at the only router the pool still holds, and is
+            // then applied to every layer's margin. That is an approximation
+            // and is stated as one: the layers' routers are different matrices
+            // and need not disagree by the same amount. It errs toward
+            // cutting, never toward excusing, which is the safe direction --
+            // an under-cut row fails loudly, an over-cut one only loses
+            // coverage that the boolean was losing outright.
             const float kAmbiguous = 2.0f * d;
-            if (want_margin[std::size_t(r)] < kAmbiguous) {
-                skip[std::size_t(r)] = true;
+            int first_tie = kAll;
+            float tie_margin = 0.0f;
+            for (const auto& lm : want_margins[std::size_t(r)]) {
+                if (lm.second < kAmbiguous) {
+                    first_tie = lm.first;
+                    tie_margin = lm.second;
+                    break;
+                }
+            }
+            if (first_tie < kAll) {
+                cut[std::size_t(r)] = first_tie;
                 ++ambiguous;
-                std::printf("    note: row %d routed differently at a margin of %.4f, inside "
-                            "the routers' own disagreement of %.4f; row excluded\n",
-                            r, double(want_margin[std::size_t(r)]), double(d));
+                std::printf("    note: row %d routed differently; the earliest selection it "
+                            "could have flipped on decided at a margin of %.4f, inside the "
+                            "routers' own disagreement of %.4f -- row compared up to dispatch "
+                            "%d and set aside after it\n",
+                            r, double(tie_margin), double(d), first_tie);
             } else {
-                std::printf("    row %d routed differently at a margin of %.4f, which the "
-                            "routers' disagreement of %.4f does NOT explain\n",
-                            r, double(want_margin[std::size_t(r)]), double(d));
+                std::printf("    row %d routed differently and no selection in the step was "
+                            "close enough to explain it: the routers' disagreement of %.4f "
+                            "covers none of its margins\n", r, double(d));
             }
         }
-        return skip;
+        return cut;
     };
 
     // ── two requests in ONE fire ──
@@ -1303,13 +1343,12 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
 
         std::vector<Trace> wants;
         std::vector<std::vector<int>> want_ids;
-        std::vector<float> want_margin;
+        std::vector<std::vector<std::pair<int, float>>> want_margins;
         std::vector<Vec> want_logits;
         const auto take = [&](Reference& rf, int tok, int pos) {
-            rf.step_min_margin = 3.0e38f;
             wants.push_back(rf.step(dag, tok, pos));
             want_ids.push_back(rf.last_ids);
-            want_margin.push_back(rf.step_min_margin);
+            want_margins.push_back(rf.step_margins);
             want_logits.push_back(rf.last_router_logits);
         };
         for (int i = 0; i < a; ++i) take(ref, tok_a[std::size_t(i)], i);
@@ -1328,11 +1367,22 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         });
         int ambiguous = 0;
         std::vector<bool> permuted;
-        const std::vector<bool> skip = route_skips(want_ids, want_margin, want_logits, R, ambiguous, permuted);
+        const std::vector<int> cut =
+            route_skips(want_ids, want_margins, want_logits, R, ambiguous, permuted);
+        // What a row set aside for a routing tie still contributed. The cut
+        // exists so that the layers BENEATH the tie are held to the tolerance
+        // like anyone else's; if this comes back zero the cut has collapsed
+        // into the boolean it replaced and the coverage is gone silently.
+        int salvaged = 0;
         for (int r = 0; r < R; ++r) {
-            if (!skip[std::size_t(r)]) {
-                compare_all(wants[std::size_t(r)], r, r, permuted[std::size_t(r)]);
-            }
+            const int before = compared;
+            compare_all(wants[std::size_t(r)], r, r, permuted[std::size_t(r)],
+                        cut[std::size_t(r)]);
+            if (cut[std::size_t(r)] < int(dag.size())) salvaged += compared - before;
+        }
+        if (ambiguous > 0) {
+            expect(salvaged > 0, std::string(who) +
+                   ": a row set aside for a routing tie is still compared up to it");
         }
         expect(ambiguous * 4 <= R,
                std::string(who) + ": most rows routed the same way as the reference");
@@ -1353,13 +1403,12 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
     if (R > 1) {
         std::vector<Trace> wants;
         std::vector<std::vector<int>> want_ids;
-        std::vector<float> want_margin;
+        std::vector<std::vector<std::pair<int, float>>> want_margins;
         std::vector<Vec> want_logits;
         for (int step = 0; step < R; ++step) {
-            ref.step_min_margin = 3.0e38f;
             wants.push_back(ref.step(dag, tokens[std::size_t(step)], step));
             want_ids.push_back(ref.last_ids);
-            want_margin.push_back(ref.step_min_margin);
+            want_margins.push_back(ref.step_margins);
             want_logits.push_back(ref.last_router_logits);
         }
         write_paged_io(0, R, tokens);
@@ -1368,11 +1417,22 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         });
         int ambiguous = 0;
         std::vector<bool> permuted;
-        const std::vector<bool> skip = route_skips(want_ids, want_margin, want_logits, R, ambiguous, permuted);
+        const std::vector<int> cut =
+            route_skips(want_ids, want_margins, want_logits, R, ambiguous, permuted);
+        // What a row set aside for a routing tie still contributed. The cut
+        // exists so that the layers BENEATH the tie are held to the tolerance
+        // like anyone else's; if this comes back zero the cut has collapsed
+        // into the boolean it replaced and the coverage is gone silently.
+        int salvaged = 0;
         for (int r = 0; r < R; ++r) {
-            if (!skip[std::size_t(r)]) {
-                compare_all(wants[std::size_t(r)], r, r, permuted[std::size_t(r)]);
-            }
+            const int before = compared;
+            compare_all(wants[std::size_t(r)], r, r, permuted[std::size_t(r)],
+                        cut[std::size_t(r)]);
+            if (cut[std::size_t(r)] < int(dag.size())) salvaged += compared - before;
+        }
+        if (ambiguous > 0) {
+            expect(salvaged > 0, std::string(who) +
+                   ": a row set aside for a routing tie is still compared up to it");
         }
         expect(ambiguous * 4 <= R, std::string(who) +
                ": most rows routed the same way as the reference");
