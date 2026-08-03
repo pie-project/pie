@@ -443,8 +443,27 @@ pub(crate) struct LaunchGrouping {
     has_device_geometry: bool,
 }
 
+/// A fire the driver will resolve a DENSE per-cell attention mask for out of
+/// a descriptor channel. Such a fire composes only SOLO: the driver's
+/// multi-program batch has no way to merge one program's dense mask with
+/// another's geometry (v1 scope), and it throws
+/// `RetryableLaunchError("dense device mask in a multi-program batch")`
+/// rather than execute a wrong one.
+///
+/// `dense_device_mask` is the program's own binding — an `AttnMask` port
+/// sourced from a channel — and is the SAME predicate the driver resolves
+/// on. The second clause is the older inference (a user mask with no wire
+/// BRLE rows must be device-carried); it is kept because it covers fires
+/// whose mask is device-carried without the port binding being visible here.
+///
+/// The inference alone was not enough. `cuda_runahead_concurrent` runs 8
+/// pipelines of a sink/sliding-window decode program: every fire carried
+/// BOTH wire BRLE rows (`masks` non-empty, so the second clause is false)
+/// AND a channel-bound `AttnMask`, so the batcher merged them and the first
+/// concurrent step failed the driver's contract, poisoned descriptor
+/// channel 0, and lost all 8 streams.
 fn has_dense_device_mask(request: &crate::driver::LaunchPlan) -> bool {
-    request.has_user_mask && request.masks.is_empty()
+    request.dense_device_mask || (request.has_user_mask && request.masks.is_empty())
 }
 
 impl LaunchGrouping {
@@ -7444,6 +7463,31 @@ mod tests {
         assert!(
             !ordinary_group.accepts(&host_on_device, limits, 16),
             "resolved-geometry host masks remain incompatible with reordered wire rows"
+        );
+
+        // The wire rows above are an INFERENCE, not the binding. A program
+        // that binds `AttnMask` to a channel gets its dense mask resolved on
+        // device whether or not this fire also lowered BRLE rows, so the
+        // binding itself has to keep the fire solo. `cuda_runahead_concurrent`
+        // is the case: 8 pipelines of a sink/sliding-window decode program,
+        // every fire carrying BOTH wire rows and the channel binding, batched
+        // into one step that the driver rejects — the failed prepare poisons
+        // descriptor channel 0 and every stream is lost.
+        let mut bound_dense = dummy_launch_request(ProcessId::new_v4(), 6);
+        bound_dense.request.dense_device_mask = true;
+        bound_dense.request.has_user_mask = true;
+        bound_dense.request.masks = vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+        bound_dense.request.mask_indptr = vec![0, 1];
+        let mut grouping = LaunchGrouping::default();
+        assert!(
+            grouping.push(&bound_dense, limits, 16),
+            "a channel-bound dense mask seals its step even with wire rows"
+        );
+        let mut ordinary_group = LaunchGrouping::default();
+        ordinary_group.push(&dummy_launch_request(ProcessId::new_v4(), 7), limits, 16);
+        assert!(
+            !ordinary_group.accepts(&bound_dense, limits, 16),
+            "and never joins a step that already has a member"
         );
     }
 

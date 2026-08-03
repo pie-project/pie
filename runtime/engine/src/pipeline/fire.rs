@@ -586,8 +586,7 @@ fn rs_plan_for(
     // the linear layers gather already-buffered activations and return before
     // the output projection -- so there is no per-row switch that would let a
     // computing row ride along.
-    if kinds.iter().any(|k| *k == Position::Commit)
-        && !kinds.iter().all(|k| *k == Position::Commit)
+    if kinds.iter().any(|k| *k == Position::Commit) && !kinds.iter().all(|k| *k == Position::Commit)
     {
         let row = kinds
             .iter()
@@ -1161,6 +1160,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             attn_mask,
             accesses,
             decode_envelope,
+            dense_mask,
         ) = {
             let p = ctx.resources().get_mut(&fwd)?;
             if let Some(e) = &p.failed {
@@ -1241,6 +1241,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 attn_mask,
                 accesses,
                 p.decode_envelope.clone(),
+                p.dense_mask,
             )
         };
         crate::scheduler::cpu_phase_add(crate::scheduler::CpuPhase::BindGeometry, phase_cpu);
@@ -1249,6 +1250,11 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let readout_defaulted = geometry.readout_defaulted;
         geometry.apply_to(&mut req);
         req.device_resolved_geometry = decode_envelope.is_some();
+        // Carried to the batcher, which keeps such a fire out of shared
+        // waves — see `scheduler::worker::has_dense_device_mask`. The
+        // binding is the program's, so it holds for every fire of the pass
+        // whether or not this one's geometry resolved on the host wire.
+        req.dense_device_mask = dense_mask;
         req.single_token_mode = req.token_ids.len() + 1 == req.qo_indptr.len()
             && req.qo_indptr.windows(2).all(|lane| lane[1] - lane[0] == 1);
         attn_mask.apply_to(&mut req);
@@ -2733,6 +2739,13 @@ async fn fire_device_geometry<C: FireContext>(
     }
     rs_prepared.apply_to(&mut req);
     attn_mask.apply_to(&mut req);
+    // Same carry as the wire path: the AttnMask channel binding is the
+    // program's, so a device-geometry fire of a mask-binding pass must be
+    // scheduled SOLO too. Omitting it here is what let the run-ahead
+    // carrier batch 8 concurrent pipelines into one step, which the driver
+    // rejects (`dense device mask in a multi-program batch`) — the failing
+    // prepare then poisoned descriptor channel 0 and lost every stream.
+    req.dense_device_mask = ctx.resources().get(&fwd)?.dense_mask;
     let ticket_reservation = TicketReservation::new(&cells, &accesses);
     ticket_reservation.apply_to(&mut req);
     let last_page_len = if pages.is_empty() { 0 } else { page_size };
