@@ -280,8 +280,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             pie_loader::CheckpointSource view(storage);
             StagedWeights staged = stage_plan_weights(
                 ctx, view, load_plan, storage.memory.persistent_bytes,
-                stream_predicate(pie::metal::model::ModelFamily::Gemma4,
-                                 cfg.stream_routed_experts));
+                stream_predicate(cfg.stream_routed_experts));
             b_.weights = std::move(staged.weights);
             // The pack must outlive the weights that point into it; see the
             // gpt-oss engine below.
@@ -616,8 +615,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
             pie_loader::CheckpointSource view(storage);
             StagedWeights staged = stage_plan_weights(
                 ctx, view, load_plan, storage.memory.persistent_bytes,
-                stream_predicate(pie::metal::model::ModelFamily::GptOss,
-                                 cfg.stream_routed_experts));
+                stream_predicate(cfg.stream_routed_experts));
             b_.weights = std::move(staged.weights);
             // The pack must outlive the weights that point into it. Taking only
             // `staged.weights` and letting `staged` die unmaps it under them,
@@ -979,8 +977,7 @@ class LlamaEngine final : public SimpleFamilyEngine {
             pie_loader::CheckpointSource view(storage);
             StagedWeights staged = stage_plan_weights(
                 ctx, view, load_plan, storage.memory.persistent_bytes,
-                stream_predicate(pie::metal::model::ModelFamily::Llama,
-                                 cfg.stream_routed_experts));
+                stream_predicate(cfg.stream_routed_experts));
             b_.weights = std::move(staged.weights);
             // The pack must outlive the weights that point into it; see the
             // gpt-oss engine above.
@@ -1235,69 +1232,44 @@ std::uint32_t SimpleFamilyEngine::max_forward_tokens_for_budget(
 }
 
 std::function<bool(const std::string&)> SimpleFamilyEngine::stream_predicate(
-    pie::metal::model::ModelFamily family, bool stream_routed_experts) {
+    bool stream_routed_experts) {
     if (!stream_routed_experts) return {};
 
-    // What is worth streaming is the per-layer projection bank: it is nearly
-    // all of any checkpoint's bytes, and it is the only class big enough for
-    // the trade to matter.
+    // A ROUTED expert bank, and nothing else. One pattern, no family.
     //
-    // The trade differs by how the bank is READ, and both halves are useful:
+    // What makes streaming a bank worth doing is that the bank is read
+    // SPARSELY. A token reads 8 experts of 128 per layer, so an eighth of it
+    // faults in and the kernel evicts the rest: measured at 16.31 GB out of
+    // the heap on Qwen3-30B-A3B, load 33.2 s -> 0.67 s, prefill unchanged and
+    // decode down 3%. A DENSE FFN is read whole every token, so paging it
+    // saves no traffic at all -- the only thing it buys is that a model larger
+    // than RAM runs slowly instead of failing to load, which is a different
+    // decision under a switch that does not name it.
     //
-    //   * a SPARSE bank -- gpt-oss's routed experts, of which a token reads 4
-    //     in 32 per layer -- is nearly free to stream. An eighth faults in and
-    //     the kernel evicts the rest. Measured: 10.75 GB out of the heap, same
-    //     tokens, same rate.
-    //   * a DENSE bank is read whole every token, so streaming it does not
-    //     save traffic. What it saves is the requirement that the weights fit
-    //     at all: a model larger than RAM runs, slowly, instead of failing to
-    //     load. For a model that fits comfortably this is the wrong trade,
-    //     which is why it is off by default.
+    // This predicate used to stream the dense FFN too, for the families that
+    // have one. That was wrong twice over. It made one switch mean two trades,
+    // so an operator who wanted the free one on a dense model silently bought
+    // the expensive one. And `[model].stream_routed_experts` is the same key
+    // the CUDA driver reads, where every call site of it -- mixtral,
+    // deepseek_v4, the qwen mixture -- sits inside a routed expert stack and
+    // no dense weight is ever streamed. The same configuration now means the
+    // same thing on both backends.
     //
-    // `.bias` stays resident everywhere: it is three orders of magnitude
-    // smaller than the weight beside it and is read whichever expert runs.
-    const auto is_bias = [](const std::string& n) {
-        return n.size() > 5 && n.compare(n.size() - 5, 5, ".bias") == 0;
+    // The name is the whole test, which is why there is no family argument any
+    // more. A routed layer publishes `mlp.experts.gate_proj` whatever family
+    // it belongs to; a dense one has no experts to match. Asking the family
+    // was asking a proxy for the layer shape, and the llama family -- the only
+    // one with both shapes -- is exactly where that proxy broke: its clause
+    // named `mlp.gate_proj`, which is not a substring of
+    // `mlp.experts.gate_proj`, so Qwen3-MoE streamed nothing while gpt-oss
+    // streamed 10.75 GB off the same access pattern.
+    //
+    // `.bias` stays resident: it is three orders of magnitude smaller than the
+    // weight beside it and is read whichever expert runs.
+    return [](const std::string& n) {
+        if (n.size() > 5 && n.compare(n.size() - 5, 5, ".bias") == 0) return false;
+        return n.find("mlp.experts.") != std::string::npos;
     };
-    switch (family) {
-        case pie::metal::model::ModelFamily::GptOss:
-            return [is_bias](const std::string& n) {
-                return n.find("mlp.experts.") != std::string::npos && !is_bias(n);
-            };
-        case pie::metal::model::ModelFamily::Gemma4:
-        case pie::metal::model::ModelFamily::Qwen35:
-        case pie::metal::model::ModelFamily::Llama:
-            // The dense FFN, which is ~70% of a decoder layer. Named by the
-            // three projections rather than by "mlp." so the per-layer
-            // embedding tensors beside them -- small, and read every token --
-            // stay resident.
-            //
-            // AND the routed bank, which the llama arm used to miss. A routed
-            // llama publishes `mlp.experts.gate_proj`, and `mlp.gate_proj` is
-            // not a substring of it, so Qwen3-MoE fell through every clause and
-            // streamed nothing -- while gpt-oss, whose experts carry the same
-            // name and the same access pattern, streamed 10.75 GB. That is the
-            // SPARSE half of the trade, the free one: a token reads 8 experts
-            // of 128 per layer, so an eighth of the bank faults in and the
-            // kernel evicts the rest. It went missing because this predicate is
-            // written per FAMILY while the thing it describes -- how a bank is
-            // read -- is per LAYER SHAPE, and the llama family is the only one
-            // that has both shapes.
-            //
-            // The two patterns are disjoint by construction: a routed layer has
-            // no dense `mlp.gate_proj` and a dense one has no experts, so one
-            // predicate serves both without being told which model it is.
-            return [is_bias](const std::string& n) {
-                if (is_bias(n)) return false;
-                if (n.find("mlp.experts.") != std::string::npos) return true;
-                return n.find("mlp.gate_proj") != std::string::npos ||
-                       n.find("mlp.up_proj") != std::string::npos ||
-                       n.find("mlp.down_proj") != std::string::npos;
-            };
-        case pie::metal::model::ModelFamily::Unknown:
-            return {};
-    }
-    return {};
 }
 
 std::size_t SimpleFamilyEngine::extra_heap_bytes(pie::metal::model::ModelFamily family,

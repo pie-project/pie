@@ -649,17 +649,25 @@ void check_refusals() {
 void check_streaming_covers_both_ffn_shapes() {
     using pie::metal::batch::SimpleFamilyEngine;
     using pie::metal::model::ModelFamily;
-    const auto llama = SimpleFamilyEngine::stream_predicate(ModelFamily::Llama, true);
-    expect(bool(llama), "llama offers a streaming predicate when asked");
-    if (!llama) return;
-    expect(llama("layers.3.mlp.experts.gate_proj"), "a routed llama streams its expert bank");
-    expect(llama("layers.3.mlp.experts.down_proj"), "including the down projection");
-    expect(llama("layers.3.mlp.gate_proj"), "a dense llama still streams its FFN");
-    expect(!llama("layers.3.mlp.experts.gate_proj.bias"),
+    const auto p = SimpleFamilyEngine::stream_predicate(true);
+    expect(bool(p), "a streaming predicate is offered when the config asks");
+    if (!p) return;
+    expect(p("layers.3.mlp.experts.gate_proj"), "a routed bank streams");
+    expect(p("layers.3.mlp.experts.down_proj"), "including the down projection");
+    expect(p("layers.3.mlp.switch_mlp.gate_proj") == false,
+           "a name the contract has not finalized onto mlp.experts. does not");
+    // The dense FFN is read WHOLE every token, so paging it saves no traffic.
+    // It used to stream under this same switch, which made one flag mean two
+    // trades -- and disagreed with the CUDA driver, where every use of this
+    // config key sits inside a routed expert stack.
+    expect(!p("layers.3.mlp.gate_proj"), "a dense FFN does not stream");
+    expect(!p("layers.3.mlp.up_proj"), "nor its up projection");
+    expect(!p("layers.3.mlp.down_proj"), "nor its down projection");
+    expect(!p("layers.3.mlp.experts.gate_proj.bias"),
            "the bias beside an expert stays resident");
-    expect(!llama("layers.3.mlp.gate.weight"), "the router itself stays resident");
-    expect(!llama("layers.3.self_attn.q_proj"), "attention stays resident");
-    expect(!SimpleFamilyEngine::stream_predicate(ModelFamily::Llama, false),
+    expect(!p("layers.3.mlp.gate.weight"), "the router itself stays resident");
+    expect(!p("layers.3.self_attn.q_proj"), "attention stays resident");
+    expect(!SimpleFamilyEngine::stream_predicate(false),
            "and nothing streams unless the config asks");
 }
 

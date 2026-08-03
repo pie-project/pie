@@ -726,7 +726,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // a heap sized for weights that are then ALSO mapped is the footprint
     // doubled rather than halved, and on a machine where the model only just
     // fits that is the difference between running and reading zeros.
-    const auto streams = SimpleFamilyEngine::stream_predicate(family, cfg.stream_routed_experts);
+    const auto streams = SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts);
     const std::size_t streamed =
         streams ? std::size_t(streamable_plan_bytes(load_plan, streams)) : 0;
     const std::size_t heap_bytes = (weights > streamed ? weights - streamed : weights) +
@@ -838,8 +838,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // WITHOUT them: a heap sized for weights that are then also mapped is the
     // footprint doubled rather than halved, which on a machine where the model
     // only just fits is the difference between running and reading zeros.
-    const auto streams = SimpleFamilyEngine::stream_predicate(
-        model::ModelFamily::Qwen35, stream_routed_experts);
+    const auto streams = SimpleFamilyEngine::stream_predicate(stream_routed_experts);
     const size_t streamed =
         streams ? size_t(streamable_plan_bytes(load_plan, streams)) : 0;
     const size_t resident_weights =

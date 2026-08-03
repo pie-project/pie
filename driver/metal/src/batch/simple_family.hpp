@@ -85,7 +85,7 @@ class SimpleFamilyEngine {
     /// this from a path that has a `DecodeGeometry` and no config, and the
     /// predicate never wanted more than the one bit anyway.
     static std::function<bool(const std::string&)> stream_predicate(
-        model::ModelFamily family, bool stream_routed_experts);
+        bool stream_routed_experts);
 
     /// One fire: several requests' new tokens sharing a command buffer.
     ///
