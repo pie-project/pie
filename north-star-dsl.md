@@ -121,7 +121,17 @@ peepholes, eligibility predicates, thresholds.
    fused predicate are deleted; the switch dispatches on op kind + stated
    variant only. Parity: byte-identical to the current executor on the
    full battery (which is itself byte-identical to hand-written).
-3. **Static C++ emission** — DONE (2026-08-02): `emit_cuda.rs` walks the
+3. **Static C++ emission** — DONE (2026-08-02); COMPLETE AT FULL
+   WIDTH (2026-08-03, `31a28eed`): after the class collapse, the
+   static form grew to cover every admitted fire — the mask arms, the
+   Peel's row-windowed regions, the lora arms (the emitter constructs
+   the fire staging and spells each correction's layer as a constant),
+   and the hook machinery (sideband preamble, 280 constant-layer
+   sites, page-mask brackets, capture publishes). The generated
+   dispatch keeps NO per-attachment exclusions: digest match means
+   static C++, full stop. Hook A/B through the generated path is
+   byte-identical 12/12 under live page eviction. Original rung-3
+   record: `emit_cuda.rs` walks the
    class traces and writes `generated/qwen3_0_6b.inc` (committed,
    regeneration-clean-tested) — 4.5k lines of straight-line C++, one
    statement per op, the XQA-or-not question answered at emission, the

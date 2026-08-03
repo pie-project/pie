@@ -17,9 +17,15 @@
 //! gate (hand-written ≡ interpreter ≡ generated) holds them together.
 //!
 //! Scope: the vocabulary the qwen3-class traces contain (pre-norm,
-//! unpadded head dim, per-head qk-norm, fused QKV). Anything outside it
-//! fails loudly — an emitter that silently skipped an op would be a
-//! miscompile, not a fallback.
+//! unpadded head dim, per-head qk-norm, fused QKV) — at FULL fire
+//! width since rung 3 completed: the masked, mixed (Peel), lora
+//! (staged handle + constant-layer corrections) and hooked arms (the
+//! sideband preamble, constant-layer sites, page-mask brackets,
+//! capture publishes) all emit, and the generated dispatch has no
+//! per-attachment exclusions. Post-norm placement and padded head
+//! dims remain interpreter-only (the asserts below). Anything outside
+//! the vocabulary fails loudly — an emitter that silently skipped an
+//! op would be a miscompile, not a fallback.
 
 use crate::facts::{LlamaLikeCudaFacts, LlamaLikeFacts, NormPlacement, QkNorm};
 use crate::family::llama_like_cuda;
