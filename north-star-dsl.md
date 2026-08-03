@@ -856,3 +856,12 @@ Step 3: the fingerprint + eligibility — LoraFireState's shape tuple
 (lane count, ranks, sites, spans, grouping) hashes into a per-key
 exec store on the hook pattern; pure decode's span-of-1 keeps it
 stable across a workload's steps.
+
+Step 3a landed (`c25a45026` → this): staging leaves the body. The
+engine stages per fire before the graph decision (invoke_lora_stage;
+the staged handle on plan_state, identity-checked), all three bodies
+consume read-only with local fallback, and the stage call answers the
+step-3b fingerprint. A lora fire's body is now launches-only end to
+end. Live: 128 interpreter-leg fires on the engine-staged state; solo
+byte-stable both legs. 3b next: the fingerprint-keyed exec store +
+eligibility + capture-with-lora.
