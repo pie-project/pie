@@ -1,5 +1,7 @@
 #include "kernels/rope.hpp"
 
+#include <cstdint>
+
 #include <cuda_bf16.h>
 
 #include "kernels/rope_device.cuh"
@@ -373,6 +375,96 @@ void launch_rope_bf16(
         positions,
         num_q_heads, num_kv_heads, head_dim, theta, interleaved, cache_pairs,
         heads_per_block);
+}
+
+// Peel device-window variant (the device-window campaign): the row
+// window rides in device memory; the grid spans the full lane count and
+// out-of-window rows early-out (uniform per block — blockIdx.x is the
+// row — so the shared-memory reduction below never diverges). Buffers
+// and positions are BASE pointers.
+template <int BLOCK>
+__global__ void qk_rmsnorm_rope_bf16_devwin_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ q_weight,
+    const __nv_bfloat16* __restrict__ k_weight,
+    const std::int32_t* __restrict__ positions,
+    const std::uint32_t* __restrict__ win,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps)
+{
+    const int n = blockIdx.x;
+    {
+        const int w0 = static_cast<int>(win[0]);
+        const int w1 = static_cast<int>(win[1]);
+        if (n < w0 || n >= w0 + w1) return;
+    }
+    const int head_idx = blockIdx.y;
+    const bool is_q = head_idx < num_q_heads;
+    const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
+    __nv_bfloat16* row = is_q
+        ? q + (static_cast<long long>(n) * num_q_heads + local_head) * head_dim
+        : k + (static_cast<long long>(n) * num_kv_heads + local_head) * head_dim;
+    const __nv_bfloat16* weight = is_q ? q_weight : k_weight;
+
+    float local = 0.f;
+    for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
+        const float v = __bfloat162float(row[i]);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[threadIdx.x] = local;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) buf[threadIdx.x] += buf[threadIdx.x + off];
+        __syncthreads();
+    }
+
+    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(head_dim) + eps);
+    const int half = head_dim / 2;
+    const int pos = positions[n];
+    for (int dim_pair = threadIdx.x; dim_pair < half; dim_pair += BLOCK) {
+        const float a = __bfloat162float(row[dim_pair]) *
+            inv_rms * __bfloat162float(weight[dim_pair]);
+        const float b = __bfloat162float(row[dim_pair + half]) *
+            inv_rms * __bfloat162float(weight[dim_pair + half]);
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        row[dim_pair] = __float2bfloat16(a * cos_v - b * sin_v);
+        row[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
+    }
+}
+
+void launch_qk_rmsnorm_rope_bf16_devwin(
+    void* q, void* k,
+    const void* q_weight, const void* k_weight,
+    const std::int32_t* positions,
+    const std::uint32_t* win_d,
+    int n_max,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps,
+    cudaStream_t stream)
+{
+    if (n_max <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(n_max, num_q_heads + num_kv_heads);
+    qk_rmsnorm_rope_bf16_devwin_kernel<BLOCK><<<grid, BLOCK, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        static_cast<const __nv_bfloat16*>(q_weight),
+        static_cast<const __nv_bfloat16*>(k_weight),
+        positions, win_d,
+        num_q_heads, num_kv_heads, head_dim, theta, eps);
 }
 
 void launch_qk_rmsnorm_rope_bf16(

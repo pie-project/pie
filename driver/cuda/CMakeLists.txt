@@ -956,7 +956,7 @@ pie_add_cuda_target(test_page_compact
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_brle SOURCES tests/test_brle.cpp src/batch/brle.cpp)
 pie_add_cuda_target(test_supergraph SOURCES tests/test_supergraph.cu src/batch/supergraph.cu)
-pie_add_cuda_target(test_peel_window SOURCES tests/test_peel_window.cu src/kernels/kv_paged.cu src/kernels/envelope.cu)
+pie_add_cuda_target(test_peel_window SOURCES tests/test_peel_window.cu src/kernels/kv_paged.cu src/kernels/envelope.cu src/kernels/split_packed.cu src/kernels/rope.cu)
 # Host oracle: fork geometry -> BRLE decode -> masking == prefix truncation.
 pie_add_cuda_target(test_masked_attention_geometry
   SOURCES tests/masked_attention_geometry_test.cpp src/batch/brle.cpp

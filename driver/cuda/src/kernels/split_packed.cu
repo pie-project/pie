@@ -1,5 +1,7 @@
 #include "kernels/split_packed.hpp"
 
+#include <cstdint>
+
 #include <cuda_bf16.h>
 
 namespace pie_cuda_driver::kernels {
@@ -472,6 +474,60 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv_kernel(
 }
 
 }  // namespace
+
+// Peel device-window variant (north-star-dsl.md, the device-window
+// campaign): the row window rides in device memory; the grid spans the
+// full lane count and out-of-window rows early-out, so a captured
+// launch replays across row splits. Buffers are BASE pointers (the
+// host-window form windows by caller offsets).
+__global__ void split_qkv_devwin_kernel(
+    const __nv_bfloat16* __restrict__ src,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_out,
+    __nv_bfloat16* __restrict__ v_out,
+    const std::uint32_t* __restrict__ win,
+    int q_dim, int kv_dim)
+{
+    const int n = blockIdx.y;
+    const int w0 = static_cast<int>(win[0]);
+    const int w1 = static_cast<int>(win[1]);
+    if (n < w0 || n >= w0 + w1) return;
+    const int stride = q_dim + 2 * kv_dim;
+    const __nv_bfloat16* src_row = src + static_cast<long long>(n) * stride;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < q_dim;
+         j += blockDim.x * gridDim.x) {
+        q_out[static_cast<long long>(n) * q_dim + j] = src_row[j];
+    }
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < kv_dim;
+         j += blockDim.x * gridDim.x) {
+        k_out[static_cast<long long>(n) * kv_dim + j] = src_row[q_dim + j];
+    }
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < kv_dim;
+         j += blockDim.x * gridDim.x) {
+        v_out[static_cast<long long>(n) * kv_dim + j] =
+            src_row[q_dim + kv_dim + j];
+    }
+}
+
+void launch_split_qkv_bf16_devwin(
+    const void* packed,
+    void* q_out, void* k_out, void* v_out,
+    const std::uint32_t* win_d,
+    int n_max, int q_dim, int kv_dim,
+    cudaStream_t stream)
+{
+    if (n_max <= 0) return;
+    constexpr int BLOCK = 256;
+    const int max_dim = q_dim > kv_dim ? q_dim : kv_dim;
+    const int xblocks = (max_dim + BLOCK - 1) / BLOCK;
+    dim3 grid(xblocks, n_max);
+    split_qkv_devwin_kernel<<<grid, BLOCK, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(packed),
+        static_cast<__nv_bfloat16*>(q_out),
+        static_cast<__nv_bfloat16*>(k_out),
+        static_cast<__nv_bfloat16*>(v_out),
+        win_d, q_dim, kv_dim);
+}
 
 void launch_split_qkv_bf16(
     const void* packed,

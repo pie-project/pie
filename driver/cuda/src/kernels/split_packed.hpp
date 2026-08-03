@@ -18,6 +18,15 @@ namespace pie_cuda_driver::kernels {
 // `packed` is row-major [N, q_dim + 2*kv_dim]; outputs are row-major
 // [N, q_dim] / [N, kv_dim] / [N, kv_dim]. Buffers must not overlap with
 // `packed`.
+// Peel device-window variant: {start, len} in device memory, full-grid
+// launch with early-out, base pointers.
+void launch_split_qkv_bf16_devwin(
+    const void* packed,
+    void* q_out, void* k_out, void* v_out,
+    const std::uint32_t* win_d,
+    int n_max, int q_dim, int kv_dim,
+    cudaStream_t stream);
+
 void launch_split_qkv_bf16(
     const void* packed,
     void* q_out, void* k_out, void* v_out,
