@@ -126,6 +126,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -138,6 +144,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -402,6 +414,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -414,6 +432,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -678,6 +702,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -690,6 +720,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -954,6 +990,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -966,6 +1008,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1230,6 +1278,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -1242,6 +1296,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1506,6 +1566,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -1518,6 +1584,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1782,6 +1854,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -1794,6 +1872,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2058,6 +2142,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -2070,6 +2160,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2334,6 +2430,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -2346,6 +2448,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2610,6 +2718,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -2622,6 +2736,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2886,6 +3006,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -2898,6 +3024,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3162,6 +3294,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -3174,6 +3312,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3438,6 +3582,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -3450,6 +3600,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3714,6 +3870,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -3726,6 +3888,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3990,6 +4158,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -4002,6 +4176,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4266,6 +4446,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -4278,6 +4464,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4542,6 +4734,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -4554,6 +4752,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4818,6 +5022,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -4830,6 +5040,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5094,6 +5310,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -5106,6 +5328,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5370,6 +5598,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -5382,6 +5616,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5646,6 +5886,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -5658,6 +5904,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5922,6 +6174,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -5934,6 +6192,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6198,6 +6462,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -6210,6 +6480,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6474,6 +6750,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -6486,6 +6768,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6750,6 +7038,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -6762,6 +7056,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7026,6 +7326,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -7038,6 +7344,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7302,6 +7614,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -7314,6 +7632,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7578,6 +7902,12 @@ const LoraTable* lora)
                     N, R, stream, row_valid_d, /*first_token=*/0);
             }
         }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -7590,6 +7920,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7939,6 +8275,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -7951,6 +8293,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -8077,6 +8425,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -8089,6 +8443,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -8215,6 +8575,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -8227,6 +8593,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -8353,6 +8725,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -8365,6 +8743,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -8491,6 +8875,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -8503,6 +8893,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -8629,6 +9025,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -8641,6 +9043,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -8767,6 +9175,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -8779,6 +9193,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -8905,6 +9325,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -8917,6 +9343,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -9043,6 +9475,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -9055,6 +9493,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -9181,6 +9625,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -9193,6 +9643,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -9319,6 +9775,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -9331,6 +9793,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -9457,6 +9925,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -9469,6 +9943,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -9595,6 +10075,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -9607,6 +10093,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -9733,6 +10225,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -9745,6 +10243,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -9871,6 +10375,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -9883,6 +10393,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -10009,6 +10525,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -10021,6 +10543,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -10147,6 +10675,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -10159,6 +10693,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -10285,6 +10825,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -10297,6 +10843,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -10423,6 +10975,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -10435,6 +10993,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -10561,6 +11125,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -10573,6 +11143,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -10699,6 +11275,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -10711,6 +11293,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -10837,6 +11425,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -10849,6 +11443,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -10975,6 +11575,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -10987,6 +11593,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -11113,6 +11725,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -11125,6 +11743,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -11251,6 +11875,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -11263,6 +11893,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -11389,6 +12025,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -11401,6 +12043,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -11527,6 +12175,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -11539,6 +12193,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {
@@ -11665,6 +12325,12 @@ const LoraTable* lora)
         }
     }
     if (custom_mask_d != nullptr) {
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
                 "generated forward: prepare built no prefill plan");
@@ -11677,6 +12343,12 @@ const LoraTable* lora)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         if (hooks != nullptr) {

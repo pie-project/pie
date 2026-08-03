@@ -448,9 +448,12 @@ void llama_like_forward_declared(
     if (std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
         std::fprintf(stderr,
                      "[declared-forward] N=%d R=%d decode=%d fast_rows=%d "
-                     "ops=%zu\n",
-                     N, R, is_pure_decode ? 1 : 0,
-                     fast_rows, plan.op_count());
+                     "mask=%d hooked=%d lora=%d ops=%zu\n",
+                     N, R, is_pure_decode ? 1 : 0, fast_rows,
+                     custom_mask_d != nullptr ? 1 : 0,
+                     stage_hooks != nullptr ? 1 : 0,
+                     (lora != nullptr && lora->usable()) ? 1 : 0,
+                     plan.op_count());
     }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;

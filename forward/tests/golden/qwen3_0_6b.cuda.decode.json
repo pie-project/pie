@@ -6636,7 +6636,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -6785,12 +6785,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 0
+        }
+      },
+      "inputs": [
+        8
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 0
           }
+        }
+      },
+      "inputs": [
+        8
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 0
         }
       },
       "inputs": [
@@ -7311,7 +7337,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -7460,12 +7486,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 1
+        }
+      },
+      "inputs": [
+        34
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 1
           }
+        }
+      },
+      "inputs": [
+        34
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 1
         }
       },
       "inputs": [
@@ -7986,7 +8038,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -8135,12 +8187,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 2
+        }
+      },
+      "inputs": [
+        60
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 2
           }
+        }
+      },
+      "inputs": [
+        60
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 2
         }
       },
       "inputs": [
@@ -8661,7 +8739,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -8810,12 +8888,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 3
+        }
+      },
+      "inputs": [
+        86
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 3
           }
+        }
+      },
+      "inputs": [
+        86
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 3
         }
       },
       "inputs": [
@@ -9336,7 +9440,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -9485,12 +9589,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 4
+        }
+      },
+      "inputs": [
+        112
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 4
           }
+        }
+      },
+      "inputs": [
+        112
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 4
         }
       },
       "inputs": [
@@ -10011,7 +10141,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -10160,12 +10290,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 5
+        }
+      },
+      "inputs": [
+        138
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 5
           }
+        }
+      },
+      "inputs": [
+        138
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 5
         }
       },
       "inputs": [
@@ -10686,7 +10842,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -10835,12 +10991,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 6
+        }
+      },
+      "inputs": [
+        164
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 6
           }
+        }
+      },
+      "inputs": [
+        164
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 6
         }
       },
       "inputs": [
@@ -11361,7 +11543,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -11510,12 +11692,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 7
+        }
+      },
+      "inputs": [
+        190
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 7
           }
+        }
+      },
+      "inputs": [
+        190
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 7
         }
       },
       "inputs": [
@@ -12036,7 +12244,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -12185,12 +12393,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 8
+        }
+      },
+      "inputs": [
+        216
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 8
           }
+        }
+      },
+      "inputs": [
+        216
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 8
         }
       },
       "inputs": [
@@ -12711,7 +12945,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -12860,12 +13094,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 9
+        }
+      },
+      "inputs": [
+        242
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 9
           }
+        }
+      },
+      "inputs": [
+        242
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 9
         }
       },
       "inputs": [
@@ -13386,7 +13646,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -13535,12 +13795,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 10
+        }
+      },
+      "inputs": [
+        268
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 10
           }
+        }
+      },
+      "inputs": [
+        268
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 10
         }
       },
       "inputs": [
@@ -14061,7 +14347,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -14210,12 +14496,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 11
+        }
+      },
+      "inputs": [
+        294
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 11
           }
+        }
+      },
+      "inputs": [
+        294
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 11
         }
       },
       "inputs": [
@@ -14736,7 +15048,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -14885,12 +15197,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 12
+        }
+      },
+      "inputs": [
+        320
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 12
           }
+        }
+      },
+      "inputs": [
+        320
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 12
         }
       },
       "inputs": [
@@ -15411,7 +15749,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -15560,12 +15898,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 13
+        }
+      },
+      "inputs": [
+        346
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 13
           }
+        }
+      },
+      "inputs": [
+        346
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 13
         }
       },
       "inputs": [
@@ -16086,7 +16450,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -16235,12 +16599,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 14
+        }
+      },
+      "inputs": [
+        372
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 14
           }
+        }
+      },
+      "inputs": [
+        372
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 14
         }
       },
       "inputs": [
@@ -16761,7 +17151,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -16910,12 +17300,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 15
+        }
+      },
+      "inputs": [
+        398
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 15
           }
+        }
+      },
+      "inputs": [
+        398
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 15
         }
       },
       "inputs": [
@@ -17436,7 +17852,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -17585,12 +18001,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 16
+        }
+      },
+      "inputs": [
+        424
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 16
           }
+        }
+      },
+      "inputs": [
+        424
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 16
         }
       },
       "inputs": [
@@ -18111,7 +18553,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -18260,12 +18702,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 17
+        }
+      },
+      "inputs": [
+        450
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 17
           }
+        }
+      },
+      "inputs": [
+        450
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 17
         }
       },
       "inputs": [
@@ -18786,7 +19254,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -18935,12 +19403,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 18
+        }
+      },
+      "inputs": [
+        476
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 18
           }
+        }
+      },
+      "inputs": [
+        476
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 18
         }
       },
       "inputs": [
@@ -19461,7 +19955,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -19610,12 +20104,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 19
+        }
+      },
+      "inputs": [
+        502
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 19
           }
+        }
+      },
+      "inputs": [
+        502
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 19
         }
       },
       "inputs": [
@@ -20136,7 +20656,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -20285,12 +20805,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 20
+        }
+      },
+      "inputs": [
+        528
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 20
           }
+        }
+      },
+      "inputs": [
+        528
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 20
         }
       },
       "inputs": [
@@ -20811,7 +21357,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -20960,12 +21506,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 21
+        }
+      },
+      "inputs": [
+        554
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 21
           }
+        }
+      },
+      "inputs": [
+        554
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 21
         }
       },
       "inputs": [
@@ -21486,7 +22058,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -21635,12 +22207,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 22
+        }
+      },
+      "inputs": [
+        580
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 22
           }
+        }
+      },
+      "inputs": [
+        580
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 22
         }
       },
       "inputs": [
@@ -22161,7 +22759,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -22310,12 +22908,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 23
+        }
+      },
+      "inputs": [
+        606
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 23
           }
+        }
+      },
+      "inputs": [
+        606
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 23
         }
       },
       "inputs": [
@@ -22836,7 +23460,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -22985,12 +23609,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 24
+        }
+      },
+      "inputs": [
+        632
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 24
           }
+        }
+      },
+      "inputs": [
+        632
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 24
         }
       },
       "inputs": [
@@ -23511,7 +24161,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -23660,12 +24310,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 25
+        }
+      },
+      "inputs": [
+        658
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 25
           }
+        }
+      },
+      "inputs": [
+        658
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 25
         }
       },
       "inputs": [
@@ -24186,7 +24862,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -24335,12 +25011,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 26
+        }
+      },
+      "inputs": [
+        684
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 26
           }
+        }
+      },
+      "inputs": [
+        684
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 26
         }
       },
       "inputs": [
@@ -24861,7 +25563,7 @@
           "arms": [
             {
               "pred": "HasCustomMask",
-              "ops": 9
+              "ops": 11
             },
             {
               "pred": "HasLora",
@@ -25010,12 +25712,38 @@
     },
     {
       "kind": {
+        "HookSite": {
+          "stage": "OnAttnProj",
+          "layer": 27
+        }
+      },
+      "inputs": [
+        710
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "dispatch_attention_flashinfer_prefill_custom",
           "state": {
             "store": "KvCache",
             "layer": 27
           }
+        }
+      },
+      "inputs": [
+        710
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "HookSite": {
+          "stage": "OnAttn",
+          "layer": 27
         }
       },
       "inputs": [

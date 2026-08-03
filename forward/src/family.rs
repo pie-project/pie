@@ -241,8 +241,18 @@ fn llama_like_text(
                     };
                     if fused_post {
                         g.arm(GuardPred::HasCustomMask, || {
+                            // Masked+hooked composes here: the sites run
+                            // around the custom dispatch exactly as the
+                            // hand-written unconditional invokes do. No
+                            // WantsAttnScore guard — the custom dispatch
+                            // has no capture variant, so nothing
+                            // publishes and the OnAttn sideband hands
+                            // the programs a null scores pointer (the
+                            // publish-gated contract).
                             let q = general_qkv();
+                            dsl::hook_site(HookStage::OnAttnProj, &q, l);
                             cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
+                            dsl::hook_site(HookStage::OnAttn, &q, l);
                         })
                         // The lora arm: the fused epilogue writes V
                         // straight to the paged cache — nothing exists to
@@ -295,7 +305,10 @@ fn llama_like_text(
                     } else {
                         let q = hoisted_q.as_ref().expect("hoisted for the non-fused arm");
                         g.arm(GuardPred::HasCustomMask, || {
+                            // Masked+hooked (the fused arm's comment).
+                            dsl::hook_site(HookStage::OnAttnProj, q, l);
                             cuda::attention_flashinfer_prefill_custom_region(q, &w.kv);
+                            dsl::hook_site(HookStage::OnAttn, q, l);
                         })
                         .otherwise(|| attn_with_sites(q));
                     }
@@ -308,8 +321,12 @@ fn llama_like_text(
                     g.arm(GuardPred::HasCustomMask, || {
                         // The custom dispatch takes the layer view whole —
                         // no dequant staging (the hand-written custom-mask
-                        // branch's contract).
+                        // branch's contract). Masked+hooked composes: the
+                        // sites bracket the dispatch (null scores at
+                        // OnAttn — no capture variant publishes).
+                        dsl::hook_site(HookStage::OnAttnProj, &q, l);
                         cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
+                        dsl::hook_site(HookStage::OnAttn, &q, l);
                     })
                     .otherwise(|| {
                         // Prefill has no fused post, so no Peel: the body

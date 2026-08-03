@@ -1159,11 +1159,13 @@ fn lowered_trace_round_trips_through_the_arena() {
     // The one body's sites (A3): two per layer — argument no-ops on an
     // unhooked fire — and one Peel per layer splitting the fused prefix
     // from the hook-visible tail at fast_rows.
+    // Sites in every arm that runs a body: the mask arm (masked+hooked
+    // composes), the lora arm, and the plain else — 2 × 3 per layer.
     let sites = ops
         .iter()
         .filter(|op| op.kind == PieForwardOpKind::HookSite)
         .count();
-    assert_eq!(sites, 112);
+    assert_eq!(sites, 168);
     let peels: Vec<_> = ops
         .iter()
         .filter(|op| op.kind == PieForwardOpKind::Peel)

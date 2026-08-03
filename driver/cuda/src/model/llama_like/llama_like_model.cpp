@@ -99,15 +99,12 @@ void LlamaLikeModel::body(Workspace& ws,
     // hand-written body below. Build-time exclusions (TP, quantized
     // projections, non-standard rope, ...) already left `declared_` empty.
     // Hooked fires (A3, the Peel op): EVERY hook composition —
-    // all-hooked, mixed (0 < fast_rows < R), none — walks the shape
-    // trace, whose Peel splits the fused prefix from the hook-visible
-    // tail at fast_rows. Only hooked+masked stays hand-written: the
-    // mask arm carries no sites.
-    const bool hooks_admissible =
-        in.stage_hooks == nullptr || in.custom_mask_d == nullptr;
+    // all-hooked, mixed (0 < fast_rows < R), none, and masked+hooked
+    // (the mask arm carries the sites; the custom dispatch publishes no
+    // scores, which is the hand-written contract) — walks the shape
+    // trace.
     const bool declared_eligible =
         static_cast<bool>(declared_) &&
-        hooks_admissible &&
         // Explicit KV-write fires are in scope (declared_forward.hpp says
         // why: every graph-replayed decode fire carries them), but only
         // when the descriptors actually arrived — the same guard the
