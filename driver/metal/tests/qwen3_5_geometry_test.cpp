@@ -583,6 +583,23 @@ void check_the_batched_mixture_becomes_a_matmul() {
     }
     expect(routed_dispatches == 3 * moe.n_layers, "the batched DAG routes every layer");
 
+    // A prefill row claims a FIXED stride of argument-table ordinals, and its
+    // DAG has to fit inside one. The stride is a constant; the DAG's length is
+    // the model's -- about twenty-seven dispatches a layer, and a routed layer
+    // is at the wide end of that. Qwen3.5-35B-A3B's forty layers emit 1083 per
+    // row, which is more than twice what the stride used to be, so the whole
+    // family refused to prefill on a real MoE checkpoint: "prefill DAG exceeds
+    // its argument-table ordinal stride", after loading nineteen gigabytes to
+    // find out. It is arithmetic on a fixture, so it belongs here, where it
+    // costs nothing and needs no weights.
+    const auto row = pie::metal::build_decode_dag_mb(moe, 1, 0);
+    expect(int(row.size()) < pie::metal::kPrefillOrdinalStride,
+           "one prefill row's routed DAG fits inside its ordinal stride");
+    // And with room to spare -- half the stride, so a decoder twice this deep
+    // still fits and the next MoE does not rediscover this by loading.
+    expect(int(row.size()) * 2 < pie::metal::kPrefillOrdinalStride,
+           "and with room for a decoder twice as deep");
+
     // A single-token decode routes ten pairs over five hundred and twelve
     // experts, where every tile would be one live row in sixteen -- so the
     // matvec wins outright and `qmm_bn` must stay zero. Once the batch is wide

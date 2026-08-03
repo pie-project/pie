@@ -855,6 +855,31 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
         plan_.kv_pool_bytes + (taps ? 0u : scratch_pool_bytes);
 
+    // Everything above is arithmetic; the next line starts spending. A model
+    // that does not fit does NOT fail here -- the heap is created, nineteen
+    // gigabytes are copied into it over forty-six seconds, every bind
+    // succeeds, and the first command buffer comes back with "The operation
+    // couldn't be completed", whose real error is three `NSUnderlyingError`
+    // levels down: `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Asking the
+    // device what it will hold is one call, and it turns three quarters of a
+    // minute and an unreadable failure into a sentence with numbers in it.
+    if (const size_t limit = RawMetalContext::device_working_set_bytes(); limit > 0) {
+        const size_t want = heap_bytes + elastic_budget;
+        if (want > limit) {
+            if (err) {
+                const auto gib = [](size_t b) {
+                    return std::to_string(double(b) / (1024.0 * 1024.0 * 1024.0)).substr(0, 5);
+                };
+                *err = "this model does not fit this GPU: it needs " + gib(want) +
+                       " GiB resident (" + gib(resident_weights) + " GiB of weights, " +
+                       gib(elastic_budget) + " GiB of KV, state and scratch) and the device "
+                       "will hold " + gib(limit) + " GiB. A shorter context shrinks the KV; "
+                       "the weights do not shrink.";
+            }
+            return false;
+        }
+    }
+
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
     if (!ctx_) {
         if (err) *err = "RawMetalContext::create failed";
@@ -2414,6 +2439,28 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // refusal here any more: what a mixture still cannot have is a SHARED
         // expert, and `geometry_from_facts` above already refuses that from
         // the config, before any of this is built.
+
+        // Whether the head is its own tensor is decided ONCE, by the contract,
+        // and read back here rather than decided a second time. The contract's
+        // rule is that a shipped `lm_head` beats whatever the config says --
+        // and the config can say nothing at all: Qwen3.5-35B-A3B is a
+        // multimodal wrapper that spells `tie_word_embeddings` at the TOP
+        // level, outside the `text_config` this family parses, so the facts
+        // defaulted to tied. The contract staged `embed_tokens` and `lm_head`;
+        // the DAG asked for `shared_embedding`; the load stopped on "unstaged
+        // weight shared_embedding.weight" -- two opinions about one fact. The
+        // plan's own tensor list is the only opinion that can be wrong in a
+        // way the binding survives, so it is the one the DAG follows.
+        const auto plan_view = load_plan.view();
+        bool plan_ties = false;
+        for (std::size_t i = 0; i < plan_view.tensors.len; ++i) {
+            if (pie_loader::bytes_to_string(plan_view.tensors.ptr[i].name) ==
+                "shared_embedding.weight") {
+                plan_ties = true;
+                break;
+            }
+        }
+        geom.tied_embeddings = plan_ties;
     }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes

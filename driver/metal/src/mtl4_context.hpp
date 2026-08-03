@@ -166,6 +166,16 @@ class RawMetalContext {
     static std::unique_ptr<RawMetalContext> create(
         size_t heap_bytes,
         size_t elastic_budget_bytes = 0);
+
+    /// What this device is willing to hold resident, in bytes.
+    ///
+    /// Free-standing because it answers BEFORE a context exists: the question
+    /// "will this model fit" has to be asked before nineteen gigabytes are
+    /// copied in. Exceeding it does not fail an allocation -- every buffer is
+    /// created, every bind succeeds, and then the command buffer comes back
+    /// with "The operation couldn't be completed", whose underlying error,
+    /// three levels down, is `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
+    static size_t device_working_set_bytes();
     ~RawMetalContext();
 
     RawMetalContext(const RawMetalContext&)            = delete;

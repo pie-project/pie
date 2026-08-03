@@ -359,6 +359,11 @@ RawMetalContext::~RawMetalContext() {
     }
 }
 
+size_t RawMetalContext::device_working_set_bytes() {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    return dev == nil ? 0 : size_t(dev.recommendedMaxWorkingSetSize);
+}
+
 std::unique_ptr<RawMetalContext> RawMetalContext::create(
     size_t heap_bytes,
     size_t elastic_budget_bytes) {
@@ -1672,8 +1677,19 @@ uint64_t RawMetalContext::Impl::commit_and_signal(
         if (fb.error != nil) {
             got.had_error = true;
             got.error = fb.error.localizedDescription.UTF8String;
-            fprintf(stderr, "[pie-metal] GPU commit error (event=%llu): %s\n",
-                    (unsigned long long)signal_value, got.error.c_str());
+            // The localized description of an MTL4 queue error is "the
+            // operation couldn't be completed", which names nothing. The
+            // domain, the code and the underlying error are what say what
+            // actually went wrong -- and a 19 GB model that fails to commit
+            // gives no other clue.
+            fprintf(stderr,
+                    "[pie-metal] GPU commit error (event=%llu): %s [%s code %ld]%s%s\n",
+                    (unsigned long long)signal_value, got.error.c_str(),
+                    fb.error.domain.UTF8String, (long)fb.error.code,
+                    fb.error.userInfo[NSUnderlyingErrorKey] != nil ? " underlying: " : "",
+                    fb.error.userInfo[NSUnderlyingErrorKey] != nil
+                        ? [[fb.error.userInfo[NSUnderlyingErrorKey] description] UTF8String]
+                        : "");
         }
         std::lock_guard<std::mutex> lock(slot->mutex);
         // Feedback blocks can land out of order; keep the newest only.

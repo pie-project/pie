@@ -238,8 +238,18 @@ ModelFacts read_model_facts(const std::string& hf_path) {
             if (tc.contains("norm_topk_prob") && tc["norm_topk_prob"].is_boolean()) {
                 facts.q35_norm_topk_prob = tc["norm_topk_prob"].get<bool>();
             }
+            // A multimodal wrapper spells this at the TOP level, beside
+            // `text_config` rather than inside it -- Qwen3.5-35B-A3B says
+            // `"tie_word_embeddings": false` there and says nothing in the text
+            // config, so reading only the inner one defaulted to tied and asked
+            // the load for a tensor the checkpoint does not have. The inner
+            // spelling still wins where both appear: it is the text decoder's
+            // own statement about the text decoder.
             if (tc.contains("tie_word_embeddings") && tc["tie_word_embeddings"].is_boolean()) {
                 facts.q35_tied_embeddings = tc["tie_word_embeddings"].get<bool>();
+            } else if (j.contains("tie_word_embeddings") &&
+                       j["tie_word_embeddings"].is_boolean()) {
+                facts.q35_tied_embeddings = j["tie_word_embeddings"].get<bool>();
             }
             if (tc.contains("mlp_only_layers") && tc["mlp_only_layers"].is_array()) {
                 facts.q35_mlp_only_layer_count = int(tc["mlp_only_layers"].size());
