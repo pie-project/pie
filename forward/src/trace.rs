@@ -486,6 +486,23 @@ pub enum OpKind {
     /// program runs is `dyn` (sideband data); this op states only WHERE
     /// and WHAT IS OBSERVABLE.
     HookSite { stage: HookStage, layer: u32 },
+    /// Loop peeling as vocabulary (A3, the class-collapse amendment):
+    /// TWO regions that BOTH run, over complementary row ranges — the
+    /// prefix region over rows `[0, fast_rows)`, the tail region over
+    /// `[fast_rows, N)`, with `fast_rows` (the hook-free prefix) a
+    /// RUNTIME input of the fire, never a trace value. Regions are
+    /// consecutive like a Guard's (prefix ops right after this op, then
+    /// the tail's); an empty row range skips its region's launches —
+    /// `fast_rows == N` is the classic all-fused fire, `fast_rows == 0`
+    /// the all-hooked one, anything between the MIXED fire. This is
+    /// plan.md Part 3 verbatim: the fast-path condition takes a row
+    /// count where it used to take a boolean.
+    ///
+    /// A Peel may PRODUCE values (the fused decode-QKV's q): the values
+    /// are the PEEL's outputs and both regions' launches bind disjoint
+    /// row windows of the same buffers, recording no SSA outputs of
+    /// their own — dataflow sees one producer, jointly lowered.
+    Peel { prefix_ops: u32, tail_ops: u32 },
 }
 
 /// Which implicit store an op addresses. Both stores are per-layer and
@@ -646,6 +663,35 @@ impl TraceBuilder {
 
     pub(crate) fn op_count_now(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Open an [`OpKind::Peel`]: records the op with empty region
+    /// lengths (and its output values — created here so dataflow sees
+    /// one producer, jointly lowered by both regions) and returns its
+    /// index for [`Self::close_peel`]. Region ops follow consecutively,
+    /// prefix first; guards may nest inside either region.
+    pub(crate) fn open_peel(&mut self, out_shapes: Vec<(Shape, DType)>) -> (usize, Vec<ValueId>) {
+        let outs = self.push(
+            OpKind::Peel {
+                prefix_ops: 0,
+                tail_ops: 0,
+            },
+            vec![],
+            out_shapes,
+        );
+        (self.ops.len() - 1, outs)
+    }
+
+    pub(crate) fn close_peel(&mut self, peel_idx: usize, prefix: u32, tail: u32) {
+        let OpKind::Peel {
+            prefix_ops,
+            tail_ops,
+        } = &mut self.ops[peel_idx].kind
+        else {
+            panic!("close_peel: not a peel at {peel_idx}");
+        };
+        *prefix_ops = prefix;
+        *tail_ops = tail;
     }
 
     pub(crate) fn push_hook_site(&mut self, stage: HookStage, layer: u32, q: ValueId) {

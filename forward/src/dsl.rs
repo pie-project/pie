@@ -691,6 +691,42 @@ pub fn guard(m: &M, pred: crate::trace::GuardPred, then_f: impl FnOnce(), else_f
     guarded(m).arm(pred, then_f).otherwise(else_f);
 }
 
+/// Record an [`OpKind::Peel`] (A3): BOTH region closures run at trace
+/// time — the prefix over rows `[0, fast_rows)` at fire time, the tail
+/// over `[fast_rows, N)`, the split a runtime input. The returned [`Val`]s
+/// are the peel's outputs, jointly lowered: both regions' ops bind
+/// disjoint row windows of the same buffers and their own values stay
+/// region-internal.
+pub fn peel(
+    t: &Trace,
+    layer: Option<u32>,
+    shape: (Shape, DType),
+    prefix_f: impl FnOnce(),
+    tail_f: impl FnOnce(),
+) -> Val {
+    let (idx, outs) = {
+        let mut b = t.inner.borrow_mut();
+        b.set_layer(layer);
+        b.open_peel(vec![shape])
+    };
+    prefix_f();
+    let prefix = {
+        let b = t.inner.borrow();
+        (b.op_count_now() - idx - 1) as u32
+    };
+    tail_f();
+    let (total, _) = {
+        let b = t.inner.borrow();
+        ((b.op_count_now() - idx - 1) as u32, ())
+    };
+    t.inner.borrow_mut().close_peel(idx, prefix, total - prefix);
+    Val {
+        t: t.clone(),
+        id: outs[0],
+        layer,
+    }
+}
+
 /// [`guard`] for declarations that carry no [`M`] (the qwen3_5 bodies
 /// build their own weight namespaces and run against a bare [`Trace`]):
 /// the same two-way chain, opened on the tape directly.
@@ -1191,6 +1227,31 @@ pub mod cuda {
     pub fn attention_xqa_decode_region(q: &Val, kv: &Kv) {
         record(&q.t, Some(kv.l), "launch_attention_xqa_decode_bf16_prepared",
                vec![], kv_state(kv), vec![q.id], None);
+    }
+
+    /// Output-less [`qkv_decode_qk_norm_rope_write_kv`] for the Peel's
+    /// prefix region (A3): the peel owns q; this launch binds its
+    /// `[0, fast_rows)` rows. Same operands, same aux contract.
+    pub fn qkv_decode_qk_norm_rope_write_kv_region(
+        packed: &Val,
+        q_norm: &NormW,
+        k_norm: &NormW,
+        kv: &Kv,
+        table: Option<&Val>,
+    ) {
+        let mut inputs = vec![packed.id];
+        if let Some(t) = table {
+            inputs.push(t.id);
+        }
+        record(
+            &packed.t,
+            Some(kv.l),
+            "launch_qkv_decode_qk_norm_rope_write_kv_bf16",
+            vec![q_norm.name.clone(), k_norm.name.clone()],
+            kv_state(kv),
+            inputs,
+            None,
+        );
     }
 
     /// `ops::dispatch_attention_flashinfer_prefill_custom`: the

@@ -162,6 +162,22 @@ fn emit_class_fn(
     b.line("    }");
     b.line("");
 
+    // A stated Peel obligates the split derivation: the hook-free prefix
+    // row count, the interpreter's `fast_rows` binding verbatim (a
+    // runtime INPUT of the stated op, not a choice).
+    let states_peel = plan
+        .ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::Peel { .. }));
+    if states_peel {
+        b.line("    const int fast_rows = hooks == nullptr");
+        b.line("        ? R");
+        b.line("        : (static_cast<int>(hooks->hook_free_prefix_rows) < R");
+        b.line("               ? static_cast<int>(hooks->hook_free_prefix_rows)");
+        b.line("               : R);");
+        b.line("");
+    }
+
     // A stated XQA launch obligates its fire-wide prepare — resolved HERE,
     // statically: the emitter saw the op, so the generated file has the
     // call and no scan.
@@ -179,9 +195,18 @@ fn emit_class_fn(
         b.line("");
     }
 
-    emit_range(&mut b, plan, facts, is_decode, 0, plan.ops.len());
+    emit_range(&mut b, plan, facts, is_decode, 0, plan.ops.len(), None);
     b.line("}");
     b.out
+}
+
+/// The Peel row window, threaded through region emission (A3): fixed
+/// C++ expressions for the region's row start and count. `None` is the
+/// full-N walk.
+#[derive(Clone, Copy)]
+struct Win {
+    start: &'static str,
+    len: &'static str,
 }
 
 /// Emit ops `[start, end)`: a Guard consumes its region ops into an
@@ -196,10 +221,40 @@ fn emit_range(
     is_decode: bool,
     start: usize,
     end: usize,
+    win: Option<Win>,
 ) {
     let mut i = start;
     while i < end {
         let op = &plan.ops[i];
+        if let OpKind::Peel {
+            prefix_ops,
+            tail_ops,
+        } = &op.kind
+        {
+            // A3: both regions, complementary row ranges, empty ranges
+            // skipped — the interpreter's Peel walk as fixed `if`s over
+            // the derived `fast_rows` local.
+            let mut region = i + 1;
+            b.stmt("if (fast_rows > 0) {");
+            b.indent += 1;
+            emit_range(
+                b, plan, facts, is_decode, region, region + *prefix_ops as usize,
+                Some(Win { start: "0", len: "fast_rows" }),
+            );
+            b.indent -= 1;
+            b.stmt("}");
+            region += *prefix_ops as usize;
+            b.stmt("if (fast_rows < N) {");
+            b.indent += 1;
+            emit_range(
+                b, plan, facts, is_decode, region, region + *tail_ops as usize,
+                Some(Win { start: "fast_rows", len: "(N - fast_rows)" }),
+            );
+            b.indent -= 1;
+            b.stmt("}");
+            i = region + *tail_ops as usize;
+            continue;
+        }
         if let OpKind::Guard { arms, else_ops } = &op.kind {
             let cond_of = |pred: &crate::trace::GuardPred| match pred {
                 crate::trace::GuardPred::HasWriteDesc => "has_write_desc".to_string(),
@@ -220,19 +275,19 @@ fn emit_range(
                 let kw = if n == 0 { "if" } else { "} else if" };
                 b.stmt(&format!("{kw} ({}) {{", cond_of(&arm.pred)));
                 b.indent += 1;
-                emit_range(b, plan, facts, is_decode, region, region + arm.ops as usize);
+                emit_range(b, plan, facts, is_decode, region, region + arm.ops as usize, win);
                 b.indent -= 1;
                 region += arm.ops as usize;
             }
             b.stmt("} else {");
             b.indent += 1;
-            emit_range(b, plan, facts, is_decode, region, region + *else_ops as usize);
+            emit_range(b, plan, facts, is_decode, region, region + *else_ops as usize, win);
             b.indent -= 1;
             b.stmt("}");
             i = region + *else_ops as usize;
             continue;
         }
-        emit_op(b, op, plan, facts, is_decode);
+        emit_op(b, op, plan, facts, is_decode, win);
         i += 1;
     }
 }
@@ -275,7 +330,14 @@ fn require(layer: u32, member: &str, name: &str) -> String {
     format!("require(w.layers[{layer}].{member}, \"{name}\")->data()")
 }
 
-fn emit_op(b: &mut Body, op: &crate::trace::Op, plan: &ForwardPlan, facts: &LlamaLikeFacts, is_decode: bool) {
+fn emit_op(
+    b: &mut Body,
+    op: &crate::trace::Op,
+    plan: &ForwardPlan,
+    facts: &LlamaLikeFacts,
+    is_decode: bool,
+    win: Option<Win>,
+) {
     let _ = plan;
     match &op.kind {
         OpKind::Embed { weight } => {
@@ -380,10 +442,24 @@ fn emit_op(b: &mut Body, op: &crate::trace::Op, plan: &ForwardPlan, facts: &Llam
             }
         }
         OpKind::SplitQkv { .. } => {
-            b.stmt("kernels::launch_split_qkv_bf16(");
-            b.stmt("    ws.qkv_fused.data(),");
-            b.stmt("    ws.q.data(), ws.k.data(), ws.v.data(),");
-            b.stmt("    N, Hq, Hk, stream);");
+            if let Some(w) = win {
+                // A Peel region's split: the window's rows at their
+                // absolute offsets (the interpreter's windowed form).
+                let (s, n) = (w.start, w.len);
+                b.stmt("kernels::launch_split_qkv_bf16(");
+                b.stmt(&format!(
+                    "    bf16_row(ws.qkv_fused.data(), {s}, Hq + 2 * Hk),"
+                ));
+                b.stmt(&format!("    bf16_row(ws.q.data(), {s}, Hq),"));
+                b.stmt(&format!("    bf16_row(ws.k.data(), {s}, Hk),"));
+                b.stmt(&format!("    bf16_row(ws.v.data(), {s}, Hk),"));
+                b.stmt(&format!("    {n}, Hq, Hk, stream);"));
+            } else {
+                b.stmt("kernels::launch_split_qkv_bf16(");
+                b.stmt("    ws.qkv_fused.data(),");
+                b.stmt("    ws.q.data(), ws.k.data(), ws.v.data(),");
+                b.stmt("    N, Hq, Hk, stream);");
+            }
         }
         OpKind::KvAppend { layer } => {
             // Unpadded shape: no pad staging. The write mechanism is a
@@ -464,18 +540,23 @@ fn emit_op(b: &mut Body, op: &crate::trace::Op, plan: &ForwardPlan, facts: &Llam
             kernel,
             weights,
             state,
-        } => emit_launch(b, kernel, weights, state.as_ref(), op, facts, is_decode),
+        } => emit_launch(b, kernel, weights, state.as_ref(), op, facts, is_decode, win),
         OpKind::HookSite { .. } => {
-            // The hooked arm's sites transliterate to a REFUSAL: the
-            // static form does not carry the hook sideband machinery
-            // (page-mask brackets, score captures), and the dispatch in
-            // declared_forward.cpp routes hooked fires to the
-            // interpreter walk — this throw is the honest text of that
-            // gate, unreachable while it holds.
-            b.stmt("throw std::runtime_error(");
-            b.stmt("    \"generated forward: hooked fire reached the static \"");
-            b.stmt("    \"form (the dispatch gate routes hooks to the \"");
-            b.stmt("    \"interpreter walk)\");");
+            // A3: the sites live in the ONE body every unmasked fire
+            // walks — on an unhooked fire they are argument no-ops
+            // (zero launches), which for the static form is an empty
+            // statement. A HOOKED fire transliterates to a REFUSAL:
+            // the static form does not carry the hook sideband
+            // machinery (page-mask brackets, score captures), and the
+            // dispatch in declared_forward.cpp routes hooked fires to
+            // the interpreter walk — the throw is the honest text of
+            // that gate, unreachable while it holds.
+            b.stmt("if (hooks != nullptr) {");
+            b.stmt("    throw std::runtime_error(");
+            b.stmt("        \"generated forward: hooked fire reached the static \"");
+            b.stmt("        \"form (the dispatch gate routes hooks to the \"");
+            b.stmt("        \"interpreter walk)\");");
+            b.stmt("}");
         }
         other => panic!("emitter: op kind {other:?} out of scope for the qwen3 classes"),
     }
@@ -489,6 +570,7 @@ fn emit_launch(
     op: &crate::trace::Op,
     facts: &LlamaLikeFacts,
     is_decode: bool,
+    win: Option<Win>,
 ) {
     match kernel {
         "launch_rope_standard_table" => {
@@ -523,38 +605,54 @@ fn emit_launch(
             b.stmt("    has_write_desc ? w_page_d : nullptr,");
             b.stmt("    has_write_desc ? w_off_d : nullptr,");
             b.stmt("    row_valid_d,");
-            b.stmt("    R, num_q_heads, num_kv_heads, d,");
+            // Windowed (A3): a Peel's prefix region owns rows
+            // [0, fast_rows); outside a peel this is R (pure decode).
+            let rows = win.map_or("R", |w| w.len);
+            b.stmt(&format!("    {rows}, num_q_heads, num_kv_heads, d,"));
             b.stmt("    cache.page_size(), cache.hnd_layout(),");
             b.stmt("    cfg.rope_theta, eps, stream);");
         }
         "launch_write_kv_explicit_bf16" => {
             let layer = state.expect("kv write addresses kv state").layer;
+            let (s_, n_) = win.map_or(("0", "N"), |w| (w.start, w.len));
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::launch_write_kv_explicit_bf16(");
-            b.stmt("        kv_view, ws.k.data(), ws.v.data(),");
-            b.stmt("        w_page_d, w_off_d, N, stream, row_valid_d);");
+            b.stmt("        kv_view,");
+            b.stmt(&format!("        bf16_row(ws.k.data(), {s_}, Hk),"));
+            b.stmt(&format!("        bf16_row(ws.v.data(), {s_}, Hk),"));
+            b.stmt(&format!("        w_page_d + {s_}, w_off_d + {s_},"));
+            b.stmt(&format!("        {n_}, stream,"));
+            b.stmt(&format!(
+                "        row_valid_d != nullptr ? row_valid_d + {s_} : nullptr);"
+            ));
             b.stmt("}");
         }
         "launch_write_kv_to_pages" => {
             let layer = state.expect("kv write addresses kv state").layer;
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+            let first = win.map_or("0", |w| w.start);
             b.stmt("    kernels::launch_write_kv_to_pages(");
             b.stmt("        kv_view, ws.k.data(), ws.v.data(),");
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("        kv_last_page_lens,");
-            b.stmt("        N, R, stream, row_valid_d);");
+            b.stmt(&format!(
+                "        N, R, stream, row_valid_d, /*first_token=*/{first});"
+            ));
             b.stmt("}");
         }
         "launch_qk_rmsnorm_rope_bf16" => {
             let (q_norm, k_norm) = (&weights[0], &weights[1]);
             let (ql, _) = split_layer_weight(q_norm).expect("q_norm layer");
+            let (s_, n_) = win.map_or(("0", "N"), |w| (w.start, w.len));
             b.stmt("kernels::launch_qk_rmsnorm_rope_bf16(");
-            b.stmt("    ws.q.data(), ws.k.data(),");
+            b.stmt(&format!("    bf16_row(ws.q.data(), {s_}, Hq),"));
+            b.stmt(&format!("    bf16_row(ws.k.data(), {s_}, Hk),"));
             b.stmt(&format!("    {},", require(ql, "q_norm", q_norm)));
             b.stmt(&format!("    {},", require(ql, "k_norm", k_norm)));
-            b.stmt("    positions, N, num_q_heads, num_kv_heads, d,");
+            b.stmt(&format!("    positions + {s_}, {n_},"));
+            b.stmt("    num_q_heads, num_kv_heads, d,");
             b.stmt("    cfg.rope_theta, eps, stream);");
         }
         "launch_attention_xqa_decode_bf16_prepared" => {

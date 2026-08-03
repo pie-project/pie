@@ -72,6 +72,7 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::Launch { .. } => PieForwardOpKind::Launch,
         OpKind::Guard { .. } => PieForwardOpKind::Guard,
         OpKind::HookSite { .. } => PieForwardOpKind::HookSite,
+        OpKind::Peel { .. } => PieForwardOpKind::Peel,
     }
 }
 
@@ -1095,12 +1096,12 @@ fn lowered_trace_round_trips_through_the_arena() {
         .filter(|op| op.kind == PieForwardOpKind::Launch)
         .collect();
     // 1 table build + per layer: the mask arm's 4 (fused qk-norm+rope,
-    // the write guard's two regions, the custom dispatch) + the hooked
-    // arm's 4 (fused qk-norm+rope, the write guard's two regions, the
-    // plain XQA launch — this fixture is XQA-on, and XQA has no capture
-    // variant, so no WantsAttnScore guard exists) + the fused
-    // else-arm's 2 (fused post, XQA) = 281.
-    assert_eq!(launches.len(), 281);
+    // the write guard's two regions, the custom dispatch) + the else
+    // arm's 5 — the Peel's prefix (the fused-post region form) + tail
+    // (fused qk-norm+rope, the write guard's two regions) — plus the
+    // plain XQA launch (this fixture is XQA-on; no capture variant, so
+    // no WantsAttnScore guard) = 253.
+    assert_eq!(launches.len(), 253);
 
     let table = launches[0];
     assert_eq!(view::name(&out, table.weight_name), "launch_rope_standard_table");
@@ -1142,20 +1143,32 @@ fn lowered_trace_round_trips_through_the_arena() {
         PieForwardOpKind::Rope | PieForwardOpKind::KvAppend
     )));
     assert!(ops.iter().any(|op| op.kind == PieForwardOpKind::SplitQkv));
-    // The per-layer guard chains: 28 outer HasCustomMask/HasStageHooks
-    // chains (value-producing) + 28×2 nested HasWriteDesc (one per
-    // attachment arm's general QKV; no WantsAttnScore under XQA).
+    // The per-layer guard chains: 28 outer HasCustomMask chains
+    // (value-producing) + 28×2 nested HasWriteDesc (the mask arm's
+    // general QKV + the Peel's tail; no WantsAttnScore under XQA).
     let guards = ops
         .iter()
         .filter(|op| op.kind == PieForwardOpKind::Guard)
         .count();
     assert_eq!(guards, 84);
-    // The hooked arm's sites: two per layer, region ops of the chain.
+    // The one body's sites (A3): two per layer — argument no-ops on an
+    // unhooked fire — and one Peel per layer splitting the fused prefix
+    // from the hook-visible tail at fast_rows.
     let sites = ops
         .iter()
         .filter(|op| op.kind == PieForwardOpKind::HookSite)
         .count();
     assert_eq!(sites, 56);
+    let peels: Vec<_> = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::Peel)
+        .collect();
+    assert_eq!(peels.len(), 28);
+    // Region lengths ride param0/param1: prefix = the fused region
+    // launch alone; tail = SplitQkv + fused qk-norm+rope + the write
+    // guard chain (guard op + two single-launch regions).
+    assert_eq!(peels[0].param0, 1);
+    assert_eq!(peels[0].param1, 5);
     unsafe { pie_forward_release(&mut out) };
 
     // An out-of-range class is a malformed request, not a default.

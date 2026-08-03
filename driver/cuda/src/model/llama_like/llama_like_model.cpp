@@ -94,18 +94,17 @@ void LlamaLikeModel::body(Workspace& ws,
                           AttentionWorkspace& attn_ws,
                           ops::CublasHandle& cublas,
                           const ForwardFn::ForwardInputs& in) {
-    // The declared executor covers exactly the hand-written UNFUSED path's
-    // vocabulary; anything it cannot express falls back, per fire, to the
+    // The declared executor covers the hand-written path's vocabulary;
+    // anything it cannot express falls back, per fire, to the
     // hand-written body below. Build-time exclusions (TP, quantized
     // projections, non-standard rope, ...) already left `declared_` empty.
-    // Hooked fires (the HookSite slice): the ALL-hooked fire
-    // (hook_free_prefix_rows == 0) walks the hooked class traces; a MIXED
-    // fire (0 < fast_rows) needs the future Peel op and keeps the
-    // hand-written path, as does the hooked+masked cross product.
+    // Hooked fires (A3, the Peel op): EVERY hook composition —
+    // all-hooked, mixed (0 < fast_rows < R), none — walks the shape
+    // trace, whose Peel splits the fused prefix from the hook-visible
+    // tail at fast_rows. Only hooked+masked stays hand-written: the
+    // mask arm carries no sites.
     const bool hooks_admissible =
-        in.stage_hooks == nullptr ||
-        (in.stage_hooks->hook_free_prefix_rows == 0 &&
-         in.custom_mask_d == nullptr);
+        in.stage_hooks == nullptr || in.custom_mask_d == nullptr;
     const bool declared_eligible =
         static_cast<bool>(declared_) &&
         hooks_admissible &&

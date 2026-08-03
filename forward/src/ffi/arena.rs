@@ -359,6 +359,19 @@ fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -
                 aux_names: aux,
             };
         }
+        // Loop peeling (A3): prefix-region length in param0, tail-region
+        // length in param1; the row split (fast_rows) is a runtime input
+        // of the fire, so nothing else crosses.
+        OpKind::Peel {
+            prefix_ops,
+            tail_ops,
+        } => (
+            PieForwardOpKind::Peel,
+            PIE_FORWARD_NO_NAME,
+            *prefix_ops,
+            *tail_ops,
+            PIE_FORWARD_NO_VALUE,
+        ),
     })
 }
 

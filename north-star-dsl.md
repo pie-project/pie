@@ -298,9 +298,33 @@ peepholes, eligibility predicates, thresholds.
      hook A/B 12/12 byte-identical (0 fallbacks — every hooked fire
      walks the collapsed traces), forward 54+16+regen-clean, engine
      394, metal 8/8.
-   - **A3**: the all-or-nothing hook guard becomes `Peel` (both
-     regions run, complementary row ranges, fast_rows the runtime
-     split) and the gate admits mixed fires.
+   - **A3 — DONE (2026-08-03)**: `OpKind::Peel` (wire 26; region
+     lengths in param0/param1, the split NEVER in the trace — it is
+     the fire's `fast_rows`, a runtime input). Better than the
+     sketch: the Peel does not live inside a hooks arm — it DISSOLVES
+     the HasStageHooks arm entirely. The one else-arm body serves
+     every hook composition: the packed GEMM full-N, the Peel
+     splitting its postprocess (fused epilogue over rows
+     `[0, fast_rows)`, general split/norm+rope/write over
+     `[fast_rows, N)` at absolute offsets — the hand-written mixed
+     fire launch for launch), then the sites (argument no-ops when
+     unhooked, early-out on null hooks) and the WantsAttnScore-guarded
+     attention, all full-N. `fast_rows == N` is the classic fused
+     fire, `0` the all-hooked one; the gate now admits MIXED fires
+     (only hooked+masked stays hand-written — the mask arm carries no
+     sites). GuardPred::HasStageHooks (wire 5) is retired vocabulary
+     after one rung of service — reserved, unstated. The interpreter
+     binds a row window (start/len) set by Peel region events; the
+     emitter derives `fast_rows` from the hooks argument and spells
+     both regions as `if (fast_rows > 0)` / `if (fast_rows < N)`
+     blocks with offset pointers. Decode 760 ops / Prefill 563.
+     Parity: 3-leg token parity; sink A4 OFF/ON/GEN; hook A/B 12/12
+     byte-identical; MIXED fires observed walking the declared Peel
+     live (`N=4 R=4 fast_rows=2/3` decode, `N=148 R=4 fast_rows=3`
+     prefill co-batches, ALL_OK liveness both gates — mixed
+     compositions are not batch-deterministic, so the mixed gate is
+     engagement + liveness + the solo byte-parities, the stage-2
+     discipline); engine 394; metal 8/8.
    - **A4**: qwen3_5's attention arms gain the same guards (its
      masked/hooked fires are guard arms from birth, never classes).
    End state: `FireClass` = fire SHAPE × SERVICE only (Decode,

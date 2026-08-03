@@ -1,5 +1,6 @@
 #include "model/llama_like/declared_forward.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -166,6 +167,18 @@ void validate_stated_kernels(const pie_forward::ForwardPlan& plan) {
             (void)resolve_launch_kernel(plan.weight_name(op));
         }
     }
+}
+
+// Row-offset views into `[N, width]` bf16 buffers — the Peel regions'
+// window binding (A3), the hand-written `bf16_row` twins. Offset zero is
+// the identity, so the windowed call forms serve the unwindowed walk too.
+inline void* bf16_row(void* base, int row, int width) {
+    return static_cast<std::uint16_t*>(base) +
+           static_cast<std::size_t>(row) * width;
+}
+inline const void* bf16_row(const void* base, int row, int width) {
+    return static_cast<const std::uint16_t*>(base) +
+           static_cast<std::size_t>(row) * width;
 }
 
 // Rung 3 (north-star-dsl.md): the static C++ form of the class traces,
@@ -412,17 +425,27 @@ void llama_like_forward_declared(
     // arms, nothing below derives a path (north-star-dsl.md).
     const pie_forward::ForwardPlan& plan =
         is_pure_decode ? declared.decode : declared.prefill;
-    // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
-    // it a silent fallback to the hand-written path would be
-    // indistinguishable from a passing A/B run.
-    if (std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
-        std::fprintf(stderr,
-                     "[declared-forward] N=%d R=%d decode=%d ops=%zu\n",
-                     total_tokens, num_requests, is_pure_decode ? 1 : 0,
-                     plan.op_count());
-    }
     const int N = total_tokens;
     const int R = num_requests;
+    // The Peel split (A3): the hook-free prefix row count — the
+    // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
+    // the stated Peel op, not a choice: with no hooks every row is the
+    // prefix; the dispatch proved rows [0, fast_rows) belong to no
+    // attention-stage program.
+    const int fast_rows = stage_hooks == nullptr
+        ? R
+        : std::min(static_cast<int>(stage_hooks->hook_free_prefix_rows), R);
+    // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
+    // it a silent fallback to the hand-written path would be
+    // indistinguishable from a passing A/B run; fast_rows is what proves
+    // a MIXED fire walked the declared Peel.
+    if (std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
+        std::fprintf(stderr,
+                     "[declared-forward] N=%d R=%d decode=%d fast_rows=%d "
+                     "ops=%zu\n",
+                     N, R, is_pure_decode ? 1 : 0,
+                     fast_rows, plan.op_count());
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
@@ -509,10 +532,32 @@ void llama_like_forward_declared(
     // end at or before their enclosing region's skip point, so popping
     // in LIFO order at each index is exact.
     std::vector<std::pair<std::size_t, std::size_t>> guard_skips;
+    // The Peel row window (A3): `{win_start, win_len}` over token rows,
+    // `{0, N}` outside peel regions. Region transitions are index
+    // events, the guard skips' peer; the windowed call forms below bind
+    // it (offset zero + full length is the identity).
+    int win_start = 0;
+    int win_len = N;
+    struct WinEvent {
+        std::size_t at;
+        int start;
+        int len;
+    };
+    std::vector<WinEvent> win_events;
     for (std::size_t i = 0; i < op_count; ++i) {
-        while (!guard_skips.empty() && i == guard_skips.back().first) {
-            i += guard_skips.back().second;
-            guard_skips.pop_back();
+        for (;;) {
+            if (!guard_skips.empty() && i == guard_skips.back().first) {
+                i += guard_skips.back().second;
+                guard_skips.pop_back();
+                continue;
+            }
+            if (!win_events.empty() && i == win_events.back().at) {
+                win_start = win_events.back().start;
+                win_len = win_events.back().len;
+                win_events.pop_back();
+                continue;
+            }
+            break;
         }
         if (i >= op_count) break;
         const PieForwardOp& op = plan.op(i);
@@ -692,10 +737,17 @@ void llama_like_forward_declared(
             break;
         }
         case PieForwardOpKind::SplitQkv: {
+            // Windowed (A3): inside a Peel's tail region this splits the
+            // hook-visible rows only, at their ABSOLUTE offsets, so the
+            // full-N consumers (hooks, attention) see one contiguous
+            // buffer — the hand-written tail split verbatim. Offset 0 +
+            // full length is the plain full-N split.
             kernels::launch_split_qkv_bf16(
-                ws.qkv_fused.data(),
-                ws.q.data(), ws.k.data(), ws.v.data(),
-                N, Hq, Hk, stream);
+                bf16_row(ws.qkv_fused.data(), win_start, Hq + 2 * Hk),
+                bf16_row(ws.q.data(), win_start, Hq),
+                bf16_row(ws.k.data(), win_start, Hk),
+                bf16_row(ws.v.data(), win_start, Hk),
+                win_len, Hq, Hk, stream);
             break;
         }
         case PieForwardOpKind::RmsnormPerHead: {
@@ -832,7 +884,11 @@ void llama_like_forward_declared(
                     has_write_desc ? w_page_d : nullptr,
                     has_write_desc ? w_off_d : nullptr,
                     row_valid_d,
-                    R, num_q_heads, num_kv_heads, d,
+                    // Windowed (A3): a Peel's prefix region owns rows
+                    // [0, fast_rows) — the hand-written fused call's
+                    // `fast_rows` row count. Outside a peel the window
+                    // is full and this is R (pure decode, N == R).
+                    win_len, num_q_heads, num_kv_heads, d,
                     cache.page_size(), cache.hnd_layout(),
                     cfg.rope_theta, eps, stream);
                 break;
@@ -849,11 +905,17 @@ void llama_like_forward_declared(
                 const ParsedWeightName q_nm = parse_weight_name(q_name);
                 if (q_nm.field != "q_norm") throw_unknown_weight(q_name);
                 const auto& layer = layer_of(w, q_nm, q_name);
+                // Windowed (A3): a Peel's tail region norms+ropes the
+                // hook-visible rows at their absolute offsets (the
+                // hand-written tail call); offset 0 + full length is
+                // the plain full-N form.
                 kernels::launch_qk_rmsnorm_rope_bf16(
-                    ws.q.data(), ws.k.data(),
+                    bf16_row(ws.q.data(), win_start, Hq),
+                    bf16_row(ws.k.data(), win_start, Hk),
                     require(layer.q_norm, q_name)->data(),
                     require(layer.k_norm, k_name)->data(),
-                    positions, N, num_q_heads, num_kv_heads, d,
+                    positions + win_start, win_len,
+                    num_q_heads, num_kv_heads, d,
                     cfg.rope_theta, eps, stream);
                 break;
             }
@@ -981,7 +1043,10 @@ void llama_like_forward_declared(
                 auto kv_view = cache.layer_view(L);
                 // Mechanical pad staging for padded head dims (the
                 // hand-written pre-write pad block; exactly one write
-                // region runs, so this launches once per layer).
+                // region runs, so this launches once per layer). A
+                // windowed write never coincides with padding: the Peel
+                // exists only in the fused deployment, whose facts
+                // require the unpadded head dim.
                 if (head_dim_padded) {
                     kernels::launch_pad_head_dim_bf16(
                         ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -990,16 +1055,22 @@ void llama_like_forward_declared(
                     kernels::launch_pad_head_dim_bf16(
                         ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
                 }
+                // Windowed (A3): the tail rows' cells only, from their
+                // slice of the descriptors — the hand-written tail
+                // write; offset 0 + full length is the plain form.
                 kernels::launch_write_kv_explicit_bf16(
-                    kv_view, attn_k, attn_v,
-                    w_page_d, w_off_d, N, stream, row_valid_d);
+                    kv_view,
+                    bf16_row(attn_k, win_start, Hk),
+                    bf16_row(attn_v, win_start, Hk),
+                    w_page_d + win_start, w_off_d + win_start,
+                    win_len, stream,
+                    row_valid_d != nullptr ? row_valid_d + win_start
+                                           : nullptr);
                 break;
             }
             case LaunchKernel::WriteKvToPages: {
                 auto kv_view = cache.layer_view(L);
-                // Mechanical pad staging for padded head dims (the
-                // hand-written pre-write pad block; exactly one write
-                // region runs, so this launches once per layer).
+                // (Pad staging comment above applies here too.)
                 if (head_dim_padded) {
                     kernels::launch_pad_head_dim_bf16(
                         ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);
@@ -1008,11 +1079,16 @@ void llama_like_forward_declared(
                     kernels::launch_pad_head_dim_bf16(
                         ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);
                 }
+                // Windowed (A3): base pointers stay; `first_token` skips
+                // the fused-prefix rows the peel's other region already
+                // wrote — the hand-written tail call verbatim (0 is the
+                // plain form's default).
                 kernels::launch_write_kv_to_pages(
                     kv_view, attn_k, attn_v,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens,
-                    N, R, stream, row_valid_d);
+                    N, R, stream, row_valid_d,
+                    /*first_token=*/win_start);
                 break;
             }
             case LaunchKernel::AttentionFlashinferPrefill: {
@@ -1063,7 +1139,40 @@ void llama_like_forward_declared(
             }
             break;
         }
+        case PieForwardOpKind::Peel: {
+            // A3: both regions run, over complementary row ranges —
+            // prefix `[0, fast_rows)`, tail `[fast_rows, N)`. An empty
+            // range skips its region's launches, exactly the
+            // hand-written `fast_rows > 0` / `unfused_tail_rows > 0`
+            // gates: fast_rows == N is the classic all-fused fire,
+            // 0 the all-hooked one, anything between the mixed fire.
+            const std::size_t prefix_len = op.param0;
+            const std::size_t tail_len = op.param1;
+            const std::size_t tail_start = i + 1 + prefix_len;
+            const std::size_t end = tail_start + tail_len;
+            const int tail_rows = N - fast_rows;
+            win_events.push_back({end, 0, N});
+            if (fast_rows > 0) {
+                win_start = 0;
+                win_len = fast_rows;
+                if (tail_rows > 0) {
+                    win_events.push_back({tail_start, fast_rows, tail_rows});
+                } else {
+                    guard_skips.emplace_back(tail_start, tail_len);
+                }
+                // the loop's ++i lands on the prefix region
+            } else {
+                win_start = 0;
+                win_len = N;
+                i = tail_start - 1;  // skip the empty prefix region
+            }
+            break;
+        }
         case PieForwardOpKind::HookSite: {
+            // A3: the sites live in the ONE body every unmasked fire
+            // walks — a fire with no attached programs passes through
+            // by argument, zero launches, zero sideband setup.
+            if (stage_hooks == nullptr) break;
             const int L = static_cast<int>(op.param1);
             if (op.param0 == 0) {
                 // OnAttnProj: reset the layer's page view, re-seed the

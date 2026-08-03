@@ -139,6 +139,12 @@ enum class PieForwardOpKind : uint32_t {
   /// score sideband) and invokes the fire's attached programs; a fire
   /// with nothing attached passes through by argument.
   HookSite = 25,
+  /// Loop peeling (A3, the class-collapse amendment): two regions
+  /// that BOTH run over complementary row ranges — prefix `[0,
+  /// fast_rows)`, tail `[fast_rows, N)`. Prefix-region op count in
+  /// `param0`, tail-region count in `param1`; the split is the
+  /// fire's hook-free prefix row count, a runtime input.
+  Peel = 26,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].

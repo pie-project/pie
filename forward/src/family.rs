@@ -161,20 +161,6 @@ fn llama_like_text(
                 }
                 q
             };
-            // The plain decode attention region (XQA overrides
-            // force_prefill_path, context.cpp:1427; the non-XQA decode
-            // arm's runtime prefill-decode-plan alternative needs `Guard`
-            // and is pinned off until it exists).
-            let decode_attn_region = |c: &LlamaLikeCudaFacts, q: &Val| {
-                if c.xqa_decode {
-                    cuda::attention_xqa_decode_region(q, &w.kv);
-                } else if c.force_prefill_path {
-                    cuda::dequant_only(&w.kv);
-                    cuda::attention_flashinfer_prefill_region(q, &w.kv);
-                } else {
-                    cuda::attention_flashinfer_decode_region(q, &w.kv);
-                }
-            };
             let attn_out_shape = (
                 Shape(vec![Dim::Tokens, Dim::Const(q_w)]),
                 DType::BF16,
@@ -185,28 +171,35 @@ fn llama_like_text(
                     let q = general_qkv();
                     attention(&q, &w.kv, q_w)
                 }
-                // A1/A2 (the class-collapse amendment): per-fire
-                // attachments are GUARD ARMS of the shape classes, not
-                // classes. The chain, in arm order: custom mask (the
-                // custom dispatch; the whole general QKV sequence in the
-                // fused deployment), attached stage hooks (the general
-                // body + the two per-layer HookSites + the
-                // WantsAttnScore-guarded attention — the score-capturing
-                // dispatch is a different launcher, and whether the
-                // fire's programs read scores is a runtime input), else
-                // the plain shape. The caller's gate keeps hooked+masked
-                // fires hand-written, so the order between the two
-                // attachment arms is not load-bearing. XQA has no
-                // capture variant: the hooked arm states the plain XQA
-                // launch, and a score-wanting program under XQA fails
-                // loudly PTIR-side (the hand-written contract).
+                // A1–A3 (the class-collapse amendment): per-fire
+                // attachments are guard arms and ROW WINDOWS of the
+                // shape classes, not classes. The chain per layer:
+                // custom mask (the custom dispatch; the whole general
+                // QKV sequence in the fused deployment) | else the ONE
+                // body every unmasked fire walks — the QKV production
+                // (a `Peel` in the fused deployment: fused epilogue over
+                // the hook-free prefix rows, general sequence over the
+                // tail, `fast_rows` the runtime split; fast_rows == N is
+                // the classic all-fused fire, 0 the all-hooked one),
+                // then the two HookSites (argument no-ops on an unhooked
+                // fire) and the WantsAttnScore-guarded attention (the
+                // score-capturing dispatch is a different launcher, and
+                // whether the fire's programs read scores is a runtime
+                // input). XQA has no capture variant: the body states
+                // the plain XQA launch, and a score-wanting program
+                // under XQA fails loudly PTIR-side (the hand-written
+                // contract). Masked+hooked stays hand-written (the mask
+                // arm carries no sites); the caller's gate encodes it.
                 Some((c, FireClass::Decode)) => {
                     let (g, a) =
                         dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
-                    let hooked_attn = |q: &Val| {
+                    let attn_with_sites = |q: &Val| {
                         dsl::hook_site(HookStage::OnAttnProj, q, l);
                         if c.xqa_decode {
                             cuda::attention_xqa_decode_region(q, &w.kv);
+                        } else if c.force_prefill_path {
+                            cuda::dequant_only(&w.kv);
+                            cuda::attention_flashinfer_prefill_region(q, &w.kv);
                         } else {
                             dsl::guarded(m)
                                 .arm(GuardPred::WantsAttnScore, || {
@@ -223,32 +216,48 @@ fn llama_like_text(
                             let q = general_qkv();
                             cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
                         })
-                        .arm(GuardPred::HasStageHooks, || {
-                            let q = general_qkv();
-                            hooked_attn(&q);
-                        })
                         .otherwise(|| {
-                            // The fused binding: the packed GEMM, then ONE
-                            // kernel for split + norms + rope + KV write.
-                            // The general arm above is this arm's
-                            // semantics.
-                            let q = cuda::qkv_decode_qk_norm_rope_write_kv(
-                                &matmul(&x, &w.qkv),
-                                &w.q_norm,
-                                &w.k_norm,
-                                &w.kv,
-                                table.as_ref(),
-                                q_w,
+                            // The packed GEMM runs over every row; the
+                            // Peel splits its postprocess: the fused
+                            // kernel (split + norms + rope + KV write,
+                            // one launch) owns the hook-free prefix, the
+                            // general sequence owns the hook-visible
+                            // tail — the hand-written mixed fire,
+                            // launch for launch.
+                            let packed = matmul(&x, &w.qkv);
+                            let q = dsl::peel(
+                                m.trace(),
+                                Some(l),
+                                attn_out_shape.clone(),
+                                || {
+                                    cuda::qkv_decode_qk_norm_rope_write_kv_region(
+                                        &packed,
+                                        &w.q_norm,
+                                        &w.k_norm,
+                                        &w.kv,
+                                        table.as_ref(),
+                                    );
+                                },
+                                || {
+                                    let (qt, kt, vt) = split_qkv(&packed, q_w, kv_w);
+                                    let (_qt, kt) =
+                                        cuda::qk_rmsnorm_rope(&qt, &kt, &w.q_norm, &w.k_norm);
+                                    dsl::guard(
+                                        m,
+                                        GuardPred::HasWriteDesc,
+                                        || cuda::write_kv_explicit(&kt, &vt, &w.kv),
+                                        || cuda::write_kv_to_pages(&kt, &vt, &w.kv),
+                                    );
+                                },
                             );
-                            decode_attn_region(c, &q);
+                            attn_with_sites(&q);
                         });
                     } else {
                         let q = general_qkv();
                         g.arm(GuardPred::HasCustomMask, || {
                             cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
                         })
-                        .arm(GuardPred::HasStageHooks, || hooked_attn(&q))
-                        .otherwise(|| decode_attn_region(c, &q));
+                        .otherwise(|| attn_with_sites(&q));
                     }
                     a
                 }
@@ -262,7 +271,10 @@ fn llama_like_text(
                         // branch's contract).
                         cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
                     })
-                    .arm(GuardPred::HasStageHooks, || {
+                    .otherwise(|| {
+                        // Prefill has no fused post, so no Peel: the body
+                        // is row-uniform — sites (argument no-ops when
+                        // unhooked), dequant, the score-guarded dispatch.
                         dsl::hook_site(HookStage::OnAttnProj, &q, l);
                         cuda::dequant_only(&w.kv);
                         dsl::guarded(m)
@@ -273,10 +285,6 @@ fn llama_like_text(
                                 cuda::attention_flashinfer_prefill_region(&q, &w.kv)
                             });
                         dsl::hook_site(HookStage::OnAttn, &q, l);
-                    })
-                    .otherwise(|| {
-                        cuda::dequant_only(&w.kv);
-                        cuda::attention_flashinfer_prefill_region(&q, &w.kv);
                     });
                     a
                 }
