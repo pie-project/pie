@@ -528,6 +528,10 @@ struct MetalExecutor::Impl {
     std::vector<std::vector<Dispatch>> prefill_dags_{};
     ScratchSchedule prefill_sched_{};
     bool mb_bound_ = false;
+    // The token count `mb_dag_`'s width-dependent constants are currently bound
+    // at. Seeded from the setup bind so a first fire at `max_tokens` rebinds
+    // nothing; every other width rebinds once. See the fire path.
+    int mb_bound_tokens_ = 0;
     std::uint64_t paged_bind_generation_ = 0;
     SlotHandle ptir_logits_{};
     SlotHandle ptir_logits_copy_params_{};
@@ -1280,7 +1284,9 @@ bool MetalExecutor::Impl::bind_paged_dag(std::string* err) {
         }
         if (!mb_bound_) {
             bind_scratch(*ctx_, mb_dag_, mb_sched_, pool_.data(), int(pool_.size()));
-            bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_);
+            bind_decode_consts(*ctx_, mb_dag_, g_, max_ctx_, gdn_prep_,
+                               std::max(1, g_.max_tokens));
+            mb_bound_tokens_ = std::max(1, g_.max_tokens);
             // Decode writes the shifted conv history straight back over the one
             // it read.  Safe because each channel is read and written by the
             // same thread, in that order, and prep and recurrent touch disjoint
@@ -1871,6 +1877,20 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     bool stage_failed = false;
     const std::vector<Dispatch> fire_dag =
         build_decode_dag_mb(g_, schedule.N, kMultiBatchOrdinalBase, fuse_residual_, gdn_prep_);
+    // The mixture's routing is the one constant this DAG's shape does not
+    // carry: the sort is told how many (token, slot) pairs to place and how
+    // many rows their tile-padded runs occupy, and a value bound at one width
+    // and fired at another sorts pairs the router never wrote. Everything else
+    // here is per-row and was bound once at setup.
+    //
+    // Rebound only when the width actually changes -- a serving loop that
+    // settles at one batch size pays this once. It allocates nothing (const
+    // slots are cached by (ordinal, index)) and moves no encoded byte, since
+    // the argument table already holds the address whose contents change.
+    if (g_.is_moe() && mb_bound_tokens_ != schedule.N) {
+        bind_token_consts(*ctx_, fire_dag, g_, schedule.N);
+        mb_bound_tokens_ = schedule.N;
+    }
     const StepTiming timing = ctx_->run_step([&](StepEncoder& se) {
         if (ptir != nullptr) {
             for (const auto& callbacks : *ptir)
@@ -2363,30 +2383,11 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
             return false;
         }
         // The routed FFN is built -- DAG, kernels, launch shapes, constants,
-        // names and pool -- and one thing is not, so the refusal now names
-        // that one thing rather than the feature.
-        //
-        // The mixture's routing constants depend on the TOKEN COUNT: the sort
-        // is told how many (token, slot) pairs to place and how many rows its
-        // padding produced, and both scale with the batch. Every other
-        // constant in this family is N-invariant, which is why `setup` binds
-        // them once and the batched path reuses that binding for whatever
-        // width a step happens to arrive at. A mixture cannot: bound at
-        // `max_tokens` and run at eight, the sort places pairs that were never
-        // routed and the projections read rows the gather never filled.
-        //
-        // Fixing it is a decision, not a port -- rebind the routing params per
-        // step, or let the kernels read the pair count from a buffer the way
-        // the CSR lengths already are -- and guessing at it is exactly the
-        // kind of fluent wrongness the rest of this file is arranged against.
-        if (geom.is_moe()) {
-            if (err != nullptr) {
-                *err = "qwen3.5 geometry: this config has a routed FFN, whose routing "
-                       "constants depend on the batch width, and this family binds its "
-                       "constants once";
-            }
-            return false;
-        }
+        // names, pool, and the per-step rebinding of the one constant the
+        // batch width can change (`bind_token_consts`, below). There is no
+        // refusal here any more: what a mixture still cannot have is a SHARED
+        // expert, and `geometry_from_facts` above already refuses that from
+        // the config, before any of this is built.
     }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes

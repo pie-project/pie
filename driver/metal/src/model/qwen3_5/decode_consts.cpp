@@ -85,9 +85,77 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
 }
 
 
-int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
-                       const DecodeGeometry& g, int max_ctx, bool gdn_prep) {
+// ── the constants that are a function of the batch width ─────────────────────
+//
+// Every other constant this file binds is per-ROW -- a width, a stride, an
+// epsilon -- so it is the same number whether the step carries one token or a
+// thousand, which is why they are bound once at setup and never looked at
+// again. The mixture's routing breaks that. `moe_route_sort` is told how many
+// (token, slot) pairs exist and how many rows their tile-padded runs occupy,
+// and both scale with the batch: bound at one width and fired at another, the
+// sort either walks off the end of the routing or silently drops the pairs
+// past the count it was given.
+//
+// So they are split out here rather than left in the walk below, and the fire
+// path rebinds THIS when the token count changes. It is a separate function
+// because the alternative -- re-walking all ~400 dispatches per step to rewrite
+// the two dozen that could have changed -- pays the whole argument table for
+// the mixture's share of it. `const_slot` caches by (ordinal, index), so this
+// overwrites the same slots in place and allocates nothing after the first.
+int bind_token_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                      const DecodeGeometry& g, int n_tokens) {
     int count = 0;
+    const int rows = n_tokens > 0 ? n_tokens : 1;
+    const int pairs = rows * g.experts_per_token;
+    const int sorted = moe_sorted_rows(g, rows);
+
+    for (const auto& d : dag) {
+        const int ord = d.ordinal;
+        switch (d.kind) {
+            case Kernel::SiluMul:
+                // The routed stack's gate and up are `moe_intermediate` wide
+                // and there is one row per sorted (token, slot) pair, padding
+                // included -- the padding rows are real rows of the buffers
+                // this reads. A dense model has neither, and the two never
+                // coexist: a model is one shape or the other.
+                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
+                                g.is_moe() ? sorted * g.moe_intermediate : g.intermediate,
+                                &count);
+                break;
+
+            case Kernel::LlMoeSort:
+            case Kernel::LlMoeGather: {
+                // One params struct for both, so the sort's padding and the
+                // gather's bounds cannot disagree about how many rows exist.
+                // `width` is read only by the gather, which moves hidden-wide
+                // rows.
+                const MoeRouteParams p{(uint32_t)pairs,
+                                       (uint32_t)g.n_experts,
+                                       (uint32_t)g.experts_per_token,
+                                       (uint32_t)shared_kernels::moe_tile_rows(pairs, g.n_experts),
+                                       (uint32_t)sorted,
+                                       (uint32_t)g.hidden};
+                bind_const<MoeRouteParams>(ctx, ord,
+                                           d.kind == Kernel::LlMoeSort
+                                               ? (uint8_t)bind::MoeRouteSort::Params
+                                               : (uint8_t)bind::MoeRouteRows::Params,
+                                           p, &count);
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
+    return count;
+}
+
+int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
+                       const DecodeGeometry& g, int max_ctx, bool gdn_prep, int n_tokens) {
+    // The width-dependent ones first, so a DAG is never left half-bound: this
+    // function is the complete binding, and the fire path's rebind is a subset
+    // of it rather than a second, separate contract.
+    int count = bind_token_consts(ctx, dag, g, n_tokens);
 
     // rope: x[h*head_dim + i], rotary half from grid.x. scale=1.0 (qwen3.6 default mrope),
     // base = log2(theta).
@@ -260,42 +328,22 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                 g.n_q_heads * g.head_dim, &count);
                 break;
             case Kernel::SiluMul:
-                // The routed stack's gate and up are `moe_intermediate` wide
-                // and there is one row per sorted (token, slot) pair, padding
-                // included -- the padding rows are real rows of the buffers
-                // this reads. A dense model has neither, and the two never
-                // coexist: a model is one shape or the other.
-                bind_const<int>(ctx, ord, (uint8_t)bind::SiluMul::Width,
-                                g.is_moe() ? moe_sorted_rows(g) * g.moe_intermediate : g.intermediate,
-                                &count);
+            case Kernel::LlMoeSort:
+            case Kernel::LlMoeGather:
+                // Bound above, by `bind_token_consts`: these are the only
+                // constants in this DAG that the batch width can change.
                 break;
-            case Kernel::Residual:
+
             // ── the mixture's routing ──
+            // Width-INVARIANT, both of them: the router reads one row and
+            // writes k logits whatever the batch is, and the combine sums k
+            // slots into one row. Only the sort and the gather in between know
+            // how many rows there are.
             case Kernel::GoRouterTopK:
                 bind_const<RouterParams>(
                     ctx, ord, (uint8_t)bind::GoRouterTopK::Params,
                     RouterParams{(uint32_t)g.n_experts, (uint32_t)g.experts_per_token}, &count);
                 break;
-            case Kernel::LlMoeSort:
-            case Kernel::LlMoeGather: {
-                // One params struct for both, so the sort's padding and the
-                // gather's bounds cannot disagree about how many rows exist.
-                // `width` is read only by the gather, which moves hidden-wide
-                // rows.
-                const MoeRouteParams p{(uint32_t)g.experts_per_token,
-                                       (uint32_t)g.n_experts,
-                                       (uint32_t)g.experts_per_token,
-                                       (uint32_t)shared_kernels::moe_tile_rows(
-                                           g.experts_per_token, g.n_experts),
-                                       (uint32_t)moe_sorted_rows(g),
-                                       (uint32_t)g.hidden};
-                bind_const<MoeRouteParams>(ctx, ord,
-                                           k == Kernel::LlMoeSort
-                                               ? (uint8_t)bind::MoeRouteSort::Params
-                                               : (uint8_t)bind::MoeRouteRows::Params,
-                                           p, &count);
-                break;
-            }
             case Kernel::LlMoeCombine:
                 bind_const<ExpertCombineParams>(
                     ctx, ord, (uint8_t)bind::GoExpertCombine::Params,
@@ -303,6 +351,13 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     &count);
                 break;
 
+            // Both residual adds. `LayerOut` is the fused one and `Residual`
+            // the standalone; they are the same kernel and take the same
+            // width. Do not let anything be inserted between these two labels:
+            // `bind::Residual::Width` and `bind::GoRouterTopK::Params` are
+            // both index 3, so a kind that falls into the wrong arm here is
+            // bound to a plausible slot with the wrong TYPE in it.
+            case Kernel::Residual:
             case Kernel::LayerOut:
                 bind_const<int>(ctx, ord, (uint8_t)bind::Residual::Width, g.hidden, &count);
                 break;
