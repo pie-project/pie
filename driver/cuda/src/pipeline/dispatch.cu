@@ -3671,6 +3671,39 @@ bool Dispatch::launch_has_attention_stages(
 
 std::uint32_t Dispatch::launch_hook_free_prefix_rows(
     const pie_native::LaunchView& view) const {
+    const std::uint32_t derived = derive_hook_free_prefix_rows(view);
+    // B (the fire planner's first consumed lowering): when the scheduler
+    // sent its planned prefix — fire_plan's qkv_postprocess site,
+    // converted to wire rows through the same attribution CSR — the plan
+    // OWNS the answer, and this derivation becomes the cross-check: the
+    // admission-time hook stamps and the compiled stage plans must agree,
+    // and a drift is a bug to refuse loudly, not a case to split.
+    if (view.planned_hook_free_prefix_rows ==
+        PIE_HOOK_FREE_PREFIX_UNPLANNED) {
+        return derived;
+    }
+    if (view.planned_hook_free_prefix_rows != derived) {
+        throw std::runtime_error(
+            "planned hook-free prefix (" +
+            std::to_string(view.planned_hook_free_prefix_rows) +
+            " wire rows) disagrees with the compiled-plan derivation (" +
+            std::to_string(derived) +
+            "): the scheduler's hook stamps and the driver's stage plans "
+            "drifted");
+    }
+    // Positive engagement evidence for the parity harness: without it a
+    // wiring bug that never sends a plan would green-run vacuously on the
+    // derivation alone.
+    if (std::getenv("PIE_DECLARED_FORWARD_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[hook-prefix-plan] planned=%u (cross-checked)\n",
+                     view.planned_hook_free_prefix_rows);
+    }
+    return view.planned_hook_free_prefix_rows;
+}
+
+std::uint32_t Dispatch::derive_hook_free_prefix_rows(
+    const pie_native::LaunchView& view) const {
     const std::size_t n_prog = view.ptir_program_hashes.size();
     // Per-program row attribution is the only way to LOCATE a hook, so its
     // absence means "no fast prefix", not "no hooks".

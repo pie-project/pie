@@ -9,15 +9,20 @@
 //! scheduler, because only the scheduler sees the model's divergence sites,
 //! the attached programs, the device cost model, and what was admitted.
 //!
-//! v0 is deliberately narrow: [`plan_fire`] re-derives, as data, exactly the
-//! decisions the scheduler already makes in scattered places — the
+//! v0 was deliberately narrow: [`plan_fire`] re-derives, as data, exactly
+//! the decisions the scheduler already makes in scattered places — the
 //! `(device_resolved_geometry, hook_program)` stable sort in
-//! `batch::build_frame_submission` and the two per-site fast-path choices the
-//! driver currently re-derives on its own (see [`SITE_QKV_POSTPROCESS`] and
-//! [`SITE_PROJECTION_WEIGHTS`]). The member order is consumed and asserted
-//! equivalent to the sort it replaces; the sites are consumed by nothing yet.
-//! That is the point: when the next divergence axis lands it lands as one
-//! more [`Site`], not as a fourth hard-coded mechanism.
+//! `batch::build_frame_submission` and the two per-site fast-path choices
+//! the driver used to re-derive on its own (see [`SITE_QKV_POSTPROCESS`]
+//! and [`SITE_PROJECTION_WEIGHTS`]). The member order is consumed and
+//! asserted equivalent to the sort it replaces, and since B the
+//! [`SITE_QKV_POSTPROCESS`] lowering is CONSUMED too: its
+//! `Prefix{fast_rows}` is converted to wire rows
+//! (`batch::planned_prefix_wire_rows`) and crossed to the driver as
+//! `planned_hook_free_prefix_rows`, where it feeds the declared Peel's
+//! split after a cross-check against the driver's compiled-plan
+//! derivation. When the next divergence axis lands it lands as one more
+//! [`Site`], not as a fourth hard-coded mechanism.
 //!
 //! Per pie-application-plan.md §4.4 the planner emits candidates, not final
 //! answers: class assignment is structural and device-independent, and a
@@ -120,10 +125,14 @@ pub(crate) enum Lowering {
     Uniform,
     /// The agreeing prefix takes the fast path, the tail does not — loop
     /// peeling. This is Stage 1's `fast_rows`, made possible by the member
-    /// order putting the agreeing lanes first. v0 counts MEMBERS, not wire
-    /// rows: the driver's `Dispatch::launch_hook_free_prefix_rows` still
-    /// re-derives the row count independently from the wire layout, and a
-    /// later increment hands the plan's answer across instead.
+    /// order putting the agreeing lanes first; since A3 it is literally
+    /// the declared trace's `Peel` op split. Counts MEMBERS, not wire
+    /// rows; `batch::planned_prefix_wire_rows` converts through the
+    /// attribution CSR and crosses the result to the driver
+    /// (`planned_hook_free_prefix_rows`), whose
+    /// `Dispatch::launch_hook_free_prefix_rows` cross-checks it against
+    /// the compiled-plan derivation and consumes it (B — the planner's
+    /// first consumed lowering).
     Prefix { fast_rows: u32 },
     /// Per-lane weights/corrections applied by span — dictionary passing.
     /// This is Stage 4's per-adapter lora correction in the driver. The

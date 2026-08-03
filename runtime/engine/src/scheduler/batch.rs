@@ -26,6 +26,74 @@ pub(crate) struct StepBuild {
     pub(crate) channel_ticket_indptr: Vec<u32>,
 }
 
+/// The fire plan's qkv_postprocess lowering, converted from MEMBER counts
+/// to WIRE request rows through the step's attribution CSR — the value
+/// [`StepSubmission::planned_hook_free_prefix_rows`] carries. The
+/// semantics mirror `Dispatch::launch_hook_free_prefix_rows` EXACTLY (it
+/// walks compiled PTIR stage plans where this walks the admission-time
+/// `hook_program` stamps over the SAME spans) so the driver's cross-check
+/// can refuse on drift instead of guessing which side is right:
+///   * malformed/absent attribution → UNPLANNED (driver derives alone);
+///   * a hook member with an empty wire span cannot be located among the
+///     rows → 0, no fast prefix;
+///   * otherwise the first hook member's row start IS the prefix (spans
+///     are contiguous in planned order — hooks-last is what makes it
+///     maximal), and with no hook members every row is in it.
+fn planned_prefix_wire_rows(
+    plan: &fire_plan::FirePlan,
+    ordered: &[Box<PendingRequest>],
+    row_indptr: &[u32],
+) -> u32 {
+    // A plan is sent only when it DECIDES something: at least one hook
+    // member (the site's Prefix arm). Hook stamps come from tracked
+    // registration, so on every planned step the driver's compiled-plan
+    // walk sees the same programs and the cross-check compares like with
+    // like; a hook-free step (including prebuilt/untracked fires, whose
+    // programs the driver may not know) keeps the driver's own
+    // derivation, whose answer is consumed by nothing anyway.
+    if !ordered.iter().any(|req| req.hook_program) {
+        return pie_driver_abi::PIE_HOOK_FREE_PREFIX_UNPLANNED;
+    }
+    if row_indptr.len() != ordered.len() + 1 {
+        return pie_driver_abi::PIE_HOOK_FREE_PREFIX_UNPLANNED;
+    }
+    let total = *row_indptr.last().expect("indptr has a total");
+    if total == 0 {
+        return 0;
+    }
+    let mut first_hook_row = total;
+    for (member, req) in ordered.iter().enumerate() {
+        if !req.hook_program {
+            continue;
+        }
+        let (lo, hi) = (row_indptr[member], row_indptr[member + 1]);
+        if hi <= lo {
+            return 0;
+        }
+        first_hook_row = first_hook_row.min(lo);
+    }
+    // The site IS the source; the row scan above is its span binding. The
+    // two must agree by construction (fast_rows counts the leading
+    // non-hook members of the same planned order).
+    if let Some(site) = plan
+        .sites
+        .iter()
+        .find(|site| site.name == fire_plan::SITE_QKV_POSTPROCESS)
+    {
+        // ≥1 hook member, so the site is always the Prefix arm here.
+        let fast_members = match site.lowering {
+            fire_plan::Lowering::Prefix { fast_rows } => fast_rows as usize,
+            _ => unreachable!("a hooked step always plans the Prefix arm"),
+        };
+        debug_assert_eq!(
+            first_hook_row,
+            row_indptr[fast_members.min(ordered.len())],
+            "the plan's member prefix and the row-span scan must agree"
+        );
+    }
+    first_hook_row
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RequestCapacityUsage {
     pub(crate) forward_requests: usize,
@@ -311,9 +379,12 @@ pub(crate) fn build_frame_submission(
         // module doc's wiring; `fire_plan::site_table::summary_sites` maps
         // the reported summary into the vocabulary). Empty — every dense
         // model, every driver without a declared plan — reduces this to
-        // the old `plan_fire` exactly. The merged sites stay INFORMATIONAL
-        // this increment: nothing consumes the site vec downstream (v0),
-        // so the assert below is the site's only reader.
+        // the old `plan_fire` exactly. The qkv_postprocess site is
+        // CONSUMED since B (`planned_prefix_wire_rows` below): its
+        // Prefix{fast_rows} crosses the wire as
+        // `planned_hook_free_prefix_rows` and the driver's Peel split
+        // uses it after a cross-check. The other sites remain
+        // informational.
         let plan = fire_plan::plan_fire_with_model(&facts, model_sites);
         debug_assert_eq!(
             plan.sites.len(),
@@ -383,6 +454,13 @@ pub(crate) fn build_frame_submission(
             );
         }
         required_kv_pages = required_kv_pages.max(build.plan.required_kv_pages);
+        // The planner's first CONSUMED lowering (fire_plan module doc):
+        // the qkv_postprocess site's Prefix{fast_rows} — member counts —
+        // converted to WIRE request rows through the attribution CSR and
+        // handed across; the driver cross-checks it against its own
+        // compiled-plan derivation and refuses the launch on drift.
+        let planned_hook_free_prefix_rows =
+            planned_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
         steps.push(StepSubmission {
             plan: build.plan,
             roster_rows,
@@ -390,6 +468,7 @@ pub(crate) fn build_frame_submission(
             sub_batch_class,
             terminal_cells: build.terminal_cells,
             program_row_indptr: build.program_row_indptr,
+            planned_hook_free_prefix_rows,
             logical_fire_ids: build.logical_fire_ids,
             channel_expected_head: build.channel_expected_head,
             channel_expected_tail: build.channel_expected_tail,

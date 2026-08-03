@@ -341,6 +341,8 @@ fn step_desc<'a>(
         channel_expected_head: u64_slice(&step.channel_expected_head),
         channel_expected_tail: u64_slice(&step.channel_expected_tail),
         channel_ticket_indptr: u32_slice(&step.channel_ticket_indptr),
+        planned_hook_free_prefix_rows: step.planned_hook_free_prefix_rows,
+        reserved_step_tail0: 0,
     }
 }
 

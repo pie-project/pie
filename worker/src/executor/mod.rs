@@ -3105,6 +3105,10 @@ fn single_step_frame(
             }],
             terminal_cells,
             program_row_indptr,
+            // No fire plan on this path (a harness/legacy single-step
+            // submission): the driver derives the hook prefix alone.
+            planned_hook_free_prefix_rows:
+                pie_driver_abi::PIE_HOOK_FREE_PREFIX_UNPLANNED,
             logical_fire_ids,
             channel_expected_head,
             channel_expected_tail,

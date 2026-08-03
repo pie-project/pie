@@ -29,6 +29,12 @@ pub struct StepSubmission {
     /// each (a device-geometry fire's row is an empty placeholder the driver
     /// replaces with channel-resolved geometry).
     pub program_row_indptr: Vec<u32>,
+    /// The fire planner's hook-free prefix in WIRE request rows
+    /// (`fire_plan`'s qkv_postprocess site, converted through
+    /// `program_row_indptr` — the planner's first consumed lowering).
+    /// `PIE_HOOK_FREE_PREFIX_UNPLANNED` when the step carries no
+    /// attribution to convert through; the driver then derives it alone.
+    pub planned_hook_free_prefix_rows: u32,
     pub logical_fire_ids: Vec<u64>,
     pub channel_expected_head: Vec<u64>,
     pub channel_expected_tail: Vec<u64>,

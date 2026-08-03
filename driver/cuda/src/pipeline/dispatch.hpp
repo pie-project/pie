@@ -336,7 +336,18 @@ class Dispatch {
     // absent. The count is in WIRE request rows, and it is conservative by
     // construction: rows past the wire span (composed device-geometry
     // suffix) are never counted into the prefix.
+    //
+    // Since B (the fire planner's first consumed lowering): when the
+    // scheduler crossed its planned prefix
+    // (`view.planned_hook_free_prefix_rows`), the PLAN owns the answer and
+    // the compiled-plan derivation below becomes a cross-check — a
+    // disagreement refuses the launch loudly.
     std::uint32_t launch_hook_free_prefix_rows(
+        const pie_native::LaunchView& view) const;
+
+    // The compiled-plan derivation alone (the pre-plan behavior; the
+    // cross-check's second opinion).
+    std::uint32_t derive_hook_free_prefix_rows(
         const pie_native::LaunchView& view) const;
 
     // Whether any program in this launch reads `AttnScore`. Capture is opt-in
