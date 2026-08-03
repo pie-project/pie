@@ -4081,9 +4081,9 @@ class DeviceBatch:
         _engrain.cuda_launch(
             "en_commit",
             self.batch,
-            # A thread owns a stack entry, so the block has to cover the
-            # stride. Rounded to a warp, and capped at what a block may hold.
-            min(1024, max(32, (grammar.max_stack + 31) // 32 * 32)),
+            # A thread owns every `blockDim.x`-th stack entry, so this is a
+            # throughput choice rather than a bound the stack imposes.
+            self._fused_threads(grammar),
             torch.cuda.current_stream().cuda_stream,
             [
                 self.state_struct().data_ptr(),
@@ -4567,13 +4567,24 @@ class DeviceBatch:
             grid_y=self._fill_chunks(grammar),
         )
 
+    # What the commit phase is launched with once the stack is deeper than it.
+    # The threads walk the stack in a strided loop, so this is a throughput
+    # choice rather than a correctness one - and it has to be a choice, because
+    # the fused kernel cannot be launched with a thread per entry past about
+    # 512: it asks for more registers than a block may hold. 256 is what a
+    # 256-deep batch used before this became a loop, so nothing that fits today
+    # changes shape.
+    _COMMIT_THREADS = 256
+
     def _fused_threads(self, grammar) -> int:
         """Threads per block for the fused kernels.
 
-        A thread owns a stack entry in the commit phase, so the block covers
-        the stride; rounded to a warp and capped at a block's maximum.
+        Enough to cover the stack where the stack is small, and capped where it
+        is not. A thread owns every `blockDim.x`-th entry of the commit phase,
+        so a narrower block costs iterations rather than correctness.
         """
-        return min(1024, max(32, (grammar.max_stack + 31) // 32 * 32))
+        wanted = max(32, (grammar.max_stack + 31) // 32 * 32)
+        return min(self._COMMIT_THREADS, wanted)
 
     def _fill_threads(self, grammar) -> int:
         """Threads per block for the fused fill, which has no commit phase.

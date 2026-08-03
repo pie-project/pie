@@ -1205,6 +1205,78 @@ class FusedStep(unittest.TestCase):
         self.assertGreater(steps, 8)
 
 
+class StackDeeperThanTheBlock(unittest.TestCase):
+    """The depth a parse reaches must not be a launch parameter.
+
+    A thread used to own a stack entry in the commit phase, so a block had to
+    be as wide as the deepest stack the batch allowed. That put the ceiling
+    into the launch: past about 512 the fused kernel could not be launched at
+    all - "too many resources requested" - and below it, a document that grew
+    past the ceiling was thrown off the device onto the reference matcher,
+    which costs about 1.5 ms per row per step and never stops, because the
+    document keeps growing. Measured at batch 512 on a corpus schema: three
+    rows a step, 4,577 us, 58% of the backend.
+    """
+
+    def setUp(self):
+        _requirements()
+
+    def test_a_parse_deeper_than_the_block_agrees_with_the_matcher(self):
+        from engrain._engine import DeviceGrammar
+
+        compiler = support.Compiler(VOCABULARY)
+        grammar = compiler.compile_json_schema(json.dumps({"type": "array"}))
+        matcher = grammar.matcher(0)
+        opening = VOCABULARY.index(b"[")
+        # Two stack entries a level, so this is past both the block width the
+        # commit is launched with and the 256 a pool defaults to.
+        for _ in range(200):
+            self.assertTrue(matcher.accept_token(opening))
+        depth = matcher.max_stack_depth()
+        self.assertGreater(depth, 256, "the premise: deeper than a default pool")
+
+        pool = DeviceGrammar(max_stack=1024)
+        pool.admit(grammar)
+        batch = pool.new_batch(1)
+        batch.set_grammars([0])
+        batch.set_matchers([matcher])
+        mask = batch.fill_mask()[0].cpu()
+
+        reference = torch.zeros(mask.numel(), dtype=torch.int32)
+        matcher.fill_bitmask(reference)
+        self.assertTrue(torch.equal(mask, reference))
+        # And the block really is narrower than the stack, or this proves
+        # nothing about the loop.
+        self.assertLess(batch._fused_threads(pool), depth)
+
+    def test_advancing_a_deep_parse_agrees_with_the_matcher(self):
+        """The commit phase runs on advance, which is where the launch failed."""
+        from engrain._engine import DeviceGrammar
+
+        compiler = support.Compiler(VOCABULARY)
+        grammar = compiler.compile_json_schema(json.dumps({"type": "array"}))
+        matcher = grammar.matcher(0)
+        opening = VOCABULARY.index(b"[")
+        for _ in range(200):
+            matcher.accept_token(opening)
+
+        pool = DeviceGrammar(max_stack=1024)
+        pool.admit(grammar)
+        batch = pool.new_batch(1)
+        batch.set_grammars([0])
+        batch.set_matchers([matcher])
+        batch.advance(torch.tensor([opening], dtype=torch.int32, device="cuda"))
+        self.assertTrue(matcher.accept_token(opening))
+
+        held = batch.configurations(0)
+        self.assertEqual(
+            sorted((state, tuple(stack)) for state, stack in held),
+            sorted(
+                (state, tuple(stack)) for state, stack in matcher.configurations()
+            ),
+        )
+
+
 class SizedForTheMachine(unittest.TestCase):
     """Nothing that decides how much of a device to use may be a constant.
 

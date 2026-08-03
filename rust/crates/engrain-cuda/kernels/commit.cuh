@@ -19,8 +19,9 @@
 #pragma once
 #include "arena.cuh"
 
-/// One block per sequence. `blockDim.x` must be at least the stack stride,
-/// since a thread owns a stack entry.
+/// One block per sequence. Any block width: a thread walks the stack in a
+/// strided loop rather than owning one entry, so the depth a batch allows is
+/// not also a launch parameter.
 extern "C" __global__ void en_commit(
     en::BatchState* state,
     const int32_t* old_lexer,
@@ -79,16 +80,10 @@ extern "C" __global__ void en_commit(
                 int32_t depth = cand_depth[base + index];
                 int32_t floor = cand_floor[base + index];
 
-                // The candidate's stack, put back together: everything below
-                // its floor is the source configuration's, read from the copy
-                // taken before this pass began overwriting the live one.
-                int32_t value = 0;
-                if (lane < depth) {
-                    value = lane < floor
-                        ? old_stack[(int64_t)(sequence * configs + source) * stack_stride
-                                    + lane]
-                        : cand_window[(base + index) * (int64_t)window + (lane - floor)];
-                }
+                // A thread owns every `blockDim.x`-th entry rather than one
+                // each, so a block of any width covers a stack of any depth.
+                int64_t source_row = (int64_t)(sequence * configs + source);
+                int64_t candidate = base + index;
 
                 bool duplicate = false;
                 for (int32_t done = 0; done < written; ++done) {
@@ -100,8 +95,17 @@ extern "C" __global__ void en_commit(
                         || state->depth[out] != depth) {
                         continue;
                     }
-                    int32_t differs = (lane < depth)
-                        && (state->stack[(int64_t)out * stack_stride + lane] != value);
+                    int32_t differs = 0;
+                    for (int32_t slot = lane; slot < depth; slot += blockDim.x) {
+                        if (state->stack[(int64_t)out * stack_stride + slot]
+                            != en::stack_entry(old_stack, cand_window, source_row,
+                                               candidate, stack_stride, window, floor,
+                                               slot)) {
+                            differs = 1;
+                        }
+                    }
+                    // Uniform across the block: the loop above varies per
+                    // thread, this does not.
                     if (__syncthreads_or(differs) == 0) {
                         duplicate = true;
                     }
@@ -109,8 +113,11 @@ extern "C" __global__ void en_commit(
 
                 if (!duplicate) {
                     int32_t out = sequence * configs + written;
-                    if (lane < depth) {
-                        state->stack[(int64_t)out * stack_stride + lane] = value;
+                    for (int32_t slot = lane; slot < depth; slot += blockDim.x) {
+                        state->stack[(int64_t)out * stack_stride + slot] =
+                            en::stack_entry(old_stack, cand_window, source_row,
+                                            candidate, stack_stride, window, floor,
+                                            slot);
                     }
                     if (lane == 0) {
                         state->lexer_state[out] = next_state;

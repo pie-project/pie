@@ -124,4 +124,32 @@ struct Shape {
     int32_t rows;  // batch * configs
 };
 
+/// One entry of a candidate's reassembled stack.
+///
+/// Everything below the candidate's floor belongs to the source configuration
+/// and is read from the copy taken before this pass began overwriting the live
+/// one; everything at or above it is what the replay produced.
+///
+/// A function of the slot rather than a value held in a register, because the
+/// commit's threads walk the stack in a strided loop rather than owning one
+/// entry each. Owning one entry each meant the block had to be as wide as the
+/// deepest stack a batch allowed, which put the depth ceiling into the launch:
+/// a stack of 512 asked for 512 threads and the fused kernel could not be
+/// launched with them at all - "too many resources requested for launch" -
+/// while the parse that needed it was a JSON array with no maxItems, which is
+/// an ordinary schema rather than a pathological one.
+__device__ inline int32_t stack_entry(
+    const int32_t* old_stack,
+    const int32_t* cand_window,
+    int64_t source_row,
+    int64_t candidate,
+    int32_t stack_stride,
+    int32_t window,
+    int32_t floor,
+    int32_t slot) {
+    return slot < floor
+        ? old_stack[source_row * stack_stride + slot]
+        : cand_window[candidate * (int64_t)window + (slot - floor)];
+}
+
 }  // namespace en
