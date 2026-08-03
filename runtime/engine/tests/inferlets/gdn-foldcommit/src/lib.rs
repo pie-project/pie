@@ -100,23 +100,47 @@ impl Arm {
             &Channel::from(toks.iter().map(|&x| x as i32).collect::<Vec<_>>()),
             &ch(vec![0, t]),
         )?;
-        fwd.attention(
-            &self.ws,
-            ..,
-            ..,
-            &ch(vec![end]),
-            &ch((0..self.max_pages).collect()),
-            &ch(vec![0, end.div_ceil(ps)]),
-            &ch((base..end).map(|p| p / ps).collect()),
-            &ch((base..end).map(|p| p % ps).collect()),
-            &ch((base..end).collect()),
-            None,
-        )?;
+        let kv_len = ch(vec![end]);
+        let pages = ch((0..self.max_pages).collect());
+        let page_indptr = ch(vec![0, end.div_ceil(ps)]);
+        let w_slot = ch((base..end).map(|p| p / ps).collect());
+        let w_off = ch((base..end).map(|p| p % ps).collect());
+        let positions = ch((base..end).collect());
+        let kv = || {
+            Some(KvBinding {
+                working_set: &self.ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            })
+        };
         match fold_len {
-            None => fwd.recurrent(std::slice::from_ref(&self.rs))?,
+            None => fwd.attention(
+                kv(),
+                std::slice::from_ref(&self.rs),
+                RsGeometry {
+                    fold_len: None,
+                    buffer: 0..0,
+                },
+            )?,
             Some(channel) => fwd
-                .recurrent_with(std::slice::from_ref(&self.rs), channel, ..)
-                .map_err(|e| format!("{tag} recurrent binding: {e}"))?,
+                .attention(
+                    kv(),
+                    std::slice::from_ref(&self.rs),
+                    RsGeometry {
+                        fold_len: Some(channel),
+                        buffer: ..,
+                    },
+                )
+                .with_context(|| format!("{tag} state binding"))?,
         }
         // An EMPTY epilogue, not an absent one: a pass with no stages has no
         // PTIR program at all. A commit samples nothing, so empty is right.
@@ -137,20 +161,37 @@ impl Arm {
 
         let fwd = ForwardPass::new();
         fwd.embed(&Channel::from(vec![0i32]), &ch(vec![0, 0]))?;
+        let kv_len = ch(vec![base]);
+        let pages = ch((0..self.max_pages).collect());
+        let page_indptr = ch(vec![0, base.div_ceil(ps)]);
+        let w_slot = ch(vec![0]);
+        let w_off = ch(vec![0]);
+        let positions = ch(vec![0]);
+        let kv = || {
+            Some(KvBinding {
+                working_set: &self.ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            })
+        };
         fwd.attention(
-            &self.ws,
-            ..,
-            ..,
-            &ch(vec![base]),
-            &ch((0..self.max_pages).collect()),
-            &ch(vec![0, base.div_ceil(ps)]),
-            &ch(vec![0]),
-            &ch(vec![0]),
-            &ch(vec![0]),
-            None,
-        )?;
-        fwd.recurrent_with(std::slice::from_ref(&self.rs), fold_len, ..)
-            .map_err(|e| format!("{tag} recurrent binding: {e}"))?;
+            kv(),
+            std::slice::from_ref(&self.rs),
+            RsGeometry {
+                fold_len: Some(fold_len),
+                buffer: ..,
+            },
+        )
+        .with_context(|| format!("{tag} state binding"))?;
         fwd.epilogue(|| {});
         Ok(fwd)
     }
@@ -181,25 +222,49 @@ impl Arm {
             &Channel::from(toks.iter().map(|&x| x as i32).collect::<Vec<_>>()),
             &ch(vec![0, t]),
         )?;
-        fwd.attention(
-            &self.ws,
-            ..,
-            ..,
-            &ch(vec![end]),
-            &ch((0..self.max_pages).collect()),
-            &ch(vec![0, end.div_ceil(ps)]),
-            &ch((base..end).map(|p| p / ps).collect()),
-            &ch((base..end).map(|p| p % ps).collect()),
-            &ch((base..end).collect()),
-            None,
-        )?;
+        let kv_len = ch(vec![end]);
+        let pages = ch((0..self.max_pages).collect());
+        let page_indptr = ch(vec![0, end.div_ceil(ps)]);
+        let w_slot = ch((base..end).map(|p| p / ps).collect());
+        let w_off = ch((base..end).map(|p| p % ps).collect());
+        let positions = ch((base..end).collect());
+        let kv = || {
+            Some(KvBinding {
+                working_set: &self.ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            })
+        };
         match buffered {
-            None => fwd.recurrent(std::slice::from_ref(&self.rs))?,
+            None => fwd.attention(
+                kv(),
+                std::slice::from_ref(&self.rs),
+                RsGeometry {
+                    fold_len: None,
+                    buffer: 0..0,
+                },
+            )?,
             Some((_start, fold_len)) => {
                 // Where the tokens land in the buffer is not stated: new
                 // tokens append at the tail, which only the runtime knows.
-                fwd.recurrent_with(std::slice::from_ref(&self.rs), &ch(vec![fold_len]), ..)
-                .map_err(|e| format!("{tag} recurrent binding: {e}"))?;
+                fwd.attention(
+                    kv(),
+                    std::slice::from_ref(&self.rs),
+                    RsGeometry {
+                        fold_len: Some(&ch(vec![fold_len])),
+                        buffer: ..,
+                    },
+                )
+                .with_context(|| format!("{tag} state binding"))?;
             }
         }
         let out = Channel::new([1], dtype::i32).named("arm_out");
@@ -215,8 +280,7 @@ impl Arm {
             // whereas the peak logit VALUE moves with the state continuously.
             peak_sink.put(&reduce_max(&logits));
         });
-        fwd.submit(pipe)
-            .map_err(|e| format!("{tag} submit: {e}"))?;
+        fwd.submit(pipe).map_err(|e| format!("{tag} submit: {e}"))?;
         let token = out
             .take()
             .get::<i32>()
@@ -338,21 +402,38 @@ impl Duo {
             .collect();
         let slots: Vec<u32> = (base..end).map(|p| p / ps).collect();
         let offs: Vec<u32> = (base..end).map(|p| p % ps).collect();
-        fwd.attention(
-            &self.ws,
-            ..,
-            ..,
-            &ch(vec![end, end]),
-            &Channel::from(pages),
-            &ch(vec![0, row_pages, 2 * row_pages]),
-            &ch([slots.clone(), slots].concat()),
-            &ch([offs.clone(), offs].concat()),
-            &ch([(base..end).collect::<Vec<_>>(), (base..end).collect()].concat()),
-            None,
-        )?;
+        let kv_len = ch(vec![end, end]);
+        let pages = Channel::from(pages);
+        let page_indptr = ch(vec![0, row_pages, 2 * row_pages]);
+        let w_slot = ch([slots.clone(), slots].concat());
+        let w_off = ch([offs.clone(), offs].concat());
+        let positions = ch([(base..end).collect::<Vec<_>>(), (base..end).collect()].concat());
+        let kv = || {
+            Some(KvBinding {
+                working_set: &self.ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &kv_len,
+                    pages: &pages,
+                    page_indptr: &page_indptr,
+                    w_slot: &w_slot,
+                    w_off: &w_off,
+                    positions: &positions,
+                    mask: None,
+                },
+            })
+        };
 
         if buffered.iter().all(Option::is_none) {
-            fwd.recurrent(&self.rs)?;
+            fwd.attention(
+                kv(),
+                &self.rs,
+                RsGeometry {
+                    fold_len: None,
+                    buffer: 0..0,
+                },
+            )?;
         } else {
             let rp = self.rs_page;
             let mut fold_len = Vec::with_capacity(2);
@@ -387,8 +468,15 @@ impl Duo {
                     }
                 }
             }
-            fwd.recurrent_with(&self.rs, &ch(fold_len), ..)
-            .map_err(|e| format!("{tag} recurrent binding: {e}"))?;
+            fwd.attention(
+                kv(),
+                &self.rs,
+                RsGeometry {
+                    fold_len: Some(&ch(fold_len)),
+                    buffer: ..,
+                },
+            )
+            .with_context(|| format!("{tag} state binding"))?;
         }
 
         // The default read-out is each lane's last row, so `logits` is
@@ -398,8 +486,7 @@ impl Duo {
         fwd.epilogue(move || {
             sink.put(&reduce_max(intrinsics::logits()));
         });
-        fwd.submit(pipe)
-            .map_err(|e| format!("{tag} submit: {e}"))?;
+        fwd.submit(pipe).map_err(|e| format!("{tag} submit: {e}"))?;
         let v = peak
             .take()
             .get::<f32>()
@@ -433,7 +520,11 @@ async fn mixed_positions(prompt: &[u32]) -> Result<String> {
     // difference moves the logits. A short repeated one does not.
     let cont: Vec<u32> = {
         let c = wit_model::encode(" quick brown fox jumps over the lazy dog and runs away");
-        if c.is_empty() { vec![1, 2, 3, 4, 5, 6, 7, 8] } else { c }
+        if c.is_empty() {
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        } else {
+            c
+        }
     };
     let t = cont.len() as u32;
     let n = prompt.len() as u32;
@@ -564,7 +655,8 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
     a.pos += HALF;
 
     // Arm B: the same four tokens, folded two fires at a time.
-    b.fire(&cont[..HALF as usize], None, &pipe, "B-fold-1").await?;
+    b.fire(&cont[..HALF as usize], None, &pipe, "B-fold-1")
+        .await?;
     b.pos += HALF;
     let b_last = b
         .fire(&cont[HALF as usize..], None, &pipe, "B-fold-2")
@@ -775,7 +867,8 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     c.pos += T as u32;
 
     // ── Arm B: two folded, then two appended — the reference ──────────────
-    b.fire(&cont[..HALF as usize], None, &pipe, "B-fold").await?;
+    b.fire(&cont[..HALF as usize], None, &pipe, "B-fold")
+        .await?;
     b.pos += HALF;
     b.rs.alloc_buffer(slabs)
         .map_err(|e| format!("B alloc_buffer: {e}"))?;
@@ -837,8 +930,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     // read `a_next=17.2500` against `b_next=16.8750`, and D — which reaches
     // A's exact store state by a path that predates the split — was wrong too.
     let outputs_agree = close(a_inside, b_inside) && close(a_inside, c_inside);
-    let states_agree =
-        close(a_next, d_next) && close(a_next, b_next) && close(a_next, c_next);
+    let states_agree = close(a_next, d_next) && close(a_next, b_next) && close(a_next, c_next);
     let ok = outputs_agree && states_agree;
     let result = format!(
         "interior tokens={T} fold={HALF} a_inside={a_inside:.4} b_inside={b_inside:.4} \
@@ -1016,12 +1108,17 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     let a_append = {
         let sink = n_dev.clone();
         let raw_sink = raw.clone();
-        a.build_fire(&window, Some(&Channel::from(vec![0u32])), "A-append", move || {
-            let t = reduce_argmax(&intrinsics::logits());
-            raw_sink.put(&t);
-            // In [1, W]: a real function of the logits, bounded by the window.
-            sink.put(&cast(add(rem(t, W), 1u32), dtype::u32));
-        })?
+        a.build_fire(
+            &window,
+            Some(&Channel::from(vec![0u32])),
+            "A-append",
+            move || {
+                let t = reduce_argmax(&intrinsics::logits());
+                raw_sink.put(&t);
+                // In [1, W]: a real function of the logits, bounded by the window.
+                sink.put(&cast(add(rem(t, W), 1u32), dtype::u32));
+            },
+        )?
     };
     // The commit sits one window PAST the append, so build it at that
     // position and put the arm back until the append has actually run.
@@ -1198,19 +1295,30 @@ async fn main(input: String) -> Result<String> {
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
+    let kv = || {
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: None,
+            },
+        })
+    };
     fwd_p.attention(
-        &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        kv(),
+        std::slice::from_ref(&rs),
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
+        },
     )?;
-    fwd_p.recurrent(std::slice::from_ref(&rs))?;
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
         g0_ch.put(&t);
@@ -1253,26 +1361,37 @@ async fn main(input: String) -> Result<String> {
     let fwd_s = ForwardPass::new();
     fwd_s.embed(&spec_toks, &spec_indptr)?;
     let spec_kv_len = Channel::from(vec![n + SPEC_TOKENS]).named("spec_kv_len");
-    fwd_s.attention(
-        &ws,
-        ..,
-        ..,
-        &spec_kv_len,
-        &spec_pages,
-        &spec_page_indptr,
-        &spec_w_slot,
-        &spec_w_off,
-        &spec_positions,
-        None,
-    )?;
+    let kv = || {
+        Some(KvBinding {
+            working_set: &ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &spec_kv_len,
+                pages: &spec_pages,
+                page_indptr: &spec_page_indptr,
+                w_slot: &spec_w_slot,
+                w_off: &spec_w_off,
+                positions: &spec_positions,
+                mask: None,
+            },
+        })
+    };
     // The buffered geometry: `SPEC_TOKENS` tokens appended at the buffer tail,
     // page-major from slab zero. `fold_len = 0` holds the folded boundary
     // still, so nothing here is committed -- that is what makes this fire
     // abandonable.
     let spec_fold_len = Channel::from(vec![0u32]).named("spec_fold_len");
     fwd_s
-        .recurrent_with(std::slice::from_ref(&rs), &spec_fold_len, ..)
-        .map_err(|e| format!("speculative recurrent binding: {e}"))?;
+        .attention(
+            kv(),
+            std::slice::from_ref(&rs),
+            RsGeometry {
+                fold_len: Some(&spec_fold_len),
+                buffer: ..,
+            },
+        )
+        .context("speculative state binding")?;
     fwd_s.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
         spec_out.put(&t);
@@ -1311,25 +1430,36 @@ async fn main(input: String) -> Result<String> {
         let fwd_c = ForwardPass::new();
         fwd_c.embed(&commit_toks, &commit_indptr)?;
         let commit_kv_len = Channel::from(vec![n + accepted]).named("commit_kv_len");
-        fwd_c.attention(
-            &ws,
-            ..,
-            ..,
-            &commit_kv_len,
-            &commit_pages,
-            &commit_page_indptr,
-            &commit_w_slot,
-            &commit_w_off,
-            &commit_positions,
-            None,
-        )?;
+        let kv = || {
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &commit_kv_len,
+                    pages: &commit_pages,
+                    page_indptr: &commit_page_indptr,
+                    w_slot: &commit_w_slot,
+                    w_off: &commit_w_off,
+                    positions: &commit_positions,
+                    mask: None,
+                },
+            })
+        };
         // The commit replays `accepted` buffered tokens. WHICH tokens is not
         // stated: the replay reaches back over the row's own occupancy, which
         // the runtime tracks.
         let commit_fold_len = Channel::from(vec![accepted]).named("commit_fold_len");
         fwd_c
-            .recurrent_with(std::slice::from_ref(&rs), &commit_fold_len, ..)
-            .map_err(|e| format!("commit recurrent binding: {e}"))?;
+            .attention(
+                kv(),
+                std::slice::from_ref(&rs),
+                RsGeometry {
+                    fold_len: Some(&commit_fold_len),
+                    buffer: ..,
+                },
+            )
+            .context("commit state binding")?;
         // An EMPTY epilogue, not an absent one. The commit samples nothing —
         // it replays buffered activations and stops at the recurrence — but a
         // pass with no stages has no PTIR program at all, and registration
@@ -1380,25 +1510,36 @@ async fn main(input: String) -> Result<String> {
         let fwd2 = ForwardPass::new();
         fwd2.embed(&c2_toks, &c2_indptr)?;
         let c2_kv_len = Channel::from(vec![base + SPEC_TOKENS]).named("c2_kv_len");
-        fwd2.attention(
-            &ws,
-            ..,
-            ..,
-            &c2_kv_len,
-            &c2_pages,
-            &c2_page_indptr,
-            &c2_w_slot,
-            &c2_w_off,
-            &c2_positions,
-            None,
-        )?;
+        let kv = || {
+            Some(KvBinding {
+                working_set: &ws,
+                geometry: KvGeometry {
+                    readable_pages: ..,
+                    writable_pages: ..,
+                    kv_len: &c2_kv_len,
+                    pages: &c2_pages,
+                    page_indptr: &c2_page_indptr,
+                    w_slot: &c2_w_slot,
+                    w_off: &c2_w_off,
+                    positions: &c2_positions,
+                    mask: None,
+                },
+            })
+        };
         // The new chunk lands at buffer token `tail`, immediately after what
         // the commit left unfolded — which is what makes this the read path
         // rather than a fresh chunk. The guest does not say so; the runtime
         // appends at the tail because there is nowhere else to append.
         let c2_fold_len = Channel::from(vec![0u32]).named("c2_fold_len");
-        fwd2.recurrent_with(std::slice::from_ref(&rs), &c2_fold_len, ..)
-        .map_err(|e| format!("chain recurrent binding: {e}"))?;
+        fwd2.attention(
+            kv(),
+            std::slice::from_ref(&rs),
+            RsGeometry {
+                fold_len: Some(&c2_fold_len),
+                buffer: ..,
+            },
+        )
+        .context("chain state binding")?;
         fwd2.epilogue(move || {
             let t = reduce_argmax(intrinsics::logits());
             c2_out.put(&t);

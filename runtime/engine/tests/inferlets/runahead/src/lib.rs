@@ -132,15 +132,17 @@ impl Decoder {
         fwd.embed(&toks, &embed_indptr)?;
         fwd.attention(
             &self.ws,
-            ..,
-            (base / self.ws.page_size())..,
-            &klen,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &pos,
-            Some(&mask),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (base / self.ws.page_size())..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: Some(&mask),
+            },
         )?;
         fwd.epilogue(move || {
             let tok = reshape(reduce_argmax(intrinsics::logits()), [1]); // [1] i32
@@ -188,15 +190,17 @@ impl Decoder {
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &self.ws,
-            ..,
-            (n / self.ws.page_size())..,
-            &klen,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &pos,
-            Some(&mask),
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / self.ws.page_size())..,
+                kv_len: &klen,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &pos,
+                mask: Some(&mask),
+            },
         )?;
         fwd.epilogue(move || {
             // Takes + compute first, puts last (value-id discipline).

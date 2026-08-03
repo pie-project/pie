@@ -92,15 +92,17 @@ async fn main(_input: String) -> Result<String> {
     fwd.embed(&toks, &lanes_b)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &klen,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &pos,
-        Some(&mask),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &pos,
+            mask: Some(&mask),
+        },
     )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
@@ -110,7 +112,7 @@ async fn main(_input: String) -> Result<String> {
         );
         let (s, i) = top_k(reshape(cand, [B * v]), B);
         let parent = div(&i, v);
-        let tok_i = cast(rem(&i, v), DType::I32);
+        let tok_i = cast(rem(&i, v), dtype::i32);
 
         // 2. flat tail-append positions: wpos = fill + lane.
         let base = fill.take(); // [1]

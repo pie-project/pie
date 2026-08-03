@@ -75,7 +75,7 @@ fn committed_len(tail: &[i32]) -> usize {
     tail.iter().take_while(|&&t| t >= 0).count()
 }
 
-fn bind_single_sequence(
+fn bind_single_sequence<B>(
     pass: &ForwardPass,
     ws: &WorkingSet,
     toks: &Channel,
@@ -83,7 +83,12 @@ fn bind_single_sequence(
     token_count: u32,
     pool_pages: u32,
     readout: &[u32],
-) -> Result<()> {
+    rs: &[RsWorkingSet],
+    rs_geom: RsGeometry<'_, B>,
+) -> Result<()>
+where
+    B: std::ops::RangeBounds<u32>,
+{
     let embed_indptr = Channel::from(vec![0u32, token_count]).named("embed_indptr");
     let positions = Channel::from((0..token_count).collect::<Vec<_>>()).named("positions");
     let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("pages");
@@ -96,16 +101,22 @@ fn bind_single_sequence(
     pass.embed(toks, &embed_indptr)?;
     pass.readout(&readout)?;
     pass.attention(
-        ws,
-        ..,
-        ..,
-        kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        Some(KvBinding {
+            working_set: ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
+        }),
+        rs,
+        rs_geom,
     )
 }
 
@@ -120,7 +131,7 @@ fn bind_single_sequence(
 /// rows would need `k+1` working sets holding `k+1` divergent copies of one
 /// sequence's state. One row of `k+1` causal tokens is the shape that has a
 /// single state to advance, which is the shape the buffer is built for.
-fn bind_window(
+fn bind_window<B>(
     pass: &ForwardPass,
     ws: &WorkingSet,
     toks: &Channel,
@@ -129,7 +140,12 @@ fn bind_window(
     count: u32,
     pool_pages: u32,
     readout: &[u32],
-) -> Result<()> {
+    rs: &[RsWorkingSet],
+    rs_geom: RsGeometry<'_, B>,
+) -> Result<()>
+where
+    B: std::ops::RangeBounds<u32>,
+{
     // `count == 0` is a row that spans NO TOKENS: "compute nothing, only move
     // the recurrent boundary". The emptiness lives in the token CSR, not in
     // the channels -- the IR has no zero-sized tensor -- so every per-token
@@ -139,9 +155,11 @@ fn bind_window(
     let positions =
         Channel::from((first_pos..first_pos + pad).collect::<Vec<_>>()).named("w_positions");
     let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("w_pages");
-    let page_indptr =
-        Channel::from(vec![0u32, (first_pos + count).div_ceil(PAGE_T).min(pool_pages)])
-            .named("w_page_indptr");
+    let page_indptr = Channel::from(vec![
+        0u32,
+        (first_pos + count).div_ceil(PAGE_T).min(pool_pages),
+    ])
+    .named("w_page_indptr");
     let w_slot = Channel::from(
         (first_pos..first_pos + pad)
             .map(|p| p / PAGE_T)
@@ -164,16 +182,22 @@ fn bind_window(
     }
     pass.embed(toks, &embed_indptr)?;
     pass.attention(
-        ws,
-        ..,
-        ..,
-        kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        Some(KvBinding {
+            working_set: ws,
+            geometry: KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
+        }),
+        rs,
+        rs_geom,
     )
 }
 
@@ -203,8 +227,20 @@ async fn bootstrap(
 
     let fwd = ForwardPass::new();
     let kv_len = Channel::from(vec![n]).named("b_kv_len");
-    bind_single_sequence(&fwd, ws, &toks, &kv_len, n, max_pages, &readout)?;
-    fwd.recurrent(std::slice::from_ref(rs))?;
+    bind_single_sequence(
+        &fwd,
+        ws,
+        &toks,
+        &kv_len,
+        n,
+        max_pages,
+        &readout,
+        std::slice::from_ref(rs),
+        RsGeometry {
+            fold_len: None,
+            buffer: 0..0,
+        },
+    )?;
     fwd.epilogue(move || {
         let picked = reduce_argmax(intrinsics::logits()); // [k] target argmax
         let seed = gather(&picked, Tensor::constant(vec![0u32])); // [1] row-0
@@ -272,8 +308,6 @@ fn build_verify(
     let fwd = ForwardPass::new();
     let kv_len = Channel::from(vec![seq_len + kp1]).named("v_kv_len");
     let readout: Vec<u32> = (0..kp1).collect();
-    bind_window(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages, &readout)?;
-
     // This fire does NOT fold its own tokens. The window is `seed + k
     // drafts`, and how many of those k are real is not known until this
     // fire's own logits come back. Folding them would advance the recurrent
@@ -288,8 +322,22 @@ fn build_verify(
     // fire per window instead of two. (§10.2.9's fold-behind shape:
     // `0 < n <= b` with `t > 0`.)
     let fold_len = Channel::from(vec![fold_len]).named("v_fold_len");
-    fwd.recurrent_with(std::slice::from_ref(rs), &fold_len, ..)
-    .map_err(|e| format!("verify recurrent binding: {e}"))?;
+    bind_window(
+        &fwd,
+        ws,
+        &toks,
+        &kv_len,
+        seq_len,
+        kp1,
+        max_pages,
+        &readout,
+        std::slice::from_ref(rs),
+        RsGeometry {
+            fold_len: Some(&fold_len),
+            buffer: ..,
+        },
+    )
+    .context("verify binding")?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded window (NOT a resubmitted draft
         // channel) and gather rows 1..=k as the verify operand.
@@ -301,7 +349,7 @@ fn build_verify(
         let ones = broadcast(Tensor::constant(1.0f32), [k]);
         let zeros = broadcast(Tensor::constant(0.0f32), [k]);
         let run = cumprod(select(&hit, &ones, &zeros)); // [k]
-        let n_acc = cast(reduce_sum(run), DType::U32); // accepted-prefix length
+        let n_acc = cast(reduce_sum(run), dtype::u32); // accepted-prefix length
         let keep = ge(broadcast(&n_acc, [kp1]), iota(kp1)); // [k+1] i <= n_acc
         let neg1 = broadcast(Tensor::constant(-1i32), [kp1]);
         let commit = select(&keep, &picked, &neg1); // accepted prefix + bonus + -1s
@@ -363,10 +411,22 @@ fn build_commit(
 
     let fwd = ForwardPass::new();
     let kv_len = Channel::from(vec![seq_len]).named("c_kv_len");
-    bind_window(&fwd, ws, &toks, &kv_len, seq_len, 0, max_pages, &[])?;
-
-    fwd.recurrent_with(std::slice::from_ref(rs), fold_len, ..)
-        .map_err(|e| format!("commit recurrent binding: {e}"))?;
+    bind_window(
+        &fwd,
+        ws,
+        &toks,
+        &kv_len,
+        seq_len,
+        0,
+        max_pages,
+        &[],
+        std::slice::from_ref(rs),
+        RsGeometry {
+            fold_len: Some(fold_len),
+            buffer: ..,
+        },
+    )
+    .context("commit binding")?;
     fwd.epilogue(|| {});
     Ok(fwd)
 }
@@ -472,7 +532,15 @@ async fn main(input: String) -> Result<String> {
         // path has no commit to build.
         let clen_ch = device.then(|| Channel::new([1], dtype::u32).named("v_clen"));
         let (verify, commit_out, drafts_out, clen_echo) = build_verify(
-            &ws, &rs, k, seed, &draft, seq_len, max_pages, pending_fold, clen_ch.as_ref(),
+            &ws,
+            &rs,
+            k,
+            seed,
+            &draft,
+            seq_len,
+            max_pages,
+            pending_fold,
+            clen_ch.as_ref(),
         )?;
         // The commit is CONSTRUCTED here -- after the verify pass is built but
         // before it is submitted. F8 only requires the consumer to claim the

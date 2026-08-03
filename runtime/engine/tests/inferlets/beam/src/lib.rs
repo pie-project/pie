@@ -67,15 +67,17 @@ async fn main(_input: String) -> Result<String> {
     fwd.embed(&toks, &lanes_b)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &klen,
-        &pages,
-        &page_rows,
-        &w_slot,
-        &w_off,
-        &pos,
-        Some(&kvm),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_rows,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &pos,
+            mask: Some(&kvm),
+        },
     )?;
     fwd.epilogue(move || {
         // cand = running scores ⊕ log_softmax(logits); (s, i) = top_k over [B*V].
@@ -120,7 +122,7 @@ async fn main(_input: String) -> Result<String> {
         tfill.put(&off1);
         w_slot.put(&slot); // next step's write descriptor
         w_off.put(&off);
-        let tok_i = cast(rem(&i, v), DType::I32);
+        let tok_i = cast(rem(&i, v), dtype::i32);
         toks.put(&tok_i);
         scores.put(&s);
         out.put(&tok_i); // host-facing token (back-pressure)

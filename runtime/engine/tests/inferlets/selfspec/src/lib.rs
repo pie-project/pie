@@ -74,15 +74,17 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     let kv_len_p = Channel::from(vec![n]).named("kv_len_p");
     fwd_p.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_p,
-        &pages_p,
-        &page_indptr_p,
-        &w_slot_p,
-        &w_off_p,
-        &positions_p,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_p,
+            pages: &pages_p,
+            page_indptr: &page_indptr_p,
+            w_slot: &w_slot_p,
+            w_off: &w_off_p,
+            positions: &positions_p,
+            mask: None,
+        },
     )?;
     fwd_p.epilogue(move || {
         let t = reduce_argmax(intrinsics::logits());
@@ -117,15 +119,17 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
         fwd.attention(
             &ws,
-            ..,
-            (n / PAGE_T)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / PAGE_T)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
             let length = kv_len.take().tensor();
@@ -191,15 +195,17 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
     fwd.readout(&readout)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded input tokens (NOT a separate
@@ -210,7 +216,7 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
         let hit = eq(&target, &draft); // [k] bool
         let ones = broadcast(Tensor::constant(1.0f32), [k]);
         let zeros = broadcast(Tensor::constant(0.0f32), [k]);
-        let n_acc = cast(reduce_sum(cumprod(select(&hit, &ones, &zeros))), DType::U32);
+        let n_acc = cast(reduce_sum(cumprod(select(&hit, &ones, &zeros))), dtype::u32);
         let keep = ge(broadcast(&n_acc, [k]), iota(k)); // [k] bool: i <= n_acc
         let zeros_i32 = broadcast(Tensor::constant(0i32), [k]);
         let verify = select(&keep, &target, &zeros_i32); // accepted prefix + correction + 0s

@@ -51,15 +51,17 @@ async fn main(_input: String) -> Result<String> {
     let kv_len = Channel::from((1..=kp1).collect::<Vec<_>>()).named("kv_len");
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         // Grammar mask FIRST, then the target argmax → grammar-legal picks.
@@ -75,7 +77,7 @@ async fn main(_input: String) -> Result<String> {
         let ones = broadcast(Tensor::constant(1.0f32), [K]);
         let zeros = broadcast(Tensor::constant(0.0f32), [K]);
         let run = cumprod(select(&hit, &ones, &zeros)); // [K]
-        let nacc = cast(reduce_sum(&run), DType::U32); // accepted-prefix length
+        let nacc = cast(reduce_sum(&run), dtype::u32); // accepted-prefix length
         let keep = ge(broadcast(&nacc, [kp1]), iota(kp1)); // [K+1]
         let neg1 = broadcast(Tensor::constant(-1i32), [kp1]);
         let commit = select(&keep, &picked, &neg1); // accept-prefix + -1 sentinels

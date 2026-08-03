@@ -49,15 +49,17 @@ async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i
     let kv_len = Channel::from(vec![N]).named("kv_len");
     fwd.attention(
         &ws,
-        ..,
-        (suffix_start / PAGE_T)..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (suffix_start / PAGE_T)..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits()); // read-out row N-1
@@ -104,15 +106,17 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
     let kv_len_a = Channel::from(vec![PAGE_T]).named("kv_len_a");
     fwd_a.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len_a,
-        &pages_a,
-        &page_indptr_a,
-        &w_slot_a,
-        &w_off_a,
-        &positions_a,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len_a,
+            pages: &pages_a,
+            page_indptr: &page_indptr_a,
+            w_slot: &w_slot_a,
+            w_off: &w_off_a,
+            positions: &positions_a,
+            mask: None,
+        },
     )?;
     fwd_a.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits());
@@ -152,15 +156,17 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
     let kv_len_b = Channel::from(vec![N]).named("kv_len_b");
     fwd_b.attention(
         &ws,
-        ..,
-        (PAGE_T / ws.page_size())..,
-        &kv_len_b,
-        &pages_b,
-        &page_indptr_b,
-        &w_slot_b,
-        &w_off_b,
-        &positions_b,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: (PAGE_T / ws.page_size())..,
+            kv_len: &kv_len_b,
+            pages: &pages_b,
+            page_indptr: &page_indptr_b,
+            w_slot: &w_slot_b,
+            w_off: &w_off_b,
+            positions: &positions_b,
+            mask: None,
+        },
     )?;
     fwd_b.epilogue(move || {
         let tok = reduce_argmax(intrinsics::logits());
