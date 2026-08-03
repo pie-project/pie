@@ -1040,3 +1040,51 @@ one connection per lane works. All batteries here use separate
 connections. The a3-era mixed_fire_test passed this morning on a
 shared connection, so something in the client/event path regressed
 today — external to this thread, worth a board entry.
+
+## Half two landed — and the premise, corrected by the scheduler's sort (2026-08-03)
+
+The score-pad gather was the one captured consumer of a hooked lane's
+row that baked a VALUE (its lane→request index). It now reads the
+index from `Impl::hook_pad_requests` — an address-stable device table
+the prepare pass re-uploads every fire, one u32 per pad in build
+order; the pad bakes `&table[ordinal]`. `token_start` left the lane
+fingerprint (the query/logits/score intrinsic bases were already
+per-fire uploaded table content); the table base is mixed instead, so
+growth recaptures once, honestly. Verified live: solo oracle still
+byte-identical to the pre-campaign build; the mixed batteries replay
+with the same capture/recapture counts as before (the remaining
+recaptures are per-instance `bound` pointer churn — real baked
+sideband state, a different animal).
+
+What the flip choreographies then taught (three attempts, all
+defeated): `fire_plan.rs` STABLE-SORTS fire members with hooked
+programs LAST. The split is therefore a FUNCTION of the entry — at
+fixed (R, N, program set) the hook-free prefix cannot move, and the
+campaign's founding premise ("hook execs churn whenever lane
+composition shifts the split") described a composition change that
+always ALSO changes the bucket or the program set, i.e. selects a
+different exec entry rather than churning one. The split terms the
+fingerprint carried (prefix rows, token_start) were entry-constant
+all along; the live churn that motivated the campaign is per-instance
+pointer churn, which persists by design (one recapture per new
+program instance).
+
+What the campaign is therefore worth, stated precisely: the captured
+bodies (model side AND hook side) are now structurally independent of
+the scheduler's member-ordering policy. The sort key has already
+generalized once (`device_resolved_geometry` joined it); when it
+generalizes again — or when admission starts interleaving 3+ lanes
+(today's engine serializes admissions, another reason no battery
+could compose a flip) — the execs keep replaying where the
+host-window forms would have silently read the wrong rows. Robustness
+bought ahead of need, byte-stable everywhere, zero regression. The
+REAL exec-stability frontier, now visible: instance-independent
+baking (program-set-level sideband slots so a respawned instance
+reuses its predecessor's exec), a separate campaign if churn ever
+matters in practice.
+
+Also noted for the board: engine admissions appear serialized (no
+R=3 co-fire ever formed across every battery; new lanes admit only
+after a running lane completes). Pre-existing behavior, possibly the
+kv-contention grant rewrite's policy — not this thread's, but it caps
+composition diversity in every hook battery.

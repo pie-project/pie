@@ -1441,6 +1441,16 @@ struct Dispatch::Impl {
     // on every replay. Same values, address-stable, contents immutable.
     std::uint32_t* hook_layer_table = nullptr;
     std::uint32_t hook_layer_table_len = 0;
+    // Hook-side device indirection (the Peel campaign's second half): the
+    // score-pad gathers' lane→request indices, ONE u32 per pad in build
+    // order, re-uploaded by every prepare pass into this address-stable
+    // table. The captured pad kernel bakes `&table[ordinal]` instead of the
+    // request VALUE, so a hooked lane changing rows (the split moving)
+    // replays the same exec — the fingerprint keys the table base, not the
+    // per-fire indices. Grows only (capacity doubling); growth moves the
+    // base and honestly recaptures once.
+    std::uint32_t* hook_pad_requests = nullptr;
+    std::uint32_t hook_pad_request_capacity = 0;
 };
 
 struct StagedLane {
@@ -1500,7 +1510,12 @@ struct HookScorePadLaunch {
     const float* folded = nullptr;              // arena score slot (stable)
     const std::uint32_t* folded_indptr = nullptr;  // arena score-rows CSR
     float* row = nullptr;                       // arena score-rows row
-    std::uint32_t request = 0;
+    // Index into Impl::hook_pad_requests, assigned in build order. The
+    // kernel reads the lane's request from `&table[ordinal]` — uploaded
+    // fresh by every prepare pass — so the captured launch survives the
+    // lane changing rows (device indirection, the Peel campaign's second
+    // half). The request VALUE lives only in the per-fire host vector.
+    std::uint32_t ordinal = 0;
     std::uint32_t kv_max = 0;
 };
 
@@ -1542,6 +1557,10 @@ struct StagedLaunch::State {
     // the launch state — which outlives every copy on `stream` — is what
     // lets the pull skip the old whole-device synchronize on the fire path.
     std::vector<std::vector<std::uint8_t>> writer_staging;
+    // Score-pad lane→request indices staged by `prepare_attention_phases`
+    // for the async upload into Impl::hook_pad_requests (the source must
+    // outlive the pass; see the device-indirection note there).
+    std::vector<std::uint32_t> pad_request_staging;
     DeviceHostChannelTicket* device_tickets = nullptr;
     // Frame split: device-composition lane tables staged at FramePrepare
     // (`stage_fixed_decode` / `stage_decode_envelopes` — the tables read
@@ -1793,6 +1812,9 @@ struct NotifyContext {
 Dispatch::Impl::~Impl() {
     if (hook_layer_table != nullptr) {
         cudaFree(hook_layer_table);
+    }
+    if (hook_pad_requests != nullptr) {
+        cudaFree(hook_pad_requests);
     }
     if (d_fixed_decode_kills != nullptr) {
         cudaFree(d_fixed_decode_kills);
@@ -2569,9 +2591,13 @@ PreparedCursor lane_ticket_window(
 __global__ void k_hook_attn_score_pad(
     const float* __restrict__ folded,
     const std::uint32_t* __restrict__ folded_indptr,
-    std::uint32_t request,
+    const std::uint32_t* __restrict__ request_d,
     float* __restrict__ row,
     std::uint32_t kv_max) {
+    // Device-indirected lane→request mapping (Peel campaign half two):
+    // the prepare pass re-uploads the index per fire, so a captured
+    // launch replays across row splits instead of baking the request.
+    const std::uint32_t request = *request_d;
     const std::uint32_t begin = folded_indptr[request];
     const std::uint32_t end = folded_indptr[request + 1];
     const std::uint32_t kv_len = end >= begin ? end - begin : 0u;
@@ -5778,8 +5804,22 @@ std::uint64_t Dispatch::prepare_attention_phases(
     for (const auto& lane_ptr : state.lanes) {
         hook_fp_mix(fingerprint, lane_ptr->bound->program_hash);
         hook_fp_mix_ptr(fingerprint, lane_ptr->bound);
-        hook_fp_mix(fingerprint, lane_ptr->token_start);
+        // `token_start` (the lane's fire row) is deliberately NOT mixed —
+        // the campaign's second half: every captured consumer of the row
+        // is device-indirected. The query/logits/score intrinsic bases go
+        // through the per-fire uploaded lane metadata tables, and the
+        // score-pad gather reads its lane→request index from
+        // `hook_pad_requests` (uploaded below). A hooked lane changing
+        // rows therefore replays the same exec.
     }
+
+    // The pads' per-fire lane→request indices, in build order; uploaded
+    // into the address-stable table after the commit pass (the pads bake
+    // `&table[ordinal]`, never the value). Staged on the launch state so
+    // the async upload's pageable source outlives this pass.
+    std::vector<std::uint32_t>& pad_request_values =
+        state.pad_request_staging;
+    pad_request_values.clear();
 
     std::uint32_t stable_slot = 1;
     state.prepared_attn[0].clear();
@@ -5850,11 +5890,15 @@ std::uint64_t Dispatch::prepare_attention_phases(
                             auto* row = reinterpret_cast<float*>(
                                 score_rows_base + need->row_offset);
                             binding.attn_score_base = row;
+                            const std::uint32_t pad_ordinal =
+                                static_cast<std::uint32_t>(
+                                    pad_request_values.size());
+                            pad_request_values.push_back(need->request);
                             task_pads.push_back(HookScorePadLaunch{
                                 score_plan.folded,
                                 folded_indptr_d,
                                 row,
-                                need->request,
+                                pad_ordinal,
                                 static_cast<std::uint32_t>(need->kv_max),
                             });
                             pad = &task_pads.back();
@@ -5970,8 +6014,8 @@ std::uint64_t Dispatch::prepare_attention_phases(
                         for (const auto& pad : group.score_pads) {
                             hook_fp_mix_ptr(fingerprint, pad.folded);
                             hook_fp_mix_ptr(fingerprint, pad.folded_indptr);
+                            hook_fp_mix(fingerprint, pad.ordinal);
                             hook_fp_mix_ptr(fingerprint, pad.row);
-                            hook_fp_mix(fingerprint, pad.request);
                             hook_fp_mix(fingerprint, pad.kv_max);
                         }
                         hook_fp_mix_prepared(fingerprint, *group.prepared);
@@ -6013,6 +6057,37 @@ std::uint64_t Dispatch::prepare_attention_phases(
         state.failed = true;
         throw;
     }
+    // Upload this fire's lane→request indices into the address-stable pad
+    // table (device indirection — see Impl::hook_pad_requests). Ordered on
+    // the fire stream, so both the capture-time launches and every replay
+    // consume THIS fire's mapping. Growth (first fire, or more pads than
+    // ever) moves the base; the fingerprint mixes it, so that one fire
+    // honestly recaptures.
+    if (!pad_request_values.empty()) {
+        const auto needed =
+            static_cast<std::uint32_t>(pad_request_values.size());
+        if (impl_->hook_pad_request_capacity < needed) {
+            std::uint32_t capacity =
+                impl_->hook_pad_request_capacity == 0
+                    ? 64u
+                    : impl_->hook_pad_request_capacity;
+            while (capacity < needed) capacity *= 2u;
+            std::uint32_t* grown = nullptr;
+            CUDA_CHECK(cudaMalloc(
+                &grown, static_cast<std::size_t>(capacity) *
+                            sizeof(std::uint32_t)));
+            if (impl_->hook_pad_requests != nullptr) {
+                cudaFree(impl_->hook_pad_requests);
+            }
+            impl_->hook_pad_requests = grown;
+            impl_->hook_pad_request_capacity = capacity;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            impl_->hook_pad_requests, pad_request_values.data(),
+            static_cast<std::size_t>(needed) * sizeof(std::uint32_t),
+            cudaMemcpyHostToDevice, in.stream));
+    }
+    hook_fp_mix_ptr(fingerprint, impl_->hook_pad_requests);
     // The body's per-layer hook invocations are accounted here — the
     // prepared-mode `execute_attention_phase` only replays launches, and on
     // a graph REPLAY it does not run at all. `finish`'s coverage check
@@ -6124,7 +6199,8 @@ void Dispatch::execute_attention_phase(
                         std::min<std::uint32_t>(
                             (pad.kv_max + 255u) / 256u, 65535u);
                     k_hook_attn_score_pad<<<blocks, 256, 0, stream>>>(
-                        pad.folded, pad.folded_indptr, pad.request,
+                        pad.folded, pad.folded_indptr,
+                        impl_->hook_pad_requests + pad.ordinal,
                         pad.row, pad.kv_max);
                     CUDA_CHECK(cudaGetLastError());
                 }
