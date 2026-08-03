@@ -522,6 +522,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/batch/frame.cpp
   src/batch/forward.cpp
   src/batch/persistent_inputs.cpp
+  src/batch/supergraph.cu
   src/batch/planner_calibration.cpp
   src/batch/tp.cpp
   src/batch/workspace.cu
@@ -954,6 +955,7 @@ pie_add_cuda_target(test_page_compact
   SOURCES tests/test_page_compact.cu src/kernels/page_compact.cu
   LIBS CUDA::cudart)
 pie_add_cuda_target(test_brle SOURCES tests/test_brle.cpp src/batch/brle.cpp)
+pie_add_cuda_target(test_supergraph SOURCES tests/test_supergraph.cu src/batch/supergraph.cu)
 # Host oracle: fork geometry -> BRLE decode -> masking == prefix truncation.
 pie_add_cuda_target(test_masked_attention_geometry
   SOURCES tests/masked_attention_geometry_test.cpp src/batch/brle.cpp
