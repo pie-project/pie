@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <cctype>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -212,6 +214,65 @@ inline pie_loader::Node mxfp4_values(ModelContract& out, pie_loader::Node blocks
     return out.scale_per_block(
         out.transmute(blocks, {rows, cols}, pie_loader::quantized(quant)),
         out.out(scales_tensor));
+}
+
+/// The one rule every routed family's mixture is named by.
+///
+/// A routed FFN must arrive with its experts STACKED on axis 0, which is what
+/// `affine_qmv_routed` indexes: one tensor per layer per projection,
+/// expert-major. Two spellings of that exist and both are accepted, because
+/// the two toolchains that produce it disagree -- `mlx_lm` wraps the mixture
+/// in a `SwitchGLU` and emits `mlp.switch_mlp.gate_proj`, the fused HF export
+/// emits `mlp.experts.gate_proj`. They are the same bytes in the same layout.
+///
+/// Two forms are refused rather than skipped, and both for the same reason:
+/// skipping is what silently produces the wrong model.
+///
+///  - The UNSTACKED bank, `mlp.experts.0.gate_proj`, which a stock HF
+///    checkpoint ships. Binding it would need a load-time gather this driver
+///    does not do, and the failure mode of guessing is expert 0's weights used
+///    for all of them -- fluent, and wrong.
+///  - A SHARED expert, a dense SwiGLU every token runs beside the routed ones
+///    under its own sigmoid gate. `qwen2_moe` and Qwen3-Next both ship one and
+///    this driver computes no such thing. Left to a family's pass-through, its
+///    weights are declared, loaded, and then read by no dispatch: the model
+///    runs the routed mixture alone. Nothing catches that -- a bind test asks
+///    whether every slot a dispatch NEEDS was filled, which is the opposite
+///    direction, and a tensor nobody asks for is invisible to it.
+///
+/// Returns the rewritten member when the name is a stacked bank, and
+/// `std::nullopt` when the name is not about a mixture at all -- in which case
+/// the caller's own mapping continues. It never returns for a refusal.
+///
+/// `schema` names the family in the message, because the refusal is what the
+/// user sees and "which driver said no" is the first thing they need.
+inline std::optional<std::string> routed_expert_member(std::string_view raw_name,
+                                                       std::string_view member,
+                                                       std::string_view schema) {
+    constexpr std::string_view kSwitch = "mlp.switch_mlp.";
+    if (member.rfind(kSwitch, 0) == 0) {
+        return "mlp.experts." + std::string(member.substr(kSwitch.size()));
+    }
+    for (std::string_view shared : {"mlp.shared_expert.", "mlp.shared_expert_gate.",
+                                    "mlp.shared_experts."}) {
+        if (member.rfind(shared, 0) == 0) {
+            fail("Metal " + std::string(schema) + " schema has no shared expert, but '" +
+                 std::string(raw_name) +
+                 "' is one: this driver would load it and never read it, running the "
+                 "routed mixture alone");
+        }
+    }
+    constexpr std::string_view kExperts = "mlp.experts.";
+    if (member.rfind(kExperts, 0) == 0) {
+        const std::string_view rest = member.substr(kExperts.size());
+        if (!rest.empty() && std::isdigit(static_cast<unsigned char>(rest.front())) != 0) {
+            fail("Metal " + std::string(schema) +
+                 " schema needs the routed experts stacked on axis 0 "
+                 "(one `mlp.experts.gate_proj` per layer, expert-major), but '" +
+                 std::string(raw_name) + "' is per-expert");
+        }
+    }
+    return std::nullopt;
 }
 
 }  // namespace contract_detail

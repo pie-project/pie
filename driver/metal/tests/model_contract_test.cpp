@@ -251,9 +251,39 @@ void test_every_name_is_mapped_or_refused() {
         }
         return false;
     };
+    // The mixture. `mlx_lm` wraps a routed FFN in a `SwitchGLU`, so a
+    // Qwen3-Next MoE checkpoint spells its stacked banks `mlp.switch_mlp.*`;
+    // the driver's dispatches read `mlp.experts.*`. Until the family learned
+    // this, the pass-through mapped `switch_mlp` onto itself: every expert was
+    // declared, loaded into the heap, and read by nothing, and the router --
+    // whose `mlp.gate` DID map -- routed tokens to weights the driver never
+    // bound. Note that `mlp.gate` is asserted above and `mlp.gate_proj` is a
+    // different tensor; the two differ by a suffix and one is a router.
+    mapped("model.language_model.layers.3.mlp.switch_mlp.gate_proj.weight",
+           "layers.3.mlp.experts.gate_proj.weight");
+    mapped("model.language_model.layers.3.mlp.switch_mlp.down_proj.scales",
+           "layers.3.mlp.experts.down_proj.scales");
+    // And the fused export's spelling is already the driver's, so it passes
+    // through unchanged rather than being rewritten twice.
+    mapped("model.language_model.layers.3.mlp.experts.up_proj.weight",
+           "layers.3.mlp.experts.up_proj.weight");
+
     check(refused("model.embed_tokens.weight"), "an unmapped name is an error, not a pass-through");
     check(refused("model.language_model.layers.x.weight"), "a non-numeric layer index is an error");
     check(refused("model.language_model.layers.7"), "a layer tensor with no suffix is an error");
+    // Two mixtures this driver cannot run, refused at load with the tensor's
+    // name on them rather than loaded and ignored. A stock HF checkpoint ships
+    // the experts unstacked, and binding those would need a load-time gather
+    // this driver does not do -- guessing gives every token expert 0, which is
+    // fluent. Qwen3-Next also ships a SHARED expert beside the routed mixture,
+    // and nothing in this driver computes one; skipping it runs the routed
+    // mixture alone, which is also fluent. Both were passing through before.
+    check(refused("model.language_model.layers.3.mlp.experts.0.gate_proj.weight"),
+          "an unstacked expert bank is refused, not silently bound to expert 0");
+    check(refused("model.language_model.layers.3.mlp.shared_expert.gate_proj.weight"),
+          "a shared expert is refused, not loaded and never read");
+    check(refused("model.language_model.layers.3.mlp.shared_expert_gate.weight"),
+          "the shared expert's gate is refused with it");
 }
 
 void test_the_schema_owns_its_model_types() {

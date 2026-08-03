@@ -94,7 +94,16 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
         fail("Metal Qwen3.5 layer tensor '" + std::string(raw_name) +
              "' has an invalid layer index");
     }
-    return "layers." + std::string(layer) + "." + std::string(rest.substr(dot + 1));
+    const std::string_view member = rest.substr(dot + 1);
+    // The mixture's naming is the same rule in every routed family, so it is
+    // asked of one place rather than restated here. Until this commit the
+    // pass-through below answered for it, which meant a Qwen3-Next MoE
+    // checkpoint's experts were declared under names no dispatch reads: the
+    // driver loaded a mixture and ran nothing with it.
+    if (auto renamed = routed_expert_member(raw_name, member, "Qwen3.5")) {
+        return "layers." + std::string(layer) + "." + *renamed;
+    }
+    return "layers." + std::string(layer) + "." + std::string(member);
 }
 
 }  // namespace contract_detail

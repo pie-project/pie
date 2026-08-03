@@ -132,57 +132,11 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name,
     }
     const std::string_view member = tail.substr(dot + 1);
 
-    // A routed FFN must arrive with its experts STACKED on axis 0, which is
-    // what `affine_qmv_routed` indexes: one tensor per layer per projection,
-    // expert-major.
-    //
-    // Two spellings of that exist and both are accepted, because the two
-    // toolchains that produce it disagree. `mlx_lm` wraps the mixture in a
-    // `SwitchGLU` and so emits `mlp.switch_mlp.gate_proj`; the fused HF export
-    // emits `mlp.experts.gate_proj`. They are the same bytes in the same
-    // layout, so both map onto the one name `heap_bind.cpp` asks for.
-    //
-    // What is refused is the UNSTACKED form, `mlp.experts.0.gate_proj`, which
-    // is what a stock HF checkpoint ships. Binding it would need a gather at
-    // load time that this driver does not do, and the failure mode of guessing
-    // is expert 0's weights used for all of them -- fluent, and wrong.
-    constexpr std::string_view kSwitch = "mlp.switch_mlp.";
-    if (member.rfind(kSwitch, 0) == 0) {
-        return "layers." + std::string(layer) + ".mlp.experts." +
-               std::string(member.substr(kSwitch.size()));
-    }
-    // A SHARED expert is a dense SwiGLU every token runs beside the routed
-    // ones, scaled by its own sigmoid gate. `qwen2_moe` ships one and this
-    // driver computes no such thing.
-    //
-    // Left to the pass-through below, its weights were declared under their
-    // own names, loaded into the heap, and then read by no dispatch -- the
-    // model ran the routed mixture alone and produced fluent text that was not
-    // the checkpoint's. Nothing caught it: `llama_bind_test` asks whether every
-    // slot a dispatch NEEDS was filled, which is the opposite direction, and a
-    // tensor nobody asks for is invisible to it.
-    //
-    // Refused rather than skipped, for the same reason the unstacked bank
-    // below is refused: skipping is what silently produced the wrong model.
-    // The refusal comes out at load with the tensor's name on it, and it goes
-    // away when the block exists.
-    for (std::string_view shared : {"mlp.shared_expert.", "mlp.shared_expert_gate.",
-                                    "mlp.shared_experts."}) {
-        if (member.rfind(shared, 0) == 0) {
-            fail("Metal llama schema has no shared expert, but '" + std::string(raw_name) +
-                 "' is one: this driver would load it and never read it, running the "
-                 "routed mixture alone");
-        }
-    }
-
-    constexpr std::string_view kExperts = "mlp.experts.";
-    if (member.rfind(kExperts, 0) == 0) {
-        const std::string_view rest_of = member.substr(kExperts.size());
-        if (!rest_of.empty() && std::isdigit(static_cast<unsigned char>(rest_of.front())) != 0) {
-            fail("Metal llama schema needs the routed experts stacked on axis 0 "
-                 "(one `mlp.experts.gate_proj` per layer, expert-major), but '" +
-                 std::string(raw_name) + "' is per-expert");
-        }
+    // The mixture's naming is the same rule in every routed family, so it is
+    // asked of one place rather than restated here: stacked banks under either
+    // spelling, and a refusal for the unstacked and shared forms.
+    if (auto renamed = routed_expert_member(raw_name, member, "llama")) {
+        return "layers." + std::string(layer) + "." + *renamed;
     }
 
     return "layers." + std::string(layer) + "." + std::string(member);
