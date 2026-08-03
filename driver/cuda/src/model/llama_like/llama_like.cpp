@@ -150,9 +150,13 @@ struct LoraFireState {
     LoraFireState(const LoraTable& table,
                   const HfConfig& cfg,
                   int N, int H, int Hq, int Hk, int I, int T,
-                  cudaStream_t s)
+                  cudaStream_t s,
+                  LoraStageArena& arena)
         : stream(s)
     {
+        // Campaign step 1: every buffer below comes from the per-fire
+        // bump arena — no body-time cudaMallocAsync, nothing to free.
+        arena.reset();
         if (T != 1) {
             // The site widths below (Hq/Hk) are the UNSHARDED projection
             // widths B was traced against; a TP rank holds only its slice.
@@ -234,9 +238,9 @@ struct LoraFireState {
             const std::size_t b_elems = static_cast<std::size_t>(
                 lane.num_layers) * lane.d_out * lane.rank;
             Lane out{&lane, nullptr, nullptr};
-            CUDA_CHECK(cudaMallocAsync(&out.a_bf16, a_elems * 2, stream));
-            CUDA_CHECK(cudaMallocAsync(&out.b_bf16, b_elems * 2, stream));
-            lanes.push_back(out);  // owned from here — freed by ~LoraFireState
+            out.a_bf16 = arena.alloc(a_elems * 2);
+            out.b_bf16 = arena.alloc(b_elems * 2);
+            lanes.push_back(out);
             kernels::launch_cast_fp32_to_bf16(
                 lane.a, out.a_bf16, a_elems, stream);
             kernels::launch_cast_fp32_to_bf16(
@@ -348,11 +352,9 @@ struct LoraFireState {
                                3 * static_cast<std::size_t>(g.nv);
             }
             if (slab_stride > 0) {
-                CUDA_CHECK(cudaMallocAsync(
-                    &ptr_slab,
+                ptr_slab = arena.alloc(
                     static_cast<std::size_t>(cfg.num_hidden_layers) *
-                        slab_stride * sizeof(void*),
-                    stream));
+                    slab_stride * sizeof(void*));
             }
         }
     }
@@ -402,13 +404,9 @@ struct LoraFireState {
     LoraFireState(const LoraFireState&) = delete;
     LoraFireState& operator=(const LoraFireState&) = delete;
 
-    ~LoraFireState() {
-        for (const Lane& lane : lanes) {
-            if (lane.a_bf16 != nullptr) cudaFreeAsync(lane.a_bf16, stream);
-            if (lane.b_bf16 != nullptr) cudaFreeAsync(lane.b_bf16, stream);
-        }
-        if (ptr_slab != nullptr) cudaFreeAsync(ptr_slab, stream);
-    }
+    // Arena-backed (campaign step 1): nothing to free — the next fire's
+    // reset reclaims the space, stream-ordered behind this fire's reads.
+    ~LoraFireState() = default;
 
     // The CORRECTION at layer L (§5.1): `x(W+BA)^T = xW^T + (xA^T)B^T`.
     // Called immediately after the base q/v projections materialize in the
@@ -942,7 +940,8 @@ void llama_like_forward_paged(
     const bool has_lora = lora != nullptr && lora->usable();
     std::optional<LoraFireState> lora_state;
     if (has_lora) {
-        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, T, stream);
+        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, T, stream,
+                           ws.lora_arena);
         // Co-batch evidence, PIE_HOOK_PREFIX_TRACE's pattern: one line per
         // fire proving how many request rows this fire carries (R) and how
         // many of them are adapter lanes with which token spans. R > lanes'
@@ -1795,10 +1794,11 @@ LoraFireStateHandle::LoraFireStateHandle(
     int kv_width,
     int intermediate,
     int tp_size,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    Workspace& ws)
     : impl_(new LoraFireState(
           table, cfg, total_tokens, hidden, q_width, kv_width,
-          intermediate, tp_size, stream)) {}
+          intermediate, tp_size, stream, ws.lora_arena)) {}
 
 LoraFireStateHandle::~LoraFireStateHandle() {
     delete static_cast<LoraFireState*>(impl_);

@@ -257,7 +257,8 @@ public:
         int kv_width,
         int intermediate,
         int tp_size,
-        cudaStream_t stream);
+        cudaStream_t stream,
+        Workspace& ws);
     ~LoraFireStateHandle();
     LoraFireStateHandle(const LoraFireStateHandle&) = delete;
     LoraFireStateHandle& operator=(const LoraFireStateHandle&) = delete;

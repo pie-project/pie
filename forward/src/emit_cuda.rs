@@ -267,7 +267,8 @@ fn emit_class_fn(
         b.line("    std::optional<LoraFireStateHandle> lora_state;");
         b.line("    if (lora != nullptr && lora->usable()) {");
         b.line("        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,");
-        b.line("                           /*tp=*/1, stream);");
+        // (campaign step 1: the staging arena rides on the workspace)
+        b.line("                           /*tp=*/1, stream, ws);");
         b.line("    }");
         b.line("");
     }

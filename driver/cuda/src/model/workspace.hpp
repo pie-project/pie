@@ -7,6 +7,7 @@
 // wire-driven `llama_like` forward and removed.
 
 #include <cstdint>
+#include <vector>
 
 #include "device_buffer.hpp"
 #include "model/loaded_model.hpp"
@@ -27,6 +28,35 @@ constexpr int workspace_logits_rows(
 // Reusable scratch buffers, sized once for `max_tokens`. The forward pass
 // only writes prefixes of these, so reusing across calls is safe as long as
 // you don't exceed `max_tokens`.
+// The lora staging arena (lora-graph campaign step 1, north-star-dsl.md):
+// per-fire BUMP allocations for the adapter cast buffers and the grouped
+// pointer slab, replacing per-fire cudaMallocAsync — a captured lora fire
+// must allocate nothing at body time. Stream-safety of the per-fire
+// reset/reuse: every write into the arena is stream-ordered (cast
+// kernels, async uploads), so reuse is ordered behind the previous
+// fire's reads. Growth keeps the old block alive in `retired` — an
+// in-flight fire may still read it — and frees at destruction.
+struct LoraStageArena {
+    DeviceBuffer<std::uint8_t> buf;
+    std::size_t used = 0;
+    std::vector<DeviceBuffer<std::uint8_t>> retired;
+
+    void reset() { used = 0; }
+
+    void* alloc(std::size_t bytes) {
+        constexpr std::size_t kAlign = 256;
+        const std::size_t at = (used + kAlign - 1) / kAlign * kAlign;
+        if (at + bytes > buf.size()) {
+            std::size_t want = (at + bytes) * 2;
+            if (want < 1 << 20) want = 1 << 20;
+            if (buf.size() > 0) retired.push_back(std::move(buf));
+            buf = DeviceBuffer<std::uint8_t>::alloc(want);
+        }
+        used = at + bytes;
+        return buf.data() + at;
+    }
+};
+
 struct Workspace {
     // Stage-2 MTP: extra rows reserved at the TAIL of `logits` (beyond the
     // `max_tokens` target rows) to hold the K native MTP draft-logit rows
@@ -65,6 +95,9 @@ struct Workspace {
     // works at {64, 128, 256, 512}, so we round up to 128). Empty
     // (numel()==0) for every other model — the forward graph aliases
     // the packed buffers directly.
+    // Lora staging (per fire, bump-allocated; see LoraStageArena above).
+    LoraStageArena lora_arena;
+
     DeviceTensor q_padded;        // [max_tokens, h_q  * head_dim_kernel]
     DeviceTensor k_padded;        // [max_tokens, h_kv * head_dim_kernel]
     DeviceTensor v_padded;        // [max_tokens, h_kv * head_dim_kernel]
