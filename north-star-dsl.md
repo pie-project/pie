@@ -471,3 +471,15 @@ Reading, honestly bounded:
   (many small fires, large N with short legs) is measured.
 - What this DOES retire: the standing worry that the interpreter walk
   taxes the hot path. In release, on this hardware, it doesn't.
+
+Follow-up (same day): the "workload where host walk shows up" was then
+built and measured — `walk_stress_perf.py`, single-lane 256-step decode
+(kernel-minimal fires, host-walk fraction maximal) and 16-lane 64-step
+co-batch, 3 reps per leg, same release build. Single-lane steps/s:
+OFF 210–218, ON 209–217, GEN 214–230 — rep ranges overlap; 16-lane
+scatter 137–182 across all legs, no leg trend. So even at the walk-
+heaviest point this engine reaches, the interpreter tax is unmeasurable
+and the generated form buys no wall-clock. The perf claim ledger
+closes: supergraph value on this hardware/scale is structural, and the
+stage-2 wave-count argument (fewer FIRES via co-batching, not cheaper
+walks) remains the only measured throughput stake.
