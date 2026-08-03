@@ -64,22 +64,63 @@ pub use pie_dsl::{
 // A stage trace interns channels and yields dense channel ids keyed by the
 // dsl channel's gid; `forward-pass.program` wants the WIT handles in that dense
 // order. Every channel the author can reference is created via `Channel::new`/
-// `from`/`seeded`, so registering (gid -> Rc<wit_channel::Channel>) at construction
-// lets a forward pass resolve each `Traced.channel_order` entry. Inferlets are
-// single-threaded (wasm), so a thread-local registry is sound.
+// `from`/`seeded`, so keying the WIT side by gid lets a forward pass resolve
+// each `Traced.channel_order` entry. Inferlets are single-threaded (wasm), so
+// thread-local registries are sound.
+//
+// The WIT resource is created on FIRST USE, not at declaration, because its
+// capacity is a constructor argument: `Channel::new(..).capacity(n)` would
+// otherwise have to throw away the resource it just made -- which is exactly
+// what it used to do, wasting one host channel per call and silently dropping
+// the staged seed of a `Channel::from(v).capacity(n)`.
 
 thread_local! {
     static WIT_CHANNELS: RefCell<HashMap<u64, Rc<wit_channel::Channel>>> = RefCell::new(HashMap::new());
+    static DECLARED: RefCell<HashMap<u64, ChannelSpec>> = RefCell::new(HashMap::new());
 }
 
-fn register_channel(gid: u64, wit: Rc<wit_channel::Channel>) {
-    WIT_CHANNELS.with(|m| {
-        m.borrow_mut().insert(gid, wit);
+#[derive(Clone)]
+struct ChannelSpec {
+    dims: Vec<u32>,
+    dtype: WitDtype,
+    capacity: u32,
+}
+
+fn declare_channel(gid: u64, spec: ChannelSpec) {
+    DECLARED.with(|m| {
+        m.borrow_mut().insert(gid, spec);
     });
 }
 
+/// Whether `gid`'s WIT resource exists yet. A declared-but-unused channel has
+/// none, which is what makes its capacity still editable.
+fn channel_exists(gid: u64) -> bool {
+    WIT_CHANNELS.with(|m| m.borrow().contains_key(&gid))
+}
+
+fn set_declared_capacity(gid: u64, capacity: u32) {
+    DECLARED.with(|m| {
+        if let Some(spec) = m.borrow_mut().get_mut(&gid) {
+            spec.capacity = capacity;
+        }
+    });
+}
+
+/// The WIT handle for `gid`, creating it from the declaration on first ask.
 fn lookup_channel(gid: u64) -> Option<Rc<wit_channel::Channel>> {
-    WIT_CHANNELS.with(|m| m.borrow().get(&gid).cloned())
+    if let Some(wit) = WIT_CHANNELS.with(|m| m.borrow().get(&gid).cloned()) {
+        return Some(wit);
+    }
+    let spec = DECLARED.with(|m| m.borrow().get(&gid).cloned())?;
+    let wit = Rc::new(wit_channel::Channel::new(
+        &spec.dims,
+        spec.dtype,
+        spec.capacity,
+    ));
+    WIT_CHANNELS.with(|m| {
+        m.borrow_mut().insert(gid, Rc::clone(&wit));
+    });
+    Some(wit)
 }
 
 fn to_wit_dtype(d: DType) -> WitDtype {
@@ -170,7 +211,7 @@ pub fn unpad_tokens(window: &[i32]) -> Vec<u32> {
 impl Channel {
     /// `Channel::new([shape], dtype)` at capacity 1 (overview §1).
     pub fn new(shape: impl IntoShape, dtype: DType) -> Channel {
-        Channel::build(shape.into_shape(), dtype, 1, false)
+        Channel::build(shape.into_shape(), dtype, false)
     }
 
     /// An initially empty channel whose producer is the host.
@@ -179,7 +220,7 @@ impl Channel {
     /// the first value is available, so a consuming pass may be submitted
     /// run-ahead and receive the value later.
     pub fn writer(shape: impl IntoShape, dtype: DType) -> Channel {
-        let channel = Channel::build(shape.into_shape(), dtype, 1, false);
+        let channel = Channel::build(shape.into_shape(), dtype, false);
         channel.dsl().note_host_put();
         channel
     }
@@ -196,14 +237,17 @@ impl Channel {
     }
 
     /// Widen the ring to `n` cells (deeper run-ahead).
+    ///
+    /// The WIT resource takes its capacity at construction, so this must come
+    /// before the channel is first used -- which for a seeded channel means
+    /// before the seed, since staging it is a use.
     pub fn capacity(self, n: u32) -> Channel {
-        let dsl = self.dsl().capacity(n);
-        let wit = Rc::new(wit_channel::Channel::new(
-            &dims_of(self.shape),
-            to_wit_dtype(self.dtype),
-            n,
-        ));
-        register_channel(dsl.gid(), wit);
+        assert!(
+            !channel_exists(self.gid),
+            "capacity must be set before the channel is used"
+        );
+        self.dsl().capacity(n);
+        set_declared_capacity(self.gid, n);
         self
     }
 
@@ -218,7 +262,7 @@ impl Channel {
     /// channel as a pre-submit `put`, never the container.
     pub fn from(v: impl IntoConst) -> Channel {
         let data: ConstData = v.into_const();
-        let ch = Channel::build(data.shape, data.dtype, 1, true);
+        let ch = Channel::build(data.shape, data.dtype, true);
         ch.wit()
             .put(&data.bytes)
             .expect("stage seed on a fresh channel");
@@ -228,7 +272,7 @@ impl Channel {
     /// A seeded channel of a given shape whose seed value is supplied at
     /// instantiation (device loop-carried multi-dim channels, D2).
     pub fn seeded(shape: impl IntoShape, dtype: DType) -> Channel {
-        Channel::build(shape.into_shape(), dtype, 1, true)
+        Channel::build(shape.into_shape(), dtype, true)
     }
 
     /// `Channel::from_shaped([shape], v)` — like [`from`], but reinterprets the
@@ -244,31 +288,28 @@ impl Channel {
             data.shape.numel(),
             "from_shaped: element count mismatch"
         );
-        let ch = Channel::build(shape, data.dtype, 1, true);
+        let ch = Channel::build(shape, data.dtype, true);
         ch.wit()
             .put(&data.bytes)
             .expect("stage seed on a fresh channel");
         ch
     }
 
-    fn build(shape: Shape, dtype: DType, capacity: u32, seeded: bool) -> Channel {
+    fn build(shape: Shape, dtype: DType, seeded: bool) -> Channel {
         let dsl = if seeded {
             DslChannel::seeded(shape, dtype)
         } else {
             DslChannel::new(shape, dtype)
         };
-        let dsl = if capacity != 1 {
-            dsl.capacity(capacity)
-        } else {
-            dsl
-        };
-        let wit = Rc::new(wit_channel::Channel::new(
-            &dims_of(shape),
-            to_wit_dtype(dtype),
-            capacity,
-        ));
         let gid = dsl.gid();
-        register_channel(gid, wit);
+        declare_channel(
+            gid,
+            ChannelSpec {
+                dims: dims_of(shape),
+                dtype: to_wit_dtype(dtype),
+                capacity: 1,
+            },
+        );
         Channel { gid, shape, dtype }
     }
 
