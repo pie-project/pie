@@ -618,3 +618,17 @@ Live: OFF vs ON byte-identical short+long, 53 declared fires. Goldens
 pin semantic + lowered forms (xqa0/dfp0/rt1/fpp1). NEXT: the generated
 inc (emitter AddBias arm + plan-less prefill fallback emission +
 qwen2_5_1_5b write_inc + digest dispatch + GEN parity).
+
+Generated leg, same day (`a4fffd177`): the emitter's AddBias arm
+resolves buffer/width at emission (168 constant-layer launches), and
+the force-prefill decode class emits the PLAN-LESS prefill launcher
+directly — the static form makes at emission the choice the
+interpreter defers to a runtime null-check, which is rung 3's whole
+argument in one arm. qwen2_5_1_5b.inc (11.2k lines) joined the digest
+table and the facts guess matched live on first boot (no fifth catch).
+Live: OFF == GEN byte-identical short+long; the holed battery passes
+through the generated custom-mask arm WITH biases (solo == mixed 6/6,
+composed and three-prefill masked fires); qwen3 GEN sanity unchanged;
+existing incs regenerate byte-identical. THREE llama deployments now
+run generated at full width (qwen3_0_6b, olmo2_1b, qwen2_5_1_5b) plus
+the qwen3_5 hybrid — four static forms, one digest mechanism.
