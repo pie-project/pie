@@ -28,6 +28,7 @@
 #include "model/llama/encode.hpp"
 #include "model/llama/scratch.hpp"
 #include "batch/simple_family.hpp"
+#include "model/qwen3_5/decode_dispatch_mb.hpp"
 
 using pie::metal::llama::Dispatch;
 using pie::metal::llama::Kind;
@@ -662,6 +663,51 @@ void check_streaming_covers_both_ffn_shapes() {
            "and nothing streams unless the config asks");
 }
 
+/// Why the tiled attention has to be told N.
+///
+/// `sdpa_paged_decode` gets a grid exactly N threadgroups tall, so a row index
+/// that exists is a row that exists. `sdpa_paged_tiled` gets a grid of WHOLE
+/// query tiles, which is taller than N whenever N is not a multiple of the
+/// tile -- and the rows in the overhang would otherwise load a query and store
+/// an attention output past the end of both.
+///
+/// The numerics test cannot see that: a write past a value's extent is not a
+/// number it reads back. So the reason is pinned here instead, as the shape it
+/// actually is -- a grid that covers more rows than the fire has, and a bound
+/// slot that says how many the fire has.
+void check_the_tiled_attention_is_told_its_row_count() {
+    using pie::metal::Grid;
+    using pie::metal::Threadgroup;
+    using pie::metal::kSdpaQueryTile;
+    using pie::metal::sdpa_should_tile;
+    using pie::metal::llama::launch_shape;
+
+    expect(!sdpa_should_tile(1), "a decode does not tile: one row cannot fill one");
+    expect(!sdpa_should_tile(kSdpaQueryTile - 1), "nor does a fire one row short of a tile");
+    expect(sdpa_should_tile(kSdpaQueryTile), "a fire that fills a tile does");
+
+    LlamaGeometry g = base();
+    g.paged_kv_enabled = true;
+    const auto dag = build_llama_dag(g, true);
+    for (const int rows : {kSdpaQueryTile, kSdpaQueryTile + 1, 3 * kSdpaQueryTile - 1}) {
+        for (const auto& d : dag) {
+            if (d.kind != Kind::Sdpa) continue;
+            Grid grid{};
+            Threadgroup tg{};
+            launch_shape(d, g, grid, tg, rows, rows);
+            const long long covered = static_cast<long long>(grid.y) * kSdpaQueryTile;
+            expect(covered >= rows,
+                   "the tiled grid covers every row of the fire at " + std::to_string(rows));
+            if (rows % kSdpaQueryTile != 0) {
+                expect(covered > rows,
+                       "and overhangs it when the rows do not fill whole tiles at " +
+                           std::to_string(rows));
+            }
+            break;
+        }
+    }
+}
+
 int main() {
     std::printf("llama_decode_step_test — one family, four configurations\n");
 
@@ -722,6 +768,7 @@ int main() {
 
     check_refusals();
     check_streaming_covers_both_ffn_shapes();
+    check_the_tiled_attention_is_told_its_row_count();
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -47,6 +47,8 @@ using pie::metal::qmm_t_dispatch;
 using pie::metal::rms_mb_dispatch;
 using pie::metal::rope_mb_dispatch;
 using pie::metal::sdpa_paged_dispatch;
+using pie::metal::sdpa_paged_tiled_dispatch;
+using pie::metal::sdpa_should_tile;
 
 Kernel shared_kind(Kind k, const LlamaGeometry& g) {
     switch (k) {
@@ -181,7 +183,12 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
     switch (d.kind) {
         // The family's own PSOs: a 128-wide head, and the routed set.
         case Kind::Sdpa:
-            return g.paged_kv_enabled ? ll.sdpa_paged_d128 : ll.sdpa_d128;
+            // Asked with the same row count `launch_shape` uses, because the
+            // two answers must agree: the tiled kernel's grid is N/32 tall and
+            // the per-row kernel's is N, so choosing one here and shaping the
+            // other there launches a thirty-second of the attention.
+            if (!g.paged_kv_enabled) return ll.sdpa_d128;
+            return sdpa_should_tile(R) ? ll.sdpa_paged_tiled_d128 : ll.sdpa_paged_d128;
         // The append follows attention. Both KV kinds must agree on the ABI:
         // the binder writes page tables into slots the ring kernel reads as a
         // head stride, so a mismatch here is a scatter through a pointer made
@@ -442,6 +449,10 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
             // The row axis is `grid.y`, which at R == 1 is the M=1 shape
             // unchanged -- the ring kernel reads y as the query's sequence
             // index and a decode has exactly one.
+            if (sdpa_should_tile(R)) {
+                sdpa_paged_tiled_dispatch(g.n_q_heads, R, grid, tg);
+                return;
+            }
             sdpa_paged_dispatch(g.n_q_heads, R, grid, tg);
             return;
         case Kind::SiluMul:

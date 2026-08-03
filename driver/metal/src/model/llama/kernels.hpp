@@ -55,6 +55,10 @@ struct LlamaPsos {
     /// 128-wide heads, decode and paged.
     Pso sdpa_d128{};
     Pso sdpa_paged_d128{};
+    /// The same paged attention with the query rows tiled -- one row per
+    /// simdgroup, K/V staged per threadgroup. Chosen by row count, not by
+    /// model: see `sdpa_should_tile`.
+    Pso sdpa_paged_tiled_d128{};
     Pso row_gather{};
 
     // Routed FFN. Left invalid on a dense checkpoint -- see `valid()`.
@@ -72,7 +76,8 @@ struct LlamaPsos {
     Pso qmm_routed[3]{};
 
     bool dense_valid() const {
-        return sdpa_d128.valid() && sdpa_paged_d128.valid() && row_gather.valid();
+        return sdpa_d128.valid() && sdpa_paged_d128.valid() &&
+               sdpa_paged_tiled_d128.valid() && row_gather.valid();
     }
     bool moe_valid() const {
         return router_topk.valid() && qmv_routed.valid() &&

@@ -161,6 +161,11 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                     // table last held at that ordinal -- a window nobody asked
                     // for, which truncates attention rather than crashing.
                     bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Window, 0, &count);
+                    // N, for the tiled pipeline's partial last tile. Bound
+                    // whether or not this fire tiles: the bind table is per
+                    // Kind and the pipeline choice is per row count.
+                    bind_const<std::int32_t>(ctx, ord, (std::uint8_t)P::Rows, std::int32_t(R),
+                                             &count);
                     break;
                 }
                 bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Sdpa::GqaFactor, gqa,

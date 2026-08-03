@@ -18,6 +18,7 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     std::vector<Spec> specs = {
         {"sdpa_vector.metal", "sdpa_vector_decode_bfloat16_d_128", &out.sdpa_d128},
         {"sdpa_paged.metal", "sdpa_paged_decode_bfloat16_d_128", &out.sdpa_paged_d128},
+        {"sdpa_paged.metal", "sdpa_paged_tiled_bfloat16_d_128", &out.sdpa_paged_tiled_d128},
         {"row_gather.metal", "row_gather_bfloat16", &out.row_gather},
     };
     // Only for a routed checkpoint. A dense one never dispatches these, and

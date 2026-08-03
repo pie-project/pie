@@ -1575,6 +1575,48 @@ int main() {
     run_case("llama-3 (dense, 2 requests x 8 rows: the GEMM)", base_geometry(), *ctx,
              kernels_dir, 0.12f, /*rows=*/16, /*paged=*/true, /*steps=*/0, /*requests=*/2);
 
+    // ── the tiled attention ──
+    //
+    // At 32 rows or more the paged attention stops giving a query row a whole
+    // threadgroup and gives it a simdgroup, so that thirty-two rows can share
+    // one staged block of K/V. Everything above runs under 32 rows and so had
+    // never launched it at all.
+    //
+    // Forty rows over two requests, deliberately: the request boundary falls
+    // INSIDE the first tile, which is the case the kernel handles by walking
+    // the runs of equal `req_of_token` rather than assuming a tile is one
+    // request. Assuming it fails here and nowhere else.
+    //
+    // The tile's OTHER edge -- the phantom rows of the rounded-up grid, which
+    // the kernel retires by reading N -- is not checked here and cannot be.
+    // Deleting that guard makes those rows write past the attention output's
+    // extent, and a write past an extent is not a number this test can read;
+    // every row count tried passes with the guard removed. What pins it is a
+    // shape assertion in llama_decode_step_test: the tiled grid is taller than
+    // N, so the kernel must be told N.
+    //
+    // Forty and not the more obvious thirty-three: dense fires of 35, 36 and
+    // 37 rows over two requests diverge from the reference by up to 0.2373
+    // while 34, 38 and 40 sit at 0.0926, with the tiled attention on or off
+    // and at one request all of them are 0.0926. That is a real defect in the
+    // multi-request path at those row counts and it is not this kernel's --
+    // building the attention's own case on top of it would only hide both.
+    run_case("llama-3 (dense, 40 rows over 2 requests: the tiled attention)", base_geometry(),
+             *ctx, kernels_dir, 0.12f, /*rows=*/40, /*paged=*/true, /*steps=*/0,
+             /*requests=*/2);
+    // Dense, and only dense. The routed model already meets the tiled
+    // attention in the 48-row batched-mixture case above, which is paged and
+    // well past the tile; running a routed model over two requests as well
+    // adds no attention coverage and does add the one thing this harness
+    // cannot check. `route_skips` compares the device's expert selection
+    // against the reference's for the LAST layer, because `expert_ids` is one
+    // colored value that every layer overwrites -- so a row whose router ties
+    // at an EARLIER layer is compared as though it had routed the same way,
+    // and fails. It is a property of the row count, not of the driver: two
+    // requests routed pass at 34 and 36 rows and fail at 38, 40, 44 and 48, at
+    // different rows and different layers each time, the last of them by
+    // 0.1207 against a tolerance of 0.12.
+
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

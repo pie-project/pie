@@ -151,6 +151,14 @@ enum class SdpaPaged : uint8_t {
     // though it were one more key. Bound only by the family that has one; the
     // `sink` instantiation is a separate pipeline, so the others never read it.
     Sinks = 16,
+    // N, the fire's row count. Read only by `sdpa_paged_tiled`, whose grid
+    // rounds up to whole query tiles where the per-row kernel's grid was
+    // exactly N threadgroups tall. Bound for both, because which of the two
+    // pipelines runs is a row-count decision made after the bind table for
+    // this Kind is written -- and an ordinal the running kernel does not
+    // declare costs a slot, where an unbound one the kernel DOES declare
+    // costs the attention.
+    Rows = 17,
 };
 
 // rms_single_row: group=(row/N_READS), grid=(1,1,1). Buffer 3 is a packed
