@@ -175,13 +175,7 @@ void record_slot(cudaStream_t stream) {
 
 }  // namespace tp_runahead
 
-bool tp_device_compose_disabled() {
-    static const bool off = [] {
-        const char* v = std::getenv("PIE_TP_DISABLE_DEVICE_COMPOSE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return off;
-}
+constexpr bool tp_device_compose_disabled() { return false; }
 
 MtpDraftPlan preflight_mtp_draft_logits(
     BatchEngine& engine,
@@ -2038,7 +2032,6 @@ void prepare_step(
     // already covers this one — mark the hook skippable.
     if (previous != nullptr) {
         s.skip_plan = plan_inputs_identical(s, *previous->impl());
-        if (std::getenv("PIE_DISABLE_SKIP_PLAN")) s.skip_plan = false;
     }
 
     if (dbg_fire) s.timing.prepare_end = fire_timing::Clock::now();
@@ -2059,21 +2052,8 @@ struct EnqProfile {
     // rotation) that swamp the per-step averages and made `enq.attn_plan`
     // read as a 2.5ms steady cost when its steady value is ~2us.
     std::uint64_t steps = 0;
-    static std::uint64_t warmup() {
-        static const std::uint64_t n = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE_WARMUP");
-            return (v != nullptr && v[0] != '\0')
-                ? std::strtoull(v, nullptr, 10) : 32ull;
-        }();
-        return n;
-    }
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
+    static constexpr std::uint64_t warmup() { return 32ull; }
+    static constexpr bool enabled() { return false; }
     static EnqProfile& instance() { static EnqProfile p; return p; }
     ~EnqProfile() {
         if (!enabled()) return;
@@ -2404,8 +2384,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         std::cerr.flush();
     }
     auto dump_rs = [&](const char* tag) {
-        if (!std::getenv("PIE_RS_TRACE") || engine.rs_cache == nullptr ||
-            !s.use_slots || s.R < 1) return;
+        return;
         const int slot = static_cast<int>(s.rs_slot_view[0]);
         std::uint32_t rw[4] = {0, 0, 0, 0}, cw[4] = {0, 0, 0, 0};
         cudaMemcpy(rw, engine.rs_cache->recurrent_state_raw(0, slot),

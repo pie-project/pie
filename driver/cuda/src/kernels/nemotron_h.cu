@@ -639,10 +639,7 @@ void launch_nemotron_mamba_ssm_batched_bf16(
 {
     if (R <= 0 || num_heads <= 0 || head_dim <= 0 || state_size <= 0) return;
     constexpr int BLOCK = 256;
-    const bool force_reg_kernel =
-        std::getenv("PIE_NEMOTRON_FORCE_PREFILL_REG_SSM") != nullptr;
-    if ((sequence_prefill || force_reg_kernel) &&
-        std::getenv("PIE_NEMOTRON_DISABLE_PREFILL_REG_SSM") == nullptr) {
+    if (sequence_prefill) {
         constexpr int PREFILL_BLOCK = 512;
         const int num_warps = PREFILL_BLOCK / 32;
         dim3 grid(R, num_heads, (head_dim + num_warps - 1) / num_warps);
@@ -664,8 +661,7 @@ void launch_nemotron_mamba_ssm_batched_bf16(
             conv_dim, intermediate, time_step_min);
         return;
     }
-    if (!sequence_prefill &&
-        std::getenv("PIE_NEMOTRON_DECODE_TILE4_SSM") != nullptr) {
+    if constexpr (false) {
         constexpr int DECODE_TILE_BLOCK = 128;
         const int num_warps = DECODE_TILE_BLOCK / 32;
         dim3 grid(R, num_heads, (head_dim + num_warps - 1) / num_warps);
@@ -688,9 +684,7 @@ void launch_nemotron_mamba_ssm_batched_bf16(
         return;
     }
     dim3 grid(R, num_heads);
-    static const bool use_warp_kernel =
-        std::getenv("PIE_NEMOTRON_DISABLE_WARP_SSM") == nullptr;
-    if (use_warp_kernel) {
+    {
         const std::size_t shared =
             2ull * static_cast<std::size_t>(state_size) * sizeof(float);
         mamba_ssm_batched_warp_kernel<<<grid, BLOCK, shared, stream>>>(
