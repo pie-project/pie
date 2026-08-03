@@ -46,9 +46,6 @@ struct DecodeGeometry {
     /// actually ships that way, which is why it is not optional in practice.
     int shared_intermediate = 0;
 
-    int q_group = 64;
-    int q_bits = 4;
-
     int max_tokens = 1;
     int max_requests = 1;
     int max_slots = 1;

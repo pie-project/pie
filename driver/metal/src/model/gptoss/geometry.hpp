@@ -67,10 +67,7 @@ struct GptOssGeometry {
     float swiglu_limit = 7.0f;
     float swiglu_alpha = 1.702f;
 
-    int q_group = 64;
-    int q_bits = 4;
-
-    /// The router's quantization width, which is NOT `q_bits`: `mlx_lm`'s
+    /// The router's quantization width, which is NOT the bank's: `mlx_lm`'s
     /// quantization predicate leaves a 32 x 2880 router at 8 bits while
     /// everything around it goes to 4, but a checkpoint quantized uniformly
     /// ships a 4-bit one. Nothing in `config.json` says which, so this is

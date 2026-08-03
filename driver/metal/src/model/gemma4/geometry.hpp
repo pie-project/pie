@@ -61,9 +61,6 @@ struct Gemma4Geometry {
     /// `out = cap * tanh(logits / cap)`; 0 disables.
     float final_softcap = 30.0f;
 
-    int q_group = 64;
-    int q_bits = 4;
-
     /// Tokens the KV cache is sized for. The SDPA and append strides are read
     /// off it ([n_kv_heads, kv_max_ctx, head_dim]), so it has no useful default:
     /// a stride guessed here is silently wrong attention.

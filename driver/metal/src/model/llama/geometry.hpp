@@ -84,9 +84,6 @@ struct LlamaGeometry {
     int experts_per_token = 0;
     int moe_intermediate = 0;
 
-    int q_group = 64;
-    int q_bits = 4;
-
     /// Tokens the KV cache is sized for. The append and attention strides are
     /// read off it, so there is no useful default: a stride guessed here is
     /// silently wrong attention.
