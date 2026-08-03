@@ -25,11 +25,15 @@
 #include <vector>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
 
 #include "heap_layout.hpp"
+#include "transcode.hpp"
 #include "decode_step.hpp"     // beta: Dispatch{kind,ordinal,layer,grid,tg} + build_decode_dag
 #include "mtl4_context.hpp"
 #include "pie_loader/checkpoint_source.hpp"
@@ -75,16 +79,108 @@ std::uint64_t extent_bytes(
     return pie_loader::extent_bytes(extent, "metal load executor");
 }
 
+/// Walk a strided source extent, calling `band(src_offset, bytes)` on each run
+/// of contiguous bytes, in destination order.
+///
+/// A strided read is how a contract selects part of a source: gpt-oss fuses its
+/// gate and up projections into alternating rows of one tensor, and splitting
+/// them is a stride over the row axis. The selected bytes are compact once
+/// selected -- the destination is the tensor they become -- so the walk only
+/// has to enumerate the source's runs, and the ranks of the two extents need
+/// not agree.
+void walk_source_bands(
+    const pie_loader::PieLoaderStridedExtentView& src,
+    const std::function<void(std::uint64_t, std::uint64_t)>& band) {
+    const std::size_t rank = src.dims.len;
+    if (rank == 0) {
+        band(0, src.element_bytes);
+        return;
+    }
+    // The longest contiguous suffix moves as one memcpy.
+    std::size_t split = rank;
+    std::int64_t run = src.element_bytes;
+    while (split > 0 && src.dims.ptr[split - 1].src_stride == run) {
+        run *= src.dims.ptr[split - 1].count;
+        --split;
+    }
+    const auto bytes = static_cast<std::uint64_t>(run);
+    if (split == 0) {
+        band(0, bytes);
+        return;
+    }
+    std::vector<std::int64_t> index(split, 0);
+    for (;;) {
+        std::uint64_t at = 0;
+        for (std::size_t i = 0; i < split; ++i) {
+            at += static_cast<std::uint64_t>(index[i] * src.dims.ptr[i].src_stride);
+        }
+        band(at, bytes);
+        std::size_t axis = split;
+        for (;;) {
+            if (axis == 0) return;
+            --axis;
+            if (++index[axis] < src.dims.ptr[axis].count) break;
+            index[axis] = 0;
+        }
+    }
+}
+
 void copy_extent(
     const pie_loader::CheckpointSource& source,
     const pie_loader::PieLoaderSourceExtentView& src,
     const pie_loader::PieLoaderDestExtentView& dst,
     const SlotHandle& target,
     std::uint64_t max_tile_bytes) {
-    if (!pie_loader::compact_extent(src.stride) ||
-        !pie_loader::compact_extent(dst.stride)) {
+    if (!pie_loader::compact_extent(src.stride)) {
+        // A strided source is a selection, not a failure: copy it band by band.
+        if (!pie_loader::compact_extent(dst.stride)) {
+            throw std::runtime_error(
+                "metal storage executor: a strided selection must land compactly");
+        }
+        auto* out = static_cast<std::uint8_t*>(target.contents());
+        std::uint64_t at = dst.offset + dst.stride.base_offset;
+        const std::uint64_t limit = at + extent_bytes(dst.stride);
+        if (limit > target.size) {
+            throw std::runtime_error(
+                "metal storage executor: strided destination is out of bounds");
+        }
+        // Collected rather than copied one at a time: the runs are small and
+        // there are millions of them, so what matters is that the mapping is
+        // released once for all of them and that the copies can go wide.
+        struct Band {
+            std::uint64_t from, to, bytes;
+        };
+        std::vector<Band> bands;
+        std::uint64_t footprint = 0;
+        walk_source_bands(src.stride, [&](std::uint64_t from, std::uint64_t bytes) {
+            if (at + bytes > limit) {
+                throw std::runtime_error(
+                    "metal storage executor: strided selection overruns its tensor");
+            }
+            bands.push_back(Band{from, at, bytes});
+            footprint = std::max(footprint, from + bytes);
+            at += bytes;
+        });
+        source.with_mapped_span(
+            src.file_id, src.file_offset + src.stride.base_offset, footprint,
+            [&](const std::uint8_t* base) {
+                transcode::parallel_ranges(
+                    static_cast<std::int64_t>(bands.size()),
+                    [&](std::int64_t begin, std::int64_t end) {
+                        for (std::int64_t i = begin; i < end; ++i) {
+                            const Band& band = bands[static_cast<std::size_t>(i)];
+                            std::memcpy(
+                                out + band.to, base + band.from,
+                                static_cast<std::size_t>(band.bytes));
+                        }
+                    });
+            });
+        (void)max_tile_bytes;
+        return;
+    }
+    if (!pie_loader::compact_extent(dst.stride)) {
         throw std::runtime_error(
-            "metal storage executor: non-compact ExtentWrite is unsupported");
+            "metal storage executor: non-compact ExtentWrite destination is unsupported");
     }
     const std::uint64_t bytes = extent_bytes(dst.stride);
     if (bytes != src.span_bytes) {
@@ -104,6 +200,323 @@ void copy_extent(
         max_tile_bytes);
 }
 
+
+/// Where a load's wall clock went, printed when `PIE_METAL_LOAD_TRACE` is set.
+///
+/// Staging a stock gpt-oss checkpoint runs two transforms over twenty billion
+/// weights, and "the load is slow" is not a statement anyone can act on: the
+/// question is always whether the time is in the arithmetic, in the file, or in
+/// the allocator. This answers it without a profiler.
+struct LoadTrace {
+    bool on = std::getenv("PIE_METAL_LOAD_TRACE") != nullptr;
+    double scratch_alloc_ms = 0, scratch_free_ms = 0;
+    double extent_ms = 0, bulk_ms = 0, scale_ms = 0, encode_ms = 0;
+    std::uint64_t scale_out_bytes = 0, encode_in_bytes = 0, scratch_bytes = 0;
+
+    struct Span {
+        LoadTrace& trace;
+        double* into;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~Span() {
+            if (!trace.on) return;
+            *into += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+        }
+    };
+    Span span(double* into) { return Span{*this, into}; }
+
+    void report() const {
+        if (!on) return;
+        std::fprintf(
+            stderr,
+            "[pie-metal] load: bulk %.0f ms  extent %.0f ms  mxfp4-decode %.0f ms (%.1f GB out)"
+            "  affine-encode %.0f ms (%.1f GB in)  scratch alloc %.0f ms / free %.0f ms"
+            " (%.1f GB)\n",
+            bulk_ms, extent_ms, scale_ms, double(scale_out_bytes) / 1e9, encode_ms,
+            double(encode_in_bytes) / 1e9, scratch_alloc_ms, scratch_free_ms,
+            double(scratch_bytes) / 1e9);
+    }
+};
+
+#ifndef PIE_METAL_KERNELS_DIR_DEFAULT
+#define PIE_METAL_KERNELS_DIR_DEFAULT ""
+#endif
+constexpr const char* kKernelsDir = PIE_METAL_KERNELS_DIR_DEFAULT;
+
+/// The two load-time transforms, on the GPU.
+///
+/// Compiled on first use and only then: a checkpoint that needs no transform --
+/// one already converted offline -- should not pay for a shader compile, and a
+/// device that cannot build these kernels should still load that checkpoint.
+/// So a failure here is recorded, not thrown, and the caller falls back to the
+/// host loops that define what these kernels have to compute.
+class TranscodeGpu {
+  public:
+    explicit TranscodeGpu(RawMetalContext& ctx) : ctx_(ctx) {}
+
+    ~TranscodeGpu() {
+        if (params_.valid()) ctx_.release_standalone_buffer(params_);
+        for (int ordinal : {kDequantOrdinal, kEncodeOrdinal}) {
+            ctx_.release_argtable_ordinal(ordinal);
+        }
+    }
+
+    /// Decode `blocks` MXFP4 blocks of `block_size` elements into BF16.
+    bool dequant_mxfp4(
+        const SlotHandle& payload,
+        const SlotHandle& exponents,
+        const SlotHandle& out,
+        std::uint64_t out_offset,
+        std::uint32_t blocks,
+        std::uint32_t block_size) {
+        if (!ready()) return false;
+        const std::uint32_t args[2] = {blocks, block_size};
+        write_params(args, sizeof(args));
+        ctx_.arg_bind_ordinal(kDequantOrdinal, 0, payload);
+        ctx_.arg_bind_ordinal(kDequantOrdinal, 1, exponents);
+        ctx_.arg_bind_ordinal(kDequantOrdinal, 2, out, out_offset);
+        ctx_.arg_bind_ordinal(kDequantOrdinal, 3, params_);
+        return run(dequant_, kDequantOrdinal, blocks);
+    }
+
+    /// Quantize `groups` groups of `group_size` elements to affine U4.
+    bool encode_affine_u4(
+        const SlotHandle& input,
+        std::uint32_t input_element_bytes,
+        const SlotHandle& codes,
+        const SlotHandle& scales,
+        const SlotHandle& biases,
+        std::uint32_t groups,
+        std::uint32_t group_size) {
+        if (!ready()) return false;
+        const Pso pso = input_element_bytes == 2 ? encode_bf16_ : encode_f32_;
+        const std::uint32_t args[2] = {groups, group_size};
+        write_params(args, sizeof(args));
+        ctx_.arg_bind_ordinal(kEncodeOrdinal, 0, input);
+        ctx_.arg_bind_ordinal(kEncodeOrdinal, 1, codes);
+        ctx_.arg_bind_ordinal(kEncodeOrdinal, 2, scales);
+        ctx_.arg_bind_ordinal(kEncodeOrdinal, 3, biases);
+        ctx_.arg_bind_ordinal(kEncodeOrdinal, 4, params_);
+        return run(pso, kEncodeOrdinal, groups);
+    }
+
+  private:
+    // Ordinals the decode DAG does not use. The argument-table space is keyed by
+    // the flat dispatch ordinal, which tops out in the hundreds; these sit far
+    // above it so a load-time table can never be mistaken for a decode one.
+    static constexpr int kDequantOrdinal = 30000;
+    static constexpr int kEncodeOrdinal = 30001;
+
+    bool ready() {
+        if (built_) return dequant_.valid();
+        built_ = true;
+        const char* env = std::getenv("PIE_METAL_KERNELS_DIR");
+        std::string dir = env != nullptr ? std::string(env) : std::string(kKernelsDir);
+        if (dir.empty()) return false;
+        if (dir.back() != '/') dir += '/';
+        const std::string path = dir + "transcode.metal";
+        std::string error;
+        dequant_ = ctx_.compile_precise_pso_from_file(path, "mxfp4_dequant_bf16", &error);
+        encode_bf16_ = ctx_.compile_precise_pso_from_file(path, "affine_encode_u4_bf16", &error);
+        encode_f32_ = ctx_.compile_precise_pso_from_file(path, "affine_encode_u4_f32", &error);
+        params_ = ctx_.create_standalone_buffer(256);
+        if (!dequant_.valid() || !encode_bf16_.valid() || !encode_f32_.valid() ||
+            !params_.valid()) {
+            std::fprintf(
+                stderr, "[pie-metal] load-time transcode kernels unavailable (%s); "
+                        "staging on the host instead\n",
+                error.empty() ? "no compiler error reported" : error.c_str());
+            dequant_ = Pso{};
+            return false;
+        }
+        // The transforms write into the placement heap, which is only made
+        // resident once staging is over. It is idempotent and covers
+        // sub-allocations made after it, so asking early costs nothing.
+        ctx_.make_resident();
+        return true;
+    }
+
+    void write_params(const void* args, std::size_t bytes) {
+        // Safe to overwrite between dispatches: `run_step` waits for the command
+        // buffer it committed before returning.
+        std::memcpy(params_.contents(), args, bytes);
+    }
+
+    bool run(Pso pso, int ordinal, std::uint32_t threads) {
+        if (threads == 0) return true;
+        // Every scratch allocation and release edits the residency set, and a
+        // set that has been edited has to be requested again before the next
+        // command buffer uses it. Asking once per dispatch is the only place
+        // that is true by construction.
+        ctx_.make_resident();
+        // Never wider than the grid: a threadgroup larger than the dispatch is
+        // not a launch this encoder performs.
+        const std::uint32_t width = std::max(
+            1u, std::min({ctx_.pso_max_threads(pso), 256u, threads}));
+        const StepTiming timing = ctx_.run_step([&](StepEncoder& encoder) {
+            encoder.set_pso(pso);
+            encoder.set_argtable_ordinal(ordinal);
+            encoder.dispatch(Grid{threads, 1, 1}, Threadgroup{width, 1, 1});
+        });
+        if (timing.timed_out) {
+            throw std::runtime_error(
+                "metal storage executor: a load-time transform did not complete");
+        }
+        return true;
+    }
+
+    RawMetalContext& ctx_;
+    bool built_ = false;
+    Pso dequant_, encode_bf16_, encode_f32_;
+    SlotHandle params_;
+};
+
+/// Execute one load-time transform.
+///
+/// The Metal heap is Shared storage, so every operand here is a host pointer
+/// into the same memory the GPU will read: a transform is a write, not a
+/// transfer, and needs no command buffer or fence to become visible.
+void run_tile_map(
+    const pie_loader::CheckpointSource& source,
+    const pie_loader::LoadPlanIndex& index,
+    const pie_loader::PieLoaderStorageOp::TileMap_Body& op,
+    std::unordered_map<std::uint32_t, SlotHandle>& buffers,
+    std::uint64_t max_tile_bytes,
+    TranscodeGpu& gpu,
+    LoadTrace& trace) {
+    namespace tc = transcode;
+    const auto slot = [&](std::uint32_t id) -> const SlotHandle& {
+        const auto found = buffers.find(id);
+        if (found == buffers.end()) {
+            throw std::runtime_error(
+                "metal storage executor: TileMap operand buffer is missing");
+        }
+        return found->second;
+    };
+    const auto shape_of = [&](std::uint32_t id) {
+        const auto& decl = index.buffer(id);
+        if (!decl.has_tensor) {
+            throw std::runtime_error(
+                "metal storage executor: TileMap output has no tensor type");
+        }
+        return pie_loader::i64_slice_to_vector(index.tensor(decl.tensor_id).shape);
+    };
+    /// The payload's bytes, either straight off disk or already in a buffer.
+    std::vector<std::uint8_t> staged;
+    const auto payload = [&](std::size_t input_index) -> std::pair<const std::uint8_t*,
+                                                                   std::uint64_t> {
+        if (op.has_source) {
+            if (!pie_loader::compact_extent(op.source.stride)) {
+                throw std::runtime_error(
+                    "metal storage executor: non-compact TileMap source is unsupported");
+            }
+            staged.resize(static_cast<std::size_t>(op.source.span_bytes));
+            source.copy_storage_bytes(
+                op.source.file_id, op.source.file_offset + op.source.stride.base_offset,
+                op.source.span_bytes, staged.data(), max_tile_bytes);
+            return {staged.data(), op.source.span_bytes};
+        }
+        if (op.input_buffers.len <= input_index) {
+            throw std::runtime_error(
+                "metal storage executor: TileMap has neither a source nor an operand");
+        }
+        const SlotHandle& in = slot(op.input_buffers.ptr[input_index]);
+        return {static_cast<const std::uint8_t*>(in.contents()), in.size};
+    };
+
+    switch (op.tile_kind) {
+    case pie_loader::PieLoaderTileMapKind::Scale: {
+        if (op.output_buffers.len != 1 || op.transform_scale_blocks.len == 0) {
+            throw std::runtime_error(
+                "metal storage executor: only per-block Scale is implemented");
+        }
+        if (op.transform_from != pie_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
+            throw std::runtime_error(
+                "metal storage executor: per-block Scale is implemented for MXFP4 only");
+        }
+        // The factor operand is the last input; a fused Scale reads its payload
+        // from the file and an unfused one from the input before it.
+        const SlotHandle& factors = slot(op.input_buffers.ptr[op.input_buffers.len - 1]);
+        const auto [bytes, size] = payload(0);
+        const SlotHandle& out = slot(op.output_buffers.ptr[0]);
+        const std::uint64_t at = op.has_dest ? op.dest.offset + op.dest.stride.base_offset : 0;
+        if (at > out.size) {
+            throw std::runtime_error(
+                "metal storage executor: Scale destination is out of bounds");
+        }
+        trace.scale_out_bytes += out.size - at;
+        const auto _span = trace.span(&trace.scale_ms);
+        const std::uint64_t elements = size * 2;
+        if (factors.size == 0 || elements % factors.size != 0) {
+            throw std::runtime_error(
+                "metal storage executor: MXFP4 blocks do not divide the payload");
+        }
+        // The GPU reads its operands out of the heap, so it can only run when
+        // the payload is already a buffer -- a fused Scale reads the file, and
+        // the host has those bytes and the GPU does not.
+        if (!op.has_source &&
+            gpu.dequant_mxfp4(
+                slot(op.input_buffers.ptr[0]), factors, out, at,
+                static_cast<std::uint32_t>(factors.size),
+                static_cast<std::uint32_t>(elements / factors.size))) {
+            return;
+        }
+        tc::scale_mxfp4_to_bf16(
+            bytes, size, static_cast<const std::uint8_t*>(factors.contents()), factors.size,
+            tc::Region{static_cast<std::uint8_t*>(out.contents()) + at, out.size - at});
+        return;
+    }
+    case pie_loader::PieLoaderTileMapKind::Encode: {
+        if (op.transform_to != pie_loader::PieLoaderQuantScheme::MlxAffineU4) {
+            throw std::runtime_error(
+                "metal storage executor: Encode is implemented for MLX affine U4 only");
+        }
+        if (op.output_buffers.len != 3) {
+            throw std::runtime_error(
+                "metal storage executor: affine Encode wants codes, scales and biases");
+        }
+        const SlotHandle& codes = slot(op.output_buffers.ptr[0]);
+        const SlotHandle& scales = slot(op.output_buffers.ptr[1]);
+        const SlotHandle& biases = slot(op.output_buffers.ptr[2]);
+        const auto shape = shape_of(op.output_buffers.ptr[0]);
+        if (shape.size() != 2) {
+            throw std::runtime_error(
+                "metal storage executor: affine Encode quantizes a matrix");
+        }
+        const auto [bytes, size] = payload(0);
+        const std::uint64_t elements =
+            static_cast<std::uint64_t>(shape[0]) * static_cast<std::uint64_t>(shape[1]);
+        if (elements == 0 || size % elements != 0) {
+            throw std::runtime_error(
+                "metal storage executor: affine Encode operand does not match its shape");
+        }
+        trace.encode_in_bytes += size;
+        const auto _span = trace.span(&trace.encode_ms);
+        const auto element_bytes = static_cast<std::uint32_t>(size / elements);
+        if (shape[1] % tc::kAffineGroup != 0) {
+            throw std::runtime_error(
+                "metal storage executor: affine Encode needs a multiple of 64 columns");
+        }
+        if (!op.has_source &&
+            gpu.encode_affine_u4(
+                slot(op.input_buffers.ptr[0]), element_bytes, codes, scales, biases,
+                static_cast<std::uint32_t>(elements / tc::kAffineGroup),
+                static_cast<std::uint32_t>(tc::kAffineGroup))) {
+            return;
+        }
+        tc::encode_mlx_affine_u4(
+            bytes, element_bytes, shape[0], shape[1],
+            tc::Region{static_cast<std::uint8_t*>(codes.contents()), codes.size},
+            tc::Region{static_cast<std::uint8_t*>(scales.contents()), scales.size},
+            tc::Region{static_cast<std::uint8_t*>(biases.contents()), biases.size});
+        return;
+    }
+    default:
+        throw std::runtime_error(
+            "metal storage executor: compiler emitted an unsupported load-time transform");
+    }
+}
 
 /// One buffer's bytes, located in the checkpoint rather than in the arena.
 struct MappedSource {
@@ -244,6 +657,9 @@ StagedWeights stage_plan_weights(
         }
     }
     std::unordered_map<std::uint32_t, SlotHandle> buffers;
+    // Transform intermediates, kept apart from `buffers` because they are the
+    // only entries this function owns rather than borrows from the heap.
+    std::unordered_map<std::uint32_t, SlotHandle> scratch;
     pie_loader::LoadPlanIndex index("metal load executor");
     index.reset(load_plan);
 
@@ -342,6 +758,63 @@ StagedWeights stage_plan_weights(
                                     load.max_tile_bytes());
         }
     }
+    LoadTrace trace;
+    TranscodeGpu gpu(ctx);
+    // The last step at which each buffer is named, so a scratch allocation can
+    // be returned the moment nothing can read it again.
+    std::unordered_map<std::uint32_t, std::size_t> last_use;
+    std::unordered_map<std::uint32_t, std::uint64_t> pending_scratch;
+    // The schedule reuses a handful of intermediate sizes over and over -- one
+    // per expert half, per layer -- so a freed buffer is nearly always the
+    // right size for the next one. Handing it back instead of asking the
+    // device for fresh pages turns the whole staging run's allocation cost
+    // into a couple of allocations.
+    std::unordered_map<std::uint64_t, std::vector<SlotHandle>> scratch_pool;
+    const auto materialize = [&](std::uint32_t id) {
+        const auto want = pending_scratch.find(id);
+        if (want == pending_scratch.end()) return;
+        trace.scratch_bytes += want->second;
+        const auto _span = trace.span(&trace.scratch_alloc_ms);
+        SlotHandle slot;
+        auto& pool = scratch_pool[want->second];
+        if (!pool.empty()) {
+            slot = pool.back();
+            pool.pop_back();
+        } else {
+            slot = ctx.create_standalone_buffer(want->second);
+        }
+        if (!slot.valid()) {
+            throw std::runtime_error(
+                "metal storage executor: transform scratch allocation failed");
+        }
+        buffers.emplace(id, slot);
+        scratch.emplace(id, slot);
+        pending_scratch.erase(want);
+    };
+    for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
+        const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
+        using Tag = pie_loader::PieLoaderStorageOp::Tag;
+        const auto touch = [&](std::uint32_t id) { last_use[id] = step; };
+        switch (instr.op.tag) {
+        case Tag::Allocate: touch(instr.op.allocate.buffer_id); break;
+        case Tag::ExtentWrite: touch(instr.op.extent_write.dest.buffer_id); break;
+        case Tag::Fill: touch(instr.op.fill.buffer_id); break;
+        case Tag::Finalize: touch(instr.op.finalize.buffer_id); break;
+        case Tag::CreateView:
+            touch(instr.op.create_view.input_buffer);
+            touch(instr.op.create_view.output_buffer);
+            break;
+        case Tag::TileMap: {
+            const auto& op = instr.op.tile_map;
+            for (std::size_t i = 0; i < op.input_buffers.len; ++i) touch(op.input_buffers.ptr[i]);
+            for (std::size_t i = 0; i < op.output_buffers.len; ++i) touch(op.output_buffers.ptr[i]);
+            if (op.has_dest) touch(op.dest.buffer_id);
+            break;
+        }
+        default: break;
+        }
+    }
+
     for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
         const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
         using Tag = pie_loader::PieLoaderStorageOp::Tag;
@@ -349,8 +822,19 @@ StagedWeights stage_plan_weights(
         case Tag::Allocate: {
             const auto& decl = index.buffer(instr.op.allocate.buffer_id);
             if (!decl.has_persistent_offset || decl.temporary) {
-                throw std::runtime_error(
-                    "metal storage executor requires arena-resident buffers");
+                // An intermediate a transform produces and consumes. It is not
+                // part of the arena the plan laid out — the plan deliberately
+                // gave it no offset there — so it comes from its own Shared
+                // allocation and is handed back once the last instruction that
+                // names it has run. Holding them all would cost more than the
+                // model: gpt-oss dequantizes half a gigabyte per expert half.
+                // Deferred: the plan declares every intermediate long before the
+                // step that fills it, so allocating here would hold ten
+                // gigabytes of scratch resident at once — past this device's
+                // working set, which silently drops GPU writes. The bytes are
+                // taken on first use instead.
+                pending_scratch.emplace(decl.id, decl.bytes);
+                break;
             }
             if (compact) {
                 buffers.emplace(decl.id,
@@ -370,11 +854,13 @@ StagedWeights stage_plan_weights(
         }
         case Tag::ExtentWrite: {
             const auto& op = instr.op.extent_write;
+            materialize(op.dest.buffer_id);
             const auto target = buffers.find(op.dest.buffer_id);
             if (target == buffers.end()) {
                 throw std::runtime_error(
                     "metal storage executor: destination buffer is missing");
             }
+            const auto _span = trace.span(&trace.extent_ms);
             copy_extent(
                 view,
                 op.source,
@@ -385,6 +871,7 @@ StagedWeights stage_plan_weights(
         }
         case Tag::BulkExtentWrite: {
             if (compact) break;  // every buffer already pulled its own bytes
+            const auto _span = trace.span(&trace.bulk_ms);
             const auto& op = instr.op.bulk_extent_write;
             const std::uint64_t offset = op.dest_offset;
             if (offset > b.weights_region.size ||
@@ -402,6 +889,7 @@ StagedWeights stage_plan_weights(
         }
         case Tag::CreateView: {
             const auto& op = instr.op.create_view;
+            materialize(op.input_buffer);
             const auto input = buffers.find(op.input_buffer);
             if (input == buffers.end()) {
                 throw std::runtime_error(
@@ -414,6 +902,7 @@ StagedWeights stage_plan_weights(
             break;
         }
         case Tag::Finalize: {
+            materialize(instr.op.finalize.buffer_id);
             const auto buffer = buffers.find(instr.op.finalize.buffer_id);
             if (buffer == buffers.end()) {
                 throw std::runtime_error(
@@ -434,6 +923,7 @@ StagedWeights stage_plan_weights(
             // to the same buffer, which `validate-fill-order` guarantees on
             // the Rust side; the writes below are synchronous host stores into
             // Shared storage, so program order is enough to preserve it here.
+            materialize(instr.op.fill.buffer_id);
             const auto target = buffers.find(instr.op.fill.buffer_id);
             if (target == buffers.end()) {
                 throw std::runtime_error(
@@ -442,11 +932,42 @@ StagedWeights stage_plan_weights(
             std::memset(target->second.contents(), 0, target->second.size);
             break;
         }
-        case Tag::TileMap:
-            throw std::runtime_error(
-                "metal storage executor: compiler emitted an unsupported load-time transform");
+        case Tag::TileMap: {
+            const auto& op = instr.op.tile_map;
+            for (std::size_t i = 0; i < op.input_buffers.len; ++i) materialize(op.input_buffers.ptr[i]);
+            for (std::size_t i = 0; i < op.output_buffers.len; ++i) materialize(op.output_buffers.ptr[i]);
+            if (op.has_dest) materialize(op.dest.buffer_id);
+            run_tile_map(view, index, op, buffers, load.max_tile_bytes(), gpu, trace);
+            break;
+        }
+        }
+        // Everything the plan can still reach is still allocated; the rest is
+        // returned now rather than at the end, which is what keeps the peak at
+        // one transform's intermediates instead of every transform's.
+        const auto _free_span = trace.span(&trace.scratch_free_ms);
+        for (auto it = scratch.begin(); it != scratch.end();) {
+            const auto dead = last_use.find(it->first);
+            if (dead != last_use.end() && dead->second > step) {
+                ++it;
+                continue;
+            }
+            scratch_pool[it->second.size].push_back(it->second);
+            buffers.erase(it->first);
+            it = scratch.erase(it);
+        }
+        for (auto it = pending_scratch.begin(); it != pending_scratch.end();) {
+            const auto dead = last_use.find(it->first);
+            it = (dead != last_use.end() && dead->second > step) ? std::next(it)
+                                                                 : pending_scratch.erase(it);
         }
     }
+    {
+        const auto _free_span = trace.span(&trace.scratch_free_ms);
+        for (auto& [bytes, pool] : scratch_pool) {
+            for (const SlotHandle& slot : pool) ctx.release_standalone_buffer(slot);
+        }
+    }
+    trace.report();
 
     return b;
 }

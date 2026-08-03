@@ -1251,6 +1251,20 @@ Pso RawMetalContext::compile_pso_from_file(const std::string& path, const std::s
                : Pso{};
 }
 
+Pso RawMetalContext::compile_precise_pso_from_file(const std::string& path,
+                                                   const std::string& fn,
+                                                   std::string* error) {
+    std::string source;
+    if (!read_metal_source(path, source, error)) return Pso{};
+    // Load-time transcode has to reproduce MLX's arithmetic bit for bit, and
+    // fast math rewrites `x / s` into `x * (1/s)` -- one ulp there moves a
+    // rounded 4-bit code by a whole step.
+    MTLCompileOptions* options = [MTLCompileOptions new];
+    bool strict = false;
+    configure_ptir_math_options(options, strict);
+    return compile_pso_impl(*impl_, source, fn, options, nil, error);
+}
+
 Pso RawMetalContext::compile_ptir_pso(
     const std::string& src,
     const std::string& fn,

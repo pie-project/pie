@@ -481,14 +481,20 @@ if(APPLE)
   target_compile_definitions(gemma4_pso_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
   add_metal_linked_test(gemma4_forward_test tests/gemma4_forward_test.cpp NEEDS_LOADER)
-  target_compile_definitions(gemma4_forward_test PRIVATE
-    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  if(TARGET gemma4_forward_test)
+    target_compile_definitions(gemma4_forward_test PRIVATE
+      PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  endif()
   add_metal_linked_test(gptoss_forward_test tests/gptoss_forward_test.cpp NEEDS_LOADER)
-  target_compile_definitions(gptoss_forward_test PRIVATE
-    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  if(TARGET gptoss_forward_test)
+    target_compile_definitions(gptoss_forward_test PRIVATE
+      PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  endif()
   add_metal_linked_test(simple_family_executor_test tests/simple_family_executor_test.cpp NEEDS_LOADER)
-  target_compile_definitions(simple_family_executor_test PRIVATE
-    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  if(TARGET simple_family_executor_test)
+    target_compile_definitions(simple_family_executor_test PRIVATE
+      PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  endif()
   # The same cases again with the weights STREAMED rather than copied. Streaming
   # is meant to change what is resident and nothing else, so the assertions are
   # the same assertions -- if it ever changes an answer, the test that says so
@@ -500,8 +506,10 @@ if(APPLE)
       ENVIRONMENT "PIE_METAL_TEST_STREAM_EXPERTS=1")
   endif()
   add_metal_linked_test(gemma4_prefill_numerics_test tests/gemma4_prefill_numerics_test.cpp NEEDS_LOADER)
-  target_compile_definitions(gemma4_prefill_numerics_test PRIVATE
-    PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  if(TARGET gemma4_prefill_numerics_test)
+    target_compile_definitions(gemma4_prefill_numerics_test PRIVATE
+      PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")
+  endif()
   add_metal_linked_test(gemma4_prefill_test tests/gemma4_prefill_test.cpp)
   target_compile_definitions(gemma4_prefill_test PRIVATE
     PIE_METAL_KERNELS_DIR_FOR_TEST="${CMAKE_CURRENT_SOURCE_DIR}/src/kernels")

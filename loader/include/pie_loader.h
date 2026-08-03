@@ -44,6 +44,10 @@ constexpr static const uint32_t PIE_LOADER_TILE_MAP_SCALE = (1 << 7);
 
 constexpr static const uint32_t PIE_LOADER_FUSION_FP8_TO_MXFP4 = (1 << 0);
 
+/// The pie-level schema above the container. An artifact written under a
+/// different one is a miss, not an error: the driver recomputes.
+constexpr static const uint64_t SCHEMA_VERSION = 1;
+
 enum class PieLoaderStatus : uint32_t {
   Ok = 0,
   /// The request was malformed: a null pointer, a non-UTF-8 path, an
@@ -63,6 +67,13 @@ enum class PieLoaderCheckpointFormat : uint32_t {
   Safetensors = 0,
   Gguf = 1,
   Unknown = 2,
+  /// Appended: adding a value in the middle would renumber `Unknown` under
+  /// every driver already compiled against this header.
+  Zt = 3,
+  Npz = 4,
+  Pt = 5,
+  Hdf5 = 6,
+  Onnx = 7,
 };
 
 enum class PieLoaderSeverity : uint32_t {
@@ -194,6 +205,9 @@ enum class PieLoaderScaleForm : uint32_t {
   RawE8M0 = 0,
   /// F32 multipliers; expand before the GEMM sees them.
   F32Factors = 1,
+  /// BF16 multipliers paired with the zero points named by
+  /// `zero_point_tensor_id`: an element is `code * scale + zero`.
+  Bf16AffineFactors = 2,
 };
 
 /// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
@@ -844,6 +858,12 @@ struct PieLoaderTargetView {
 struct PieLoaderQuantAttachmentView {
   uint32_t tensor_id;
   uint32_t scale_tensor_id;
+  /// The tensor holding this weight's zero points, for an affine scheme, or
+  /// [`PIE_LOADER_NO_TENSOR`] for a symmetric one. An affine weight without it
+  /// cannot be dequantized, so a driver reading a `Bf16AffineFactors`
+  /// attachment is entitled to treat the sentinel as a malformed plan rather
+  /// than as an offset of zero.
+  uint32_t zero_point_tensor_id;
   PieLoaderQuantGranularity granularity;
   uint32_t group_size;
   uint32_t channel_axis;
@@ -930,6 +950,84 @@ struct PieLoaderPlan {
   void *owner;
 };
 
+/// An artifact open for writing.
+///
+/// Freed by [`pie_loader_weight_store_publish`] or
+/// [`pie_loader_weight_store_discard`]; nothing reaches the destination path
+/// until the first of those succeeds.
+struct PieLoaderWeightWriter {
+  void *owner;
+};
+
+/// A tensor with bytes of its own, as the driver declares it.
+struct PieLoaderWeightTensor {
+  PieLoaderBytes name;
+  /// How the bytes are stored. The payload's length is
+  /// `product(shape) × width(dtype)`, and the driver's own type must agree
+  /// with that or the artifact would describe something else.
+  PieLoaderDType dtype;
+  /// The driver's name for the type its kernels will read. Stored verbatim.
+  PieLoaderBytes runtime_dtype;
+  PieLoaderI64Slice shape;
+};
+
+/// A tensor that is a window into another tensor's bytes.
+///
+/// Reconstructed as a window, never as a copy: views are how a fused projection
+/// or a stacked expert weight is addressed, and copying them back would double
+/// the memory they exist to save.
+struct PieLoaderWeightView {
+  PieLoaderBytes name;
+  /// The tensor whose bytes this window lies in. Empty for a window with no
+  /// bytes at all, which a store is allowed to hold.
+  PieLoaderBytes root;
+  uint64_t byte_offset;
+  PieLoaderDType dtype;
+  PieLoaderBytes runtime_dtype;
+  PieLoaderI64Slice shape;
+  /// What the store records this window as cut from, which is not always the
+  /// root: a view of a view names the intermediate.
+  PieLoaderBytes backing;
+};
+
+/// A quantized weight's companion metadata.
+struct PieLoaderWeightQuant {
+  PieLoaderBytes name;
+  /// The driver's name for the granularity its kernels expect. Stored verbatim.
+  PieLoaderBytes kind;
+  PieLoaderBytes scale;
+  PieLoaderBytes zero_point;
+  int32_t group_size;
+  int32_t channel_axis;
+};
+
+/// A tensor as the artifact reports it back.
+struct PieLoaderWeightTensorView {
+  PieLoaderBytes name;
+  PieLoaderBytes runtime_dtype;
+  PieLoaderI64Slice shape;
+  /// The payload, borrowed from the mapping. Valid until the handle closes.
+  const uint8_t *data;
+  uint64_t nbytes;
+  /// Where the payload begins in the file. What a caller checks when it wants
+  /// to know the artifact is mappable — a question the bytes cannot answer.
+  uint64_t file_offset;
+};
+
+using PieLoaderWeightTensorSlice = PieLoaderSlice<PieLoaderWeightTensorView>;
+
+using PieLoaderWeightViewSlice = PieLoaderSlice<PieLoaderWeightView>;
+
+using PieLoaderWeightQuantSlice = PieLoaderSlice<PieLoaderWeightQuant>;
+
+/// An opened artifact. Freed with [`pie_loader_weight_store_close`].
+struct PieLoaderWeightStore {
+  PieLoaderWeightTensorSlice tensors;
+  PieLoaderWeightViewSlice views;
+  PieLoaderWeightQuantSlice quants;
+  void *owner;
+};
+
 
 
 extern "C" {
@@ -1006,6 +1104,136 @@ void pie_loader_release(PieLoaderPlan *plan);
 /// `diags` is null or a pointer produced by this module that has not already been
 /// released.
 void pie_loader_release_diagnostics(PieLoaderDiagnostics *diags);
+
+/// Open an artifact for `key` at `path`.
+///
+/// Nothing appears at `path` until [`pie_loader_weight_store_publish`]
+/// succeeds: the bytes go to a neighbouring file that is renamed into place, so
+/// a run that dies mid-write leaves nothing a later boot would try to read.
+///
+/// # Safety
+///
+/// `path` and `key` are valid [`PieLoaderBytes`] live for the call. `out` is a
+/// writable slot. `out_diags` is null or a writable slot.
+PieLoaderStatus pie_loader_weight_store_create(PieLoaderBytes path,
+                                               PieLoaderBytes key,
+                                               PieLoaderWeightWriter **out,
+                                               PieLoaderDiagnostics **out_diags);
+
+/// Declare a tensor and open it for writing.
+///
+/// Its payload is `product(shape) × width(dtype)` bytes, delivered by
+/// [`pie_loader_weight_store_write`] and closed by
+/// [`pie_loader_weight_store_end_tensor`].
+///
+/// # Safety
+///
+/// `writer` is a live handle and every borrowed field of `decl` is live for the
+/// call.
+PieLoaderStatus pie_loader_weight_store_begin_tensor(PieLoaderWeightWriter *writer,
+                                                     const PieLoaderWeightTensor *decl);
+
+/// Append bytes to the open tensor.
+///
+/// # Safety
+///
+/// `writer` is a live handle and `data` points at `len` initialized bytes live
+/// for the call.
+PieLoaderStatus pie_loader_weight_store_write(PieLoaderWeightWriter *writer,
+                                              const uint8_t *data,
+                                              size_t len);
+
+/// Close the open tensor, which must have received its whole payload.
+///
+/// # Safety
+///
+/// `writer` is a live handle.
+PieLoaderStatus pie_loader_weight_store_end_tensor(PieLoaderWeightWriter *writer);
+
+/// Record a window into a tensor's bytes.
+///
+/// # Safety
+///
+/// `writer` is a live handle and every borrowed field of `decl` is live for the
+/// call.
+PieLoaderStatus pie_loader_weight_store_add_view(PieLoaderWeightWriter *writer,
+                                                 const PieLoaderWeightView *decl);
+
+/// Record a quantized weight's companion metadata.
+///
+/// # Safety
+///
+/// `writer` is a live handle and every borrowed field of `decl` is live for the
+/// call.
+PieLoaderStatus pie_loader_weight_store_add_quant(PieLoaderWeightWriter *writer,
+                                                  const PieLoaderWeightQuant *decl);
+
+/// Close the artifact and move it into place.
+///
+/// The handle is freed either way; a failure leaves nothing at the destination.
+/// On failure the message is *not* retrievable — the handle it would have lived
+/// in is gone — so it is written through `out_diags` instead.
+///
+/// # Safety
+///
+/// `writer` is a live handle, not used again after this call. `out_diags` is
+/// null or a writable slot.
+PieLoaderStatus pie_loader_weight_store_publish(PieLoaderWeightWriter *writer,
+                                                PieLoaderDiagnostics **out_diags);
+
+/// Abandon an artifact under construction, removing the partial file.
+///
+/// # Safety
+///
+/// `writer` is null, or a live handle not used again after this call.
+void pie_loader_weight_store_discard(PieLoaderWeightWriter *writer);
+
+/// The message from whatever last failed on `writer`.
+///
+/// Empty when nothing has. Borrowed from the handle and valid until the next
+/// failing call on it or until the handle is freed.
+///
+/// # Safety
+///
+/// `writer` is null or a live handle.
+PieLoaderBytes pie_loader_weight_store_error(const PieLoaderWeightWriter *writer);
+
+/// Open the artifact at `path`, refusing one written for another key.
+///
+/// A key mismatch, a schema the loader does not know, and a file that is not an
+/// artifact at all are all the same answer to the caller — recompute — so they
+/// share a status and differ only in the diagnostic.
+///
+/// # Safety
+///
+/// `path` and `expected_key` are valid [`PieLoaderBytes`] live for the call.
+/// `out` is a writable slot. `out_diags` is null or a writable slot.
+PieLoaderStatus pie_loader_weight_store_open(PieLoaderBytes path,
+                                             PieLoaderBytes expected_key,
+                                             PieLoaderWeightStore **out,
+                                             PieLoaderDiagnostics **out_diags);
+
+/// Whether the tensor at `index` still matches the digest written with it.
+///
+/// Writes 1 or 0 through `out_ok`. A mismatch is not an error status: the
+/// caller's move is to recompute, the same as for an artifact that was not
+/// there. The check reads the mapping, so it can run on another thread while
+/// the copies to the device are in flight — which is what the driver does.
+///
+/// # Safety
+///
+/// `store` is a live handle and `out_ok` is a writable slot.
+PieLoaderStatus pie_loader_weight_store_verify(const PieLoaderWeightStore *store,
+                                               size_t index,
+                                               bool *out_ok);
+
+/// Free an artifact handle and unmap the file.
+///
+/// # Safety
+///
+/// `store` is null, or a handle from [`pie_loader_weight_store_open`] that has
+/// not already been closed.
+void pie_loader_weight_store_close(PieLoaderWeightStore *store);
 
 }  // extern "C"
 

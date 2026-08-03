@@ -268,6 +268,8 @@ class RawMetalContext {
     // PTIR semantics require strict NaN/tie behavior. This path always passes
     // explicit safe-math options (MTLMathModeSafe, or fastMathEnabled=NO on
     // older SDKs).
+    Pso compile_precise_pso_from_file(const std::string& path, const std::string& fn,
+                                      std::string* error);
     Pso compile_ptir_pso(const std::string& metal_source, const std::string& fn_name,
                          std::string* error = nullptr);
     Pso compile_ptir_pso_from_file(

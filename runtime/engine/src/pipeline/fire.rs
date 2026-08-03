@@ -534,7 +534,10 @@ fn rs_plan_for(
             // says.
             if n == 0 {
                 return Err(format!(
-                    "request row {row} carries no tokens and folds nothing: it neither                      computes nor moves the boundary, so the fire has no effect. A row                      spanning no tokens means \"replay the buffered prefix and stop\",                      which needs a fold length"
+                    "request row {row} carries no tokens and folds nothing: it neither \
+                     computes nor moves the boundary, so the fire has no effect. \
+                     A row spanning no tokens means \"replay the buffered prefix \
+                     and stop\", which needs a fold length"
                 ));
             }
             Position::Commit

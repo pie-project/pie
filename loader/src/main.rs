@@ -5,11 +5,11 @@
 //! it against a stored one, and execute it against the real checkpoint bytes.
 //!
 //! ```text
-//! pie-loader dump   SNAPSHOT CONTRACT [options]        the compiled plan, as JSON
-//! pie-loader verify SNAPSHOT CONTRACT [options]        compile, then check the result
-//! pie-loader diff   SNAPSHOT CONTRACT GOLDEN [options] compile and compare to a dump
-//! pie-loader replay SNAPSHOT CONTRACT [options]        execute the plan on the host
-//! pie-loader align  SNAPSHOT CONTRACT OUT [options]     rewrite it streamable
+//! pie-loader dump    SNAPSHOT CONTRACT [options]        the compiled plan, as JSON
+//! pie-loader verify  SNAPSHOT CONTRACT [options]        compile, then check the result
+//! pie-loader diff    SNAPSHOT CONTRACT GOLDEN [options] compile and compare to a dump
+//! pie-loader replay  SNAPSHOT CONTRACT [options]        execute the plan on the host
+//! pie-loader convert SNAPSHOT CONTRACT OUT [options]    execute, write a checkpoint
 //! ```
 //!
 //! `CONTRACT` is a JSON [`ModelContract`] — what the tool holds instead of a
@@ -17,19 +17,29 @@
 //! authors one in C++ (`driver/*/src/model/<family>/<family>_contract.hpp`);
 //! `loader/tests/golden/contracts/` holds the ones the tests use.
 //!
-//! `align` is the one command that writes a checkpoint rather than reading
-//! one. A streamed weight is read by the device where it lies, through a
-//! mapping, so it has to begin on a page of its own -- and published
-//! checkpoints put essentially no tensor on a page. `align` rewrites the
-//! shards so the ones a driver can stream do, which is a property of the bytes'
-//! placement and not of what the checkpoint means: every tensor keeps its name,
-//! dtype, shape and contents. Which tensors those are comes from the contract's
-//! groups, so the tool is not guessing from names.
+//! `convert` is the one command that writes a checkpoint rather than reading
+//! one, and what it writes is `.zt`. There used to be a second writer and an
+//! `align` command beside it: a streamed weight is read by the device where it
+//! lies, through a mapping, so it has to begin on a page of its own, and
+//! published safetensors checkpoints put essentially no tensor on a page. That
+//! rewrite is gone because its output was, in the end, a checkpoint whose
+//! placement only pie relied on -- and `.zt` places every tensor on a page by
+//! construction, with no filler tensors invented to express a gap the format
+//! has no word for.
 //!
 //! `replay` is the strongest statement the loader can make about itself
 //! offline: it reads the checkpoint through the plan and reports what each
 //! runtime tensor actually contains, so a plan that verifies but moves the
 //! wrong bytes is still caught.
+//!
+//! `convert` is `replay` with the output kept: it executes the plan on the
+//! host — including runtime quantization, which is why it compiles against
+//! [`CONVERT_TILE_MAP_MASK`] rather than the host verification mask — and
+//! writes what came out as a new `.zt` checkpoint. The contract is the
+//! conversion: whatever it declares (an MXFP4 payload and its scales, a cast,
+//! a fold) is what lands on disk, under the names it declares. The expensive
+//! encode then happens once, offline, and loading the converted checkpoint is
+//! extent writes.
 //!
 //! Options, positionally, all optional:
 //! `BACKEND` (`cuda`|`metal`|`host`), `RUNTIME_QUANT`, `MXFP4_POLICY`
@@ -40,16 +50,16 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use pie_loader::checkpoint::CheckpointMetadata;
-use pie_loader::checkpoint::align::{STREAM_PAGE_BYTES, align_checkpoint, streamable_tensors};
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
+use pie_loader::checkpoint::write::{WriteTensor, write_zt};
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
 use pie_loader::error::Error;
 use pie_loader::ffi::view::verify_marshalled;
 use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::plan::{
-    CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, METAL_TILE_MAP_MASK,
-    StorageTarget,
+    CONVERT_TILE_MAP_MASK, CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan,
+    METAL_TILE_MAP_MASK, StorageTarget,
 };
 use pie_loader::types::{BackendKind, DType};
 use pie_loader::verify::ContractView;
@@ -58,11 +68,11 @@ const USAGE: &str = "\
 usage: pie-loader <command> SNAPSHOT CONTRACT [BACKEND] [FUSION] [TP] [TARGET]
 
 commands:
-  dump   SNAPSHOT CONTRACT          compile and print the plan as JSON
-  verify SNAPSHOT CONTRACT          compile, then check the plan against its contract
-  diff   SNAPSHOT CONTRACT GOLDEN   compile and compare against a stored `dump` output
-  replay SNAPSHOT CONTRACT          compile and execute the plan against the checkpoint
-  align  SNAPSHOT CONTRACT OUT      write OUT: the same checkpoint, streamable
+  dump    SNAPSHOT CONTRACT          compile and print the plan as JSON
+  verify  SNAPSHOT CONTRACT          compile, then check the plan against its contract
+  diff    SNAPSHOT CONTRACT GOLDEN   compile and compare against a stored `dump` output
+  replay  SNAPSHOT CONTRACT          compile and execute the plan against the checkpoint
+  convert SNAPSHOT CONTRACT OUT      execute on the host, write OUT as a new `.zt`
 
 CONTRACT is a JSON ModelContract; see loader/tests/golden/contracts/.
 
@@ -114,9 +124,10 @@ fn run(args: &[String]) -> Result<(), Fail> {
         return Err(Fail::Usage(format!("{command} needs a contract file")));
     };
 
-    // `diff` and `align` each take one extra positional before the options.
+    // `diff` and `convert` each take one extra positional before the
+    // options.
     let (extra, rest) = match command.as_str() {
-        "diff" | "align" => {
+        "diff" | "convert" => {
             let what = if command == "diff" {
                 "a golden dump"
             } else {
@@ -137,7 +148,7 @@ fn run(args: &[String]) -> Result<(), Fail> {
         "verify" => run_verify(&snapshot, &contract, &options),
         "diff" => diff(&snapshot, &contract, extra.as_deref().unwrap(), &options),
         "replay" => replay(&snapshot, &contract, &options),
-        "align" => align(&snapshot, &contract, extra.as_deref().unwrap(), &options),
+        "convert" => convert(&snapshot, &contract, extra.as_deref().unwrap(), &options),
         other => Err(Fail::Usage(format!("unknown command '{other}'"))),
     }
 }
@@ -263,6 +274,28 @@ impl Options {
             block_scale_rows: 128,
         }
     }
+
+    /// The target `convert` compiles against: backend-neutral, the host's
+    /// transforms plus `Encode`.
+    ///
+    /// A TARGET file still wins, for a caller reproducing something exact.
+    /// BACKEND is deliberately not consulted — the output of a conversion is
+    /// bytes for a checkpoint, not for a device, and a plan lowered for a
+    /// device would carry transforms (`Repack`) whose output has no on-disk
+    /// representation.
+    fn convert_target(&self) -> StorageTarget {
+        if let Some(target) = &self.target {
+            return target.clone();
+        }
+        StorageTarget {
+            backend: BackendKind::Unknown,
+            tp_rank: self.tp_rank,
+            tp_size: self.tp_size,
+            max_tile_bytes: 64 << 20,
+            tile_map_mask: CONVERT_TILE_MAP_MASK,
+            ..StorageTarget::default()
+        }
+    }
 }
 
 /// Compile, reporting how long it took and how big the answer is.
@@ -282,79 +315,6 @@ fn compile(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resu
         started.elapsed()
     );
     Ok(plan)
-}
-
-/// Write a streamable copy of the checkpoint.
-///
-/// The set of tensors to put on pages is taken from the compiled plan's groups
-/// rather than from a name pattern. A group is a contract's statement that its
-/// instances are interchangeable, which is precisely the property that lets a
-/// driver hold one instance's weights instead of another's at run time -- so
-/// the tensors a group binds are the tensors streaming can page, as a fact the
-/// contract states rather than a guess about what `mlp.experts.` means.
-///
-/// Aligning everything would be the wrong policy and is not offered: padding
-/// costs a page per tensor, which disappears against a 132 MB expert bank and
-/// triples the size of a small one.
-fn align(
-    snapshot: &Path,
-    contract: &ModelContract,
-    out: &Path,
-    options: &Options,
-) -> Result<(), Fail> {
-    let metadata = parse_checkpoint_metadata(snapshot)?;
-    let plan = compile_load_plan(&metadata, contract, options.target())?;
-    let streamable = streamable_tensors(&plan, &metadata);
-    if streamable.whole.is_empty() && streamable.banded.is_empty() {
-        return Err(Fail::Failed(
-            "this contract declares no groups, so nothing in it can be streamed and \
-             aligning the checkpoint would only make it bigger"
-                .to_string(),
-        ));
-    }
-    // A fused bank cannot be aligned by moving it: its instances begin at
-    // `base + i * stride`, and the stride is whatever the shape makes it.
-    // Aligning it anyway would produce a checkpoint that loads, streams, and
-    // faults in the whole bank to read one expert -- correct, and slower than
-    // not streaming, with nothing on disk to explain why.
-    if !streamable.banded.is_empty() {
-        return Err(Fail::Failed(format!(
-            "{} of this contract's group tensors are fused banks, which aligning cannot \
-             separate: every instance reads a band of one tensor, so moving it puts \
-             instance 0 on a page and no other. First: {}",
-            streamable.banded.len(),
-            streamable.banded.iter().next().unwrap()
-        )));
-    }
-    let names = streamable.whole;
-
-    let report = align_checkpoint(snapshot, out, &names, STREAM_PAGE_BYTES)?;
-    for file in &report.files {
-        eprintln!(
-            "{}: {} tensors aligned, {} fillers, +{} bytes",
-            file.path.display(),
-            file.aligned,
-            file.fillers,
-            file.overhead_bytes()
-        );
-    }
-    // A name the plan resolved but the rewrite never saw means the two disagree
-    // about what is in the checkpoint, which would silently leave a streamed
-    // tensor unaligned -- correct, and slow in a way nothing would explain.
-    if !report.missing.is_empty() {
-        return Err(Fail::Failed(format!(
-            "{} tensor(s) the plan reads are not in the checkpoint's shards, first {}",
-            report.missing.len(),
-            report.missing[0]
-        )));
-    }
-    println!(
-        "{} aligned to {STREAM_PAGE_BYTES} bytes: {} tensors, {} bytes of padding",
-        out.display(),
-        report.aligned(),
-        report.overhead_bytes()
-    );
-    Ok(())
 }
 
 fn dump(snapshot: &Path, contract: &ModelContract, options: &Options) -> Result<(), Fail> {
@@ -447,5 +407,116 @@ fn replay(snapshot: &Path, contract: &ModelContract, options: &Options) -> Resul
             pie_loader::cache_key::fnv1a(tensor)
         );
     }
+    Ok(())
+}
+
+/// Execute the plan on the host and keep the output: write every public
+/// runtime tensor, in plan order, as a new `.zt` checkpoint under `out`.
+///
+/// The contract *is* the conversion. It names the output tensors, and its
+/// expressions say what each one is made of — a `Cast` into a quantized
+/// encoding is how "quantize this offline" is spelled, and the scales that
+/// encode publishes arrive as the extra declarations the plan already carries.
+/// Loading the result afterwards is a different, cheaper contract against the
+/// converted names.
+///
+/// Whole-model in memory: the host executor materializes the persistent arena
+/// before anything is written, so converting a checkpoint takes roughly its
+/// decoded size in RAM. Streaming the write per tensor is possible if that
+/// ever binds, but it means teaching the executor to retire buffers early —
+/// not worth it before someone hits the wall.
+fn convert(
+    snapshot: &Path,
+    contract: &ModelContract,
+    out: &Path,
+    options: &Options,
+) -> Result<(), Fail> {
+    if out.exists() {
+        return Err(Fail::Failed(format!(
+            "{} already exists; convert writes a fresh checkpoint and is not in a \
+             position to know what an existing one is",
+            out.display()
+        )));
+    }
+    if !contract.groups.is_empty() {
+        return Err(Fail::Failed(
+            "this contract declares groups, which convert does not run: a group \
+             compiles to one template plus bindings, not to resident tensors. \
+             Declare the members as plain tensors for conversion"
+                .to_string(),
+        ));
+    }
+    let metadata = parse_checkpoint_metadata(snapshot)?;
+    let plan = compile_load_plan(&metadata, contract, options.convert_target())?;
+    let started = Instant::now();
+    let storage = pie_loader::testkit::host_executor::execute_plan(&plan, snapshot)?;
+    eprintln!(
+        "executed {} instructions ({} arena bytes) in {:?}",
+        plan.instrs.len(),
+        storage.arena.len(),
+        started.elapsed()
+    );
+
+    let mut tensors = Vec::new();
+    for decl in &plan.tensors {
+        if !decl.visibility.is_public() {
+            continue;
+        }
+        let bytes = storage.tensors.get(&decl.name).ok_or_else(|| {
+            Fail::Failed(format!(
+                "the plan declares '{}' but executing it produced no such tensor",
+                decl.name
+            ))
+        })?;
+        tensors.push(WriteTensor { decl, bytes });
+    }
+    if tensors.is_empty() {
+        return Err(Fail::Failed(
+            "the contract declares no public tensors, so there is nothing to write".to_string(),
+        ));
+    }
+
+    // Provenance, not meaning: enough to tell two conversions apart and name
+    // what produced this one. Digests rather than paths so the file does not
+    // record one machine's directory layout.
+    let mut provenance = std::collections::BTreeMap::new();
+    provenance.insert(
+        "pie_convert_compiler".to_string(),
+        pie_loader::plan::compiler_version().to_string(),
+    );
+    let contract_json = serde_json::to_vec(contract)
+        .map_err(|err| Fail::Failed(format!("cannot serialize the contract: {err}")))?;
+    provenance.insert(
+        "pie_convert_contract".to_string(),
+        format!("{:016x}", pie_loader::cache_key::fnv1a(&contract_json)),
+    );
+    let source = plan
+        .files
+        .iter()
+        .map(|file| {
+            let name = Path::new(&file.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&file.path);
+            format!("{name}:{}", file.size_bytes)
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    provenance.insert(
+        "pie_convert_source".to_string(),
+        format!("{:016x}", pie_loader::cache_key::fnv1a(source.as_bytes())),
+    );
+
+    // `.zt` is the only output: it can name every scheme the plan language
+    // admits, places tensors on pages without inventing filler tensors to
+    // express a gap, and carries a digest.
+    let path = out.join("model.zt");
+    write_zt(&path, &provenance, &tensors)?;
+    let bytes: u64 = tensors.iter().map(|tensor| tensor.bytes.len() as u64).sum();
+    println!(
+        "{}: {} tensors, {bytes} bytes",
+        path.display(),
+        tensors.len()
+    );
     Ok(())
 }

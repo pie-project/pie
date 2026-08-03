@@ -20,7 +20,9 @@ pub mod pass;
 pub mod passes;
 
 pub use crate::extent::{Dim, Extent};
-pub use passes::tile::{CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK};
+pub use passes::tile::{
+    CONVERT_TILE_MAP_MASK, CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, METAL_TILE_MAP_MASK,
+};
 
 /// Which tile-map transforms a target's kernels implement.
 ///
@@ -180,6 +182,11 @@ pub struct SourceTensorDecl {
 /// has to know they belong together in order to attach the quant metadata its
 /// kernels read.
 ///
+/// An affine scheme needs a third: its groups are offset as well as scaled, and
+/// `zero_point_tensor` names the tensor holding the offsets. It is `None` for
+/// every symmetric scheme, which is to say for everything whose `scale_form` is
+/// not [`ScaleForm::Bf16AffineFactors`].
+///
 /// Every entry here is recorded by whoever declared the scale tensor, at the
 /// point of declaring it: `plan/build.rs::quant_metadata_outputs` for scales the
 /// loader creates, and [`Scales`](crate::contract::Scales) for scales the
@@ -188,6 +195,7 @@ pub struct SourceTensorDecl {
 pub struct QuantAttachment {
     pub tensor: TensorId,
     pub scale_tensor: TensorId,
+    pub zero_point_tensor: Option<TensorId>,
     pub granularity: QuantGranularity,
     pub group_size: u32,
     pub channel_axis: u32,

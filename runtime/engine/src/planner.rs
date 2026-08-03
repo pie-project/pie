@@ -58,13 +58,27 @@ use crate::store::kv::page_table::ReclaimQuote;
 /// Process identity the planner tracks (FCFS clock key, residency key).
 pub type ProcessId = uuid::Uuid;
 
-/// Opt-in event markers (`PIE_CONTENTION_TRACE_MS`): `println!`, not
+/// Opt-in event markers (`PIE_CONTENTION_TRACE_EVENTS=1`): `println!`, not
 /// `tracing` — the embedded (pyo3) server installs no subscriber. The
 /// timestamp shares the fire-timing monotonic clock so planner events
 /// correlate with `PIE_FIRE_TIMING` wave records in one benchmark log.
+///
+/// **This is a separate switch from the periodic stall sampler**
+/// (`PIE_CONTENTION_TRACE_MS`) on purpose. The markers fire per planner
+/// EVENT — one line per park, serve, restore and eviction step — and a
+/// contended run emits tens of thousands of them. Tying them to the
+/// sampler's variable made `PIE_CONTENTION_TRACE_MS=0`, the natural
+/// spelling of "off", the single most expensive setting there is: the
+/// sampler thread never starts (it needs `ms > 0`) but every marker prints.
+/// Runs taken that way read 25-30% under the same build untraced, which is
+/// larger than most effects this planner is tuned against.
 pub(crate) fn trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PIE_CONTENTION_TRACE_MS").is_some())
+    *ENABLED.get_or_init(|| {
+        std::env::var("PIE_CONTENTION_TRACE_EVENTS")
+            .map(|raw| !matches!(raw.trim(), "" | "0" | "false" | "off"))
+            .unwrap_or(false)
+    })
 }
 
 macro_rules! ptrace {
@@ -182,8 +196,16 @@ impl RegistryPool {
     }
 
     fn with_kv<R>(&self, operation: impl FnOnce(&mut crate::store::kv::KvStore) -> R) -> R {
+        self.with_kv_tagged("planner", operation)
+    }
+
+    fn with_kv_tagged<R>(
+        &self,
+        tag: &'static str,
+        operation: impl FnOnce(&mut crate::store::kv::KvStore) -> R,
+    ) -> R {
         let stores = crate::store::registry::get(self.model, self.driver);
-        crate::store::registry::with_kv_lock(&stores.kv, "planner", operation)
+        crate::store::registry::with_kv_lock(&stores.kv, tag, operation)
     }
 
     fn with_rs<R>(&self, operation: impl FnOnce(&mut crate::store::rs::RsStore) -> R) -> R {
@@ -195,11 +217,15 @@ impl RegistryPool {
 
 impl PoolPort for RegistryPool {
     fn device_stats(&self) -> (u32, u32) {
-        self.with_kv(|kv| (kv.available_pages() as u32, kv.capacity_pages()))
+        self.with_kv_tagged("planner-device-stats", |kv| {
+            (kv.available_pages() as u32, kv.capacity_pages())
+        })
     }
 
     fn host_stats(&self) -> (u32, u32) {
-        self.with_kv(|kv| (kv.host_swap_available() as u32, kv.host_swap_capacity()))
+        self.with_kv_tagged("planner-host-stats", |kv| {
+            (kv.host_swap_available() as u32, kv.host_swap_capacity())
+        })
     }
 
     fn rs_stats(&self) -> (u32, u32) {
@@ -207,7 +233,7 @@ impl PoolPort for RegistryPool {
     }
 
     fn reclaim_idle(&self) -> u32 {
-        self.with_kv(|kv| {
+        self.with_kv_tagged("planner-reclaim-idle", |kv| {
             let epoch = kv.current_epoch();
             let freed = kv.drop_unused_cache_leases(epoch);
             if freed > 0 {
@@ -229,14 +255,16 @@ impl PoolPort for RegistryPool {
         &self,
         count: u32,
     ) -> Option<Vec<crate::store::kv::page_table::PhysicalKvPageId>> {
-        self.with_kv(|kv| kv.reserve_device_pages(count as usize))
+        self.with_kv_tagged("planner-reserve", |kv| {
+            kv.reserve_device_pages(count as usize)
+        })
     }
 
     fn reserve_device_up_to(
         &self,
         count: u32,
     ) -> Vec<crate::store::kv::page_table::PhysicalKvPageId> {
-        self.with_kv(|kv| {
+        self.with_kv_tagged("planner-reserve-up-to", |kv| {
             let take = (kv.available_pages() as u32).min(count);
             if take == 0 {
                 return Vec::new();
@@ -246,7 +274,7 @@ impl PoolPort for RegistryPool {
     }
 
     fn release_device(&self, pages: Vec<crate::store::kv::page_table::PhysicalKvPageId>) {
-        self.with_kv(|kv| kv.release_device_reservation(pages));
+        self.with_kv_tagged("planner-release", |kv| kv.release_device_reservation(pages));
     }
 
     fn reserve_rs(&self, count: u32) -> Option<Vec<crate::store::rs::RsSlotId>> {
@@ -372,6 +400,10 @@ pub struct PlannerStats {
     pub serves: AtomicU64,
     /// Eviction attempts spawned.
     pub evictions_started: AtomicU64,
+    /// Shortages that did NOT trigger an eviction because the fleet was
+    /// still making progress — the load-control rung. Every one of these is
+    /// a fence/quiesce/D2H/H2D round trip not paid.
+    pub eviction_deferrals: AtomicU64,
     /// Evictions that committed (working sets moved to host swap).
     pub evictions: AtomicU64,
     /// Evictions abandoned before commit (nothing reclaimable, non-detachable
@@ -459,6 +491,19 @@ pub struct PlannerDiagnostics {
     pub parks_total: u64,
     pub serves_total: u64,
     pub evictions_total: u64,
+    /// Shortages that did not trigger an eviction because the fleet could
+    /// still make progress on its own (load control).
+    pub eviction_deferrals_total: u64,
+    /// The entry the drain is blocked on, and how many entries still
+    /// compete for pages at all (a served-but-uncollected grant does not).
+    pub unmet_head_pages: u32,
+    pub unmet_head_kind: &'static str,
+    pub unmet_queued: u32,
+    /// Entries BEHIND the blocked head that the currently-free stock could
+    /// cover on its own. The drain is head-first, so these wait even though
+    /// the resource to serve them exists — the head-of-line cost.
+    pub bypassable_entries: u32,
+    pub bypassable_pages: u32,
     pub eviction_rollbacks_total: u64,
     pub restores_total: u64,
     pub restore_failures_total: u64,
@@ -635,6 +680,12 @@ impl Waiter {
 /// Key: spawn clock first, insertion order second.
 type EntryKey = (u64, u64);
 
+/// One eviction in flight, as the planner accounts for it.
+struct EvictionMark {
+    /// Pages this victim is expected to free when it lands.
+    pages: u32,
+}
+
 #[derive(Default)]
 struct Inner {
     next_seq: u64,
@@ -645,9 +696,9 @@ struct Inner {
     /// toward the current head's demand. Planner-level (not per-entry), so a
     /// head change strands nothing; released only when the queue empties.
     accum: DevicePageReservation,
-    /// Evictions in flight → pages each is expected to free. Subtracted from
+    /// Evictions in flight → what each is expected to free. Subtracted from
     /// the deficit so concurrent plans never over-evict.
-    evicting: HashMap<ProcessId, u32>,
+    evicting: HashMap<ProcessId, EvictionMark>,
     /// Victims whose last eviction rolled back on `HostSwapFull`. Re-picking
     /// one before host room changes is pure spin: victim selection is
     /// deterministic, so the retry re-runs the whole fence → suspend →
@@ -665,9 +716,40 @@ struct Inner {
     /// whenever a process retires or host room returns, i.e. whenever the
     /// answer could actually have changed.
     prepare_blocked: HashSet<ProcessId>,
+    /// Destructions ordered but not yet paid out — see [`Inner::kill_in_flight`].
+    killing: HashSet<ProcessId>,
 }
 
 impl Inner {
+    /// A starvation kill has been ordered whose pages have not come back yet.
+    ///
+    /// `evicting` covers reclaim by *transfer*; this covers reclaim by
+    /// *destruction*, and the two must gate identically — neither is a reason
+    /// to start another. The window is not the one the `outcome: Some(_)`
+    /// check already covers: setting the victim's outcome only wakes it. Its
+    /// pages return when its store drops, which is a WASM unwind later —
+    /// milliseconds, against the microseconds its waiter takes to collect the
+    /// error and vacate the queue. In between, `free` is still 0 and nothing
+    /// marks a reclaim as under way, so every planner poke ordered another
+    /// kill. Measured on D/512 under the supply-stall rule: **250 kills/s
+    /// sustained, 3590 total for 768 requests, and a resident set that ended
+    /// exactly where it started (541)** — the destructions raced each other
+    /// instead of the deficit.
+    ///
+    /// Self-clearing on both exits, so it cannot wedge the deadlock breaker
+    /// it guards: the victim either dies (leaves `procs`) or survives the
+    /// error and re-contends (a fresh unmet ask), and either way stops
+    /// counting. `unregister` prunes the set so it stays bounded.
+    fn kill_in_flight(&self) -> bool {
+        self.killing.iter().any(|pid| {
+            self.procs.contains_key(pid)
+                && !self
+                    .queue
+                    .values()
+                    .any(|waiter| waiter.pid == *pid && waiter.is_unmet())
+        })
+    }
+
     fn nonresident_count(&self) -> usize {
         self.procs
             .values()
@@ -882,6 +964,7 @@ impl ResidencyPlanner {
         let (signal, removed) = self.with_inner(|inner| {
             let signal = inner.procs.remove(&pid).map(|proc| proc.signal);
             inner.evicting.remove(&pid);
+            inner.killing.remove(&pid);
             // Teardown returns this process's host slots (and drops it from
             // the candidate pool either way), so re-arm the parked victims.
             inner.host_swap_blocked.clear();
@@ -1415,25 +1498,32 @@ impl ResidencyPlanner {
             })
             .collect();
         ordered.sort_by_key(|&(_, seq, quiescent)| (!quiescent, std::cmp::Reverse(seq)));
+        // ONE quote call for the whole candidate list. A quote depends only
+        // on the fleet-wide page table and on the group's own locations —
+        // never on which other groups ride along — so batching returns
+        // exactly the chunked answer. It is not equivalent in COST:
+        // `PageTable::reclaim_quotes` walks EVERY working set to build the
+        // outward-sharing census BEFORE it looks at a single group, so
+        // chunking re-ran that fleet-wide walk once per chunk under the
+        // global KV lock, on the demand path. Chunking was introduced to cut
+        // the p99 HOLD (§16), but the hold is dominated by that same
+        // group-independent prologue, so it only multiplied the total.
+        // Measured under host swap: 26828 chunk calls holding the KV lock for
+        // 80% of wall, against 245 s of guest wait — the GPU idled while the
+        // planner re-censused the fleet.
+        let pids: Vec<ProcessId> = ordered.iter().map(|(pid, ..)| *pid).collect();
+        let quotes = crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
         let mut picks = Vec::new();
         let mut covered = 0u32;
-        for chunk in ordered.chunks(8) {
+        for (pid, quote) in pids.into_iter().zip(quotes) {
             if covered >= deficit {
                 break;
             }
-            let pids: Vec<ProcessId> = chunk.iter().map(|(pid, ..)| *pid).collect();
-            let quotes =
-                crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
-            for ((pid, ..), quote) in chunk.iter().zip(quotes) {
-                if covered >= deficit {
-                    break;
-                }
-                if let Some(ReclaimQuote::Pages(pages)) = quote
-                    && pages > 0
-                {
-                    covered += pages;
-                    picks.push((*pid, pages));
-                }
+            if let Some(ReclaimQuote::Pages(pages)) = quote
+                && pages > 0
+            {
+                covered += pages;
+                picks.push((pid, pages));
             }
         }
         picks
@@ -1446,6 +1536,35 @@ impl ResidencyPlanner {
         let (host_free, _) = self.port.host_stats();
         if !self.port.suspend_capable() || host_free == 0 {
             self.check_starvation(StarveCause::NoSwapRoom);
+            return;
+        }
+        // LOAD CONTROL. Eviction is a LIVENESS rung, not a demand rung.
+        //
+        // A shortage is not by itself a reason to move KV bytes. While any
+        // admitted process is still running, its pages are already on their
+        // way back to the pool: it will retire, free, and poke the drain.
+        // Evicting to serve the head sooner only trades that free for a
+        // fence → lane-leave → lease-quiesce → D2H → H2D round trip, and
+        // then owes an H2D to put the victim back — for a pool that was
+        // going to turn over anyway.
+        //
+        // Measured, X-shape at 3.1x oversubscription (1024 req, conc 512,
+        // 8192 pages): demand-triggered eviction ran 982 times in 36 s to
+        // avoid the 9 starvation restarts the same shape takes with no swap
+        // at all, at p50 246 ms per victim (135 ms of it just waiting out
+        // the victim's in-flight lease) and 77 MB moved each way. Batch
+        // width was never the limit — p90 was 352 of a 366 request cap — so
+        // the extra residency bought nothing.
+        //
+        // The wedge predicate is exactly "no completion can ever arrive on
+        // its own", and it is the same one the starvation rung uses, so the
+        // two can never disagree about when waiting is still an option.
+        // Under it, host swap does what it is for: a wedged fleet PARKS to
+        // host DRAM instead of having a request destroyed.
+        if !self.is_wedged() {
+            self.stats
+                .eviction_deferrals
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         let Some(victims) = self.victim_set() else {
@@ -1487,7 +1606,7 @@ impl ResidencyPlanner {
             let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
             // Evictions already in flight fund the head when they land;
             // never over-evict for pages that are already on their way.
-            let expected: u32 = inner.evicting.values().sum();
+            let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
             let deficit = missing.saturating_sub(expected);
             if deficit == 0 {
                 return None;
@@ -1560,7 +1679,7 @@ impl ResidencyPlanner {
                     continue;
                 }
                 proc.state = Residency::Evicting;
-                inner.evicting.insert(pid, expected);
+                inner.evicting.insert(pid, EvictionMark { pages: expected });
                 spawned.push(pid);
                 for waiter in inner.queue.values_mut().filter(|w| w.pid == pid) {
                     if let WaitKind::Allocation {
@@ -1694,7 +1813,7 @@ impl ResidencyPlanner {
                         return (None, 0, Vec::new());
                     };
                     let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
-                    let expected: u32 = inner.evicting.values().sum();
+                    let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
                     let deficit = missing.saturating_sub(expected);
                     if deficit == 0 {
                         return (None, 0, Vec::new());
@@ -2056,6 +2175,14 @@ impl ResidencyPlanner {
             );
         }
         let (free, total) = self.port.device_stats();
+        // A destruction already ordered has not been paid out yet: gate the
+        // rung that DESTROYS, and only that one. The cheaper rungs above
+        // (salvage, last-resort eviction) stay open — they are what we would
+        // rather have happen — and eviction's own load control keeps using
+        // the wedge predicate unchanged.
+        if self.with_inner(|inner| inner.kill_in_flight()) {
+            return;
+        }
         // Pick the victim OUTSIDE the lock: the choice needs reclaim quotes,
         // and quoting takes store locks (`quote_and_pick` has the same rule).
         let Some(victim_key) = self.pick_starvation_victim() else {
@@ -2088,7 +2215,9 @@ impl ResidencyPlanner {
                 total,
                 cause,
             }));
-            Some((notify.clone(), victim_pid))
+            let notify = notify.clone();
+            inner.killing.insert(victim_pid);
+            Some((notify, victim_pid))
         });
         if let Some((notify, victim_pid)) = notify {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
@@ -2168,37 +2297,30 @@ impl ResidencyPlanner {
         // each pass the youngest-first rule is unchanged.
         let mut first_holder = None;
         for restartable_only in [true, false] {
-            // Chunked, like `quote_and_pick`: quoting the whole fleet under
-            // one KV-lock hold was the planner's p99 hold (§16). The first
-            // holder is usually within the first chunk or two.
-            for chunk in candidates.chunks(16) {
-                let pids: Vec<ProcessId> = chunk
-                    .iter()
-                    .filter(|(_, pid)| {
-                        !restartable_only || crate::inferlet::process::is_restartable(*pid)
-                    })
-                    .map(|(_, pid)| *pid)
-                    .collect();
-                if pids.is_empty() {
-                    continue;
-                }
-                let quotes =
-                    crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
-                let keys = chunk.iter().filter(|(_, pid)| {
+            // One call for the whole fleet, not chunks: see
+            // `quote_and_pick` for why chunking multiplied the cost of the
+            // group-independent census instead of bounding it.
+            let selected: Vec<(EntryKey, ProcessId)> = candidates
+                .iter()
+                .filter(|(_, pid)| {
                     !restartable_only || crate::inferlet::process::is_restartable(*pid)
-                });
-                for ((key, _), quote) in keys.zip(quotes) {
-                    if let Some(ReclaimQuote::Pages(pages)) = quote
-                        && pages > 0
-                    {
-                        if restartable_only {
-                            return Some(*key);
-                        }
-                        first_holder.get_or_insert(*key);
-                        break;
+                })
+                .copied()
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            let pids: Vec<ProcessId> = selected.iter().map(|(_, pid)| *pid).collect();
+            let quotes =
+                crate::inferlet::process::residency::kv_reclaim_quotes(&pids, model, driver);
+            for ((key, _), quote) in selected.iter().zip(quotes) {
+                if let Some(ReclaimQuote::Pages(pages)) = quote
+                    && pages > 0
+                {
+                    if restartable_only {
+                        return Some(*key);
                     }
-                }
-                if first_holder.is_some() {
+                    first_holder.get_or_insert(*key);
                     break;
                 }
             }
@@ -2494,6 +2616,49 @@ impl ResidencyPlanner {
                 },
             })
             .collect();
+        // The entry the DRAIN is actually blocked on. `queue.first()` is
+        // merely the oldest entry, met or not, so reporting it made a
+        // served-but-uncollected grant look like a stalled head.
+        let (unmet_head_pages, unmet_head_kind) = match inner.unmet_head() {
+            Some((_, waiter)) => (
+                waiter.kv_need(),
+                match &waiter.kind {
+                    WaitKind::Allocation { .. } => "allocation",
+                    WaitKind::Restore { .. } => "restore",
+                },
+            ),
+            None => (0, "-"),
+        };
+        let unmet_queued = inner
+            .queue
+            .values()
+            .filter(|waiter| waiter.is_unmet())
+            .count() as u32;
+        // What the head-first rule costs right now: walk PAST the blocked
+        // head and see how much of the queue the free stock alone would
+        // already cover. Nothing is served here — this only measures.
+        let (bypassable_entries, bypassable_pages) = {
+            let head_seq = inner.unmet_head().map(|(key, _)| key.0);
+            match head_seq {
+                None => (0, 0),
+                Some(head) => {
+                    let mut budget = device_pages_free;
+                    let (mut entries, mut pages) = (0u32, 0u32);
+                    for (key, waiter) in inner.queue.iter() {
+                        if key.0 <= head || !waiter.is_unmet() {
+                            continue;
+                        }
+                        let need = waiter.kv_need();
+                        if need <= budget {
+                            budget -= need;
+                            entries += 1;
+                            pages += need;
+                        }
+                    }
+                    (entries, pages)
+                }
+            }
+        };
         let parked: std::collections::HashSet<ProcessId> =
             inner.queue.values().map(|waiter| waiter.pid).collect();
         let mut runner_ids: Vec<(ProcessId, u64, bool)> = inner
@@ -2541,6 +2706,12 @@ impl ResidencyPlanner {
             parks_total: self.stats.parks.load(Relaxed),
             serves_total: self.stats.serves.load(Relaxed),
             evictions_total: self.stats.evictions.load(Relaxed),
+            eviction_deferrals_total: self.stats.eviction_deferrals.load(Relaxed),
+            unmet_head_pages,
+            unmet_head_kind,
+            unmet_queued,
+            bypassable_entries,
+            bypassable_pages,
             eviction_rollbacks_total: self.stats.eviction_rollbacks.load(Relaxed),
             restores_total: self.stats.restores.load(Relaxed),
             restore_failures_total: self.stats.restore_failures.load(Relaxed),
@@ -2639,7 +2810,7 @@ fn kv_page_count(
     let Some(stores) = crate::store::registry::try_get(model, driver) else {
         return 0;
     };
-    crate::store::registry::with_kv_lock(&stores.kv, "planner", |kv| {
+    crate::store::registry::with_kv_lock(&stores.kv, "planner-held-pages", |kv| {
         count(kv, &working_sets) as u32
     })
 }
@@ -2707,6 +2878,10 @@ mod starvation_race_tests {
         free: parking_lot::Mutex<Vec<PhysicalKvPageId>>,
         total: u32,
         stall: AtomicU32,
+        /// Host swap room. Zero (the default) keeps `plan_eviction` on its
+        /// `NoSwapRoom` short-circuit, which is what every starvation-rung
+        /// test wants; non-zero lets a test reach the load-control gate.
+        host: u32,
     }
 
     impl RacePool {
@@ -2715,6 +2890,16 @@ mod starvation_race_tests {
                 free: parking_lot::Mutex::new(Vec::new()),
                 total,
                 stall: AtomicU32::new(0),
+                host: 0,
+            }
+        }
+
+        /// A pool that CAN swap, so `plan_eviction` runs past its
+        /// no-transport short-circuit and reaches the load-control gate.
+        fn with_swap(total: u32, host: u32) -> Self {
+            Self {
+                host,
+                ..Self::new(total)
             }
         }
 
@@ -2734,7 +2919,7 @@ mod starvation_race_tests {
             (self.free.lock().len() as u32, self.total)
         }
         fn host_stats(&self) -> (u32, u32) {
-            (0, 0)
+            (self.host, self.host)
         }
         fn rs_stats(&self) -> (u32, u32) {
             (0, 0)
@@ -2743,11 +2928,11 @@ mod starvation_race_tests {
             0
         }
         fn suspend_capable(&self) -> bool {
-            // No swap transport: `plan_eviction` goes straight to
-            // `check_starvation(NoSwapRoom)`, which is the shortest path to
-            // the rung under test and skips `last_resort_evict` (it needs
-            // the real residency tables).
-            false
+            // Without host room: no swap transport, so `plan_eviction` goes
+            // straight to `check_starvation(NoSwapRoom)` — the shortest path
+            // to the starvation rung, and it skips `last_resort_evict`
+            // (which needs the real residency tables).
+            self.host > 0
         }
         fn locus(&self) -> (usize, usize) {
             (0, 0)
@@ -2998,5 +3183,155 @@ mod starvation_race_tests {
             planner.spawn_seq(newest) > planner.spawn_seq(younger),
             "a fresh registration must remain the youngest"
         );
+    }
+
+    /// Load control: a shortage alone must NOT move KV bytes.
+    ///
+    /// While any admitted process is still running, its pages are already on
+    /// their way back to the pool — evicting only trades that free for a
+    /// fence → lease-quiesce → D2H → H2D round trip and an owed restore.
+    /// Eviction is therefore gated on the same wedge predicate the
+    /// starvation rung uses, so the two can never disagree about whether
+    /// waiting is still an option.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shortage_alone_defers_eviction_while_the_fleet_still_runs() {
+        // Non-zero capacity with an empty free list: an ask bigger than the
+        // pool is failed loud instead of parking.
+        let pool = Arc::new(RacePool::with_swap(4, 64));
+        let planner = Arc::new(ResidencyPlanner::new(
+            pool.clone(),
+            PlannerConfig::default(),
+        ));
+
+        // An unparked admitted runner: relief is still on its way, so the
+        // fleet is not wedged.
+        let holder = ProcessId::new_v4();
+        planner.register(holder);
+        planner.note_admitted(holder);
+
+        let head = ProcessId::new_v4();
+        planner.register(head);
+        planner.note_admitted(head);
+        // Younger, resident, admitted: legal victims under the anti-thrash
+        // rule, so a set exists and only the gate can hold the round back.
+        for _ in 0..3 {
+            let pid = ProcessId::new_v4();
+            planner.register(pid);
+            planner.note_admitted(pid);
+        }
+
+        let demand = Demand {
+            kv_pages: 1,
+            rs_slots: 0,
+        };
+        let p = planner.clone();
+        let parked = tokio::spawn(async move { p.acquire(head, head, demand).await });
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if planner.diagnostics().queue.len() == 1 {
+                break;
+            }
+        }
+        let d = planner.diagnostics();
+        assert_eq!(
+            d.queue.len(),
+            1,
+            "the ask must park (starved={} salvaged={} free={}/{})",
+            d.starvations_total,
+            d.salvages_total,
+            d.device_pages_free,
+            d.device_pages_total
+        );
+
+        // The victim set is non-empty and the deficit is exactly the head's
+        // need: nothing about the shortage has changed.
+        let set = planner.victim_set().expect("an unmet head yields a set");
+        assert_eq!(set.deficit, 1, "the round is demand-exact");
+        assert!(
+            !set.members.is_empty(),
+            "younger residents are legal victims"
+        );
+
+        // ...yet the drain must not have spawned one, because `holder` is
+        // still running and will free on its own.
+        assert!(!planner.is_wedged(), "a running holder is not a wedge");
+        let d = planner.diagnostics();
+        assert_eq!(
+            d.evictions_total, 0,
+            "a shortage alone must not move KV bytes"
+        );
+        assert!(
+            d.eviction_deferrals_total > 0,
+            "the load-control rung must record the deferral it made"
+        );
+
+        parked.abort();
+    }
+
+    /// The destruction guard clears on BOTH of its exits, so it can never
+    /// wedge the deadlock breaker it rate-limits.
+    ///
+    /// Ordering a kill only wakes the victim; its pages return when its
+    /// store drops, a WASM unwind later. Without a marker for that window
+    /// every planner poke ordered another destruction — 250 kills/s on
+    /// D/512, 3590 for 768 requests, resident set unchanged. The marker is
+    /// only safe if it lifts by itself, which is what this pins down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ordered_kill_stops_counting_once_the_victim_dies_or_re_contends() {
+        let pool = Arc::new(RacePool::new(4));
+        let planner = Arc::new(ResidencyPlanner::new(
+            pool.clone(),
+            PlannerConfig::default(),
+        ));
+
+        // A running holder keeps the wedge predicate false throughout, so
+        // the rung under test is never entered for real.
+        let holder = ProcessId::new_v4();
+        planner.register(holder);
+        planner.note_admitted(holder);
+
+        let victim = ProcessId::new_v4();
+        planner.register(victim);
+        planner.note_admitted(victim);
+        planner.with_inner(|inner| inner.killing.insert(victim));
+        assert!(
+            planner.with_inner(|inner| inner.kill_in_flight()),
+            "an ordered destruction counts until it is paid out"
+        );
+
+        // Exit 1 — the victim dies: its pages are back, nothing is owed.
+        planner.unregister(victim);
+        assert!(
+            !planner.with_inner(|inner| inner.kill_in_flight()),
+            "a retired victim cannot still owe pages"
+        );
+
+        // Exit 2 — the victim survives the error and asks again. It is a
+        // legal target once more, so the marker must lift for it too.
+        let survivor = ProcessId::new_v4();
+        planner.register(survivor);
+        planner.note_admitted(survivor);
+        planner.with_inner(|inner| inner.killing.insert(survivor));
+        assert!(planner.with_inner(|inner| inner.kill_in_flight()));
+
+        let demand = Demand {
+            kv_pages: 1, // the pool starts empty, so even one page must park
+            rs_slots: 0,
+        };
+        let p = planner.clone();
+        let parked = tokio::spawn(async move { p.acquire(survivor, survivor, demand).await });
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if planner.diagnostics().queue.len() == 1 {
+                break;
+            }
+        }
+        assert_eq!(planner.diagnostics().queue.len(), 1, "the ask must park");
+        assert!(
+            !planner.with_inner(|inner| inner.kill_in_flight()),
+            "a fresh unmet ask means the victim survived and is contending again"
+        );
+
+        parked.abort();
     }
 }

@@ -18,8 +18,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::checkpoint::CheckpointMetadata;
-use crate::checkpoint::gguf::parse_gguf_checkpoint;
-use crate::checkpoint::safetensors::parse_safetensors_checkpoint;
+use crate::checkpoint::zt;
 use crate::error::Error;
 
 /// Discover the safetensors shard files for a snapshot directory, matching the
@@ -100,26 +99,51 @@ fn discover_gguf_file(snapshot_dir: &Path) -> Option<PathBuf> {
     ggufs.into_iter().next()
 }
 
-/// Parse a checkpoint directory's headers into a [`CheckpointMetadata`],
-/// picking the on-disk format (safetensors, else GGUF). Only headers are read;
-/// bulk tensor bytes are never mapped.
-pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, Error> {
-    if let Some(gguf) = discover_gguf_file(snapshot_dir)
-        && snapshot_dir.is_file()
+/// The single `.zt` checkpoint for a snapshot directory, if present.
+fn discover_zt_file(snapshot_dir: &Path) -> Option<PathBuf> {
+    if snapshot_dir.is_file()
+        && snapshot_dir
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zt"))
     {
-        return parse_gguf_checkpoint(&gguf);
+        return Some(snapshot_dir.to_path_buf());
+    }
+    let named = snapshot_dir.join("model.zt");
+    named.is_file().then_some(named)
+}
+
+/// Parse a checkpoint's headers into a [`CheckpointMetadata`]. Only headers
+/// are read; bulk tensor bytes are never mapped.
+///
+/// Every format is read the same way, through [`zt`]: `ztensor-compat`
+/// projects safetensors, GGUF, `.npz`, `.pt`, `.h5` and `.onnx` into one
+/// object model, and `zt` translates that model into the loader's. This module
+/// is what remains of format knowledge here, and it is not about *formats* --
+/// it is about **layout**: which files on disk make up one checkpoint. That is
+/// a question no format answers about itself. A safetensors snapshot states it
+/// in `model.safetensors.index.json`, a convention beside the format; GGUF and
+/// `.zt` are single-file and state it by being one file.
+///
+/// The order below is the order a snapshot is likely to hold: a `.zt`
+/// artifact (what `pie model optimize` writes), else the canonical HF
+/// safetensors layout, else GGUF.
+pub fn parse_checkpoint_metadata(snapshot_dir: &Path) -> Result<CheckpointMetadata, Error> {
+    if let Some(zt) = discover_zt_file(snapshot_dir) {
+        return zt::parse_checkpoint(&zt);
+    }
+    if snapshot_dir.is_file() {
+        // A file names itself; detection is the projections' job, not a
+        // suffix's.
+        return zt::parse_checkpoint(snapshot_dir);
     }
     // Safetensors takes precedence — it is the canonical HF snapshot format and
     // the C++ loader opens it first.
     match discover_safetensors_files(snapshot_dir) {
-        Ok(files) => parse_safetensors_checkpoint(&files),
-        Err(safetensors_err) => {
-            if let Some(gguf) = discover_gguf_file(snapshot_dir) {
-                parse_gguf_checkpoint(&gguf)
-            } else {
-                Err(safetensors_err)
-            }
-        }
+        Ok(files) => zt::parse_checkpoint_files(&files),
+        Err(safetensors_err) => match discover_gguf_file(snapshot_dir) {
+            Some(gguf) => zt::parse_checkpoint(&gguf),
+            None => Err(safetensors_err),
+        },
     }
 }
 

@@ -154,6 +154,86 @@ inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
         .expect(std::vector<std::int64_t>{rows, logical_cols});
 }
 
+/// The encoding this driver's quantized matvecs read.
+///
+/// `bits` is 4 or 8: `mlx_lm`'s quantization predicate leaves a small, sensitive
+/// projection (gpt-oss's router) at 8 bits while quantizing everything around it
+/// to 4, so a family that declared one width for the whole checkpoint would be
+/// describing a checkpoint that does not exist.
+inline PieLoaderEncodingSpec affine_encoding(int bits, std::uint32_t group_size) {
+    PieLoaderQuantSpecView quant = pie_loader::quant_spec(
+        bits == 4 ? PieLoaderQuantScheme::MlxAffineU4 : PieLoaderQuantScheme::Int8Asymmetric,
+        PieLoaderDType::BF16);
+    quant.bits_per_element = static_cast<std::uint32_t>(bits);
+    quant.group_size = group_size;
+    quant.channel_axis = 1;
+    return pie_loader::quantized(quant);
+}
+
+/// The columns this driver's kernels group under one scale.
+inline constexpr std::int64_t kAffineGroup = 64;
+
+/// Declare a weight the LOADER quantizes, rather than one the checkpoint
+/// shipped quantized.
+///
+/// The distinction is the whole of the difference between a checkpoint someone
+/// converted offline and the one its authors published: `cast` to a quantized
+/// encoding is an encode, and an encode writes `<stem>.scales` and
+/// `<stem>.biases` beside its output as part of the same pass. `output` must
+/// therefore end in `.weight` -- that is the component the metadata names
+/// replace -- and the driver binds all three under exactly the names a
+/// converted checkpoint would have shipped.
+///
+/// `rows` is the product of every axis but the last, because the encode kernel
+/// walks `[rows, cols]` tiles and a stacked expert tensor is a taller matrix as
+/// far as quantization is concerned: the groups run along the last axis either
+/// way.
+inline void push_encoded_affine(ModelContract& out, pie_loader::Node value,
+                                std::int64_t rows, std::int64_t cols, std::string output) {
+    if (cols % kAffineGroup != 0) {
+        fail("Metal: '" + output + "' has " + std::to_string(cols) +
+             " columns, which these group-64 kernels cannot quantize");
+    }
+    const PieLoaderEncodingSpec encoding =
+        affine_encoding(4, static_cast<std::uint32_t>(kAffineGroup));
+    out.define(std::move(output), out.cast(value, encoding), encoding)
+        .expect(std::vector<std::int64_t>{rows, cols});
+}
+
+/// The BF16 values behind an MXFP4 `_blocks`/`_scales` pair.
+///
+/// Two nodes and no kernel of this driver's own: the contract says the packed
+/// bytes are E2M1 nibbles under E8M0 block scales, and the loader's dequantizer
+/// is what turns that declaration into values. The scales have to be *declared*
+/// before they can be scaled by -- `scale_per_block` takes a published tensor,
+/// not a fresh `src` -- so this leaves an internal tensor behind under
+/// `scales_name`.
+///
+/// `blocks` and `scales` are expressions rather than names so a caller can
+/// select the half of a fused tensor it wants before anything is decoded.
+inline pie_loader::Node mxfp4_values(ModelContract& out, pie_loader::Node blocks,
+                                    pie_loader::Node scales, std::int64_t rows,
+                                    std::int64_t cols, const std::string& scales_tensor) {
+    if (cols % 32 != 0) {
+        fail("MXFP4 tensor '" + scales_tensor + "' has " + std::to_string(cols) +
+             " columns, which is not a whole number of 32-element blocks");
+    }
+    const std::vector<std::int64_t> groups{rows, cols / 32};
+    const PieLoaderEncodingSpec e8m0 = pie_loader::raw(PieLoaderDType::E8M0);
+    out.define(scales_tensor, out.transmute(scales, groups, e8m0), e8m0)
+        .expect(groups)
+        .internal();
+
+    PieLoaderQuantSpecView quant = pie_loader::quant_spec(PieLoaderQuantScheme::Mxfp4E2M1E8M0,
+                                                         PieLoaderDType::BF16);
+    quant.bits_per_element = 4;
+    quant.group_size = 32;
+    quant.channel_axis = 1;
+    return out.scale_per_block(
+        out.transmute(blocks, {rows, cols}, pie_loader::quantized(quant)),
+        out.out(scales_tensor));
+}
+
 }  // namespace contract_detail
 
 }  // namespace pie::metal::model
