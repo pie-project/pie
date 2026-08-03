@@ -131,6 +131,10 @@ pub struct PieForwardLlamaLikeCudaFacts {
     pub rope_table: u8,
     /// FlashInfer's decode set lacks this GQA ratio.
     pub force_prefill_path: u8,
+    /// Attention runs at a padded kernel head dim (Phi-3's 96 → 128);
+    /// non-zero is true. Appended field: existing zero-initialized C
+    /// callers read as false.
+    pub head_dim_padded: u8,
 }
 
 fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
@@ -138,6 +142,7 @@ fn read_cuda_facts(facts: &PieForwardLlamaLikeCudaFacts) -> LlamaLikeCudaFacts {
         xqa_decode: facts.xqa_decode != 0,
         decode_fused_post: facts.decode_fused_post != 0,
         rope_table: facts.rope_table != 0,
+        head_dim_padded: facts.head_dim_padded != 0,
         force_prefill_path: facts.force_prefill_path != 0,
     }
 }

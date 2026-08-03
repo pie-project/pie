@@ -307,6 +307,15 @@ pub struct LlamaLikeCudaFacts {
     /// ([`crate::trace::AttnKernel::PrefillDequantDecode`]). XQA, when
     /// eligible, overrides this (context.cpp:1427).
     pub force_prefill_path: bool,
+    /// The attention kernels run at a padded `head_dim_kernel` wider than
+    /// the logical head dim (Phi-3-mini: 96 → 128). A load-time fact
+    /// (`cfg.head_dim != cfg.head_dim_kernel`): the generated form stages
+    /// zero-padded q/k/v copies around the KV write, overrides the
+    /// softmax scale to `1/sqrt(d)`, and strips the attention output —
+    /// the hand-written `head_dim_padded` branches, resolved at emission.
+    /// Serde-defaulted (append-only discipline).
+    #[serde(default)]
+    pub head_dim_padded: bool,
 }
 
 impl LlamaLikeCudaFacts {
@@ -332,6 +341,7 @@ impl LlamaLikeCudaFacts {
             decode_fused_post: true,
             rope_table: true,
             force_prefill_path: false,
+            head_dim_padded: false,
         }
     }
 }

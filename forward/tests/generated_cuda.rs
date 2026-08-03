@@ -53,6 +53,7 @@ fn committed_incs_are_regeneration_clean() {
                 decode_fused_post: true,
                 rope_table: true,
                 force_prefill_path: false,
+                head_dim_padded: false,
             },
             "olmo2_1b",
         ),
@@ -66,8 +67,37 @@ fn committed_incs_are_regeneration_clean() {
                 decode_fused_post: false,
                 rope_table: true,
                 force_prefill_path: true,
+                head_dim_padded: false,
             },
             "qwen2_5_1_5b",
+        ),
+    );
+    check(
+        "mistral_7b_v03",
+        &emit_llama_like_cuda_inc(
+            &LlamaLikeFacts::mistral_7b_v03(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: true,
+                rope_table: true,
+                force_prefill_path: false,
+                head_dim_padded: false,
+            },
+            "mistral_7b_v03",
+        ),
+    );
+    check(
+        "phi3_mini",
+        &emit_llama_like_cuda_inc(
+            &LlamaLikeFacts::phi3_mini(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+                head_dim_padded: true,
+            },
+            "phi3_mini",
         ),
     );
     check_q35(

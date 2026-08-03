@@ -69,6 +69,7 @@ fn main() {
                 decode_fused_post: true,
                 rope_table: true,
                 force_prefill_path: false,
+                head_dim_padded: false,
             },
             "olmo2_1b",
         ),
@@ -91,8 +92,55 @@ fn main() {
                 decode_fused_post: false,
                 rope_table: true,
                 force_prefill_path: true,
+                head_dim_padded: false,
             },
             "qwen2_5_1_5b",
+        ),
+    );
+
+    // Mistral-7B-Instruct-v0.3 on L40S: the fused binding with no
+    // qk-norm (the combination the lowered goldens pinned after the
+    // hoist regression) at 7B scale. GQA 4 is inside the flashinfer
+    // decode set (no force-prefill); XQA off live like every deployment
+    // on this card; dfp TRUE as a fact and unused by the text (the
+    // fused arm also wants per-head qk-norm — the olmo2 precedent).
+    // Facts guessed from the config + binding rules; the live digest
+    // judges them on first boot.
+    write_inc(
+        "mistral_7b_v03",
+        &emit_llama_like_cuda_inc(
+            &LlamaLikeFacts::mistral_7b_v03(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: true,
+                rope_table: true,
+                force_prefill_path: false,
+                head_dim_padded: false,
+            },
+            "mistral_7b_v03",
+        ),
+    );
+
+    // Phi-3-mini-4k on L40S: the padded head dim (96 -> 128) — the
+    // generated form stages the zero-padded q/k/v copies around the KV
+    // write, overrides the softmax scale to 1/sqrt(96), and strips the
+    // attention output, all spelled statically (the interpreter's
+    // head_dim_padded locals became this deployment's constants). MHA
+    // ratio 1 is in the flashinfer decode set (no force-prefill); dfp
+    // off (the derivation's head_dim == head_dim_kernel term). Facts
+    // guessed; the live digest judges them on first boot.
+    write_inc(
+        "phi3_mini",
+        &emit_llama_like_cuda_inc(
+            &LlamaLikeFacts::phi3_mini(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+                head_dim_padded: true,
+            },
+            "phi3_mini",
         ),
     );
 

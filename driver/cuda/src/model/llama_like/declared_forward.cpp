@@ -195,6 +195,8 @@ inline const void* bf16_row(const void* base, int row, int width) {
 #include "model/llama_like/generated/qwen3_0_6b.inc"
 #include "model/llama_like/generated/olmo2_1b.inc"
 #include "model/llama_like/generated/qwen2_5_1_5b.inc"
+#include "model/llama_like/generated/mistral_7b_v03.inc"
+#include "model/llama_like/generated/phi3_mini.inc"
 
 // PIE_DECLARED_FORWARD_GENERATED=1 routes digest-matched fires through
 // the generated static form instead of the interpreter walk — the third
@@ -345,6 +347,9 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // executor still checks emptiness loudly at the table launch.
     cuda.rope_table = 1;
     cuda.force_prefill_path = fwd_cfg.force_prefill_path ? 1 : 0;
+    // Load-time: the kernel head dim the attention runs at vs the logical
+    // one (Phi-3-mini pads 96 -> 128; llama_like.cpp's head_dim_padded).
+    cuda.head_dim_padded = (cfg.head_dim != cfg.head_dim_kernel) ? 1 : 0;
 
     out.decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
@@ -377,7 +382,8 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         "/xqa" + std::to_string(cuda.xqa_decode) +
         "/dfp" + std::to_string(cuda.decode_fused_post) +
         "/rt" + std::to_string(cuda.rope_table) +
-        "/fpp" + std::to_string(cuda.force_prefill_path);
+        "/fpp" + std::to_string(cuda.force_prefill_path) +
+        "/pad" + std::to_string(cuda.head_dim_padded);
     return out;
 }
 
@@ -422,6 +428,8 @@ void llama_like_forward_declared(
         declared.facts_digest != kGeneratedDigest_qwen3_0_6b &&
         declared.facts_digest != kGeneratedDigest_olmo2_1b &&
         declared.facts_digest != kGeneratedDigest_qwen2_5_1_5b &&
+        declared.facts_digest != kGeneratedDigest_mistral_7b_v03 &&
+        declared.facts_digest != kGeneratedDigest_phi3_mini &&
         std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
         // Silent non-engagement is this path's failure mode; say why.
         std::fprintf(stderr,
@@ -432,6 +440,10 @@ void llama_like_forward_declared(
                      kGeneratedDigest_olmo2_1b);
         std::fprintf(stderr, "  emitted: %s\n",
                      kGeneratedDigest_qwen2_5_1_5b);
+        std::fprintf(stderr, "  emitted: %s\n",
+                     kGeneratedDigest_mistral_7b_v03);
+        std::fprintf(stderr, "  emitted: %s\n",
+                     kGeneratedDigest_phi3_mini);
     }
     // A1 (the class-collapse amendment): a custom mask no longer picks a
     // class — the decode/prefill traces carry it as their HasCustomMask
@@ -467,6 +479,16 @@ void llama_like_forward_declared(
         if (declared.facts_digest == kGeneratedDigest_qwen2_5_1_5b) {
             run(generated_llama_like_decode_qwen2_5_1_5b,
                 generated_llama_like_prefill_qwen2_5_1_5b);
+            return;
+        }
+        if (declared.facts_digest == kGeneratedDigest_mistral_7b_v03) {
+            run(generated_llama_like_decode_mistral_7b_v03,
+                generated_llama_like_prefill_mistral_7b_v03);
+            return;
+        }
+        if (declared.facts_digest == kGeneratedDigest_phi3_mini) {
+            run(generated_llama_like_decode_phi3_mini,
+                generated_llama_like_prefill_phi3_mini);
             return;
         }
     }

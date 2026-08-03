@@ -135,6 +135,7 @@ fn qwen2_5_1_5b_cuda_decode() {
                 decode_fused_post: false,
                 rope_table: true,
                 force_prefill_path: true,
+                head_dim_padded: false,
             },
             FireClass::Decode,
         ),
@@ -152,6 +153,47 @@ fn qwen2_5_1_5b_cuda_prefill() {
                 decode_fused_post: false,
                 rope_table: true,
                 force_prefill_path: true,
+                head_dim_padded: false,
+            },
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// The lowered phi3 pins: the first PADDED head dim through the emitter
+/// (96 -> 128) — pad staging around the KV write, the softmax scale
+/// override, the post-attention strip, all constants of the text. The
+/// cuda facts match the live L40S derivation (xqa0/dfp0/rt1/fpp0/pad1).
+#[test]
+fn phi3_mini_cuda_decode() {
+    check_plan(
+        "phi3_mini.cuda.decode",
+        &llama_like_cuda(
+            &LlamaLikeFacts::phi3_mini(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+                head_dim_padded: true,
+            },
+            FireClass::Decode,
+        ),
+    );
+}
+
+#[test]
+fn phi3_mini_cuda_prefill() {
+    check_plan(
+        "phi3_mini.cuda.prefill",
+        &llama_like_cuda(
+            &LlamaLikeFacts::phi3_mini(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+                head_dim_padded: true,
             },
             FireClass::Prefill,
         ),
@@ -454,6 +496,7 @@ fn mistral_7b_v03_cuda_decode() {
                 decode_fused_post: false,
                 rope_table: true,
                 force_prefill_path: false,
+                head_dim_padded: false,
             },
             FireClass::Decode,
         ),
@@ -471,6 +514,7 @@ fn mistral_7b_v03_cuda_prefill() {
                 decode_fused_post: false,
                 rope_table: true,
                 force_prefill_path: false,
+                head_dim_padded: false,
             },
             FireClass::Prefill,
         ),

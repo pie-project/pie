@@ -39,7 +39,7 @@ use crate::trace::{FireClass, ForwardPlan, NormVariant, OpKind, RopeKind};
 /// the live parity gate is what holds them together.
 pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String {
     format!(
-        "llama_like/h{}/l{}/qh{}/kvh{}/hd{}/i{}/v{}/rope{}/nv{}/np{}/qk{}/fq{}/te{}/qb{}/xqa{}/dfp{}/rt{}/fpp{}",
+        "llama_like/h{}/l{}/qh{}/kvh{}/hd{}/i{}/v{}/rope{}/nv{}/np{}/qk{}/fq{}/te{}/qb{}/xqa{}/dfp{}/rt{}/fpp{}/pad{}",
         facts.hidden,
         facts.layers,
         facts.q_heads,
@@ -71,6 +71,7 @@ pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String
         u8::from(cuda.decode_fused_post),
         u8::from(cuda.rope_table),
         u8::from(cuda.force_prefill_path),
+        u8::from(cuda.head_dim_padded),
     )
 }
 
@@ -102,6 +103,7 @@ pub fn emit_llama_like_cuda_inc(
     out.push_str(&emit_class_fn(
         &decode,
         facts,
+        cuda,
         &format!("generated_llama_like_decode_{tag}"),
         true,
     ));
@@ -109,6 +111,7 @@ pub fn emit_llama_like_cuda_inc(
     out.push_str(&emit_class_fn(
         &prefill,
         facts,
+        cuda,
         &format!("generated_llama_like_prefill_{tag}"),
         false,
     ));
@@ -150,6 +153,7 @@ const PARAMS: &str = "\
 fn emit_class_fn(
     plan: &ForwardPlan,
     facts: &LlamaLikeFacts,
+    cuda: &LlamaLikeCudaFacts,
     fn_name: &str,
     is_decode: bool,
 ) -> String {
@@ -158,8 +162,15 @@ fn emit_class_fn(
     // `post_norm` arms line for line.
     let mut b = Body::default();
     b.line(&format!("inline void {fn_name}(\n{PARAMS})\n{{"));
-    b.line("    // Locals mirror the interpreter's preamble (unpadded shape:");
-    b.line("    // the staging aliases are the plain buffers).");
+    if cuda.head_dim_padded {
+        b.line("    // Locals mirror the interpreter's preamble — PADDED shape");
+        b.line("    // (Phi-3's 96 -> 128): the attention consumes zero-padded");
+        b.line("    // dk staging copies, the softmax keeps the real-dim scale,");
+        b.line("    // and the o_proj reads the stripped logical-width output.");
+    } else {
+        b.line("    // Locals mirror the interpreter's preamble (unpadded shape:");
+        b.line("    // the staging aliases are the plain buffers).");
+    }
     b.line("    const int N = total_tokens;");
     b.line("    const int R = num_requests;");
     b.line("    const int H = cfg.hidden_size;");
@@ -172,6 +183,15 @@ fn emit_class_fn(
     b.line("    const int num_kv_heads = cfg.num_key_value_heads;");
     b.line("    const float eps = cfg.rms_norm_eps;");
     b.line("    cudaStream_t stream = cublas.stream();");
+    if cuda.head_dim_padded {
+        b.line("    const int dk = cfg.head_dim_kernel;");
+        b.line("    const float sm_scale_override =");
+        b.line("        1.0f / std::sqrt(static_cast<float>(d));");
+        b.line("    void* const attn_q = ws.q_padded.data();");
+        b.line("    void* const attn_k = ws.k_padded.data();");
+        b.line("    void* const attn_v = ws.v_padded.data();");
+        b.line("    void* const attn_out_buf = ws.attn_out_padded.data();");
+    }
     b.line("    if (std::getenv(\"PIE_DECLARED_FORWARD_TRACE\")) {");
     b.line("        std::fprintf(stderr,");
     b.line(&format!(
@@ -248,7 +268,7 @@ fn emit_class_fn(
         b.line("");
     }
 
-    emit_range(&mut b, plan, facts, is_decode, 0, plan.ops.len(), None);
+    emit_range(&mut b, plan, facts, cuda, is_decode, 0, plan.ops.len(), None);
     b.line("}");
     b.out
 }
@@ -271,6 +291,7 @@ fn emit_range(
     b: &mut Body,
     plan: &ForwardPlan,
     facts: &LlamaLikeFacts,
+    cuda: &LlamaLikeCudaFacts,
     is_decode: bool,
     start: usize,
     end: usize,
@@ -291,7 +312,7 @@ fn emit_range(
             b.stmt("if (fast_rows > 0) {");
             b.indent += 1;
             emit_range(
-                b, plan, facts, is_decode, region, region + *prefix_ops as usize,
+                b, plan, facts, cuda, is_decode, region, region + *prefix_ops as usize,
                 Some(Win { start: "0", len: "fast_rows" }),
             );
             b.indent -= 1;
@@ -300,7 +321,7 @@ fn emit_range(
             b.stmt("if (fast_rows < N) {");
             b.indent += 1;
             emit_range(
-                b, plan, facts, is_decode, region, region + *tail_ops as usize,
+                b, plan, facts, cuda, is_decode, region, region + *tail_ops as usize,
                 Some(Win { start: "fast_rows", len: "(N - fast_rows)" }),
             );
             b.indent -= 1;
@@ -331,19 +352,19 @@ fn emit_range(
                 let kw = if n == 0 { "if" } else { "} else if" };
                 b.stmt(&format!("{kw} ({}) {{", cond_of(&arm.pred)));
                 b.indent += 1;
-                emit_range(b, plan, facts, is_decode, region, region + arm.ops as usize, win);
+                emit_range(b, plan, facts, cuda, is_decode, region, region + arm.ops as usize, win);
                 b.indent -= 1;
                 region += arm.ops as usize;
             }
             b.stmt("} else {");
             b.indent += 1;
-            emit_range(b, plan, facts, is_decode, region, region + *else_ops as usize, win);
+            emit_range(b, plan, facts, cuda, is_decode, region, region + *else_ops as usize, win);
             b.indent -= 1;
             b.stmt("}");
             i = region + *else_ops as usize;
             continue;
         }
-        emit_op(b, op, plan, facts, is_decode, win);
+        emit_op(b, op, plan, facts, cuda, is_decode, win);
         i += 1;
     }
 }
@@ -391,6 +412,7 @@ fn emit_op(
     op: &crate::trace::Op,
     plan: &ForwardPlan,
     facts: &LlamaLikeFacts,
+    cuda: &LlamaLikeCudaFacts,
     is_decode: bool,
     win: Option<Win>,
 ) {
@@ -686,7 +708,7 @@ fn emit_op(
             kernel,
             weights,
             state,
-        } => emit_launch(b, kernel, weights, state.as_ref(), op, facts, is_decode, win),
+        } => emit_launch(b, kernel, weights, state.as_ref(), op, facts, cuda, is_decode, win),
         OpKind::HookSite { stage, layer } => {
             // The interpreter's site handler, transliterated with the
             // stage and layer as constants. Null hooks skip everything
@@ -782,9 +804,36 @@ fn emit_launch(
     state: Option<&crate::trace::StateRef>,
     op: &crate::trace::Op,
     facts: &LlamaLikeFacts,
+    cuda: &LlamaLikeCudaFacts,
     is_decode: bool,
     win: Option<Win>,
 ) {
+    // Padded head dim (Phi-3): the attention consumes the zero-padded
+    // `dk` staging copies and the softmax keeps the real-dim scale —
+    // all resolved AT EMISSION (the interpreter's `head_dim_padded`
+    // locals become constants of this deployment's text).
+    let padded = cuda.head_dim_padded;
+    let q_buf = if padded { "attn_q" } else { "ws.q.data()" };
+    let out_buf = if padded {
+        "attn_out_buf"
+    } else {
+        "ws.attn_out.data()"
+    };
+    let scale = if padded {
+        "sm_scale_override"
+    } else {
+        "/*sm_scale_override=*/-1.f"
+    };
+    // The post-attention strip (padded only): the o_proj GEMM reads the
+    // logical-width ws.attn_out; every attention launch's output gets
+    // stripped into it — the interpreter's name-keyed strip block.
+    let strip = |b: &mut Body| {
+        if padded {
+            b.stmt("kernels::launch_strip_head_dim_bf16(");
+            b.stmt("    attn_out_buf, ws.attn_out.data(),");
+            b.stmt("    N, num_q_heads, d, dk, stream);");
+        }
+    };
     match kernel {
         "launch_rope_standard_table" => {
             b.stmt("if (ws.rope_table.empty()) {");
@@ -797,6 +846,11 @@ fn emit_launch(
             b.stmt("    N, d, cfg.rope_theta, stream);");
         }
         "launch_qkv_decode_qk_norm_rope_write_kv_bf16" => {
+            assert!(
+                !padded,
+                "emitter: the fused decode epilogue requires the unpadded \
+                 head dim (its facts predicate); a padded emission is drift"
+            );
             let layer = state.expect("fused post addresses kv state").layer;
             let (q_norm, k_norm) = (&weights[0], &weights[1]);
             let (ql, _) = split_layer_weight(q_norm).expect("q_norm layer");
@@ -828,12 +882,30 @@ fn emit_launch(
         "launch_write_kv_explicit_bf16" => {
             let layer = state.expect("kv write addresses kv state").layer;
             let (s_, n_) = win.map_or(("0", "N"), |w| (w.start, w.len));
+            if padded {
+                // A windowed write never coincides with padding (the Peel
+                // exists only in the fused deployment, whose facts require
+                // the unpadded head dim) — same invariant as the
+                // interpreter's comment, checked at emission.
+                assert!(win.is_none(), "emitter: windowed write under padding");
+                b.stmt("kernels::launch_pad_head_dim_bf16(");
+                b.stmt("    ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);");
+                b.stmt("kernels::launch_pad_head_dim_bf16(");
+                b.stmt("    ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);");
+                b.stmt("kernels::launch_pad_head_dim_bf16(");
+                b.stmt("    ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);");
+            }
+            let (kbuf, vbuf) = if padded {
+                ("attn_k", "attn_v")
+            } else {
+                ("ws.k.data()", "ws.v.data()")
+            };
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    kernels::launch_write_kv_explicit_bf16(");
             b.stmt("        kv_view,");
-            b.stmt(&format!("        bf16_row(ws.k.data(), {s_}, Hk),"));
-            b.stmt(&format!("        bf16_row(ws.v.data(), {s_}, Hk),"));
+            b.stmt(&format!("        bf16_row({kbuf}, {s_}, Hk),"));
+            b.stmt(&format!("        bf16_row({vbuf}, {s_}, Hk),"));
             b.stmt(&format!("        w_page_d + {s_}, w_off_d + {s_},"));
             b.stmt(&format!("        {n_}, stream,"));
             b.stmt(&format!(
@@ -843,11 +915,25 @@ fn emit_launch(
         }
         "launch_write_kv_to_pages" => {
             let layer = state.expect("kv write addresses kv state").layer;
+            if padded {
+                assert!(win.is_none(), "emitter: windowed write under padding");
+                b.stmt("kernels::launch_pad_head_dim_bf16(");
+                b.stmt("    ws.q.data(), attn_q, N, num_q_heads, d, dk, stream);");
+                b.stmt("kernels::launch_pad_head_dim_bf16(");
+                b.stmt("    ws.k.data(), attn_k, N, num_kv_heads, d, dk, stream);");
+                b.stmt("kernels::launch_pad_head_dim_bf16(");
+                b.stmt("    ws.v.data(), attn_v, N, num_kv_heads, d, dk, stream);");
+            }
+            let kv_bufs = if padded {
+                "kv_view, attn_k, attn_v,"
+            } else {
+                "kv_view, ws.k.data(), ws.v.data(),"
+            };
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             let first = win.map_or("0", |w| w.start);
             b.stmt("    kernels::launch_write_kv_to_pages(");
-            b.stmt("        kv_view, ws.k.data(), ws.v.data(),");
+            b.stmt(&format!("        {kv_bufs}"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("        kv_last_page_lens,");
             b.stmt(&format!(
@@ -869,6 +955,11 @@ fn emit_launch(
             b.stmt("    cfg.rope_theta, eps, stream);");
         }
         "launch_attention_xqa_decode_bf16_prepared" => {
+            assert!(
+                !padded,
+                "emitter: XQA with a padded head dim has no deployment and \
+                 no hand-written reference — refuse rather than guess"
+            );
             let layer = state.expect("attention addresses kv state").layer;
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/false);
             b.stmt(&format!("{{"));
@@ -925,14 +1016,15 @@ fn emit_launch(
                 ));
                 b.stmt("            : fwd_cfg.sliding_window;");
                 b.stmt("    ops::launch_attention_flashinfer_prefill(");
-                b.stmt("        ws.q.data(), kv_view, ws.attn_out.data(),");
+                b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
                 b.stmt("        kv_last_page_lens,");
                 b.stmt("        qo_indptr_h, kv_page_indptr_h,");
                 b.stmt("        N, R, num_q_heads, attn_ws, stream,");
                 b.stmt("        layer_window_left,");
                 b.stmt("        /*logits_soft_cap=*/0.f,");
-                b.stmt("        /*sm_scale_override=*/-1.f);");
+                b.stmt(&format!("        {scale});"));
+                strip(b);
                 b.stmt("}");
                 return;
             }
@@ -947,12 +1039,15 @@ fn emit_launch(
             ));
             b.stmt("    ops::dispatch_attention_flashinfer_prefill_bf16(");
             b.stmt(&format!("        *{plan_cache},"));
-            b.stmt("        ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,");
-            b.stmt("        ws.attn_out.data(),");
+            b.stmt(&format!(
+                "        {q_buf}, kv_view.k_bf16_pages, kv_view.v_bf16_pages,"
+            ));
+            b.stmt(&format!("        {out_buf},"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("        kv_last_page_lens,");
             b.stmt("        attn_ws, stream, /*logits_soft_cap=*/0.f,");
-            b.stmt("        /*sm_scale_override=*/-1.f);");
+            b.stmt(&format!("        {scale});"));
+            strip(b);
             b.stmt("}");
         }
         "dispatch_attention_flashinfer_decode" => {
@@ -984,11 +1079,14 @@ fn emit_launch(
             b.stmt("            : fwd_cfg.sliding_window;");
             b.stmt("    ops::dispatch_attention_flashinfer_decode(");
             b.stmt("        *plan_state.decode_plan,");
-            b.stmt("        ws.q.data(), kv_view, ws.attn_out.data(),");
+            b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
             b.stmt("        attn_page_indices, attn_page_indptr,");
             b.stmt("        attn_last_page_lens,");
             b.stmt("        attn_ws, stream, layer_window_left,");
-            b.stmt("        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);");
+            b.stmt(&format!(
+                "        /*logits_soft_cap=*/0.f, {scale});"
+            ));
+            strip(b);
             b.stmt("}");
         }
         "dispatch_attention_flashinfer_prefill_custom" => {
@@ -1008,10 +1106,11 @@ fn emit_launch(
             ));
             b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
             b.stmt("        *plan_state.prefill_plan,");
-            b.stmt("        ws.q.data(), kv_view, ws.attn_out.data(),");
+            b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
             b.stmt("        attn_ws, stream);");
+            strip(b);
             b.stmt("}");
         }
         "pie_lora_qkv_correction" => {
@@ -1052,16 +1151,19 @@ fn emit_launch(
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    ops::dispatch_attention_flashinfer_decode_capture(");
             b.stmt("        *plan_state.decode_plan,");
-            b.stmt("        ws.q.data(), kv_view, ws.attn_out.data(),");
+            b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
             b.stmt("        attn_page_indices, attn_page_indptr,");
             b.stmt("        attn_last_page_lens,");
             b.stmt("        attn_ws, stream,");
             b.stmt("        score_capture->raw(), score_capture->indptr_d(),");
             b.stmt("        /*window_left=*/-1,");
-            b.stmt("        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);");
+            b.stmt(&format!(
+                "        /*logits_soft_cap=*/0.f, {scale});"
+            ));
             b.stmt("    score_capture->publish(");
             b.stmt("        attn_page_indptr, attn_last_page_lens,");
             b.stmt("        cache.page_size());");
+            strip(b);
             b.stmt("}");
         }
         "dispatch_attention_flashinfer_prefill_capture_bf16" => {
@@ -1086,16 +1188,21 @@ fn emit_launch(
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
             b.stmt("    ops::dispatch_attention_flashinfer_prefill_capture_bf16(");
             b.stmt(&format!("        *{plan_cache},"));
-            b.stmt("        ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,");
-            b.stmt("        ws.attn_out.data(),");
+            b.stmt(&format!(
+                "        {q_buf}, kv_view.k_bf16_pages, kv_view.v_bf16_pages,"
+            ));
+            b.stmt(&format!("        {out_buf},"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("        kv_last_page_lens, attn_ws, stream,");
             b.stmt("        prefill_score_capture->raw(),");
             b.stmt("        prefill_score_capture->folded(),");
             b.stmt("        prefill_score_capture->indptr_d(),");
             b.stmt("        prefill_score_capture->window(),");
-            b.stmt("        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);");
+            b.stmt(&format!(
+                "        /*logits_soft_cap=*/0.f, {scale});"
+            ));
             b.stmt("    prefill_score_capture->publish();");
+            strip(b);
             b.stmt("}");
         }
         other => panic!("emitter: stated kernel {other} out of scope"),

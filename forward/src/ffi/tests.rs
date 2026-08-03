@@ -1089,6 +1089,7 @@ fn lowered_trace_round_trips_through_the_arena() {
         decode_fused_post: 1,
         rope_table: 1,
         force_prefill_path: 0,
+        head_dim_padded: 0,
     };
     let mut out = PieForwardPlan::default();
     assert_eq!(

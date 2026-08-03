@@ -449,6 +449,10 @@ struct PieForwardLlamaLikeCudaFacts {
   uint8_t rope_table;
   /// FlashInfer's decode set lacks this GQA ratio.
   uint8_t force_prefill_path;
+  /// Attention runs at a padded kernel head dim (Phi-3's 96 → 128);
+  /// non-zero is true. Appended field: existing zero-initialized C
+  /// callers read as false.
+  uint8_t head_dim_padded;
 };
 
 /// The qwen3_5_moe MLP-block facts, as C states them. Mirrors

@@ -7,10 +7,10 @@
 // three-way parity gate. One TU per deployment; the `qwen3_0_6b` suffix
 // keeps the symbols apart and the digest constant names the pair.
 //
-// Emitted from: llama_like/h1024/l28/qh16/kvh8/hd128/i3072/v151936/rope0/nv0/np0/qk1/fq1/te0/qb0/xqa0/dfp1/rt1/fpp0
+// Emitted from: llama_like/h1024/l28/qh16/kvh8/hd128/i3072/v151936/rope0/nv0/np0/qk1/fq1/te0/qb0/xqa0/dfp1/rt1/fpp0/pad0
 
 constexpr const char* kGeneratedDigest_qwen3_0_6b =
-    "llama_like/h1024/l28/qh16/kvh8/hd128/i3072/v151936/rope0/nv0/np0/qk1/fq1/te0/qb0/xqa0/dfp1/rt1/fpp0";
+    "llama_like/h1024/l28/qh16/kvh8/hd128/i3072/v151936/rope0/nv0/np0/qk1/fq1/te0/qb0/xqa0/dfp1/rt1/fpp0/pad0";
 
 inline void generated_llama_like_decode_qwen3_0_6b(
 const Qwen3Weights& w,
