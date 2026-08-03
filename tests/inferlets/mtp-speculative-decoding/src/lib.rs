@@ -191,8 +191,8 @@ async fn main(input: Input) -> Result<String> {
         let targets = reduce_argmax(intrinsics::logits());
         let drafts = gather(&win, add(iota(k), 1u32));
         let truth = gather(&targets, iota(k));
-        let acc = cumprod(cast(eq(&drafts, &truth), DType::F32));
-        let m = reshape(cast(reduce_sum(&acc), DType::U32), [1]);
+        let acc = cumprod(cast(eq(&drafts, &truth), dtype::f32));
+        let m = reshape(cast(reduce_sum(&acc), dtype::u32), [1]);
 
         // Committed this round: slot 0 plus the accepted prefix, `-1`-padded
         // to the envelope; all `-1` on post-stop fires.
@@ -208,7 +208,7 @@ async fn main(input: Input) -> Result<String> {
             eos_hit = or(&eos_hit, eq(&committed, Tensor::constant(stop as i32)));
         }
         let eos_any = ne(
-            reduce_max(cast(&eos_hit, DType::U32)),
+            reduce_max(cast(&eos_hit, dtype::u32)),
             Tensor::constant(0u32),
         );
         let stop_next = or(&stop_prev, reshape(eos_any, [1]));
@@ -235,14 +235,14 @@ async fn main(input: Input) -> Result<String> {
         let stop_next_w = broadcast(&stop_next, [w]);
         let next_window = select(&stop_next_w, &neg1_w, &win_next);
         let next_live = ne(&next_window, Tensor::constant(TOKEN_PAD));
-        let next_live_u32 = cast(&next_live, DType::U32);
-        let next_live_f32 = cast(&next_live, DType::F32);
-        let next_rank = cast(sub(cumsum(&next_live_f32), &next_live_f32), DType::U32);
+        let next_live_u32 = cast(&next_live, dtype::u32);
+        let next_live_f32 = cast(&next_live, dtype::f32);
+        let next_rank = cast(sub(cumsum(&next_live_f32), &next_live_f32), dtype::u32);
         let next_positions = add(broadcast(&next_base, [w]), &next_rank);
 
         let next_kv_len = add(&next_positions, &next_live_u32);
         let page_counts = div(add(&next_kv_len, PAGE_T - 1), PAGE_T);
-        let page_tail = cast(cumsum(cast(&page_counts, DType::F32)), DType::U32);
+        let page_tail = cast(cumsum(cast(&page_counts, dtype::f32)), dtype::u32);
         let next_page_indptr = scatter_set(
             broadcast(Tensor::constant(0u32), [w + 1]),
             add(iota(w), 1u32),

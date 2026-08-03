@@ -286,7 +286,7 @@ macro_rules! define_beam_search {
             );
             let (s, i) = top_k(reshape(cand, [B * v]), B);
             let parent = div(&i, v);
-            let tok_i = cast(rem(&i, v), DType::I32);
+            let tok_i = cast(rem(&i, v), dtype::i32);
     
             // 2. flat tail-append positions: wpos = fill + lane.
             let base = fill.take(); // [1]
@@ -347,7 +347,7 @@ macro_rules! define_beam_search {
             out.put(&tok_i);
             out_par.put(&parent);
             out_scr.put(&s);
-            out_greedy.put(&reshape(cast(reduce_argmax(&logits), DType::I32), [B]));
+            out_greedy.put(&reshape(cast(reduce_argmax(&logits), dtype::i32), [B]));
             pool_ids_ch.put(&pids);
         });
     

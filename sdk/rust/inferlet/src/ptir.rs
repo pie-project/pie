@@ -1531,7 +1531,9 @@ pub mod shared_prelude {
         row_membership, scalar_gather, scatter_add, scatter_set, select, sign, sink_window_mask,
         sliding_window_mask, softmax, sort_desc, sub, top_k, transpose,
     };
-    pub use pie_dsl::{DType, Stage};
+    /// Only `Stage`: dtypes are spelled `dtype::f32` and friends, one
+    /// lowercase spelling for the one thing they name.
+    pub use pie_dsl::Stage;
 }
 
 // ---------------------------------------------------------------------------

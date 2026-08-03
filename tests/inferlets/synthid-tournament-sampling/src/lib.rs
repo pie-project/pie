@@ -177,7 +177,7 @@ fn g_layer(secret: u32, counter: &Tensor, layer: u32, vocab: u32) -> Tensor {
     let state = rng_state(secret ^ (G_SALT.wrapping_mul(layer + 1)), counter);
     cast(
         ge(rng(&state, [vocab]), Tensor::constant(0.5f32)),
-        DType::F32,
+        dtype::f32,
     )
 }
 
@@ -188,7 +188,7 @@ fn g_layer(secret: u32, counter: &Tensor, layer: u32, vocab: u32) -> Tensor {
 /// same offset sees the same clamped prefix, so the counter stays a pure
 /// function of the context.
 fn context_counter(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
-    let last = sub(cast(hlen, DType::I32), Tensor::constant(1i32));
+    let last = sub(cast(hlen, dtype::i32), Tensor::constant(1i32));
     let mut h = broadcast(Tensor::constant(0u32), [1]);
     // Oldest token first, so the hash is the usual left-to-right polynomial.
     for d in (0..cfg.context_width).rev() {
@@ -198,7 +198,7 @@ fn context_counter(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
         );
         // `+1` lifts the `-1` padding sentinel to 0 and keeps every real token
         // distinguishable from it.
-        let tok = cast(add(gather(hist, &idx), Tensor::constant(1i32)), DType::U32);
+        let tok = cast(add(gather(hist, &idx), Tensor::constant(1i32)), dtype::u32);
         h = rem(
             add(mul(&h, Tensor::constant(HASH_MULTIPLIER)), tok),
             Tensor::constant(HASH_MODULUS),
@@ -267,7 +267,7 @@ fn step(
     let repeated = gt(
         reduce_max(cast(
             eq(chist, broadcast(&counter, [cfg.history_size])),
-            DType::U32,
+            dtype::u32,
         )),
         Tensor::constant(0u32),
     );

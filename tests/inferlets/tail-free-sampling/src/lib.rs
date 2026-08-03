@@ -136,7 +136,7 @@ fn tail_free_keep(logits: &Tensor, vocab: u32, k_max: u32, z: f32) -> (Tensor, T
 
     let zeros = broadcast(Tensor::constant(0.0f32), [k_max]);
     let kept_mass = reshape(reduce_sum(select(&keep_sorted, &p, &zeros)), [1]);
-    let kept = reshape(reduce_sum(cast(&keep_sorted, DType::F32)), [1]);
+    let kept = reshape(reduce_sum(cast(&keep_sorted, dtype::f32)), [1]);
 
     let base = broadcast(Tensor::constant(false), [vocab]);
     let keep = scatter_set(base, &order, keep_sorted);

@@ -163,9 +163,9 @@ fn xtc_mask(
         broadcast(&fired, [vocab]),
         and(&above, gt(&probs, broadcast(&min_above, [vocab]))),
     );
-    let dropped = reshape(reduce_sum(cast(&drop, DType::F32)), [1]);
+    let dropped = reshape(reduce_sum(cast(&drop, dtype::f32)), [1]);
     let keep = and(&kept_floor, not(&drop));
-    (keep, dropped, reshape(cast(&fired, DType::F32), [1]))
+    (keep, dropped, reshape(cast(&fired, dtype::f32), [1]))
 }
 
 /// One sampling step: temperature, head removal, Gumbel-max draw.

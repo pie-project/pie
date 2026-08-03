@@ -156,7 +156,7 @@ async fn main(input: Input) -> Result<Output> {
             let r_next = add(&r, iota(2));
             tok_out_p.put(&token);
             if want_stats {
-                let mirror = reshape(cast(&token, DType::F32), [1]);
+                let mirror = reshape(cast(&token, dtype::f32), [1]);
                 s1_out_p.put(&mirror);
                 s2_out_p.put(&mirror);
             }
@@ -247,7 +247,7 @@ async fn main(input: Input) -> Result<Output> {
             page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
             tok_out.put(&token);
             if want_stats {
-                let mirror = reshape(cast(&token, DType::F32), [1]);
+                let mirror = reshape(cast(&token, dtype::f32), [1]);
                 s1_out.put(&mirror);
                 s2_out.put(&mirror);
             }

@@ -177,9 +177,9 @@ struct Cfg {
 /// `alive`, which never resurrects once cleared.
 fn suffix_match(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
     let l = cfg.capacity;
-    let pos = cast(iota(l), DType::I32);
+    let pos = cast(iota(l), dtype::i32);
     let zero_i = broadcast(Tensor::constant(0i32), [l]);
-    let last = sub(cast(hlen, DType::I32), Tensor::constant(1i32));
+    let last = sub(cast(hlen, dtype::i32), Tensor::constant(1i32));
 
     // A position is a candidate only if the token after it was actually
     // written, which rules out the tail itself.
@@ -201,7 +201,7 @@ fn suffix_match(hist: &Tensor, hlen: &Tensor, cfg: Cfg) -> Tensor {
         let tail_ok = broadcast(ge(&tail, Tensor::constant(0i32)), [l]);
 
         alive = and(and(alive, matches), and(in_window, tail_ok));
-        m = add(&m, cast(&alive, DType::F32));
+        m = add(&m, cast(&alive, dtype::f32));
     }
     m
 }
@@ -217,7 +217,7 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
     // scatter in bounds over the buffer's unwritten tail, whose lanes carry a
     // zero vote anyway.
     let next_idx = min_elem(
-        add(cast(iota(l), DType::I32), Tensor::constant(1i32)),
+        add(cast(iota(l), dtype::i32), Tensor::constant(1i32)),
         broadcast(Tensor::constant(l as i32 - 1), [l]),
     );
     let next_tok = max_elem(
@@ -230,7 +230,7 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
     // Ascending, so the longest match is written last and wins.
     for n in cfg.allowed_length..=cfg.max_ngram {
         let hit = ge(&m, broadcast(Tensor::constant(n as f32), [l]));
-        let votes = scatter_add(&vocab_zero, &next_tok, cast(&hit, DType::F32));
+        let votes = scatter_add(&vocab_zero, &next_tok, cast(&hit, dtype::f32));
         let charge = cfg.multiplier * cfg.base.powi((n - cfg.allowed_length) as i32);
         penalty = select(
             gt(&votes, &vocab_zero),
@@ -240,7 +240,7 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
     }
 
     let count = reshape(
-        reduce_sum(cast(&gt(&penalty, &vocab_zero), DType::F32)),
+        reduce_sum(cast(&gt(&penalty, &vocab_zero), dtype::f32)),
         [1],
     );
     let peak = reshape(reduce_max(&penalty), [1]);

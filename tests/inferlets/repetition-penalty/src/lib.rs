@@ -155,10 +155,10 @@ fn apply_penalties(
     );
     let pres = mul(
         broadcast(Tensor::constant(cfg.presence_penalty), [vocab]),
-        cast(&out_seen, DType::F32),
+        cast(&out_seen, dtype::f32),
     );
 
-    let penalized = reshape(reduce_sum(cast(&seen, DType::F32)), [1]);
+    let penalized = reshape(reduce_sum(cast(&seen, dtype::f32)), [1]);
     let peak = reshape(reduce_max(counts), [1]);
     (sub(sub(&l, &freq), &pres), penalized, peak)
 }

@@ -107,7 +107,7 @@ fn mirostat_step(
     let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
     let masked = select(&mask, &logits, &neg_inf);
     let token = gumbel_max(masked, r); // [1] i32
-    let p_token = scalar_gather(&probs, cast(&token, DType::U32)); // [1] f32
+    let p_token = scalar_gather(&probs, cast(&token, dtype::u32)); // [1] f32
     let surprise = neg(log(p_token)); // [1] f32
     (token, surprise)
 }

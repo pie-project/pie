@@ -117,7 +117,7 @@ fn truncation_keep(
 
     let zeros = broadcast(Tensor::constant(0.0f32), [vocab]);
     let kept_mass = reshape(reduce_sum(select(&keep, &probs, &zeros)), [1]);
-    let kept = reshape(reduce_sum(cast(&keep, DType::F32)), [1]);
+    let kept = reshape(reduce_sum(cast(&keep, dtype::f32)), [1]);
     (keep, kept, kept_mass)
 }
 
