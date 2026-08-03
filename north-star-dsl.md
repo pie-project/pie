@@ -841,3 +841,18 @@ the comment that justified it ("a lora fire never enters capture") is
 retired. Gate: solo lora byte-stable across a cross-build stash diff;
 zero-adapter equivalence holds. Step 2: slab uploads to a
 prepare-style stage pass, then the fingerprint + eligibility.
+
+Campaign step 2 landed (`dfe182e02`): the stage/launch split. The
+whole slab computes and uploads ONCE at fire setup (every slot value
+is a fire constant — arena addresses, layer-strided adapter slices,
+ws buffer rows); the per-member M arrays precompute into the groups;
+apply() is slot arithmetic + GEMM launches only. The capture-fatal
+pattern (per-layer pageable memcpyAsync from a scope-dying vector) is
+gone. Gates: solo lora byte-stable vs pre-campaign; zero-grouped
+z1==z2 steady-state across repeated runs (the single False is a
+cold-boot first-round composition transient — lane arrival staggers
+through warmup; the deterministic solo oracle carries correctness).
+Step 3: the fingerprint + eligibility — LoraFireState's shape tuple
+(lane count, ranks, sites, spans, grouping) hashes into a per-key
+exec store on the hook pattern; pure decode's span-of-1 keeps it
+stable across a workload's steps.
