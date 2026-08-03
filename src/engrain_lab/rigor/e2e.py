@@ -198,6 +198,17 @@ def main() -> int:
         "matcher's per-sequence call is schema-agnostic. It also makes the "
         "compiler part of the measurement, which is where we are weakest.",
     )
+    parser.add_argument(
+        "--schemas",
+        type=int,
+        default=None,
+        help="how many distinct schemas to draw from, cycling to fill the "
+        "batch. 1 is the other extreme from all-distinct: every request under "
+        "the same grammar in the same parse state, which is exactly what the "
+        "fill deduplicates, so it is the case that should flatter us most. "
+        "Under --unique the schemas come from the corpus, so sweeping this is "
+        "what finds the count at which sharing stops paying for residency.",
+    )
     parser.add_argument("--memory", type=float, default=0.45)
     arguments = parser.parse_args()
 
@@ -229,23 +240,28 @@ def main() -> int:
         "backend": arguments.backend,
         "model": arguments.model,
         "unique": arguments.unique,
+        "schemas": arguments.schemas,
         "rows": [],
     }
     for batch in arguments.batches:
         if arguments.unique:
-            assigned = [corpus[i % len(corpus)] for i in range(batch)]
+            pool = min(arguments.schemas or len(corpus), len(corpus))
+            pool = max(1, pool)
+            assigned = [corpus[i % pool] for i in range(batch)]
             prompts = [
                 f"Produce one JSON document, number {i}. JSON only."
                 for i in range(batch)
             ]
-            distinct = min(batch, len(corpus))
+            distinct = min(batch, pool)
         else:
-            assigned = [SCHEMAS[i % len(SCHEMAS)] for i in range(batch)]
+            pool = arguments.schemas or len(SCHEMAS)
+            pool = max(1, min(pool, len(SCHEMAS)))
+            assigned = [SCHEMAS[i % pool] for i in range(batch)]
             prompts = [
-                f"Give a JSON {SUBJECTS[i % len(SCHEMAS)]} record {i}. JSON only."
+                f"Give a JSON {SUBJECTS[i % pool]} record {i}. JSON only."
                 for i in range(batch)
             ]
-            distinct = min(batch, len(SCHEMAS))
+            distinct = min(batch, pool)
         params = [
             SamplingParams(
                 temperature=0.8,
@@ -319,6 +335,8 @@ def main() -> int:
 
     RESULTS.mkdir(exist_ok=True)
     tag = "-unique" if arguments.unique else ""
+    if arguments.schemas:
+        tag = f"{tag}-{arguments.schemas}schema"
     out = RESULTS / f"e2e-{arguments.backend}{tag}.json"
     out.write_text(json.dumps(report, indent=2))
     print(f"written to {out}")
