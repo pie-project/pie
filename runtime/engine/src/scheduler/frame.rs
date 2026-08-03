@@ -369,7 +369,7 @@ pub(super) struct FramePolicy {
     truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
-    /// Deadline for the join-gate grace period ([`FramePolicy::join_gate_circular`]).
+    /// Deadline for the join gate's hold ([`JOIN_SETTLE_US`]).
     join_hold_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
     /// Lanes with fires the engine has dispatched but not yet retired: the
@@ -1287,27 +1287,20 @@ impl FramePolicy {
                 return FramePlan::Terminate(expired);
             }
             let joining = engine_owes;
-            // `missing == 0` is the second, wider way out of the join gate,
-            // and unlike `join_gate_circular` it needs no circularity proof:
-            // every lane the seal is actually waiting on has already
-            // submitted, and nothing is executing to re-decide the boundary.
-            // A joiner is by definition NOT a member yet — it has no lane in
-            // the wait-set — so sealing here excludes nobody. It only starts
-            // the next epoch without a process that was going to arrive
-            // anyway, which is a density optimisation, never correctness.
+            // Holding the seal for a joiner is a density optimisation, never
+            // correctness: a joiner is by definition NOT a member yet — it
+            // has no lane in the wait-set — so sealing without it excludes
+            // nobody. It merely starts the next epoch one process short of
+            // what it could have carried.
             //
-            // `is_joining()` claims that optimisation far too readily under
-            // churn: `(pending_slots > 0 || !departing.is_empty()) &&
-            // !staged.is_empty()` is essentially always true once the pool is
-            // oversubscribed, so a fully-submitted boundary sat out the whole
-            // strict-watchdog window while the GPU idled. Measured on
-            // `churn_extreme` (1024-way over 96 pages): 51.3s with 23 submit
-            // deadline breaches and five `[frame-stall]` reports before,
-            // 33.6s with all 4096 requests completed after.
+            // So the hold is only worth taking when the boundary is otherwise
+            // finished: every lane it actually waits on has submitted and
+            // nothing is executing to re-decide it. Anywhere else, waiting
+            // would trade real work for a speculative passenger.
             let joining = if joining && missing == 0 && !executing {
-                // A healthy gather resolves in microseconds, so waiting
-                // JOIN_GRACE_US before concluding the claim is false costs
-                // nothing and keeps the dense wait-all path.
+                // The joiner is named (see `earmarked`), so the only thing
+                // left between it and the boundary is guest time, which has
+                // no upper bound. Bound it and move on.
                 let deadline = *self
                     .join_hold_deadline
                     .get_or_insert(now + Duration::from_micros(JOIN_SETTLE_US));
