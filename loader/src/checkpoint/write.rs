@@ -206,39 +206,56 @@ fn zero_tensor(packing: &str) -> Value {
     ])
 }
 
-/// Writes `tensors` as one canonical `.zt` file at `path`.
+/// Writes a checkpoint one tensor at a time, payloads in chunks.
 ///
-/// `metadata` lands in the file's attributes. Canonical form requires
-/// ascending names, so the tensors are sorted on the way out — which also
-/// makes the output byte-identical for identical input.
-pub fn write_zt(
-    path: &Path,
-    metadata: &BTreeMap<String, String>,
-    tensors: &[WriteTensor<'_>],
-) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            Error::Checkpoint(format!("cannot create {}: {err}", parent.display()))
-        })?;
+/// The streaming face of [`write_zt`], for callers whose payloads should never
+/// all be resident at once — `pie model optimize` copies multi-gigabyte
+/// tensors straight from the source checkpoint through a bounded buffer.
+/// Canonical form requires objects in ascending name order; [`write_zt`] sorts
+/// for its caller, this type trusts its caller to add in order.
+pub struct CheckpointWriter {
+    /// `None` only after [`finish`](CheckpointWriter::finish) has taken it.
+    writer: Option<ztensor::Writer>,
+    open: Option<ztensor::Sink>,
+}
+
+impl CheckpointWriter {
+    /// Opens a checkpoint at `path`; `metadata` lands in the file's
+    /// attributes.
+    ///
+    /// Publication is atomic: the writer puts bytes beside the target and
+    /// moves them into place on [`finish`](Self::finish), so a run that dies
+    /// mid-write leaves nothing.
+    pub fn create(path: &Path, metadata: &BTreeMap<String, String>) -> Result<Self, Error> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                Error::Checkpoint(format!("cannot create {}: {err}", parent.display()))
+            })?;
+        }
+        let mut writer = ztensor::Writer::publish(path).map_err(Error::from)?;
+        if !metadata.is_empty() {
+            writer.set_attributes(Value::Map(
+                metadata
+                    .iter()
+                    .map(|(k, v)| (Value::Text(k.clone()), Value::Text(v.clone())))
+                    .collect(),
+            ));
+        }
+        Ok(Self {
+            writer: Some(writer),
+            open: None,
+        })
     }
-    // Publication is atomic: the writer puts bytes beside the target and moves
-    // them into place at the end, so a run that dies mid-write leaves nothing.
-    let mut writer = ztensor::Writer::publish(path).map_err(Error::from)?;
 
-    if !metadata.is_empty() {
-        writer.set_attributes(Value::Map(
-            metadata
-                .iter()
-                .map(|(k, v)| (Value::Text(k.clone()), Value::Text(v.clone())))
-                .collect(),
-        ));
-    }
-
-    let mut ordered: Vec<&WriteTensor<'_>> = tensors.iter().collect();
-    ordered.sort_by(|a, b| a.decl.name.cmp(&b.decl.name));
-
-    for tensor in ordered {
-        let decl = tensor.decl;
+    /// Declares a tensor and opens it for writing. Its payload is exactly
+    /// `nbytes` bytes, delivered by [`write`](Self::write).
+    pub fn begin_tensor(&mut self, decl: &TensorDecl, nbytes: u64) -> Result<(), Error> {
+        if self.open.is_some() {
+            return Err(Error::Checkpoint(format!(
+                "tensor {} was begun while another is still open",
+                decl.name
+            )));
+        }
         let (dtype, ltype) = storage_of(decl.encoding.dtype(), &decl.encoding)?;
         let shape: Vec<u64> = decl
             .shape
@@ -250,7 +267,7 @@ pub fn write_zt(
             })
             .collect::<Result<_, _>>()?;
         let (layout, attributes) = profile_of(&decl.encoding)?;
-        let mut object = writer.object(&decl.name).shape(shape).layout(layout);
+        let mut object = self.writer().object(&decl.name).shape(shape).layout(layout);
         if let Some(attributes) = attributes {
             object = object.attributes(attributes);
         }
@@ -258,10 +275,71 @@ pub fn write_zt(
         if let Some(ltype) = ltype {
             object = object.logical(ltype);
         }
-        object.bytes(tensor.bytes).add().map_err(Error::from)?;
+        self.open = Some(object.length(nbytes).stream().map_err(Error::from)?);
+        Ok(())
     }
-    writer.finish().map_err(Error::from)?;
-    Ok(())
+
+    /// Appends bytes to the open tensor.
+    pub fn write(&mut self, chunk: &[u8]) -> Result<(), Error> {
+        let sink = self
+            .open
+            .as_mut()
+            .ok_or_else(|| Error::Checkpoint("no tensor is open".into()))?;
+        let writer = self.writer.as_mut().expect("writer present");
+        sink.write(writer, chunk).map_err(Error::from)
+    }
+
+    /// Closes the open tensor, which must have received its whole payload.
+    pub fn end_tensor(&mut self) -> Result<(), Error> {
+        let sink = self
+            .open
+            .take()
+            .ok_or_else(|| Error::Checkpoint("no tensor is open".into()))?;
+        let writer = self.writer.as_mut().expect("writer present");
+        sink.close(writer).map_err(Error::from)
+    }
+
+    /// Adds a tensor whose payload is already in memory.
+    pub fn add_tensor(&mut self, decl: &TensorDecl, bytes: &[u8]) -> Result<(), Error> {
+        self.begin_tensor(decl, bytes.len() as u64)?;
+        self.write(bytes)?;
+        self.end_tensor()
+    }
+
+    /// Closes the manifest and moves the file into place.
+    pub fn finish(mut self) -> Result<(), Error> {
+        if self.open.is_some() {
+            return Err(Error::Checkpoint(
+                "finish was called while a tensor is still open".into(),
+            ));
+        }
+        let writer = self.writer.take().expect("writer present");
+        writer.finish().map_err(Error::from)?;
+        Ok(())
+    }
+
+    fn writer(&mut self) -> &mut ztensor::Writer {
+        self.writer.as_mut().expect("writer present")
+    }
+}
+
+/// Writes `tensors` as one canonical `.zt` file at `path`.
+///
+/// `metadata` lands in the file's attributes. Canonical form requires
+/// ascending names, so the tensors are sorted on the way out — which also
+/// makes the output byte-identical for identical input.
+pub fn write_zt(
+    path: &Path,
+    metadata: &BTreeMap<String, String>,
+    tensors: &[WriteTensor<'_>],
+) -> Result<(), Error> {
+    let mut writer = CheckpointWriter::create(path, metadata)?;
+    let mut ordered: Vec<&WriteTensor<'_>> = tensors.iter().collect();
+    ordered.sort_by(|a, b| a.decl.name.cmp(&b.decl.name));
+    for tensor in ordered {
+        writer.add_tensor(tensor.decl, tensor.bytes)?;
+    }
+    writer.finish()
 }
 
 #[cfg(test)]
@@ -360,6 +438,42 @@ mod tests {
             other => panic!("expected a quantized encoding, got {other:?}"),
         }
         assert_eq!(w.shape, vec![2, 32]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Streaming a payload in uneven chunks produces the same file as handing
+    /// it over whole — how the producer sliced its reads is not the file's
+    /// business.
+    #[test]
+    fn chunked_streaming_matches_whole_bytes() {
+        let dir = tmpdir("chunked");
+        let bytes: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let d = decl("w", vec![4096], Encoding::Raw(DType::U8));
+
+        let whole = dir.join("whole.zt");
+        write_zt(
+            &whole,
+            &BTreeMap::new(),
+            &[WriteTensor {
+                decl: &d,
+                bytes: &bytes,
+            }],
+        )
+        .unwrap();
+
+        let chunked = dir.join("chunked.zt");
+        let mut writer = CheckpointWriter::create(&chunked, &BTreeMap::new()).unwrap();
+        writer.begin_tensor(&d, bytes.len() as u64).unwrap();
+        for chunk in bytes.chunks(97) {
+            writer.write(chunk).unwrap();
+        }
+        writer.end_tensor().unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(
+            std::fs::read(&whole).unwrap(),
+            std::fs::read(&chunked).unwrap()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

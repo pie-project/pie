@@ -57,6 +57,27 @@ pub fn parse_checkpoint_files(paths: &[PathBuf]) -> Result<CheckpointMetadata, E
     describe(&ztensor_compat::index_all(paths).map_err(Error::from)?)
 }
 
+/// Verifies every tensor digest of a `.zt` artifact; returns the tensor count.
+///
+/// The gate a destructive caller (`pie model optimize --delete-source`) runs
+/// before destroying what the artifact was computed from. A part *without* a
+/// digest fails rather than passes: "nothing was checked" cannot justify a
+/// delete.
+pub fn verify_checkpoint(path: &Path) -> Result<usize, Error> {
+    let source = Source::open(path).map_err(Error::from)?;
+    let mut count = 0usize;
+    for tensor in source.tensors() {
+        if tensor.verify_all().map_err(Error::from)? == ztensor::Verified::NoDigest {
+            return Err(Error::Checkpoint(format!(
+                "tensor '{}' carries no digest to verify",
+                tensor.name()
+            )));
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Turns an opened source into the loader's metadata.
 ///
 /// The single-file and multi-file cases are one function because the source
