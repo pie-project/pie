@@ -25,6 +25,7 @@
 #include "kernels/swiglu.hpp"
 #include "model/attn_page_mask.hpp"
 #include "model/attn_score.hpp"
+#include "model/lora.hpp"
 #include "model/stage_hooks.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_xqa.hpp"
@@ -113,6 +114,7 @@ enum class LaunchKernel {
     AttentionFlashinferPrefillCapture,
     WriteKvExplicit,
     WriteKvToPages,
+    LoraQkvCorrection,
 };
 
 LaunchKernel resolve_launch_kernel(std::string_view kernel) {
@@ -151,6 +153,9 @@ LaunchKernel resolve_launch_kernel(std::string_view kernel) {
     }
     if (kernel == "launch_write_kv_to_pages") {
         return LaunchKernel::WriteKvToPages;
+    }
+    if (kernel == "pie_lora_qkv_correction") {
+        return LaunchKernel::LoraQkvCorrection;
     }
     throw std::runtime_error(
         "declared forward: stated kernel '" + std::string(kernel) +
@@ -385,7 +390,8 @@ void llama_like_forward_declared(
     int runtime_window_left,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
-    const StageHooks* stage_hooks)
+    const StageHooks* stage_hooks,
+    const LoraTable* lora)
 {
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
@@ -404,7 +410,7 @@ void llama_like_forward_declared(
     // class — the decode/prefill traces carry it as their HasCustomMask
     // guard arm, so the generated static form serves masked fires too
     // (the mask data crosses as arguments).
-    if (stage_hooks == nullptr &&
+    if (stage_hooks == nullptr && lora == nullptr &&
         generated_forward_enabled() &&
         declared.facts_digest == kGeneratedForDigest) {
         (is_pure_decode ? generated_llama_like_decode
@@ -417,7 +423,7 @@ void llama_like_forward_declared(
             logit_row_indices_d, num_logit_rows,
             w_page_d, w_off_d, row_valid_d, has_write_desc,
             custom_mask_d, custom_mask_indptr_d,
-            stage_hooks);
+            stage_hooks, lora);
         return;
     }
     // Rung 2 + A2: the fire's SHAPE picks its trace, and the trace
@@ -465,6 +471,20 @@ void llama_like_forward_declared(
     // Inherit cublas's stream so every launch lands on the captured graph,
     // for the reason llama_like_forward_paged states at its stream setup.
     cudaStream_t stream = cublas.stream();
+    // The §5.1 lora fire staging: adapters cast + grouped once per fire
+    // (the hand-written `lora_state`), consumed by the HasLora guard's
+    // correction launches. Constructed only when the predicate holds.
+    const bool has_lora = lora != nullptr && lora->usable();
+    std::optional<LoraFireStateHandle> lora_state;
+    if (has_lora) {
+        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, /*tp=*/1, stream);
+        if (std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[lora-fire] declared R=%d lanes=%u grouping=%s\n",
+                         R, lora->count, lora_state->grouping_desc().c_str());
+        }
+    }
+
     // With padding the attention kernel runs at `dk` but the softmax must
     // stay scaled to the real head dim — `1/sqrt(d)`, the hand-written
     // override. Unpadded, -1 lets the dispatch pick `1/sqrt(dk)` (== d).
@@ -1068,6 +1088,33 @@ void llama_like_forward_declared(
                                            : nullptr);
                 break;
             }
+            case LaunchKernel::LoraQkvCorrection: {
+                // The pseudo-symbol: one operation, many calls — the
+                // hand-written apply, argument for argument (qkv_in is
+                // the buffer the projections read; scratch borrows
+                // ws.gate exactly as the hand-written call does). The
+                // LAYER comes from the op's own tag, NOT the state
+                // param (this launch addresses no implicit store, so
+                // param1 rests at 0 — reading it applied layer 0's
+                // adapter slice everywhere, the bug the first live A/B
+                // caught).
+                if (!lora_state) {
+                    throw std::runtime_error(
+                        "declared forward: lora correction stated but no "
+                        "usable lora table (guard/pred drift)");
+                }
+                if (op.layer < 0) {
+                    throw std::runtime_error(
+                        "declared forward: lora correction without a "
+                        "layer tag");
+                }
+                const void* const qkv_in =
+                    post_norm ? ws.y.data() : ws.norm_x.data();
+                lora_state->apply(
+                    cublas.handle(), op.layer, qkv_in, H, Hq, Hk,
+                    ws.q.data(), ws.v.data(), ws.gate.data());
+                break;
+            }
             case LaunchKernel::WriteKvToPages: {
                 auto kv_view = cache.layer_view(L);
                 // (Pad staging comment above applies here too.)
@@ -1258,9 +1305,14 @@ void llama_like_forward_declared(
                     return custom_mask_d != nullptr;
                 case static_cast<std::uint32_t>(
                     pie_forward::PieForwardGuardPred::HasStageHooks):
-                    // A2: the hooked arm (the caller's gate admits only
-                    // all-hooked fires, so presence ⇔ fast_rows == 0).
+                    // A2: the hooked arm (retired vocabulary since A3;
+                    // kept for any trace that still states it).
                     return stage_hooks != nullptr;
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::HasLora):
+                    // The §5.1 correction arm: usable lora lanes take the
+                    // general sequence + the correction pseudo-symbol.
+                    return has_lora;
                 default:
                     throw std::runtime_error(
                         "declared forward: guard predicate kind " +

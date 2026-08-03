@@ -218,7 +218,11 @@ enum class PieForwardGuardPred : uint32_t {
   HasCustomMask = 4,
   /// The fire carries attached stage-hook programs (`stage_hooks !=
   /// nullptr`) — A2, the class-collapse amendment. Payload unused.
+  /// Retired since A3 (reserved, unstated).
   HasStageHooks = 5,
+  /// The fire carries usable lora lanes (the §5.1 correction).
+  /// Payload unused.
+  HasLora = 6,
 };
 
 /// The llama_like facts, as C states them. Mirrors

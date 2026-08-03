@@ -38,7 +38,8 @@ const std::uint8_t* row_valid_d,
 bool has_write_desc,
 const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
-const StageHooks* hooks)
+const StageHooks* hooks,
+const LoraTable* lora)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
@@ -89,6 +90,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -130,6 +138,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[0].qkv_proj_fused, "layer.0.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[0].q_norm, "layer.0.q_norm")->data(),
+            require(w.layers[0].k_norm, "layer.0.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(0);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(0);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(0);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[0]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -276,6 +366,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -317,6 +414,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[1].qkv_proj_fused, "layer.1.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[1].q_norm, "layer.1.q_norm")->data(),
+            require(w.layers[1].k_norm, "layer.1.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(1);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(1);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(1);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[1]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -463,6 +642,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -504,6 +690,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[2].qkv_proj_fused, "layer.2.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[2].q_norm, "layer.2.q_norm")->data(),
+            require(w.layers[2].k_norm, "layer.2.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(2);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(2);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(2);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[2]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -650,6 +918,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -691,6 +966,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[3].qkv_proj_fused, "layer.3.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[3].q_norm, "layer.3.q_norm")->data(),
+            require(w.layers[3].k_norm, "layer.3.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(3);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(3);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(3);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[3]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -837,6 +1194,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -878,6 +1242,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[4].qkv_proj_fused, "layer.4.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[4].q_norm, "layer.4.q_norm")->data(),
+            require(w.layers[4].k_norm, "layer.4.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(4);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(4);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(4);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[4]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1024,6 +1470,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -1065,6 +1518,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[5].qkv_proj_fused, "layer.5.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[5].q_norm, "layer.5.q_norm")->data(),
+            require(w.layers[5].k_norm, "layer.5.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(5);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(5);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(5);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[5]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1211,6 +1746,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -1252,6 +1794,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[6].qkv_proj_fused, "layer.6.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[6].q_norm, "layer.6.q_norm")->data(),
+            require(w.layers[6].k_norm, "layer.6.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(6);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(6);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(6);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[6]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1398,6 +2022,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -1439,6 +2070,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[7].qkv_proj_fused, "layer.7.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[7].q_norm, "layer.7.q_norm")->data(),
+            require(w.layers[7].k_norm, "layer.7.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(7);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(7);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(7);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[7]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1585,6 +2298,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -1626,6 +2346,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[8].qkv_proj_fused, "layer.8.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[8].q_norm, "layer.8.q_norm")->data(),
+            require(w.layers[8].k_norm, "layer.8.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(8);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(8);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(8);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[8]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1772,6 +2574,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -1813,6 +2622,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[9].qkv_proj_fused, "layer.9.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[9].q_norm, "layer.9.q_norm")->data(),
+            require(w.layers[9].k_norm, "layer.9.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(9);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(9);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(9);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[9]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1959,6 +2850,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -2000,6 +2898,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[10].qkv_proj_fused, "layer.10.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[10].q_norm, "layer.10.q_norm")->data(),
+            require(w.layers[10].k_norm, "layer.10.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(10);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(10);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(10);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[10]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2146,6 +3126,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -2187,6 +3174,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[11].qkv_proj_fused, "layer.11.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[11].q_norm, "layer.11.q_norm")->data(),
+            require(w.layers[11].k_norm, "layer.11.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(11);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(11);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(11);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[11]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2333,6 +3402,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -2374,6 +3450,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[12].qkv_proj_fused, "layer.12.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[12].q_norm, "layer.12.q_norm")->data(),
+            require(w.layers[12].k_norm, "layer.12.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(12);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(12);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(12);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[12]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2520,6 +3678,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -2561,6 +3726,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[13].qkv_proj_fused, "layer.13.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[13].q_norm, "layer.13.q_norm")->data(),
+            require(w.layers[13].k_norm, "layer.13.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(13);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(13);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(13);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[13]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2707,6 +3954,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -2748,6 +4002,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[14].qkv_proj_fused, "layer.14.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[14].q_norm, "layer.14.q_norm")->data(),
+            require(w.layers[14].k_norm, "layer.14.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(14);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(14);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(14);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[14]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2894,6 +4230,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -2935,6 +4278,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[15].qkv_proj_fused, "layer.15.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[15].q_norm, "layer.15.q_norm")->data(),
+            require(w.layers[15].k_norm, "layer.15.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(15);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(15);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(15);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[15]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3081,6 +4506,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -3122,6 +4554,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[16].qkv_proj_fused, "layer.16.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[16].q_norm, "layer.16.q_norm")->data(),
+            require(w.layers[16].k_norm, "layer.16.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(16);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(16);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(16);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     16 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[16]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3268,6 +4782,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -3309,6 +4830,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[17].qkv_proj_fused, "layer.17.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[17].q_norm, "layer.17.q_norm")->data(),
+            require(w.layers[17].k_norm, "layer.17.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(17);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(17);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(17);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     17 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[17]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3455,6 +5058,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -3496,6 +5106,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[18].qkv_proj_fused, "layer.18.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[18].q_norm, "layer.18.q_norm")->data(),
+            require(w.layers[18].k_norm, "layer.18.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(18);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(18);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(18);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     18 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[18]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3642,6 +5334,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -3683,6 +5382,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[19].qkv_proj_fused, "layer.19.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[19].q_norm, "layer.19.q_norm")->data(),
+            require(w.layers[19].k_norm, "layer.19.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(19);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(19);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(19);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     19 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[19]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3829,6 +5610,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -3870,6 +5658,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[20].qkv_proj_fused, "layer.20.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[20].q_norm, "layer.20.q_norm")->data(),
+            require(w.layers[20].k_norm, "layer.20.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(20);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(20);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(20);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     20 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[20]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4016,6 +5886,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -4057,6 +5934,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[21].qkv_proj_fused, "layer.21.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[21].q_norm, "layer.21.q_norm")->data(),
+            require(w.layers[21].k_norm, "layer.21.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(21);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(21);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(21);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     21 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[21]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4203,6 +6162,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -4244,6 +6210,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[22].qkv_proj_fused, "layer.22.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[22].q_norm, "layer.22.q_norm")->data(),
+            require(w.layers[22].k_norm, "layer.22.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(22);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(22);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(22);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     22 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[22]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4390,6 +6438,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -4431,6 +6486,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[23].qkv_proj_fused, "layer.23.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[23].q_norm, "layer.23.q_norm")->data(),
+            require(w.layers[23].k_norm, "layer.23.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(23);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(23);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(23);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     23 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[23]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4577,6 +6714,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -4618,6 +6762,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[24].qkv_proj_fused, "layer.24.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[24].q_norm, "layer.24.q_norm")->data(),
+            require(w.layers[24].k_norm, "layer.24.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(24);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(24);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(24);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     24 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[24]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4764,6 +6990,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -4805,6 +7038,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[25].qkv_proj_fused, "layer.25.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[25].q_norm, "layer.25.q_norm")->data(),
+            require(w.layers[25].k_norm, "layer.25.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(25);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(25);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(25);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     25 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[25]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4951,6 +7266,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -4992,6 +7314,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[26].qkv_proj_fused, "layer.26.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[26].q_norm, "layer.26.q_norm")->data(),
+            require(w.layers[26].k_norm, "layer.26.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(26);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(26);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(26);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     26 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[26]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5138,6 +7542,13 @@ const StageHooks* hooks)
             ws.qkv_fused.data(),
             ws.q.data(), ws.k.data(), ws.v.data(),
             N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
         kernels::launch_qk_rmsnorm_rope_bf16(
             bf16_row(ws.q.data(), 0, Hq),
             bf16_row(ws.k.data(), 0, Hk),
@@ -5179,6 +7590,88 @@ const StageHooks* hooks)
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
                 attn_ws, stream);
+        }
+    } else if (lora != nullptr && lora->usable()) {
+        ops::gemm_act_x_w(cublas.handle(),
+            ws.norm_x.data(),
+            ops::WeightView(*require(w.layers[27].qkv_proj_fused, "layer.27.qkv")),
+            ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+        kernels::launch_split_qkv_bf16(
+            ws.qkv_fused.data(),
+            ws.q.data(), ws.k.data(), ws.v.data(),
+            N, Hq, Hk, stream);
+        if (lora != nullptr && lora->usable()) {
+            throw std::runtime_error(
+                "generated forward: lora fire reached the static "
+                "form (the dispatch gate routes lora to the "
+                "interpreter walk)");
+        } else {
+        }
+        kernels::launch_qk_rmsnorm_rope_bf16(
+            bf16_row(ws.q.data(), 0, Hq),
+            bf16_row(ws.k.data(), 0, Hk),
+            require(w.layers[27].q_norm, "layer.27.q_norm")->data(),
+            require(w.layers[27].k_norm, "layer.27.k_norm")->data(),
+            positions + 0, N,
+            num_q_heads, num_kv_heads, d,
+            cfg.rope_theta, eps, stream);
+        if (has_write_desc) {
+            {
+                auto kv_view = cache.layer_view(27);
+                kernels::launch_write_kv_explicit_bf16(
+                    kv_view,
+                    bf16_row(ws.k.data(), 0, Hk),
+                    bf16_row(ws.v.data(), 0, Hk),
+                    w_page_d + 0, w_off_d + 0,
+                    N, stream,
+                    row_valid_d != nullptr ? row_valid_d + 0 : nullptr);
+            }
+        } else {
+            {
+                auto kv_view = cache.layer_view(27);
+                kernels::launch_write_kv_to_pages(
+                    kv_view, ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens,
+                    N, R, stream, row_valid_d, /*first_token=*/0);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
+        }
+        if (hooks != nullptr && hooks->wants_attn_score) {
+            throw std::runtime_error(
+                "generated forward: capture dispatch reached the "
+                "static form (the dispatch gate routes hooks to "
+                "the interpreter walk)");
+        } else {
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            {
+                auto kv_view = cache.layer_view(27);
+                const int layer_window_left =
+                    (!fwd_cfg.per_layer_window_left.empty() &&
+                     27 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                        ? fwd_cfg.per_layer_window_left[27]
+                        : fwd_cfg.sliding_window;
+                ops::dispatch_attention_flashinfer_decode(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+            }
+        }
+        if (hooks != nullptr) {
+            throw std::runtime_error(
+                "generated forward: hooked fire reached the static "
+                "form (the dispatch gate routes hooks to the "
+                "interpreter walk)");
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5372,7 +7865,8 @@ const std::uint8_t* row_valid_d,
 bool has_write_desc,
 const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
-const StageHooks* hooks)
+const StageHooks* hooks,
+const LoraTable* lora)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
@@ -5408,6 +7902,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -5539,6 +8040,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -5670,6 +8178,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -5801,6 +8316,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -5932,6 +8454,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -6063,6 +8592,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -6194,6 +8730,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -6325,6 +8868,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -6456,6 +9006,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -6587,6 +9144,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -6718,6 +9282,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -6849,6 +9420,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -6980,6 +9558,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -7111,6 +9696,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -7242,6 +9834,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -7373,6 +9972,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -7504,6 +10110,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -7635,6 +10248,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -7766,6 +10386,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -7897,6 +10524,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -8028,6 +10662,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -8159,6 +10800,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -8290,6 +10938,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -8421,6 +11076,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -8552,6 +11214,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -8683,6 +11352,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -8814,6 +11490,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),
@@ -8945,6 +11628,13 @@ const StageHooks* hooks)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    if (lora != nullptr && lora->usable()) {
+        throw std::runtime_error(
+            "generated forward: lora fire reached the static "
+            "form (the dispatch gate routes lora to the "
+            "interpreter walk)");
+    } else {
+    }
     kernels::launch_qk_rmsnorm_rope_bf16(
         bf16_row(ws.q.data(), 0, Hq),
         bf16_row(ws.k.data(), 0, Hk),

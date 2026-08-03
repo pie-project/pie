@@ -125,6 +125,22 @@ fn llama_like_text(
                         matmul(&x, &w.v_proj),
                     )
                 };
+                if m.lowering().is_some() {
+                    // The §5.1 lora correction: the adapter delta lands
+                    // on the just-materialized RAW q/v projections,
+                    // BEFORE anything consumes them — bias, norms, rope,
+                    // the KV append (the hand-written apply's position;
+                    // correcting after rope is different arithmetic, the
+                    // bug the first live A/B caught). A guard with an
+                    // EMPTY else: a fire with no usable lanes launches
+                    // nothing.
+                    dsl::guard(
+                        m,
+                        GuardPred::HasLora,
+                        || cuda::lora_qkv_correction(&q, &v, l),
+                        || {},
+                    );
+                }
                 // A lowered arm with the per-head convention and Standard
                 // rope states the fused norm+rope kernel (the hand-written
                 // `fuse_qk_norm_rope` branch — bf16 rounds differently
@@ -227,6 +243,18 @@ fn llama_like_text(
                         g.arm(GuardPred::HasCustomMask, || {
                             let q = general_qkv();
                             cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
+                        })
+                        // The lora arm: the fused epilogue writes V
+                        // straight to the paged cache — nothing exists to
+                        // correct into — so a lora fire runs the whole
+                        // general sequence (whose internal HasLora guard
+                        // lands the correction), full-N: the hand-written
+                        // `!has_lora` predicate term, stated as an arm.
+                        // Mask+lora composes in the mask arm above (its
+                        // general body carries the same internal guard).
+                        .arm(GuardPred::HasLora, || {
+                            let q = general_qkv();
+                            attn_with_sites(&q);
                         })
                         .otherwise(|| {
                             // The packed GEMM runs over every row; the

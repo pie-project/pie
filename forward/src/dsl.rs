@@ -1270,6 +1270,27 @@ pub mod cuda {
                vec![], kv_state(kv), vec![q.id], None);
     }
 
+    /// `"pie_lora_qkv_correction"`: the §5.1 adapter correction — every
+    /// usable lora lane's `x·Aᵀ·Bᵀ` delta landed on the materialized q/v
+    /// projections, before anything consumes them (bias, norms, rope,
+    /// KV append). A PSEUDO-SYMBOL, the stash pair's peer: the driver
+    /// implements it as the per-lane / grouped GEMM-pair sequence of
+    /// `LoraFireState::apply` — a launcher may be many calls; the symbol
+    /// names the operation. Output-less and in place on q/v; stated
+    /// inside the `HasLora` guard's then-region (the else is empty — a
+    /// fire with no adapters launches nothing, which is the truth).
+    pub fn lora_qkv_correction(q: &Val, v: &Val, l: u32) {
+        record(
+            &q.t,
+            Some(l),
+            "pie_lora_qkv_correction",
+            vec![],
+            None,
+            vec![q.id, v.id],
+            None,
+        );
+    }
+
     /// The standalone dequant staging launch, for arms whose attention
     /// lives inside a guard (the dequant is common to both regions, so
     /// it precedes the guard).

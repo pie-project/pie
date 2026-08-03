@@ -3835,6 +3835,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        3,
+        5
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -4142,6 +4171,35 @@
         17,
         18
       ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        16,
+        18
+      ],
+      "outputs": [],
       "layer": 1
     },
     {
@@ -4457,6 +4515,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        29,
+        31
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -4764,6 +4851,35 @@
         43,
         44
       ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        42,
+        44
+      ],
+      "outputs": [],
       "layer": 3
     },
     {
@@ -5079,6 +5195,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        55,
+        57
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -5386,6 +5531,35 @@
         69,
         70
       ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        68,
+        70
+      ],
+      "outputs": [],
       "layer": 5
     },
     {
@@ -5701,6 +5875,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        81,
+        83
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -6008,6 +6211,35 @@
         95,
         96
       ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        94,
+        96
+      ],
+      "outputs": [],
       "layer": 7
     },
     {
@@ -6323,6 +6555,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        107,
+        109
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -6630,6 +6891,35 @@
         121,
         122
       ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        120,
+        122
+      ],
+      "outputs": [],
       "layer": 9
     },
     {
@@ -6945,6 +7235,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        133,
+        135
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -7252,6 +7571,35 @@
         147,
         148
       ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        146,
+        148
+      ],
+      "outputs": [],
       "layer": 11
     },
     {
@@ -7567,6 +7915,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        159,
+        161
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -7874,6 +8251,35 @@
         173,
         174
       ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        172,
+        174
+      ],
+      "outputs": [],
       "layer": 13
     },
     {
@@ -8189,6 +8595,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        185,
+        187
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -8496,6 +8931,35 @@
         199,
         200
       ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        198,
+        200
+      ],
+      "outputs": [],
       "layer": 15
     },
     {
@@ -8811,6 +9275,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        211,
+        213
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -9118,6 +9611,35 @@
         225,
         226
       ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        224,
+        226
+      ],
+      "outputs": [],
       "layer": 17
     },
     {
@@ -9433,6 +9955,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        237,
+        239
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -9740,6 +10291,35 @@
         251,
         252
       ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        250,
+        252
+      ],
+      "outputs": [],
       "layer": 19
     },
     {
@@ -10055,6 +10635,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        263,
+        265
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -10362,6 +10971,35 @@
         277,
         278
       ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        276,
+        278
+      ],
+      "outputs": [],
       "layer": 21
     },
     {
@@ -10677,6 +11315,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        289,
+        291
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -10984,6 +11651,35 @@
         303,
         304
       ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        302,
+        304
+      ],
+      "outputs": [],
       "layer": 23
     },
     {
@@ -11299,6 +11995,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        315,
+        317
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -11606,6 +12331,35 @@
         329,
         330
       ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        328,
+        330
+      ],
+      "outputs": [],
       "layer": 25
     },
     {
@@ -11921,6 +12675,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        341,
+        343
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -12228,6 +13011,35 @@
         355,
         356
       ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        354,
+        356
+      ],
+      "outputs": [],
       "layer": 27
     },
     {
@@ -12543,6 +13355,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        367,
+        369
+      ],
+      "outputs": [],
+      "layer": 28
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -12850,6 +13691,35 @@
         381,
         382
       ],
+      "layer": 29
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        380,
+        382
+      ],
+      "outputs": [],
       "layer": 29
     },
     {
@@ -13165,6 +14035,35 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        393,
+        395
+      ],
+      "outputs": [],
+      "layer": 30
+    },
+    {
+      "kind": {
         "Rope": {
           "kind": "Standard"
         }
@@ -13472,6 +14371,35 @@
         407,
         408
       ],
+      "layer": 31
+    },
+    {
+      "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasLora",
+              "ops": 1
+            }
+          ],
+          "else_ops": 0
+        }
+      },
+      "inputs": [],
+      "outputs": [],
+      "layer": null
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "pie_lora_qkv_correction"
+        }
+      },
+      "inputs": [
+        406,
+        408
+      ],
+      "outputs": [],
       "layer": 31
     },
     {

@@ -182,11 +182,14 @@ void llama_like_forward_declared(
     int runtime_window_left,
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
-    // The fire's attached stage programs (the HookSite slice); null on
-    // unhooked fires. The caller's gate admits only all-hooked fires
-    // (hook_free_prefix_rows == 0) — the sites and the score guard are
-    // in the hooked class traces, and the page-mask/score sidebands are
-    // this executor's bracket mechanics.
-    const StageHooks* stage_hooks);
+    // The fire's attached stage programs; null on unhooked fires. Sites
+    // and the score guard live in the shape traces (A3); the
+    // page-mask/score sidebands are this executor's bracket mechanics.
+    const StageHooks* stage_hooks,
+    // The fire's resolved lora configuration (null = none). Usable lanes
+    // take the HasLora guard arms — the general sequence plus the
+    // `pie_lora_qkv_correction` pseudo-symbol (LoraFireState::apply
+    // behind the registry, staged once per fire).
+    const LoraTable* lora);
 
 }  // namespace pie_cuda_driver::model

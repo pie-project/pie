@@ -213,8 +213,16 @@ pub enum GuardPred {
     /// the WantsAttnScore-guarded attention. The caller's gate admits
     /// only ALL-hooked fires (fast_rows == 0), so presence ⇔ every row
     /// is hooked; A3's Peel op replaces this all-or-nothing arm with
-    /// the fast_rows row split. Wire kind 5, payload unused.
+    /// the fast_rows row split. Wire kind 5, payload unused. RETIRED
+    /// vocabulary since A3 (reserved, unstated).
     HasStageHooks,
+    /// The fire carries usable lora lanes (`lora != nullptr &&
+    /// lora->usable()`) — the §5.1 correction: the adapter delta lands
+    /// on the materialized q/v projections before anything consumes
+    /// them, and the fused decode-QKV epilogue (which writes V straight
+    /// to the paged cache, so there is nothing to correct into) must
+    /// not run. Wire kind 6, payload unused.
+    HasLora,
 }
 
 impl GuardPred {
@@ -227,6 +235,7 @@ impl GuardPred {
             GuardPred::WantsAttnScore => (3, 0),
             GuardPred::HasCustomMask => (4, 0),
             GuardPred::HasStageHooks => (5, 0),
+            GuardPred::HasLora => (6, 0),
         }
     }
 }

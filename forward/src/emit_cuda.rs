@@ -122,7 +122,8 @@ const PARAMS: &str = "\
     bool has_write_desc,\n\
     const std::uint8_t* custom_mask_d,\n\
     const std::int32_t* custom_mask_indptr_d,\n\
-    const StageHooks* hooks";
+    const StageHooks* hooks,\n\
+    const LoraTable* lora";
 
 fn emit_class_fn(
     plan: &ForwardPlan,
@@ -268,6 +269,9 @@ fn emit_range(
                 }
                 crate::trace::GuardPred::HasStageHooks => {
                     "hooks != nullptr".to_string()
+                }
+                crate::trace::GuardPred::HasLora => {
+                    "lora != nullptr && lora->usable()".to_string()
                 }
             };
             let mut region = i + 1;
@@ -764,6 +768,15 @@ fn emit_launch(
             b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
             b.stmt("        attn_ws, stream);");
             b.stmt("}");
+        }
+        "pie_lora_qkv_correction" => {
+            // The lora arm transliterates to a refusal like the hook
+            // machinery: the static form does not carry LoraFireState,
+            // and the dispatch keeps lora fires on the interpreter walk.
+            b.stmt("throw std::runtime_error(");
+            b.stmt("    \"generated forward: lora fire reached the static \"");
+            b.stmt("    \"form (the dispatch gate routes lora to the \"");
+            b.stmt("    \"interpreter walk)\");");
         }
         "dispatch_attention_flashinfer_decode_capture"
         | "dispatch_attention_flashinfer_prefill_capture_bf16" => {

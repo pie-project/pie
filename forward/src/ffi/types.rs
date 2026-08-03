@@ -158,7 +158,11 @@ pub enum PieForwardGuardPred {
     HasCustomMask = 4,
     /// The fire carries attached stage-hook programs (`stage_hooks !=
     /// nullptr`) — A2, the class-collapse amendment. Payload unused.
+    /// Retired since A3 (reserved, unstated).
     HasStageHooks = 5,
+    /// The fire carries usable lora lanes (the §5.1 correction).
+    /// Payload unused.
+    HasLora = 6,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as
