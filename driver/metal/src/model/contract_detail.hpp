@@ -197,9 +197,16 @@ inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
 /// This is a transmute and not a decode: the bytes staged into the heap are the
 /// checkpoint's own. The alternative -- dequantize to BF16 and re-quantize
 /// affine -- is what the loader did, and it is the one lossy step in a
-/// checkpoint that is otherwise read verbatim. It costs no accuracy that can be
-/// pointed at in a tap, and it costs the ability to be compared against mlx-lm
-/// at all, because the two quantizers disagree on 8.2% of codes.
+/// checkpoint that is otherwise read verbatim.
+///
+/// That argument used to lean on a second one: that the re-quantized weights
+/// could not be compared against mlx-lm because the driver's quantizer and
+/// MLX's disagreed on 8.2% of codes. They no longer disagree -- the cause was a
+/// rounding mode, and `transcode.metal` now reproduces `mx.quantize` bit for
+/// bit. The transmute is still right, on its own merits: sixteen E2M1 levels
+/// times a power of two do not survive a trip through a 15-step affine grid,
+/// and the sixteen bits per group that grid costs are not bits this format
+/// needs.
 inline void push_mlx_mxfp4_stacked(ModelContract& out, const SourceTensor& raw,
                                    const SourceTensor& scales, std::string output) {
     if (raw.shape.size() < 2 || scales.shape.size() != raw.shape.size()) {

@@ -376,9 +376,9 @@ int main(int argc, char** argv) {
             // says the driver reads openai's format rather than converting it:
             // until the expert bank was bound as the E2M1 nibbles and E8M0
             // block exponents it ships as, the loader dequantized it and
-            // re-quantized it affine-U4, and no row could exist -- mlx's
-            // quantizer and this one disagree on 8.2% of codes, always by one,
-            // so the two runs did not hold the same weights. They do now.
+            // re-quantized it affine-U4 -- sixteen levels times a power of two
+            // forced through a 15-step grid, so the two runs did not hold the
+            // same weights and no row could exist. They do now.
             {"gpt-oss-20b", 24, 32, 4, 2880, {13, 279, 410, 12038, 410, 25},
              {785, 6722, 315, 9625, 1455, 12095}},
             // The same Llama-3.2-1B at 8 bits. It is here because it is the

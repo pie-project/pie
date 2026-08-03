@@ -65,14 +65,21 @@ struct EncodeParams {
 ///
 ///   * the scale is NEGATED unless the group's minimum is the larger in
 ///     magnitude, which puts code 0 on whichever end dominates;
-///   * the ENDPOINT is snapped, not the scale -- `scale = edge / rint(edge /
-///     scale)` -- which keeps the largest magnitude in the group exact.
+///   * the ENDPOINT is snapped, not the scale -- `scale = edge / round(edge /
+///     scale)` -- which keeps the largest magnitude in the group exact;
+///   * `w_max` starts at ZERO, so an all-negative group is quantized over the
+///     range up to zero rather than up to its own largest element.
+///
+/// `round` is half AWAY FROM ZERO. `rint` is half to even, and the difference
+/// between them was an 8.2% disagreement with `mx.quantize` on an MXFP4-derived
+/// expert bank -- every mismatch by exactly one, because those values sit on
+/// half-integers by construction.
 inline float2 mlx_affine_params(float w_min, float w_max) {
     const bool mask = abs(w_min) > abs(w_max);
     float scale = max((w_max - w_min) / 15.0f, 1e-7f);
     if (!mask) scale = -scale;
     const float edge = mask ? w_min : w_max;
-    const float q0 = rint(edge / scale);
+    const float q0 = round(edge / scale);
     float bias = 0.0f;
     if (q0 != 0.0f) {
         scale = edge / q0;
@@ -95,7 +102,7 @@ inline void encode_affine_group(
     const uint first = gid * p.group_size;
 
     float w_min = INFINITY;
-    float w_max = -INFINITY;
+    float w_max = 0.0f;
     for (uint i = 0; i < p.group_size; ++i) {
         const float value = float(input[first + i]);
         w_min = min(w_min, value);
@@ -112,7 +119,7 @@ inline void encode_affine_group(
         uint packed = 0;
         for (uint k = 0; k < 8; ++k) {
             const float value = float(input[first + w * 8 + k]);
-            const float q = rint((value - params.y) / params.x);
+            const float q = round((value - params.y) / params.x);
             packed |= uint(clamp(q, 0.0f, 15.0f)) << (4 * k);
         }
         codes[first / 8 + w] = packed;
