@@ -6905,7 +6905,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn two_pipelines_coalesce_into_one_wave_after_cold_hold() -> anyhow::Result<()> {
+    async fn two_pipelines_coalesce_into_one_wave() -> anyhow::Result<()> {
         let operation_log = Arc::new(Mutex::new(Vec::new()));
         let (driver_id, _scheduler, bound_a, _endpoints) = setup_scheduler_with_limits(
             DummyDriverOptions {
@@ -6923,8 +6923,7 @@ mod tests {
 
         // Submitted back-to-back, no await in between: both land in the
         // scheduler's queue before it next drains, so both `on_pipeline_
-        // request` calls land in the SAME wave-gather — no timing race
-        // with the 500us cold-hold window.
+        // request` calls land in the SAME wave-gather.
         let first = bound_a.reserve_completion();
         crate::scheduler::submit_async(
             dummy_launch(),
@@ -6944,10 +6943,10 @@ mod tests {
             second.clone(),
         )?;
 
-        // The wait-all quorum's bootstrap cold-hold gathers both pipelines'
-        // first requests into ONE dense wave (`requests=2`) instead of two
-        // solo fires — the dummy driver's launch-shape trace names the
-        // program count directly.
+        // The wait-all gate holds the seal until every member is ready, so
+        // both pipelines' first requests land in ONE dense wave
+        // (`requests=2`) instead of two solo fires — the dummy driver's
+        // launch-shape trace names the program count directly.
         let coalesced = timeout(Duration::from_secs(5), async {
             loop {
                 let hit = operation_log

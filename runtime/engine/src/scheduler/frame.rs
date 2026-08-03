@@ -8,8 +8,7 @@
 //! barrier (each tracked fire arrives as its own single-fire frame; a seal
 //! boundary is a wave boundary). The former per-wave `WaitAllPolicy`
 //! (scheduler/quorum.rs) was this policy specialized to k = 1 and is folded
-//! in — its run-ahead depth lever, cold hold, and watchdog constants live
-//! here now.
+//! in — its run-ahead depth lever and watchdog constants live here now.
 //!
 //! A *frame* is k consecutive waves submitted as one unit per lane: the guest
 //! supplies exactly k ordered slots (`forward.submit`), slot i executes in
@@ -99,31 +98,6 @@ pub struct FrameStamp {
     pub seq: u64,
     pub slot: u32,
     pub fires: u32,
-}
-
-/// Bootstrap gather window before the FIRST seal of an assembly episode, so
-/// a co-launched fleet's first frames land in one sealed epoch instead of a
-/// narrow head frame.
-const COLD_HOLD_US: u64 = 2_000;
-
-/// Deploy lever for M2 frame-group settlement deferral (`settle_defer` on
-/// non-tail waves). DEFAULT OFF: with per-wave publication kept (spec §6.2),
-/// the deferrable bookkeeping is microseconds while frame-granular
-/// completion resolution couples the posting window to frame-sized
-/// retirement — measured a net k>1 loss on the CUDA driver (see
-/// vesuvius-phase2.md "M2+M3 measured outcome"). The driver machinery is
-
-fn cold_hold() -> Duration {
-    static HOLD: OnceLock<Duration> = OnceLock::new();
-    *HOLD.get_or_init(|| {
-        Duration::from_micros(
-            std::env::var("PIE_SCHED_COLD_HOLD_US")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(COLD_HOLD_US)
-                .max(1),
-        )
-    })
 }
 
 /// Liveness watchdog for a blocked gather. Report-only, exactly as in the
@@ -363,7 +337,6 @@ pub(super) struct FramePolicy {
     truncated_seqs: BTreeMap<ProcessId, u64>,
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
-    cold_hold_deadline: Option<Instant>,
     /// Lanes with fires the engine has dispatched but not yet retired: the
     /// engine owes them a result, so the submit deadline's clock must not run
     /// against them. This is the debt a lockstep guest (no run-ahead, awaits
@@ -384,7 +357,6 @@ pub(super) struct FramePolicy {
     /// already protects the fleet, so nothing but a genuinely abandoned
     /// process reaches this.
     silence_timeout: Duration,
-    ever_sealed: bool,
     /// Probe sink (`profile-fire` wave counters); `None` in unit tests.
     stats: Option<Arc<SchedulerStats>>,
 }
@@ -440,11 +412,9 @@ impl FramePolicy {
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
-            cold_hold_deadline: None,
             in_flight_lanes: BTreeSet::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
             silence_timeout: crate::scheduler::configured_silence_timeout(),
-            ever_sealed: false,
             stats,
         }
     }
@@ -989,13 +959,11 @@ impl FramePolicy {
     }
 
     /// Mirror of the quorum's empty-wait-set re-arm: when the last awaited
-    /// lane leaves, the next fleet enters a fresh bootstrap gather.
+    /// lane leaves, the next fleet starts a fresh episode.
     fn maybe_reset_episode(&mut self) {
         if self.lanes.values().any(|lane| lane.awaited) {
             return;
         }
-        self.ever_sealed = false;
-        self.cold_hold_deadline = None;
         self.strict_watchdog_deadline = None;
     }
 
@@ -1010,37 +978,13 @@ impl FramePolicy {
     /// partitioned into as many coexisting frames as the budgets require
     /// (partitions post in seal order and pipeline on-stream). Exactly one
     /// frame per lane per boundary keeps the fleet on one frame sequence.
-    /// Called only once the wait-all gate holds (no missing awaited lane,
-    /// no earmarked successor assembling); deterministic — no timing input beyond the
-    /// bootstrap cold hold.
-    fn seal(&mut self, now: Instant) -> Option<FramePlan> {
+    /// Called only once the wait-all gate holds (no missing awaited lane, no
+    /// earmarked successor assembling); fully deterministic — no timing input
+    /// at all.
+    fn seal(&mut self) -> Option<FramePlan> {
         if !self.have_seal_candidate() {
-            self.cold_hold_deadline = None;
             return None;
         }
-        let mut cold_hold_fired = false;
-        if !self.ever_sealed && !self.structurally_full() {
-            // Bootstrap gather: membership is still forming (the wait-set
-            // has only the lanes that already submitted), so "all ready" is
-            // trivially true. Hold the first seal briefly so a co-launched
-            // fleet lands in one epoch. A structurally full wave fires
-            // immediately even cold — it didn't run out of patience, it ran
-            // out of room.
-            match self.cold_hold_deadline {
-                None => {
-                    let hold = cold_hold();
-                    self.cold_hold_deadline = Some(now + hold);
-                    return Some(FramePlan::Hold(hold));
-                }
-                Some(deadline) if now < deadline => {
-                    return Some(FramePlan::Hold(deadline - now));
-                }
-                Some(_) => {
-                    cold_hold_fired = true;
-                }
-            }
-        }
-        self.cold_hold_deadline = None;
 
         // One frame per lane per boundary: a lane whose SECOND frame is
         // also already complete (back-to-back prefill chains) contributes
@@ -1097,13 +1041,8 @@ impl FramePolicy {
                 break;
             }
             sealed_any = true;
-            self.ever_sealed = true;
             served.extend(members.iter().copied());
-            self.record_sealed_waves(
-                waves.iter().filter(|wave| !wave.is_empty()).count(),
-                cold_hold_fired,
-            );
-            cold_hold_fired = false;
+            self.record_sealed_waves(waves.iter().filter(|wave| !wave.is_empty()).count());
             let _ = &fire_waves;
             self.sealed.push_back(SealedFrame {
                 waves,
@@ -1118,39 +1057,11 @@ impl FramePolicy {
         sealed_any.then(|| FramePlan::Dispatch(Vec::new()))
     }
 
-    /// Structural capacity: a wave of the ready front frames already
-    /// saturates a per-wave budget, so gathering longer cannot widen it —
-    /// the bootstrap cold hold is bypassed (the wave didn't run out of
-    /// patience; it ran out of room).
-    fn structurally_full(&self) -> bool {
-        let mut wave_rows = vec![0usize; self.k];
-        let mut wave_tokens = vec![0usize; self.k];
-        for lane in self.lanes.values() {
-            let Some(front) = lane.frames.front() else {
-                continue;
-            };
-            if !front.is_complete() {
-                continue;
-            }
-            for fire in front.fires.iter().filter(|fire| fire.fire_id.is_some()) {
-                let wave = (fire.slot as usize).min(self.k - 1);
-                wave_rows[wave] += fire.rows.max(1);
-                wave_tokens[wave] += fire.tokens;
-                if wave_rows[wave] >= self.max_wave_rows
-                    || wave_tokens[wave] >= self.max_wave_tokens
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// An unstamped rider batch posted outside the sealed waves: it is
     /// still one wave fire for the density counters (the per-wave quorum
     /// counted untracked-only batches the same way).
     pub fn record_rider_wave(&self) {
-        self.record_sealed_waves(1, false);
+        self.record_sealed_waves(1);
     }
 
     /// Wave-density probe counters (the former quorum `record_wave`/
@@ -1158,7 +1069,7 @@ impl FramePolicy {
     /// discriminates a persistent wait-set from one that empties between
     /// fires. A seal never fires with a missing awaited lane (the wait-all
     /// gate held), so `wave_missing_sum` stays 0 by construction.
-    fn record_sealed_waves(&self, wave_count: usize, cold_hold_fired: bool) {
+    fn record_sealed_waves(&self, wave_count: usize) {
         if let Some(stats) = &self.stats {
             use std::sync::atomic::Ordering::Relaxed;
             let awaited = self.lanes.values().filter(|lane| lane.awaited).count() as u64;
@@ -1169,9 +1080,6 @@ impl FramePolicy {
                 .quorum
                 .wave_active_sum
                 .fetch_add(awaited * waves, Relaxed);
-            if cold_hold_fired {
-                stats.fire.quorum.cold_hold_fires.fetch_add(1, Relaxed);
-            }
         }
     }
 
@@ -1405,7 +1313,7 @@ impl FramePolicy {
             // what re-merges stragglers into one dense fleet epoch without
             // any drain barrier: a seal never excludes a busy lane, because
             // it waits for every lane's submission instead.
-            match self.seal(now) {
+            match self.seal() {
                 Some(FramePlan::Dispatch(_)) => continue,
                 Some(plan) => return plan,
                 // Ready lanes exist but none can seal (all busy in an
@@ -1421,7 +1329,7 @@ impl FramePolicy {
         let mut out = format!(
             "frame k={} lanes={} awaited={} sealed={} pending_binds={} \
 staged={} joins_in_flight={} departing={} suspended={} pending_slots={} \
-ever_sealed={} watchdog={:?}",
+watchdog={:?}",
             self.k,
             self.lanes.len(),
             self.lanes.values().filter(|lane| lane.awaited).count(),
@@ -1432,7 +1340,6 @@ ever_sealed={} watchdog={:?}",
             self.departing.len(),
             self.suspended.len(),
             self.pending_slots,
-            self.ever_sealed,
             self.strict_watchdog_deadline
                 .map(|deadline| deadline.saturating_duration_since(Instant::now())),
         );
@@ -1489,14 +1396,6 @@ mod tests {
         policy.plan_dispatch(queued, &HashSet::new(), false, now)
     }
 
-    fn drive_past_cold_hold(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
-        let now = Instant::now();
-        match plan(policy, queued, now) {
-            FramePlan::Hold(hold) => plan(policy, queued, now + hold + Duration::from_micros(1)),
-            plan => plan,
-        }
-    }
-
     /// Seal, then settle: the worker retires every dispatched batch, which is
     /// what pays back the lanes' submit-deadline debt. A test that dispatches
     /// without retiring leaves the engine permanently owing, so the deadline
@@ -1523,27 +1422,11 @@ mod tests {
         assert!(configured_max_in_flight() >= 1);
     }
 
-    /// A structurally full wave bypasses the bootstrap cold hold — the
-    /// reason every pre-existing worker.rs unit test (which all run at row
-    /// budget 1) observes no gather delay on the unified k = 1 path.
+    /// Density at k = 1 comes from the wait-all gate, not from a timer: two
+    /// lanes whose first single-slot frames are both ready seal as ONE dense
+    /// wave, and a wave missing a member holds until that member submits.
     #[test]
-    fn structural_cap_seals_immediately_even_cold() {
-        let mut policy = FramePolicy::new(1, 1, 4096, None);
-        let lane = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 7, 1, 1);
-        let queued: QueuedFireIds = [7].into_iter().collect();
-        assert_eq!(
-            plan(&mut policy, &queued, Instant::now()),
-            FramePlan::Dispatch(vec![vec![7]]),
-            "a full wave must seal with no cold-hold delay"
-        );
-    }
-
-    /// The bootstrap gather at k = 1: two lanes' first single-slot frames
-    /// hold through the cold window, then seal as ONE dense wave (the former
-    /// per-wave quorum's `cold_hold_gathers_two_pipelines_then_fires_dense`).
-    #[test]
-    fn bootstrap_cold_hold_gathers_single_slot_lanes_then_seals_dense() {
+    fn ready_single_slot_lanes_seal_as_one_dense_wave() {
         let mut policy = FramePolicy::new(1, 64, 4096, None);
         let (a, b) = (pid(), pid());
         // Single-slot stamps as the worker synthesizes them at k = 1:
@@ -1551,11 +1434,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 10, 0, 1), Some(a), 10, 1, 1);
         policy.on_fire_enqueued(stamp(b, 11, 0, 1), Some(b), 11, 1, 1);
         let queued: QueuedFireIds = [10, 11].into_iter().collect();
-        let t0 = Instant::now();
-        let FramePlan::Hold(hold) = plan(&mut policy, &queued, t0) else {
-            panic!("bootstrap membership is forming: the cold hold must arm");
-        };
-        let sealed = plan(&mut policy, &queued, t0 + hold + Duration::from_micros(1));
+        let sealed = plan(&mut policy, &queued, Instant::now());
         assert_eq!(
             fires(&sealed).len(),
             2,
@@ -1569,7 +1448,7 @@ mod tests {
             FramePlan::Hold(_) => {}
             plan => panic!("wait-all must hold for the idle lane, got {plan:?}"),
         }
-        // `b`'s next fire arrives: the wave seals dense, no cold hold.
+        // `b`'s next fire arrives: the wave seals dense.
         policy.on_fire_enqueued(stamp(b, 13, 0, 1), Some(b), 13, 1, 1);
         let queued: QueuedFireIds = [12, 13].into_iter().collect();
         let next = plan(&mut policy, &queued, Instant::now());
@@ -1587,7 +1466,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 200, 37, 1);
 
         let queued: QueuedFireIds = [100, 101, 102, 103, 200].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let sealed = plan(&mut policy, &queued, Instant::now());
         // One whole frame: wave 0 = both lanes' slot-0 fires (lane-id order
         // preserved), later slots in slot order.
         let FramePlan::Dispatch(waves) = sealed else {
@@ -1644,7 +1523,7 @@ mod tests {
         // The straggler completes: one dense epoch, both lanes' slot-0.
         policy.on_fire_enqueued(stamp(slow, 0, 1, 2), Some(slow), 4, 1, 1);
         let queued: QueuedFireIds = [1, 2, 3, 4].into_iter().collect();
-        let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("all lanes ready: the epoch must seal");
         };
         assert_eq!(waves[0].len(), 2, "dense wave 0 holds BOTH lanes");
@@ -1661,7 +1540,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1);
         let queued: QueuedFireIds = [50, 51].into_iter().collect();
-        let FramePlan::Dispatch(frame0) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(frame0) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("expected lane a's whole frame");
         };
         assert_eq!(frame0, vec![vec![50], vec![51]]);
@@ -1717,29 +1596,25 @@ mod tests {
     }
 
     #[test]
-    fn dropped_fires_resolve_and_leave_rearms_the_gather() {
+    fn dropped_fires_resolve_and_leave_rearms_the_episode() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lane = pid();
         policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 20, 1, 1);
         policy.on_fire_enqueued(stamp(lane, 0, 1, 2), Some(lane), 21, 1, 1);
         let queued: QueuedFireIds = [20, 21].into_iter().collect();
-        let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("expected the whole frame");
         };
         assert_eq!(waves, vec![vec![20], vec![21]]);
         let queued = QueuedFireIds::default();
         assert_eq!(plan(&mut policy, &queued, Instant::now()), FramePlan::Park);
         assert_eq!(policy.sealed.len(), 0, "frame popped at dispatch");
-        assert!(
-            policy.ever_sealed,
-            "the wait-set persists while the lane is awaited — drained \
-             books alone do not re-arm the gather"
-        );
-        // Only the lane's LEAVE empties the wait-set and re-arms bootstrap.
+        // The lane's LEAVE empties the wait-set; the episode's liveness
+        // watchdog re-arms with it.
         policy.on_lane_leave(lane, None, false);
         assert!(
-            !policy.ever_sealed,
-            "an emptied wait-set re-arms the gather"
+            policy.strict_watchdog_deadline.is_none(),
+            "an emptied wait-set re-arms the episode"
         );
     }
 
@@ -1763,7 +1638,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(healthy, 0, 1, 2), Some(healthy), 103, 1, 1);
         let queued: QueuedFireIds = [100, 101, 102, 103].into_iter().collect();
         assert!(matches!(
-            drive_past_cold_hold(&mut policy, &queued),
+            plan(&mut policy, &queued, Instant::now()),
             FramePlan::Dispatch(_)
         ));
 
@@ -1825,7 +1700,7 @@ mod tests {
         // Parked before slot 1: the allocation wait posts a lane close.
         policy.on_lane_leave(lane, Some(lane), false);
         let queued: QueuedFireIds = [10].into_iter().collect();
-        let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("a parked lane's submitted slot must still seal");
         };
         assert_eq!(waves[0], vec![10]);
@@ -1841,7 +1716,7 @@ mod tests {
         // Host submit failed at slot 2: only 2 fires exist.
         policy.on_frame_truncated(lane, 0, 2);
         let queued: QueuedFireIds = [30, 31].into_iter().collect();
-        let FramePlan::Dispatch(waves) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("truncated frame must still seal");
         };
         assert_eq!(waves[0], vec![30]);
@@ -1864,7 +1739,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 40, 37, 1);
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 41, 37, 1);
         let queued: QueuedFireIds = [40, 41].into_iter().collect();
-        let FramePlan::Dispatch(frame_a) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(frame_a) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("expected a seal");
         };
         assert_eq!(frame_a[0], vec![40], "first-fit admits lane a only");
@@ -1889,7 +1764,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 60, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 61, 1, 1);
         let queued: QueuedFireIds = [60, 61].into_iter().collect();
-        let FramePlan::Dispatch(frame_a) = drive_past_cold_hold(&mut policy, &queued) else {
+        let FramePlan::Dispatch(frame_a) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("expected lane a's whole frame");
         };
         assert_eq!(frame_a, vec![vec![60], vec![61]]);
@@ -1924,7 +1799,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 1, 1);
         policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1);
         let queued: QueuedFireIds = [90, 91].into_iter().collect();
-        let bootstrap = drive_past_cold_hold(&mut policy, &queued);
+        let bootstrap = plan(&mut policy, &queued, Instant::now());
         assert_eq!(fires(&bootstrap).len(), 2);
 
         // b resubmits; a does not — the gather blocks on a.
@@ -1951,7 +1826,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
         policy.on_bind_enqueued(Some(binder));
         let queued: QueuedFireIds = [95].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let sealed = plan(&mut policy, &queued, Instant::now());
         assert_eq!(fires(&sealed), vec![95]);
     }
 
@@ -1995,7 +1870,7 @@ mod tests {
         let queued: QueuedFireIds = [95, 96].into_iter().collect();
         assert!(
             matches!(
-                drive_past_cold_hold(&mut policy, &queued),
+                plan(&mut policy, &queued, Instant::now()),
                 FramePlan::Dispatch(_)
             ),
             "a retired departure must leave no phantom hold"
@@ -2028,7 +1903,7 @@ mod tests {
         let queued: QueuedFireIds = [95].into_iter().collect();
         assert!(
             matches!(
-                drive_past_cold_hold(&mut policy, &queued),
+                plan(&mut policy, &queued, Instant::now()),
                 FramePlan::Dispatch(_)
             ),
             "a drained release must not hold for a staged bystander"
@@ -2046,7 +1921,7 @@ mod tests {
         policy.on_lane_leave(closed, None, false);
         policy.on_lane_leave(terminated, None, true);
         let queued: QueuedFireIds = [50].into_iter().collect();
-        let sealed = drive_past_cold_hold(&mut policy, &queued);
+        let sealed = plan(&mut policy, &queued, Instant::now());
         assert_eq!(fires(&sealed), vec![50]);
     }
 
@@ -2062,7 +1937,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 61, 1, 1);
         let queued: QueuedFireIds = [60, 61].into_iter().collect();
         assert_eq!(
-            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            fires(&plan(&mut policy, &queued, Instant::now())),
             vec![60, 61]
         );
 
@@ -2081,7 +1956,7 @@ mod tests {
         // a leaves the wait-set: b's frame is now the whole quorum.
         policy.on_lane_park(a, 1);
         assert_eq!(
-            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            fires(&plan(&mut policy, &queued, Instant::now())),
             vec![70, 71]
         );
     }
@@ -2101,7 +1976,7 @@ mod tests {
         policy.on_lane_park(a, 1);
 
         let queued: QueuedFireIds = [80, 81, 90, 91].into_iter().collect();
-        let mut sealed = fires(&drive_past_cold_hold(&mut policy, &queued));
+        let mut sealed = fires(&plan(&mut policy, &queued, Instant::now()));
         sealed.sort_unstable();
         assert_eq!(
             sealed,
@@ -2114,7 +1989,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 1, 1, 2), Some(b), 93, 1, 1);
         let queued: QueuedFireIds = [92, 93].into_iter().collect();
         assert_eq!(
-            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            fires(&plan(&mut policy, &queued, Instant::now())),
             vec![92, 93]
         );
     }
@@ -2129,7 +2004,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 100, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 101, 1, 1);
         let queued: QueuedFireIds = [100, 101].into_iter().collect();
-        drive_past_cold_hold(&mut policy, &queued);
+        plan(&mut policy, &queued, Instant::now());
         policy.on_lane_park(a, 1);
 
         // a rejoins with a PARTIAL frame while b is complete: wait-all must
@@ -2148,7 +2023,7 @@ mod tests {
 
         policy.on_fire_enqueued(stamp(a, 2, 1, 2), Some(a), 111, 1, 1);
         let queued: QueuedFireIds = [110, 111, 120, 121].into_iter().collect();
-        let mut sealed = fires(&drive_past_cold_hold(&mut policy, &queued));
+        let mut sealed = fires(&plan(&mut policy, &queued, Instant::now()));
         sealed.sort_unstable();
         assert_eq!(sealed, vec![110, 111, 120, 121]);
     }
@@ -2162,7 +2037,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 130, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 131, 1, 1);
         let queued: QueuedFireIds = [130, 131].into_iter().collect();
-        drive_past_cold_hold(&mut policy, &queued);
+        plan(&mut policy, &queued, Instant::now());
         policy.on_lane_park(a, 1);
         policy.on_lane_park(a, 2);
 
@@ -2173,7 +2048,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 1, 0, 2), Some(b), 150, 1, 1);
         policy.on_fire_enqueued(stamp(b, 1, 1, 2), Some(b), 151, 1, 1);
         let queued: QueuedFireIds = [140, 141, 150, 151].into_iter().collect();
-        let mut sealed = fires(&drive_past_cold_hold(&mut policy, &queued));
+        let mut sealed = fires(&plan(&mut policy, &queued, Instant::now()));
         sealed.sort_unstable();
         assert_eq!(sealed, vec![140, 141, 150, 151]);
     }
@@ -2189,7 +2064,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 161, 1, 1);
         let queued: QueuedFireIds = [160, 161].into_iter().collect();
         assert_eq!(
-            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            fires(&plan(&mut policy, &queued, Instant::now())),
             vec![160, 161]
         );
     }
@@ -2207,7 +2082,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 200, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 201, 1, 1);
         let queued: QueuedFireIds = [200, 201].into_iter().collect();
-        drive_past_cold_hold(&mut policy, &queued);
+        plan(&mut policy, &queued, Instant::now());
         retire(&mut policy, [a]);
 
         // b is complete, a is silent: the seal blocks on a.
@@ -2234,7 +2109,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 1, 1, 2), Some(b), 231, 1, 1);
         retire(&mut policy, [a, b]);
         let queued: QueuedFireIds = [220, 221, 230, 231].into_iter().collect();
-        let mut sealed = fires(&drive_past_cold_hold(&mut policy, &queued));
+        let mut sealed = fires(&plan(&mut policy, &queued, Instant::now()));
         sealed.sort_unstable();
         assert_eq!(sealed, vec![220, 221, 230, 231], "a is a full member again");
     }
@@ -2254,7 +2129,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 240, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 241, 1, 1);
         let queued: QueuedFireIds = [240, 241].into_iter().collect();
-        drive_past_cold_hold(&mut policy, &queued);
+        plan(&mut policy, &queued, Instant::now());
         retire(&mut policy, [a]);
 
         policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 250, 1, 1);
@@ -2273,7 +2148,7 @@ mod tests {
         // an abandoned lane to be noticed: b keeps submitting while a stays
         // silent. (An engine with nothing at all to do parks and reaps
         // nobody — there is no fleet to protect at that point.)
-        let mut tick = |policy: &mut FramePolicy, seq: u64, at: Instant| -> FramePlan {
+        let tick = |policy: &mut FramePolicy, seq: u64, at: Instant| -> FramePlan {
             let base = 260u64 + seq * 2;
             policy.on_fire_enqueued(stamp(b, seq, 0, 2), Some(b), base, 1, 1);
             policy.on_fire_enqueued(stamp(b, seq, 1, 2), Some(b), base + 1, 1, 1);
@@ -2316,7 +2191,7 @@ mod tests {
         }
         let queued: QueuedFireIds = [300, 301, 302, 303].into_iter().collect();
         assert!(matches!(
-            drive_past_cold_hold(&mut policy, &queued),
+            plan(&mut policy, &queued, Instant::now()),
             FramePlan::Dispatch(_)
         ));
 
@@ -2390,7 +2265,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 400, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 401, 1, 1);
         let queued: QueuedFireIds = [400, 401].into_iter().collect();
-        drive_past_cold_hold(&mut policy, &queued);
+        plan(&mut policy, &queued, Instant::now());
         retire(&mut policy, [a]);
         policy.on_lane_park(a, 1);
 
@@ -2399,7 +2274,7 @@ mod tests {
         let queued: QueuedFireIds = [410, 411].into_iter().collect();
         let now = Instant::now();
         assert_eq!(
-            fires(&drive_past_cold_hold(&mut policy, &queued)),
+            fires(&plan(&mut policy, &queued, Instant::now())),
             vec![410, 411]
         );
         // Long past the deadline, the parked lane is still alive and can
@@ -2417,7 +2292,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(b, 1, 0, 2), Some(b), 430, 1, 1);
         policy.on_fire_enqueued(stamp(b, 1, 1, 2), Some(b), 431, 1, 1);
         let queued: QueuedFireIds = [420, 421, 430, 431].into_iter().collect();
-        let mut sealed = fires(&drive_past_cold_hold(&mut policy, &queued));
+        let mut sealed = fires(&plan(&mut policy, &queued, Instant::now()));
         sealed.sort_unstable();
         assert_eq!(sealed, vec![420, 421, 430, 431]);
     }
@@ -2434,7 +2309,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 500, 1, 1);
         policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 501, 1, 1);
         let queued: QueuedFireIds = [500, 501].into_iter().collect();
-        drive_past_cold_hold(&mut policy, &queued);
+        plan(&mut policy, &queued, Instant::now());
         retire(&mut policy, [a]);
 
         // a is mid-rebind: the engine owes it, so its silence is not a breach.

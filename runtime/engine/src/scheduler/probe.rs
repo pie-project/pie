@@ -41,8 +41,6 @@
 //! ├── inter_batch_bubble_us  device idle between one batch retiring and the next launching (F1 target: →0)
 //! ├── quorum_latency_us      last-pipeline-ready → dense-batch enqueue (F1 quorum completion)
 //! ├── escape_fires           count of F2 idle-escape fires (ready subset fired on device-idle+empty-queue)
-//! ├── cold_hold_us           time spent in the F3 cold-hold window (nothing in flight)
-//! ├── cold_hold_fires        count of fires that went through the F3 cold-hold path
 //! ├── straggler_fires        legacy field; always zero under strict wait-all
 //! └── readiness_miss         count of dummy-runs: a pass launched structurally-ready whose late edge missed (M3 gate: rate < 1%)
 //! ```
@@ -127,14 +125,6 @@ pub struct QuorumProbes {
     /// decode-fleet bubble-filler. Zero when the cohort always completes
     /// before the in-flight batch retires (pure quorum).
     pub submit_ahead_fires: AtomicU64,
-
-    /// Time spent holding in the F3 cold-hold window (nothing in flight at
-    /// all): the sub-millisecond wait for arrivals before firing partial.
-    pub cold_hold_us: AtomicU64,
-
-    /// Count of fires that went through the cold-hold path (F3), the
-    /// denominator for cold-hold occupancy (`cold_hold_us / cold_hold_fires`).
-    pub cold_hold_fires: AtomicU64,
 
     /// Legacy counter retained in telemetry; strict wait-all never fires narrow.
     pub straggler_fires: AtomicU64,
