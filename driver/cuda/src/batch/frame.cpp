@@ -952,8 +952,7 @@ void prepare_step(
             }();
             const bool spatial_planned = spatial_mask_on &&
                 view.planned_unmasked_prefix_rows !=
-                    PIE_UNMASKED_PREFIX_UNPLANNED &&
-                view.planned_unmasked_prefix_rows > 0;
+                    PIE_UNMASKED_PREFIX_UNPLANNED;
             if (s.rpg.per_program.size() > 1 && !spatial_planned) {
                 for (std::size_t p = 0; p < s.rpg.per_program.size(); ++p) {
                     if (s.rpg.is_device_geometry[p] &&
@@ -1687,69 +1686,90 @@ void prepare_step(
     // to fire-lane indexing so `launch_pack_dense_mask` needs no offset
     // parameter. Shape contract, enforced loudly: exactly ONE masked
     // device-geometry program, its rows exactly the planned suffix.
+    // Per-wave reset: these are harvested only by the spatial pack below;
+    // a later wave must never see a previous wave's geometry through the
+    // prepare pointers (stale sizes read out of bounds).
+    s.spatial_suffix_page_counts.clear();
+    s.spatial_suffix_last_lens.clear();
     if (s.dg_resolved && s.rpg.per_program.size() > 1 &&
         !use_structured_mask && !s.have_custom_mask) {
         static const bool spatial_mask_on2 = [] {
             const char* v = std::getenv("PIE_SPATIAL_MASK");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        int masked_program = -1;
-        int masked_count = 0;
+        struct MaskedProgram {
+            int program = 0;
+            int base = 0;
+            int rows = 0;
+            int stride = 0;
+        };
+        std::vector<MaskedProgram> masked_programs;
+        const auto& rip = view.ptir_program_row_indptr;
+        const bool have_rip =
+            rip.size() == s.rpg.per_program.size() + 1;
         for (std::size_t p = 0; p < s.rpg.per_program.size(); ++p) {
             if (s.rpg.is_device_geometry[p] &&
                 s.rpg.per_program[p].has_mask &&
                 !s.rpg.per_program[p].mask.empty()) {
-                masked_program = static_cast<int>(p);
-                ++masked_count;
+                MaskedProgram m;
+                m.program = static_cast<int>(p);
+                if (have_rip) {
+                    m.base = static_cast<int>(rip.data()[p]);
+                    m.rows = static_cast<int>(rip.data()[p + 1]) - m.base;
+                }
+                masked_programs.push_back(m);
             }
         }
-        if (masked_count > 0) {
+        if (!masked_programs.empty()) {
             const bool spatial_planned = spatial_mask_on2 &&
                 view.planned_unmasked_prefix_rows !=
-                    PIE_UNMASKED_PREFIX_UNPLANNED &&
-                view.planned_unmasked_prefix_rows > 0;
-            if (!spatial_planned || masked_count != 1) {
+                    PIE_UNMASKED_PREFIX_UNPLANNED;
+            if (!spatial_planned || !have_rip) {
                 throw std::runtime_error(
                     "ptir: dense-masked program in a composed step outside "
                     "the planned spatial-mask shape (" +
-                    std::to_string(masked_count) + " masked programs, " +
+                    std::to_string(masked_programs.size()) +
+                    " masked programs, " +
                     (spatial_planned ? "planned" : "UNPLANNED") + ")");
             }
-            const pipeline::FireGeometry& fg =
-                s.rpg.per_program[static_cast<std::size_t>(masked_program)];
             const int lanes = static_cast<int>(qo_view.size()) - 1;
             const int split =
                 static_cast<int>(view.planned_unmasked_prefix_rows);
             const int suffix = lanes - split;
-            // The masked program's composed row base must BE the split
-            // (the seriation puts masked members last).
-            const auto& rip = view.ptir_program_row_indptr;
-            if (rip.size() ==
-                    s.rpg.per_program.size() + 1 &&
-                (static_cast<int>(
-                     rip.data()[masked_program]) != split ||
-                 static_cast<int>(
-                     rip.data()[masked_program + 1]) != lanes)) {
-                throw std::runtime_error(
-                    "ptir: the masked program's composed rows are not the "
-                    "planned suffix (seriation drift)");
+            // The masked programs' composed rows must tile EXACTLY the
+            // planned suffix (the seriation puts masked members last;
+            // program order gives ascending bases).
+            int cursor = split;
+            int stride_max = 0;
+            for (auto& m : masked_programs) {
+                if (m.base != cursor || m.rows <= 0) {
+                    throw std::runtime_error(
+                        "ptir: masked programs' composed rows do not tile "
+                        "the planned suffix (seriation drift)");
+                }
+                cursor += m.rows;
+                const pipeline::FireGeometry& fgp =
+                    s.rpg.per_program[static_cast<std::size_t>(m.program)];
+                if (fgp.mask.size() %
+                        static_cast<std::size_t>(m.rows) != 0) {
+                    throw std::runtime_error(
+                        "ptir: spatial dense mask size does not divide "
+                        "its program's row count");
+                }
+                m.stride = static_cast<int>(
+                    fgp.mask.size() / static_cast<std::size_t>(m.rows));
+                stride_max = std::max(stride_max, m.stride);
             }
-            const int fg_rows = suffix;
-            if (fg_rows <= 0 ||
-                fg.mask.size() % static_cast<std::size_t>(fg_rows) != 0) {
+            if (cursor != lanes) {
                 throw std::runtime_error(
-                    "ptir: spatial dense mask size does not divide the "
-                    "suffix row count");
+                    "ptir: masked programs' composed rows do not reach the "
+                    "fire's end (seriation drift)");
             }
-            const int stride = static_cast<int>(
-                fg.mask.size() / static_cast<std::size_t>(fg_rows));
+            const int stride = stride_max;
             const std::uint32_t page =
                 static_cast<std::uint32_t>(kv_cache.page_size());
             std::vector<std::uint8_t> padded(
                 static_cast<std::size_t>(lanes) * stride, 0);
-            std::memcpy(
-                padded.data() + static_cast<std::size_t>(split) * stride,
-                fg.mask.data(), fg.mask.size());
             std::vector<std::uint32_t> klen(
                 static_cast<std::size_t>(lanes), 0);
             std::vector<std::int32_t> mindptr(
@@ -1758,35 +1778,43 @@ void prepare_step(
                 static_cast<std::size_t>(suffix), 0);
             s.spatial_suffix_last_lens.assign(
                 static_cast<std::size_t>(suffix), 0);
-            for (int l = 0; l < lanes; ++l) {
-                std::uint32_t k = 0;
-                if (l >= split) {
-                    const int fl = l - split;
+            for (const auto& m : masked_programs) {
+                const pipeline::FireGeometry& fgp =
+                    s.rpg.per_program[static_cast<std::size_t>(m.program)];
+                for (int fl = 0; fl < m.rows; ++fl) {
+                    const int l = m.base + fl;
+                    std::memcpy(
+                        padded.data() +
+                            static_cast<std::size_t>(l) * stride,
+                        fgp.mask.data() +
+                            static_cast<std::size_t>(fl) * m.stride,
+                        static_cast<std::size_t>(m.stride));
                     const bool resolved_geometry =
-                        !fg.kv_page_indptr.empty();
+                        !fgp.kv_page_indptr.empty();
                     const std::uint32_t np = resolved_geometry
                         ? ((fl + 1 <
-                            static_cast<int>(fg.kv_page_indptr.size()))
-                               ? fg.kv_page_indptr[fl + 1] -
-                                     fg.kv_page_indptr[fl]
+                            static_cast<int>(fgp.kv_page_indptr.size()))
+                               ? fgp.kv_page_indptr[fl + 1] -
+                                     fgp.kv_page_indptr[fl]
                                : 0u)
                         : kvpp_view[l + 1] - kvpp_view[l];
                     const std::uint32_t lpl = resolved_geometry
                         ? ((fl < static_cast<int>(
-                                     fg.kv_last_page_lens.size()))
-                               ? fg.kv_last_page_lens[fl]
+                                     fgp.kv_last_page_lens.size()))
+                               ? fgp.kv_last_page_lens[fl]
                                : 0u)
                         : kvlpl_view[l];
                     s.spatial_suffix_page_counts[
-                        static_cast<std::size_t>(fl)] = np;
+                        static_cast<std::size_t>(l - split)] = np;
                     s.spatial_suffix_last_lens[
-                        static_cast<std::size_t>(fl)] = lpl;
-                    k = np == 0 ? 0u : (np - 1) * page + lpl;
+                        static_cast<std::size_t>(l - split)] = lpl;
+                    klen[l] = np == 0 ? 0u : (np - 1) * page + lpl;
                 }
-                klen[l] = k;
+            }
+            for (int l = 0; l < lanes; ++l) {
                 const std::uint32_t qo_len = qo_view[l + 1] - qo_view[l];
                 const std::uint64_t bits =
-                    static_cast<std::uint64_t>(qo_len) * k;
+                    static_cast<std::uint64_t>(qo_len) * klen[l];
                 mindptr[l + 1] = mindptr[l] +
                     static_cast<std::int32_t>((bits + 7u) / 8u);
             }

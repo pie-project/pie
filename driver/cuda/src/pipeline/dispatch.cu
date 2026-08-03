@@ -7722,8 +7722,9 @@ int Dispatch::dense_mask_scope_violation(const pie_native::LaunchView& view,
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     if (spatial_on &&
-        view.planned_unmasked_prefix_rows != PIE_UNMASKED_PREFIX_UNPLANNED &&
-        view.planned_unmasked_prefix_rows > 0) {
+        view.planned_unmasked_prefix_rows != PIE_UNMASKED_PREFIX_UNPLANNED) {
+        // planned == 0 is the all-masked composed fire: the suffix covers
+        // every row and the custom kernel serves the whole step.
         return -1;
     }
     const Impl& s = *impl_;

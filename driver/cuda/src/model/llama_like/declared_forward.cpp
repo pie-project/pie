@@ -1250,24 +1250,27 @@ void llama_like_forward_declared(
                             "spatial mask: the XQA prefix is not wired "
                             "yet (its fire-wide prepare is R-shaped)");
                     }
-                    if (decode_plan == nullptr) {
-                        throw std::runtime_error(
-                            "spatial mask: split active but prepare built "
-                            "no prefix decode plan");
+                    if (split > 0) {
+                        if (decode_plan == nullptr) {
+                            throw std::runtime_error(
+                                "spatial mask: split active but prepare "
+                                "built no prefix decode plan");
+                        }
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             L < static_cast<int>(
+                                     fwd_cfg.per_layer_window_left
+                                         .size()))
+                                ? fwd_cfg.per_layer_window_left[L]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *decode_plan,
+                            attn_q, kv_view, attn_out_buf,
+                            kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, sm_scale_override);
                     }
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         L < static_cast<int>(
-                                 fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[L]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *decode_plan,
-                        attn_q, kv_view, attn_out_buf,
-                        kv_page_indices, kv_page_indptr,
-                        kv_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, sm_scale_override);
                     // The suffix: BASE buffers + device CSR pointers at
                     // +split with their ABSOLUTE values — the kernel
                     // indexes rows through the indptr values, so the

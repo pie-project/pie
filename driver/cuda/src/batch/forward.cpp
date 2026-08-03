@@ -796,7 +796,6 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.is_pure_decode && in.have_custom_mask && !has_hooks &&
         in.lora == nullptr &&
         in.unmasked_prefix_rows != 0xffffffffu &&
-        in.unmasked_prefix_rows > 0 &&
         in.unmasked_prefix_rows < static_cast<std::uint32_t>(in.forward_R);
     bool run_graph = graph_eligible && !use_spatial_mask;
     if (!use_spatial_mask && in.is_pure_decode && in.have_custom_mask &&

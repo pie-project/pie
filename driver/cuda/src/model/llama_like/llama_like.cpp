@@ -703,7 +703,6 @@ void prepare_llama_like_decode_plan(
     }();
     if (spatial_mask_on && have_custom_mask && is_pure_decode &&
         unmasked_prefix_rows != 0xffffffffu &&
-        unmasked_prefix_rows > 0 &&
         unmasked_prefix_rows < static_cast<std::uint32_t>(num_requests) &&
         // The XQA prefix is not wired (its fire-wide prepare is R-shaped);
         // deployments that would pick XQA keep the fire-level mask arm.
@@ -711,15 +710,18 @@ void prepare_llama_like_decode_plan(
           !cache.hnd_layout())) {
         const int split = static_cast<int>(unmasked_prefix_rows);
         const int rs = num_requests - split;
-        // Prefix decode plans (xqa / flashinfer decode / prefill-decode —
-        // whichever this deployment picks), over the same arrays at R' =
-        // split. Pure decode: total_tokens' == split.
-        prepare_llama_like_decode_plan(
-            state, attn_ws, cache, cfg, fwd_cfg,
-            qo_indptr_h, kv_page_indices_d, kv_page_indptr_h,
-            kv_page_indptr_d, kv_last_page_lens_h, kv_last_page_lens_d,
-            split, split, /*is_pure_decode=*/true,
-            /*have_custom_mask=*/false, attn_score_window);
+        // Prefix decode plans (whichever this deployment picks), over the
+        // same arrays at R' = split. Pure decode: total_tokens' == split.
+        // split == 0 (all-masked composed fire) has no prefix and builds
+        // no decode plan.
+        if (split > 0) {
+            prepare_llama_like_decode_plan(
+                state, attn_ws, cache, cfg, fwd_cfg,
+                qo_indptr_h, kv_page_indices_d, kv_page_indptr_h,
+                kv_page_indptr_d, kv_last_page_lens_h, kv_last_page_lens_d,
+                split, split, /*is_pure_decode=*/true,
+                /*have_custom_mask=*/false, attn_score_window);
+        }
         // The recursion reset the state flags; restore the split AFTER it.
         std::vector<std::uint32_t> qo_suffix(
             static_cast<std::size_t>(rs) + 1);
@@ -1707,17 +1709,19 @@ void llama_like_forward_paged(
                         "spatial mask: the planned split and the prepared "
                         "split drifted");
                 }
-                if (decode_plan == nullptr) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built no "
-                        "prefix decode plan");
+                if (split > 0) {
+                    if (decode_plan == nullptr) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    ops::dispatch_attention_flashinfer_decode(
+                        *decode_plan,
+                        attn_q, kv_view, attn_out_buf,
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        attn_ws, stream, layer_window_left,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
                 }
-                ops::dispatch_attention_flashinfer_decode(
-                    *decode_plan,
-                    attn_q, kv_view, attn_out_buf,
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    attn_ws, stream, layer_window_left,
-                    /*logits_soft_cap=*/0.f, sm_scale_override);
                 // BASE buffers + ABSOLUTE device CSR values at +split —
                 // see the interpreter's split branch for why no rebasing.
                 if (mask_suffix_qo_indptr_d == nullptr) {
