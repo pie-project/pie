@@ -1425,3 +1425,20 @@ plans (graph_mode_plan for the suffix mask plan is already true).
 Gates: spatial battery under graphs (engage lines + replays, outputs
 per the numerics contract), default-off regression, then the
 consolidated sweep for the default-on decision.
+
+## Spatial mask DEFAULT ON (2026-08-04)
+
+The sweep under the gate: solo oracle byte-stable vs pre-campaign,
+masked dense==none, hook solos + mixed hook battery, lora solos
+deterministic. Flipped at all six sites (PIE_SPATIAL_MASK=0
+disarms); the era-pinning grouping tests now pin the spatial
+contract. Live default boot: R=2 split=1 engages, oracle stable.
+The ladder's remaining rungs: NS-4 (the union pass — the emitter
+still skips spatial fires to the interpreter; per-class traces
+should merge into one windowed op list, killing the fire-level
+Guard at its root) and NS-5 (retire the two-path supergraph form
+once NS-4 serves its fires). A flip-era caution for the record:
+a pattern-based env flip catches NEIGHBORING gates — the first
+attempt flipped TP_DISABLE_DEVICE_COMPOSE / STEP_PROFILE /
+HOOK_GRAPH_TRACE to default-on before the per-name pass restored
+them.
