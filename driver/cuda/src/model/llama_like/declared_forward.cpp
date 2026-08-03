@@ -1137,18 +1137,26 @@ void llama_like_forward_declared(
                 break;
             }
             case LaunchKernel::AttentionFlashinferPrefillCustom: {
+                // Masked PURE-DECODE fires dispatch against their
+                // dedicated plan slot (the supergraph axiom): see
+                // LlamaLikePlanState::mask_decode_plan.
                 // The hand-written custom-mask branch, minus the choosing
                 // (llama_like.cpp:1457): the custom dispatch takes the
                 // layer view whole (no dequant) and the mask data rides
                 // as runtime args of the stated kernel.
-                if (prefill_plan == nullptr) {
+                const ops::PrefillPlanCache* mask_plan = is_pure_decode
+                    ? (plan_state.mask_decode_plan
+                           ? plan_state.mask_decode_plan.get()
+                           : nullptr)
+                    : prefill_plan;
+                if (mask_plan == nullptr) {
                     throw std::runtime_error(
                         "declared forward: trace states the custom-mask "
                         "prefill kernel but prepare built no plan");
                 }
                 auto kv_view = cache.layer_view(L);
                 ops::dispatch_attention_flashinfer_prefill_custom(
-                    *prefill_plan,
+                    *mask_plan,
                     attn_q, kv_view, attn_out_buf,
                     qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -1536,6 +1544,79 @@ void llama_like_forward_declared(
                 " has no emission rule");
         }
     }
+}
+
+
+bool llama_like_supergraph_supported(const LlamaLikeDeclaredPlan& declared) {
+    if (!generated_forward_enabled()) return false;
+    return declared.facts_digest == kGeneratedDigest_qwen3_0_6b ||
+           declared.facts_digest == kGeneratedDigest_olmo2_1b ||
+           declared.facts_digest == kGeneratedDigest_qwen2_5_1_5b ||
+           declared.facts_digest == kGeneratedDigest_mistral_7b_v03 ||
+           declared.facts_digest == kGeneratedDigest_phi3_mini;
+}
+
+bool llama_like_forward_supergraph_build(
+    const LlamaLikeDeclaredPlan& declared,
+    const Qwen3Weights& w,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    const LlamaLikePlanState& plan_state,
+    Workspace& ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    const std::uint8_t* row_valid_d,
+    bool has_write_desc,
+    const std::uint8_t* custom_mask_d,
+    const std::int32_t* custom_mask_indptr_d,
+    batch::SupergraphBuilder& sg) {
+    if (!llama_like_supergraph_supported(declared)) return false;
+    const auto run = [&](auto build_fn) {
+        build_fn(w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
+                 token_ids, positions, qo_indptr, kv_page_indices,
+                 kv_page_indptr, kv_last_page_lens, qo_indptr_h,
+                 kv_page_indptr_h, total_tokens, num_requests,
+                 logit_row_indices_d, num_logit_rows, w_page_d, w_off_d,
+                 row_valid_d, has_write_desc, custom_mask_d,
+                 custom_mask_indptr_d,
+                 /*hooks=*/nullptr, /*lora=*/nullptr, sg);
+    };
+    if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
+        run(generated_llama_like_decode_qwen3_0_6b_supergraph_build);
+        return true;
+    }
+    if (declared.facts_digest == kGeneratedDigest_olmo2_1b) {
+        run(generated_llama_like_decode_olmo2_1b_supergraph_build);
+        return true;
+    }
+    if (declared.facts_digest == kGeneratedDigest_qwen2_5_1_5b) {
+        run(generated_llama_like_decode_qwen2_5_1_5b_supergraph_build);
+        return true;
+    }
+    if (declared.facts_digest == kGeneratedDigest_mistral_7b_v03) {
+        run(generated_llama_like_decode_mistral_7b_v03_supergraph_build);
+        return true;
+    }
+    if (declared.facts_digest == kGeneratedDigest_phi3_mini) {
+        run(generated_llama_like_decode_phi3_mini_supergraph_build);
+        return true;
+    }
+    return false;
 }
 
 }  // namespace pie_cuda_driver::model

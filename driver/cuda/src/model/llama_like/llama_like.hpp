@@ -131,8 +131,16 @@ struct LlamaLikePlanState {
     ops::DecodePlanCachePtr decode_plan;
     ops::PrefillPlanCachePtr prefill_plan;
     ops::PrefillPlanCachePtr prefill_decode_plan;
+    // Custom-mask PURE-DECODE fires get their OWN plan slot (the
+    // supergraph axiom, S3: an arm may not share a mutable plan slot
+    // with a foreign fire class). Before this, masked decodes re-planned
+    // `prefill_plan` and every request's PREFILL re-planned it back —
+    // the layout oscillation cost the union key one orphan capture per
+    // request, and today's masked-variant graphs the same churn.
+    ops::PrefillPlanCachePtr mask_decode_plan;
     bool use_prefill_plan = false;
     bool use_prefill_decode_plan = false;
+    bool use_mask_decode_plan = false;
     // Set when the prefill plan was built for the FA2 score-capturing
     // dispatch. SM90-vs-FA2 is decided at PLAN time, so the body cannot
     // decide to capture on its own -- it can only honour what the prepare
@@ -168,6 +176,9 @@ void prepare_llama_like_decode_plan(
     // plan is then built for the FA2 score-capturing dispatch. Decided here
     // and not in the body because SM90-vs-FA2 is a plan-time choice.
     std::uint32_t attn_score_window = 0);
+
+std::uint32_t llama_like_supergraph_graph_layout(
+    const LlamaLikePlanState& state);
 
 std::uint32_t llama_like_decode_graph_layout(
     const LlamaLikePlanState& state);

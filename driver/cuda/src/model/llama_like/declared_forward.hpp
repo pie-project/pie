@@ -92,6 +92,10 @@
 #include "model/llama_like/llama_like.hpp"
 #include "pie_forward/plan.hpp"
 
+namespace pie_cuda_driver::batch {
+class SupergraphBuilder;
+}  // namespace pie_cuda_driver::batch
+
 namespace pie_cuda_driver::model {
 
 // The traced forms plus what the executor needs to know about how they
@@ -191,5 +195,42 @@ void llama_like_forward_declared(
     // `pie_lora_qkv_correction` pseudo-symbol (LoraFireState::apply
     // behind the registry, staged once per fire).
     const LoraTable* lora);
+
+// The unionized supergraph (S3): whether this deployment's digest has an
+// emitted `..._supergraph_build`, and the digest-dispatched build call
+// itself (false = no emitted build; the caller must not have promised a
+// supergraph capture). Same argument surface as the declared walk minus
+// the attachments the union excludes (hooks, lora), plus the builder.
+bool llama_like_supergraph_supported(const LlamaLikeDeclaredPlan& declared);
+
+bool llama_like_forward_supergraph_build(
+    const LlamaLikeDeclaredPlan& declared,
+    const Qwen3Weights& w,
+    const HfConfig& cfg,
+    const LlamaLikeForwardCfg& fwd_cfg,
+    const LlamaLikePlanState& plan_state,
+    Workspace& ws,
+    KvCache& cache,
+    AttentionWorkspace& attn_ws,
+    ops::CublasHandle& cublas,
+    const std::int32_t* token_ids,
+    const std::int32_t* positions,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* qo_indptr_h,
+    const std::uint32_t* kv_page_indptr_h,
+    int total_tokens,
+    int num_requests,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows,
+    const std::uint32_t* w_page_d,
+    const std::uint32_t* w_off_d,
+    const std::uint8_t* row_valid_d,
+    bool has_write_desc,
+    const std::uint8_t* custom_mask_d,
+    const std::int32_t* custom_mask_indptr_d,
+    batch::SupergraphBuilder& sg);
 
 }  // namespace pie_cuda_driver::model

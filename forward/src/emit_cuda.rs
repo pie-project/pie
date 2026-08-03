@@ -1189,21 +1189,28 @@ fn emit_launch(
         }
         "dispatch_attention_flashinfer_prefill_custom" => {
             // The custom-mask arm (A1): the custom dispatch takes the
-            // layer view whole (no dequant) against the PREFILL plan
-            // whatever the fire's shape, and the mask data rides as
+            // layer view whole (no dequant), and the mask data rides as
             // runtime args of the stated kernel — the interpreter's
-            // handler, minus the choosing.
+            // handler, minus the choosing. The plan SLOT is the class's:
+            // masked pure-decode fires own `mask_decode_plan` (the
+            // supergraph axiom — no mutable plan sharing across fire
+            // classes), prefill-shaped masked fires keep `prefill_plan`.
             let layer = state.expect("attention addresses kv state").layer;
-            b.stmt("if (!plan_state.prefill_plan) {");
+            let plan_cache = if is_decode {
+                "plan_state.mask_decode_plan"
+            } else {
+                "plan_state.prefill_plan"
+            };
+            b.stmt(&format!("if (!{plan_cache}) {{"));
             b.stmt("    throw std::runtime_error(");
-            b.stmt("        \"generated forward: prepare built no prefill plan\");");
+            b.stmt("        \"generated forward: prepare built no custom-mask plan\");");
             b.stmt("}");
             b.stmt(&format!("{{"));
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
             ));
             b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
-            b.stmt("        *plan_state.prefill_plan,");
+            b.stmt(&format!("        *{plan_cache},"));
             b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
             b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");

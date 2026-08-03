@@ -46,6 +46,10 @@ struct PersistentInputs {
     // Custom mask. `mask` is a packed bitmap; capacity is the worst
     // case ceil(max_qo * max_kv / 8). `indptr` has R+1 byte offsets.
     DeviceBuffer<std::uint8_t>  custom_mask;
+    // The supergraph's device predicate word (batch/supergraph.hpp slots):
+    // uploaded per fire before a supergraph replay; the graph's embedded
+    // set_cond kernels read it to arm the conditional branches.
+    DeviceBuffer<std::uint8_t>  supergraph_preds;
     DeviceBuffer<std::int32_t>  custom_mask_indptr;
     // Stable staging for a device-derived dense bool mask before
     // `launch_pack_dense_mask` writes `custom_mask`. One byte per source bit;

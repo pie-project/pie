@@ -1,4 +1,6 @@
 #include "batch/forward.hpp"
+
+#include "batch/supergraph.hpp"
 #include "batch/graph_variant.hpp"
 
 #include <algorithm>
@@ -56,6 +58,7 @@ void ForwardFn::attach_model(model::IModel* m) {
     supports_small_prefill_graph = caps.supports_small_prefill_graph;
     supports_runtime_window       = caps.supports_runtime_window;
     supports_hook_graph_capture   = caps.supports_hook_graph_capture;
+    supports_supergraph           = caps.supports_supergraph;
 }
 
 void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
@@ -97,8 +100,22 @@ void ForwardFn::invoke_body(model::Workspace& ws,
     }
 }
 
+bool ForwardFn::invoke_supergraph_body(model::Workspace& ws,
+                                       KvCache& kv,
+                                       AttentionWorkspace& aws,
+                                       ops::CublasHandle& cublas,
+                                       const ForwardInputs& in,
+                                       batch::SupergraphBuilder& sg) {
+    return model != nullptr &&
+           model->supergraph_body(ws, kv, aws, cublas, in, sg);
+}
+
 std::uint32_t ForwardFn::invoke_graph_layout() {
     return model ? model->graph_layout() : 0u;
+}
+
+std::uint32_t ForwardFn::invoke_supergraph_graph_layout() {
+    return model ? model->supergraph_graph_layout() : 0u;
 }
 
 namespace {
@@ -268,9 +285,40 @@ cudaGraphExec_t capture_forward_graph_exec(
     const std::uint32_t* w_off_d,
     bool has_write_desc,
     int runtime_window_left,
-    const model::StageHooks* stage_hooks)
+    const model::StageHooks* stage_hooks,
+    bool use_supergraph)
 {
     auto& pi = engine.inputs;
+
+    // Supergraph capture (S3): the mask arm's captured dispatch needs the
+    // custom prefill plan MATERIALIZED at capture time (the emission's
+    // null-plan check runs on the host, during capture) — and the else
+    // arm needs the decode plan. Prepare builds exactly one per call, so
+    // the supergraph capture runs prepare twice, mask-first; per-fire
+    // prepare at replay then updates whichever plan that fire's live arm
+    // consumes.
+    if (use_supergraph) {
+        ForwardFn::PrepareInputs prep{};
+        prep.qo_indptr_h = qo_indptr_h;
+        prep.kv_page_indices_h = kv_page_indices_h;
+        prep.kv_page_indices_d =
+            reinterpret_cast<const std::uint32_t*>(pi.kv_page_indices.data());
+        prep.kv_page_indptr_h = kv_page_indptr_h;
+        prep.kv_page_indptr_d =
+            reinterpret_cast<const std::uint32_t*>(pi.kv_page_indptr.data());
+        prep.kv_last_page_lens_h = kv_last_page_lens_h;
+        prep.kv_last_page_lens_d =
+            reinterpret_cast<const std::uint32_t*>(
+                pi.kv_last_page_lens.data());
+        prep.total_tokens = N;
+        prep.num_requests = R;
+        prep.is_pure_decode = is_pure_decode;
+        prep.runtime_window_left = runtime_window_left;
+        prep.have_custom_mask = true;
+        engine.forward_fn.invoke_prepare(engine.attn_ws, prep);
+        prep.have_custom_mask = false;
+        engine.forward_fn.invoke_prepare(engine.attn_ws, prep);
+    }
 
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     CudaStreamOwner capture_stream;
@@ -318,9 +366,26 @@ cudaGraphExec_t capture_forward_graph_exec(
         // KV CSRs) are replay-stable per key by the same argument the plain
         // captured body makes for every other `pi.*` buffer.
         fwd_in.stage_hooks = stage_hooks;
-        engine.forward_fn.invoke_body(
-            engine.ws, engine.kv_cache, engine.attn_ws, engine.cublas,
-            fwd_in);
+        if (use_supergraph) {
+            // The union body: the mask/write-desc data pointers must be
+            // the persistent buffers UNCONDITIONALLY — a masked replay
+            // reads them even though this capture-time fire may carry no
+            // mask.
+            fwd_in.custom_mask_d = pi.custom_mask.data();
+            fwd_in.custom_mask_indptr_d = pi.custom_mask_indptr.data();
+            batch::SupergraphBuilder sg(cstream, pi.supergraph_preds.data());
+            if (!engine.forward_fn.invoke_supergraph_body(
+                    engine.ws, engine.kv_cache, engine.attn_ws,
+                    engine.cublas, fwd_in, sg)) {
+                throw std::runtime_error(
+                    "supergraph capture requested but the model has no "
+                    "emitted build for this deployment");
+            }
+        } else {
+            engine.forward_fn.invoke_body(
+                engine.ws, engine.kv_cache, engine.attn_ws, engine.cublas,
+                fwd_in);
+        }
     }
     CudaGraphOwner graph(capture_guard.end());
     if (engine.tp_comm != nullptr &&
@@ -649,6 +714,16 @@ bool forward_graph_replay_eligible(
         !has_lora;
 }
 
+// The unionized supergraph rollout gate (S3): default OFF while the
+// batteries accumulate; PIE_SUPERGRAPH=1 arms it.
+static bool supergraph_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_SUPERGRAPH");
+        return v != nullptr && v[0] != '0';
+    }();
+    return on;
+}
+
 void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) {
     auto& ws = engine.ws;
     auto& kv_cache = engine.kv_cache;
@@ -693,17 +768,28 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     bool hook_prepared = false;
     HookGraphKeyState* hook_state = nullptr;
     HookGraphKeyState::Entry* hook_entry = nullptr;
+    // The unionized supergraph (S3): a pure-decode fire whose
+    // attachments live inside the union (mask x write-desc; no hooks, no
+    // lora — graph_eligible already excludes lora and hook-blocked
+    // fires) replays the conditional graph, and its cache key FOLDS the
+    // mask bit: masked and unmasked fires share the exec, the branch is
+    // the device predicate word's job.
+    const bool use_supergraph = supergraph_enabled() &&
+        engine.forward_fn.supports_supergraph && graph_eligible &&
+        in.is_pure_decode && !has_hooks;
     ForwardGraphKey key{};
     if (graph_eligible) {
-        const std::uint32_t graph_layout =
-            engine.forward_fn.invoke_graph_layout();
+        const std::uint32_t graph_layout = use_supergraph
+            ? engine.forward_fn.invoke_supergraph_graph_layout()
+            : engine.forward_fn.invoke_graph_layout();
         const std::uint32_t graph_variant =
             make_graph_variant(
                 /*small_spec=*/false,
                 /*rs_verify=*/false,
-                in.have_custom_mask,
+                use_supergraph ? false : in.have_custom_mask,
                 graph_layout,
-                /*has_hooks=*/has_hooks);
+                /*has_hooks=*/has_hooks) |
+            (use_supergraph ? kGvSupergraph : 0u);
         key = ForwardGraphKey{
             in.forward_R,
             in.forward_N,
@@ -825,7 +911,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 pi.w_off.data(),
                 in.has_write_desc,
                 in.structured_window_left,
-                has_hooks ? in.stage_hooks : nullptr);
+                has_hooks ? in.stage_hooks : nullptr,
+                use_supergraph);
             if (has_hooks) {
                 // The capture is the one moment the model's per-layer hook
                 // coverage is observable; a body that skipped hooks would
@@ -873,6 +960,36 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                             g_hook_graph_counters.captures));
                 }
             } else {
+                if (use_supergraph) {
+                    if (step_profile_enabled()) {
+                        std::fprintf(
+                            stderr,
+                            "[supergraph] capture at lookup variant=%u "
+                            "(mask=%d wdesc=%d)\n",
+                            key.variant, in.have_custom_mask ? 1 : 0,
+                            in.has_write_desc ? 1 : 0);
+                    }
+                    // The union key includes the CUSTOM prefill plan's
+                    // layout, and the capture's dual-prepare is what
+                    // materializes that plan on a bucket's first fire —
+                    // so the pre-capture key was computed against a null
+                    // plan. Re-key from the post-capture state and store
+                    // under THAT: the next fire (masked or not) recomputes
+                    // the same pair and hits.
+                    const std::uint32_t graph_layout =
+                        engine.forward_fn.invoke_supergraph_graph_layout();
+                    key.variant = make_graph_variant(
+                        /*small_spec=*/false,
+                        /*rs_verify=*/false,
+                        /*custom_mask=*/false,
+                        graph_layout,
+                        /*has_hooks=*/false) | kGvSupergraph;
+                    if (step_profile_enabled()) {
+                        std::fprintf(stderr,
+                                     "[supergraph] stored variant=%u\n",
+                                     key.variant);
+                    }
+                }
                 engine.graph_cache->put(key, exec);
             }
         } else if (has_hooks) {
@@ -895,6 +1012,20 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                     static_cast<unsigned long long>(
                         g_hook_graph_counters.replays));
             }
+        }
+        if (use_supergraph) {
+            // Arm the fire's branches: the graph's set_cond kernels read
+            // these slots (batch/supergraph.hpp). Peel's all-fast bit is
+            // constitutively 1 here — hook fires are outside the union,
+            // so every row is hook-free.
+            std::uint8_t preds[batch::kSupergraphPredSlots] = {};
+            preds[0] = in.has_write_desc ? 1 : 0;
+            preds[4] = in.have_custom_mask ? 1 : 0;
+            preds[batch::kPredSlotPeelAllFast] = 1;
+            preds[batch::kPredSlotPeelAllHooked] = 0;
+            CUDA_CHECK(cudaMemcpyAsync(
+                engine.inputs.supergraph_preds.data(), preds,
+                sizeof(preds), cudaMemcpyHostToDevice, cublas.stream()));
         }
         CUDA_CHECK(cudaGraphLaunch(exec, cublas.stream()));
         return;

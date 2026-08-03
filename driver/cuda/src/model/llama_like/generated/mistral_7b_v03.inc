@@ -141,14 +141,14 @@ const LoraTable* lora)
                 0u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(0);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -373,14 +373,14 @@ const LoraTable* lora)
                 1u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(1);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -605,14 +605,14 @@ const LoraTable* lora)
                 2u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(2);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -837,14 +837,14 @@ const LoraTable* lora)
                 3u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(3);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -1069,14 +1069,14 @@ const LoraTable* lora)
                 4u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(4);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -1301,14 +1301,14 @@ const LoraTable* lora)
                 5u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(5);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -1533,14 +1533,14 @@ const LoraTable* lora)
                 6u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(6);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -1765,14 +1765,14 @@ const LoraTable* lora)
                 7u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(7);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -1997,14 +1997,14 @@ const LoraTable* lora)
                 8u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(8);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -2229,14 +2229,14 @@ const LoraTable* lora)
                 9u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(9);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -2461,14 +2461,14 @@ const LoraTable* lora)
                 10u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(10);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -2693,14 +2693,14 @@ const LoraTable* lora)
                 11u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(11);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -2925,14 +2925,14 @@ const LoraTable* lora)
                 12u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(12);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -3157,14 +3157,14 @@ const LoraTable* lora)
                 13u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(13);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -3389,14 +3389,14 @@ const LoraTable* lora)
                 14u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(14);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -3621,14 +3621,14 @@ const LoraTable* lora)
                 15u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(15);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -3853,14 +3853,14 @@ const LoraTable* lora)
                 16u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(16);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -4085,14 +4085,14 @@ const LoraTable* lora)
                 17u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(17);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -4317,14 +4317,14 @@ const LoraTable* lora)
                 18u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(18);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -4549,14 +4549,14 @@ const LoraTable* lora)
                 19u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(19);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -4781,14 +4781,14 @@ const LoraTable* lora)
                 20u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(20);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -5013,14 +5013,14 @@ const LoraTable* lora)
                 21u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(21);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -5245,14 +5245,14 @@ const LoraTable* lora)
                 22u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(22);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -5477,14 +5477,14 @@ const LoraTable* lora)
                 23u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(23);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -5709,14 +5709,14 @@ const LoraTable* lora)
                 24u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(24);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -5941,14 +5941,14 @@ const LoraTable* lora)
                 25u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(25);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -6173,14 +6173,14 @@ const LoraTable* lora)
                 26u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(26);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -6405,14 +6405,14 @@ const LoraTable* lora)
                 27u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(27);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -6637,14 +6637,14 @@ const LoraTable* lora)
                 28u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(28);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -6869,14 +6869,14 @@ const LoraTable* lora)
                 29u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(29);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -7101,14 +7101,14 @@ const LoraTable* lora)
                 30u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(30);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -7333,14 +7333,14 @@ const LoraTable* lora)
                 31u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(31);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -7665,7 +7665,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(0);
@@ -7870,7 +7870,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(1);
@@ -8075,7 +8075,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(2);
@@ -8280,7 +8280,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(3);
@@ -8485,7 +8485,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(4);
@@ -8690,7 +8690,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(5);
@@ -8895,7 +8895,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(6);
@@ -9100,7 +9100,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(7);
@@ -9305,7 +9305,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(8);
@@ -9510,7 +9510,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(9);
@@ -9715,7 +9715,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(10);
@@ -9920,7 +9920,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(11);
@@ -10125,7 +10125,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(12);
@@ -10330,7 +10330,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(13);
@@ -10535,7 +10535,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(14);
@@ -10740,7 +10740,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(15);
@@ -10945,7 +10945,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(16);
@@ -11150,7 +11150,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(17);
@@ -11355,7 +11355,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(18);
@@ -11560,7 +11560,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(19);
@@ -11765,7 +11765,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(20);
@@ -11970,7 +11970,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(21);
@@ -12175,7 +12175,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(22);
@@ -12380,7 +12380,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(23);
@@ -12585,7 +12585,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(24);
@@ -12790,7 +12790,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(25);
@@ -12995,7 +12995,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(26);
@@ -13200,7 +13200,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(27);
@@ -13405,7 +13405,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(28);
@@ -13610,7 +13610,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(29);
@@ -13815,7 +13815,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(30);
@@ -14020,7 +14020,7 @@ const LoraTable* lora)
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(31);
@@ -14326,14 +14326,14 @@ const LoraTable* lora,
                 0u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(0);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -14526,14 +14526,14 @@ const LoraTable* lora,
                 1u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(1);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -14726,14 +14726,14 @@ const LoraTable* lora,
                 2u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(2);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -14926,14 +14926,14 @@ const LoraTable* lora,
                 3u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(3);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -15126,14 +15126,14 @@ const LoraTable* lora,
                 4u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(4);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -15326,14 +15326,14 @@ const LoraTable* lora,
                 5u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(5);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -15526,14 +15526,14 @@ const LoraTable* lora,
                 6u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(6);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -15726,14 +15726,14 @@ const LoraTable* lora,
                 7u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(7);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -15926,14 +15926,14 @@ const LoraTable* lora,
                 8u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(8);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -16126,14 +16126,14 @@ const LoraTable* lora,
                 9u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(9);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -16326,14 +16326,14 @@ const LoraTable* lora,
                 10u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(10);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -16526,14 +16526,14 @@ const LoraTable* lora,
                 11u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(11);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -16726,14 +16726,14 @@ const LoraTable* lora,
                 12u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(12);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -16926,14 +16926,14 @@ const LoraTable* lora,
                 13u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(13);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -17126,14 +17126,14 @@ const LoraTable* lora,
                 14u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(14);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -17326,14 +17326,14 @@ const LoraTable* lora,
                 15u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(15);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -17526,14 +17526,14 @@ const LoraTable* lora,
                 16u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(16);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -17726,14 +17726,14 @@ const LoraTable* lora,
                 17u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(17);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -17926,14 +17926,14 @@ const LoraTable* lora,
                 18u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(18);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -18126,14 +18126,14 @@ const LoraTable* lora,
                 19u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(19);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -18326,14 +18326,14 @@ const LoraTable* lora,
                 20u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(20);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -18526,14 +18526,14 @@ const LoraTable* lora,
                 21u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(21);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -18726,14 +18726,14 @@ const LoraTable* lora,
                 22u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(22);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -18926,14 +18926,14 @@ const LoraTable* lora,
                 23u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(23);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -19126,14 +19126,14 @@ const LoraTable* lora,
                 24u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(24);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -19326,14 +19326,14 @@ const LoraTable* lora,
                 25u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(25);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -19526,14 +19526,14 @@ const LoraTable* lora,
                 26u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(26);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -19726,14 +19726,14 @@ const LoraTable* lora,
                 27u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(27);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -19926,14 +19926,14 @@ const LoraTable* lora,
                 28u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(28);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -20126,14 +20126,14 @@ const LoraTable* lora,
                 29u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(29);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -20326,14 +20326,14 @@ const LoraTable* lora,
                 30u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(30);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
@@ -20526,14 +20526,14 @@ const LoraTable* lora,
                 31u, stream, /*query_is_f32=*/false,
                 {.mask_sink = page_mask.sink()});
         }
-        if (!plan_state.prefill_plan) {
+        if (!plan_state.mask_decode_plan) {
             throw std::runtime_error(
-                "generated forward: prepare built no prefill plan");
+                "generated forward: prepare built no custom-mask plan");
         }
         {
             auto kv_view = cache.layer_view(31);
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *plan_state.prefill_plan,
+                *plan_state.mask_decode_plan,
                 ws.q.data(), kv_view, ws.attn_out.data(),
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,

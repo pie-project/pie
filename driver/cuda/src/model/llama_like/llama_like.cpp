@@ -660,16 +660,22 @@ void prepare_llama_like_decode_plan(
     state.xqa_max_pages_per_seq = 0;
     state.use_prefill_plan = false;
     state.use_prefill_decode_plan = false;
+    state.use_mask_decode_plan = false;
     state.prefill_score_window = 0;
     if (have_custom_mask) {
-        if (!state.prefill_plan) {
-            state.prefill_plan = ops::make_prefill_plan();
+        // Pure-decode custom-mask fires plan into their DEDICATED slot
+        // (see LlamaLikePlanState::mask_decode_plan); prefill-shaped
+        // custom-mask fires keep the prefill slot.
+        auto& mask_plan = is_pure_decode ? state.mask_decode_plan
+                                         : state.prefill_plan;
+        if (!mask_plan) {
+            mask_plan = ops::make_prefill_plan();
         }
         const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
         const int num_q_heads_local  = cfg.num_attention_heads / T;
         const int num_kv_heads_local = cfg.num_key_value_heads / T;
         ops::plan_attention_flashinfer_prefill_bf16(
-            *state.prefill_plan,
+            *mask_plan,
             qo_indptr_h,
             kv_page_indptr_h,
             kv_last_page_lens_h,
@@ -687,7 +693,11 @@ void prepare_llama_like_decode_plan(
             cache.hnd_layout(),
             /*causal_mask=*/false,
             /*custom_mask=*/true);
-        state.use_prefill_plan = true;
+        if (is_pure_decode) {
+            state.use_mask_decode_plan = true;
+        } else {
+            state.use_prefill_plan = true;
+        }
         return;
     }
     if (is_pure_decode && fwd_cfg.use_xqa_decode &&
@@ -828,8 +838,38 @@ std::uint32_t llama_like_decode_graph_layout(
     if (state.use_prefill_plan && state.prefill_plan) {
         return ops::prefill_plan_graph_layout(*state.prefill_plan);
     }
+    if (state.use_mask_decode_plan && state.mask_decode_plan) {
+        return ops::prefill_plan_graph_layout(*state.mask_decode_plan);
+    }
     if (!state.decode_plan) return 0;
     return ops::decode_plan_graph_layout(*state.decode_plan);
+}
+
+std::uint32_t llama_like_supergraph_graph_layout(
+    const LlamaLikePlanState& state)
+{
+    // The UNION key's layout (S3): the supergraph contains BOTH the
+    // decode dispatch (else arm) and the custom-mask prefill dispatch
+    // (mask arm), so its capture validity spans both plans' kernel
+    // configurations. Each fire's prepare refreshes exactly the live
+    // arm's plan and leaves the other stable, so masked and unmasked
+    // fires at one (R, N) compose the SAME pair and share the exec —
+    // which is the whole point. A plan whose re-plan shifts its layout
+    // shifts the key and recaptures, exactly the existing per-layout
+    // discipline.
+    const std::uint32_t decode_side = state.use_xqa_decode
+        ? ops::xqa_decode_graph_layout(state.xqa_max_pages_per_seq)
+        : (state.decode_plan
+               ? ops::decode_plan_graph_layout(*state.decode_plan)
+               : 0u);
+    const std::uint32_t mask_side =
+        state.mask_decode_plan
+            ? ops::prefill_plan_graph_layout(*state.mask_decode_plan)
+            : 0u;
+    // splitmix-style mix so the pair cannot alias a plain layout.
+    std::uint32_t h = decode_side + 0x9e3779b9u;
+    h ^= mask_side + 0x85ebca6bu + (h << 6) + (h >> 2);
+    return h;
 }
 
 void llama_like_forward_paged(
@@ -1455,12 +1495,17 @@ void llama_like_forward_paged(
                     /*logits_soft_cap=*/0.f, sm_scale_override);
             }
         } else if (custom_mask_d) {
-            if (!plan_state.use_prefill_plan || prefill_plan == nullptr) {
+            const ops::PrefillPlanCache* mask_plan = is_pure_decode
+                ? (plan_state.use_mask_decode_plan
+                       ? plan_state.mask_decode_plan.get()
+                       : nullptr)
+                : (plan_state.use_prefill_plan ? prefill_plan : nullptr);
+            if (mask_plan == nullptr) {
                 throw std::runtime_error(
                     "custom attention mask has no prepared prefill plan");
             }
             ops::dispatch_attention_flashinfer_prefill_custom(
-                *prefill_plan,
+                *mask_plan,
                 attn_q, kv_view, attn_out_buf,
                 qo_indptr, kv_page_indices, kv_page_indptr,
                 kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
