@@ -491,9 +491,12 @@ impl WorkingSet {
         }
     }
 
-    /// Tokens per KV page for this working set's model.
+    /// Tokens per KV page for this working set's model — the constant every
+    /// page-geometry expression divides by, so it reads next to the working
+    /// set it is used with. A cached [`crate::model::kv_page_size`], not a
+    /// property of this handle: the engine serves one model.
     pub fn page_size(&self) -> u32 {
-        self.kv.page_size()
+        kv_page_size()
     }
 
     /// Current logical extent in pages, including reserved-but-unwritten space.
@@ -640,8 +643,12 @@ impl RsWorkingSet {
     }
 
     /// Size in bytes of one folded recurrent-state object for this model.
+    /// A cached [`crate::model::rs_state_size`]; see [`WorkingSet::page_size`].
     pub fn state_size(&self) -> u64 {
-        self.rs.state_size()
+        thread_local! {
+            static SIZE: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
+        }
+        SIZE.with(|c| *c.get_or_init(crate::model::rs_state_size))
     }
 
     /// Current number of buffered page slots.
@@ -649,9 +656,13 @@ impl RsWorkingSet {
         self.rs.buffer_size()
     }
 
-    /// Tokens per buffered RS page for this working set's model/driver.
+    /// Tokens per buffered RS page for this model/driver. A cached
+    /// [`crate::model::rs_buffer_page_size`]; see [`WorkingSet::page_size`].
     pub fn buffer_page_size(&self) -> u32 {
-        self.rs.buffer_page_size()
+        thread_local! {
+            static SIZE: std::cell::OnceCell<u32> = const { std::cell::OnceCell::new() };
+        }
+        SIZE.with(|c| *c.get_or_init(crate::model::rs_buffer_page_size))
     }
 
     /// Append `n` reserved buffered page slots; returns the contiguous
@@ -1008,7 +1019,7 @@ mod page_declaration_tests {
 impl<W: PassWit> Pass<W> {
     pub fn new() -> Pass<W> {
         let vocab = crate::model::output_vocab_size();
-        let page_size = crate::model::kv_page_size();
+        let page_size = kv_page_size();
         Pass {
             wit: W::new(),
             inner: RefCell::new(ForwardInner {
@@ -1322,6 +1333,16 @@ pub fn live_slots() -> usize {
     })
 }
 
+/// Tokens per KV page (cached) — the divisor in every page-geometry
+/// expression. Also reachable as [`WorkingSet::page_size`], which is the
+/// spelling to prefer when a working set is in hand.
+pub fn kv_page_size() -> u32 {
+    thread_local! {
+        static PAGE: std::cell::OnceCell<u32> = const { std::cell::OnceCell::new() };
+    }
+    PAGE.with(|c| *c.get_or_init(crate::model::kv_page_size))
+}
+
 /// Max embed tokens in a single pass (C) — the guest-side prefill chunk
 /// budget (cached). Split a prompt of L tokens into `ceil(L / C)` chunks, or
 /// let [`prefill_chunks`] do it, which is what you want.
@@ -1553,8 +1574,8 @@ impl Default for Pipeline {
 pub mod shared_prelude {
     pub use super::{
         Channel, KvBinding, KvGeometry, PageGrant, Pipeline, RsGeometry, RsWorkingSet, TOKEN_PAD,
-        WorkingSet, channel_capacity, frame_size, live_slots, max_embed_length, pad_tokens,
-        prefill_chunks, unpad_tokens,
+        WorkingSet, channel_capacity, frame_size, kv_page_size, live_slots, max_embed_length,
+        pad_tokens, prefill_chunks, unpad_tokens,
     };
     /// Every inferlet returns `inferlet::Result` from `#[inferlet::main]` and
     /// asks the model for its tokenizer and vocabulary, so both come with the

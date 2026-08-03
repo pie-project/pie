@@ -61,10 +61,6 @@ impl pie::inferlet::working_set::HostKvWorkingSet for ProcessCtx {
         Ok(self.ctx().table.push(ws)?)
     }
 
-    async fn page_size(&mut self, this: Resource<KvWorkingSet>) -> Result<u32> {
-        crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.get(&this)?.page_size)
-    }
 
     async fn page_len(&mut self, this: Resource<KvWorkingSet>) -> Result<u32> {
         crate::inferlet::process::gate::residency_gate(self).await?;
