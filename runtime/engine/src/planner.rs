@@ -789,6 +789,23 @@ impl Inner {
     /// something an evictee owns — that the yield must not outlive, so
     /// [`Inner::fleet_stalled`] hands the head straight back to the oldest
     /// entry of any kind.
+    ///
+    /// That argument has a second precondition it did not name: eviction
+    /// must be able to KEEP evicting. It is funded by the host pool, which
+    /// is finite, and the only event that returns a host slot is a restore
+    /// — the very thing being yielded. Once the pool is out, "evict every
+    /// resident" is not reachable, the unmet allocations stay unmet, and
+    /// the evictees holding the host pool can never come back to release
+    /// it. `fleet_stalled` does not catch it, because residents ARE
+    /// completing; the fleet is live and starving a resource at the same
+    /// time. Measured on `soak` (160 device pages, 1024 host pages, 4096
+    /// requests at 256-way): the rung drained host_free 1024 -> 0 in the
+    /// first seconds and it never recovered — restores pinned at 1-8 and
+    /// `evicted` at ~210 for the remaining 60 s while every further
+    /// attempt rolled back on `HostSwapFull`, 21895 of them, and the
+    /// starvation rung killed 138 of the stranded processes. Before the
+    /// yield the same fleet ran 123 evictions, 0 rollbacks and 0 kills.
+    /// So [`Inner::eviction_unfundable`] is the second valve.
     fn unmet_head(&self) -> Option<(EntryKey, &Waiter)> {
         let mut oldest_restore: Option<EntryKey> = None;
         let mut allocation: Option<EntryKey> = None;
@@ -810,7 +827,7 @@ impl Inner {
         }
         let head = match (allocation, oldest_restore) {
             (Some(allocation), Some(restore)) => {
-                if restore < allocation && self.fleet_stalled() {
+                if restore < allocation && (self.fleet_stalled() || self.eviction_unfundable()) {
                     restore
                 } else {
                     allocation
@@ -822,6 +839,21 @@ impl Inner {
         self.queue
             .get_key_value(&head)
             .map(|(&key, waiter)| (key, waiter))
+    }
+
+    /// Eviction has run out of the resource that funds it. A victim parked
+    /// in `host_swap_blocked` is proof: its bytes were refused by the host
+    /// pool, and victim selection is deterministic, so nothing about that
+    /// answer changes until host slots are actually returned. Only a
+    /// restore returns them, which is why this gates the restore yield in
+    /// [`Inner::unmet_head`] — preferring an allocation here cannot serve
+    /// it, since the rung that would fund it is blocked on the same pool.
+    ///
+    /// Deliberately a live signal rather than a latch: `clear_host_swap_blocks`
+    /// empties the set the moment host room returns, so the yield resumes as
+    /// soon as eviction can pay for itself again.
+    fn eviction_unfundable(&self) -> bool {
+        !self.host_swap_blocked.is_empty()
     }
 
     /// No completion can ever arrive on its own: no eviction in flight, no
@@ -3115,6 +3147,61 @@ mod service_order_tests {
         let (key, waiter) = inner.unmet_head().expect("a head");
         assert_eq!(key.0, 1);
         assert!(matches!(waiter.kind, WaitKind::Allocation { .. }));
+    }
+
+    /// The second valve. The fleet is live — a resident is running, so
+    /// `fleet_stalled` is false and the first valve stays shut — but the
+    /// host pool that funds eviction is out, and only a restore returns a
+    /// host slot. Yielding here serves nobody: the allocation it yields to
+    /// can only be funded by an eviction that cannot be paid for. On `soak`
+    /// this ran for 60 s and cost 21895 rollbacks and 138 starvation kills.
+    #[test]
+    fn a_restore_takes_the_head_once_eviction_cannot_be_funded() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (2, Residency::Resident, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[2], 3, 1);
+        assert!(!inner.fleet_stalled(), "a resident is still running");
+        assert_eq!(
+            inner.unmet_head().expect("a head").0.0,
+            3,
+            "with host room the yield stands"
+        );
+
+        inner.host_swap_blocked.insert(pids[1]);
+
+        assert!(inner.eviction_unfundable());
+        let (key, waiter) = inner.unmet_head().expect("a head");
+        assert_eq!(key.0, 1, "the older restore must take the head");
+        assert!(matches!(waiter.kind, WaitKind::Restore { .. }));
+    }
+
+    /// And it is a live signal, not a latch: once host room returns the
+    /// blocked set is cleared and the yield resumes, so the fix cannot
+    /// re-introduce the evict/restore ping-pong it is bounding.
+    #[test]
+    fn returning_host_room_resumes_the_yield() {
+        let (mut inner, pids) = fleet(&[
+            (1, Residency::Evicted, true),
+            (2, Residency::Resident, true),
+            (3, Residency::Resident, true),
+        ]);
+        park_restore(&mut inner, pids[0], 1, 18);
+        park_allocation(&mut inner, pids[2], 3, 1);
+        inner.host_swap_blocked.insert(pids[1]);
+        assert_eq!(inner.unmet_head().expect("a head").0.0, 1);
+
+        inner.host_swap_blocked.clear();
+
+        assert!(!inner.eviction_unfundable());
+        assert_eq!(
+            inner.unmet_head().expect("a head").0.0,
+            3,
+            "the allocation takes the head again"
+        );
     }
 }
 
