@@ -107,6 +107,42 @@ struct ModelFacts {
     bool ll_qk_norm = false;
     bool ll_tied_embeddings = true;
     bool ll_norm_topk_prob = true;
+    // ── Qwen3.5 / Qwen3-Next (the GDN hybrid) ──
+    // Its shape used to be a struct full of defaults compiled into the driver,
+    // which meant the family ran exactly one checkpoint and mis-ran any other
+    // silently. These are the keys that shape actually comes from.
+    int q35_num_hidden_layers = 0;
+    int q35_hidden_size = 0;
+    int q35_vocab_size = 0;
+    int q35_num_attention_heads = 0;
+    int q35_num_key_value_heads = 0;
+    int q35_head_dim = 0;
+    int q35_intermediate_size = 0;
+    // The linear-attention block. `conv_dim` and the value total are DERIVED
+    // from these rather than read, because a config cannot state them
+    // inconsistently with the head counts and this driver should not be able
+    // to either.
+    int q35_linear_key_heads = 0;
+    int q35_linear_value_heads = 0;
+    int q35_linear_key_head_dim = 0;
+    int q35_linear_value_head_dim = 0;
+    int q35_linear_conv_kernel = 0;
+    /// One full-attention layer every `interval`; -1 for an irregular pattern
+    /// the geometry refuses rather than approximates.
+    int q35_full_attn_interval = 0;
+    // The routed FFN.
+    int q35_num_experts = 0;
+    int q35_num_experts_per_tok = 0;
+    int q35_moe_intermediate_size = 0;
+    int q35_shared_expert_intermediate = 0;
+    int q35_decoder_sparse_step = 1;
+    /// Layers the config exempts from routing. Carried as a COUNT because the
+    /// geometry refuses any non-empty one; the number is for the message.
+    int q35_mlp_only_layer_count = 0;
+    float q35_rms_norm_eps = 1e-6f;
+    bool q35_tied_embeddings = true;
+    bool q35_norm_topk_prob = true;
+
     // Which storage schema this driver authors against. Parsed here because
     // this is already the driver's one read of `config.json`; the loader no
     // longer opens it (`loader/architecture.md` §10.4).

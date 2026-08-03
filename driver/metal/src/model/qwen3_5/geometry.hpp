@@ -27,6 +27,14 @@ struct DecodeGeometry {
     int gdn_v_total = 2048;
 
     int intermediate = 3584;
+
+    /// Routed mixture. `n_experts == 0` is a dense FFN. Same three fields the
+    /// llama geometry carries, and for the same reason: the difference between
+    /// a dense and a routed decoder is these, not a different family.
+    int n_experts = 0;
+    int experts_per_token = 0;
+    int moe_intermediate = 0;
+
     int q_group = 64;
     int q_bits = 4;
 
@@ -56,6 +64,10 @@ struct DecodeGeometry {
         return std::size_t(gdn_v_heads) * std::size_t(gdn_v_dim) *
                std::size_t(gdn_k_dim) * 4u;
     }
+
+    bool is_moe() const { return n_experts > 0 && experts_per_token > 0; }
+    /// The width one expert's gate/up produce, or the dense width.
+    int ffn_width() const { return is_moe() ? moe_intermediate : intermediate; }
 };
 
 }  // namespace pie::metal

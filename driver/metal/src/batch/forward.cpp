@@ -20,6 +20,7 @@
 #include "model/contract.hpp"
 #include "model/gemma4/decode_step.hpp"
 #include "model/gemma4/geometry.hpp"
+#include "model/qwen3_5/geometry_facts.hpp"
 #include "simple_family.hpp"
 #include "decode_consts.hpp"
 #include "decode_dispatch_mb.hpp"
@@ -2346,7 +2347,32 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         }
         return false;
     }
-    DecodeGeometry geom{};  // shipped qwen3.6 defaults
+    // The shape this checkpoint actually has, from its own config.
+    //
+    // This was `DecodeGeometry geom{}` -- default-constructed, with one preview
+    // checkpoint's dimensions compiled in as the defaults. Every other member
+    // of the family therefore ran at the wrong hidden size, layer count and
+    // linear-attention geometry, and said nothing about it: the loader binds by
+    // NAME, and a name carries no dimension to disagree with.
+    DecodeGeometry geom{};
+    {
+        std::string gerr;
+        if (!geometry_from_facts(cfg.qwen35, geom, &gerr)) {
+            if (err != nullptr) *err = gerr;
+            return false;
+        }
+        // The routed FFN this family's own checkpoints ship is not built yet.
+        // Refused here rather than left to the dense DAG, which would ask the
+        // binder for an `mlp.gate_proj` a routed checkpoint does not have and
+        // report a missing tensor instead of a missing feature.
+        if (geom.is_moe()) {
+            if (err != nullptr) {
+                *err = "qwen3.5 geometry: this config has a routed FFN and the family's "
+                       "decode DAG builds a dense one";
+            }
+            return false;
+        }
+    }
     // Phase 1b (review fix B): really allocate `kPhase1bRsSlots` resident
     // GDN conv+recurrent state slots — heap_layout.hpp's `plan_heap` sizes
     // the State region as `slots * per_slot_bytes` and heap_bind.cpp binds

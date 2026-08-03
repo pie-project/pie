@@ -472,6 +472,17 @@ add_test(NAME gptoss_decode_step_test COMMAND gptoss_decode_step_test)
 # Llama: one DAG serving llama/mistral/qwen2/qwen3 and the Qwen MoEs. The claim
 # that these are one family and not four is a claim about this function, so it
 # is checked here rather than discovered in an encoder.
+# The Qwen3.5 family's shape, as a config-to-geometry function. Its geometry
+# used to be a struct of compiled-in defaults, so this pins that it is derived
+# and that what cannot be derived is refused by name.
+add_executable(qwen3_5_geometry_test tests/qwen3_5_geometry_test.cpp)
+target_compile_features(qwen3_5_geometry_test PRIVATE cxx_std_20)
+target_include_directories(qwen3_5_geometry_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/batch)
+target_link_libraries(qwen3_5_geometry_test PRIVATE pie_driver_metal_lib)
+add_test(NAME qwen3_5_geometry_test COMMAND qwen3_5_geometry_test)
+
 add_executable(llama_decode_step_test tests/llama_decode_step_test.cpp)
 target_compile_features(llama_decode_step_test PRIVATE cxx_std_20)
 target_include_directories(llama_decode_step_test PRIVATE

@@ -406,6 +406,43 @@ struct SetupConfig {
         bool present() const { return n_layers > 0 && hidden > 0; }
     } llama;
 
+    /// Qwen3.5 / Qwen3-Next: the GDN hybrid's shape.
+    ///
+    /// This family used to have no facts at all. Its `DecodeGeometry` was
+    /// default-constructed and the defaults were one preview checkpoint's
+    /// dimensions, so the driver ran that checkpoint and mis-ran every other
+    /// one -- silently, because nothing in the path ever compared a config
+    /// against what it was about to execute.
+    struct Qwen35Facts {
+        int n_layers = 0;
+        int hidden = 0;
+        int vocab = 0;
+        int n_q_heads = 0;
+        int n_kv_heads = 0;
+        int head_dim = 0;
+        int intermediate = 0;
+        /// The linear-attention block's head counts and dims. The convolution
+        /// width and the value total are derived from them by the geometry.
+        int gdn_k_heads = 0;
+        int gdn_v_heads = 0;
+        int gdn_k_dim = 0;
+        int gdn_v_dim = 0;
+        int gdn_conv_k = 0;
+        /// One full-attention layer every `interval`. -1 means the config
+        /// listed an irregular pattern, which the geometry refuses.
+        int full_attn_interval = 0;
+        int n_experts = 0;
+        int experts_per_token = 0;
+        int moe_intermediate = 0;
+        int shared_expert_intermediate = 0;
+        int decoder_sparse_step = 1;
+        int mlp_only_layer_count = 0;
+        float eps = 1e-6f;
+        bool tied_embeddings = true;
+        bool norm_topk_prob = true;
+        bool present() const { return n_layers > 0 && hidden > 0; }
+    } qwen35;
+
     /// How many tokens the KV ring must hold, across ALL resident requests.
     ///
     /// Zero means `kMetalMaxCtxTokens`: a ring sized for a full fleet, which is

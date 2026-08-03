@@ -7,6 +7,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "model/contract.hpp"
+
 namespace pie::metal {
 
 ModelFacts read_model_facts(const std::string& hf_path) {
@@ -201,6 +203,73 @@ ModelFacts read_model_facts(const std::string& hf_path) {
                 facts.model_type == "qwen3" || facts.model_type == "qwen3_moe";
         }
 
+        // ── Qwen3.5 / Qwen3-Next: the GDN hybrid ──
+        // Read only when `model_type` names it, like every block around it.
+        if (pie::metal::model::qwen3_5::is_supported_model_type(facts.model_type)) {
+            const auto gi = [](const nlohmann::json& obj, const char* key, int& out) {
+                if (obj.contains(key) && obj[key].is_number_integer()) {
+                    out = obj[key].get<int>();
+                }
+            };
+            const auto gf = [](const nlohmann::json& obj, const char* key, float& out) {
+                if (obj.contains(key) && obj[key].is_number()) {
+                    out = obj[key].get<float>();
+                }
+            };
+            gi(j, "num_hidden_layers", facts.q35_num_hidden_layers);
+            gi(j, "hidden_size", facts.q35_hidden_size);
+            gi(j, "vocab_size", facts.q35_vocab_size);
+            gi(j, "num_attention_heads", facts.q35_num_attention_heads);
+            gi(j, "num_key_value_heads", facts.q35_num_key_value_heads);
+            gi(j, "head_dim", facts.q35_head_dim);
+            gi(j, "intermediate_size", facts.q35_intermediate_size);
+            gi(j, "linear_num_key_heads", facts.q35_linear_key_heads);
+            gi(j, "linear_num_value_heads", facts.q35_linear_value_heads);
+            gi(j, "linear_key_head_dim", facts.q35_linear_key_head_dim);
+            gi(j, "linear_value_head_dim", facts.q35_linear_value_head_dim);
+            gi(j, "linear_conv_kernel_dim", facts.q35_linear_conv_kernel);
+            gi(j, "full_attention_interval", facts.q35_full_attn_interval);
+            gi(j, "num_experts", facts.q35_num_experts);
+            gi(j, "num_experts_per_tok", facts.q35_num_experts_per_tok);
+            gi(j, "moe_intermediate_size", facts.q35_moe_intermediate_size);
+            gi(j, "shared_expert_intermediate_size", facts.q35_shared_expert_intermediate);
+            gi(j, "decoder_sparse_step", facts.q35_decoder_sparse_step);
+            gf(j, "rms_norm_eps", facts.q35_rms_norm_eps);
+            if (j.contains("norm_topk_prob") && j["norm_topk_prob"].is_boolean()) {
+                facts.q35_norm_topk_prob = j["norm_topk_prob"].get<bool>();
+            }
+            if (j.contains("tie_word_embeddings") && j["tie_word_embeddings"].is_boolean()) {
+                facts.q35_tied_embeddings = j["tie_word_embeddings"].get<bool>();
+            }
+            if (j.contains("mlp_only_layers") && j["mlp_only_layers"].is_array()) {
+                facts.q35_mlp_only_layer_count = int(j["mlp_only_layers"].size());
+            }
+            // Some releases spell the layer pattern as a list instead of an
+            // interval. Reduced to the interval it implies, or to -1 when it
+            // implies none -- the geometry refuses -1 rather than rounding an
+            // irregular stack to a regular one, which would put full attention
+            // on layers that are linear.
+            if (facts.q35_full_attn_interval == 0 && j.contains("layer_types") &&
+                j["layer_types"].is_array()) {
+                std::vector<int> full;
+                int idx = 0;
+                for (const auto& lt : j["layer_types"]) {
+                    if (lt.is_string() && lt.get<std::string>() == "full_attention") {
+                        full.push_back(idx);
+                    }
+                    ++idx;
+                }
+                if (!full.empty()) {
+                    const int interval = full[0] + 1;
+                    bool regular = true;
+                    for (std::size_t k = 0; k < full.size(); ++k) {
+                        regular = regular && full[k] == int(k + 1) * interval - 1;
+                    }
+                    facts.q35_full_attn_interval = regular ? interval : -1;
+                }
+            }
+        }
+
         // ── Gemma 4 ──
         // Read only when the config says so, so nothing here can perturb the
         // family that already works.
@@ -313,6 +382,28 @@ void fill_family_geometry(pie::metal::batch::SetupConfig& cfg, const ModelFacts&
     cfg.llama.norm_topk_prob = facts.ll_norm_topk_prob;
     cfg.llama.qk_norm = facts.ll_qk_norm;
     cfg.llama.tied_embeddings = facts.ll_tied_embeddings;
+    cfg.qwen35.n_layers = facts.q35_num_hidden_layers;
+    cfg.qwen35.hidden = facts.q35_hidden_size;
+    cfg.qwen35.vocab = facts.q35_vocab_size;
+    cfg.qwen35.n_q_heads = facts.q35_num_attention_heads;
+    cfg.qwen35.n_kv_heads = facts.q35_num_key_value_heads;
+    cfg.qwen35.head_dim = facts.q35_head_dim;
+    cfg.qwen35.intermediate = facts.q35_intermediate_size;
+    cfg.qwen35.gdn_k_heads = facts.q35_linear_key_heads;
+    cfg.qwen35.gdn_v_heads = facts.q35_linear_value_heads;
+    cfg.qwen35.gdn_k_dim = facts.q35_linear_key_head_dim;
+    cfg.qwen35.gdn_v_dim = facts.q35_linear_value_head_dim;
+    cfg.qwen35.gdn_conv_k = facts.q35_linear_conv_kernel;
+    cfg.qwen35.full_attn_interval = facts.q35_full_attn_interval;
+    cfg.qwen35.n_experts = facts.q35_num_experts;
+    cfg.qwen35.experts_per_token = facts.q35_num_experts_per_tok;
+    cfg.qwen35.moe_intermediate = facts.q35_moe_intermediate_size;
+    cfg.qwen35.shared_expert_intermediate = facts.q35_shared_expert_intermediate;
+    cfg.qwen35.decoder_sparse_step = facts.q35_decoder_sparse_step;
+    cfg.qwen35.mlp_only_layer_count = facts.q35_mlp_only_layer_count;
+    cfg.qwen35.eps = facts.q35_rms_norm_eps;
+    cfg.qwen35.tied_embeddings = facts.q35_tied_embeddings;
+    cfg.qwen35.norm_topk_prob = facts.q35_norm_topk_prob;
     cfg.gemma4.n_layers = facts.g4_num_hidden_layers;
     cfg.gemma4.hidden = facts.g4_hidden_size;
     cfg.gemma4.intermediate = facts.g4_intermediate_size;
