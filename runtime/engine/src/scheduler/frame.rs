@@ -139,22 +139,19 @@ const STRICT_WATCHDOG_US: u64 = 1_000_000;
 /// the two is worth 2x on a sixteen-request fleet (206 -> 422 tok/s).
 const GATHER_POLL_US: u64 = 500;
 
-/// Grace period before the join gate gives up on a joiner and seals without
-/// it — see [`FramePolicy::join_gate_circular`] and the `missing == 0` arm in
-/// [`FramePolicy::plan_dispatch`].
+/// How long an identified successor may keep an otherwise fully-submitted
+/// boundary waiting for its first fire. A healthy join lands in microseconds,
+/// so this is three orders of magnitude of slack, and it is still fifty times
+/// under the strict watchdog — a join that misses it was never "imminent" in
+/// any sense the epoch benefits from.
 ///
-/// This is not guest policy: `park()` and the submit deadline govern a guest's
-/// silence, whereas this governs the ENGINE's own bookkeeping, where `staged`
-/// and `pending_slots` claim an arrival is imminent. A healthy join resolves
-/// in microseconds, so the grace costs nothing and keeps the dense wait-all
-/// path for the case the claim is true.
-const JOIN_GRACE_US: u64 = 2_000;
-
-/// How long a successor that has already consumed its execution slot may keep
-/// an otherwise fully-submitted boundary waiting for its first fire. A healthy
-/// join lands in microseconds, so this is three orders of magnitude of slack,
-/// and it is still fifty times under the strict watchdog — a join that misses
-/// it was never "imminent" in any sense the epoch benefits from.
+/// This is the ONLY timer the join gate needs, and it is not a heuristic: the
+/// interval from permit to first fire is guest time and has no upper bound,
+/// so the boundary must be able to give up. The earmark used to need a
+/// second, shorter one to apologise for guessing, and that one is gone —
+/// instrumented over `churn`, `admission_tail` and `allshared_noswap`, the
+/// gate is entered thousands of times and this deadline expires zero times,
+/// because a named earmark resolves the moment its taker wakes.
 const JOIN_SETTLE_US: u64 = 20_000;
 
 struct ArrivedFire {
@@ -334,6 +331,11 @@ pub(super) struct FramePolicy {
     /// The seal waits for exactly these lanes (removed by first fire and
     /// by every leave path, so a joiner that dies cannot wedge the seal).
     joins_in_flight: BTreeSet<ProcessId>,
+    /// Processes blocked on an execution permit, in the order the FIFO-fair
+    /// semaphore will hand them one. A slot that is free or about to be free
+    /// belongs to the head of this queue, which is what makes the successor
+    /// earmark a named process.
+    admission_queue: VecDeque<ProcessId>,
     /// Processes that consumed an execution slot and still hold it. A
     /// Terminate leave of a member moves it to `departing`: its slot is
     /// now certain to resolve (the permit's only exit is `ProcessCtx::drop`,
@@ -368,7 +370,7 @@ pub(super) struct FramePolicy {
     /// Liveness-only deadline for the current blocked-gather episode.
     strict_watchdog_deadline: Option<Instant>,
     /// Deadline for the join-gate grace period ([`FramePolicy::join_gate_circular`]).
-    join_escape_deadline: Option<Instant>,
+    join_hold_deadline: Option<Instant>,
     cold_hold_deadline: Option<Instant>,
     /// Lanes with fires the engine has dispatched but not yet retired: the
     /// engine owes them a result, so the submit deadline's clock must not run
@@ -410,12 +412,13 @@ impl FramePolicy {
             staged: BTreeSet::new(),
             pending_slots: 0,
             joins_in_flight: BTreeSet::new(),
+            admission_queue: VecDeque::new(),
             slotted: BTreeSet::new(),
             departing: BTreeSet::new(),
             suspended: BTreeSet::new(),
             truncated_seqs: BTreeMap::new(),
             strict_watchdog_deadline: None,
-            join_escape_deadline: None,
+            join_hold_deadline: None,
             cold_hold_deadline: None,
             in_flight_lanes: BTreeSet::new(),
             submit_deadline: crate::scheduler::configured_submit_deadline(),
@@ -726,10 +729,23 @@ impl FramePolicy {
     /// fire here.
     pub fn on_execution_slot_consumed(&mut self, pid: ProcessId) {
         self.pending_slots = self.pending_slots.saturating_sub(1);
+        self.admission_queue.retain(|queued| *queued != pid);
         self.slotted.insert(pid);
         if self.staged.contains(&pid) {
             self.joins_in_flight.insert(pid);
         }
+    }
+
+    /// A process began waiting for an execution permit.
+    pub fn on_admission_queued(&mut self, pid: ProcessId) {
+        if !self.admission_queue.contains(&pid) {
+            self.admission_queue.push_back(pid);
+        }
+    }
+
+    /// It took the permit, or was cancelled before it could.
+    pub fn on_admission_dequeued(&mut self, pid: ProcessId) {
+        self.admission_queue.retain(|queued| *queued != pid);
     }
 
     /// A slot holder's Terminate leave arrived: its release broadcast is
@@ -757,42 +773,36 @@ impl FramePolicy {
     }
 
     /// Whether the seal is waiting on a successor's arrival: a swap is
-    /// earmarked (a slot was released or a holder is departing, with a
-    /// staged taker for it) or an admitted successor's first fire is still
+    /// earmarked (a slot is free or about to be, and the process that will
+    /// take it is identified) or an admitted successor's first fire is still
     /// in flight. This is exactly the cohort-boundary window.
-    pub fn is_joining(&self) -> bool {
-        !self.joins_in_flight.is_empty()
-            || ((self.pending_slots > 0 || !self.departing.is_empty()) && !self.staged.is_empty())
+    ///
+    /// The earmark used to be `(pending_slots > 0 || !departing.is_empty())
+    /// && !staged.is_empty()`: a cross product, not a matching. It never
+    /// claimed that *that* staged process would take *that* slot, because it
+    /// could not -- admission is a race for a counting permit. Once the pool
+    /// was oversubscribed both sides were permanently non-empty, so the
+    /// predicate was permanently true and only a grace timer stopped a
+    /// fully-submitted boundary from idling the GPU for the whole
+    /// strict-watchdog window.
+    ///
+    /// `admission_queue` closes that gap. `tokio::Semaphore` is FIFO-fair,
+    /// so the processes blocked on a permit ARE the takers of the next slots
+    /// to free, in order. Matching the two by position earmarks named
+    /// processes, and the hold now lasts only from a release until its
+    /// identified taker wakes -- microseconds -- instead of standing
+    /// permanently true.
+    pub fn earmarked(&self) -> impl Iterator<Item = ProcessId> + '_ {
+        let slots = self.pending_slots as usize + self.departing.len();
+        self.admission_queue
+            .iter()
+            .filter(|pid| self.staged.contains(pid))
+            .take(slots)
+            .copied()
     }
 
-    /// Whether the JOIN half of the seal gate is provably circular.
-    ///
-    /// [`Self::is_joining`] holds the seal because a staged successor's
-    /// admission and first fire are *imminent*. When every staged successor
-    /// is still behind an unfinished bind, none of them is imminent at all:
-    /// a bind completes through the driver lane's control slot, which is
-    /// ordered behind the dispatch this unsealed boundary is holding. The
-    /// wait then closes a `bind -> dispatch -> seal -> bind` cycle on the
-    /// JOINING side, which no amount of accounting on `missing` can reach:
-    /// the holder is not a member at all. Observed under open-loop arrivals as `lanes=29 awaited=29
-    /// sealed=0 pending_binds=99 staged=99 pending_slots=99
-    /// joins_in_flight=0`, every lane's front frame complete, nothing
-    /// executing: the GPU sat idle and the fleet never moved again.
-    ///
-    /// The two exclusions are the cases where the wait is NOT circular.
-    /// A non-empty `joins_in_flight` means a successor already holds its
-    /// slot, so its fire is genuinely in flight. A non-empty `departing`
-    /// means a slot release is still coming from a teardown task that this
-    /// seal does not gate. Either one is real progress, so neither escapes.
-    fn join_gate_circular(&self, executing: bool) -> bool {
-        !executing
-            && self.joins_in_flight.is_empty()
-            && self.departing.is_empty()
-            && !self.staged.is_empty()
-            && self
-                .staged
-                .iter()
-                .all(|pid| self.pending_binds.contains_key(pid))
+    pub fn is_joining(&self) -> bool {
+        !self.joins_in_flight.is_empty() || self.earmarked().next().is_some()
     }
 
     pub fn on_bind_completed(&mut self, pid: Option<ProcessId>) {
@@ -955,7 +965,7 @@ impl FramePolicy {
         self.ever_sealed = false;
         self.cold_hold_deadline = None;
         self.strict_watchdog_deadline = None;
-        self.join_escape_deadline = None;
+        self.join_hold_deadline = None;
     }
 
     fn have_seal_candidate(&self) -> bool {
@@ -1203,7 +1213,7 @@ impl FramePolicy {
             if !self.lanes.values().any(|lane| !lane.frames.is_empty()) {
                 // Nothing queued anywhere: no gather episode is running.
                 self.strict_watchdog_deadline = None;
-                self.join_escape_deadline = None;
+                self.join_hold_deadline = None;
                 return FramePlan::Park;
             }
             // `missing` counts awaited lanes whose next frame is not fully
@@ -1294,23 +1304,16 @@ impl FramePolicy {
             // `churn_extreme` (1024-way over 96 pages): 51.3s with 23 submit
             // deadline breaches and five `[frame-stall]` reports before,
             // 33.6s with all 4096 requests completed after.
-            let joining = if joining
-                && (self.join_gate_circular(executing) || (missing == 0 && !executing))
-            {
+            let joining = if joining && missing == 0 && !executing {
                 // A healthy gather resolves in microseconds, so waiting
                 // JOIN_GRACE_US before concluding the claim is false costs
                 // nothing and keeps the dense wait-all path.
-                let grace = if self.joins_in_flight.is_empty() {
-                    JOIN_GRACE_US
-                } else {
-                    JOIN_SETTLE_US
-                };
                 let deadline = *self
-                    .join_escape_deadline
-                    .get_or_insert(now + Duration::from_micros(grace));
+                    .join_hold_deadline
+                    .get_or_insert(now + Duration::from_micros(JOIN_SETTLE_US));
                 now < deadline
             } else {
-                self.join_escape_deadline = None;
+                self.join_hold_deadline = None;
                 joining
             };
             if joining || missing > 0 {
@@ -1353,7 +1356,7 @@ impl FramePolicy {
                 return plan;
             }
             self.strict_watchdog_deadline = None;
-            self.join_escape_deadline = None;
+            self.join_hold_deadline = None;
             // EARLY seal: the gate held (every awaited lane's next frame is
             // fully submitted, no earmarked successor assembling), so seal NOW — normally
             // while the previous frame still executes. Sealing early is
@@ -1453,16 +1456,16 @@ mod tests {
     }
 
     /// The join gate arms its deadline on the first blocked plan and only
-    /// seals without the joiner once [`JOIN_GRACE_US`] has passed, which is
+    /// seals without the joiner once [`JOIN_SETTLE_US`] has passed, which is
     /// longer than the gather poll one [`drive_past_cold_hold`] step
     /// advances by.
-    fn drive_past_join_grace(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
+    fn drive_past_join_settle(policy: &mut FramePolicy, queued: &QueuedFireIds) -> FramePlan {
         let now = Instant::now();
         match plan(policy, queued, now) {
             FramePlan::Hold(_) => plan(
                 policy,
                 queued,
-                now + Duration::from_micros(JOIN_GRACE_US + 1),
+                now + Duration::from_micros(JOIN_SETTLE_US + 1),
             ),
             plan => plan,
         }
@@ -1951,11 +1954,12 @@ mod tests {
         // successor has not bound yet: `is_joining()` holds the seal.
         policy.on_execution_slot_released(runner);
         policy.on_bind_enqueued(Some(successor));
+        policy.on_admission_queued(successor);
         assert!(policy.is_joining());
 
         policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 11, 1, 1);
         let queued: QueuedFireIds = [11].into_iter().collect();
-        let sealed = drive_past_join_grace(&mut policy, &queued);
+        let sealed = drive_past_join_settle(&mut policy, &queued);
         assert_eq!(
             fires(&sealed),
             vec![11],
@@ -1996,10 +2000,17 @@ mod tests {
 
         policy.on_fire_enqueued(stamp(runner, 1, 0, 1), Some(runner), 11, 1, 1);
         let queued: QueuedFireIds = [11].into_iter().collect();
-        match drive_past_join_grace(&mut policy, &queued) {
+        match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) | FramePlan::Park => {}
             plan => panic!("an admitted successor's first fire must be waited for, got {plan:?}"),
         }
+        // ...but the wait is bounded: permit-to-first-fire is guest time, so
+        // the boundary seals dense-minus-one rather than idle on a promise.
+        assert_eq!(
+            fires(&drive_past_join_settle(&mut policy, &queued)),
+            vec![11],
+            "a joiner that misses the settle window stops holding the boundary"
+        );
     }
 
     /// A freed slot with a staged taker holds the seal; the successor's
@@ -2014,6 +2025,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
         policy.on_bind_enqueued(Some(successor));
         policy.on_bind_completed(Some(successor));
+        policy.on_admission_queued(successor);
         policy.on_execution_slot_released(pid());
         let queued: QueuedFireIds = [95].into_iter().collect();
         match drive_past_cold_hold(&mut policy, &queued) {
@@ -2102,6 +2114,7 @@ mod tests {
         policy.on_fire_enqueued(stamp(lane, 0, 0, 1), Some(lane), 95, 1, 1);
         policy.on_bind_enqueued(Some(successor));
         policy.on_bind_completed(Some(successor));
+        policy.on_admission_queued(successor);
         // Terminate leave lands pass-granular, release still in flight.
         policy.on_slotted_terminate(predecessor);
         policy.on_lane_leave(predecessor, None, true);
@@ -2169,6 +2182,8 @@ mod tests {
         let (a, b) = (pid(), pid());
         policy.on_bind_enqueued(Some(a));
         policy.on_bind_enqueued(Some(b));
+        policy.on_admission_queued(a);
+        policy.on_admission_queued(b);
         policy.on_execution_slot_consumed(a);
         policy.on_fire_enqueued(stamp(a, 10, 0, 1), Some(a), 10, 1, 1);
         let queued: QueuedFireIds = [10].into_iter().collect();
@@ -2238,6 +2253,7 @@ mod tests {
         // then let it die before firing: the leave releases the hold.
         policy.on_fire_enqueued(stamp(lane, 1, 0, 1), Some(lane), 96, 1, 1);
         policy.on_bind_enqueued(Some(successor));
+        policy.on_admission_queued(successor);
         let queued: QueuedFireIds = [96].into_iter().collect();
         match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) | FramePlan::Park => {}

@@ -212,6 +212,23 @@ pub(crate) fn notify_execution_slot_consumed(pid: ProcessId) {
     }
 }
 
+/// A process joined the execution-admission FIFO. Announced before the
+/// permit wait so the frame policy can earmark it by identity.
+pub(crate) fn notify_admission_queued(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::AdmissionQueued(pid));
+    }
+}
+
+/// A process left the FIFO -- it took its permit, or it was cancelled.
+pub(crate) fn notify_admission_dequeued(pid: ProcessId) {
+    let handles = super::handle_registry().read().unwrap();
+    for handle in handles.iter().flatten() {
+        let _ = handle.send(SchedulerItem::AdmissionDequeued(pid));
+    }
+}
+
 /// No-op: wait-set rejoin is implicit on the pipeline's next scheduler
 /// submission, so a join event has nothing to do here (the planner's
 /// restore path relies on the same implicit rejoin).
@@ -458,9 +475,7 @@ impl LaunchGrouping {
         // RS rows are one per request across the whole composed batch, so a
         // fire that binds recurrent state and one that does not cannot share
         // a wave: the driver would see fewer slot ids than requests.
-        if self.count != 0
-            && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows
-        {
+        if self.count != 0 && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows {
             return false;
         }
         // Custom wire masks co-batch freely with other wire-geometry fires —
@@ -666,6 +681,11 @@ enum SchedulerItem {
     /// waits for this exact process's first fire (identity-paired with the
     /// release above — the two race through the mailbox in either order).
     ExecutionSlotConsumed(ProcessId),
+    /// A process is queued for an execution permit; it is the identified
+    /// taker of the next slot to free (the semaphore is FIFO-fair).
+    AdmissionQueued(ProcessId),
+    /// It took the permit, or went away before it could.
+    AdmissionDequeued(ProcessId),
     /// The planner concluded a suspended process is runnable again (restore
     /// committed, or the eviction rolled back): its lanes may rejoin the
     /// wait-set and batch full frames again. Process-keyed.
@@ -684,7 +704,10 @@ enum SchedulerItem {
     /// lands once every frame submitted before it has sealed, so a guest may
     /// park with fires still outstanding (frame mode only; a no-op
     /// otherwise).
-    LanePark { lane: ProcessId, seq: u64 },
+    LanePark {
+        lane: ProcessId,
+        seq: u64,
+    },
     /// Snapshot the run loop's state as a human-readable dump (queue
     /// composition, in-flight work, barrier membership). Answered inline on
     /// dequeue — a held wave must be inspectable from outside the thread.
@@ -2876,6 +2899,12 @@ impl BatchScheduler {
             }
             SchedulerItem::ExecutionSlotConsumed(pid) => {
                 frame_policy.on_execution_slot_consumed(pid);
+            }
+            SchedulerItem::AdmissionQueued(pid) => {
+                frame_policy.on_admission_queued(pid);
+            }
+            SchedulerItem::AdmissionDequeued(pid) => {
+                frame_policy.on_admission_dequeued(pid);
             }
             SchedulerItem::PipelineLeave(pid, owner, kind, response) => {
                 if kind == LeaveKind::Terminate {
