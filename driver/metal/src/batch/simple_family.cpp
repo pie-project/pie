@@ -385,6 +385,10 @@ class Gemma4Engine final : public SimpleFamilyEngine {
 
     int vocab() const override { return g_.vocab; }
     int n_layers() const override { return g_.n_layers; }
+    WeightBytes weight_bytes() const override {
+        // Gemma 4 is dense: there is no bank and nothing to discount.
+        return pie::metal::weight_bytes(b_.weights, 0, 0);
+    }
 
     void reset() override {
         for (int L = 0; L < g_.n_layers; ++L) {
@@ -741,6 +745,9 @@ class GptOssEngine final : public SimpleFamilyEngine {
 
     int vocab() const override { return g_.vocab; }
     int n_layers() const override { return g_.n_layers; }
+    WeightBytes weight_bytes() const override {
+        return pie::metal::weight_bytes(b_.weights, g_.n_experts, g_.experts_per_token);
+    }
 
     void reset() override {
         for (int L = 0; L < g_.n_layers; ++L) {
@@ -1088,6 +1095,9 @@ class LlamaEngine final : public SimpleFamilyEngine {
 
     int vocab() const override { return g_.vocab; }
     int n_layers() const override { return g_.n_layers; }
+    WeightBytes weight_bytes() const override {
+        return pie::metal::weight_bytes(b_.weights, g_.n_experts, g_.experts_per_token);
+    }
 
     void reset() override {
         for (auto& kv : kv_) {

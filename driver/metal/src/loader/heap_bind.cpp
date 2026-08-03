@@ -690,6 +690,42 @@ namespace {
 // second implementation would quietly diverge, and a checkpoint staged two
 // slightly different ways is a model that works for one family and produces
 // plausible wrong tokens for the other.
+WeightBytes weight_bytes(const std::unordered_map<std::string, SlotHandle>& weights,
+                         int n_experts, int experts_per_token) {
+    // A mixture with a top-k wider than its bank would be a config defect, and
+    // a share above one would silently inflate the bandwidth it claims.
+    const double share = (n_experts > 0 && experts_per_token > 0 && experts_per_token < n_experts)
+                             ? double(experts_per_token) / double(n_experts)
+                             : 1.0;
+    WeightBytes out;
+    for (const auto& [name, slot] : weights) {
+        out.resident += slot.size;
+        // `mlp.experts.` is the runtime name every family's routed bank is
+        // staged under -- llama's, qwen3.5's and gpt-oss's alike -- and the
+        // shared expert beside it is `mlp.shared_expert.`, which every token
+        // reads whole and which this therefore leaves alone.
+        if (name.find("mlp.experts.") != std::string::npos) {
+            out.routed_resident += slot.size;
+            out.per_token += double(slot.size) * share;
+        } else if (name.rfind("embed_tokens", 0) == 0) {
+            // Gathered, one row a token. Counted at zero rather than at a row
+            // because a row is under a millionth of what a layer moves and
+            // pretending to that precision would suggest the rest has it.
+            //
+            // `embed_tokens` is the UNTIED spelling -- `EmbedUntied` binds it
+            // and `LmHeadUntied` binds a separate `lm_head`, which is read in
+            // full and counted in full. A tied checkpoint stages one tensor
+            // called `shared_embedding` that serves both, and it falls to the
+            // branch below because the head does read every row of it.
+            // `embed_tokens_per_layer` is gemma4's second gathered table and
+            // shares the prefix on purpose.
+        } else {
+            out.per_token += double(slot.size);
+        }
+    }
+    return out;
+}
+
 StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
     const pie_loader::CheckpointSource& view,

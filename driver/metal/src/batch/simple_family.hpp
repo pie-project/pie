@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mtl4_context.hpp"
+#include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
 #include "model/contract.hpp"
 #include "forward.hpp"
@@ -115,6 +116,15 @@ class SimpleFamilyEngine {
 
     virtual int vocab() const = 0;
     virtual int n_layers() const = 0;
+
+    /// What the heap actually holds, and how much of it a token reads.
+    ///
+    /// The counting RULE lives once, in `pie::metal::weight_bytes`. What each
+    /// family supplies is the two numbers only it knows -- the width of its
+    /// expert bank and how much of it a token pulls -- because a mixture's size
+    /// and its cost are different questions and nothing in the tensor names
+    /// answers the second.
+    virtual WeightBytes weight_bytes() const = 0;
 
     /// Whether this family stores its KV in pages the runtime allocates, and so
     /// can hold several sequences at once. False means a single-sequence ring:

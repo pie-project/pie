@@ -2514,6 +2514,19 @@ bool MetalExecutor::ready() const { return impl_ != nullptr && impl_->ready(); }
 
 std::uint32_t MetalExecutor::vocab() const { return vocab_; }
 
+WeightBytes MetalExecutor::weight_bytes() const {
+    if (!ready()) return {};
+    // Two decoders live here -- the llama/qwen3 path with its own `BoundDecode`
+    // and everything that runs through a `SimpleFamilyEngine` -- and both stage
+    // the same kind of map. Asking each for its map rather than teaching each
+    // to do the arithmetic keeps the counting rule in one place.
+    if (const SimpleFamilyEngine* eng = impl_->simple_engine(); eng != nullptr) {
+        return eng->weight_bytes();
+    }
+    return pie::metal::weight_bytes(impl_->b_.weights, impl_->g_.n_experts,
+                                    impl_->g_.experts_per_token);
+}
+
 RawMetalContext* MetalExecutor::command_context() {
     return ready() ? impl_->ctx_.get() : nullptr;
 }

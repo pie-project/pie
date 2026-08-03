@@ -47,6 +47,7 @@ struct StepTiming;
 class StepEncoder;
 class RawMetalContext;
 struct SlotHandle;
+struct WeightBytes;
 
 }  // namespace pie::metal
 
@@ -649,6 +650,11 @@ class MetalExecutor {
 
     bool ready() const;
     std::uint32_t vocab() const;
+
+    /// Resident weight bytes, and how many of them one decoded token reads.
+    /// A fact about the heap, not a formula over a config -- see
+    /// `weight_bytes` in `loader/heap_bind_metal.hpp`.
+    WeightBytes weight_bytes() const;
 
     // One member's forward for this fire: validates the Phase 1a linear-
     // sequence contract, advances the resident decoder (reset+replay for a

@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "loader/heap_bind_metal.hpp"
 #include "batch/forward.hpp"
 #include "model/contract.hpp"
 #include "model/llama/encode.hpp"
@@ -686,36 +687,63 @@ int main(int argc, char** argv) {
                 n_decode, pipelined_s, double(n_decode) / pipelined_s,
                 1000.0 * pipelined_s / double(n_decode));
 
-    // Decode at batch one reads every weight once per token, so tokens/s times
-    // bytes-of-weights is the bandwidth actually achieved. Stating it this way
-    // is what makes the number comparable across machines -- and it is the only
-    // honest way to say whether a decode kernel is "fast", since the ceiling is
-    // the bus and not the ALU.
+    // Decode at batch one reads (almost) every weight once per token, so
+    // tokens/s times bytes-read is the bandwidth actually achieved. Stating it
+    // this way is what makes the number comparable across machines -- and it is
+    // the only honest way to say whether a decode kernel is "fast", since the
+    // ceiling is the bus and not the ALU.
+    //
+    // Both numbers are MEASURED from the staged tensors. This used to be a
+    // formula over `cfg.llama.*`, which is the exact defect `BenchShape` above
+    // was written to fix: gemma4 and gpt-oss fill a different sub-config, so it
+    // read zeros and printed `weights: 0.00 GiB -> 0.0 GB/s` under a run whose
+    // whole purpose is to say whether the decode is bus-bound. Repairing it per
+    // family would have been worse than pointless -- qwen3.5's stack is mostly
+    // linear attention rather than four projections, and gpt-oss's expert bank
+    // is 4 bits under a byte per 32 rather than a bf16 pair per 64 -- and all
+    // of it is already a byte count in the heap.
+    //
+    // Resident and read-per-token are printed separately because for a mixture
+    // they are different questions: Qwen3-30B-A3B holds thirty billion weights
+    // and touches about three billion of them a token, and one number cannot
+    // answer both.
     const double gib = 1024.0 * 1024.0 * 1024.0;
-    double weight_bytes = 0;
-    {
-        const double h = cfg.llama.hidden;
-        const double q = double(cfg.llama.n_q_heads) * cfg.llama.head_dim;
-        const double kv = double(cfg.llama.n_kv_heads) * cfg.llama.head_dim;
-        // 4 bits per weight plus a bf16 scale and bias per group of 64.
-        const double per = 0.5 + 2.0 * 2.0 / 64.0;
-        const double attn = h * q + h * kv * 2 + q * h;
-        // A routed layer reads only the experts it CHOSE, so the width one
-        // token pulls through the FFN is `experts_per_token * moe_intermediate`
-        // -- not the whole bank, and not `intermediate_size`, which a routed
-        // config still carries and which happens to equal the active width on
-        // Qwen3-MoE (8 x 768) purely by coincidence.
-        const bool routed = cfg.llama.n_experts > 0;
-        const double ffn_width = routed ? double(cfg.llama.experts_per_token) *
-                                              cfg.llama.moe_intermediate
-                                        : double(cfg.llama.intermediate);
-        double ffn = 3.0 * h * ffn_width;
-        // The router itself is read in full, every token, every layer.
-        if (routed) ffn += h * double(cfg.llama.n_experts) * 2.0;
-        weight_bytes = double(cfg.llama.n_layers) * (attn + ffn) * per;
-        weight_bytes += double(cfg.llama.vocab) * h * per;  // the tied head
+    const auto wb = exec.weight_bytes();
+    std::printf("  weights: %.2f GiB resident, %.2f GiB read per token"
+                "  ->  decode moves %.1f GB/s\n",
+                double(wb.resident) / gib, wb.per_token / gib, wb.per_token * decode_tps / 1e9);
+    // A reported bandwidth nobody checks is how this line came to print `0.00
+    // GiB` for two families for as long as it did. These are the three things
+    // that were violated, stated so a fourth family cannot repeat them:
+    if (wb.resident == 0) {
+        std::printf("  FAIL  the heap holds no weights, so the bandwidth above is not a "
+                    "measurement of anything\n");
+        return 1;
     }
-    std::printf("  weights: %.2f GiB  ->  decode moves %.1f GB/s\n", weight_bytes / gib,
-                weight_bytes * decode_tps / 1e9);
+    if (wb.per_token > double(wb.resident)) {
+        std::printf("  FAIL  a token reads %.2f GiB of a %.2f GiB heap\n", wb.per_token / gib,
+                    double(wb.resident) / gib);
+        return 1;
+    }
+    // A mixture must leave out the experts it did not choose, and how many
+    // that is comes from the CHECKPOINT's config here, while everything above
+    // comes from the heap the driver staged. That independence is the point:
+    // the driver agreeing with itself proves nothing, and taking the routing
+    // fraction from the wrong family's geometry -- which read as zero -- once
+    // claimed 824 GB/s on a bus that does 400.
+    if (shape.n_experts > 0 && shape.experts_per_token > 0) {
+        const double inactive =
+            double(wb.routed_resident) *
+            (1.0 - double(shape.experts_per_token) / double(shape.n_experts));
+        if (double(wb.resident) - wb.per_token < inactive * 0.99) {
+            std::printf("  FAIL  %d experts top-%d over a %.2f GiB bank leaves %.2f GiB "
+                        "unread, but a token was counted as skipping only %.2f GiB\n",
+                        shape.n_experts, shape.experts_per_token,
+                        double(wb.routed_resident) / gib, inactive / gib,
+                        (double(wb.resident) - wb.per_token) / gib);
+            return 1;
+        }
+    }
+
     return 0;
 }
