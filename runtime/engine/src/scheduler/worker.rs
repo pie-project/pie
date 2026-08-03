@@ -424,6 +424,17 @@ pub(crate) struct LaunchGrouping {
     has_device_geometry: bool,
     /// A member's program writes the `attn_page_mask` sink.
     has_page_mask: bool,
+    /// A member is a MASKED device-geometry fire (dense device mask, or
+    /// a wire-BRLE mask riding a device-geometry fire — the
+    /// resolved_custom_wire solo shape): nothing may join behind it, in
+    /// either direction, because its mask cannot be re-assembled against
+    /// a composed layout.
+    has_masked_device_geometry: bool,
+    /// A member carries a STRUCTURED device mask (item A's exempt shape).
+    /// Wire-BRLE-masked lanes must not share a fire with it: the frame
+    /// stages exactly one custom-mask source (the structured pack or the
+    /// wire assembly), and mixing the two would collide loudly there.
+    has_structured_mask: bool,
     /// A member carries a qo row spanning more than one token (chunk
     /// prefill / multi-token step).
     has_multi_token: bool,
@@ -500,12 +511,25 @@ impl LaunchGrouping {
         let wire_mask_on_device_geometry = request.request.has_user_mask
             && !request.request.masks.is_empty()
             && request.request.device_resolved_geometry;
+        // Dense-mask compose: a wire-BRLE-masked WIRE lane co-batches
+        // with device-resolved decode envelopes now — the frame decodes
+        // the wire rows and fills causal for the envelope lanes
+        // host-side, feeding the same custom dispatch (frame.cpp's
+        // composed assembly). What still refuses: a genuinely dense
+        // DEVICE mask (its content is device-resident — nothing to
+        // assemble from), a wire mask ON a device-geometry fire (its
+        // BRLE indexes the placeholder layout composition replaces; the
+        // solo resolved_custom_wire path serves it), and a
+        // structured × wire mask MIX (one custom-mask source per fire).
+        let wire_masked = request.request.has_user_mask
+            && !request.request.masks.is_empty()
+            && !request.request.device_resolved_geometry;
         if self.count != 0
             && (masked_device_geometry
                 || wire_mask_on_device_geometry
-                || (self.has_user_mask && self.has_device_geometry)
-                || (mask_blocks_composition(&request.request) && self.has_device_geometry)
-                || (request.request.device_resolved_geometry && self.has_user_mask))
+                || self.has_masked_device_geometry
+                || (wire_masked && self.has_structured_mask)
+                || (request.request.structured_device_mask && self.has_user_mask))
         {
             return Some("mask-compose");
         }
@@ -561,6 +585,11 @@ impl LaunchGrouping {
         self.has_user_mask |= mask_blocks_composition(&request.request);
         self.has_device_geometry |= request.request.device_resolved_geometry;
         self.has_page_mask |= request.page_mask_program;
+        self.has_structured_mask |= request.request.structured_device_mask;
+        self.has_masked_device_geometry |= has_dense_device_mask(&request.request)
+            || (request.request.has_user_mask
+                && !request.request.masks.is_empty()
+                && request.request.device_resolved_geometry);
         self.has_multi_token |= request.has_multi_token_row();
         request.requires_solo_submission()
             || has_dense_device_mask(&request.request)
@@ -7630,6 +7659,73 @@ mod tests {
                  (host_lowered={host_lowered})"
             );
         }
+    }
+
+    /// Dense-mask compose: a wire-BRLE-masked WIRE lane co-batches with
+    /// device-resolved decode envelopes (the frame decodes the wire rows
+    /// and fills causal for the envelopes host-side); the structured ×
+    /// wire mix stays refused (one custom-mask source per fire), and
+    /// masked DEVICE-GEOMETRY fires stay out in both directions.
+    #[test]
+    fn launch_grouping_composes_wire_masked_with_envelopes() {
+        let limits = SchedulerLimits {
+            max_forward_requests: 8,
+            max_forward_tokens: 4096,
+            max_page_refs: 4096,
+        };
+        let wire_masked = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.has_user_mask = true;
+            request.request.masks =
+                vec![crate::driver::command::EncodedMask::new(vec![0, 1], 1)];
+            request.request.mask_indptr = vec![0, 1];
+            request
+        };
+        let envelope = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.device_resolved_geometry = true;
+            request
+        };
+        let structured = |instance: u64| {
+            let mut request = dummy_launch_request(ProcessId::new_v4(), instance);
+            request.request.has_user_mask = true;
+            request.request.structured_device_mask = true;
+            request.request.device_resolved_geometry = true;
+            request
+        };
+
+        // Wire-masked first: envelopes join now (the relax), in both
+        // admission orders.
+        let mut grouping = LaunchGrouping::default();
+        assert!(grouping.accepts(&wire_masked(1), limits, 16));
+        grouping.push(&wire_masked(1), limits, 16);
+        assert!(
+            grouping.accepts(&envelope(2), limits, 16),
+            "an envelope decode joins a wire-masked wire lane (the frame \
+             assembles wire rows + causal fill)"
+        );
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&envelope(3), limits, 16);
+        assert!(
+            grouping.accepts(&wire_masked(4), limits, 16),
+            "a wire-masked wire lane joins envelope decodes"
+        );
+
+        // The structured x wire mix stays refused, both orders.
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&structured(5), limits, 16);
+        assert_eq!(
+            grouping.refusal(&wire_masked(6), limits, 16),
+            Some("mask-compose"),
+            "wire mask must not join a structured-mask group"
+        );
+        let mut grouping = LaunchGrouping::default();
+        grouping.push(&wire_masked(7), limits, 16);
+        assert_eq!(
+            grouping.refusal(&structured(8), limits, 16),
+            Some("mask-compose"),
+            "a structured-mask fire must not join a wire-masked group"
+        );
     }
 
     /// Stage 2 item A: a pooled device-geometry fire whose device mask
