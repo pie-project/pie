@@ -1291,24 +1291,21 @@ impl FramePolicy {
             // by definition NOT a member yet — it has no lane in the wait-set
             // — so sealing without it excludes nobody.
             //
-            // What it buys, measured by A/B on the same binary (the hold
-            // engages ~10x per epoch under `churn_extreme`):
-            //   - epoch density +6% (20.2 vs 19.0 members/epoch at a matched
-            //     epoch count); ~0% on `admission_tail`, `mixed_head`,
-            //     `allshared_noswap`, `soak`, `onefits`.
-            //   - wall time and tok/s: NO measurable difference anywhere.
-            //   - submit deadline breaches under 1024-way turnover: reliably
-            //     fewer with the hold (11 vs 32, 63 vs 99 across an
-            //     order-balanced pair of runs).
-            // So this is a tail mechanism for extreme turnover, not the
-            // throughput win the density framing suggests: a joiner that
-            // misses a boundary waits a whole epoch, and at that turnover
-            // rate the wait is what pushes stragglers past their deadline.
+            // A/B on the same binary, with the hold isolated from the clock
+            // pause above and the host quiet: NO difference in wall time,
+            // tok/s or submit deadline breaches, on any scenario. The only
+            // effect it has is +6% epoch density on `churn_extreme` (20.2 vs
+            // 19.0 members/epoch at a matched epoch count), and that does not
+            // reach throughput. Everything the join predicate actually earns
+            // is earned by `engine_owes` disarming the deadline clock, not by
+            // this hold. Kept because it is measured-neutral and already
+            // proven under the suite, but it is NOT load-bearing — a future
+            // simplification pass can drop it as long as `is_joining()`
+            // survives for the clock.
             //
-            // The hold is only worth taking when the boundary is otherwise
-            // finished: every lane it actually waits on has submitted and
-            // nothing is executing to re-decide it. Anywhere else, waiting
-            // would trade real work for a speculative passenger.
+            // The hold is only taken when the boundary is otherwise finished:
+            // every lane it actually waits on has submitted and nothing is
+            // executing to re-decide it.
             let joining = if joining && missing == 0 && !executing {
                 // The joiner is named (see `earmarked`), so the only thing
                 // left between it and the boundary is guest time, which has
