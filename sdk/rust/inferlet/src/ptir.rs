@@ -362,9 +362,19 @@ impl Taken {
     }
 
     /// Materialize the committed value to the host, decoded to `T`.
+    ///
+    /// `T` must be the channel's own dtype. The bytes are a raw
+    /// little-endian window, so decoding an `f32` channel as `i32` would
+    /// reinterpret the bit pattern and return plausible garbage.
     pub async fn get<T: HostElem>(self) -> Result<Vec<T>, String> {
+        if T::DTYPE != self.dtype {
+            return Err(format!(
+                "channel holds {:?}, decoded as {:?}",
+                self.dtype,
+                T::DTYPE
+            ));
+        }
         let raw = self.bytes().await?;
-        let _ = self.dtype;
         Ok(T::decode(&raw))
     }
 }
@@ -381,10 +391,15 @@ impl AsTensor for &Taken {
 }
 
 /// A host-readable element type (little-endian, 4 bytes/elem; `bool` is 1 byte).
+///
+/// [`DTYPE`](Self::DTYPE) is what makes the raw byte window self-describing:
+/// [`Taken::get`] refuses a `T` the channel does not hold.
 pub trait HostElem: Copy {
+    const DTYPE: DType;
     fn decode(raw: &[u8]) -> Vec<Self>;
 }
 impl HostElem for i32 {
+    const DTYPE: DType = DType::I32;
     fn decode(raw: &[u8]) -> Vec<i32> {
         raw.chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -392,6 +407,7 @@ impl HostElem for i32 {
     }
 }
 impl HostElem for u32 {
+    const DTYPE: DType = DType::U32;
     fn decode(raw: &[u8]) -> Vec<u32> {
         raw.chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -399,10 +415,17 @@ impl HostElem for u32 {
     }
 }
 impl HostElem for f32 {
+    const DTYPE: DType = DType::F32;
     fn decode(raw: &[u8]) -> Vec<f32> {
         raw.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
+    }
+}
+impl HostElem for bool {
+    const DTYPE: DType = DType::Bool;
+    fn decode(raw: &[u8]) -> Vec<bool> {
+        raw.iter().map(|&byte| byte != 0).collect()
     }
 }
 
