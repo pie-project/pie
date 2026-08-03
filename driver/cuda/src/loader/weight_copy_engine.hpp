@@ -188,7 +188,7 @@ public:
 private:
     bool copy_streams_enabled() const
     {
-        return !loader_config::env_truthy("PIE_CUDA_DISABLE_PARALLEL_WEIGHT_COPIES");
+        return true;
     }
 
     bool pinned_staging_enabled() const
@@ -216,7 +216,7 @@ private:
     bool batched_copies_enabled() const
     {
 #if CUDART_VERSION >= 12080
-        return !loader_config::env_truthy("PIE_CUDA_DISABLE_BATCHED_WEIGHT_COPIES");
+        return true;
 #else
         return false;
 #endif

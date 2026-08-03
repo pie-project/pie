@@ -86,9 +86,6 @@ bool flashinfer_mamba_ssu_enabled() {
     // R~144 (microbenched 2026-05-25); the "vertical"/"horizontal" algorithms
     // that beat the legacy path are gated to sm_90+. So default by SM:
     // on sm_90+, prefer FlashInfer; on sm_89 and below, keep the legacy path.
-    static const int forced =
-        env_tristate("PIE_NEMOTRON_FLASHINFER_SSU");
-    if (forced >= 0) return forced != 0;
     return current_device_major() >= 9;
 }
 
