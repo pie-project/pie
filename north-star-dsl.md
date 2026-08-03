@@ -776,3 +776,26 @@ machinery must become capture-safe first), Peel mixed fires
 (device-read row windows), and the perf measurement of what the union
 bought (capture-count deltas; the masked-fire graph coverage that
 eager fallbacks previously cost).
+
+## The two-path lesson (2026-08-03, `4dcd7b112`)
+
+The union's first perf guardrail run caught the per-guard form taxing
+decode 5-15%: guards are stated PER LAYER, so the conditional graph
+carried ~112 nodes and as many single-thread arm kernels per replay.
+Two facts resolved it:
+1. PoC-2 (tools/supergraph-poc/poc2.cu): sibling conditional nodes
+   share one root handle; a nested body graph CANNOT reference an
+   ancestor's handle. Per-slot shared handles only work per
+   nesting scope.
+2. Within today's union, every predicate but the mask is a CONSTANT
+   of the graph context (eligibility: write-desc required, score/lora
+   excluded, hooked rows out → Peel at all-fast).
+The build therefore emits the RESOLVED form: one top-level IF/ELSE on
+the mask, each body a fully guard-resolved straight-line walk
+(SgValuation — emission-time evaluation of what the interpreter
+branches on per fire). One handle, one arm kernel, zero nesting;
+release throughput regression gone (ranges overlap, n16 often faster
+ON). The k>1 form (per-guard conditionals + per-slot shared handles
+per scope) returns when hooks/lora join the union and the predicate
+space becomes genuinely multi-dimensional — enumerating 2^k resolved
+paths stops scaling right around k=3 at 28 layers.
