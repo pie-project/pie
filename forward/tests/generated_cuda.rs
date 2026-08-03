@@ -57,4 +57,31 @@ fn committed_incs_are_regeneration_clean() {
             "olmo2_1b",
         ),
     );
+    check_q35(
+        "qwen3_5_0_8b",
+        &pie_forward::emit_qwen35::emit_qwen35_cuda_inc(
+            &pie_forward::Qwen35HybridFacts::qwen3_5_0_8b(),
+            &pie_forward::Qwen35CudaFacts {
+                state_bf16: true,
+                warp_tiled: false,
+                warp_tiled_max: 64,
+                cached_max: 0,
+                verify_stash: true,
+            },
+            "qwen3_5_0_8b",
+        ),
+    );
+}
+
+fn check_q35(name: &str, fresh: &str) {
+    let path = format!(
+        "{}/../driver/cuda/src/model/qwen3_5/generated/{name}.inc",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let committed = std::fs::read_to_string(&path).expect("committed generated .inc");
+    assert_eq!(
+        committed, fresh,
+        "generated {name}.inc drifted from the emitter; regenerate with \
+         `cargo run -p pie-forward --bin emit-cuda`"
+    );
 }

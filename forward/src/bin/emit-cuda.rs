@@ -13,17 +13,22 @@
 //! on first live run).
 
 use pie_forward::emit_cuda::emit_llama_like_cuda_inc;
-use pie_forward::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use pie_forward::emit_qwen35::emit_qwen35_cuda_inc;
+use pie_forward::{LlamaLikeCudaFacts, LlamaLikeFacts, Qwen35CudaFacts, Qwen35HybridFacts};
 
-fn write_inc(name: &str, contents: &str) {
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../driver/cuda/src/model/llama_like/generated"
+fn write_inc_at(family: &str, name: &str, contents: &str) {
+    let dir = format!(
+        "{}/../driver/cuda/src/model/{family}/generated",
+        env!("CARGO_MANIFEST_DIR")
     );
-    std::fs::create_dir_all(dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
     let path = format!("{dir}/{name}.inc");
     std::fs::write(&path, contents).unwrap();
     println!("wrote {path}");
+}
+
+fn write_inc(name: &str, contents: &str) {
+    write_inc_at("llama_like", name, contents);
 }
 
 fn main() {
@@ -66,6 +71,31 @@ fn main() {
                 force_prefill_path: false,
             },
             "olmo2_1b",
+        ),
+    );
+
+    // Qwen3.5-0.8B hybrid on L40S (decode + prefill; the MTP service
+    // classes stay on the interpreter walk). The cuda facts fixture is
+    // the SYNTHETIC set — the live digest judges and corrects it on
+    // first boot, the mechanism's standing contract.
+    write_inc_at(
+        "qwen3_5",
+        "qwen3_5_0_8b",
+        &emit_qwen35_cuda_inc(
+            &Qwen35HybridFacts::qwen3_5_0_8b(),
+            &Qwen35CudaFacts {
+                // LIVE-anchored (digest-corrected on first boot — the
+                // mechanism's fourth catch: the synthetic fixture said
+                // wt1/cm4096, the live env defaults say wt0/cm0):
+                // warp-tiled needs its state-persist env gate, the
+                // cached family its max-tokens env, both off by default.
+                state_bf16: true,
+                warp_tiled: false,
+                warp_tiled_max: 64,
+                cached_max: 0,
+                verify_stash: true,
+            },
+            "qwen3_5_0_8b",
         ),
     );
 }

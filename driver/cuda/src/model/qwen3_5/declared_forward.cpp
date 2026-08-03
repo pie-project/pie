@@ -149,6 +149,19 @@ Q35Kernel resolve_q35_kernel(std::string_view k) {
         "drifted)");
 }
 
+// Rung 3, second family: the static C++ form of the decode/prefill
+// class traces, emitted by `cargo run -p pie-forward --bin emit-cuda`
+// and committed. Digest-gated like the llama forms.
+#include "model/qwen3_5/generated/qwen3_5_0_8b.inc"
+
+bool q35_generated_forward_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_DECLARED_FORWARD_GENERATED");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 }  // namespace
 
 void qwen35_validate_stated_kernels(const pie_forward::ForwardPlan& plan) {
@@ -265,6 +278,35 @@ bool qwen3_5_forward_declared(
                          "[declared-qwen35-exec] recurrent-state dtype "
                          "differs from the build-time default; class "
                          "traces disabled, semantic walk serves\n");
+        }
+    }
+    // The static form (decode/prefill classes; the services stay on the
+    // interpreter walk). Digest-gated: a mismatch prints once under the
+    // trace env and the interpreter serves, loudly recoverable.
+    const bool plain_class =
+        class_plan == &declared.decode || class_plan == &declared.prefill;
+    if (plain_class && state_dtype_ok && q35_generated_forward_enabled()) {
+        if (declared.facts_digest == kQ35GeneratedDigest_qwen3_5_0_8b) {
+            (is_pure_decode ? generated_qwen35_decode_qwen3_5_0_8b
+                            : generated_qwen35_prefill_qwen3_5_0_8b)(
+                w, cfg, fwd_cfg, plan_state, ws, la, cache, state_cache,
+                attn_ws, cublas,
+                token_ids, positions, qo_indptr,
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                total_tokens, num_requests,
+                w_page_d, w_off_d, row_valid_d, has_write_desc,
+                slot_ids_h, is_fresh_h, slot_ids_d, is_fresh_d,
+                logit_row_indices_d, num_logit_rows,
+                stage_hooks);
+            return true;
+        }
+        if (qwen35_declared_exec_trace_enabled()) {
+            std::fprintf(stderr,
+                         "[declared-qwen35-generated] digest mismatch:\n"
+                         "  live:    %s\n  emitted: %s\n",
+                         declared.facts_digest.c_str(),
+                         kQ35GeneratedDigest_qwen3_5_0_8b);
         }
     }
     const pie_forward::ForwardPlan& plan = *class_plan;
