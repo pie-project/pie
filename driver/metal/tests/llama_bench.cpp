@@ -33,6 +33,8 @@
 #include <vector>
 
 #include "batch/forward.hpp"
+#include "model/llama/encode.hpp"
+#include "model/llama/geometry.hpp"
 #include "model_facts.hpp"
 
 using namespace pie::metal;
@@ -145,6 +147,25 @@ int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
 const std::vector<std::uint32_t> kGatePrompt{785, 6722, 315,  9625, 374,  12095,
                                              13,  576,  6722, 315,  6323, 374};
 
+/// The same sentence sixteen times.
+///
+/// Its only job is to be LONG. A routed prefill switches to the batched
+/// mixture at `n_experts * kMoeTileRows / 2` (row, slot) pairs, which on
+/// Qwen3-30B-A3B is 1024 pairs -- 128 rows. Every other check in this driver's
+/// real-weight path prefills twelve tokens and so runs the mixture as matvecs,
+/// which means `affine_qmm_t_routed` -- the kernel a long prompt actually
+/// spends its time in -- was benchmarked on this checkpoint and never once
+/// checked against it. The synthetic numerics test covers the shape; nothing
+/// covered the weights.
+///
+/// Built by repetition rather than transcribed because 192 token ids in a
+/// source file are 192 chances to fix a typo into the expected answer.
+std::vector<std::uint32_t> long_gate_prompt() {
+    std::vector<std::uint32_t> out;
+    for (int i = 0; i < 16; ++i) out.insert(out.end(), kGatePrompt.begin(), kGatePrompt.end());
+    return out;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -172,9 +193,10 @@ int main(int argc, char** argv) {
     cfg.kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
     cfg.snapshot_dir = ckpt;
     cfg.vocab_size = facts.vocab_size;
-    // The prompt, or the batched check's two members together (12 + 8), which
-    // is the widest fire this binary makes when the prompt is short.
-    cfg.max_forward_tokens = std::uint32_t(std::max(n_prompt, 32));
+    // The timing prompt, or the long gate below -- whichever fire is wider.
+    cfg.max_forward_tokens =
+        std::uint32_t(std::max<std::size_t>(std::size_t(std::max(n_prompt, 32)),
+                                            long_gate_prompt().size()));
     // Two: the batch check below fires a pair in ONE pass, and a driver set up
     // for one request would refuse it rather than answer it wrongly.
     cfg.max_forward_requests = 2;
@@ -188,7 +210,9 @@ int main(int argc, char** argv) {
     // 64-request fleet and does not scale with the model: at 48 layers it is
     // 13 GiB of KV, which beside a 17 GiB checkpoint does not fit a 32 GiB
     // machine at all. A stopwatch that cannot load the model measures nothing.
-    cfg.max_ctx_tokens = std::uint32_t(std::max(n_prompt + n_decode, 1) + 64);
+    cfg.max_ctx_tokens = std::uint32_t(
+        std::max<std::size_t>(std::size_t(std::max(n_prompt + n_decode, 1)),
+                              long_gate_prompt().size() + 8) + 64);
     fill_family_geometry(cfg, facts);
     std::printf("  %s: %d layers, hidden %d, %d/%d heads x %d", cfg.model_type.c_str(),
                 cfg.llama.n_layers, cfg.llama.hidden, cfg.llama.n_q_heads,
@@ -235,12 +259,16 @@ int main(int argc, char** argv) {
             const char* name;
             int n_layers, n_experts;
             std::vector<int> want;
+            /// The continuation of `long_gate_prompt()`, empty if unknown.
+            std::vector<int> want_long;
         };
         const std::vector<Known> known{
-            // " Tokyo. The capital of the"
-            {"Qwen3-1.7B", 28, 0, {26194, 13, 576, 6722, 315, 279}},
-            // " Tokyo. The capital of Brazil"
-            {"Qwen3-30B-A3B", 48, 128, {26194, 13, 576, 6722, 315, 15948}},
+            // " Tokyo. The capital of the", then "The capital of France is Paris"
+            {"Qwen3-1.7B", 28, 0, {26194, 13, 576, 6722, 315, 279},
+             {785, 6722, 315, 9625, 374, 12095}},
+            // " Tokyo. The capital of Brazil", then the sentence again
+            {"Qwen3-30B-A3B", 48, 128, {26194, 13, 576, 6722, 315, 15948},
+             {785, 6722, 315, 9625, 374, 12095}},
         };
         const Known* ref = nullptr;
         for (const Known& k : known) {
@@ -251,31 +279,67 @@ int main(int argc, char** argv) {
         }
         const std::vector<int> want = ref != nullptr ? ref->want : std::vector<int>{};
         std::uint32_t page = 0;
-        Seq c;
-        c.id = 1;
-        c.tokens = p;
-        c.tokens.resize(p.size() + want.size(), 0u);
-        std::vector<int> got;
-        int t = fire(exec, c, std::uint32_t(p.size()), page_size, page, true);
-        for (std::size_t i = 0; i < want.size() && t >= 0; ++i) {
-            got.push_back(t);
-            c.tokens[p.size() + i] = std::uint32_t(t);
-            t = fire(exec, c, 1, page_size, page, true);
-        }
-        const bool ok = ref != nullptr && got == want;
-        if (ref == nullptr) {
-            std::printf("  ....  UNGATED (no mlx-lm reference for this shape), produced:");
-        } else {
-            std::printf("  %s  greedy continuation matches mlx-lm (%s):",
-                        ok ? "PASS" : "FAIL", ref->name);
-        }
-        for (const int v : got) std::printf(" %d", v);
-        std::printf("\n");
-        if (ref != nullptr && !ok) {
-            std::printf("        wanted:");
-            for (const int v : want) std::printf(" %d", v);
+        std::uint32_t next_id = 1;
+
+        // Prefill `pr` as one fire, then decode greedily one token at a time,
+        // and say whether the result is what mlx-lm produced. Written once and
+        // called twice: the short gate and the long one differ in the prompt
+        // and in nothing else, and a second copy would be a second place for
+        // the comparison to be subtly weaker.
+        const auto gate = [&](const std::vector<std::uint32_t>& pr,
+                              const std::vector<int>& expect, const char* what) {
+            Seq c;
+            c.id = next_id++;
+            c.tokens = pr;
+            c.tokens.resize(pr.size() + expect.size(), 0u);
+            std::vector<int> got;
+            int t = fire(exec, c, std::uint32_t(pr.size()), page_size, page, true);
+            for (std::size_t i = 0; i < expect.size() && t >= 0; ++i) {
+                got.push_back(t);
+                c.tokens[pr.size() + i] = std::uint32_t(t);
+                t = fire(exec, c, 1, page_size, page, true);
+            }
+            const bool good = ref != nullptr && !expect.empty() && got == expect;
+            if (ref == nullptr || expect.empty()) {
+                std::printf("  ....  UNGATED (no mlx-lm reference for this shape), produced:");
+            } else {
+                std::printf("  %s  %s (%s):", good ? "PASS" : "FAIL", what, ref->name);
+            }
+            for (const int v : got) std::printf(" %d", v);
             std::printf("\n");
-            return 1;
+            if (ref != nullptr && !expect.empty() && !good) {
+                std::printf("        wanted:");
+                for (const int v : expect) std::printf(" %d", v);
+                std::printf("\n");
+                return false;
+            }
+            return true;
+        };
+
+        if (!gate(p, want, "greedy continuation matches mlx-lm")) return 1;
+
+        // The same check again on a prompt long enough to take the BATCHED
+        // mixture. Stated as a precondition rather than assumed: the threshold
+        // is arithmetic on the geometry, and the day it moves this check would
+        // quietly become a third run of the matvec path it was added to stop
+        // covering for.
+        if (ref != nullptr && cfg.llama.n_experts > 0) {
+            const std::vector<std::uint32_t> lp = long_gate_prompt();
+            llama::LlamaGeometry lg;
+            std::string ignore;
+            const bool have_geo = llama::geometry_from_facts(cfg.llama, lg, &ignore);
+            const bool batched =
+                have_geo && llama::llama_moe_tile_rows(lg, int(lp.size())) > 1;
+            if (!batched) {
+                std::printf("  FAIL  the long gate reaches the batched mixture "
+                            "(%zu rows is still the matvec path)\n", lp.size());
+                return 1;
+            }
+            std::printf("  ....  long gate: %zu rows, batched mixture\n", lp.size());
+            if (!gate(lp, ref->want_long,
+                      "batched-mixture continuation matches mlx-lm")) {
+                return 1;
+            }
         }
 
         // Taps and timings are mutually exclusive, and not as a convenience:
@@ -290,14 +354,16 @@ int main(int argc, char** argv) {
             // the PROMPT's fire rather than the last of the gate's one-row
             // decodes. The gate above has already run; this only re-publishes.
             Seq d;
-            d.id = 2;
+            d.id = next_id++;
             d.tokens = p;
             std::uint32_t dpage = page;
             fire(exec, d, std::uint32_t(p.size()), page_size, dpage, false);
             std::printf("  taps dumped for:");
             for (const std::uint32_t v : p) std::printf(" %u", v);
             std::printf("\n  (no timings: golden taps disable pool recycling)\n");
-            return ok ? 0 : 1;
+            // Both gates above returned non-zero on failure, so reaching here
+            // means they passed.
+            return 0;
         }
     }
 
