@@ -27,9 +27,8 @@
 //!   by position against the FIFO-fair admission queue to name its taker.
 //!   A joiner is NOT a wait-set member and never holds the seal — sealing
 //!   without it excludes nobody, it only starts the next epoch one process
-//!   short. The window instead stops the submit-deadline clock and defers
-//!   returned bind permits, so bring-up does not compete with the boundary
-//!   it is joining;
+//!   short. The window instead defers the bind permits a retiring process
+//!   returns, so bring-up does not compete with the boundary it is joining;
 //! - seals from every ready lane (deterministic first-fit in lane-id order
 //!   against the per-wave token/row budgets — pure arithmetic over declared
 //!   demand, never timing). A lane deferred by capacity is served in the
@@ -803,9 +802,12 @@ impl FramePolicy {
     ///
     /// This never held the seal and no longer pretends to. A joiner is not a
     /// wait-set member, so sealing without it excludes nobody. What the
-    /// window is for is that the engine is visibly mid-handover: it stops the
-    /// submit-deadline clock (members idle for reasons that are ours, not
-    /// theirs) and defers the bind permits a retiring process returns.
+    /// window is for is that the engine is visibly mid-handover, which is the
+    /// moment to hold back the bind permits a retiring process returns
+    /// (`set_bind_release_hold`) so the incoming cohort's bring-up does not
+    /// compete with the boundary it is joining. That is now its only use: it
+    /// also used to stop every lane's submit-deadline clock, which measured
+    /// as worth nothing.
     ///
     /// The earmark used to be `(pending_slots > 0 || !departing.is_empty())
     /// && !staged.is_empty()`: a cross product, not a matching. It never
@@ -1270,19 +1272,27 @@ impl FramePolicy {
             // is not missing owes nothing and its clock is disarmed, so the
             // deadline measures consecutive blocking, never lifetime.
             //
-            // `joining` and a pending bind are the engine's own debts: the
-            // guest cannot submit until they resolve, so they hold the clock
-            // rather than let it run. Note this is deliberately NOT gated on
-            // the global `executing` flag — a dead member has to be found
-            // precisely when other lanes are still busy, and a global clock
-            // would be reset by their traffic forever.
-            let engine_owes = self.is_joining();
+            // The clock stops only for debts owed to THIS lane: an unretired
+            // dispatch and a bind in flight. Both are cases where the guest
+            // physically cannot submit because it is waiting on us.
+            //
+            // A cohort boundary elsewhere in the engine used to stop every
+            // lane's clock too, on the theory that a fleet mid-handover owes
+            // its members some slack. Measured on `churn_extreme` (8 runs an
+            // arm, same binary, alternating order, quiet host) and `soak`, it
+            // moves nothing: 12.13s vs 12.20s wall, 6719 vs 6612 tok/s, zero
+            // failures either way. It was a global stop for a per-lane
+            // question, and the deadline is honest without it.
+            //
+            // Deliberately NOT gated on the global `executing` flag either —
+            // a silent member has to be found precisely when other lanes are
+            // busy, and a global clock would be reset by their traffic
+            // forever.
             let mut expired: Vec<ProcessId> = Vec::new();
             let leash = self.submit_deadline;
             let silence = self.silence_timeout;
             for (lane_id, lane) in self.lanes.iter_mut() {
-                let owes = engine_owes
-                    || self.in_flight_lanes.contains(lane_id)
+                let owes = self.in_flight_lanes.contains(lane_id)
                     || lane
                         .owner
                         .is_some_and(|owner| self.pending_binds.contains_key(&owner));
