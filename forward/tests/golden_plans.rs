@@ -382,3 +382,45 @@ fn qwen3_5_hybrid_cuda_frozen_verify() {
 // WantsAttnScore-guarded attention, all in the hooked arm's region.
 // Which PROGRAM runs never appears: sites state WHERE and WHAT IS
 // OBSERVABLE; programs are sideband data.)
+
+/// The Off-norm lowered goldens (mistral shape): the first LOWERED pin of
+/// a deployment whose general arm keeps the SEMANTIC rope (no per-head
+/// qk-norm) and whose decode has no fused post — the branch combination
+/// the 2026-08-03 hoist regression hid in (general QKV traced into the
+/// mask arm after `guarded_value` opened; every unmasked fire skipped
+/// QKV). The cuda facts are STRUCTURAL fixtures (xqa/fpp off): what
+/// these goldens pin is the region layout — QKV/rope/write BEFORE the
+/// attention chain's guard op, arms carrying attention only.
+#[test]
+fn mistral_7b_v03_cuda_decode() {
+    check_plan(
+        "mistral_7b_v03.cuda.decode",
+        &llama_like_cuda(
+            &LlamaLikeFacts::mistral_7b_v03(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+            },
+            FireClass::Decode,
+        ),
+    );
+}
+
+#[test]
+fn mistral_7b_v03_cuda_prefill() {
+    check_plan(
+        "mistral_7b_v03.cuda.prefill",
+        &llama_like_cuda(
+            &LlamaLikeFacts::mistral_7b_v03(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: false,
+            },
+            FireClass::Prefill,
+        ),
+    );
+}

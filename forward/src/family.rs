@@ -191,6 +191,18 @@ fn llama_like_text(
                 // contract). Masked+hooked stays hand-written (the mask
                 // arm carries no sites); the caller's gate encodes it.
                 Some((c, FireClass::Decode)) => {
+                    // ORDER IS LOAD-BEARING: `guarded_value` OPENS the
+                    // chain, and every op recorded after it counts into
+                    // the first arm's region. The non-fused deployment's
+                    // general QKV must therefore trace BEFORE the guard
+                    // opens (the hoisted `q` below) — tracing it after
+                    // put the whole QKV sequence inside the mask arm,
+                    // and every unmasked fire skipped it (the phi3/
+                    // mistral live-garbage regression, caught 2026-08-03
+                    // by the three-model battery; the mistral lowered
+                    // goldens now pin this structure).
+                    let hoisted_q =
+                        (!fused_post).then(|| general_qkv());
                     let (g, a) =
                         dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
                     let attn_with_sites = |q: &Val| {
@@ -253,11 +265,11 @@ fn llama_like_text(
                             attn_with_sites(&q);
                         });
                     } else {
-                        let q = general_qkv();
+                        let q = hoisted_q.as_ref().expect("hoisted for the non-fused arm");
                         g.arm(GuardPred::HasCustomMask, || {
-                            cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
+                            cuda::attention_flashinfer_prefill_custom_region(q, &w.kv);
                         })
-                        .otherwise(|| attn_with_sites(&q));
+                        .otherwise(|| attn_with_sites(q));
                     }
                     a
                 }
