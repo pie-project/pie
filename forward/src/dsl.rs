@@ -266,8 +266,6 @@ pub fn trace(
             match class {
                 FireClass::Decode => "decode",
                 FireClass::Prefill => "prefill",
-                FireClass::MaskedDecode => "masked_decode",
-                FireClass::MaskedPrefill => "masked_prefill",
                 FireClass::HookedDecode => "hooked_decode",
                 FireClass::HookedPrefill => "hooked_prefill",
                 // The service classes are qwen3_5's; llama_like has no
@@ -1193,16 +1191,25 @@ pub mod cuda {
         record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_bf16",
                vec![], kv_state(kv), vec![q.id], None);
     }
+    pub fn attention_xqa_decode_region(q: &Val, kv: &Kv) {
+        record(&q.t, Some(kv.l), "launch_attention_xqa_decode_bf16_prepared",
+               vec![], kv_state(kv), vec![q.id], None);
+    }
 
     /// `ops::dispatch_attention_flashinfer_prefill_custom`: the
     /// custom-mask prefill dispatch — a genuinely distinct launcher, so
     /// no pseudo-symbol is needed. The mask data (BRLE bytes + indptr)
-    /// crosses as runtime args of the stated kernel, commit_lens's peer;
-    /// stated by the Masked* classes, whose existence is what expresses
-    /// "a masked decode is not a decode" (the fused-QKV arm's predicate
-    /// breaks with it).
+    /// crosses as runtime args of the stated kernel, commit_lens's peer.
+    /// Since A1 (the class-collapse amendment) it is stated inside the
+    /// `HasCustomMask` guard arm of the Decode/Prefill traces — the
+    /// output-less region form below is what the arm records; this
+    /// value-producing form remains for consumers outside a guard.
     pub fn attention_flashinfer_prefill_custom(q: &Val, kv: &Kv, q_width: u32) -> Val {
         attn(q, kv, q_width, "dispatch_attention_flashinfer_prefill_custom")
+    }
+    pub fn attention_flashinfer_prefill_custom_region(q: &Val, kv: &Kv) {
+        record(&q.t, Some(kv.l), "dispatch_attention_flashinfer_prefill_custom",
+               vec![], kv_state(kv), vec![q.id], None);
     }
 
     /// The standalone dequant staging launch, for arms whose attention

@@ -26,12 +26,14 @@
 //     two different kernels — IS expressed now: the declaration's
 //     `HasWriteDesc` Guard states both arms, the first live Guard;
 //     rung 4a.)
-// Everything the trace cannot express yet (hooks, TP, vision, quantized
-// projections, non-standard rope, qkv bias) falls back to
+// Everything the trace cannot express yet (mixed-hook fires, TP, vision,
+// quantized projections, non-standard rope, qkv bias) falls back to
 // `llama_like_forward_paged` — the caller gates, `build` refuses.
-// Custom masks ARE expressed since the mask classes (north-star-dsl.md):
-// masked fires walk `masked_decode`/`masked_prefill` traces stating the
-// custom-mask prefill dispatch. Post-norm placement (olmo2) and the global qk-norm convention
+// Custom masks ARE expressed — since A1 (the class-collapse amendment)
+// as the `HasCustomMask` guard arm INSIDE the decode/prefill traces: the
+// mask arm carries the general QKV sequence (with the nested
+// HasWriteDesc guard — the walk keeps a skip STACK) and states the
+// custom-mask prefill dispatch; the mask data rides as runtime args. Post-norm placement (olmo2) and the global qk-norm convention
 // ARE in scope: the trace states both as facts (the matmul(beta=0) →
 // rmsnorm → residual_add triplet; plain row Rmsnorm on q/k), and this
 // executor launches the hand-written post-norm / `rmsnorm_qk`-global
@@ -108,12 +110,9 @@ struct LlamaLikeDeclaredPlan {
     pie_forward::ForwardPlan plan;
     pie_forward::ForwardPlan decode;
     pie_forward::ForwardPlan prefill;
-    // The mask classes (north-star-dsl.md): a masked decode is not a
-    // decode — the fused-QKV arm's predicate breaks and the attention is
-    // the custom-mask prefill dispatch. Masked fires walked these from
-    // the moment they stopped falling back to the hand-written path.
-    pie_forward::ForwardPlan masked_decode;
-    pie_forward::ForwardPlan masked_prefill;
+    // (The masked traces are gone with the mask classes — A1, the
+    // class-collapse amendment: a masked fire walks decode/prefill and
+    // takes their HasCustomMask guard arms.)
     // The all-hooked classes (the HookSite slice, fast_rows == 0): the
     // general unfused body + the two per-layer hook sites + the
     // WantsAttnScore-guarded attention. Mixed fires (0 < fast_rows < R)

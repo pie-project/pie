@@ -150,7 +150,9 @@ pub enum PieForwardFireClass {
     StateOnly = 3,
     /// Reserved (the frozen-verify slice); both entries reject it today.
     FrozenVerify = 4,
-    /// The mask classes (llama_like; qwen3_5's masked slice is later).
+    /// RETIRED (A1, the class-collapse amendment): a custom mask is a
+    /// HasCustomMask guard arm of classes 0/1. The discriminants stay
+    /// reserved (append-only rule); both entries reject them.
     MaskedDecode = 5,
     MaskedPrefill = 6,
     /// The all-hooked classes (fast_rows == 0; the HookSite slice).
@@ -494,11 +496,12 @@ pub unsafe extern "C" fn pie_forward_trace_llama_like_cuda(
         let class = match class {
             0 => FireClass::Decode,
             1 => FireClass::Prefill,
-            // 5/6: the masked classes (north-star-dsl.md, the mask
-            // classes). 2/3/4 are qwen3_5's service classes; llama_like
-            // has no MTP, so they stay malformed requests here.
-            5 => FireClass::MaskedDecode,
-            6 => FireClass::MaskedPrefill,
+            // 5/6 (the masked classes) are RETIRED (A1, the
+            // class-collapse amendment): a custom mask is a
+            // HasCustomMask guard arm of classes 0/1 now. The wire
+            // numbers stay reserved; requesting them is malformed.
+            // 2/3/4 are qwen3_5's service classes; llama_like has no
+            // MTP, so they stay malformed requests here too.
             // 7/8: the all-hooked classes (the HookSite slice).
             7 => FireClass::HookedDecode,
             8 => FireClass::HookedPrefill,

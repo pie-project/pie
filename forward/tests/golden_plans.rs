@@ -303,13 +303,16 @@ fn qwen3_5_hybrid_0_8b_cuda_commit_advance() {
 
 /// The first LOWERED goldens (north-star-dsl.md): the SAME llama_like
 /// text, traced with the CUDA backend facts and a fire class in hand, so
-/// the class arms run and the traced form states kernels. Decode: the
-/// fused-QKV arm replaces SplitQkv + RmsnormPerHead×2 + Rope + KvAppend
-/// with one `QkvDecodeFusedPost` per layer (layer 0 preceded by the
-/// once-per-fire `RopeTableBuild` — the hand-written runtime latch, made
-/// trace-time by the unrolled layer loop), and every Attention states
-/// `XqaDecode`. This golden IS the decode launch list — the thing rung 2's
-/// dumb interpreter walks and rung 3's emitter transliterates to C++.
+/// the class arms run and the traced form states kernels. Decode, since
+/// A1 (the class-collapse amendment): each layer is a value-producing
+/// HasCustomMask guard — the mask arm carries the whole general QKV
+/// sequence (split, fused qk-norm+rope, the NESTED HasWriteDesc write
+/// guard) ending in the custom-mask dispatch; the else-arm is the fused
+/// decode-QKV launch (consuming the once-per-fire rope-table value,
+/// hoisted unconditionally — a masked fire launches it unread) plus the
+/// plain decode attention. This golden IS the decode launch list — the
+/// thing rung 2's dumb interpreter walks (with a skip stack) and rung
+/// 3's emitter transliterates to nested `if`s.
 #[test]
 fn qwen3_0_6b_cuda_decode() {
     check_plan(
@@ -323,9 +326,10 @@ fn qwen3_0_6b_cuda_decode() {
 }
 
 /// The prefill-class lowering of the same text: the general arm
-/// throughout (no fused post — its predicate is decode-only), every
-/// Attention stating `PrefillPlanned`. Structurally the semantic trace
-/// plus kernel statements; the golden pins exactly that relationship.
+/// throughout (no fused post — its predicate is decode-only), then the
+/// per-layer HasCustomMask guard (A1): custom dispatch in the mask arm
+/// (no dequant — the custom dispatch takes the layer view whole),
+/// dequant + planned prefill in the else-arm.
 #[test]
 fn qwen3_0_6b_cuda_prefill() {
     check_plan(
@@ -338,39 +342,11 @@ fn qwen3_0_6b_cuda_prefill() {
     );
 }
 
-/// The mask classes (north-star-dsl.md): a masked decode is NOT a decode
-/// — the fused decode-QKV arm's predicate is `class == Decode`, so the
-/// masked trace carries the general QKV arm (with the fused
-/// qk-norm+rope, which masking does not break) and states the
-/// custom-mask prefill dispatch. The golden pins exactly that op-list
-/// difference; the mask DATA never appears — it is a runtime argument
-/// of the stated kernel, commit_lens's peer.
-#[test]
-fn qwen3_0_6b_cuda_masked_decode() {
-    check_plan(
-        "qwen3_0_6b.cuda.masked_decode",
-        &llama_like_cuda(
-            &LlamaLikeFacts::qwen3_0_6b(),
-            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-            FireClass::MaskedDecode,
-        ),
-    );
-}
-
-/// The masked prefill: the prefill body with the attention swapped to
-/// the custom-mask dispatch (and no dequant — the custom dispatch takes
-/// the layer view whole).
-#[test]
-fn qwen3_0_6b_cuda_masked_prefill() {
-    check_plan(
-        "qwen3_0_6b.cuda.masked_prefill",
-        &llama_like_cuda(
-            &LlamaLikeFacts::qwen3_0_6b(),
-            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-            FireClass::MaskedPrefill,
-        ),
-    );
-}
+// (The masked-class goldens are gone with the classes themselves — A1,
+// the class-collapse amendment: the custom mask is a HasCustomMask
+// guard arm INSIDE the decode/prefill goldens above, which pin the
+// arm's op-list delta — the general QKV sequence in the fused
+// deployment's mask arm, the custom dispatch, no dequant.)
 
 /// The frozen-verify class (the rung-5 geometry amendment): the prefill
 /// body plus ONE stash store per linear layer — the cheap in-proj

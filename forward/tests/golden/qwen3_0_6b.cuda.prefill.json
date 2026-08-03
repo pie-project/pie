@@ -3437,6 +3437,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        8
+      ],
+      "layer": 0
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 0
+          }
+        }
+      },
+      "inputs": [
+        6
+      ],
+      "outputs": [],
+      "layer": 0
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -3462,9 +3496,7 @@
       "inputs": [
         6
       ],
-      "outputs": [
-        8
-      ],
+      "outputs": [],
       "layer": 0
     },
     {
@@ -3662,6 +3694,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        21
+      ],
+      "layer": 1
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 1
+          }
+        }
+      },
+      "inputs": [
+        19
+      ],
+      "outputs": [],
+      "layer": 1
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -3687,9 +3753,7 @@
       "inputs": [
         19
       ],
-      "outputs": [
-        21
-      ],
+      "outputs": [],
       "layer": 1
     },
     {
@@ -3887,6 +3951,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        34
+      ],
+      "layer": 2
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 2
+          }
+        }
+      },
+      "inputs": [
+        32
+      ],
+      "outputs": [],
+      "layer": 2
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -3912,9 +4010,7 @@
       "inputs": [
         32
       ],
-      "outputs": [
-        34
-      ],
+      "outputs": [],
       "layer": 2
     },
     {
@@ -4112,6 +4208,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        47
+      ],
+      "layer": 3
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 3
+          }
+        }
+      },
+      "inputs": [
+        45
+      ],
+      "outputs": [],
+      "layer": 3
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -4137,9 +4267,7 @@
       "inputs": [
         45
       ],
-      "outputs": [
-        47
-      ],
+      "outputs": [],
       "layer": 3
     },
     {
@@ -4337,6 +4465,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        60
+      ],
+      "layer": 4
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 4
+          }
+        }
+      },
+      "inputs": [
+        58
+      ],
+      "outputs": [],
+      "layer": 4
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -4362,9 +4524,7 @@
       "inputs": [
         58
       ],
-      "outputs": [
-        60
-      ],
+      "outputs": [],
       "layer": 4
     },
     {
@@ -4562,6 +4722,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        73
+      ],
+      "layer": 5
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 5
+          }
+        }
+      },
+      "inputs": [
+        71
+      ],
+      "outputs": [],
+      "layer": 5
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -4587,9 +4781,7 @@
       "inputs": [
         71
       ],
-      "outputs": [
-        73
-      ],
+      "outputs": [],
       "layer": 5
     },
     {
@@ -4787,6 +4979,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        86
+      ],
+      "layer": 6
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 6
+          }
+        }
+      },
+      "inputs": [
+        84
+      ],
+      "outputs": [],
+      "layer": 6
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -4812,9 +5038,7 @@
       "inputs": [
         84
       ],
-      "outputs": [
-        86
-      ],
+      "outputs": [],
       "layer": 6
     },
     {
@@ -5012,6 +5236,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        99
+      ],
+      "layer": 7
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 7
+          }
+        }
+      },
+      "inputs": [
+        97
+      ],
+      "outputs": [],
+      "layer": 7
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -5037,9 +5295,7 @@
       "inputs": [
         97
       ],
-      "outputs": [
-        99
-      ],
+      "outputs": [],
       "layer": 7
     },
     {
@@ -5237,6 +5493,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        112
+      ],
+      "layer": 8
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 8
+          }
+        }
+      },
+      "inputs": [
+        110
+      ],
+      "outputs": [],
+      "layer": 8
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -5262,9 +5552,7 @@
       "inputs": [
         110
       ],
-      "outputs": [
-        112
-      ],
+      "outputs": [],
       "layer": 8
     },
     {
@@ -5462,6 +5750,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        125
+      ],
+      "layer": 9
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 9
+          }
+        }
+      },
+      "inputs": [
+        123
+      ],
+      "outputs": [],
+      "layer": 9
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -5487,9 +5809,7 @@
       "inputs": [
         123
       ],
-      "outputs": [
-        125
-      ],
+      "outputs": [],
       "layer": 9
     },
     {
@@ -5687,6 +6007,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        138
+      ],
+      "layer": 10
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 10
+          }
+        }
+      },
+      "inputs": [
+        136
+      ],
+      "outputs": [],
+      "layer": 10
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -5712,9 +6066,7 @@
       "inputs": [
         136
       ],
-      "outputs": [
-        138
-      ],
+      "outputs": [],
       "layer": 10
     },
     {
@@ -5912,6 +6264,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        151
+      ],
+      "layer": 11
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 11
+          }
+        }
+      },
+      "inputs": [
+        149
+      ],
+      "outputs": [],
+      "layer": 11
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -5937,9 +6323,7 @@
       "inputs": [
         149
       ],
-      "outputs": [
-        151
-      ],
+      "outputs": [],
       "layer": 11
     },
     {
@@ -6137,6 +6521,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        164
+      ],
+      "layer": 12
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 12
+          }
+        }
+      },
+      "inputs": [
+        162
+      ],
+      "outputs": [],
+      "layer": 12
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -6162,9 +6580,7 @@
       "inputs": [
         162
       ],
-      "outputs": [
-        164
-      ],
+      "outputs": [],
       "layer": 12
     },
     {
@@ -6362,6 +6778,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        177
+      ],
+      "layer": 13
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 13
+          }
+        }
+      },
+      "inputs": [
+        175
+      ],
+      "outputs": [],
+      "layer": 13
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -6387,9 +6837,7 @@
       "inputs": [
         175
       ],
-      "outputs": [
-        177
-      ],
+      "outputs": [],
       "layer": 13
     },
     {
@@ -6587,6 +7035,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        190
+      ],
+      "layer": 14
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 14
+          }
+        }
+      },
+      "inputs": [
+        188
+      ],
+      "outputs": [],
+      "layer": 14
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -6612,9 +7094,7 @@
       "inputs": [
         188
       ],
-      "outputs": [
-        190
-      ],
+      "outputs": [],
       "layer": 14
     },
     {
@@ -6812,6 +7292,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        203
+      ],
+      "layer": 15
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 15
+          }
+        }
+      },
+      "inputs": [
+        201
+      ],
+      "outputs": [],
+      "layer": 15
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -6837,9 +7351,7 @@
       "inputs": [
         201
       ],
-      "outputs": [
-        203
-      ],
+      "outputs": [],
       "layer": 15
     },
     {
@@ -7037,6 +7549,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        216
+      ],
+      "layer": 16
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 16
+          }
+        }
+      },
+      "inputs": [
+        214
+      ],
+      "outputs": [],
+      "layer": 16
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -7062,9 +7608,7 @@
       "inputs": [
         214
       ],
-      "outputs": [
-        216
-      ],
+      "outputs": [],
       "layer": 16
     },
     {
@@ -7262,6 +7806,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        229
+      ],
+      "layer": 17
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 17
+          }
+        }
+      },
+      "inputs": [
+        227
+      ],
+      "outputs": [],
+      "layer": 17
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -7287,9 +7865,7 @@
       "inputs": [
         227
       ],
-      "outputs": [
-        229
-      ],
+      "outputs": [],
       "layer": 17
     },
     {
@@ -7487,6 +8063,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        242
+      ],
+      "layer": 18
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 18
+          }
+        }
+      },
+      "inputs": [
+        240
+      ],
+      "outputs": [],
+      "layer": 18
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -7512,9 +8122,7 @@
       "inputs": [
         240
       ],
-      "outputs": [
-        242
-      ],
+      "outputs": [],
       "layer": 18
     },
     {
@@ -7712,6 +8320,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        255
+      ],
+      "layer": 19
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 19
+          }
+        }
+      },
+      "inputs": [
+        253
+      ],
+      "outputs": [],
+      "layer": 19
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -7737,9 +8379,7 @@
       "inputs": [
         253
       ],
-      "outputs": [
-        255
-      ],
+      "outputs": [],
       "layer": 19
     },
     {
@@ -7937,6 +8577,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        268
+      ],
+      "layer": 20
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 20
+          }
+        }
+      },
+      "inputs": [
+        266
+      ],
+      "outputs": [],
+      "layer": 20
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -7962,9 +8636,7 @@
       "inputs": [
         266
       ],
-      "outputs": [
-        268
-      ],
+      "outputs": [],
       "layer": 20
     },
     {
@@ -8162,6 +8834,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        281
+      ],
+      "layer": 21
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 21
+          }
+        }
+      },
+      "inputs": [
+        279
+      ],
+      "outputs": [],
+      "layer": 21
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -8187,9 +8893,7 @@
       "inputs": [
         279
       ],
-      "outputs": [
-        281
-      ],
+      "outputs": [],
       "layer": 21
     },
     {
@@ -8387,6 +9091,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        294
+      ],
+      "layer": 22
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 22
+          }
+        }
+      },
+      "inputs": [
+        292
+      ],
+      "outputs": [],
+      "layer": 22
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -8412,9 +9150,7 @@
       "inputs": [
         292
       ],
-      "outputs": [
-        294
-      ],
+      "outputs": [],
       "layer": 22
     },
     {
@@ -8612,6 +9348,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        307
+      ],
+      "layer": 23
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 23
+          }
+        }
+      },
+      "inputs": [
+        305
+      ],
+      "outputs": [],
+      "layer": 23
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -8637,9 +9407,7 @@
       "inputs": [
         305
       ],
-      "outputs": [
-        307
-      ],
+      "outputs": [],
       "layer": 23
     },
     {
@@ -8837,6 +9605,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        320
+      ],
+      "layer": 24
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 24
+          }
+        }
+      },
+      "inputs": [
+        318
+      ],
+      "outputs": [],
+      "layer": 24
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -8862,9 +9664,7 @@
       "inputs": [
         318
       ],
-      "outputs": [
-        320
-      ],
+      "outputs": [],
       "layer": 24
     },
     {
@@ -9062,6 +9862,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        333
+      ],
+      "layer": 25
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 25
+          }
+        }
+      },
+      "inputs": [
+        331
+      ],
+      "outputs": [],
+      "layer": 25
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -9087,9 +9921,7 @@
       "inputs": [
         331
       ],
-      "outputs": [
-        333
-      ],
+      "outputs": [],
       "layer": 25
     },
     {
@@ -9287,6 +10119,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        346
+      ],
+      "layer": 26
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 26
+          }
+        }
+      },
+      "inputs": [
+        344
+      ],
+      "outputs": [],
+      "layer": 26
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -9312,9 +10178,7 @@
       "inputs": [
         344
       ],
-      "outputs": [
-        346
-      ],
+      "outputs": [],
       "layer": 26
     },
     {
@@ -9512,6 +10376,40 @@
     },
     {
       "kind": {
+        "Guard": {
+          "arms": [
+            {
+              "pred": "HasCustomMask",
+              "ops": 1
+            }
+          ],
+          "else_ops": 2
+        }
+      },
+      "inputs": [],
+      "outputs": [
+        359
+      ],
+      "layer": 27
+    },
+    {
+      "kind": {
+        "Launch": {
+          "kernel": "dispatch_attention_flashinfer_prefill_custom",
+          "state": {
+            "store": "KvCache",
+            "layer": 27
+          }
+        }
+      },
+      "inputs": [
+        357
+      ],
+      "outputs": [],
+      "layer": 27
+    },
+    {
+      "kind": {
         "Launch": {
           "kernel": "launch_dequant_kv_cache_layer_to_bf16_active",
           "state": {
@@ -9537,9 +10435,7 @@
       "inputs": [
         357
       ],
-      "outputs": [
-        359
-      ],
+      "outputs": [],
       "layer": 27
     },
     {

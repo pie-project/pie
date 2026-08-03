@@ -167,14 +167,11 @@ pub enum FireClass {
     HookedDecode,
     /// Prefill-shaped all-hooked fire.
     HookedPrefill,
-    /// Decode-shaped fire carrying a custom attention mask: the masked
-    /// attention runs the custom-mask prefill dispatch, and the fused
-    /// decode-QKV arm's predicate (`!has_custom_mask`) breaks — the op
-    /// list changes, so the mask is a CLASS, not a guard
-    /// (north-star-dsl.md, the mask classes).
-    MaskedDecode,
-    /// Prefill-shaped fire carrying a custom attention mask.
-    MaskedPrefill,
+    // The masked classes (wire 5/6) are RETIRED (A1, the class-collapse
+    // amendment): a custom mask is a GuardPred::HasCustomMask arm of
+    // the Decode/Prefill traces now — the op-list delta is local, so
+    // it lives at op granularity. The wire numbers stay reserved
+    // (append-only ABI); the trace entries answer InvalidArgument.
 }
 
 // (The short-lived `AttnKernel` enum — rung 1's `Attention.param1` tag —
@@ -208,6 +205,12 @@ pub enum GuardPred {
     /// dispatch runs instead of the plain one. Wire kind 3, payload
     /// unused.
     WantsAttnScore,
+    /// The fire carries a custom attention mask (`custom_mask_d !=
+    /// nullptr`): the masked arm runs the custom-mask prefill dispatch
+    /// and, in the fused-decode deployment, the general QKV sequence —
+    /// the class-collapse amendment's first predicate (a mask is a
+    /// guard, not a class). Wire kind 4, payload unused.
+    HasCustomMask,
 }
 
 impl GuardPred {
@@ -218,6 +221,7 @@ impl GuardPred {
             GuardPred::TokensLE(k) => (1, k),
             GuardPred::TokensGT(k) => (2, k),
             GuardPred::WantsAttnScore => (3, 0),
+            GuardPred::HasCustomMask => (4, 0),
         }
     }
 }
@@ -577,8 +581,12 @@ pub struct TraceBuilder {
     values: Vec<ValueInfo>,
     ops: Vec<Op>,
     layer: Option<u32>,
-    /// A guard is open ([`Self::open_guard`]); nesting is refused.
-    in_guard: bool,
+    /// Open [`Self::open_guard`] depth. Nesting is part of the
+    /// vocabulary since A1 (north-star-dsl.md, the class-collapse
+    /// amendment): a nested guard is an ordinary op inside a region —
+    /// region lengths count it and its regions, the aux wire encoding
+    /// is unchanged, the walk keeps a skip stack, the emitter recurses.
+    guard_depth: u32,
 }
 
 impl TraceBuilder {
@@ -588,7 +596,7 @@ impl TraceBuilder {
             values: Vec::new(),
             ops: Vec::new(),
             layer: None,
-            in_guard: false,
+            guard_depth: 0,
         }
     }
 
@@ -615,15 +623,11 @@ impl TraceBuilder {
     /// (and its output values, if any — created HERE so dataflow sees
     /// one producer whichever arm runs) and returns its index for
     /// [`Self::close_guard`] to patch once the dsl has run every region
-    /// closure. Nesting is refused — flat consecutive regions are the
-    /// contract every consumer (interpreter jump logic, emitter) relies
-    /// on.
+    /// closure. Guards may NEST (A1): the inner guard op and its
+    /// regions are contiguous ops inside the enclosing region, so the
+    /// enclosing arm's length simply counts them.
     pub(crate) fn open_guard(&mut self, out_shapes: Vec<(Shape, DType)>) -> (usize, Vec<ValueId>) {
-        assert!(
-            !self.in_guard,
-            "nested guards are not part of the vocabulary (flat regions)"
-        );
-        self.in_guard = true;
+        self.guard_depth += 1;
         let outs = self.push(
             OpKind::Guard {
                 arms: Vec::new(),
@@ -653,7 +657,8 @@ impl TraceBuilder {
         };
         *a = arms;
         *e = else_ops;
-        self.in_guard = false;
+        assert!(self.guard_depth > 0, "close_guard without open_guard");
+        self.guard_depth -= 1;
     }
 
     /// The `+=` fold ([`crate::dsl`]): if `rhs` is the output of the op

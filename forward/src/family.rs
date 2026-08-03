@@ -110,19 +110,12 @@ fn llama_like_text(
             } else {
                 rmsnorm(&y, &w.attn_norm)
             };
-            let q = if fused_post {
-                // Decode class, fused binding: the packed GEMM, then ONE
-                // kernel for split + norms + rope + KV write. The general
-                // arm below is this arm's semantics.
-                cuda::qkv_decode_qk_norm_rope_write_kv(
-                    &matmul(&x, &w.qkv),
-                    &w.q_norm,
-                    &w.k_norm,
-                    &w.kv,
-                    table.as_ref(),
-                    q_w,
-                )
-            } else {
+
+            // The general QKV arm, produced once and called from every
+            // path that takes it: packed-or-split projections, the q/k
+            // norm convention ("the weight knows"), rope, and the KV
+            // write (the HasWriteDesc guard when lowered). Produces q.
+            let general_qkv = || {
                 let (q, k, v) = if f.fused_qkv {
                     split_qkv(&matmul(&x, &w.qkv), q_w, kv_w)
                 } else {
@@ -132,9 +125,7 @@ fn llama_like_text(
                         matmul(&x, &w.v_proj),
                     )
                 };
-                // The weight knows its convention (per-head, row-global,
-                // or — under QkNorm::Off — no norm exists to apply). A
-                // lowered arm with the per-head convention and Standard
+                // A lowered arm with the per-head convention and Standard
                 // rope states the fused norm+rope kernel (the hand-written
                 // `fuse_qk_norm_rope` branch — bf16 rounds differently
                 // from the triple, so parity requires the same launch);
@@ -156,9 +147,9 @@ fn llama_like_text(
                 if m.lowering().is_some() {
                     // The KV-write mechanism is a per-fire runtime input
                     // (explicit descriptors when the fire steers a graph
-                    // replay, page-derived otherwise) — the first Guard:
-                    // the one branch the lowered form carries, both arms
-                    // stated (north-star-dsl.md).
+                    // replay, page-derived otherwise). Under the fused
+                    // deployment's mask arm this guard NESTS inside the
+                    // HasCustomMask guard (A1 — the walk keeps a stack).
                     dsl::guard(
                         m,
                         GuardPred::HasWriteDesc,
@@ -170,80 +161,121 @@ fn llama_like_text(
                 }
                 q
             };
-            // The hook sites (HookSite slice): the two model-body points
-            // where an all-hooked fire's programs run — before attention
-            // (page-mask intervention) and after it (score observation).
-            // Only the Hooked* classes carry them; everywhere else the
-            // sites do not exist as launches, which is the truth.
-            if matches!(
-                m.lowering(),
-                Some((_, FireClass::HookedDecode | FireClass::HookedPrefill))
-            ) {
-                dsl::hook_site(HookStage::OnAttnProj, &q, l);
-            }
+            // The plain decode attention region (XQA overrides
+            // force_prefill_path, context.cpp:1427; the non-XQA decode
+            // arm's runtime prefill-decode-plan alternative needs `Guard`
+            // and is pinned off until it exists).
+            let decode_attn_region = |c: &LlamaLikeCudaFacts, q: &Val| {
+                if c.xqa_decode {
+                    cuda::attention_xqa_decode_region(q, &w.kv);
+                } else if c.force_prefill_path {
+                    cuda::dequant_only(&w.kv);
+                    cuda::attention_flashinfer_prefill_region(q, &w.kv);
+                } else {
+                    cuda::attention_flashinfer_decode_region(q, &w.kv);
+                }
+            };
+            let attn_out_shape = (
+                Shape(vec![Dim::Tokens, Dim::Const(q_w)]),
+                DType::BF16,
+            );
+
             let a = match m.lowering() {
-                // The kernel, stated — raw signatures, one per launcher.
-                // XQA overrides force_prefill_path (context.cpp:1427); the
-                // non-XQA decode arm's runtime prefill-decode-plan
-                // alternative needs `Guard` and is pinned off until it
-                // exists (north-star-dsl.md).
-                Some((c, FireClass::Decode)) if c.xqa_decode => {
-                    cuda::attention_xqa_decode(&q, &w.kv, q_w)
+                None => {
+                    let q = general_qkv();
+                    attention(&q, &w.kv, q_w)
                 }
-                Some((c, FireClass::Decode)) if c.force_prefill_path => {
-                    cuda::attention_prefill_dequant(&q, &w.kv, q_w)
+                // A1 (the class-collapse amendment): a custom mask is a
+                // GUARD ARM of the shape classes, not a class — the
+                // masked arm runs the custom-mask prefill dispatch and,
+                // in the fused deployment, the whole general QKV
+                // sequence (the fused decode-QKV epilogue's
+                // !has_custom_mask term, stated as regions).
+                Some((c, FireClass::Decode)) => {
+                    let (g, a) =
+                        dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
+                    if fused_post {
+                        g.arm(GuardPred::HasCustomMask, || {
+                            let q = general_qkv();
+                            cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
+                        })
+                        .otherwise(|| {
+                            // The fused binding: the packed GEMM, then ONE
+                            // kernel for split + norms + rope + KV write.
+                            // The general arm above is this arm's
+                            // semantics.
+                            let q = cuda::qkv_decode_qk_norm_rope_write_kv(
+                                &matmul(&x, &w.qkv),
+                                &w.q_norm,
+                                &w.k_norm,
+                                &w.kv,
+                                table.as_ref(),
+                                q_w,
+                            );
+                            decode_attn_region(c, &q);
+                        });
+                    } else {
+                        let q = general_qkv();
+                        g.arm(GuardPred::HasCustomMask, || {
+                            cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
+                        })
+                        .otherwise(|| decode_attn_region(c, &q));
+                    }
+                    a
                 }
-                Some((_, FireClass::Decode)) => cuda::attention_flashinfer_decode(&q, &w.kv, q_w),
-                Some((_, FireClass::Prefill)) => cuda::attention_flashinfer_prefill(&q, &w.kv, q_w),
-                // The hooked classes (all-hooked fires, fast_rows == 0):
-                // the SAME kernels the shape's class states, wrapped in
-                // the WantsAttnScore guard — the score-capturing dispatch
-                // is a different launcher, and whether the fire's
-                // programs read scores is a runtime input. XQA mirrors
-                // the Decode arm (no capture variant exists for it; a
-                // score-wanting program under XQA fails loudly PTIR-side,
-                // the hand-written contract).
-                Some((c, FireClass::HookedDecode)) if c.xqa_decode => {
-                    cuda::attention_xqa_decode(&q, &w.kv, q_w)
-                }
-                Some((_, FireClass::HookedDecode)) => {
-                    let (g, a) = dsl::guarded_value(
-                        m.trace(),
-                        Some(l),
-                        (
-                            Shape(vec![Dim::Tokens, Dim::Const(q_w)]),
-                            DType::BF16,
-                        ),
-                    );
-                    g.arm(GuardPred::WantsAttnScore, || {
-                        cuda::attention_flashinfer_decode_capture(&q, &w.kv)
+                Some((_, FireClass::Prefill)) => {
+                    let q = general_qkv();
+                    let (g, a) =
+                        dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
+                    g.arm(GuardPred::HasCustomMask, || {
+                        // The custom dispatch takes the layer view whole —
+                        // no dequant staging (the hand-written custom-mask
+                        // branch's contract).
+                        cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
                     })
-                    .otherwise(|| cuda::attention_flashinfer_decode_region(&q, &w.kv));
+                    .otherwise(|| {
+                        cuda::dequant_only(&w.kv);
+                        cuda::attention_flashinfer_prefill_region(&q, &w.kv);
+                    });
+                    a
+                }
+                // The hooked classes (all-hooked fires, fast_rows == 0):
+                // the general body plus the two HookSites per layer; the
+                // attention rides the WantsAttnScore guard — the
+                // score-capturing dispatch is a different launcher, and
+                // whether the fire's programs read scores is a runtime
+                // input. XQA mirrors the Decode arm (no capture variant
+                // exists for it; a score-wanting program under XQA fails
+                // loudly PTIR-side, the hand-written contract).
+                Some((c, FireClass::HookedDecode)) => {
+                    let q = general_qkv();
+                    dsl::hook_site(HookStage::OnAttnProj, &q, l);
+                    let a = if c.xqa_decode {
+                        cuda::attention_xqa_decode(&q, &w.kv, q_w)
+                    } else {
+                        let (g, a) =
+                            dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
+                        g.arm(GuardPred::WantsAttnScore, || {
+                            cuda::attention_flashinfer_decode_capture(&q, &w.kv)
+                        })
+                        .otherwise(|| cuda::attention_flashinfer_decode_region(&q, &w.kv));
+                        a
+                    };
+                    dsl::hook_site(HookStage::OnAttn, &q, l);
                     a
                 }
                 Some((_, FireClass::HookedPrefill)) => {
+                    let q = general_qkv();
+                    dsl::hook_site(HookStage::OnAttnProj, &q, l);
                     cuda::dequant_only(&w.kv);
-                    let (g, a) = dsl::guarded_value(
-                        m.trace(),
-                        Some(l),
-                        (
-                            Shape(vec![Dim::Tokens, Dim::Const(q_w)]),
-                            DType::BF16,
-                        ),
-                    );
+                    let (g, a) =
+                        dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
                     g.arm(GuardPred::WantsAttnScore, || {
                         cuda::attention_flashinfer_prefill_capture(&q, &w.kv)
                     })
                     .otherwise(|| cuda::attention_flashinfer_prefill_region(&q, &w.kv));
+                    dsl::hook_site(HookStage::OnAttn, &q, l);
                     a
-                }
-                // The masked classes: the custom-mask prefill dispatch,
-                // whatever the fire's shape — and the fused decode-QKV
-                // arm never fired above because its predicate is
-                // class == Decode, which is exactly "a masked decode is
-                // not a decode" stated as an op-list difference.
-                Some((_, FireClass::MaskedDecode | FireClass::MaskedPrefill)) => {
-                    cuda::attention_flashinfer_prefill_custom(&q, &w.kv, q_w)
                 }
                 Some((
                     _,
@@ -251,14 +283,7 @@ fn llama_like_text(
                 )) => {
                     unreachable!("llama_like refuses the service classes at trace start")
                 }
-                None => attention(&q, &w.kv, q_w),
             };
-            if matches!(
-                m.lowering(),
-                Some((_, FireClass::HookedDecode | FireClass::HookedPrefill))
-            ) {
-                dsl::hook_site(HookStage::OnAttn, &q, l);
-            }
             if post_norm {
                 // Post-norm: o_proj to scratch, norm the OUTPUT, then the
                 // separate residual landing (`+=` of a non-matmul records
@@ -597,13 +622,7 @@ fn gdn_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((
-            _,
-            FireClass::MaskedDecode
-            | FireClass::MaskedPrefill
-            | FireClass::HookedDecode
-            | FireClass::HookedPrefill,
-        )) => {
+        Some((_, FireClass::HookedDecode | FireClass::HookedPrefill)) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -669,13 +688,7 @@ fn gdn_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((
-            _,
-            FireClass::MaskedDecode
-            | FireClass::MaskedPrefill
-            | FireClass::HookedDecode
-            | FireClass::HookedPrefill,
-        )) => {
+        Some((_, FireClass::HookedDecode | FireClass::HookedPrefill)) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -875,13 +888,7 @@ fn full_attn_body(
         Some((_, FireClass::CommitAdvance)) => {
             unreachable!("CommitAdvance traces its own pass, never the layer body")
         }
-        Some((
-            _,
-            FireClass::MaskedDecode
-            | FireClass::MaskedPrefill
-            | FireClass::HookedDecode
-            | FireClass::HookedPrefill,
-        )) => {
+        Some((_, FireClass::HookedDecode | FireClass::HookedPrefill)) => {
             unreachable!("class not yet traced for qwen3_5 (entry rejects)")
         }
     };
@@ -1011,10 +1018,7 @@ fn qwen3_5_hybrid_text(facts: &Qwen35HybridFacts, lower: Qwen35Lower<'_>) -> For
                 FireClass::CommitAdvance => "commit_advance",
                 FireClass::StateOnly => "state_only",
                 FireClass::FrozenVerify => "frozen_verify",
-                FireClass::MaskedDecode
-                | FireClass::MaskedPrefill
-                | FireClass::HookedDecode
-                | FireClass::HookedPrefill => {
+                FireClass::HookedDecode | FireClass::HookedPrefill => {
                     unreachable!("class not yet traced for qwen3_5 (entry rejects)")
                 }
             }

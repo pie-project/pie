@@ -1069,8 +1069,11 @@ fn entry_honours_the_unfused_binding() {
 /// — kernel symbol in the weight slot, consumed weight names in
 /// `aux_names` (signature order), the state mark in the params — plus
 /// the fused decode shape itself: 28 fused posts, ONE table build
-/// consumed by all of them as an operand, and the general arm's
-/// SplitQkv/Rope/KvAppend absent.
+/// consumed by all of them as an operand. Since A1 (the class-collapse
+/// amendment) the Decode trace ALSO carries the HasCustomMask guard's
+/// mask arm per layer — the general QKV sequence (SplitQkv appears as a
+/// region op) and the custom-mask dispatch — beside the fused else-arm;
+/// the launch count pins both arms.
 #[test]
 fn lowered_trace_round_trips_through_the_arena() {
     let facts = c_facts_qwen3();
@@ -1091,8 +1094,10 @@ fn lowered_trace_round_trips_through_the_arena() {
         .iter()
         .filter(|op| op.kind == PieForwardOpKind::Launch)
         .collect();
-    // 1 table build + 28 fused posts + 28 attentions.
-    assert_eq!(launches.len(), 57);
+    // 1 table build + per layer: the mask arm's 4 (fused qk-norm+rope,
+    // the write guard's two regions, the custom dispatch) + the fused
+    // else-arm's 2 (fused post, XQA) = 169.
+    assert_eq!(launches.len(), 169);
 
     let table = launches[0];
     assert_eq!(view::name(&out, table.weight_name), "launch_rope_standard_table");
@@ -1126,11 +1131,21 @@ fn lowered_trace_round_trips_through_the_arena() {
         .expect("decode class states XQA");
     assert_eq!(attn.param0, 1);
 
-    // No general-arm leftovers in the fused decode class.
+    // The lowered general arm states its kernels: no semantic Rope or
+    // KvAppend anywhere (SplitQkv is legitimately present — the mask
+    // arm's region carries the general QKV sequence since A1).
     assert!(!ops.iter().any(|op| matches!(
         op.kind,
-        PieForwardOpKind::SplitQkv | PieForwardOpKind::Rope | PieForwardOpKind::KvAppend
+        PieForwardOpKind::Rope | PieForwardOpKind::KvAppend
     )));
+    assert!(ops.iter().any(|op| op.kind == PieForwardOpKind::SplitQkv));
+    // The per-layer guard chains: 28 HasCustomMask (value-producing) +
+    // 28 nested HasWriteDesc inside their mask arms.
+    let guards = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::Guard)
+        .count();
+    assert_eq!(guards, 56);
     unsafe { pie_forward_release(&mut out) };
 
     // An out-of-range class is a malformed request, not a default.

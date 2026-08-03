@@ -183,7 +183,9 @@ enum class PieForwardFireClass : uint32_t {
   StateOnly = 3,
   /// Reserved (the frozen-verify slice); both entries reject it today.
   FrozenVerify = 4,
-  /// The mask classes (llama_like; qwen3_5's masked slice is later).
+  /// RETIRED (A1, the class-collapse amendment): a custom mask is a
+  /// HasCustomMask guard arm of classes 0/1. The discriminants stay
+  /// reserved (append-only rule); both entries reject them.
   MaskedDecode = 5,
   MaskedPrefill = 6,
   /// The all-hooked classes (fast_rows == 0; the HookSite slice).
@@ -202,6 +204,12 @@ enum class PieForwardGuardPred : uint32_t {
   TokensLE = 1,
   /// `N > payload`.
   TokensGT = 2,
+  /// The fire's programs read attention scores at OnAttn
+  /// (`StageHooks::wants_attn_score`). Payload unused.
+  WantsAttnScore = 3,
+  /// The fire carries a custom attention mask (`custom_mask_d !=
+  /// nullptr`) — A1, the class-collapse amendment. Payload unused.
+  HasCustomMask = 4,
 };
 
 /// The llama_like facts, as C states them. Mirrors

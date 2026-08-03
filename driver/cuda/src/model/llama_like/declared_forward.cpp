@@ -8,6 +8,8 @@
 #include <string>
 #include <optional>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -310,10 +312,6 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
     out.prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Prefill);
-    out.masked_decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
-        facts, cuda, pie_forward::PieForwardFireClass::MaskedDecode);
-    out.masked_prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
-        facts, cuda, pie_forward::PieForwardFireClass::MaskedPrefill);
     out.hooked_decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::HookedDecode);
     out.hooked_prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
@@ -322,8 +320,6 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // registry fails at model load, not mid-fire.
     validate_stated_kernels(out.decode);
     validate_stated_kernels(out.prefill);
-    validate_stated_kernels(out.masked_decode);
-    validate_stated_kernels(out.masked_prefill);
     validate_stated_kernels(out.hooked_decode);
     validate_stated_kernels(out.hooked_prefill);
 
@@ -397,8 +393,11 @@ void llama_like_forward_declared(
                      "  live:    %s\n  emitted: %s\n",
                      declared.facts_digest.c_str(), kGeneratedForDigest);
     }
-    const bool has_custom_mask = custom_mask_d != nullptr;
-    if (!has_custom_mask && stage_hooks == nullptr &&
+    // A1 (the class-collapse amendment): a custom mask no longer picks a
+    // class — the decode/prefill traces carry it as their HasCustomMask
+    // guard arm, so the generated static form serves masked fires too
+    // (the mask data crosses as arguments).
+    if (stage_hooks == nullptr &&
         generated_forward_enabled() &&
         declared.facts_digest == kGeneratedForDigest) {
         (is_pure_decode ? generated_llama_like_decode
@@ -409,22 +408,17 @@ void llama_like_forward_declared(
             qo_indptr_h, kv_page_indptr_h,
             total_tokens, num_requests,
             logit_row_indices_d, num_logit_rows,
-            w_page_d, w_off_d, row_valid_d, has_write_desc);
+            w_page_d, w_off_d, row_valid_d, has_write_desc,
+            custom_mask_d, custom_mask_indptr_d);
         return;
     }
-    // Rung 2 + the mask classes: the fire's class picks its trace, and
-    // the trace states every kernel — nothing below derives a path
-    // (north-star-dsl.md). A mask is a class axis, not a branch: masked
-    // fires walk traces in which the fused-QKV arm never existed and the
-    // attention IS the custom-mask dispatch.
+    // Rung 2: the fire's class picks its trace, and the trace states
+    // every kernel — nothing below derives a path (north-star-dsl.md).
     const bool hooked = stage_hooks != nullptr;
     const pie_forward::ForwardPlan& plan =
         hooked ? (is_pure_decode ? declared.hooked_decode
                                  : declared.hooked_prefill)
-        : has_custom_mask
-            ? (is_pure_decode ? declared.masked_decode
-                              : declared.masked_prefill)
-            : (is_pure_decode ? declared.decode : declared.prefill);
+               : (is_pure_decode ? declared.decode : declared.prefill);
     // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
     // it a silent fallback to the hand-written path would be
     // indistinguishable from a passing A/B run.
@@ -515,17 +509,19 @@ void llama_like_forward_declared(
     // swiglu kernel the following Swiglu op launches (the hand-written
     // `use_fused_gu` pairing).
     bool gate_up_used_fused = false;
-    // Guard skip state: when a taken then-region ends, the else-region is
-    // dead and the walk jumps it (regions are flat — the builder refuses
-    // nesting — so one pending skip suffices).
-    std::size_t guard_else_at = SIZE_MAX;
-    std::size_t guard_else_len = 0;
+    // Guard skip STACK (A1): when a taken region ends, everything to the
+    // chain's end is dead and the walk jumps it. Guards NEST since the
+    // class-collapse amendment (the mask arm carries the write-mechanism
+    // guard), so pending skips stack — inner skips (pushed later) always
+    // end at or before their enclosing region's skip point, so popping
+    // in LIFO order at each index is exact.
+    std::vector<std::pair<std::size_t, std::size_t>> guard_skips;
     for (std::size_t i = 0; i < op_count; ++i) {
-        if (i == guard_else_at) {
-            guard_else_at = SIZE_MAX;
-            i += guard_else_len;
-            if (i >= op_count) break;
+        while (!guard_skips.empty() && i == guard_skips.back().first) {
+            i += guard_skips.back().second;
+            guard_skips.pop_back();
         }
+        if (i >= op_count) break;
         const PieForwardOp& op = plan.op(i);
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
@@ -1055,15 +1051,18 @@ void llama_like_forward_declared(
             // The attention launches land in the padded staging buffer
             // when the head dim is padded; strip before the o_proj GEMM
             // reads `[N, num_q*d]` — mechanical staging, as the pad in
-            // KvAppend (the hand-written post-attention strip).
+            // the write handlers (the hand-written post-attention strip).
+            // Keyed by NAME, not by outputs: since A1 the attention
+            // launches are guard-region (output-less) forms — the guard
+            // owns the value; the launch is still the buffer's writer.
+            const std::string_view launch_name = plan.weight_name(op);
             const bool is_attention_out =
-                plan.outputs(op).size == 1 &&
-                (plan.weight_name(op) ==
-                     "launch_attention_xqa_decode_bf16_prepared" ||
-                 plan.weight_name(op) ==
-                     "dispatch_attention_flashinfer_decode" ||
-                 plan.weight_name(op) ==
-                     "dispatch_attention_flashinfer_prefill_bf16");
+                launch_name == "launch_attention_xqa_decode_bf16_prepared" ||
+                launch_name == "dispatch_attention_flashinfer_decode" ||
+                launch_name == "dispatch_attention_flashinfer_prefill_bf16" ||
+                launch_name == "dispatch_attention_flashinfer_prefill_custom" ||
+                launch_name == "dispatch_attention_flashinfer_decode_capture" ||
+                launch_name == "dispatch_attention_flashinfer_prefill_capture_bf16";
             if (is_attention_out && head_dim_padded) {
                 kernels::launch_strip_head_dim_bf16(
                     attn_out_buf, ws.attn_out.data(),
@@ -1146,9 +1145,15 @@ void llama_like_forward_declared(
                 case static_cast<std::uint32_t>(
                     pie_forward::PieForwardGuardPred::TokensGT):
                     return N > static_cast<int>(payload);
-                case 3:  // WantsAttnScore
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::WantsAttnScore):
                     return stage_hooks != nullptr &&
                            stage_hooks->wants_attn_score;
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::HasCustomMask):
+                    // A1 (the class-collapse amendment): the mask arm
+                    // of the decode/prefill traces.
+                    return custom_mask_d != nullptr;
                 default:
                     throw std::runtime_error(
                         "declared forward: guard predicate kind " +
@@ -1175,9 +1180,10 @@ void llama_like_forward_declared(
                 chosen_len = else_len;
             }
             const std::size_t total_end = cursor + else_len;
-            // Jump to the chosen region; when it ends, jump to total_end.
-            guard_else_at = chosen_start + chosen_len;
-            guard_else_len = total_end - guard_else_at;
+            // Jump to the chosen region; when it ends, jump to total_end
+            // (stacked, so a nested guard inside the region composes).
+            guard_skips.emplace_back(chosen_start + chosen_len,
+                                     total_end - (chosen_start + chosen_len));
             i = chosen_start - 1;  // the loop's ++i lands on the region
             break;
         }

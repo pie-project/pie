@@ -260,6 +260,43 @@ peepholes, eligibility predicates, thresholds.
    (fall back to hand-written) — they were a harness convenience, and
    the harness keeps the hand-written path anyway.
 
+   **The class-collapse amendment (the A-ladder; direction set in
+   review 2026-08-03).** The wiki review's sharpest finding: classes
+   MULTIPLY (mask × hook × service × family), which re-derives the
+   partition-and-batch enumeration this plan set out to beat.
+   Masked×2/Hooked×2 are whole-trace-granularity treatments of deltas
+   the vocabulary can express at op granularity. The mask-classes
+   decision is REVERSED: "a masked decode is not a decode" stays true
+   op-list-wise, but the delta is LOCAL (the attention site + the
+   fused-QKV arm), and a local op-list delta over a runtime input is
+   exactly Guard territory. The ladder:
+   - **A1 (this slice)**: `GuardPred::HasCustomMask` (wire 4);
+     Decode/Prefill traces carry the mask arm as a guard chain at the
+     attention site — in the fused_post deployment the mask arm holds
+     the whole general QKV sequence, so its nested HasWriteDesc guard
+     makes guard NESTING part of the vocabulary (the walk keeps a skip
+     STACK, the emitter recurses; the aux wire encoding is unchanged —
+     a nested guard is just an op inside a region). Masked classes
+     deleted; wire values 5/6 answer InvalidArgument (append-only ABI
+     keeps the numbers). The rope-table hoist stays unconditional in
+     the fused deployment — a masked fire launches one table build it
+     never reads (outputs unaffected; the ops-count line shows it).
+   - **A2**: same collapse for Hooked×2 — HookSites become
+     unconditional ops of Decode/Prefill (a site with no program is a
+     no-op by argument), the WantsAttnScore guard rides in the main
+     text, and the fused arm guards on hook-free rows.
+   - **A3**: the all-or-nothing hook guard becomes `Peel` (both
+     regions run, complementary row ranges, fast_rows the runtime
+     split) and the gate admits mixed fires.
+   - **A4**: qwen3_5's attention arms gain the same guards (its
+     masked/hooked fires are guard arms from birth, never classes).
+   End state: `FireClass` = fire SHAPE × SERVICE only (Decode,
+   Prefill, CommitAdvance, StateOnly, FrozenVerify) — the axes that
+   change the pass wholesale; per-fire attachments (masks, hooks,
+   lora) are guards, sites, and channel data. This is also the
+   region vocabulary the future union pass (supergraph merge) emits
+   into, which is why the collapse precedes it.
+
 ## What this does not reopen
 
 Non-goals hold: no kernel is generated (the DSL *names* existing

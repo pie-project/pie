@@ -119,7 +119,9 @@ const PARAMS: &str = "\
     const std::uint32_t* w_page_d,\n\
     const std::uint32_t* w_off_d,\n\
     const std::uint8_t* row_valid_d,\n\
-    bool has_write_desc";
+    bool has_write_desc,\n\
+    const std::uint8_t* custom_mask_d,\n\
+    const std::int32_t* custom_mask_indptr_d";
 
 fn emit_class_fn(
     plan: &ForwardPlan,
@@ -176,11 +178,26 @@ fn emit_class_fn(
         b.line("");
     }
 
-    // Index walk: a Guard consumes its region ops into an emitted
-    // `if`/`else` — the ONLY branch the declaration wrote, spelled as the
-    // fixed condition its closed predicate names.
-    let mut i = 0;
-    while i < plan.ops.len() {
+    emit_range(&mut b, plan, facts, is_decode, 0, plan.ops.len());
+    b.line("}");
+    b.out
+}
+
+/// Emit ops `[start, end)`: a Guard consumes its region ops into an
+/// emitted `if`/`else if`/`else` — the ONLY branch the declaration wrote,
+/// spelled as the fixed condition its closed predicate names. RECURSIVE
+/// since A1 (the class-collapse amendment): a nested guard is an
+/// ordinary op inside a region and recurses into its own chain.
+fn emit_range(
+    b: &mut Body,
+    plan: &ForwardPlan,
+    facts: &LlamaLikeFacts,
+    is_decode: bool,
+    start: usize,
+    end: usize,
+) {
+    let mut i = start;
+    while i < end {
         let op = &plan.ops[i];
         if let OpKind::Guard { arms, else_ops } = &op.kind {
             let cond_of = |pred: &crate::trace::GuardPred| match pred {
@@ -190,33 +207,30 @@ fn emit_class_fn(
                 crate::trace::GuardPred::WantsAttnScore => {
                     "hooks != nullptr && hooks->wants_attn_score".to_string()
                 }
+                crate::trace::GuardPred::HasCustomMask => {
+                    "custom_mask_d != nullptr".to_string()
+                }
             };
             let mut region = i + 1;
             for (n, arm) in arms.iter().enumerate() {
                 let kw = if n == 0 { "if" } else { "} else if" };
                 b.stmt(&format!("{kw} ({}) {{", cond_of(&arm.pred)));
                 b.indent += 1;
-                for j in region..(region + arm.ops as usize) {
-                    emit_op(&mut b, &plan.ops[j], plan, facts, is_decode);
-                }
+                emit_range(b, plan, facts, is_decode, region, region + arm.ops as usize);
                 b.indent -= 1;
                 region += arm.ops as usize;
             }
             b.stmt("} else {");
             b.indent += 1;
-            for j in region..(region + *else_ops as usize) {
-                emit_op(&mut b, &plan.ops[j], plan, facts, is_decode);
-            }
+            emit_range(b, plan, facts, is_decode, region, region + *else_ops as usize);
             b.indent -= 1;
             b.stmt("}");
             i = region + *else_ops as usize;
             continue;
         }
-        emit_op(&mut b, op, plan, facts, is_decode);
+        emit_op(b, op, plan, facts, is_decode);
         i += 1;
     }
-    b.line("}");
-    b.out
 }
 
 #[derive(Default)]
@@ -612,6 +626,29 @@ fn emit_launch(
             b.stmt("        kv_page_indices, kv_page_indptr, kv_last_page_lens,");
             b.stmt("        attn_ws, stream, layer_window_left,");
             b.stmt("        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);");
+            b.stmt("}");
+        }
+        "dispatch_attention_flashinfer_prefill_custom" => {
+            // The custom-mask arm (A1): the custom dispatch takes the
+            // layer view whole (no dequant) against the PREFILL plan
+            // whatever the fire's shape, and the mask data rides as
+            // runtime args of the stated kernel — the interpreter's
+            // handler, minus the choosing.
+            let layer = state.expect("attention addresses kv state").layer;
+            b.stmt("if (!plan_state.prefill_plan) {");
+            b.stmt("    throw std::runtime_error(");
+            b.stmt("        \"generated forward: prepare built no prefill plan\");");
+            b.stmt("}");
+            b.stmt(&format!("{{"));
+            b.stmt(&format!(
+                "    auto kv_view = cache.layer_view({layer});"
+            ));
+            b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
+            b.stmt("        *plan_state.prefill_plan,");
+            b.stmt("        ws.q.data(), kv_view, ws.attn_out.data(),");
+            b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
+            b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
+            b.stmt("        attn_ws, stream);");
             b.stmt("}");
         }
         other => panic!("emitter: stated kernel {other} out of scope"),

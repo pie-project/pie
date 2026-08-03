@@ -144,6 +144,12 @@ pub enum PieForwardGuardPred {
     TokensLE = 1,
     /// `N > payload`.
     TokensGT = 2,
+    /// The fire's programs read attention scores at OnAttn
+    /// (`StageHooks::wants_attn_score`). Payload unused.
+    WantsAttnScore = 3,
+    /// The fire carries a custom attention mask (`custom_mask_d !=
+    /// nullptr`) — A1, the class-collapse amendment. Payload unused.
+    HasCustomMask = 4,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as
