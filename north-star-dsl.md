@@ -1155,3 +1155,47 @@ The NS ladder (each rung parity-gated live, per standing practice):
   merged op lists; the 2^k supergraph key collapses to bucket keys.
 - NS-5: retire the fire-level two-path form once NS-3/4 serve its
   fires (it remains the fallback until byte-parity holds everywhere).
+
+## NS-1 live gate + NS-2 design, pinned pre-implementation (2026-08-03)
+
+NS-1 gates (L40S, debug): masked-dense == masked-none byte-identical
+under the new seriation; solo oracle byte-stable vs pre-campaign;
+concurrent masked+plain mix green. The reorder is live and harmless.
+
+NS-2 — the spatial mask fire, design:
+- Scope: hook-free pure-decode fires with 0 < unmasked < R. Hooked+
+  masked fires keep the fire-level arm (the seriation key nests mask
+  under hooks, so the mask set is not contiguous there).
+- The split source of truth is the PLAN: SITE_ATTENTION_MASK's
+  fast_rows crosses the wire exactly as planned_hook_free_prefix_rows
+  does (the B pattern: planned value + driver cross-check against a
+  wire-derivable bound where possible; the driver CANNOT derive
+  per-row maskness itself — composed assemblies synthesize causal
+  rows for unmasked lanes).
+- Prepare builds BOTH plans for such fires: the decode plan over the
+  PREFIX sub-CSR (host CSRs unchanged, R' = split) and the custom
+  mask plan over the SUFFIX (host CSR slices rebased by
+  qo_indptr_h[split]; the device-side rebased suffix CSRs upload into
+  dedicated pi buffers per fire — pi.mask_suffix_{qo,kvpp,kvlpl},
+  R+1 headroom).
+- The body (hand-written first, then interpreter case, then emitter
+  arm): attention ONLY splits — decode kernel over rows [0, split),
+  custom prefill kernel over [split, N) reading the suffix CSRs and
+  the mask (mask indptr is already suffix-relative once composition
+  stops synthesizing causal rows for the prefix — NS-2 keeps the
+  synthesized rows and offsets custom_mask_indptr_d by the prefix's
+  entries instead, so composition stays untouched). QKV, KV-write,
+  MLP, lm_head stay full-N shared — the work-sharing is preserved;
+  attention contributes the two structural points per layer the IR
+  predicts.
+- Numerics statement for the gates: unmasked lanes in a mixed fire
+  MOVE from custom-kernel to decode-kernel numerics — byte-equal to
+  their solo-plain selves (the more consistent contract), NOT to
+  yesterday's mixed output. Masked lanes stay byte-equal to the
+  masked arm. Gates: masked solo unchanged; mixed fire's unmasked
+  lanes == plain solo; dense==none still holds per lane.
+- Gate lever: PIE_SPATIAL_MASK (default OFF until the ladder's own
+  batteries pass; flips ON with its consolidated sweep).
+- Graph path: the supergraph mask arm keeps serving masked fires
+  until NS-3 windows the arms (region windows + window-nonempty
+  conditionals); NS-2 is eager-first.
