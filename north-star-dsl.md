@@ -907,3 +907,33 @@ long-horizon capture-safety reworks if hooks/lora ever need to shed
 their fingerprints (device-indirected shapes — blocked on kernel/API
 support, e.g. device-side grouped GEMM shapes, which cuBLAS does not
 offer today).
+
+Consolidated sweep at tip `091ca131d` (2026-08-03): units green
+(forward 78, engine 395, ABI); live byte-stable on every axis —
+parity, supergraph small+wide A/B, holed mixed, hook battery, lora
+solos. The lora campaign's six commits hold together.
+
+## The Peel device-window campaign — design
+
+The supergraph fallout list's last item. Today a MIXED hooked fire
+(0 < fast_rows < N) bakes its row split into kernel args, so hook
+execs churn (or ban to eager) whenever lane composition shifts the
+split. The campaign teaches the Peel-region kernels to read the
+window from DEVICE memory:
+1. A per-fire device window word (pi.peel_window: {start,len} u32x2,
+   uploaded beside the supergraph preds).
+2. Device-window variants of the region kernels — the fused decode
+   epilogue (prefix region) and the tail's split/qk-norm-rope/KV-write
+   — launched at the FULL-N grid with a per-row window check (wasted
+   threads at the tail, bounded by N; the launch shape stops depending
+   on the split).
+3. The interpreter's Win threading and the emitter's Win expressions
+   move from host constants to the device word on the graph paths
+   (eager keeps host windows — no wasted threads where no capture
+   needs stability).
+4. The hook fingerprint drops the split; mixed fires replay one exec
+   across compositions.
+Order: kernels first (each with an A/B against the host-window form),
+then the plumbing, then the fingerprint change, batteries at each
+step. This is deliberate multi-cycle kernel surgery — correctness
+gates are the mixed-hook battery and the full sweep.
