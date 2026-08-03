@@ -350,6 +350,41 @@ peepholes, eligibility predicates, thresholds.
    region vocabulary the future union pass (supergraph merge) emits
    into, which is why the collapse precedes it.
 
+   **B — DONE (2026-08-03)**: the planner's first consumed lowering.
+   `Prefix{fast_rows}` converts to wire rows and crosses the ABI
+   (`planned_hook_free_prefix_rows`); the driver cross-checks it
+   against its compiled-plan derivation (refusing on drift) and
+   feeds the declared Peel's split. Live: planned=0 ×276
+   (all-hooked), planned=2/3 ×48 (mixed), 0 refusals.
+
+   **C — the fire census verdict (2026-08-03).** `PIE_FIRE_CENSUS=1`
+   prints one line per sealed step group (size, the head's solo
+   contract, join refusals by clause — `LaunchGrouping::refusal` and
+   `solo_reason` are the reason-carrying twins of the old booleans).
+   Measured over a realistic mix (mixed hooked fires, staggered
+   dense-masked lanes, solo hook alternation, k=3 perf A/B):
+   - ZERO solo-contract fires — the remaining `requires_solo` terms
+     (rs-buffer: stage-2 contract verdict; prebuilt-untracked:
+     harness; multirow-zero-tokens) never fire in real work.
+   - The ONLY join refusals are `mask-compose` (303 events): a
+     DENSE-masked lane vs device-resolved decode envelopes — the
+     residual of stage 2's item A, which relaxed exactly the
+     structured-mask subset. The relax path is a DRIVER capability
+     (per-lane wire-mask packing on the composed path), with this
+     census as its measured target; nothing scheduler-side remains
+     to loosen.
+   - Carrying a hooked lane in a mixed fire costs the plain lanes
+     NOTHING (naive slowdown 1.00×/0.96×/0.90× across reps — the
+     Peel + planner ordering did their job).
+   The supergraph-ladder implication, recorded honestly: the class
+   collapse has EATEN most of the union pass's original unblocked
+   payload — per-fire attachment divergence now co-batches inside
+   one fire, so D's remaining targets are the dense-mask compose
+   capability above and the externally-blocked structural axes
+   (multi-checkpoint serving, depth/MoD, vision). D stays
+   measurement-gated on a workload that actually carries one of
+   those.
+
 ## What this does not reopen
 
 Non-goals hold: no kernel is generated (the DSL *names* existing

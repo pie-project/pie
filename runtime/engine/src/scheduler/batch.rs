@@ -26,6 +26,15 @@ pub(crate) struct StepBuild {
     pub(crate) channel_ticket_indptr: Vec<u32>,
 }
 
+/// `PIE_FIRE_CENSUS=1` prints one line per sealed step group (size, solo
+/// contract, join refusals by clause) — the C measurement's surface.
+fn fire_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PIE_FIRE_CENSUS").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 /// The fire plan's qkv_postprocess lowering, converted from MEMBER counts
 /// to WIRE request rows through the step's attribution CSR — the value
 /// [`StepSubmission::planned_hook_free_prefix_rows`] carries. The
@@ -324,13 +333,38 @@ pub(crate) fn build_frame_submission(
             let mut group: Vec<Box<PendingRequest>> = Vec::new();
             let mut rest: Vec<Box<PendingRequest>> = Vec::new();
             let mut closed = false;
+            let mut refusals: Vec<&'static str> = Vec::new();
             for req in deferred {
-                if closed || !grouping.accepts(&req, limits, page_size) {
+                if closed {
+                    refusals.push("group-closed");
+                    rest.push(req);
+                    continue;
+                }
+                if let Some(reason) = grouping.refusal(&req, limits, page_size) {
+                    refusals.push(reason);
                     rest.push(req);
                     continue;
                 }
                 closed = grouping.push(&req, limits, page_size);
                 group.push(req);
+            }
+            // The fire census (C): one line per sealed step group — size,
+            // the head's solo contract if any, and every join refusal by
+            // clause. This is the measurement surface for "what does the
+            // remaining partition cost": a workload whose census shows only
+            // contract-bound reasons has nothing left for the scheduler to
+            // relax.
+            if fire_census_enabled() {
+                let solo = group
+                    .first()
+                    .and_then(|req| req.solo_reason())
+                    .unwrap_or("-");
+                eprintln!(
+                    "[fire-census] step members={} solo={} deferred={:?}",
+                    group.len(),
+                    solo,
+                    refusals,
+                );
             }
             debug_assert!(!group.is_empty(), "grouping always admits the head");
             if group.is_empty() {

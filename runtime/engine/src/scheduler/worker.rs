@@ -353,9 +353,25 @@ impl PendingRequest {
     }
 
     fn requires_solo_submission(&self) -> bool {
-        (self.prebuilt && self.pipeline_id.is_none())
-            || (self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0))
-            || self.touches_rs_buffer()
+        self.solo_reason().is_some()
+    }
+
+    /// Why this fire must go out alone, if it must — the fire census's
+    /// vocabulary (C, the class-collapse follow-up measurement): every
+    /// remaining solo term is either a harness path or a driver-contract
+    /// exclusion, and the census is what shows which ones a real workload
+    /// actually pays for.
+    pub(crate) fn solo_reason(&self) -> Option<&'static str> {
+        if self.prebuilt && self.pipeline_id.is_none() {
+            return Some("prebuilt-untracked");
+        }
+        if self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0) {
+            return Some("multirow-zero-tokens");
+        }
+        if self.touches_rs_buffer() {
+            return Some("rs-buffer");
+        }
+        None
     }
 
     /// A fire that buffers recurrent activations, or folds them back, picks
@@ -438,8 +454,19 @@ impl LaunchGrouping {
         limits: SchedulerLimits,
         page_size: u32,
     ) -> bool {
+        self.refusal(request, limits, page_size).is_none()
+    }
+
+    /// [`Self::accepts`] with the WHY: `None` = admitted, `Some(reason)` =
+    /// the clause that refused — the fire census's join-refusal vocabulary.
+    pub(crate) fn refusal(
+        &self,
+        request: &PendingRequest,
+        limits: SchedulerLimits,
+        page_size: u32,
+    ) -> Option<&'static str> {
         if self.instances.contains(&request.instance_id) {
-            return false;
+            return Some("same-instance");
         }
         // Wire-geometry (chunk) and device-resolved (chained decode) fires
         // CO-BATCH as ordered sub-batches of one step (true sub-batches,
@@ -452,10 +479,10 @@ impl LaunchGrouping {
             .pipeline_id
             .is_some_and(|pid| self.pipelines.contains(&pid))
         {
-            return false;
+            return Some("same-pipeline");
         }
         if self.count != 0 && (request.requires_solo_submission() || self.has_solo_submission) {
-            return false;
+            return Some("solo-contract");
         }
         // Custom wire masks co-batch freely with other wire-geometry fires —
         // the wire layer emits a mask row per request (synthesized causal for
@@ -480,7 +507,7 @@ impl LaunchGrouping {
                 || (mask_blocks_composition(&request.request) && self.has_device_geometry)
                 || (request.request.device_resolved_geometry && self.has_user_mask))
         {
-            return false;
+            return Some("mask-compose");
         }
         // Invariant: a batch containing an `attn_page_mask`-writing program
         // is pure decode. The driver honours a written mask only on the
@@ -498,15 +525,18 @@ impl LaunchGrouping {
             && ((request.page_mask_program && self.has_multi_token)
                 || (request.has_multi_token_row() && self.has_page_mask))
         {
-            return false;
+            return Some("page-mask-multitoken");
         }
         if self.count == 0 {
-            return true;
+            return None;
         }
         let usage = batch::request_capacity_usage(request, page_size);
-        self.count.saturating_add(usage.forward_requests) <= limits.max_forward_requests
-            && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
-            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
+        let fits = self.count.saturating_add(usage.forward_requests)
+            <= limits.max_forward_requests
+            && self.forward_tokens.saturating_add(usage.forward_tokens)
+                <= limits.max_forward_tokens
+            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs;
+        if fits { None } else { Some("capacity") }
     }
 
     pub(crate) fn push(
