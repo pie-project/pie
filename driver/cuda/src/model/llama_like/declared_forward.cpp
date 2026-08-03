@@ -192,6 +192,7 @@ inline const void* bf16_row(const void* base, int row, int width) {
 // it defines names the deployment it was emitted from, and the dispatch
 // in `llama_like_forward_declared` runs it only on exact match.
 #include "model/llama_like/generated/qwen3_0_6b.inc"
+#include "model/llama_like/generated/olmo2_1b.inc"
 
 // PIE_DECLARED_FORWARD_GENERATED=1 routes digest-matched fires through
 // the generated static form instead of the interpreter walk — the third
@@ -398,13 +399,16 @@ void llama_like_forward_declared(
     // below — the parity gate's third leg proves it — with every choice
     // resolved at EMISSION time instead of at walk time.
     if (generated_forward_enabled() &&
-        declared.facts_digest != kGeneratedForDigest &&
+        declared.facts_digest != kGeneratedDigest_qwen3_0_6b &&
+        declared.facts_digest != kGeneratedDigest_olmo2_1b &&
         std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
         // Silent non-engagement is this path's failure mode; say why.
         std::fprintf(stderr,
                      "[declared-forward-generated] digest mismatch:\n"
-                     "  live:    %s\n  emitted: %s\n",
-                     declared.facts_digest.c_str(), kGeneratedForDigest);
+                     "  live:    %s\n  emitted: %s | %s\n",
+                     declared.facts_digest.c_str(),
+                     kGeneratedDigest_qwen3_0_6b,
+                     kGeneratedDigest_olmo2_1b);
     }
     // A1 (the class-collapse amendment): a custom mask no longer picks a
     // class — the decode/prefill traces carry it as their HasCustomMask
@@ -414,20 +418,29 @@ void llama_like_forward_declared(
     // complete): the emitter constructs the lora staging AND the hook
     // sidebands (page mask, score captures) and spells the sites,
     // brackets and corrections with constant layers.
-    if (generated_forward_enabled() &&
-        declared.facts_digest == kGeneratedForDigest) {
-        (is_pure_decode ? generated_llama_like_decode
-                        : generated_llama_like_prefill)(
-            w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
-            token_ids, positions, qo_indptr,
-            kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            qo_indptr_h, kv_page_indptr_h,
-            total_tokens, num_requests,
-            logit_row_indices_d, num_logit_rows,
-            w_page_d, w_off_d, row_valid_d, has_write_desc,
-            custom_mask_d, custom_mask_indptr_d,
-            stage_hooks, lora);
-        return;
+    if (generated_forward_enabled()) {
+        const auto run = [&](auto decode_fn, auto prefill_fn) {
+            (is_pure_decode ? decode_fn : prefill_fn)(
+                w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
+                token_ids, positions, qo_indptr,
+                kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                total_tokens, num_requests,
+                logit_row_indices_d, num_logit_rows,
+                w_page_d, w_off_d, row_valid_d, has_write_desc,
+                custom_mask_d, custom_mask_indptr_d,
+                stage_hooks, lora);
+        };
+        if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
+            run(generated_llama_like_decode_qwen3_0_6b,
+                generated_llama_like_prefill_qwen3_0_6b);
+            return;
+        }
+        if (declared.facts_digest == kGeneratedDigest_olmo2_1b) {
+            run(generated_llama_like_decode_olmo2_1b,
+                generated_llama_like_prefill_olmo2_1b);
+            return;
+        }
     }
     // Rung 2 + A2: the fire's SHAPE picks its trace, and the trace
     // states every kernel — attachments (mask, hooks) are its guard

@@ -4,14 +4,15 @@
 // already made at trace time. Included by declared_forward.cpp inside
 // its anonymous namespace; regenerate after any change to the
 // declaration, the facts below, or the emitter, and re-run the
-// three-way parity gate.
+// three-way parity gate. One TU per deployment; the `qwen3_0_6b` suffix
+// keeps the symbols apart and the digest constant names the pair.
 //
 // Emitted from: llama_like/h1024/l28/qh16/kvh8/hd128/i3072/v151936/rope0/nv0/np0/qk1/fq1/te0/xqa0/dfp1/rt1/fpp0
 
-constexpr const char* kGeneratedForDigest =
+constexpr const char* kGeneratedDigest_qwen3_0_6b =
     "llama_like/h1024/l28/qh16/kvh8/hd128/i3072/v151936/rope0/nv0/np0/qk1/fq1/te0/xqa0/dfp1/rt1/fpp0";
 
-inline void generated_llama_like_decode(
+inline void generated_llama_like_decode_qwen3_0_6b(
 const Qwen3Weights& w,
 const HfConfig& cfg,
 const LlamaLikeForwardCfg& fwd_cfg,
@@ -12778,7 +12779,7 @@ const LoraTable* lora)
     }
 }
 
-inline void generated_llama_like_prefill(
+inline void generated_llama_like_prefill_qwen3_0_6b(
 const Qwen3Weights& w,
 const HfConfig& cfg,
 const LlamaLikeForwardCfg& fwd_cfg,

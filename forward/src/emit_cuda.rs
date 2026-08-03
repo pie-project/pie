@@ -76,7 +76,11 @@ pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String
 /// Emit the committed `.inc`: both class functions plus the digest
 /// constant, ready for inclusion inside `declared_forward.cpp`'s
 /// anonymous namespace (it uses the helpers and includes already there).
-pub fn emit_llama_like_cuda_inc(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String {
+pub fn emit_llama_like_cuda_inc(
+    facts: &LlamaLikeFacts,
+    cuda: &LlamaLikeCudaFacts,
+    tag: &str,
+) -> String {
     let decode = llama_like_cuda(facts, cuda, FireClass::Decode);
     let prefill = llama_like_cuda(facts, cuda, FireClass::Prefill);
     let digest = facts_digest(facts, cuda);
@@ -88,14 +92,25 @@ pub fn emit_llama_like_cuda_inc(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFact
          // already made at trace time. Included by declared_forward.cpp inside\n\
          // its anonymous namespace; regenerate after any change to the\n\
          // declaration, the facts below, or the emitter, and re-run the\n\
-         // three-way parity gate.\n\
+         // three-way parity gate. One TU per deployment; the `{tag}` suffix\n\
+         // keeps the symbols apart and the digest constant names the pair.\n\
          //\n\
          // Emitted from: {digest}\n\n\
-         constexpr const char* kGeneratedForDigest =\n    \"{digest}\";\n\n"
+         constexpr const char* kGeneratedDigest_{tag} =\n    \"{digest}\";\n\n"
     ));
-    out.push_str(&emit_class_fn(&decode, facts, "generated_llama_like_decode", true));
+    out.push_str(&emit_class_fn(
+        &decode,
+        facts,
+        &format!("generated_llama_like_decode_{tag}"),
+        true,
+    ));
     out.push('\n');
-    out.push_str(&emit_class_fn(&prefill, facts, "generated_llama_like_prefill", false));
+    out.push_str(&emit_class_fn(
+        &prefill,
+        facts,
+        &format!("generated_llama_like_prefill_{tag}"),
+        false,
+    ));
     out
 }
 
@@ -137,12 +152,9 @@ fn emit_class_fn(
     fn_name: &str,
     is_decode: bool,
 ) -> String {
-    // The emitter's vocabulary is the qwen3 shape; refuse anything else
-    // rather than miscompile (see module doc).
-    assert!(
-        facts.norm_placement == NormPlacement::Pre,
-        "emitter: post-norm emission is a follow-up rung"
-    );
+    // Post-norm placement (olmo2) emits since the second-deployment
+    // rung: the buffer routing below mirrors the interpreter's
+    // `post_norm` arms line for line.
     let mut b = Body::default();
     b.line(&format!("inline void {fn_name}(\n{PARAMS})\n{{"));
     b.line("    // Locals mirror the interpreter's preamble (unpadded shape:");
@@ -399,10 +411,21 @@ fn emit_op(
             }
             let (layer, field) = split_layer_weight(weight)
                 .unwrap_or_else(|| panic!("emitter: unknown norm weight {weight}"));
-            let (input, output) = match field {
-                // Pre-norm routing, the interpreter's arm verbatim.
-                "attn_norm" => ("ws.y.data()", "ws.norm_x.data()"),
-                "mlp_norm" => ("ws.y.data()", "ws.norm_y.data()"),
+            let post = facts.norm_placement == NormPlacement::Post;
+            let (input, output, width) = match field {
+                // Pre-norm: norm the stream INTO the sub-layer's scratch.
+                // Post-norm (olmo2): the sub-layer's OUTPUT (landed in
+                // norm_x by the beta=0 projection) is normed into norm_y;
+                // the following ResidualAdd lands it on the stream — the
+                // interpreter's post-norm arms verbatim.
+                "attn_norm" if post => ("ws.norm_x.data()", "ws.norm_y.data()", "H"),
+                "attn_norm" => ("ws.y.data()", "ws.norm_x.data()", "H"),
+                "mlp_norm" if post => ("ws.norm_x.data()", "ws.norm_y.data()", "H"),
+                "mlp_norm" => ("ws.y.data()", "ws.norm_y.data()", "H"),
+                // Global qk-norm (olmo2): ONE row RMSNorm over the
+                // flattened projection, in place.
+                "q_norm" => ("ws.q.data()", "ws.q.data()", "Hq"),
+                "k_norm" => ("ws.k.data()", "ws.k.data()", "Hk"),
                 other => panic!("emitter: row-norm field {other} out of scope"),
             };
             b.stmt(&format!("kernels::launch_rmsnorm_bf16("));
@@ -410,7 +433,7 @@ fn emit_op(
                 "    {input}, {},",
                 require(layer, field, weight)
             ));
-            b.stmt(&format!("    {output}, N, H, eps, stream);"));
+            b.stmt(&format!("    {output}, N, {width}, eps, stream);"));
         }
         OpKind::Matmul {
             weight,
@@ -438,6 +461,11 @@ fn emit_op(
                     b.stmt("    ws.y.data(), N, H, Hq, 1.f);");
                 }
                 ("gate_up", false) => {
+                    let mlp_in = if facts.norm_placement == NormPlacement::Post {
+                        "ws.y.data()"
+                    } else {
+                        "ws.norm_y.data()"
+                    };
                     // The binding dispatch, transliterated: fused when the
                     // deployment materialised the packed weight AND the
                     // workspace carries the buffer (the interpreter's
@@ -451,20 +479,20 @@ fn emit_op(
                     ));
                     b.stmt(&format!("if (gate_up_fused_{layer}) {{"));
                     b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt("        ws.norm_y.data(),");
+                    b.stmt(&format!("        {mlp_in},"));
                     b.stmt(&format!(
                         "        ops::WeightView(*w.layers[{layer}].gate_up_proj_fused),"
                     ));
                     b.stmt("        ws.gate_up_fused.data(), N, 2 * I, H);");
                     b.stmt("} else {");
                     b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt("        ws.norm_y.data(),");
+                    b.stmt(&format!("        {mlp_in},"));
                     b.stmt(&format!(
                         "        make_weight_view(require(w.layers[{layer}].gate_proj, \"{weight}\"), w.layers[{layer}].gate_proj_quant),"
                     ));
                     b.stmt("        ws.gate.data(), N, I, H);");
                     b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt("        ws.norm_y.data(),");
+                    b.stmt(&format!("        {mlp_in},"));
                     b.stmt(&format!(
                         "        make_weight_view(require(w.layers[{layer}].up_proj, \"{weight}\"), w.layers[{layer}].up_proj_quant),"
                     ));
@@ -478,6 +506,44 @@ fn emit_op(
                         "    make_weight_view(require(w.layers[{layer}].down_proj, \"{weight}\"), w.layers[{layer}].down_proj_quant),"
                     ));
                     b.stmt("    ws.y.data(), N, H, I, 1.f);");
+                }
+                // Unfused projections (olmo2/phi3 bindings): the three
+                // per-projection GEMMs the interpreter's arms make. The
+                // QKV input is the post-norm stream itself or the
+                // pre-norm scratch (the interpreter's qkv_in).
+                ("q_proj", false) | ("k_proj", false) | ("v_proj", false) => {
+                    let post = facts.norm_placement == NormPlacement::Post;
+                    let input = if post { "ws.y.data()" } else { "ws.norm_x.data()" };
+                    let (out, width, member, quant) = match field {
+                        "q_proj" => ("ws.q.data()", "Hq", "q_proj", "q_proj_quant"),
+                        "k_proj" => ("ws.k.data()", "Hk", "k_proj", "k_proj_quant"),
+                        _ => ("ws.v.data()", "Hk", "v_proj", "v_proj_quant"),
+                    };
+                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt(&format!("    {input},"));
+                    b.stmt(&format!(
+                        "    make_weight_view(require(w.layers[{layer}].{member}, \"{weight}\"), w.layers[{layer}].{quant}),"
+                    ));
+                    b.stmt(&format!("    {out}, N, {width}, H);"));
+                }
+                // Post-norm landings (olmo2): the sub-layer output goes to
+                // the norm_x scratch at beta=0; Rmsnorm + ResidualAdd land
+                // it — the interpreter's post-norm arms verbatim.
+                ("o_proj", false) => {
+                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("    ws.attn_out.data(),");
+                    b.stmt(&format!(
+                        "    make_weight_view(require(w.layers[{layer}].o_proj, \"{weight}\"), w.layers[{layer}].o_proj_quant),"
+                    ));
+                    b.stmt("    ws.norm_x.data(), N, H, Hq, 0.f);");
+                }
+                ("down", false) => {
+                    b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                    b.stmt("    ws.gate.data(),");
+                    b.stmt(&format!(
+                        "    make_weight_view(require(w.layers[{layer}].down_proj, \"{weight}\"), w.layers[{layer}].down_proj_quant),"
+                    ));
+                    b.stmt("    ws.norm_x.data(), N, H, I, 0.f);");
                 }
                 (other, beta) => {
                     panic!("emitter: matmul field {other} (beta_one={beta}) out of scope")
@@ -503,6 +569,25 @@ fn emit_op(
                 b.stmt("    ws.q.data(), ws.k.data(), ws.v.data(),");
                 b.stmt("    N, Hq, Hk, stream);");
             }
+        }
+        OpKind::Rope { kind, partial } => {
+            assert!(partial.is_none(), "emitter: partial rope out of scope");
+            assert_eq!(
+                *kind,
+                crate::trace::RopeKind::Standard,
+                "emitter: only standard rope"
+            );
+            b.stmt("kernels::launch_rope_bf16(");
+            b.stmt("    ws.q.data(), ws.k.data(), positions,");
+            b.stmt("    N, num_q_heads, num_kv_heads, d,");
+            b.stmt("    cfg.rope_theta, stream);");
+        }
+        OpKind::ResidualAdd => {
+            // The post-norm landing: `y += norm_y` — the interpreter's
+            // arm verbatim.
+            b.stmt("kernels::launch_residual_add_bf16(");
+            b.stmt("    ws.y.data(), ws.norm_y.data(),");
+            b.stmt("    static_cast<std::size_t>(N) * H, stream);");
         }
         OpKind::KvAppend { layer } => {
             // Unpadded shape: no pad staging. The write mechanism is a
@@ -821,10 +906,9 @@ fn emit_launch(
         "dispatch_attention_flashinfer_decode" => {
             let layer = state.expect("attention addresses kv state").layer;
             emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
-            assert!(
-                facts.norm_placement == NormPlacement::Pre,
-                "window resolution below assumes the in-scope configs"
-            );
+            // Per-layer window resolution is RUNTIME cfg reads
+            // (per_layer_window_left / sliding_window) — placement-
+            // independent, so post-norm deployments emit it unchanged.
             b.stmt("if (!plan_state.decode_plan) {");
             b.stmt("    throw std::runtime_error(");
             b.stmt("        \"generated forward: prepare built no decode plan\");");
@@ -889,8 +973,13 @@ fn emit_launch(
             b.stmt("        \"generated forward: lora correction stated but no \"");
             b.stmt("        \"usable lora table (guard/pred drift)\");");
             b.stmt("}");
+            let qkv_in = if facts.norm_placement == NormPlacement::Post {
+                "ws.y.data()"
+            } else {
+                "ws.norm_x.data()"
+            };
             b.stmt("lora_state->apply(");
-            b.stmt(&format!("    cublas.handle(), {layer}, ws.norm_x.data(),"));
+            b.stmt(&format!("    cublas.handle(), {layer}, {qkv_in},"));
             b.stmt("    H, Hq, Hk,");
             b.stmt("    ws.q.data(), ws.v.data(), ws.gate.data());");
         }

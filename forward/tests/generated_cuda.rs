@@ -1,5 +1,5 @@
-//! The committed generated `.inc` matches what the emitter produces —
-//! the cbindgen-header rule applied to rung 3's artifact: a drift between
+//! The committed generated `.inc`s match what the emitter produces —
+//! the cbindgen-header rule applied to rung 3's artifacts: a drift between
 //! the declaration (or the emitter) and the committed static C++ cannot
 //! happen quietly. Regenerate with `cargo run -p pie-forward --bin
 //! emit-cuda` and review the diff; then re-run the three-way parity gate.
@@ -7,24 +7,54 @@
 use pie_forward::emit_cuda::emit_llama_like_cuda_inc;
 use pie_forward::{LlamaLikeCudaFacts, LlamaLikeFacts};
 
+fn check(name: &str, fresh: &str) {
+    let path = format!(
+        "{}/../driver/cuda/src/model/llama_like/generated/{name}.inc",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let committed = std::fs::read_to_string(&path).expect("committed generated .inc");
+    assert_eq!(
+        committed, fresh,
+        "generated {name}.inc drifted from the emitter; regenerate with \
+         `cargo run -p pie-forward --bin emit-cuda`, review the diff, and \
+         re-run the three-way parity gate"
+    );
+}
+
 #[test]
-fn committed_inc_is_regeneration_clean() {
-    // The LIVE deployment's facts — the same override emit-cuda applies
-    // (see its comment for the te0 provenance).
-    let facts = LlamaLikeFacts {
+fn committed_incs_are_regeneration_clean() {
+    // The LIVE deployments' facts — the same sets emit-cuda writes (see
+    // its comments for provenance).
+    let qwen_facts = LlamaLikeFacts {
         tied_embeddings: false,
         ..LlamaLikeFacts::qwen3_0_6b()
     };
-    let fresh = emit_llama_like_cuda_inc(&facts, &LlamaLikeCudaFacts::qwen3_0_6b_l40s());
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../driver/cuda/src/model/llama_like/generated/qwen3_0_6b.inc"
+    check(
+        "qwen3_0_6b",
+        &emit_llama_like_cuda_inc(
+            &qwen_facts,
+            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            "qwen3_0_6b",
+        ),
     );
-    let committed = std::fs::read_to_string(path).expect("committed generated .inc");
-    assert_eq!(
-        committed, fresh,
-        "generated .inc drifted from the emitter; regenerate with \
-         `cargo run -p pie-forward --bin emit-cuda`, review the diff, and \
-         re-run the three-way parity gate"
+    check(
+        "olmo2_1b",
+        &emit_llama_like_cuda_inc(
+            &LlamaLikeFacts::olmo2_1b(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                // TRUE as a deployment FACT (env on, native bf16,
+                // head_dim == kernel — the build's derivation; the live
+                // digest said dfp1 and corrected the dfp0 guess on first
+                // boot, the mechanism's third catch). The TEXT still
+                // never fires the fused arm here: its predicate also
+                // wants per-head qk-norm and the fused binding, both
+                // false for olmo2 — a fact can be true and unused.
+                decode_fused_post: true,
+                rope_table: true,
+                force_prefill_path: false,
+            },
+            "olmo2_1b",
+        ),
     );
 }
