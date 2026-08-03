@@ -56,7 +56,7 @@ fn decode_text(tokens: &[u32]) -> Result<String> {
     if tokens.is_empty() {
         return Ok(String::new());
     }
-    let mut dec = chat::Decoder::new();
+    let mut dec = chat::create_decoder();
     let mut text = String::new();
     match dec.feed(tokens)? {
         chat::Event::Delta(s) | chat::Event::Done(s) => text.push_str(&s),

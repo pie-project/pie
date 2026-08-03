@@ -10,12 +10,11 @@ pub type Result<T> = std::result::Result<T, String>;
 pub use wit_bindgen;
 
 // Re-export serde and serde_json so the macro-generated JSON bridge can use them
-pub use schemars;
 pub use serde;
 pub use serde_json;
 
-// Re-export the attribute macros
-pub use inferlet_macros::{main, tool};
+// Re-export the attribute macro
+pub use inferlet_macros::main;
 
 // Generate WIT bindings directly in lib.rs. With no `async:` option, the
 // WIT's own `async func` annotations drive async generation: only
@@ -42,50 +41,37 @@ mod constraint;
 pub use constraint::{AnyJson, Constrain, Ebnf, GrammarConstraint, JsonSchema, Regex, Schema};
 
 /// The runtime working-set resources (KV page-slot array + recurrent state).
-/// Most inferlets use the [`Context`] facade; reach here for direct control.
+/// The generated WIT resources, unwrapped; [`ptir::WorkingSet`] is the
+/// pass-facing handle built over them.
 pub mod working_set {
     pub use crate::pie::inferlet::working_set::*;
 }
 
 // =============================================================================
-// Sampler / Probe + Forward primitive
+// Forward primitive
 // =============================================================================
 
-pub mod audio;
-pub mod http;
 pub mod mask;
 /// The author-facing PTIR bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
 /// `WorkingSet`/`Channel` over the WIT `ptir` resources, driving the `pie-dsl`
 /// trace `Builder`. The single home of the PTIR authoring surface.
 pub mod ptir;
 
-/// Snapshot manifests (keep-core): the thin `SnapshotData` + serde +
-/// wasi:filesystem I/O (`save`/`open`/`snapshot`/`take`/`delete`). The token-log
-/// REPLAY factors out to the inferlet's carrier prefill; the `Context::save/open`
-/// facade is the sugar that gets deleted. See `ptir-snapshot-keepcore-spec`.
-pub mod snapshot;
-
 /// Device tensor + tensor-program substrate (the WIT `tensor` interface).
 ///
 /// Exposes the generated `tensor::{Tensor, Program, Op, OpKind, Value, Input,
 /// Dtype, Literal, Predicate, RngKind}` bindings — the **front door** the guest
 /// emit (`SamplingProgram` → `op-kind`) and program-authoring inferlets build
-/// against. A [`Program`](tensor::Program) is binding-free and reusable;
-/// attach it (with attach-time input bindings) via
-/// [`Forward::sampler`](crate::forward::Forward::sampler).
+/// against.
 pub mod tensor {
     pub use crate::pie::inferlet::types::*;
 }
 
 // =============================================================================
-// Generation state machine + decoders + speculation
+// Generation state machine + decoders
 // =============================================================================
 
 pub mod chat;
-pub mod reasoning;
-pub mod tools;
-
-pub use tools::Tool;
 
 // =============================================================================
 // Model
@@ -162,28 +148,3 @@ pub use crate::pie::inferlet::grammar::Matcher;
 // is needed (the old `ForwardPassExt`, `FutureStringExt`, `FutureBlobExt` and the `wstd`
 // executor have been removed); the host event loop drives all of it.
 
-// =============================================================================
-// Argument Parsing (re-exported from pico_args)
-// =============================================================================
-
-/// Re-export of `pico_args::Arguments` for ergonomic CLI argument parsing.
-pub use pico_args::Arguments;
-
-/// Parses a `Vec<String>` (as received from the WIT entry point) into
-/// a `pico_args::Arguments` for flag/option extraction.
-pub fn parse_args(args: Vec<String>) -> Arguments {
-    Arguments::from_vec(args.into_iter().map(std::ffi::OsString::from).collect())
-}
-
-/// Prelude module for convenient imports.
-///
-/// `use inferlet::prelude::*;` covers the common case so inferlets don't
-/// have to maintain a hand-rolled import grocery list.
-pub mod prelude {
-    pub use crate::model;
-    pub use crate::runtime;
-    pub use crate::tensor;
-    pub use crate::{Result, Schema, Tool};
-    pub use crate::{chat, reasoning, tools};
-    pub use crate::{main, tool};
-}
