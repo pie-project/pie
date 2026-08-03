@@ -90,13 +90,17 @@ async fn main(input: Input) -> Result<Output> {
     let mask_mode = input.mask_mode.clone();
     if !matches!(
         mask_mode.as_str(),
-        "none" | "dense" | "structured" | "dense-prefill"
+        "none" | "dense" | "structured" | "dense-prefill" | "dense-prefill-hole"
     ) {
         return Err(format!("unknown mask_mode: {mask_mode}"));
     }
     let masked = matches!(mask_mode.as_str(), "dense" | "structured");
     let structured = mask_mode == "structured";
-    let masked_prefill = mask_mode == "dense-prefill";
+    let masked_prefill = matches!(mask_mode.as_str(), "dense-prefill" | "dense-prefill-hole");
+    // The hole: knock column 1 out of the causal envelope for rows p >= 2.
+    // Non-causal by construction, so `is_pure_causal` cannot elide it — a
+    // composed batch is forced through the wire-mask ASSEMBLY branch.
+    let holed = mask_mode == "dense-prefill-hole";
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 
@@ -156,7 +160,9 @@ async fn main(input: Input) -> Result<Output> {
         // the dense-mask compose admits into shared batches.
         let mask_p = masked_prefill.then(|| {
             let rows: Vec<bool> = (base..end)
-                .flat_map(|p| (0..pool_len).map(move |j| j <= p))
+                .flat_map(|p| {
+                    (0..pool_len).map(move |j| j <= p && !(holed && j == 1 && p >= 2))
+                })
                 .collect();
             Channel::from_shaped([len, pool_len], rows).named("mask_p")
         });

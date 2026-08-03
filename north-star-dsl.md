@@ -523,3 +523,24 @@ batteries' shape): ON == GEN byte-identical. The rule, recorded for
 every future battery: **a cross-leg byte-parity claim requires equal
 census fingerprints; when a workload races a sequential lane against
 a decode stream, compare fingerprints first and texts second.**
+
+Follow-up, same day — the ASSEMBLY got its producer too.
+`mask_mode="dense-prefill-hole"` knocks column 1 out of the causal
+envelope (rows p >= 2), so `is_pure_causal` cannot elide it and a
+composed batch is FORCED through frame.cpp's wire-mask assembly
+branch. Live, both legs:
+- Interpreter: `N=52 R=3 mask=1` (holed prefill + 2 envelopes) and
+  `N=150 R=3 mask=1` (THREE wire-masked prefills co-batched with each
+  other) — the custom dispatch engaged on composed batches.
+- Generated: 2× `N=52 R=3 decode=0` through the generated custom-mask
+  arm; solo holed tokens ON == GEN byte-identical.
+- Correctness oracle, composition-invariant by construction: every
+  raced lane's max_tokens=1 output depends only on its own prefill
+  logits, so SOLO token == MIXED token is the assembly-correctness
+  signal. All 6 lanes match, on both legs.
+The dense-mask compose design (the pinned section above) is now fully
+live-proven end to end: scheduler relax → composed assembly → custom
+dispatch, interpreter and generated. What remains honest: dense DEVICE
+masks stay solo by nature, and no REAL policy inferlet ships a
+non-causal wire mask yet — naive-masked is the measurement instrument
+standing in for one.

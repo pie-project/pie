@@ -12,4 +12,4 @@ prompt = {type = "string", optional = true, description = "Prompt to send to the
 temperature = {type = "float", optional = true, description = "Temperature applied before the Gumbel-max draw (default: 1.0)"}
 max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
 seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}
-mask_mode = {type = "string", optional = true, description = "none | dense | structured | dense-prefill (default: dense)"}
+mask_mode = {type = "string", optional = true, description = "none | dense | structured | dense-prefill | dense-prefill-hole (default: dense)"}
