@@ -1106,6 +1106,45 @@ bool MetalExecutor::Impl::copy_state_slot(uint32_t src_slot, uint32_t dst_slot, 
     return true;
 }
 
+/// Why a step did not succeed, in the GPU's own words when it has any.
+///
+/// Every caller used to say "timed out before its completion fence", which is
+/// true of exactly one of the two ways a step fails. The other -- the command
+/// buffer ran and came back with an error -- was reported as a timeout, and
+/// the error itself was printed to stderr and dropped. A nineteen-gigabyte
+/// model whose every fire failed out of memory produced a clean run, token
+/// zero, and four passing checks.
+std::string step_failure_reason(const StepTiming& timing) {
+    if (timing.gpu_error) {
+        return "the GPU rejected this command buffer: " +
+               (timing.gpu_error_text.empty() ? std::string("no reason given")
+                                              : timing.gpu_error_text);
+    }
+    return "Metal command timed out before its completion fence";
+}
+
+std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g) {
+    const std::uint64_t conv = g.gdn_conv_stride_bytes();
+    const std::uint64_t recur = g.gdn_recurrent_stride_bytes();
+    std::uint64_t gdn_layers = 0;
+    for (int l = 0; l < g.n_layers; ++l) {
+        if (!g.is_full_attn(l)) ++gdn_layers;
+    }
+    return gdn_layers * (2 * conv + recur);
+}
+
+std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
+                                  std::uint32_t floor_slots) {
+    const std::uint64_t per_slot = rs_slot_bytes_for(g);
+    // A geometry with no linear-attention layers has no state to slot; the
+    // count is then whatever the caller needs, at no cost.
+    if (per_slot == 0) return std::max<std::uint32_t>(floor_slots, 1);
+    const std::uint64_t affordable = budget_bytes / per_slot;
+    std::uint64_t slots = std::min<std::uint64_t>(affordable, kPhase1bRsSlots);
+    slots = std::max<std::uint64_t>(slots, std::max<std::uint32_t>(floor_slots, 1));
+    return std::uint32_t(slots);
+}
+
 uint64_t MetalExecutor::Impl::rs_slot_bytes() const {
     if (!ready()) return 0;
     const size_t conv_stride  = g_.gdn_conv_stride_bytes();
@@ -1930,7 +1969,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
         if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
     });
     if (!timing.succeeded())
-        return fail("Metal command timed out before its completion fence");
+        return fail(step_failure_reason(timing));
     if (stage_failed) return fail(stage_err);
     // Step meter.  This machine is permanently contended (the agent process
     // alone runs at ~250% CPU), so wall-clock A/B swings 3x and cannot decide
@@ -2084,7 +2123,7 @@ bool MetalExecutor::Impl::run_prefill_step(
         if (!encode_logits_stage(se, &stage_err)) stage_failed = true;
     });
     if (!timing.succeeded())
-        return fail("Metal command timed out before its completion fence");
+        return fail(step_failure_reason(timing));
     if (stage_failed) return fail(stage_err);
     // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
     // compares across arms -- a raw total confuses "faster" with "shorter prompt".
@@ -2469,12 +2508,18 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
     // slot count, so this only grows reserved-but-idle memory; it does not
     // change the sealed M=1 decode path's behavior. `copy_state` operates
     // truthfully over these slots (real memory, not aspirational).
-    geom.max_slots = kPhase1bRsSlots;
+    // As many slots as the budget buys for THIS checkpoint's state, not a
+    // count chosen against a model whose slot was three times smaller. The
+    // floor is the concurrency the caller asked for: a driver that reserves
+    // fewer slots than it accepts requests hangs rather than queues.
+    geom.max_slots = int(rs_slots_for_budget(
+        geom, kRsSlotBudgetBytes,
+        std::min(cfg.max_forward_requests, kPagedMaxForwardRequests)));
     // Bounded, actually allocated/bound multi-batch capacity.  The paged path
     // has no hidden ring fallback: every advertised row/request has an IO,
     // scratch, logits, slot-state, and CSR binding.
-    geom.max_requests = static_cast<int>(std::min(cfg.max_forward_requests,
-                                                  kPagedMaxForwardRequests));
+    geom.max_requests = static_cast<int>(
+        std::min<std::uint32_t>(cfg.max_forward_requests, std::uint32_t(geom.max_slots)));
     geom.max_tokens = static_cast<int>(std::min(cfg.max_forward_tokens,
                                                 kPagedMaxForwardTokensCeiling));
     geom.max_slots = std::max(geom.max_slots, geom.max_requests);

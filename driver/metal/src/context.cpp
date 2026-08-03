@@ -37,6 +37,7 @@
 #include "pipeline/registry.hpp"
 #include "batch/compose.hpp"
 #include "batch/forward.hpp"
+#include "model/qwen3_5/geometry_facts.hpp"
 #include "batch/simple_family.hpp"
 #include "batch/scratch.hpp"
 #include "batch/worker.hpp"
@@ -340,29 +341,37 @@ std::string build_caps_json(const Config& cfg,
     // request synchronously; the extra slots exist purely as addressable
     // copy_state destinations/sources (e.g. warm-starting/branching a
     // resident sequence's state), not concurrent forward execution.
-    const std::uint32_t rs_cache_slots =
-        rs_cache_required ? executor::kPhase1bRsSlots : 0u;
-    // Static per-slot byte formula mirrors MetalExecutor::rs_slot_bytes()
-    // exactly (conv_state + conv_state_out + recurrent_state per GDN layer),
-    // computed here from the shipped qwen3.6 DecodeGeometry{} defaults
-    // directly since no live executor/decoder exists yet at capabilities-
-    // build time (mirrors how vocab_size is cross-checked without a live
-    // decoder).
+    // The slot count and the slot SIZE, both from this checkpoint's geometry.
+    //
+    // Both were read off a default-constructed `DecodeGeometry` -- one preview
+    // model's dimensions, compiled in as the defaults -- so every other member
+    // of the family advertised a slot size that was not its own, and reserved
+    // a count chosen for a slot three times smaller than the one it has.
+    // Qwen3.5-35B-A3B's sixty-four slots are 4.3 GiB, which is most of the
+    // reason it did not fit a machine that would otherwise have held it.
+    //
+    // `rs_slots_for_budget` is the SAME function setup calls, because a
+    // capability advertising more slots than setup allocates is a request the
+    // driver accepts and cannot hold.
+    std::uint32_t rs_cache_slots = 0u;
     std::uint32_t rs_cache_slot_bytes = 0u;
     if (rs_cache_required) {
-        const backend::DecodeGeometry g{};
-        const std::uint64_t conv_stride = g.gdn_conv_stride_bytes();
-        const std::uint64_t recur_stride = g.gdn_recurrent_stride_bytes();
-        int gdn_layers = 0;
-        for (int l = 0; l < g.n_layers; ++l) {
-            if (!g.is_full_attn(l)) ++gdn_layers;
+        backend::DecodeGeometry g{};
+        pie::metal::batch::SetupConfig probe;
+        fill_family_geometry(probe, facts);
+        std::string gerr;
+        if (!pie::metal::geometry_from_facts(probe.qwen35, g, &gerr)) {
+            g = backend::DecodeGeometry{};
         }
-        rs_cache_slot_bytes = static_cast<std::uint32_t>(
-            std::uint64_t(gdn_layers) * (2 * conv_stride + recur_stride));
+        rs_cache_slot_bytes =
+            static_cast<std::uint32_t>(executor::rs_slot_bytes_for(g));
+        rs_cache_slots = executor::rs_slots_for_budget(
+            g, executor::kRsSlotBudgetBytes,
+            std::min(cfg.batching.max_forward_requests,
+                     kMetalPagedMaxForwardRequests));
     }
     const std::uint32_t max_forward_requests =
-        rs_cache_required ? std::min(cfg.batching.max_forward_requests,
-                                     kMetalPagedMaxForwardRequests)
+        rs_cache_required ? std::min(cfg.batching.max_forward_requests, rs_cache_slots)
                           : cfg.batching.max_forward_requests;
     // The families `SimpleFamilyEngine` serves allocate their activation pool
     // for `max_forward_tokens` ROWS at setup, so echoing the config's value

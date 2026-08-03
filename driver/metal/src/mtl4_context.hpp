@@ -87,6 +87,12 @@ struct StepTiming {
     bool completed = false;    // event fence reached; command resources may be released
     bool timed_out = false;    // the initial bounded wait expired before the fence
     bool gpu_error = false;    // commit feedback reported a GPU-side error
+    // What the GPU said, when it said anything. `gpu_error` alone sent every
+    // caller to the same "timed out before its completion fence" message, so a
+    // command buffer that ran, failed, and reported
+    // `kIOGPUCommandBufferCallbackErrorOutOfMemory` was indistinguishable from
+    // one that never came back.
+    std::string gpu_error_text;
     double total_ms()  const { return encode_ms + gpu_exec_ms; }
     bool succeeded() const { return completed && !gpu_error; }
 };

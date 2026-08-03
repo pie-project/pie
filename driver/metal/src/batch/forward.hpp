@@ -185,6 +185,35 @@ bool validate_request_local_positions(
 inline constexpr std::uint32_t kPhase1bRsSlots = 64;
 inline constexpr std::uint32_t kPagedMaxForwardRequests = kPhase1bRsSlots;
 
+/// What the recurrent-state slots are allowed to cost, in bytes.
+///
+/// Sixty-four slots was a COUNT, chosen where a slot was 21 MB and sixty-four
+/// of them 1.37 GB. A slot's size is the model's, not a constant: at forty
+/// layers, thirty-two value heads and a 128-wide state, one slot is 67 MiB and
+/// sixty-four are 4.3 GiB -- which is what stood between Qwen3.5-35B-A3B and a
+/// machine that would otherwise have held it. So the BUDGET is the constant,
+/// because it is the thing that was actually being chosen, and the count is
+/// derived from what a slot costs for the checkpoint in hand.
+inline constexpr std::uint64_t kRsSlotBudgetBytes = 1536ull << 20;
+
+/// Bytes one recurrent-state slot costs for this geometry: conv in, conv out
+/// and the recurrent state, for every GDN layer.
+///
+/// The same formula as `MetalExecutor::rs_slot_bytes()`, which needs a live
+/// executor and so cannot answer before setup -- and answering before setup is
+/// the whole point. Kept beside the slot count it feeds.
+std::uint64_t rs_slot_bytes_for(const DecodeGeometry& g);
+
+/// How many slots to reserve: as many as the budget buys, never more than
+/// `kPhase1bRsSlots` and never fewer than `floor_slots`.
+///
+/// ONE function, called by the capabilities pass and by setup, because a
+/// capability advertising more slots than setup allocates is a request the
+/// driver accepts and cannot hold -- the same rule, and the same reason, as
+/// `simple_family_max_forward_tokens`.
+std::uint32_t rs_slots_for_budget(const DecodeGeometry& g, std::uint64_t budget_bytes,
+                                  std::uint32_t floor_slots);
+
 // Tokens the resident KV/GDN ring holds, across the WHOLE fleet -- it is one
 // linear ring, not a per-request allocation, so the whole fleet shares it. At
 // 4096 that ceiling was reached by sixteen requests generating ~230 tokens

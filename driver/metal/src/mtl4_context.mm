@@ -1712,10 +1712,21 @@ GpuCommitFeedback RawMetalContext::last_commit_feedback() const {
 static void apply_commit_feedback(const RawMetalContext& ctx,
                                   uint64_t event_value,
                                   StepTiming& tm) {
-    const GpuCommitFeedback fb = ctx.last_commit_feedback();
+    // The fence has already been reached, so the feedback for this event is
+    // either in or about to be: the handler is dispatched asynchronously and
+    // lands within microseconds of the signal. Giving it a bounded moment is
+    // the difference between reporting what went wrong and reporting nothing --
+    // a run whose every command buffer failed out of memory came back as a
+    // clean success, because the block had not landed when this looked.
+    GpuCommitFeedback fb = ctx.last_commit_feedback();
+    for (int spin = 0; fb.event_value != event_value && spin < 200; ++spin) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        fb = ctx.last_commit_feedback();
+    }
     if (fb.event_value != event_value) return;
     tm.gpu_ms = fb.gpu_ms;
     tm.gpu_error = fb.had_error;
+    tm.gpu_error_text = fb.error;
 }
 
 StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,
