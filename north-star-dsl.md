@@ -1235,3 +1235,46 @@ then admits wire-masked lanes. Independently valuable — the code
 comment itself prices the solo regime at 1.8-2.3x per token for the
 co-batched plain lanes — and it is the LAST precondition for the
 spatial mask fire's first live engagement.
+
+## The compose blocker, dissected — and the split dissolves it (2026-08-03)
+
+Why masked decode fires are all R=1: steady decode lanes ride the
+DEVICE-RESOLVED chained-decode envelope geometry, and worker.rs
+refuses `wire_mask_on_device_geometry` ("its BRLE indexes the
+placeholder layout composition replaces; the solo
+resolved_custom_wire path serves it"). Plain WIRE-geometry masked
+lanes already compose (the dense-mask compose relax) — but decode is
+envelope-class, so the spatial fire's subject never forms.
+
+The deeper reason the solo rule exists: a composed fire-level mask
+arm needs a mask row for EVERY lane, and an envelope lane's kv_len is
+device-only knowledge — the host cannot synthesize its causal row
+("nothing to assemble from"). The fire-level uniformity is what
+demands the impossible row.
+
+NS-2's split removes exactly that demand: the unmasked prefix takes
+the DECODE kernel and needs NO mask rows; only the masked suffix's
+rows — program-authored, host-known BRLE content — need staging, and
+the split body already reads `custom_mask_indptr_d + split`. So the
+wire-mask-on-device-geometry relax becomes possible ONLY under the
+spatial split — the north-star thesis in miniature: per-region
+members eliminate the whole-fire obligation that forced the solo
+lowering.
+
+The unblocking campaign (next, in order):
+1. Engine grouping: admit `wire_mask_on_device_geometry` lanes into
+   device-geometry groups when PIE_SPATIAL_MASK is armed engine-side
+   (std::env gate mirroring the driver's), keeping the structured-mix
+   and dense-device refusals.
+2. Frame: the device-composed fixed-decode assembly stages the masked
+   lanes' BRLE rows at their seriated suffix positions (lane order is
+   host-known even when geometry is device-resolved) — mask_indptr
+   entries for prefix lanes stay empty/zero-length, which the split
+   body never reads.
+3. The seriation must hold on the device-compose path too (the
+   envelope suffix contract composes with mask-last within the
+   envelope class — verify member_order flows into the device compose
+   lane order).
+4. Gates: masked-solo unchanged; the mixed fire engages ([spatial-
+   mask] R>1 lines); masked lane byte-equal to solo; plain lanes
+   byte-equal to solo-plain; then the wide battery and the sweep.
