@@ -1311,3 +1311,40 @@ Remaining surgery, pinned for the next stretch:
 Current state is safe to ship gated: default-off changes nothing;
 gate-on forms the group and fails LOUD at admission (no corruption
 path), which is exactly where the next stretch picks up.
+
+## THE FIRST SPATIAL FIRE ENGAGED (2026-08-03) — half the gate green
+
+With the scope admits (dispatch admission + frame backstop, both
+gated on a valid planned split) and the suffix-positioned dense pack
+(the masked program's device-carried mask staged PADDED to fire-lane
+indexing — prefix rows klen 0, the pack kernel no-ops them), the
+composed masked+plain pure-decode fire RUNS THE SPLIT:
+[spatial-mask] R=2 split=1, seventeen fires, prefix on the decode
+kernel, suffix on the custom kernel, one fire. And the first gate
+half is GREEN: the plain lane's mixed output is BYTE-EQUAL to its
+solo self — the unmasked prefix truly runs the decode kernel inside
+a fire that also serves a masked lane. This is the north-star merge,
+alive.
+
+The masked suffix's numerics are wrong (garbage tokens), and the
+cause is identified: the suffix plan and the rebased suffix CSRs
+were built from the HOST wire views (h_qo/h_kvpp), which for a
+composed-envelope lane are placeholders — the truth lives in the
+RESOLVER's per-program host geometry (fg.kv_page_indptr/
+kv_last_page_lens, exactly what the dense pack block already
+consumes) and in the composed DEVICE CSRs. The fix, pinned:
+1. The suffix dispatch needs NO uploaded rebased CSRs at all — pass
+   DEVICE pointer offsets with ABSOLUTE values: q/out at BASE (not
+   bf16_row offsets), qo_indptr_d + split, kv_page_indices_d BASE,
+   kv_page_indptr_d + split, kvlpl_d + split, mask_indptr_d + split.
+   The kernel indexes rows through the (absolute) indptr values, so
+   no rebasing is needed device-side. pi.mask_suffix_* buffers and
+   the forward.cpp upload block then retire.
+2. The suffix PLAN still needs host counts: thread the masked
+   program's RESOLVED host geometry (np/lpl per suffix lane, from
+   fg) from the frame into PrepareInputs (new pointer fields staged
+   on the wave state), replacing the h_kvpp slices.
+3. Wire flavors (prefill-phase masks) keep the fire-level arm; the
+   frame's resolved_custom_wire stays single-program (the reverted
+   extension's lesson: a composed spatial step's wire rows are the
+   WIRE lanes' synthesized causal masks, pure-causal by the walk).

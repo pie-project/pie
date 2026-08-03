@@ -940,7 +940,15 @@ void prepare_step(
             // This resolve-time throw is the unreachable backstop: by now
             // `begin_host` has mutated wave state, so failing here poisons
             // the whole frame.
-            if (s.rpg.per_program.size() > 1) {
+            static const bool spatial_mask_on = [] {
+                const char* v = std::getenv("PIE_SPATIAL_MASK");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            const bool spatial_planned = spatial_mask_on &&
+                view.planned_unmasked_prefix_rows !=
+                    PIE_UNMASKED_PREFIX_UNPLANNED &&
+                view.planned_unmasked_prefix_rows > 0;
+            if (s.rpg.per_program.size() > 1 && !spatial_planned) {
                 for (std::size_t p = 0; p < s.rpg.per_program.size(); ++p) {
                     if (s.rpg.is_device_geometry[p] &&
                         s.rpg.per_program[p].has_mask) {
@@ -1341,25 +1349,13 @@ void prepare_step(
         // layout: pure causal decodes to nothing and the structured pack
         // covers the batch. Anything non-causal here is a scheduler breach
         // — fail loud below rather than silently dropping a mask.
-        // NS-2 (the spatial mask fire): a COMPOSED all-envelope decode
-        // batch whose masked lanes were admitted under the spatial-mask
-        // relax. The wire placeholder rows map 1:1 onto the resolved rows
-        // (the same alignment the solo path below relies on), so the BRLE
-        // rows decode against the RESOLVED spans directly: plain lanes'
-        // elided rows decode empty — which is correct, because the split
-        // body serves them with the DECODE kernel and never reads their
-        // indptr entries. An unplanned masked compose is a scheduler
-        // breach (the relax admits only plannable groups) — fail loud.
-        const bool spatial_masked_compose =
-            s.dg_resolved && view.has_user_mask &&
-            view.ptir_program_hashes.size() > 1 &&
-            view.planned_unmasked_prefix_rows !=
-                PIE_UNMASKED_PREFIX_UNPLANNED &&
-            view.planned_unmasked_prefix_rows > 0;
+        // (NS-2 note: a composed spatial-mask step's wire rows are the
+        // WIRE lanes' synthesized causal masks — pure causal, handled by
+        // the walk below; the masked lane's DEVICE-carried mask packs in
+        // the spatial dense-pack block after this one.)
         const bool resolved_custom_wire =
-            (s.dg_resolved && view.has_user_mask &&
-             view.ptir_program_hashes.size() == 1) ||
-            spatial_masked_compose;
+            s.dg_resolved && view.has_user_mask &&
+            view.ptir_program_hashes.size() == 1;
         const auto qo_span = std::span<const std::uint32_t>(
             resolved_custom_wire ? qo_view.data() : qo_view_orig.data(),
             resolved_custom_wire ? qo_view.size() : qo_view_orig.size());
@@ -1674,6 +1670,136 @@ void prepare_step(
                 throw std::runtime_error(
                     "dense attention mask exceeds persistent capacity");
             }
+        }
+    }
+
+    // NS-2 (the spatial mask fire): a COMPOSED multi-program step whose
+    // scheduler planned an unmasked prefix packs the dense-masked
+    // program's mask at its composed SUFFIX positions — prefix rows get
+    // zero-length indptr entries (klen 0, the pack kernel no-ops them and
+    // the split body never reads them). The dense source is staged PADDED
+    // to fire-lane indexing so `launch_pack_dense_mask` needs no offset
+    // parameter. Shape contract, enforced loudly: exactly ONE masked
+    // device-geometry program, its rows exactly the planned suffix.
+    if (s.dg_resolved && s.rpg.per_program.size() > 1 &&
+        !use_structured_mask && !s.have_custom_mask) {
+        static const bool spatial_mask_on2 = [] {
+            const char* v = std::getenv("PIE_SPATIAL_MASK");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        int masked_program = -1;
+        int masked_count = 0;
+        for (std::size_t p = 0; p < s.rpg.per_program.size(); ++p) {
+            if (s.rpg.is_device_geometry[p] &&
+                s.rpg.per_program[p].has_mask &&
+                !s.rpg.per_program[p].mask.empty()) {
+                masked_program = static_cast<int>(p);
+                ++masked_count;
+            }
+        }
+        if (masked_count > 0) {
+            const bool spatial_planned = spatial_mask_on2 &&
+                view.planned_unmasked_prefix_rows !=
+                    PIE_UNMASKED_PREFIX_UNPLANNED &&
+                view.planned_unmasked_prefix_rows > 0;
+            if (!spatial_planned || masked_count != 1) {
+                throw std::runtime_error(
+                    "ptir: dense-masked program in a composed step outside "
+                    "the planned spatial-mask shape (" +
+                    std::to_string(masked_count) + " masked programs, " +
+                    (spatial_planned ? "planned" : "UNPLANNED") + ")");
+            }
+            const pipeline::FireGeometry& fg =
+                s.rpg.per_program[static_cast<std::size_t>(masked_program)];
+            const int lanes = static_cast<int>(qo_view.size()) - 1;
+            const int split =
+                static_cast<int>(view.planned_unmasked_prefix_rows);
+            const int suffix = lanes - split;
+            // The masked program's composed row base must BE the split
+            // (the seriation puts masked members last).
+            const auto& rip = view.ptir_program_row_indptr;
+            if (rip.size() ==
+                    s.rpg.per_program.size() + 1 &&
+                (static_cast<int>(
+                     rip.data()[masked_program]) != split ||
+                 static_cast<int>(
+                     rip.data()[masked_program + 1]) != lanes)) {
+                throw std::runtime_error(
+                    "ptir: the masked program's composed rows are not the "
+                    "planned suffix (seriation drift)");
+            }
+            const int fg_rows = suffix;
+            if (fg_rows <= 0 ||
+                fg.mask.size() % static_cast<std::size_t>(fg_rows) != 0) {
+                throw std::runtime_error(
+                    "ptir: spatial dense mask size does not divide the "
+                    "suffix row count");
+            }
+            const int stride = static_cast<int>(
+                fg.mask.size() / static_cast<std::size_t>(fg_rows));
+            const std::uint32_t page =
+                static_cast<std::uint32_t>(kv_cache.page_size());
+            std::vector<std::uint8_t> padded(
+                static_cast<std::size_t>(lanes) * stride, 0);
+            std::memcpy(
+                padded.data() + static_cast<std::size_t>(split) * stride,
+                fg.mask.data(), fg.mask.size());
+            std::vector<std::uint32_t> klen(
+                static_cast<std::size_t>(lanes), 0);
+            std::vector<std::int32_t> mindptr(
+                static_cast<std::size_t>(lanes) + 1, 0);
+            for (int l = 0; l < lanes; ++l) {
+                std::uint32_t k = 0;
+                if (l >= split) {
+                    const int fl = l - split;
+                    const bool resolved_geometry =
+                        !fg.kv_page_indptr.empty();
+                    const std::uint32_t np = resolved_geometry
+                        ? ((fl + 1 <
+                            static_cast<int>(fg.kv_page_indptr.size()))
+                               ? fg.kv_page_indptr[fl + 1] -
+                                     fg.kv_page_indptr[fl]
+                               : 0u)
+                        : kvpp_view[l + 1] - kvpp_view[l];
+                    const std::uint32_t lpl = resolved_geometry
+                        ? ((fl < static_cast<int>(
+                                     fg.kv_last_page_lens.size()))
+                               ? fg.kv_last_page_lens[fl]
+                               : 0u)
+                        : kvlpl_view[l];
+                    k = np == 0 ? 0u : (np - 1) * page + lpl;
+                }
+                klen[l] = k;
+                const std::uint32_t qo_len = qo_view[l + 1] - qo_view[l];
+                const std::uint64_t bits =
+                    static_cast<std::uint64_t>(qo_len) * k;
+                mindptr[l + 1] = mindptr[l] +
+                    static_cast<std::int32_t>((bits + 7u) / 8u);
+            }
+            const std::size_t packed_bytes =
+                static_cast<std::size_t>(mindptr[lanes]);
+            if (packed_bytes == 0 ||
+                packed_bytes > pi.custom_mask.size() ||
+                padded.size() > pi.dense_mask.size() ||
+                static_cast<std::size_t>(lanes) + 1 >
+                    pi.custom_mask_indptr.size() ||
+                klen.size() > pi.structured_mask_klen.size()) {
+                throw std::runtime_error(
+                    "ptir: spatial dense mask exceeds persistent capacity");
+            }
+            s.up_dense_mask = pi.dense_mask.stage_from_host(
+                std::span<const std::uint8_t>(padded));
+            s.up_dense_klen = pi.structured_mask_klen.stage_from_host(
+                std::span<const std::uint32_t>(klen));
+            s.up_dense_indptr = pi.custom_mask_indptr.stage_from_host(
+                std::span<const std::int32_t>(mindptr));
+            s.pack_dense = true;
+            s.pack_dense_lanes = lanes;
+            s.pack_dense_stride = stride;
+            s.pack_dense_bytes = packed_bytes;
+            s.have_custom_mask = true;
+            s.mask_bytes = static_cast<int>(packed_bytes);
+            s.mask_indptr_count = lanes + 1;
         }
     }
 
