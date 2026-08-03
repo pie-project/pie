@@ -82,10 +82,6 @@ pub use pie::inferlet::types;
 // Context
 // =============================================================================
 
-mod constraint;
-
-pub use constraint::{AnyJson, Constrain, Ebnf, GrammarConstraint, JsonSchema, Regex, Schema};
-
 /// The runtime working-set resources (KV page-slot array + recurrent state).
 /// The generated WIT resources, unwrapped; [`ptir::WorkingSet`] is the
 /// pass-facing handle built over them.
@@ -102,16 +98,6 @@ pub mod mask;
 /// `WorkingSet`/`Channel` over the WIT `ptir` resources, driving the `pie-dsl`
 /// trace `Builder`. The single home of the PTIR authoring surface.
 pub mod ptir;
-
-/// Device tensor + tensor-program substrate (the WIT `tensor` interface).
-///
-/// Exposes the generated `tensor::{Tensor, Program, Op, OpKind, Value, Input,
-/// Dtype, Literal, Predicate, RngKind}` bindings — the **front door** the guest
-/// emit (`SamplingProgram` → `op-kind`) and program-authoring inferlets build
-/// against.
-pub mod tensor {
-    pub use crate::pie::inferlet::types::*;
-}
 
 // =============================================================================
 // Generation state machine + decoders
@@ -169,7 +155,12 @@ pub mod session {
     pub use crate::pie::inferlet::session::*;
 }
 
-pub mod inference {
+/// Grammar compilation + incremental matching (the WIT `grammar` interface).
+/// [`Grammar`](grammar::Grammar) compiles a JSON Schema / regex / EBNF source
+/// once for the bound model's vocabulary; [`Matcher`](grammar::Matcher) walks
+/// one generation against it, exposing the packed allowed-token bitmask that
+/// [`mask`] interprets.
+pub mod grammar {
     pub use crate::pie::inferlet::grammar::*;
 }
 
@@ -182,11 +173,6 @@ pub mod inference {
 pub mod media {
     pub use crate::pie::inferlet::media::{Audio, Image, Video};
 }
-
-/// Grammar matcher — re-export for callers that build their own
-/// constraints around it. Most users should reach for [`Schema`] or
-/// [`GrammarConstraint`] instead.
-pub use crate::pie::inferlet::grammar::Matcher;
 
 // Under component-model-async, the WIT `async func`s are generated as native
 // `async fn`s directly on the bindings — `forward-pass.execute().await`,

@@ -3,9 +3,10 @@
 //! The host grammar matcher advances after every accepted token and supplies
 //! the next allowed-token mask to a PTIR `mask_apply` + argmax epilogue.
 
-use inferlet::mask::bit_allowed;
+use inferlet::chat;
+use inferlet::grammar::{Grammar, Matcher};
+use inferlet::mask::unpack_mask;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Constrain, JsonSchema, Schema, chat};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -45,15 +46,6 @@ fn default_max_tokens() -> usize {
     512
 }
 
-fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
-    if packed.is_empty() {
-        return vec![true; vocab as usize];
-    }
-    (0..vocab as usize)
-        .map(|token| bit_allowed(packed, token))
-        .collect()
-}
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<String> {
     if input.max_tokens == 0 {
@@ -63,7 +55,7 @@ async fn main(input: Input) -> Result<String> {
     let vocab = model::output_vocab_size();
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
-    let mut constraint = JsonSchema(&input.schema).build_constraint()?;
+    let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
     let mut prompt = chat::system_user(
         "Generate only the requested JSON value, with no markdown or explanation.",
@@ -128,7 +120,9 @@ async fn main(input: Input) -> Result<String> {
         .context("read first constrained token")?[0] as u32;
 
     let mut generated = vec![first];
-    constraint.advance(&[first]).context("advance grammar")?;
+    constraint
+        .accept_tokens(&[first])
+        .context("advance grammar")?;
 
     if !constraint.is_terminated() && generated.len() < input.max_tokens {
         let token_in = Channel::from(vec![first as i32]).named("token_in");
@@ -194,7 +188,9 @@ async fn main(input: Input) -> Result<String> {
                 .await
                 .context("read constrained token")?[0] as u32;
             generated.push(token);
-            constraint.advance(&[token]).context("advance grammar")?;
+            constraint
+                .accept_tokens(&[token])
+                .context("advance grammar")?;
             if constraint.is_terminated() || generated.len() == input.max_tokens {
                 break;
             }

@@ -60,9 +60,10 @@
 //! different storage. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::mask::bit_allowed;
+use inferlet::chat;
+use inferlet::grammar::{Grammar, Matcher};
+use inferlet::mask::unpack_mask;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Constrain, JsonSchema, Schema, chat};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -141,15 +142,6 @@ fn default_max_tokens() -> usize {
 
 fn default_seed() -> u32 {
     0x51D0
-}
-
-fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
-    if packed.is_empty() {
-        return vec![true; vocab as usize];
-    }
-    (0..vocab as usize)
-        .map(|t| bit_allowed(packed, t))
-        .collect()
 }
 
 /// The explored prefix trie. `alpha[node]` is the current over-approximation of
@@ -242,7 +234,7 @@ async fn main(input: Input) -> Result<Output> {
 
     for round in 0..input.rounds {
         let root_alpha_before = trie.alpha[0];
-        let mut constraint = JsonSchema(&input.schema).build_constraint()?;
+        let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
         // A fresh KV state per round: ASAp resamples the whole string, and a
         // WorkingSet permanently claims the first pipeline it fires on, so all
@@ -317,7 +309,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let mut generated = vec![first as u32];
         constraint
-            .advance(&[first as u32])
+            .accept_tokens(&[first as u32])
             .context("grammar rejected the prefill token")?;
         let mut node = trie.child(0, first as u32);
         path_nodes.push(node);
@@ -398,7 +390,7 @@ async fn main(input: Input) -> Result<Output> {
                 weighted_masses.push(read_f32(&wmass_out).await?);
                 used_alpha.push(alpha_of(&trie, node, token));
                 generated.push(token);
-                constraint.advance(&[token]).map_err(|e| {
+                constraint.accept_tokens(&[token]).map_err(|e| {
                     format!(
                         "round {round} step {}: grammar rejected token {token}: {e}",
                         generated.len() - 1

@@ -51,9 +51,10 @@
 //! silently corrupt the constraint instead of failing, so it is checked here
 //! rather than assumed.
 
-use inferlet::mask::bit_allowed;
+use inferlet::chat;
+use inferlet::grammar::{Grammar, Matcher};
+use inferlet::mask::unpack_mask;
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Constrain, JsonSchema, Schema, chat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -129,15 +130,6 @@ struct Output {
     acceptance_rate: f64,
     /// How many times the fork/rollback invariant was checked and held.
     rollback_checks: usize,
-}
-
-fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
-    if packed.is_empty() {
-        return vec![true; vocab as usize];
-    }
-    (0..vocab as usize)
-        .map(|token| bit_allowed(packed, token))
-        .collect()
 }
 
 /// Longest-suffix prompt lookup over the committed history (CacheBack-style).
@@ -260,7 +252,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let vocab = model::output_vocab_size();
     let page_size = WorkingSet::new().page_size();
-    let mut constraint = JsonSchema(&input.schema).build_constraint()?;
+    let constraint = Matcher::new(&Grammar::from_json_schema(&input.schema)?);
 
     let mut committed = chat::system_user(
         "Generate only the requested JSON value, with no markdown or explanation.",
@@ -296,7 +288,7 @@ async fn main(input: Input) -> Result<Output> {
                 break;
             }
             constraint
-                .advance(&[token])
+                .accept_tokens(&[token])
                 .context("grammar rejected a drafted token")?;
             draft.push(token);
             if constraint.is_terminated() {
@@ -359,7 +351,7 @@ async fn main(input: Input) -> Result<Output> {
 
         for token in accepted {
             constraint
-                .advance(&[token])
+                .accept_tokens(&[token])
                 .context("accepted token violates the grammar")?;
             committed.push(token);
             generated.push(token);
