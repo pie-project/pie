@@ -727,3 +727,29 @@ pins green; live GEN byte-stable. NEXT — S3, driver integration:
    fires eager as today);
 4. cache-key collapse: the mask variant bit leaves the key for
    supergraph-eligible fires (one exec serves masked and unmasked).
+
+S3 landed (`cb9ad3c58`) — the union is LIVE behind PIE_SUPERGRAPH=1:
+one exec per (R, N) serves masked and unmasked decode fires (77
+shared-key replays in the first flight, byte-identical to the
+supergraph-off leg). The integration: the 9-slot device predicate
+word on persistent inputs; IModel::supergraph_body dispatched by
+digest; the capture's dual prepare materializing both arms' plans;
+the union key (kGvSupergraph bit, mask bit folded, layout = a mix
+spanning BOTH plans, post-capture re-key for the first-fire null-plan
+case).
+
+And the first flight earned its keep: the union key EXPOSED a real
+pre-existing defect — masked pure-decode fires shared the custom
+prefill plan slot with genuine prefill fires, whose per-request
+re-planning oscillated the layout (one orphan capture per request;
+today's masked-variant graphs quietly churned the same way). The
+repair is now an axiom in code: **an arm may not share a mutable plan
+slot with a foreign fire class** (`mask_decode_plan`, routed through
+prepare, the hand-written body, the interpreter case and the
+emitter's custom arm alike).
+
+S4 board (fallout repair, ordered): hook fires into the union
+(capture-safe score/page-mask machinery), lora staging capture
+safety, Peel mixed fires (device-read row windows), multi-R sweep +
+batteries at width (all deployments × attachment combos ×
+buckets), then default-on.
