@@ -151,6 +151,30 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name,
         return "layers." + std::string(layer) + ".mlp.experts." +
                std::string(member.substr(kSwitch.size()));
     }
+    // A SHARED expert is a dense SwiGLU every token runs beside the routed
+    // ones, scaled by its own sigmoid gate. `qwen2_moe` ships one and this
+    // driver computes no such thing.
+    //
+    // Left to the pass-through below, its weights were declared under their
+    // own names, loaded into the heap, and then read by no dispatch -- the
+    // model ran the routed mixture alone and produced fluent text that was not
+    // the checkpoint's. Nothing caught it: `llama_bind_test` asks whether every
+    // slot a dispatch NEEDS was filled, which is the opposite direction, and a
+    // tensor nobody asks for is invisible to it.
+    //
+    // Refused rather than skipped, for the same reason the unstacked bank
+    // below is refused: skipping is what silently produced the wrong model.
+    // The refusal comes out at load with the tensor's name on it, and it goes
+    // away when the block exists.
+    for (std::string_view shared : {"mlp.shared_expert.", "mlp.shared_expert_gate.",
+                                    "mlp.shared_experts."}) {
+        if (member.rfind(shared, 0) == 0) {
+            fail("Metal llama schema has no shared expert, but '" + std::string(raw_name) +
+                 "' is one: this driver would load it and never read it, running the "
+                 "routed mixture alone");
+        }
+    }
+
     constexpr std::string_view kExperts = "mlp.experts.";
     if (member.rfind(kExperts, 0) == 0) {
         const std::string_view rest_of = member.substr(kExperts.size());
