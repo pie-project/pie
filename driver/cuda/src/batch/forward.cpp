@@ -293,7 +293,8 @@ cudaGraphExec_t capture_forward_graph_exec(
     bool has_write_desc,
     int runtime_window_left,
     const model::StageHooks* stage_hooks,
-    bool use_supergraph)
+    bool use_supergraph,
+    const model::LoraTable* lora)
 {
     auto& pi = engine.inputs;
 
@@ -373,6 +374,7 @@ cudaGraphExec_t capture_forward_graph_exec(
         // KV CSRs) are replay-stable per key by the same argument the plain
         // captured body makes for every other `pi.*` buffer.
         fwd_in.stage_hooks = stage_hooks;
+        fwd_in.lora = lora;
         if (use_supergraph) {
             // The union body: the mask/write-desc data pointers must be
             // the persistent buffers UNCONDITIONALLY — a masked replay
@@ -697,6 +699,7 @@ bool forward_graph_replay_eligible(
     int num_clips,
     bool has_stage_hooks,
     bool has_lora) {
+    (void)has_lora;
     const bool mask_pointers_stable =
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
@@ -717,8 +720,11 @@ bool forward_graph_replay_eligible(
             static_cast<std::size_t>(std::max(forward_R, 0))) &&
         num_images == 0 &&
         num_clips == 0 &&
-        !has_stage_hooks &&
-        !has_lora;
+        !has_stage_hooks;
+    // (campaign step 3b: lora fires are graph-eligible now — their execs
+    // live in the fingerprint-partitioned lora store; `has_lora` remains
+    // a parameter so TP callers can keep refusing, where lora cannot
+    // occur anyway.)
 }
 
 // The unionized supergraph gate: DEFAULT ON since the width batteries
@@ -748,8 +754,9 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     // body and (step 3b) a captured one consume the same pre-staged
     // state. A null table clears; a lora fire re-stages fresh, so the
     // body's identity check always sees THIS fire's staging.
-    engine.forward_fn.invoke_lora_stage(
-        engine.ws, in.lora, in.forward_N, cublas.stream());
+    const std::uint64_t lora_fingerprint =
+        engine.forward_fn.invoke_lora_stage(
+            engine.ws, in.lora, in.forward_N, cublas.stream());
     const bool hook_blocks = hook_fire_blocks_graph(engine, has_hooks);
     const bool graph_eligible = forward_graph_replay_eligible(
         engine,
@@ -793,7 +800,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     // the device predicate word's job.
     const bool use_supergraph = supergraph_enabled() &&
         engine.forward_fn.supports_supergraph && graph_eligible &&
-        in.is_pure_decode && !has_hooks;
+        in.is_pure_decode && !has_hooks && in.lora == nullptr;
     ForwardGraphKey key{};
     if (graph_eligible) {
         const std::uint32_t graph_layout = use_supergraph
@@ -806,7 +813,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 use_supergraph ? false : in.have_custom_mask,
                 graph_layout,
                 /*has_hooks=*/has_hooks) |
-            (use_supergraph ? kGvSupergraph : 0u);
+            (use_supergraph ? kGvSupergraph : 0u) |
+            (in.lora != nullptr ? kGvLora : 0u);
         key = ForwardGraphKey{
             in.forward_R,
             in.forward_N,
@@ -866,13 +874,36 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.lora != nullptr ? 1 : 0);
         }
     }
+    // Lora campaign step 3b: lora execs live in per-fingerprint entries
+    // (the hook store's discipline; the fingerprint IS the entry hash, so
+    // a changed lane structure selects a different entry rather than a
+    // stale one). Ban semantics carry over unchanged.
+    const bool has_lora_fire = in.lora != nullptr;
+    HookGraphKeyState* lora_store = nullptr;
+    HookGraphKeyState::Entry* lora_entry = nullptr;
+    if (run_graph && has_lora_fire) {
+        if (lora_fingerprint == 0) {
+            // The model has no stage support (or nothing usable) — a
+            // lora fire without staged state must not capture.
+            run_graph = false;
+        } else {
+            lora_store = &engine.lora_graph_states[key];
+            lora_entry = lora_store->find(lora_fingerprint);
+            if (lora_store->banned ||
+                (lora_entry != nullptr && lora_entry->banned)) {
+                run_graph = false;
+            }
+        }
+    }
     if (run_graph) {
         // Hook execs live in the per-program-set entries of
         // `hook_graph_states`, NOT in the shared shape-keyed cache — two hook
         // programs at one (R, N, variant) capture different graphs.
         cudaGraphExec_t exec = has_hooks
             ? (hook_entry != nullptr ? hook_entry->exec : nullptr)
-            : engine.graph_cache->get(key);
+            : has_lora_fire
+                ? (lora_entry != nullptr ? lora_entry->exec : nullptr)
+                : engine.graph_cache->get(key);
         const bool stale =
             has_hooks && exec != nullptr &&
             hook_entry->fingerprint != hook_fingerprint;
@@ -929,7 +960,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.has_write_desc,
                 in.structured_window_left,
                 has_hooks ? in.stage_hooks : nullptr,
-                use_supergraph);
+                use_supergraph,
+                in.lora);
             if (has_hooks) {
                 // The capture is the one moment the model's per-layer hook
                 // coverage is observable; a body that skipped hooks would
@@ -975,6 +1007,25 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                         stale ? " (fingerprint recapture)" : "",
                         static_cast<unsigned long long>(
                             g_hook_graph_counters.captures));
+                }
+            } else if (has_lora_fire) {
+                if (lora_entry == nullptr) {
+                    lora_entry = lora_store->insert(lora_fingerprint);
+                    if (lora_store->banned) {
+                        ++g_hook_graph_counters.bans;
+                    }
+                } else if (lora_entry->exec != nullptr) {
+                    cudaGraphExecDestroy(lora_entry->exec);
+                }
+                lora_entry->exec = exec;
+                lora_entry->fingerprint = lora_fingerprint;
+                if (hook_graph_trace_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[lora-graph] capture R=%d N=%d variant=%u "
+                        "fp=%016llx\n",
+                        key.num_requests, key.num_tokens, key.variant,
+                        static_cast<unsigned long long>(lora_fingerprint));
                 }
             } else {
                 if (use_supergraph) {

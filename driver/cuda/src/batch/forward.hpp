@@ -455,6 +455,12 @@ struct BatchEngine {
     // bounded under adversarial program churn.
     std::unordered_map<ForwardGraphKey, HookGraphKeyState,
                        ForwardGraphKeyHash> hook_graph_states;
+    // Lora campaign step 3b: lora-carrying captures, partitioned by the
+    // stage pass's fingerprint exactly as hook execs are partitioned by
+    // program-set hash (same struct, same churn discipline: a stale
+    // fingerprint recaptures, consecutive churn bans the entry).
+    std::unordered_map<ForwardGraphKey, HookGraphKeyState,
+                       ForwardGraphKeyHash> lora_graph_states;
 };
 
 // Whether a fire that carries stage hooks must stay OFF the graph path.
@@ -512,7 +518,11 @@ cudaGraphExec_t capture_forward_graph_exec(
     // SupergraphBuilder body instead of the plain body — guards become
     // conditional nodes over `pi.supergraph_preds`, so ONE exec serves
     // every eligible attachment combination at this (R, N).
-    bool use_supergraph = false);
+    bool use_supergraph = false,
+    // Lora campaign step 3b: non-null captures a LORA-carrying body —
+    // the launches read the ENGINE-staged state (the caller must have
+    // staged this fire), and the exec lives in the fingerprint store.
+    const model::LoraTable* lora = nullptr);
 
 // Env-gated (`PIE_STEP_PROFILE`) forward-body wall-clock timer. Declared here
 // (not private to batch/forward.cpp) because `enqueue_step` in

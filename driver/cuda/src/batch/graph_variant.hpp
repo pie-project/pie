@@ -34,6 +34,10 @@ inline constexpr std::uint32_t kGvHasHooks    = 1u << 3;
 // the union's whole point — so the bit keeps supergraph and plain
 // captures from aliasing at the same (R, N, layout).
 inline constexpr std::uint32_t kGvSupergraph  = 1u << 31;
+// Lora-carrying captures (campaign step 3b): their execs live in the
+// fingerprint-partitioned lora store, and the bit keeps their shape keys
+// from aliasing plain or supergraph captures at the same (R, N, layout).
+inline constexpr std::uint32_t kGvLora        = 1u << 30;
 inline constexpr int           kGvLayoutShift = 4;
 
 inline constexpr std::uint32_t kGvFlagMask =
