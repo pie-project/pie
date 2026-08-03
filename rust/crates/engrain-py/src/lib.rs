@@ -26,7 +26,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
 use pyo3::create_exception;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyByteArray, PyBytes, PyDict};
 
 create_exception!(
     _engrain,
@@ -618,24 +618,21 @@ fn pack_configurations<'py>(
     matchers: Vec<PyRef<'py, Matcher>>,
     limit: usize,
 ) -> PyResult<(
-    Bound<'py, PyBytes>,
-    Bound<'py, PyBytes>,
-    Bound<'py, PyBytes>,
-    Bound<'py, PyBytes>,
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
+    Bound<'py, PyByteArray>,
     usize,
     usize,
 )> {
-    let states: Vec<Vec<(u32, Vec<u32>)>> = matchers
-        .iter()
-        .map(|matcher| matcher.inner.configurations())
-        .collect();
+    // Two passes over borrowed state rather than one over a cloned copy. The
+    // clone was the cost: at batch 512 with a 520-deep stack it is a megabyte
+    // of `Vec<u32>` built and dropped every step, to be read once.
     let mut width = 1usize;
     let mut deep = 1usize;
-    for set in &states {
-        width = width.max(set.len());
-        for (_, stack) in set {
-            deep = deep.max(stack.len());
-        }
+    for matcher in matchers.iter() {
+        width = width.max(matcher.inner.configuration_count());
+        deep = deep.max(matcher.inner.max_stack_depth());
     }
     if width > limit {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -643,35 +640,52 @@ fn pack_configurations<'py>(
         )));
     }
 
-    let rows = states.len();
+    let rows = matchers.len();
     let mut lexer = vec![0i32; rows * width];
     let mut depths = vec![1i32; rows * width];
     let mut stacks = vec![0i32; rows * width * deep];
     let mut counts = vec![1i32; rows];
-    for (row, set) in states.iter().enumerate() {
-        counts[row] = set.len().max(1) as i32;
-        for (index, (state, stack)) in set.iter().enumerate() {
-            lexer[row * width + index] = *state as i32;
+    for (row, matcher) in matchers.iter().enumerate() {
+        counts[row] = matcher.inner.configuration_count().max(1) as i32;
+        let mut index = 0usize;
+        matcher.inner.each_configuration(|state, stack| {
+            lexer[row * width + index] = state as i32;
             depths[row * width + index] = stack.len() as i32;
             let at = (row * width + index) * deep;
             for (offset, entry) in stack.iter().enumerate() {
                 stacks[at + offset] = *entry as i32;
             }
-        }
+            index += 1;
+        });
     }
 
-    fn bytes<'py>(python: Python<'py>, values: &[i32]) -> Bound<'py, PyBytes> {
-        let mut out = Vec::with_capacity(values.len() * 4);
-        for value in values {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-        PyBytes::new(python, &out)
+    /// The words as bytes, in one copy rather than four per word.
+    ///
+    /// A `bytearray` rather than `bytes` because the caller hands it to
+    /// `torch.frombuffer`, which insists on a writable buffer and made a whole
+    /// second copy of every array to get one.
+    fn bytes<'py>(python: Python<'py>, values: &[i32]) -> PyResult<Bound<'py, PyByteArray>> {
+        #[cfg(target_endian = "little")]
+        // Sound: `i32` has no padding and no invalid bit patterns, the slice
+        // outlives the call, and `PyByteArray::new` copies before returning.
+        let raw = unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4)
+        };
+        #[cfg(not(target_endian = "little"))]
+        let raw = &{
+            let mut out = Vec::with_capacity(values.len() * 4);
+            for value in values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            out
+        }[..];
+        Ok(PyByteArray::new(python, raw))
     }
     Ok((
-        bytes(python, &lexer),
-        bytes(python, &depths),
-        bytes(python, &stacks),
-        bytes(python, &counts),
+        bytes(python, &lexer)?,
+        bytes(python, &depths)?,
+        bytes(python, &stacks)?,
+        bytes(python, &counts)?,
         width,
         deep,
     ))

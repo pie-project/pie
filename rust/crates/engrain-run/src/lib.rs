@@ -150,6 +150,23 @@ impl Matcher {
             .collect()
     }
 
+    /// Every live configuration, lent rather than cloned.
+    ///
+    /// `configurations` copies each stack into a fresh `Vec` so that it can
+    /// cross into Python. The packer does not need that: it reads each stack
+    /// once and writes it straight into the buffer the device takes, and at a
+    /// serving batch the copies were most of what packing cost.
+    pub fn each_configuration(&self, mut visit: impl FnMut(u32, &[u32])) {
+        for config in &self.configs {
+            visit(config.lexer_state, &config.stack);
+        }
+    }
+
+    /// How many configurations are live.
+    pub fn configuration_count(&self) -> usize {
+        self.configs.len()
+    }
+
     /// How deep the deepest live configuration's stack is.
     ///
     /// Separate from `configurations` because the caller that wants this wants
