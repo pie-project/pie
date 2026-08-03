@@ -379,9 +379,7 @@ std::vector<std::size_t> llama_pool_elems(const std::vector<Dispatch>& dag,
         if (c < 0 || c >= col.colors_used) continue;
         // The tail's tensors have one row per SAMPLED row; the body's one per
         // token; the expert stack k per token.
-        using K = Kind;
-        const K kind = dag[std::size_t(u.index)].kind;
-        const bool tail = kind == K::RowGather || kind == K::FinalRms || kind == K::LmHead;
+        const bool tail = is_tail(dag[std::size_t(u.index)].kind);
         const ValueExtent& e = ext[std::size_t(u.value)];
         const int n = e.rows_are_slots != 0 ? rows * k : (tail ? head_rows : rows);
         const std::size_t need = std::size_t(n) * std::size_t(e.elems);

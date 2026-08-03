@@ -7,29 +7,19 @@ coherent text on these checkpoints. driver/metal/tests/mlx is a second reference
 but it has drifted from the family it models, so parity should be judged against
 mlx-lm.
 
-Usage: mlx_lm_taps.py <model_path> <comma_token_ids> <out_dir>
+Usage: qwen3_5_mlx_taps.py <model_path> <comma_token_ids> <out_dir>
 """
-import os
 import sys
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
-from mlx_lm import load
+from taps_common import open_taps
 
 
 def main():
-    model_path, ids_csv, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-    ids = [int(x) for x in ids_csv.strip().split(",") if x]
-    os.makedirs(out_dir, exist_ok=True)
-
-    model, _ = load(model_path)
+    model, ids, dump, out_dir = open_taps(sys.argv)
     lm = model.language_model.model
     head = getattr(model.language_model, "lm_head", None)
-
-    def dump(name, t):
-        a = np.array(mx.astype(t, mx.float32)).reshape(len(ids), -1)
-        np.save(os.path.join(out_dir, name + ".npy"), a)
 
     x = mx.array([ids])
     h = lm.embed_tokens(x)

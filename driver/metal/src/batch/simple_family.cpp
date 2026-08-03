@@ -83,10 +83,10 @@ bool llama_geometry(const SetupConfig& cfg, llama::LlamaGeometry& g, int max_ctx
     return true;
 }
 
-/// Which bind index carries each gemma4 kind's OUTPUT, and how wide it is.
-/// The names are `tests/parity/gemma4_mlx_taps.py`'s, so the engine's dump and
-/// the raw path's diff against the same reference.
 /// Which bind index carries a dispatch's OUTPUT, under what name, how wide.
+///
+/// The names are the `tests/parity/*_mlx_taps.py` names, so that the engine's
+/// dump and the raw path's diff against the same reference.
 ///
 /// One struct for every family, because the dump is a property of the SCRATCH
 /// COLOURING and not of the model: the colouring, the pool and the redirected
@@ -161,10 +161,7 @@ std::vector<std::size_t> g4_pool_elems(const std::vector<gemma4::Dispatch>& dag,
         if (!g4_tap_for(dag[di], g, t)) continue;
         // The tail's tensors have one row per SAMPLED row; the body's have one
         // per token.
-        const bool tail = dag[di].kind == gemma4::Kind::LmHead ||
-                          dag[di].kind == gemma4::Kind::FinalSoftcap ||
-                          dag[di].kind == gemma4::Kind::FinalRms ||
-                          dag[di].kind == gemma4::Kind::RowGather;
+        const bool tail = gemma4::is_tail(dag[di].kind);
         const std::size_t need =
             std::size_t(tail ? head_rows : rows) * std::size_t(t.width);
         for (const auto& sb : col.per_dispatch[di]) {
@@ -237,11 +234,7 @@ void dump_g4_taps(const std::vector<gemma4::Dispatch>& dag, const Gemma4Geometry
     dump_taps_from(
         dag, col, pool, logits, rows, head_rows,
         [&](const gemma4::Dispatch& d, Tap& t) { return g4_tap_for(d, g, t); },
-        [](const gemma4::Dispatch& d) {
-            using K = gemma4::Kind;
-            return d.kind == K::RowGather || d.kind == K::FinalRms || d.kind == K::LmHead ||
-                   d.kind == K::FinalSoftcap;
-        });
+        [](const gemma4::Dispatch& d) { return gemma4::is_tail(d.kind); });
 }
 
 // ── gemma4 ──────────────────────────────────────────────────────────────────
@@ -531,10 +524,7 @@ void dump_go_taps(const std::vector<gptoss::Dispatch>& dag, const GptOssGeometry
     dump_taps_from(
         dag, col, pool, logits, rows, head_rows,
         [&](const gptoss::Dispatch& d, Tap& t) { return go_tap_for(d, g, t); },
-        [](const gptoss::Dispatch& d) {
-            using K = gptoss::Kind;
-            return d.kind == K::FinalRms || d.kind == K::LmHead;
-        });
+        [](const gptoss::Dispatch& d) { return gptoss::is_tail(d.kind); });
 }
 
 /// The widest buffer a gpt-oss dispatch touches, in bf16 elements.
@@ -586,7 +576,7 @@ std::vector<std::size_t> go_pool_elems(const std::vector<gptoss::Dispatch>& dag,
         const K kind = dag[di].kind;
         // The tail's tensors have one row per SAMPLED row; the body's have one
         // per token.
-        const bool tail = kind == K::RowGather || kind == K::FinalRms || kind == K::LmHead;
+        const bool tail = gptoss::is_tail(kind);
         const std::size_t need = std::size_t(tail ? head_rows : rows) *
                                  std::size_t(go_kind_width(kind, g));
         for (const auto& sb : col.per_dispatch[di]) {
@@ -897,7 +887,6 @@ void dump_ll_taps(const std::vector<llama::Dispatch>& dag, const llama::LlamaGeo
             writes[std::size_t(u.index)] = int(u.bind_index);
         }
     }
-    std::size_t di_of = 0;
     dump_taps_from(
         dag, col, pool, logits, rows, head_rows,
         [&](const llama::Dispatch& d, Tap& t) {
@@ -905,16 +894,12 @@ void dump_ll_taps(const std::vector<llama::Dispatch>& dag, const llama::LlamaGeo
             // position from the address is exact and avoids widening its
             // signature for one family.
             const std::size_t di = std::size_t(&d - dag.data());
-            (void)di_of;
             if (!ll_tap_for(d, g, t)) return false;
             if (writes[di] < 0) return false;
             t.out_bind = std::uint8_t(writes[di]);
             return true;
         },
-        [](const llama::Dispatch& d) {
-            using K = llama::Kind;
-            return d.kind == K::RowGather || d.kind == K::FinalRms || d.kind == K::LmHead;
-        });
+        [](const llama::Dispatch& d) { return llama::is_tail(d.kind); });
 }
 
 // ── the llama-shaped families ───────────────────────────────────────────────

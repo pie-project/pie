@@ -81,6 +81,20 @@ void the_geometry_is_the_checkpoints() {
     ragged_gqa.n_kv_heads = 7;
     expect(!geometry_from_facts(ragged_gqa, bad, &err),
            "so is a head count grouped attention cannot divide: " + err);
+    // `router_topk` clamps both of these instead of failing, and gpt-oss shares
+    // that kernel with llama. A clamped k routes to fewer experts than the
+    // config asks for while `go_kind_width` keeps sizing the expert stacks by
+    // the configured k, so the slots past the clamp are never written and the
+    // model still produces text.
+    Facts wide_k;
+    wide_k.n_experts = 128;
+    wide_k.experts_per_token = 20;
+    expect(!geometry_from_facts(wide_k, bad, &err),
+           "so is a top-k wider than the router can hold: " + err);
+    Facts many_experts;
+    many_experts.n_experts = 2048;
+    expect(!geometry_from_facts(many_experts, bad, &err),
+           "so is an expert count past one threadgroup of lanes: " + err);
 }
 
 void the_step_is_this_many_dispatches() {

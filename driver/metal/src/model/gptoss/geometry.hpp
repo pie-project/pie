@@ -27,6 +27,8 @@
 #include <cstddef>
 #include <string>
 
+#include "../shared_kernels.hpp"
+
 namespace pie::metal::gptoss {
 
 struct GptOssGeometry {
@@ -113,6 +115,26 @@ inline bool geometry_from_facts(const Facts& f, GptOssGeometry& out, std::string
     }
     if (f.experts_per_token > f.n_experts) {
         if (err) *err = "gpt-oss geometry: `num_experts_per_tok` exceeds `num_local_experts`";
+        return false;
+    }
+    // The same two bounds llama's routed branch refuses, because it is the same
+    // `router_topk`: it holds the chosen logits in a fixed threadgroup array and
+    // ranks one expert per lane, and it CLAMPS to both. Clamping silently would
+    // route with fewer experts than the config asks for, or among the first
+    // 1024, while every consumer keeps striding by the configured k --
+    // `go_kind_width` sizes the expert stacks at `experts_per_token *
+    // intermediate` whatever the kernel actually filled.
+    if (f.experts_per_token > shared_kernels::kRouterMaxTopK) {
+        if (err) *err = "gpt-oss geometry: `num_experts_per_tok` " +
+                        std::to_string(f.experts_per_token) +
+                        " exceeds the router's top-k limit of " +
+                        std::to_string(shared_kernels::kRouterMaxTopK);
+        return false;
+    }
+    if (f.n_experts > shared_kernels::kRouterMaxExperts) {
+        if (err) *err = "gpt-oss geometry: `num_local_experts` " + std::to_string(f.n_experts) +
+                        " exceeds the " + std::to_string(shared_kernels::kRouterMaxExperts) +
+                        " a single threadgroup can rank";
         return false;
     }
     if (f.n_kv_heads <= 0 || f.n_q_heads % f.n_kv_heads != 0) {

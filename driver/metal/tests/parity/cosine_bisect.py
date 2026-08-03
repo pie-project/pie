@@ -55,33 +55,30 @@ LL_LAYER = ["attn_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm",
             "moe", "layer_out"]
 
 
-def taps_llama(n_layers=48):
-    taps = [(-1, "embed")]
+def build(n_layers, layer_kinds, pre=("embed",), tail=("final_norm", "logits")):
+    """The tap list for a family, in DAG order.
+
+    The order is the whole point of the bisection: it reports the FIRST name
+    that diverges, so a list that ran ahead of the dependencies would name a
+    consequence and send the reader to the wrong kernel. `layer_kinds` may be a
+    callable when a family's blocks alternate.
+    """
+    taps = [(-1, k) for k in pre]
     for L in range(n_layers):
-        taps += [(L, k) for k in LL_LAYER]
-    return taps + [(-1, "final_norm"), (-1, "logits")]
+        ks = layer_kinds(L) if callable(layer_kinds) else layer_kinds
+        taps += [(L, k) for k in ks]
+    return taps + [(-1, k) for k in tail]
 
 
-def taps_qwen3_5(n_layers=24):
-    taps = [(-1, "embed")]
-    for L in range(n_layers):
-        block = ATTN_ORDER if (L % 4) == 3 else GDN_ORDER
-        taps += [(L, k) for k in block] + [(L, k) for k in MLP_ORDER]
-    return taps + [(-1, "final_norm"), (-1, "logits")]
-
-
-def taps_gptoss(n_layers=24):
-    taps = [(-1, "embed")]
-    for L in range(n_layers):
-        taps += [(L, k) for k in GO_LAYER]
-    return taps + [(-1, "final_norm"), (-1, "logits")]
-
-
-def taps_gemma4(n_layers=35):
-    taps = [(-1, k) for k in G4_PRE]
-    for L in range(n_layers):
-        taps += [(L, k) for k in G4_LAYER]
-    return taps + [(-1, k) for k in G4_TAIL]
+# Each family is its per-layer order and its layer count -- everything else
+# about the comparison is shared, so adding one is adding a row here.
+FAMILIES = {
+    "llama": lambda: build(48, LL_LAYER),
+    "gptoss": lambda: build(24, GO_LAYER),
+    "gemma4": lambda: build(35, G4_LAYER, pre=G4_PRE, tail=G4_TAIL),
+    "qwen3_5": lambda: build(
+        24, lambda L: (ATTN_ORDER if (L % 4) == 3 else GDN_ORDER) + MLP_ORDER),
+}
 
 
 # The four values a routed layer keeps ONE PER SLOT. Their slot order is the
@@ -97,44 +94,45 @@ SLOT_TAPS = ("expert_gate", "expert_up", "expert_act", "expert_out")
 
 
 def align_slots(r, m, k):
-    """Match `m`'s k slots per row onto `r`'s and drop any that have no
-    counterpart, returning how many were dropped.
+    """Permute `m`'s k slots per row onto `r`'s, and say how many found no
+    counterpart.
 
-    A slot either matches its counterpart at ~0.999 or scores ~0.3 against
-    everything -- two orders of magnitude apart -- so 0.9 separates them with
-    nothing near the line. An unmatched slot means the two routers chose a
-    DIFFERENT expert for it, which at the top-k boundary is a near-tie on the
-    smallest of the k weights; the caller reports the count rather than hiding
-    it, and `moe` is still compared in full.
+    The permutation is greedy on cosine, and it is a PERMUTATION: every slot is
+    paired and every slot stays in the comparison. An earlier version dropped
+    the pairs that scored badly, which is exactly backwards -- a slot whose
+    expert output is genuinely WRONG scores badly for that reason, and dropping
+    it hid the one thing worth finding. It also truncated every row to the
+    shortest surviving one, so a single bad row silently removed the
+    least-agreeing slot from rows that were fine.
+
+    A pair either matches at ~0.999 or scores ~0.3 against everything, two
+    orders of magnitude apart, so 0.9 separates them with nothing near the line.
+    A low-scoring pair means the two routers took a different expert for that
+    slot -- at the top-k boundary, the smallest of the k weights -- and the
+    caller reports the count. It cannot tell that apart from the same expert
+    computed wrongly; `moe`, the weighted sum, is what settles which, and it is
+    compared in full a few taps later.
     """
     rows = min(r.shape[0], m.shape[0])
     rr = r[:rows].reshape(rows, k, -1)
     mm = m[:rows].reshape(rows, k, -1)
-    keep_r, keep_m, dropped = [], [], 0
+    out = np.empty_like(mm)
+    low = 0
     for i in range(rows):
         a = rr[i] / (np.linalg.norm(rr[i], axis=1, keepdims=True) + 1e-30)
         b = mm[i] / (np.linalg.norm(mm[i], axis=1, keepdims=True) + 1e-30)
         c = a @ b.T
         used_r, used_m = set(), set()
-        pairs = sorted(((c[x, y], x, y) for x in range(k) for y in range(k)),
-                       key=lambda t: -t[0])
-        row_r, row_m = [], []
-        for score, x, y in pairs:
+        for score, x, y in sorted(((c[x, y], x, y) for x in range(k) for y in range(k)),
+                                  key=lambda t: -t[0]):
             if x in used_r or y in used_m:
                 continue
             used_r.add(x)
             used_m.add(y)
-            if score > 0.9:
-                row_r.append(rr[i][x])
-                row_m.append(mm[i][y])
-            else:
-                dropped += 1
-        keep_r.append(np.concatenate(row_r) if row_r else np.zeros(0, dtype=rr.dtype))
-        keep_m.append(np.concatenate(row_m) if row_m else np.zeros(0, dtype=mm.dtype))
-    width = min(min(len(x) for x in keep_r), min(len(x) for x in keep_m))
-    r2 = np.stack([x[:width] for x in keep_r])
-    m2 = np.stack([x[:width] for x in keep_m])
-    return r2, m2, dropped
+            out[i, x] = mm[i, y]
+            if score <= 0.9:
+                low += 1
+    return rr.reshape(rows, -1), out.reshape(rows, -1), low
 
 
 def cosine(a, b):
@@ -157,14 +155,7 @@ def main():
     if "--family" in sys.argv:
         family = sys.argv[sys.argv.index("--family") + 1]
 
-    if family == "gemma4":
-        taps = taps_gemma4()
-    elif family == "gptoss":
-        taps = taps_gptoss()
-    elif family == "llama":
-        taps = taps_llama()
-    else:
-        taps = taps_qwen3_5()
+    taps = FAMILIES.get(family, FAMILIES["qwen3_5"])()
 
     # How many experts a token routes to, read off the tensors rather than
     # configured: `expert_out` is k stacked hidden-wide rows and `moe` is their
@@ -184,6 +175,11 @@ def main():
     print(f"{'tap':<22} {'cos':>10} {'rel_l2':>10} {'ref_rms':>10} {'mtl_rms':>10}")
     print("-" * 66)
     first_bad = None
+    # Layers where a slot found no counterpart. Their `moe` is the weighted sum
+    # that INCLUDES the differing expert, so it dips for the same reason and is
+    # marked with it -- otherwise the tap that answers the question looks like
+    # the tap that raises it.
+    routed_apart = set()
     for layer, name in taps:
         stem = name if layer < 0 else f"{layer}.{name}"
         rp = os.path.join(ref_dir, stem + ".npy")
@@ -196,9 +192,12 @@ def main():
         note = ""
         if name in SLOT_TAPS and slots > 1 and r.shape[1] % slots == 0 and \
                 m.shape[1] % slots == 0:
-            r, m, dropped = align_slots(r, m, slots)
-            if dropped:
-                note = f"  [{dropped} slot(s) routed differently]"
+            r, m, unmatched = align_slots(r, m, slots)
+            if unmatched:
+                routed_apart.add(layer)
+                note = f"  [{unmatched} slot(s) routed differently; see .moe]"
+        elif name == "moe" and layer in routed_apart:
+            note = "  [includes the differently-routed expert; see .layer_out]"
         n = min(r.shape[0], m.shape[0])
         if row is not None:
             r, m = r[row:row + 1], m[row:row + 1]
@@ -220,8 +219,13 @@ def main():
                     max(np.linalg.norm(r.astype(np.float64)), 1e-30))
         rr = float(np.sqrt(np.mean(r.astype(np.float64) ** 2)))
         mr = float(np.sqrt(np.mean(m.astype(np.float64) ** 2)))
+        # A slot tap whose slots did not all pair up is not a bisection result:
+        # it cannot tell a different expert SELECTED from the right expert
+        # computed WRONG. `moe` can, it is compared in full, and it is two taps
+        # later -- so the number and the note are printed and the search for the
+        # first diverging tap walks on.
         flag = "" if c > 0.99 else "   <-- DIVERGES"
-        if c <= 0.99 and first_bad is None:
+        if c <= 0.99 and first_bad is None and not note:
             first_bad = stem
         print(f"{stem:<22} {c:>10.6f} {rel:>10.4f} {rr:>10.4f} {mr:>10.4f}{flag}{note}")
     print("-" * 66)

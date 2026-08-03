@@ -71,6 +71,18 @@ enum class Kind : std::uint8_t {
     Argmax,
 };
 
+/// Which kinds run on the rows the sampler will READ rather than on every token.
+///
+/// `RowGather` compacts the sampled positions to a dense prefix, and everything
+/// after it works on that prefix. Two places ask this -- the scratch sizer, so
+/// a colour holding one of these is allocated for the shorter count, and the
+/// golden-tap dumper, so a published tensor has the rows it really has -- and
+/// they have to give the same answer. When they disagree the sizer wins and the
+/// dumper reads past the value into whatever the pool put after it.
+constexpr bool is_tail(Kind k) {
+    return k == Kind::RowGather || k == Kind::FinalRms || k == Kind::LmHead;
+}
+
 struct Dispatch {
     Kind kind;
     int layer;    // -1 for the layer-less embedding and the tail

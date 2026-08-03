@@ -82,42 +82,48 @@ MemberForwardDesc desc_for(Seq& s, std::uint32_t n, std::uint32_t page_size,
     return d;
 }
 
+/// Where a staged row's bf16 logits start, at the offset the sampler reads.
+const std::uint16_t* bf16_row(const LogitsOut& out, std::uint32_t row) {
+    return static_cast<const std::uint16_t*>(out.device_contents) +
+           std::size_t(out.device_row_offset + row) * std::size_t(out.vocab);
+}
+
+float widen(std::uint16_t h) {
+    const std::uint32_t bits = std::uint32_t(h) << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
 /// The argmax of a staged logits row, read the way the sampler reads it.
+///
+/// Deliberately allocation-free: this runs inside the timed decode loop, where
+/// the host-side argmax over the vocabulary is already part of what is being
+/// measured and a 150k-element copy per step would not be.
 int argmax_of(const LogitsOut& out, std::uint32_t row) {
-    const auto* bf = static_cast<const std::uint16_t*>(out.device_contents) +
-                     std::size_t(out.device_row_offset + row) * std::size_t(out.vocab);
-    const auto f32 = [&](std::uint32_t i) {
-        const std::uint32_t bits = std::uint32_t(bf[i]) << 16;
-        float f;
-        std::memcpy(&f, &bits, 4);
-        return f;
-    };
+    const std::uint16_t* bf = bf16_row(out, row);
     int best = 0;
-    float bv = f32(0);
+    float bv = widen(bf[0]);
     for (std::uint32_t i = 1; i < out.vocab; ++i) {
-        if (const float v = f32(i); v > bv) { bv = v; best = int(i); }
+        if (const float v = widen(bf[i]); v > bv) { bv = v; best = int(i); }
     }
     return best;
 }
 
-/// A staged logits row, widened to f32 -- the whole row, because comparing two
-/// fires by their argmax alone cannot tell "a different answer" from "the same
-/// answer, one ulp apart".
+/// The whole row, widened -- because comparing two fires by their argmax alone
+/// cannot tell "a different answer" from "the same answer, one ulp apart".
 std::vector<float> row_of(const LogitsOut& out, std::uint32_t row) {
-    const auto* bf = static_cast<const std::uint16_t*>(out.device_contents) +
-                     std::size_t(out.device_row_offset + row) * std::size_t(out.vocab);
+    const std::uint16_t* bf = bf16_row(out, row);
     std::vector<float> v(out.vocab);
-    for (std::uint32_t i = 0; i < out.vocab; ++i) {
-        const std::uint32_t bits = std::uint32_t(bf[i]) << 16;
-        std::memcpy(&v[i], &bits, 4);
-    }
+    for (std::uint32_t i = 0; i < out.vocab; ++i) v[i] = widen(bf[i]);
     return v;
 }
 
 /// Fire `n` tokens and block until the GPU is done, so the time measured is the
 /// work and not the enqueue. Returns the greedy token, or -1 on failure.
 int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
-         std::uint32_t& next_free_page, bool want_token = false) {
+         std::uint32_t& next_free_page, bool want_token = false,
+         LogitsOut* staged = nullptr) {
     MemberForwardDesc d = desc_for(s, n, page_size, next_free_page);
     LogitsOut out;
     std::string err;
@@ -126,8 +132,18 @@ int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
         return -1;
     }
     s.next_position += n;
+    if (staged != nullptr) *staged = out;
     return want_token ? argmax_of(out, 0) : 0;
 }
+
+/// "The capital of France is Paris. The capital of Italy is".
+///
+/// One prompt, used three ways: the greedy gate continues it, the golden-tap
+/// dump publishes its fire, and the batched check pairs it with its own
+/// eight-token prefix. Writing it out per check invites the day the tap dump
+/// and the gate disagree about which fire the taps belong to.
+const std::vector<std::uint32_t> kGatePrompt{785, 6722, 315,  9625, 374,  12095,
+                                             13,  576,  6722, 315,  6323, 374};
 
 }  // namespace
 
@@ -156,6 +172,8 @@ int main(int argc, char** argv) {
     cfg.kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
     cfg.snapshot_dir = ckpt;
     cfg.vocab_size = facts.vocab_size;
+    // The prompt, or the batched check's two members together (12 + 8), which
+    // is the widest fire this binary makes when the prompt is short.
     cfg.max_forward_tokens = std::uint32_t(std::max(n_prompt, 32));
     // Two: the batch check below fires a pair in ONE pass, and a driver set up
     // for one request would refuse it rather than answer it wrongly.
@@ -202,8 +220,7 @@ int main(int argc, char** argv) {
     // checkpoint is the reference; the tokens are hard-coded because the point
     // is to detect a change here, not to re-derive the answer each run.
     {
-        const std::vector<std::uint32_t> p{785,  6722, 315,  9625, 374, 12095,
-                                           13,   576,  6722, 315,  6323, 374};
+        const std::vector<std::uint32_t>& p = kGatePrompt;
         // Keyed by shape rather than by directory name, because the same
         // checkpoint lives under a different path on every machine. A model
         // this table does not know is BENCHED BUT NOT GATED, and says so --
@@ -303,10 +320,9 @@ int main(int argc, char** argv) {
     // margin is measured against the two fires' observed disagreement, and the
     // token is only gated on when the margin is the larger of the two.
     {
-        // "The capital of France is Paris. The capital of Italy is" and its
-        // eight-token prefix "The capital of France is Paris. The".
-        const std::vector<std::uint32_t> long_p{785, 6722, 315, 9625,  374, 12095,
-                                                13,  576,  6722, 315, 6323, 374};
+        // The gate's prompt, and its eight-token prefix "The capital of
+        // France is Paris. The".
+        const std::vector<std::uint32_t>& long_p = kGatePrompt;
         const std::vector<std::uint32_t> short_p(long_p.begin(), long_p.begin() + 8);
         // The KV pool here is sized for one sequence, and nothing in this file
         // frees a page, so each independent check starts the allocator over.
@@ -318,11 +334,8 @@ int main(int argc, char** argv) {
             Seq c;
             c.id = next_id++;
             c.tokens = p;
-            MemberForwardDesc d = desc_for(c, std::uint32_t(p.size()), page_size, page);
             LogitsOut out;
-            std::string err;
-            if (!exec.forward(d, out, &err)) {
-                std::printf("  FAIL  forward: %s\n", err.c_str());
+            if (fire(exec, c, std::uint32_t(p.size()), page_size, page, false, &out) < 0) {
                 return std::vector<float>();
             }
             return row_of(out, 0);
@@ -452,11 +465,21 @@ int main(int argc, char** argv) {
     }
     const double decode_s = now_s() - t1;
 
+    // The ceiling has to be measured at the SAME context length as the figure
+    // it is the ceiling OF, or the two numbers differ by their attention length
+    // as much as by their scheduling. So the second sequence prefills the same
+    // prompt -- untimed -- and decodes from the same position.
+    //
+    // Its pages restart at 0, the way every other independent sequence in this
+    // file starts its allocator: nothing here frees a page, `max_ctx_tokens`
+    // declares ONE sequence's worth of ring, and a fire writes the pages it
+    // names before reading them. Continuing the first sequence's counter ran
+    // off the end of the pool at the default argument sizes.
     Seq s2;
     s2.id = 5;
     s2.tokens = s.tokens;
-    std::uint32_t next_page2 = next_page;
-    if (fire(exec, s2, 1, page_size, next_page2) < 0) return 1;
+    std::uint32_t next_page2 = 0;
+    if (fire(exec, s2, std::uint32_t(n_prompt), page_size, next_page2) < 0) return 1;
     const double t2 = now_s();
     for (int i = 0; i < n_decode; ++i) {
         if (fire(exec, s2, 1, page_size, next_page2) < 0) return 1;
