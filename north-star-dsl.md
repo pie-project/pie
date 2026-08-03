@@ -632,3 +632,27 @@ composed and three-prefill masked fires); qwen3 GEN sanity unchanged;
 existing incs regenerate byte-identical. THREE llama deployments now
 run generated at full width (qwen3_0_6b, olmo2_1b, qwen2_5_1_5b) plus
 the qwen3_5 hybrid — four static forms, one digest mechanism.
+
+## Mistral + Phi-3 generated legs — the matrix closes (2026-08-03, `6a1822a6f`)
+
+Mistral-7B-v0.3: zero emitter work (fused/no-qk-norm arms existed);
+digest matched first boot; OFF == GEN byte-identical at 7B.
+
+Phi-3-mini: the last emission axis — the PADDED head dim.
+`LlamaLikeCudaFacts.head_dim_padded` (appended, digest `pad` term,
+driver derivation `cfg.head_dim != cfg.head_dim_kernel`); the emitter
+resolves at emission what the interpreter resolves per fire: dk
+staging aliases, the `1/sqrt(d)` softmax override, pad staging around
+both KV-write forms, the post-attention strip after every attention
+arm. XQA×padding and fused-post×padding are emission REFUSALS (no
+deployment, no reference — refuse rather than guess). Live: OFF == GEN
+byte-identical; the holed battery passes the generated PADDED
+custom-mask arm 6/6.
+
+**Every checkpoint in the cache now runs a digest-gated static form**
+(qwen3_0_6b, olmo2_1b, qwen2_5_1_5b, mistral_7b_v03, phi3_mini +
+qwen3_5_0_8b hybrid). Six emitted texts, one digest mechanism, five
+axes it verified live this arc (xqa, dfp, wt/cm, te, and today's
+first-boot matches for qb/fpp/pad). Rung 3's claim — "the declared
+form is statically convertible to C++ at full width" — now has no
+untested deployment in this environment left to test it on.
