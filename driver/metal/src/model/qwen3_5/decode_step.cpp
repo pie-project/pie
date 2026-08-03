@@ -63,7 +63,13 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
     auto resid = [&]() { LD l; residual_dispatch(g.hidden, l.grid, l.tg); return l; };
 
     // EMBED ×1 (4-bit dequant gather of the shared lm_head bundle).
-    { LD l; embed_dispatch(g.hidden, l.grid, l.tg); emit(Kernel::EmbedGather, -1, l); }
+    // Tied, one table serves both ends of the model and both kinds bind
+    // `shared_embedding`. Untied -- which is every routed member of this
+    // family -- they are two tensors, and a kind is a weight name, so they
+    // are two kinds. Same kernels, same launch shapes, same constants: what
+    // differs is only which tensor is asked for.
+    { LD l; embed_dispatch(g.hidden, l.grid, l.tg);
+      emit(g.tied_embeddings ? Kernel::EmbedGather : Kernel::EmbedUntied, -1, l); }
 
     for (int L = 0; L < g.n_layers; ++L) {
         if (g.is_full_attn(L)) {
@@ -185,7 +191,7 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
 
     // TAIL: final_norm, lm_head (logits ALWAYS produced, I3), [optional] device argmax.
     emit(Kernel::FinalRms,  -1, rms(g.hidden, 1));
-    emit(Kernel::QmvLmHead, -1, qmv(g.vocab));
+    emit(g.tied_embeddings ? Kernel::QmvLmHead : Kernel::LmHeadUntied, -1, qmv(g.vocab));
     if (with_argmax) {
         emit(Kernel::Argmax, -1, LD{ Grid{1024, 1, 1}, Threadgroup{1024, 1, 1} });
     }

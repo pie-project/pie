@@ -29,7 +29,16 @@ bool load_decode_psos(RawMetalContext& ctx,
                       bool gdn_prep = false,
                       /// Compile the routed mixture's kernels. Only a
                       /// checkpoint whose geometry has experts dispatches them.
-                      bool routed = false);
+                      bool routed = false,
+                      /// Claim `EmbedUntied`/`LmHeadUntied` for the shared
+                      /// embed/matvec entrypoints. Off by default, and the
+                      /// default is load-bearing: the llama family compiles
+                      /// its OWN kernels for these kinds at its own group size
+                      /// and bit width, and looks here only as a fallback. A
+                      /// table that claimed them unconditionally would hand it
+                      /// a valid gs_64/b_4 PSO for a checkpoint that is
+                      /// neither, and a wrong-but-valid PSO is silent.
+                      bool untied = false);
 
 // ── M>1 multi-batch PSOs (beta, multi-batch lane) ─────────────────────────────
 // The 4 kernel kinds whose M>1 form differs from the M=1 PSO (the rest just grid-widen

@@ -28,8 +28,8 @@ struct ContractFacts {
     int first_kv_shared_layer = -1;
 
     /// Whether `lm_head` IS `embed_tokens` (`tie_word_embeddings`, defaulting
-    /// to true when the config omits it). Only the llama schema reads it, and
-    /// only as a hint: a checkpoint that actually ships an `lm_head` overrides
+    /// to true when the config omits it). The llama and Qwen3.5 schemas read
+    /// it, and only as a hint: a checkpoint that actually ships an `lm_head` overrides
     /// it, because mapping a real tensor onto `shared_embedding` declares that
     /// name twice and fails the load.
     bool tied_embeddings = true;
@@ -76,7 +76,8 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
     }
     // Refusal for an unknown family belongs to the schema that would have
     // handled it, so the message names the schema that was actually consulted.
-    qwen3_5::author_model_contract(checkpoint, model_type, target, out);
+    qwen3_5::author_model_contract(checkpoint, model_type, target, out,
+                                   facts.tied_embeddings);
 }
 
 }  // namespace pie::metal::model

@@ -233,6 +233,26 @@ void test_every_name_is_mapped_or_refused() {
     // wrapper. Authoring stopped on this name.
     mapped("language_model.lm_head.weight", "shared_embedding.weight");
     mapped("language_model.lm_head.biases", "shared_embedding.biases");
+    // ── and the same two names when the head is NOT the table ──
+    // A tied checkpoint has one tensor and one slot, so both ends land on
+    // `shared_embedding`. An untied one has two, and mapping them both onto
+    // that slot declares it twice -- which is how this was found: every routed
+    // member of the family is untied, and the load stopped with a duplicate.
+    // `LmHeadUntied` and `EmbedUntied` bind these names.
+    {
+        const detail::HeadTying untied{false};
+        const auto mapped_untied = [&untied](std::string_view from, std::string_view to) {
+            const auto got = detail::runtime_name(from, untied);
+            check(got.has_value() && *got == to,
+                  std::string("untied: ") + std::string(from) + " -> " + std::string(to));
+        };
+        mapped_untied("lm_head.weight", "lm_head.weight");
+        mapped_untied("language_model.lm_head.scales", "lm_head.scales");
+        mapped_untied("model.language_model.embed_tokens.weight", "embed_tokens.weight");
+        mapped_untied("language_model.model.embed_tokens.biases", "embed_tokens.biases");
+        // Everything else is indifferent to tying, and must stay so.
+        mapped_untied("model.language_model.norm.weight", "final_norm.weight");
+    }
     // The tied half: this family ships tied, so its checkpoint has an
     // `embed_tokens` and no `lm_head`, and both land in the one shared slot
     // `EmbedGather` and `QmvLmHead` bind.

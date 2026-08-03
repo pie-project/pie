@@ -75,7 +75,16 @@ inline std::optional<std::string_view> decoder_member(std::string_view raw_name)
     return std::nullopt;
 }
 
-inline std::optional<std::string> runtime_name(std::string_view raw_name) {
+/// Whether this checkpoint's `lm_head` IS its embedding table.
+///
+/// A struct rather than a bare bool so a call site cannot pass it positionally
+/// to the wrong parameter -- the same reason the llama schema has one.
+struct HeadTying {
+    bool tied = true;
+};
+
+inline std::optional<std::string> runtime_name(std::string_view raw_name,
+                                               const HeadTying& head_tying = {}) {
     // Not the text decoder. The vision tower has the same two spellings as the
     // decoder does; `mtp.` is the multi-token-prediction head, which this
     // driver does not run. Skipping is a declaration too -- an unlisted tensor
@@ -85,14 +94,21 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
             return std::nullopt;
         }
     }
-    // The untied output projection. Spelled bare by the HF release, which puts
-    // it outside `model`, and under the wrapper by the mlx repack -- the same
-    // two-tools-one-tensor split as the decoder prefix. Only the tied members
-    // of this family avoid it: 0.8B ships tied and has no `lm_head` at all,
-    // 35B-A3B ships untied and has one.
+    // The output projection. Spelled bare by the HF release, which puts it
+    // outside `model`, and under the wrapper by the mlx repack -- the same
+    // two-tools-one-tensor split as the decoder prefix. The dense members of
+    // this family tie: 0.8B has no `lm_head` at all. Every ROUTED member is
+    // untied and ships one, which is why this is not a detail.
+    //
+    // Untied it keeps its own name and `LmHeadUntied` binds it. Tied it lands
+    // on `shared_embedding` beside the table it IS -- and if a checkpoint that
+    // says it ties nonetheless ships the tensor, both would land there and the
+    // load would fail as a duplicate. That is why the caller decides tying from
+    // the TENSORS and not from the config alone.
     for (std::string_view head : {"lm_head.", "language_model.lm_head."}) {
         if (raw_name.rfind(head, 0) == 0) {
-            return "shared_embedding." + std::string(raw_name.substr(head.size()));
+            const std::string tail(raw_name.substr(head.size()));
+            return head_tying.tied ? "shared_embedding." + tail : "lm_head." + tail;
         }
     }
     const std::optional<std::string_view> decoder = decoder_member(raw_name);
@@ -110,7 +126,8 @@ inline std::optional<std::string> runtime_name(std::string_view raw_name) {
     // shared slot here, not two.
     constexpr std::string_view kEmbed = "embed_tokens.";
     if (decoder->rfind(kEmbed, 0) == 0) {
-        return "shared_embedding." + std::string(decoder->substr(kEmbed.size()));
+        const std::string tail(decoder->substr(kEmbed.size()));
+        return head_tying.tied ? "shared_embedding." + tail : "embed_tokens." + tail;
     }
     if (*decoder == "norm.weight") {
         return std::string("final_norm.weight");
@@ -167,7 +184,8 @@ inline bool is_supported_model_type(std::string_view model_type) {
 /// checkpoint does not match what the schema expects. The contract is left in
 /// `out`, which must outlive the compile call that consumes its `view()`.
 inline void author_model_contract(const Checkpoint& checkpoint, std::string_view model_type,
-                                  const pie_loader::DeviceTarget& target, ModelContract& out) {
+                                  const pie_loader::DeviceTarget& target, ModelContract& out,
+                                  bool tied_embeddings = true) {
     using namespace pie::metal::model::contract_detail;
     using namespace contract_detail;
     if (!is_supported_model_type(model_type)) {
@@ -185,9 +203,22 @@ inline void author_model_contract(const Checkpoint& checkpoint, std::string_view
         return nullptr;
     };
 
+    // `tie_word_embeddings` is what the config SAYS; a shipped `lm_head` is
+    // what the checkpoint DOES. When they disagree the tensors win, because
+    // mapping a real `lm_head` onto `shared_embedding` beside the table it is
+    // supposed to BE declares that name twice and fails the load with a
+    // duplicate rather than with the disagreement. Both spellings are checked,
+    // for the same reason both are mapped.
+    const bool has_lm_head =
+        std::any_of(tensors.begin(), tensors.end(), [](const SourceTensor& raw) {
+            return raw.name.rfind("lm_head.", 0) == 0 ||
+                   raw.name.rfind("language_model.lm_head.", 0) == 0;
+        });
+    const HeadTying head{tied_embeddings && !has_lm_head};
+
     std::size_t declared = 0;
     for (const SourceTensor& raw : tensors) {
-        std::optional<std::string> output = runtime_name(raw.name);
+        std::optional<std::string> output = runtime_name(raw.name, head);
         if (!output.has_value()) {
             continue;
         }

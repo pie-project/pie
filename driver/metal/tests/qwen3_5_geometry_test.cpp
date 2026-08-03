@@ -372,6 +372,31 @@ void check_the_routed_ffn_replaces_the_dense_one_and_nothing_else() {
     expect(pie::metal::qmv_kn(Kernel::LlSharedDown, skew).N == skew.hidden,
            "landing back in the hidden it will be added to");
 
+    // Tying is what decides which pair of kinds the two ends of the model
+    // run, and a kind is a weight name. A routed checkpoint of this family is
+    // ALWAYS untied -- 35B-A3B ships an `lm_head` beside its `embed_tokens` --
+    // so getting this wrong is not an edge case, it is every MoE member: both
+    // ends would ask for `shared_embedding` and the contract would declare that
+    // name twice.
+    {
+        Facts f = qwen3_next_routed();
+        f.tied_embeddings = false;
+        DecodeGeometry ut{};
+        std::string e3;
+        expect(geometry_from_facts(f, ut, &e3), "an untied config builds: " + e3);
+        const auto u_dag = pie::metal::build_decode_dag(ut);
+        expect(count(u_dag, Kernel::EmbedUntied) == 1 && count(u_dag, Kernel::LmHeadUntied) == 1,
+               "an untied model reads its own two tensors");
+        expect(count(u_dag, Kernel::EmbedGather) == 0 && count(u_dag, Kernel::QmvLmHead) == 0,
+               "and neither end asks for the shared slot");
+        expect(count(m_dag, Kernel::EmbedGather) == 1 && count(m_dag, Kernel::QmvLmHead) == 1 &&
+                   count(m_dag, Kernel::EmbedUntied) == 0 &&
+                   count(m_dag, Kernel::LmHeadUntied) == 0,
+               "a tied model still reads one table twice");
+        expect(u_dag.size() == m_dag.size(),
+               "and tying costs no dispatch either way -- it is a name, not a shape");
+    }
+
     // Everything above the FFN is untouched. Attention is where this family
     // differs from every other one, and the mixture is not allowed to perturb
     // it -- a hybrid stack whose GDN/full split moved when experts appeared

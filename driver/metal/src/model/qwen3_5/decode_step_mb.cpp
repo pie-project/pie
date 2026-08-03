@@ -38,7 +38,8 @@ int qmv_out_size(Kernel k, const DecodeGeometry& g) {
         case Kernel::QmvV: return g.n_kv_heads * g.head_dim;
         case Kernel::QmvGate:
         case Kernel::QmvUp: return g.intermediate;
-        case Kernel::QmvLmHead: return g.vocab;
+        case Kernel::QmvLmHead:
+        case Kernel::LmHeadUntied: return g.vocab;
         // The router is a DENSE matvec into one logit per expert: it runs over
         // the tokens like any other projection, and only what follows it is
         // routed. The three expert projections are deliberately absent -- they
@@ -91,6 +92,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
         return;
     }
     switch (d.kind) {
+        case Kernel::EmbedUntied:
         case Kernel::EmbedGather:
             embed_mb_dispatch(g.hidden, n, d.grid, d.tg); break;
         case Kernel::Rms:
@@ -199,6 +201,7 @@ bool barrier_after_mb(const std::vector<Dispatch>& dag, size_t i,
 
 Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& mb) {
     switch (d.kind) {
+        case Kernel::EmbedUntied:
         case Kernel::EmbedGather: return mb.embed_mb;
         case Kernel::Rope:
         case Kernel::RopeK: return mb.rope_mb;
@@ -312,6 +315,7 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
             bind_slot(ctx, ord, wb.bind_index, it->second);
         }
         switch (d.kind) {
+            case Kernel::EmbedUntied:
             case Kernel::EmbedGather:
                 ctx.arg_bind_ordinal(ord, uint8_t(bind::Embed::TokenId), io(IoSlot::TokenId),
                                      offsets.token_row * sizeof(uint32_t));
@@ -388,6 +392,7 @@ void bind_decode_dag_mb(RawMetalContext& ctx, const BoundDecode& b,
                 ctx.arg_bind_ordinal(ord, uint8_t(bind::Rope::Position), io(IoSlot::Position),
                                      offsets.token_row * sizeof(uint32_t));
                 break;
+            case Kernel::LmHeadUntied:
             case Kernel::QmvLmHead:
                 ctx.arg_bind_ordinal(ord, uint8_t(bind::Qmv::Out), io(IoSlot::Logits),
                                      offsets.logits_bytes);
@@ -439,7 +444,8 @@ namespace {
 // group.
 // The tail that exists only to produce a row's logits.
 bool produces_logits(Kernel kind) {
-    return kind == Kernel::QmvLmHead || kind == Kernel::Argmax;
+    return kind == Kernel::QmvLmHead || kind == Kernel::LmHeadUntied ||
+           kind == Kernel::Argmax;
 }
 
 bool carries_cross_token_state(Kernel kind) {
@@ -506,7 +512,8 @@ void encode_prefill_dags_mb(StepEncoder& se,
         geometry != nullptr ? qmm_strided_rows(int(n), max_rows) : 0;
     for (size_t i = 0; i < length; ++i) {
         const Dispatch& d0 = dags[0][i];
-        if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead) {
+        if (strided_rows > 0 && d0.kind != Kernel::QmvLmHead &&
+            d0.kind != Kernel::LmHeadUntied) {
             const int out = qmv_out_size(d0.kind, *geometry);
             if (out != 0 && out % 32 == 0) {
                 const bool wide = qmm_strided_bm(strided_rows) == kQmmBMWide &&

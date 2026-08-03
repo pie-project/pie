@@ -54,7 +54,8 @@ bool load_decode_psos(RawMetalContext& ctx,
                       std::string* err,
                       bool fuse_residual,
                       bool gdn_prep,
-                      bool routed) {
+                      bool routed,
+                      bool untied) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
 
@@ -82,6 +83,22 @@ bool load_decode_psos(RawMetalContext& ctx,
         // so it must be applied after the base specs above.
         want("gdn_prep.metal", "gdn_prep_bfloat16", {Kernel::GdnPrep});
         want("gdn_prep.metal", "gdn_core_recurrent_bfloat16", {Kernel::GdnCore});
+    }
+    if (untied) {
+        // An untied checkpoint's two ends are two tensors and therefore two
+        // kinds -- but the same two entrypoints, at the same shapes. Only the
+        // weight name differs, which is the whole reason the kinds exist.
+        //
+        // Behind a flag, and the flag is load-bearing. The llama family
+        // compiles its OWN kernels for these kinds, at its checkpoint's group
+        // size and bit width, and consults this table only as a fallback.
+        // Claiming them unconditionally handed it a valid gs_64/b_4 PSO for a
+        // checkpoint that is neither -- not a load failure, just wrong numbers,
+        // and it took the numerics test to say so.
+        want("embed_gather.metal", "embed_gather_4bit_bfloat16_gs_64_b_4",
+             {Kernel::EmbedUntied});
+        want("quantized_qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4",
+             {Kernel::LmHeadUntied});
     }
     if (routed) {
         // A routed checkpoint's mixture, on the same kernels the llama family

@@ -896,7 +896,8 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // ── Compile the kernel PSOs. ──
     std::string load_err;
     if (!load_decode_psos(*ctx_, kernels_dir, psos_, /*with_argmax=*/false, &load_err,
-                          fuse_residual_, gdn_prep_, g_.is_moe())) {
+                          fuse_residual_, gdn_prep_, g_.is_moe(),
+                          /*untied=*/!g_.tied_embeddings)) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;
@@ -2359,7 +2360,14 @@ bool MetalExecutor::setup(const SetupConfig& cfg, std::string* err) {
         // cannot see: it decides whether the head is its own tensor or the
         // embedding table read a second time, and a contract only sees tensors.
         model::ContractFacts contract_facts;
-        contract_facts.tied_embeddings = cfg.llama.tied_embeddings;
+        // Whichever family this is, its own reading of the flag. They are
+        // separate fields because they are separate configs, and a single
+        // shared one would have made the qwen3.5 half silently inherit
+        // llama's default the moment a checkpoint of either kind loaded.
+        contract_facts.tied_embeddings =
+            model::model_family_of(cfg.model_type) == model::ModelFamily::Qwen35
+                ? cfg.qwen35.tied_embeddings
+                : cfg.llama.tied_embeddings;
         load_plan = compile_load_plan(cfg.snapshot_dir, metal_device_target(), cfg.model_type,
                                       contract_facts);
     } catch (const std::exception& error) {

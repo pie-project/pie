@@ -71,7 +71,8 @@ KN qmv_kn(Kernel k, const DecodeGeometry& g) {
         case Kernel::QmvGate:   return {H, g.intermediate};   // 1024 → 3584
         case Kernel::QmvUp:     return {H, g.intermediate};   // 1024 → 3584
         case Kernel::QmvDown:   return {g.intermediate, H};   // 3584 → 1024
-        case Kernel::QmvLmHead: return {H, g.vocab};          // 1024 → 248320
+        case Kernel::QmvLmHead:
+        case Kernel::LmHeadUntied: return {H, g.vocab};       // 1024 → 248320
         // The mixture. The router is an ordinary matvec into one logit per
         // expert; the three expert projections have a K and an N like any
         // other, and what makes them routed is which slice of the weight a row
@@ -199,6 +200,7 @@ int bind_decode_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
         }
 
         switch (k) {
+            case Kernel::EmbedUntied:
             case Kernel::EmbedGather:
                 bind_const<int>(ctx, ord, (uint8_t)bind::Embed::Hidden, g.hidden, &count);
                 break;

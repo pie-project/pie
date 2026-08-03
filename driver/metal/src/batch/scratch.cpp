@@ -109,6 +109,7 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
         // live in a disjoint range.
         const int o = static_cast<int>(dispatch_index);
         switch (d.kind) {
+            case Kernel::EmbedUntied:
             case Kernel::EmbedGather:
                 resid = fresh(); wr(o, bi::EmbedOut, resid);
                 break;
@@ -339,6 +340,7 @@ ScratchSchedule build_scratch_schedule(const std::vector<Dispatch>& dag,
             }
 
             // tail lm_head: reads normed_final from scratch, writes logits to IO (not scratch).
+            case Kernel::LmHeadUntied:
             case Kernel::QmvLmHead:
                 rd(o, bi::QmvX, normed);
                 break;
