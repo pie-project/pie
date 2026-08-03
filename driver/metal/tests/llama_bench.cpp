@@ -610,43 +610,60 @@ int main(int argc, char** argv) {
             }
             bool good = true;
             const std::vector<float>* want[2] = {&want0, &want1};
+            // Relative L2 between two logit rows. Used twice per member, which
+            // is the point: an absolute threshold has to know how much two
+            // fires of the SAME sequence may legitimately differ, and it does
+            // not. A batched member runs a GEMM where a lone one ran a matvec,
+            // and at a ten-token prefix of this prompt Llama-3.2-1B's rows
+            // come out 0.064 apart -- past the 0.05 line this check used to
+            // draw, on a fire with nothing wrong with it.
+            const auto rel_l2 = [](const std::vector<float>& a2,
+                                   const std::vector<float>& b2) {
+                double num = 0.0;
+                double den = 0.0;
+                for (std::size_t v = 0; v < a2.size(); ++v) {
+                    const double d0 = double(a2[v]) - double(b2[v]);
+                    num += d0 * d0;
+                    den += double(b2[v]) * double(b2[v]);
+                }
+                return std::sqrt(num / std::max(den, 1e-30));
+            };
             for (int i = 0; i < 2; ++i) {
                 const std::vector<float> got = row_of(outs[i], 0);
                 const auto [want_tok, margin] = top2(*want[i]);
                 const auto [got_tok, _] = top2(got);
-                double num = 0.0;
-                double den = 0.0;
                 float dev = 0.0F;
                 for (std::size_t v = 0; v < got.size(); ++v) {
-                    const double d0 = double(got[v]) - double((*want[i])[v]);
-                    num += d0 * d0;
-                    den += double((*want[i])[v]) * double((*want[i])[v]);
                     dev = std::max(dev, std::fabs(got[v] - (*want[i])[v]));
                 }
-                const double rel = std::sqrt(num / std::max(den, 1e-30));
-                // The row is the assertion. Two fires of the same sequence
-                // may differ by the arithmetic the batch shape chose -- a head
-                // that gathered two rows runs a GEMM where one row ran a matvec
-                // -- and that shows up at 1e-3 relative. A row that came from
-                // the wrong sequence, or from the wrong position of the right
-                // one, shows up near 1: the two live two orders of magnitude
-                // apart, with nothing in between to make 0.05 a delicate line.
-                const bool same_row = rel < 0.05;
+                const double own = rel_l2(got, *want[i]);
+                const double other = rel_l2(got, *want[1 - i]);
+                // The assertion, with no constant in it: this member's row is
+                // nearer its OWN lone fire than the other member's. That is
+                // exactly the thing being hunted -- a fire that crossed its
+                // rows, or that answered the longer prompt twice because the
+                // shorter is its prefix, lands nearer the wrong reference.
+                // Arithmetic drift moves `own` and cannot move it past
+                // `other`: the two sit two orders of magnitude apart.
+                const bool same_row = own < other;
                 // Only THEN is the token worth checking, and only when the
-                // row's own top-two margin clears what these two fires actually
-                // disagreed by. Below that, the argmax is a coin the test has
-                // no business calling: " Paris" and " in" after "The capital of
-                // France is" sit two bf16 ulps apart, and the first version of
-                // this check reported the coin landing differently as a bug.
+                // row's own top-two margin clears what these two fires
+                // actually disagreed by. Below that, the argmax is a coin the
+                // test has no business calling: " Paris" and " in" after "The
+                // capital of France is" sit two bf16 ulps apart, and the first
+                // version of this check reported the coin landing differently
+                // as a bug. Gemma-4 reads these ids as nothing in particular
+                // and is ambiguous at every prefix length, so this stays.
                 const bool decisive = margin > 2.0F * dev;
                 const bool agree = got_tok == want_tok;
                 const bool bad = !same_row || (decisive && !agree);
                 if (bad) good = false;
                 std::printf("  %s  one fire, %s member %d: %d vs %d alone "
-                            "(margin %.3f, fires differ by %.3f, rel %.5f)%s\n",
+                            "(margin %.3f, fires differ by %.3f, rel %.5f vs "
+                            "%.5f to the other member)%s\n",
                             bad ? "FAIL" : (decisive ? "PASS" : "TIE "), what, i, got_tok,
-                            want_tok, double(margin), double(dev), rel,
-                            (same_row && !decisive) ? "  [ambiguous: token not gated]" : "");
+                            want_tok, double(margin), double(dev), own, other,
+                            (same_row && !decisive) ? "  [row gated, token ambiguous]" : "");
             }
             return good;
         };
