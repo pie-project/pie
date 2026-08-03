@@ -123,10 +123,7 @@ inline int qmm_split_k(int out_vec, int N, int K, int bm) {
     // 8% (32.37ms split against 29.86 unsplit), where at 16 lanes splitting
     // wins 11% (18.29 against 20.50).
     const int tiles = (out_vec / kQmmSplitBN) * ((N + kQmmBM - 1) / kQmmBM);
-    static const int target = [] {
-        const char* e = std::getenv("PIE_METAL_SPLIT_TGS");
-        return e ? std::atoi(e) : kQmmSplitTargetTgs;
-    }();
+    constexpr int target = kQmmSplitTargetTgs;
     int split = tiles > 0 ? target / tiles : 1;
     split = std::min(split, kQmmSplitMaxSplits);
     const int k_align = 64;  // group_size, and a multiple of BK=32
@@ -160,8 +157,7 @@ inline void qmm_splitk_reduce_dispatch(int out_vec, int N, Grid& g, Threadgroup&
 // dequantized once per row block, so a 512-row prompt at BM=16 unpacks every
 // weight thirty-two times.
 inline int qmm_strided_bm(int padded_rows) {
-    static const bool off = std::getenv("PIE_METAL_NO_PREFILL_BM32") != nullptr;
-    return (!off && padded_rows >= kQmmWideMinBatch) ? kQmmBMWide : kQmmBM;
+    return padded_rows >= kQmmWideMinBatch ? kQmmBMWide : kQmmBM;
 }
 
 inline int qmm_strided_rows(int N, int max_rows) {

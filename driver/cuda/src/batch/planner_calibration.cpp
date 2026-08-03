@@ -180,10 +180,7 @@ bool run_shape(BatchEngine& engine,
 
 }  // namespace
 
-bool planner_calibration_requested() {
-    const char* v = std::getenv("PIE_CUDA_PLANNER_CALIBRATE");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
-}
+bool planner_calibration_requested() { return false; }
 
 std::size_t calibrate_memory_planner(BatchEngine& engine,
                                      int tp_size,

@@ -40,14 +40,7 @@ inline void maybe_add_bias(
     kernels::launch_add_bias_bf16(out, bias_tensor->data(), N, dim, stream);
 }
 
-bool decode_full_attention_variant_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DECODE_FULL_ATTENTION");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+bool decode_full_attention_variant_enabled() { return true; }
 
 // Bug#2 A/B: the fused QKV+qk-norm+rope+KV-write kernel
 // (`launch_qkv_qk_norm_rope_write_kv_bf16`) is the R>1 concurrent-decode
@@ -61,14 +54,7 @@ bool decode_full_attention_variant_enabled() {
 // prefill, so the switch is now the A/B for BOTH shapes: turning it off costs
 // ~10% of prefill wall. Existing runbooks keep working, which is why the name
 // was not churned.
-bool decode_fused_post_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_CUDA_DECODE_FUSED_POST");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+bool decode_fused_post_enabled() { return true; }
 
 inline void apply_rope(
     const LlamaLikeForwardCfg& fwd_cfg,

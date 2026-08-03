@@ -97,13 +97,7 @@ struct TpProfile {
     std::array<std::uint64_t, kStageCount> ns{};
     std::array<std::uint64_t, kStageCount> hits{};
 
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_TP_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
+    static constexpr bool enabled() { return false; }
 
     static TpProfile& instance() {
         static TpProfile p;

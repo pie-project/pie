@@ -280,10 +280,6 @@ void StepEncoder::dispatch(Grid grid, Threadgroup tg) {
 // wins (beta's per-edge hazard model: Device for true heap-RAW, None for ordering-only).
 static MTL4VisibilityOptions resolve_barrier_vis(BarrierVisibility req) {
     static const int override_mode = [] {
-        const char* e = getenv("PIE_BARRIER_VIS");
-        if (!e) return -1;
-        if (strcasecmp(e, "none") == 0 || strcmp(e, "0") == 0) return 0;
-        if (strcasecmp(e, "device") == 0 || strcmp(e, "1") == 0) return 1;
         return -1;
     }();
     const int mode = override_mode >= 0

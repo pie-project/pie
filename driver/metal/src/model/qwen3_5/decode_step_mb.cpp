@@ -46,15 +46,9 @@ namespace {
 bool g_ab_arm = false;
 }  // namespace
 
-bool ab_all_barriers() {
-    static const bool on = std::getenv("PIE_METAL_AB_BARRIERS") != nullptr;
-    return on;
-}
+bool ab_all_barriers() { return false; }
 
-bool ab_enabled() {
-    static const bool on = std::getenv("PIE_METAL_AB") != nullptr;
-    return on;
-}
+bool ab_enabled() { return false; }
 bool ab_arm() { return g_ab_arm; }
 void ab_set_arm(bool b) { g_ab_arm = b; }
 
@@ -65,8 +59,7 @@ void mb_geometry(Dispatch& d, const DecodeGeometry& g, int n) {
     if (const int out = qmv_out_size(d.kind, g); out != 0) {
         d.qmm_bn = qmm_bn(out, n);
         d.qmm_bm = qmm_bm(n);
-        static const bool split_off = std::getenv("PIE_METAL_NO_SPLITK") != nullptr;
-        d.qmm_split = (d.qmm_bn > 0 && !split_off)
+        d.qmm_split = (d.qmm_bn > 0)
                           ? qmm_split_k(out, n, qmv_kn(d.kind, g).K, d.qmm_bm)
                           : 1;
         if (d.qmm_split > 1)
