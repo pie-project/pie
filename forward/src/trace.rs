@@ -159,19 +159,15 @@ pub enum FireClass {
     /// verify-stash STORE per linear layer. Reserved by the rung-5
     /// geometry; its trace is the next qwen3_5 slice.
     FrozenVerify,
-    /// Decode-shaped fire whose EVERY lane carries hook programs
-    /// (fast_rows == 0): the general unfused body plus the two
-    /// [`OpKind::HookSite`]s per layer — the hand-written all-hooked
-    /// path's exact launch list. The MIXED fire (0 < fast_rows < R)
-    /// needs the future Peel op and stays hand-written.
-    HookedDecode,
-    /// Prefill-shaped all-hooked fire.
-    HookedPrefill,
-    // The masked classes (wire 5/6) are RETIRED (A1, the class-collapse
-    // amendment): a custom mask is a GuardPred::HasCustomMask arm of
-    // the Decode/Prefill traces now — the op-list delta is local, so
-    // it lives at op granularity. The wire numbers stay reserved
-    // (append-only ABI); the trace entries answer InvalidArgument.
+    // The masked classes (wire 5/6) and the hooked classes (wire 7/8)
+    // are RETIRED (A1/A2, the class-collapse amendment): a custom mask
+    // is a GuardPred::HasCustomMask arm and attached stage hooks are a
+    // GuardPred::HasStageHooks arm of the Decode/Prefill traces now —
+    // the op-list deltas are local, so they live at op granularity.
+    // What remains a class is what changes the PASS wholesale: the
+    // fire's shape and the MTP services. The wire numbers stay
+    // reserved (append-only ABI); the trace entries answer
+    // InvalidArgument.
 }
 
 // (The short-lived `AttnKernel` enum — rung 1's `Attention.param1` tag —
@@ -211,6 +207,14 @@ pub enum GuardPred {
     /// the class-collapse amendment's first predicate (a mask is a
     /// guard, not a class). Wire kind 4, payload unused.
     HasCustomMask,
+    /// The fire carries attached stage-hook programs (`stage_hooks !=
+    /// nullptr`) — A2 of the class-collapse amendment: the hooked arm
+    /// holds the general QKV sequence, the two per-layer HookSites and
+    /// the WantsAttnScore-guarded attention. The caller's gate admits
+    /// only ALL-hooked fires (fast_rows == 0), so presence ⇔ every row
+    /// is hooked; A3's Peel op replaces this all-or-nothing arm with
+    /// the fast_rows row split. Wire kind 5, payload unused.
+    HasStageHooks,
 }
 
 impl GuardPred {
@@ -222,6 +226,7 @@ impl GuardPred {
             GuardPred::TokensGT(k) => (2, k),
             GuardPred::WantsAttnScore => (3, 0),
             GuardPred::HasCustomMask => (4, 0),
+            GuardPred::HasStageHooks => (5, 0),
         }
     }
 }

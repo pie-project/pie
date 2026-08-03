@@ -110,15 +110,13 @@ struct LlamaLikeDeclaredPlan {
     pie_forward::ForwardPlan plan;
     pie_forward::ForwardPlan decode;
     pie_forward::ForwardPlan prefill;
-    // (The masked traces are gone with the mask classes — A1, the
-    // class-collapse amendment: a masked fire walks decode/prefill and
-    // takes their HasCustomMask guard arms.)
-    // The all-hooked classes (the HookSite slice, fast_rows == 0): the
-    // general unfused body + the two per-layer hook sites + the
-    // WantsAttnScore-guarded attention. Mixed fires (0 < fast_rows < R)
-    // stay hand-written until the Peel op.
-    pie_forward::ForwardPlan hooked_decode;
-    pie_forward::ForwardPlan hooked_prefill;
+    // (The masked and hooked traces are gone with their classes — A1/A2,
+    // the class-collapse amendment: a masked fire takes decode/prefill's
+    // HasCustomMask guard arm; an all-hooked fire takes their
+    // HasStageHooks arm — the general body, the two per-layer hook
+    // sites and the WantsAttnScore-guarded attention, all region ops.
+    // Mixed fires (0 < fast_rows < R) stay hand-written until the Peel
+    // op.)
     // What the class traces were taken from, in the format the generated
     // .inc embeds (`emit_cuda::facts_digest`); rung 3's dispatch runs the
     // static form only on exact match.

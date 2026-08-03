@@ -266,8 +266,6 @@ pub fn trace(
             match class {
                 FireClass::Decode => "decode",
                 FireClass::Prefill => "prefill",
-                FireClass::HookedDecode => "hooked_decode",
-                FireClass::HookedPrefill => "hooked_prefill",
                 // The service classes are qwen3_5's; llama_like has no
                 // spec-decode repair pass. The ffi entry rejects them
                 // before tracing; this is the same statement for direct
@@ -706,13 +704,12 @@ pub(crate) fn guard_on(
 }
 
 /// Record a [`OpKind::HookSite`] (the HookSite slice): the layer's
-/// attached programs run here at fire time, observing `q`; a fire with
-/// nothing attached passes through by argument. Emitted only by the
-/// Hooked* class arms — the semantic trace and the unhooked classes
-/// carry no sites, which is the launch-list truth (the hand-written
-/// invoke is a no-op returning early on null hooks, but the SITES'
-/// bracketing launches — begin_layer, compact — exist only on hooked
-/// fires).
+/// attached programs run here at fire time, observing `q`. Since A2
+/// (the class-collapse amendment) the sites live INSIDE the
+/// `HasStageHooks` guard arm of the Decode/Prefill traces — the one
+/// text carries them, and an unhooked fire's walk never reaches them,
+/// which is the launch-list truth (the SITES' bracketing launches —
+/// begin_layer, compact — exist only on hooked fires).
 pub fn hook_site(stage: crate::trace::HookStage, q: &Val, layer: u32) {
     q.t.with(Some(layer), |b| {
         b.push_hook_site(stage, layer, q.id);

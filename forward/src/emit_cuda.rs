@@ -121,7 +121,8 @@ const PARAMS: &str = "\
     const std::uint8_t* row_valid_d,\n\
     bool has_write_desc,\n\
     const std::uint8_t* custom_mask_d,\n\
-    const std::int32_t* custom_mask_indptr_d";
+    const std::int32_t* custom_mask_indptr_d,\n\
+    const StageHooks* hooks";
 
 fn emit_class_fn(
     plan: &ForwardPlan,
@@ -209,6 +210,9 @@ fn emit_range(
                 }
                 crate::trace::GuardPred::HasCustomMask => {
                     "custom_mask_d != nullptr".to_string()
+                }
+                crate::trace::GuardPred::HasStageHooks => {
+                    "hooks != nullptr".to_string()
                 }
             };
             let mut region = i + 1;
@@ -461,6 +465,18 @@ fn emit_op(b: &mut Body, op: &crate::trace::Op, plan: &ForwardPlan, facts: &Llam
             weights,
             state,
         } => emit_launch(b, kernel, weights, state.as_ref(), op, facts, is_decode),
+        OpKind::HookSite { .. } => {
+            // The hooked arm's sites transliterate to a REFUSAL: the
+            // static form does not carry the hook sideband machinery
+            // (page-mask brackets, score captures), and the dispatch in
+            // declared_forward.cpp routes hooked fires to the
+            // interpreter walk — this throw is the honest text of that
+            // gate, unreachable while it holds.
+            b.stmt("throw std::runtime_error(");
+            b.stmt("    \"generated forward: hooked fire reached the static \"");
+            b.stmt("    \"form (the dispatch gate routes hooks to the \"");
+            b.stmt("    \"interpreter walk)\");");
+        }
         other => panic!("emitter: op kind {other:?} out of scope for the qwen3 classes"),
     }
 }
@@ -650,6 +666,15 @@ fn emit_launch(
             b.stmt("        kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,");
             b.stmt("        attn_ws, stream);");
             b.stmt("}");
+        }
+        "dispatch_attention_flashinfer_decode_capture"
+        | "dispatch_attention_flashinfer_prefill_capture_bf16" => {
+            // Score-capturing dispatches live in the HasStageHooks arm;
+            // same refusal contract as the HookSite emission above.
+            b.stmt("throw std::runtime_error(");
+            b.stmt("    \"generated forward: capture dispatch reached the \"");
+            b.stmt("    \"static form (the dispatch gate routes hooks to \"");
+            b.stmt("    \"the interpreter walk)\");");
         }
         other => panic!("emitter: stated kernel {other} out of scope"),
     }

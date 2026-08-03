@@ -270,7 +270,7 @@ peepholes, eligibility predicates, thresholds.
    op-list-wise, but the delta is LOCAL (the attention site + the
    fused-QKV arm), and a local op-list delta over a runtime input is
    exactly Guard territory. The ladder:
-   - **A1 (this slice)**: `GuardPred::HasCustomMask` (wire 4);
+   - **A1 — DONE (2026-08-03)**: `GuardPred::HasCustomMask` (wire 4);
      Decode/Prefill traces carry the mask arm as a guard chain at the
      attention site — in the fused_post deployment the mask arm holds
      the whole general QKV sequence, so its nested HasWriteDesc guard
@@ -281,10 +281,23 @@ peepholes, eligibility predicates, thresholds.
      keeps the numbers). The rope-table hoist stays unconditional in
      the fused deployment — a masked fire launches one table build it
      never reads (outputs unaffected; the ops-count line shows it).
-   - **A2**: same collapse for Hooked×2 — HookSites become
-     unconditional ops of Decode/Prefill (a site with no program is a
-     no-op by argument), the WantsAttnScore guard rides in the main
-     text, and the fused arm guards on hook-free rows.
+   - **A2 — DONE (2026-08-03)**: same collapse for Hooked×2 via
+     `GuardPred::HasStageHooks` (wire 5). Better than the sketch: the
+     sites are not unconditional ops — they live INSIDE the hooked
+     arm's region, so an unhooked fire's walk never reaches them (the
+     per-fire launch-list truth is structural). The attention chain
+     per layer: [HasCustomMask → custom | HasStageHooks → sites +
+     side-effect WantsAttnScore guard | else → plain/fused]; the
+     fused arm moved to the chain's else. The generated static form
+     transliterates the hooked arm as an honest REFUSAL (throw at the
+     first HookSite/capture) and its dispatch keeps hooked fires on
+     the interpreter walk — extending the static form to the hook
+     sideband machinery is its own later increment. Nine classes are
+     five: Decode (788 ops), Prefill (619), CommitAdvance, StateOnly,
+     FrozenVerify. Parity: 3-leg token parity, sink A4 OFF/ON/GEN,
+     hook A/B 12/12 byte-identical (0 fallbacks — every hooked fire
+     walks the collapsed traces), forward 54+16+regen-clean, engine
+     394, metal 8/8.
    - **A3**: the all-or-nothing hook guard becomes `Peel` (both
      regions run, complementary row ranges, fast_rows the runtime
      split) and the gate admits mixed fires.

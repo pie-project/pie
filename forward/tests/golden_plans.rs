@@ -367,34 +367,10 @@ fn qwen3_5_hybrid_cuda_frozen_verify() {
     );
 }
 
-/// The all-hooked classes (the HookSite slice): the general unfused body
-/// — the fused decode-QKV arm's predicate is `class == Decode`, so an
-/// all-hooked decode never fuses, exactly the hand-written fast_rows==0
-/// path — plus the two HookSite ops per layer bracketing an attention
-/// wrapped in the WantsAttnScore guard (the score-capturing dispatch is
-/// a different launcher, and whether the fire's programs read scores is
-/// a runtime input). Which PROGRAM runs never appears: sites state WHERE
-/// and WHAT IS OBSERVABLE; programs are sideband data.
-#[test]
-fn qwen3_0_6b_cuda_hooked_decode() {
-    check_plan(
-        "qwen3_0_6b.cuda.hooked_decode",
-        &llama_like_cuda(
-            &LlamaLikeFacts::qwen3_0_6b(),
-            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-            FireClass::HookedDecode,
-        ),
-    );
-}
-
-#[test]
-fn qwen3_0_6b_cuda_hooked_prefill() {
-    check_plan(
-        "qwen3_0_6b.cuda.hooked_prefill",
-        &llama_like_cuda(
-            &LlamaLikeFacts::qwen3_0_6b(),
-            &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
-            FireClass::HookedPrefill,
-        ),
-    );
-}
+// (The hooked-class goldens are gone with the classes themselves — A2,
+// the class-collapse amendment: attached stage hooks are a
+// HasStageHooks guard arm INSIDE the decode/prefill goldens above —
+// the general body, the two per-layer HookSites and the
+// WantsAttnScore-guarded attention, all in the hooked arm's region.
+// Which PROGRAM runs never appears: sites state WHERE and WHAT IS
+// OBSERVABLE; programs are sideband data.)

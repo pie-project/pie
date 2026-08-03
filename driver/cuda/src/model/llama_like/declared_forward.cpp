@@ -312,16 +312,10 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
     out.prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Prefill);
-    out.hooked_decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
-        facts, cuda, pie_forward::PieForwardFireClass::HookedDecode);
-    out.hooked_prefill = pie_forward::ForwardPlan::trace_llama_like_cuda(
-        facts, cuda, pie_forward::PieForwardFireClass::HookedPrefill);
     // Drift between the declaration's stated kernels and this executor's
     // registry fails at model load, not mid-fire.
     validate_stated_kernels(out.decode);
     validate_stated_kernels(out.prefill);
-    validate_stated_kernels(out.hooked_decode);
-    validate_stated_kernels(out.hooked_prefill);
 
     // The digest naming what these traces were taken from — the same
     // format `pie_forward::emit_cuda::facts_digest` embeds in the
@@ -409,16 +403,15 @@ void llama_like_forward_declared(
             total_tokens, num_requests,
             logit_row_indices_d, num_logit_rows,
             w_page_d, w_off_d, row_valid_d, has_write_desc,
-            custom_mask_d, custom_mask_indptr_d);
+            custom_mask_d, custom_mask_indptr_d,
+            stage_hooks);
         return;
     }
-    // Rung 2: the fire's class picks its trace, and the trace states
-    // every kernel — nothing below derives a path (north-star-dsl.md).
-    const bool hooked = stage_hooks != nullptr;
+    // Rung 2 + A2: the fire's SHAPE picks its trace, and the trace
+    // states every kernel — attachments (mask, hooks) are its guard
+    // arms, nothing below derives a path (north-star-dsl.md).
     const pie_forward::ForwardPlan& plan =
-        hooked ? (is_pure_decode ? declared.hooked_decode
-                                 : declared.hooked_prefill)
-               : (is_pure_decode ? declared.decode : declared.prefill);
+        is_pure_decode ? declared.decode : declared.prefill;
     // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
     // it a silent fallback to the hand-written path would be
     // indistinguishable from a passing A/B run.
@@ -1154,6 +1147,11 @@ void llama_like_forward_declared(
                     // A1 (the class-collapse amendment): the mask arm
                     // of the decode/prefill traces.
                     return custom_mask_d != nullptr;
+                case static_cast<std::uint32_t>(
+                    pie_forward::PieForwardGuardPred::HasStageHooks):
+                    // A2: the hooked arm (the caller's gate admits only
+                    // all-hooked fires, so presence ⇔ fast_rows == 0).
+                    return stage_hooks != nullptr;
                 default:
                     throw std::runtime_error(
                         "declared forward: guard predicate kind " +

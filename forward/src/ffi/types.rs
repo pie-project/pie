@@ -150,6 +150,9 @@ pub enum PieForwardGuardPred {
     /// The fire carries a custom attention mask (`custom_mask_d !=
     /// nullptr`) — A1, the class-collapse amendment. Payload unused.
     HasCustomMask = 4,
+    /// The fire carries attached stage-hook programs (`stage_hooks !=
+    /// nullptr`) — A2, the class-collapse amendment. Payload unused.
+    HasStageHooks = 5,
 }
 
 /// Mirrors [`crate::trace::DType`]; same appended-only discriminant rule as

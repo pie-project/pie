@@ -1095,9 +1095,12 @@ fn lowered_trace_round_trips_through_the_arena() {
         .filter(|op| op.kind == PieForwardOpKind::Launch)
         .collect();
     // 1 table build + per layer: the mask arm's 4 (fused qk-norm+rope,
-    // the write guard's two regions, the custom dispatch) + the fused
-    // else-arm's 2 (fused post, XQA) = 169.
-    assert_eq!(launches.len(), 169);
+    // the write guard's two regions, the custom dispatch) + the hooked
+    // arm's 4 (fused qk-norm+rope, the write guard's two regions, the
+    // plain XQA launch — this fixture is XQA-on, and XQA has no capture
+    // variant, so no WantsAttnScore guard exists) + the fused
+    // else-arm's 2 (fused post, XQA) = 281.
+    assert_eq!(launches.len(), 281);
 
     let table = launches[0];
     assert_eq!(view::name(&out, table.weight_name), "launch_rope_standard_table");
@@ -1139,13 +1142,20 @@ fn lowered_trace_round_trips_through_the_arena() {
         PieForwardOpKind::Rope | PieForwardOpKind::KvAppend
     )));
     assert!(ops.iter().any(|op| op.kind == PieForwardOpKind::SplitQkv));
-    // The per-layer guard chains: 28 HasCustomMask (value-producing) +
-    // 28 nested HasWriteDesc inside their mask arms.
+    // The per-layer guard chains: 28 outer HasCustomMask/HasStageHooks
+    // chains (value-producing) + 28×2 nested HasWriteDesc (one per
+    // attachment arm's general QKV; no WantsAttnScore under XQA).
     let guards = ops
         .iter()
         .filter(|op| op.kind == PieForwardOpKind::Guard)
         .count();
-    assert_eq!(guards, 56);
+    assert_eq!(guards, 84);
+    // The hooked arm's sites: two per layer, region ops of the chain.
+    let sites = ops
+        .iter()
+        .filter(|op| op.kind == PieForwardOpKind::HookSite)
+        .count();
+    assert_eq!(sites, 56);
     unsafe { pie_forward_release(&mut out) };
 
     // An out-of-range class is a malformed request, not a default.
