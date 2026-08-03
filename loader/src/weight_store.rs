@@ -137,10 +137,6 @@ pub struct ArtifactWriter {
     quants: Vec<Quant>,
 }
 
-fn zt(err: ztensor::Error) -> Error {
-    Error::Checkpoint(err.to_string())
-}
-
 impl ArtifactWriter {
     /// Opens an artifact for `key` at `path`.
     ///
@@ -160,7 +156,7 @@ impl ArtifactWriter {
             .canonical(false)
             .align(ALIGN)
             .publish(path)
-            .map_err(zt)?;
+            .map_err(Error::from)?;
         Ok(Self {
             writer: Some(writer),
             open: None,
@@ -205,7 +201,7 @@ impl ArtifactWriter {
         if let Some(ltype) = ltype {
             object = object.logical(ltype);
         }
-        self.open = Some(object.length(nbytes).stream().map_err(zt)?);
+        self.open = Some(object.length(nbytes).stream().map_err(Error::from)?);
         self.tensors.push(tensor);
         Ok(())
     }
@@ -217,7 +213,7 @@ impl ArtifactWriter {
             .as_mut()
             .ok_or_else(|| Error::Checkpoint("no tensor is open".into()))?;
         let writer = self.writer.as_mut().expect("writer present");
-        sink.write(writer, chunk).map_err(zt)
+        sink.write(writer, chunk).map_err(Error::from)
     }
 
     /// Closes the open tensor, which must have received its whole payload.
@@ -227,7 +223,7 @@ impl ArtifactWriter {
             .take()
             .ok_or_else(|| Error::Checkpoint("no tensor is open".into()))?;
         let writer = self.writer.as_mut().expect("writer present");
-        sink.close(writer).map_err(zt)
+        sink.close(writer).map_err(Error::from)
     }
 
     fn writer(&mut self) -> &mut Writer {
@@ -263,7 +259,7 @@ impl ArtifactWriter {
         ]);
         let mut writer = self.writer.take().expect("writer present");
         writer.set_attributes(Value::Map(vec![(Value::Text(RECORD.into()), record)]));
-        writer.finish().map_err(zt)?;
+        writer.finish().map_err(Error::from)?;
         Ok(())
     }
 }
@@ -286,7 +282,7 @@ impl Artifact {
     /// Both refusals are misses rather than errors in the caller's eyes — the
     /// distinction the caller needs is only whether it has to recompute.
     pub fn open(path: &Path, expected_key: &str) -> Result<Self, Error> {
-        let source = Source::open(path).map_err(zt)?;
+        let source = Source::open(path).map_err(Error::from)?;
         let attributes = source
             .attributes()
             .ok_or_else(|| Error::Checkpoint("not a weight-store artifact".into()))?;
@@ -315,9 +311,9 @@ impl Artifact {
         let mut tensors = Vec::new();
         for tensor in source.tensors() {
             let name = tensor.name();
-            let part = tensor.data().map_err(|_| {
-                Error::Checkpoint(format!("object {name:?} has no data part"))
-            })?;
+            let part = tensor
+                .data()
+                .map_err(|_| Error::Checkpoint(format!("object {name:?} has no data part")))?;
             let runtime_dtype = tensor
                 .attributes()
                 .and_then(|a| field(a, RUNTIME_DTYPE))
@@ -350,7 +346,12 @@ impl Artifact {
             .unwrap_or_default();
         let quants = field(&record, "quant")
             .and_then(Value::as_array)
-            .map(|entries| entries.iter().map(read_quant).collect::<Result<Vec<_>, _>>())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(read_quant)
+                    .collect::<Result<Vec<_>, _>>()
+            })
             .transpose()?
             .unwrap_or_default();
 
@@ -379,7 +380,7 @@ impl Artifact {
         self.source
             .tensor(&self.tensor(index)?.name)
             .and_then(|t| t.map())
-            .map_err(zt)
+            .map_err(Error::from)
     }
 
     /// Where a tensor's bytes begin in the file. What a caller checks when it
@@ -391,7 +392,7 @@ impl Artifact {
             .tensor(name)
             .and_then(|t| t.locate())
             .map(|at| at.offset)
-            .map_err(zt)
+            .map_err(Error::from)
     }
 
     /// Whether a tensor's bytes still match the digest written with them.
@@ -407,7 +408,7 @@ impl Artifact {
             // A mismatch is a rejected file to zTensor and a cache miss here;
             // both mean the same thing to the caller, which is recompute.
             Err(err) if err.rule() == Some(ztensor::Rule::Digest) => Ok(false),
-            Err(err) => Err(zt(err)),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -514,15 +515,15 @@ fn quant_value(quant: &Quant) -> Value {
     Value::Map(vec![
         (Value::Text("name".into()), Value::Text(quant.name.clone())),
         (Value::Text("kind".into()), Value::Text(quant.kind.clone())),
-        (Value::Text("scale".into()), Value::Text(quant.scale.clone())),
+        (
+            Value::Text("scale".into()),
+            Value::Text(quant.scale.clone()),
+        ),
         (
             Value::Text("zero_point".into()),
             Value::Text(quant.zero_point.clone()),
         ),
-        (
-            Value::Text("group_size".into()),
-            signed(quant.group_size),
-        ),
+        (Value::Text("group_size".into()), signed(quant.group_size)),
         (
             Value::Text("channel_axis".into()),
             signed(quant.channel_axis),
@@ -696,7 +697,10 @@ mod tests {
 
         let artifact = Artifact::open(&path, "key-1").unwrap();
         assert_eq!(artifact.tensors().len(), 2);
-        assert_eq!(artifact.tensors()[0], tensor("a", DType::BF16, vec![3, 101], "bf16"));
+        assert_eq!(
+            artifact.tensors()[0],
+            tensor("a", DType::BF16, vec![3, 101], "bf16")
+        );
         assert_eq!(artifact.bytes(0).unwrap(), a);
         assert_eq!(artifact.bytes(1).unwrap(), b);
         assert!(artifact.verify(0).unwrap());
@@ -735,8 +739,15 @@ mod tests {
         let mut last_end = 0u64;
         for index in 0..artifact.tensors().len() {
             let offset = artifact.file_offset(index).unwrap();
-            assert_eq!(offset % 16384, 0, "payload {index} does not begin on a page");
-            assert!(offset >= last_end, "payload {index} runs into its neighbour");
+            assert_eq!(
+                offset % 16384,
+                0,
+                "payload {index} does not begin on a page"
+            );
+            assert!(
+                offset >= last_end,
+                "payload {index} runs into its neighbour"
+            );
             last_end = offset + artifact.bytes(index).unwrap().len() as u64;
         }
         std::fs::remove_dir_all(&dir).ok();

@@ -43,7 +43,7 @@ use crate::types::{
 /// A `.zt` root that names shards brings them along; every other format is one
 /// file that describes itself.
 pub fn parse_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
-    describe(&ztensor_compat::index(path).map_err(zt_err)?)
+    describe(&ztensor_compat::index(path).map_err(Error::from)?)
 }
 
 /// Opens a set of files that together hold one checkpoint.
@@ -54,7 +54,7 @@ pub fn parse_checkpoint(path: &Path) -> Result<CheckpointMetadata, Error> {
 /// rather than anything inside it. So this takes a list, and a name in two
 /// files is refused rather than resolved by precedence.
 pub fn parse_checkpoint_files(paths: &[PathBuf]) -> Result<CheckpointMetadata, Error> {
-    describe(&ztensor_compat::index_all(paths).map_err(zt_err)?)
+    describe(&ztensor_compat::index_all(paths).map_err(Error::from)?)
 }
 
 /// Turns an opened source into the loader's metadata.
@@ -79,7 +79,7 @@ fn describe(source: &Source) -> Result<CheckpointMetadata, Error> {
     let mut tensors = Vec::new();
     for tensor in source.tensors() {
         for part_name in tensor.parts() {
-            let part = tensor.part(part_name).map_err(zt_err)?;
+            let part = tensor.part(part_name).map_err(Error::from)?;
             let name = if part_name == "data" {
                 tensor.name().to_string()
             } else {
@@ -113,10 +113,6 @@ fn describe(source: &Source) -> Result<CheckpointMetadata, Error> {
         }
     }
     Ok(CheckpointMetadata { files, tensors })
-}
-
-fn zt_err(err: ztensor::Error) -> Error {
-    Error::Checkpoint(err.to_string())
 }
 
 fn checkpoint_format(label: &str) -> CheckpointFormat {
@@ -213,12 +209,33 @@ fn encoding_of(tensor: &ztensor::Tensor<'_>, part: &ztensor::Part<'_>) -> Result
     }
 
     let scheme = scheme_of(layout, attrs)?;
-    let group_size = attr_u64(attrs, "group_size")
-        .or_else(|| attr_u64(attrs, "block_size"))
-        .or_else(|| attr_u64(attrs, "elems_per_block"))
-        .unwrap_or_else(|| u64::from(scheme.default_group_size()));
-    let bits = attr_u64(attrs, "bits").unwrap_or_else(|| u64::from(scheme.default_bits()));
-    let axis = attr_u64(attrs, "axis").and_then(|a| u8::try_from(a).ok()).map(Axis);
+    let name = tensor.name();
+    // An attribute the checkpoint did not state is the scheme's default, which
+    // is a fact about the scheme. An attribute it *did* state that will not fit
+    // the loader's representation is a different thing entirely, and falling
+    // back to the default there would silently plan for a layout the file does
+    // not have — `group_size` and `bits` decide byte spans, so the planner
+    // would go on to address the wrong bytes and no one would be told.
+    let fits = |value: Option<u64>, field: &str, max: u64| -> Result<Option<u64>, Error> {
+        match value {
+            Some(v) if v > max => Err(Error::Checkpoint(format!(
+                "{name}: {field} is {v}, which the loader cannot represent (max {max})"
+            ))),
+            other => Ok(other),
+        }
+    };
+
+    let group_size = fits(
+        attr_u64(attrs, "group_size")
+            .or_else(|| attr_u64(attrs, "block_size"))
+            .or_else(|| attr_u64(attrs, "elems_per_block")),
+        "group_size",
+        u64::from(u32::MAX),
+    )?
+    .unwrap_or_else(|| u64::from(scheme.default_group_size()));
+    let bits = fits(attr_u64(attrs, "bits"), "bits", u64::from(u8::MAX))?
+        .unwrap_or_else(|| u64::from(scheme.default_bits()));
+    let axis = fits(attr_u64(attrs, "axis"), "axis", u64::from(u8::MAX))?.map(|a| Axis(a as u8));
 
     Ok(Encoding::Quant(
         QuantSpec {
@@ -226,8 +243,8 @@ fn encoding_of(tensor: &ztensor::Tensor<'_>, part: &ztensor::Part<'_>) -> Result
             // What the payload decodes to. The checkpoint does not say, and
             // every device path the loader targets decodes to BF16.
             logical_dtype: DType::BF16,
-            bits_per_element: u8::try_from(bits).unwrap_or(0),
-            group_size: u32::try_from(group_size).unwrap_or(0),
+            bits_per_element: bits as u8,
+            group_size: group_size as u32,
             channel_axis: axis,
         }
         .normalized(),
@@ -335,7 +352,7 @@ fn attr_u64(attrs: Option<&Value>, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ztensor::{cbor, DType as ZDType, Writer};
+    use ztensor::{DType as ZDType, Writer, cbor};
 
     /// Writes a file and describes it, which is the whole path this module is:
     /// zTensor's object model in, the loader's flat tensor space out.
@@ -370,6 +387,45 @@ mod tests {
         assert_eq!(tensor.span_bytes, 32);
         assert_eq!(tensor.file_offset % 65536, 0);
         assert_eq!(tensor.encoding, Encoding::Raw(DType::BF16));
+    }
+
+    /// A quant attribute the loader cannot represent is refused, not rounded.
+    ///
+    /// This is the module's own rule — a layout it has no scheme for is an
+    /// error rather than a guess — applied to the layout's *parameters*.
+    /// `group_size` and `bits` decide byte spans, so substituting a default
+    /// for a value the checkpoint actually stated would have the planner
+    /// address the wrong bytes while every test still passed.
+    #[test]
+    fn a_quant_attribute_that_does_not_fit_is_refused() {
+        for (attr, value) in [("bits", 999u64), ("group_size", 1u64 << 33), ("axis", 300)] {
+            let result = lower(attr, |w| {
+                w.object("w")
+                    .shape([32u64, 32])
+                    .layout("zt.mx/1")
+                    .attr(attr, value)
+                    .part("data")
+                    .dtype(ZDType::U8)
+                    .logical("f4_e2m1")
+                    .bytes(&[0u8; 512])
+                    .part("scales")
+                    .dtype(ZDType::U8)
+                    .logical("f8_e8m0")
+                    .bytes(&[0u8; 32])
+                    .add()
+                    .unwrap();
+            });
+            let err = result.expect_err(&format!("{attr}={value} was accepted"));
+            let text = err.to_string();
+            assert!(
+                text.contains(attr),
+                "{attr}: message does not name it: {text}"
+            );
+            assert!(
+                text.contains(&value.to_string()),
+                "{attr}: message does not say what was stated: {text}"
+            );
+        }
     }
 
     #[test]
@@ -450,10 +506,7 @@ mod tests {
                 .shape([32u64, 32])
                 .layout("zt.quant_group/1")
                 .attr("bits", 4u64)
-                .attr(
-                    "packing",
-                    cbor::map([("order", "lsb_first")]),
-                )
+                .attr("packing", cbor::map([("order", "lsb_first")]))
                 .attr(
                     "zero_point",
                     cbor::map([("form", "tensor"), ("packing", "same_as_data")]),

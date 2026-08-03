@@ -24,8 +24,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ztensor::cbor::Value;
 use ztensor::DType as ZDType;
+use ztensor::cbor::Value;
 
 use crate::error::Error;
 use crate::types::{DType, Encoding, QuantScheme, TensorDecl};
@@ -42,7 +42,10 @@ pub struct WriteTensor<'a> {
 /// layout on the object says which scheme. The one exception is MXFP4's
 /// payload, whose elements are half a byte — `f4_e2m1` says so, and the size
 /// equation the reader checks follows from it.
-fn storage_of(decl_dtype: DType, encoding: &Encoding) -> Result<(ZDType, Option<&'static str>), Error> {
+fn storage_of(
+    decl_dtype: DType,
+    encoding: &Encoding,
+) -> Result<(ZDType, Option<&'static str>), Error> {
     if let Encoding::Quant(spec) = encoding {
         return Ok(match spec.scheme {
             QuantScheme::Mxfp4E2M1E8M0 => (ZDType::U8, Some("f4_e2m1")),
@@ -183,7 +186,10 @@ fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Erro
 }
 
 fn zero_none() -> Value {
-    Value::Map(vec![(Value::Text("form".into()), Value::Text("none".into()))])
+    Value::Map(vec![(
+        Value::Text("form".into()),
+        Value::Text("none".into()),
+    )])
 }
 
 fn zero_implied(value: u64) -> Value {
@@ -210,15 +216,14 @@ pub fn write_zt(
     metadata: &BTreeMap<String, String>,
     tensors: &[WriteTensor<'_>],
 ) -> Result<(), Error> {
-    let zt_err = |err: ztensor::Error| Error::Checkpoint(err.to_string());
-
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| Error::Checkpoint(format!("cannot create {}: {err}", parent.display())))?;
+        std::fs::create_dir_all(parent).map_err(|err| {
+            Error::Checkpoint(format!("cannot create {}: {err}", parent.display()))
+        })?;
     }
     // Publication is atomic: the writer puts bytes beside the target and moves
     // them into place at the end, so a run that dies mid-write leaves nothing.
-    let mut writer = ztensor::Writer::publish(path).map_err(zt_err)?;
+    let mut writer = ztensor::Writer::publish(path).map_err(Error::from)?;
 
     if !metadata.is_empty() {
         writer.set_attributes(Value::Map(
@@ -253,9 +258,9 @@ pub fn write_zt(
         if let Some(ltype) = ltype {
             object = object.logical(ltype);
         }
-        object.bytes(tensor.bytes).add().map_err(zt_err)?;
+        object.bytes(tensor.bytes).add().map_err(Error::from)?;
     }
-    writer.finish().map_err(zt_err)?;
+    writer.finish().map_err(Error::from)?;
     Ok(())
 }
 
