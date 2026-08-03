@@ -53,7 +53,8 @@ bool load_decode_psos(RawMetalContext& ctx,
                       bool with_argmax,
                       std::string* err,
                       bool fuse_residual,
-                      bool gdn_prep) {
+                      bool gdn_prep,
+                      bool routed) {
     const std::string dir = kernels_dir.empty() || kernels_dir.back() == '/'
                                 ? kernels_dir : kernels_dir + "/";
 
@@ -81,6 +82,31 @@ bool load_decode_psos(RawMetalContext& ctx,
         // so it must be applied after the base specs above.
         want("gdn_prep.metal", "gdn_prep_bfloat16", {Kernel::GdnPrep});
         want("gdn_prep.metal", "gdn_core_recurrent_bfloat16", {Kernel::GdnCore});
+    }
+    if (routed) {
+        // A routed checkpoint's mixture, on the same kernels the llama family
+        // dispatches -- these are shared `Kernel` values and the weights for
+        // them are already keyed by kind. Compiled only when the geometry says
+        // the model has experts: a dense checkpoint never dispatches them, and
+        // compiling them anyway would let an unrelated shader error fail a load
+        // that would otherwise have worked.
+        //
+        // `SiluMul` is deliberately absent. The routed path runs it over the
+        // SORTED rows, which is the same kernel over a different extent, so the
+        // dense entry above already serves it.
+        // The routing logits are an ordinary dense matvec -- one weight, one
+        // output row per expert, no routing to speak of yet. It is loaded HERE
+        // and not alongside the dense projections above because a kind in that
+        // table is a kind every checkpoint is expected to have: a dense model
+        // has no `mlp.gate`, and claiming the kind for it makes the loader
+        // demand a tensor that does not exist.
+        want("quantized_qmv.metal", "affine_qmv_fast_bfloat16_gs_64_b_4", {Kernel::LlRouter});
+        want("gptoss.metal", "router_topk_bfloat16", {Kernel::GoRouterTopK});
+        want("moe_route.metal", "moe_route_sort", {Kernel::LlMoeSort});
+        want("moe_route.metal", "moe_route_gather", {Kernel::LlMoeGather});
+        want("moe_route.metal", "moe_combine_sorted", {Kernel::LlMoeCombine});
+        want("quantized_qmv.metal", "affine_qmv_routed_bfloat16_gs_64_b_4",
+             {Kernel::LlExpertGate, Kernel::LlExpertUp, Kernel::LlExpertDown});
     }
     if (with_argmax) {
         // Device argmax + EOS-compare (I3 sampling substrate). bf16 logits = lm_head out.

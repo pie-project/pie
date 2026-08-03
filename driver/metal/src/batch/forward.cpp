@@ -892,7 +892,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // ── Compile the kernel PSOs. ──
     std::string load_err;
     if (!load_decode_psos(*ctx_, kernels_dir, psos_, /*with_argmax=*/false, &load_err,
-                          fuse_residual_, gdn_prep_)) {
+                          fuse_residual_, gdn_prep_, g_.is_moe())) {
         if (err) *err = "PSO load failed: " + load_err;
         ctx_.reset();
         return false;

@@ -18,7 +18,9 @@
 #include <string>
 
 #include "batch/forward.hpp"
+#include "model/qwen3_5/decode_step.hpp"
 #include "model/qwen3_5/geometry_facts.hpp"
+#include "model/shared_kernels.hpp"
 
 using pie::metal::DecodeGeometry;
 using pie::metal::geometry_from_facts;
@@ -163,14 +165,19 @@ void check_what_is_refused() {
     }
 }
 
+// The same checkpoint with its mixture declared. Qwen3-Next routes 10 of 512
+// experts through a 512-wide FFN, and shares the rest of its shape with the
+// dense fixture -- which is the point: the two differ in the mixture alone.
+Facts qwen3_next_routed() {
+    Facts f = qwen3_next();
+    f.n_experts = 512;
+    f.experts_per_token = 10;
+    f.moe_intermediate = 512;
+    return f;
+}
+
 void check_the_routed_ffn_is_bounded_by_what_the_kernels_do() {
-    const auto routed = [] {
-        Facts f = qwen3_next();
-        f.n_experts = 512;
-        f.experts_per_token = 10;
-        f.moe_intermediate = 512;
-        return f;
-    };
+    const auto routed = [] { return qwen3_next_routed(); };
     {
         DecodeGeometry g{};
         std::string err;
@@ -242,6 +249,92 @@ void check_the_routed_ffn_is_bounded_by_what_the_kernels_do() {
     }
 }
 
+// What the routed FFN actually costs in dispatches, and that the rest of the
+// layer does not notice it.
+//
+// The two FFN shapes are checked against EACH OTHER rather than against a
+// remembered dispatch count, because the number that matters is the delta: a
+// routed layer replaces the dense mixture and changes nothing above it. A
+// pinned total would have to be re-pinned every time attention changed, and
+// re-pinning a number is how a test stops being a question.
+void check_the_routed_ffn_replaces_the_dense_one_and_nothing_else() {
+    std::printf("\n-- the routed FFN, in the DAG --\n");
+    using pie::metal::Dispatch;
+    using pie::metal::Kernel;
+
+    std::string err;
+    DecodeGeometry dense{};
+    expect(geometry_from_facts(qwen3_next(), dense, &err), "dense geometry builds");
+    DecodeGeometry moe{};
+    expect(geometry_from_facts(qwen3_next_routed(), moe, &err), "routed geometry builds");
+
+    const auto d_dag = pie::metal::build_decode_dag(dense);
+    const auto m_dag = pie::metal::build_decode_dag(moe);
+
+    auto count = [](const std::vector<Dispatch>& dag, Kernel k) {
+        int n = 0;
+        for (const auto& d : dag) n += (d.kind == k);
+        return n;
+    };
+
+    // The mixture's own dispatches: absent from a dense stack entirely, and one
+    // per layer in a routed one. If any of these were emitted unconditionally
+    // the dense model would dispatch a router it has no weights for.
+    const Kernel routed_only[] = {Kernel::LlRouter,      Kernel::GoRouterTopK,
+                                  Kernel::LlMoeSort,     Kernel::LlMoeGather,
+                                  Kernel::LlExpertGate,  Kernel::LlExpertUp,
+                                  Kernel::LlExpertDown,  Kernel::LlMoeCombine};
+    for (Kernel k : routed_only) {
+        expect(count(d_dag, k) == 0, "a dense stack dispatches no part of a mixture");
+        expect(count(m_dag, k) == moe.n_layers, "a routed stack routes every layer");
+    }
+    // And the dense projections are gone, not merely joined -- a routed layer
+    // that still ran `mlp.gate_proj` would be reading a tensor the checkpoint
+    // does not have.
+    for (Kernel k : {Kernel::QmvGate, Kernel::QmvUp, Kernel::QmvDown}) {
+        expect(count(d_dag, k) == dense.n_layers, "a dense stack keeps its own projections");
+        expect(count(m_dag, k) == 0, "a routed stack drops the dense projections");
+    }
+    // `SiluMul` is shared: one per layer either way, over a different extent.
+    // It is the one kernel the two shapes have in common, and the reason the
+    // routed PSO table does not compile a second copy of it.
+    expect(count(d_dag, Kernel::SiluMul) == dense.n_layers &&
+               count(m_dag, Kernel::SiluMul) == moe.n_layers,
+           "both shapes run one SiluMul per layer");
+
+    // Everything above the FFN is untouched. Attention is where this family
+    // differs from every other one, and the mixture is not allowed to perturb
+    // it -- a hybrid stack whose GDN/full split moved when experts appeared
+    // would be a different model wearing the same config.
+    for (Kernel k : {Kernel::GdnCore, Kernel::Sdpa, Kernel::QmvQ, Kernel::FfnRms}) {
+        expect(count(d_dag, k) == count(m_dag, k),
+               "the mixture does not disturb what runs above it");
+    }
+
+    // The residual has to survive the swap. The dense tail can fuse the add
+    // into `down_proj`; `moe_combine_sorted` has no such fusion, so a routed
+    // layer must still emit the standalone add -- and if it did not, every
+    // layer's input would be dropped and the model would still produce text.
+    const auto m_fused = pie::metal::build_decode_dag(moe, false, /*fuse_residual=*/true);
+    expect(count(m_fused, Kernel::LayerOut) == moe.n_layers,
+           "a routed layer adds its residual even when the dense tail would fuse it");
+
+    // The projections run on the SORTED rows, not on the token. At M=1 the
+    // sort is a pure grouping -- one row per (token, slot) pair, no padding --
+    // so a routed matvec is `experts_per_token` times as wide as a dense one.
+    // Launching it at the dense extent would compute slot 0 and leave the rest
+    // of the pool holding whatever the previous layer wrote.
+    const int pairs = moe.experts_per_token;
+    const int sorted = pie::metal::shared_kernels::moe_sorted_rows(pairs, moe.n_experts);
+    expect(sorted == pairs, "at M=1 the sort pads nothing");
+    for (const auto& d : m_dag) {
+        if (d.kind != Kernel::LlExpertGate) continue;
+        expect(d.grid.x == 32u * static_cast<std::uint32_t>(sorted),
+               "a routed projection is launched over every (token, slot) pair");
+        break;
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -250,6 +343,7 @@ int main() {
     check_head_dim_is_derived_only_when_it_can_be();
     check_what_is_refused();
     check_the_routed_ffn_is_bounded_by_what_the_kernels_do();
+    check_the_routed_ffn_replaces_the_dense_one_and_nothing_else();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

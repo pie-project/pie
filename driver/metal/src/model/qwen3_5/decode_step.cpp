@@ -16,6 +16,7 @@
 
 #include "decode_step.hpp"
 #include "decode_dispatch.hpp"
+#include "../shared_kernels.hpp"
 
 namespace pie::metal {
 
@@ -107,14 +108,54 @@ std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax
             if (fuse_residual) dag.back().fuse_residual = true;
             else emit(Kernel::Residual, L, resid());
         }
-        // SwiGLU MLP (6, every layer): ffn_norm, gate_proj, up_proj, swiglu, down_proj, layer_out.
-        emit(Kernel::FfnRms,   L, rms(g.hidden, 1));
-        emit(Kernel::QmvGate,  L, qmv(g.intermediate));
-        emit(Kernel::QmvUp,    L, qmv(g.intermediate));
-        { LD l; silu_mul_dispatch(g.intermediate, l.grid, l.tg); emit(Kernel::SiluMul, L, l); }
-        emit(Kernel::QmvDown,  L, qmv(g.hidden));
-        if (fuse_residual) dag.back().fuse_residual = true;
-        else emit(Kernel::LayerOut, L, resid());
+        // The FFN, in one of two shapes. Everything above this line is the
+        // same either way -- the routed and dense members of this family differ
+        // in the mixture and in nothing else, which is why they are one family
+        // and not two.
+        emit(Kernel::FfnRms, L, rms(g.hidden, 1));
+        if (g.is_moe()) {
+            // The same nine dispatches and the same kernels the llama family's
+            // mixture runs. They are shared `Kernel` values, and the weights
+            // for them are already keyed by kind in `weights_for_kind`, so
+            // what this family was missing was the DAG and not the machinery.
+            //
+            // The sort is what makes the projections tractable: each of the
+            // three reads a DIFFERENT weight matrix per (token, slot) pair, so
+            // grouping the pairs by expert makes one expert's rows contiguous
+            // and a contiguous run against one weight slice is the matmul the
+            // driver already has. At M=1 it is a grouping with no padding and
+            // the projections stay matvecs, which is deliberate: one dataflow
+            // for both, so the batched path is not a second implementation.
+            const int pairs = g.experts_per_token;
+            const int sorted = shared_kernels::moe_sorted_rows(pairs, g.n_experts);
+            emit(Kernel::LlRouter, L, qmv(g.n_experts));
+            { LD l; shared_kernels::router_topk_dispatch(g.n_experts, l.grid, l.tg);
+              emit(Kernel::GoRouterTopK, L, l); }
+            { LD l; shared_kernels::moe_route_sort_dispatch(g.n_experts, l.grid, l.tg);
+              emit(Kernel::LlMoeSort, L, l); }
+            { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, sorted, l.grid, l.tg);
+              emit(Kernel::LlMoeGather, L, l); }
+            { LD l; shared_kernels::routed_qmv_dispatch(g.moe_intermediate, 1, l.grid, l.tg,
+                                                        sorted);
+              emit(Kernel::LlExpertGate, L, l); }
+            { LD l; shared_kernels::routed_qmv_dispatch(g.moe_intermediate, 1, l.grid, l.tg,
+                                                        sorted);
+              emit(Kernel::LlExpertUp, L, l); }
+            { LD l; shared_kernels::moe_route_rows_dispatch(g.moe_intermediate, sorted,
+                                                            l.grid, l.tg);
+              emit(Kernel::SiluMul, L, l); }
+            { LD l; shared_kernels::routed_qmv_dispatch(g.hidden, 1, l.grid, l.tg, sorted);
+              emit(Kernel::LlExpertDown, L, l); }
+            { LD l; shared_kernels::moe_route_rows_dispatch(g.hidden, 1, l.grid, l.tg);
+              emit(Kernel::LlMoeCombine, L, l); }
+        } else {
+            emit(Kernel::QmvGate,  L, qmv(g.intermediate));
+            emit(Kernel::QmvUp,    L, qmv(g.intermediate));
+            { LD l; silu_mul_dispatch(g.intermediate, l.grid, l.tg); emit(Kernel::SiluMul, L, l); }
+            emit(Kernel::QmvDown,  L, qmv(g.hidden));
+            if (fuse_residual) dag.back().fuse_residual = true;
+        }
+        if (!fuse_residual || g.is_moe()) emit(Kernel::LayerOut, L, resid());
     }
 
     // TAIL: final_norm, lm_head (logits ALWAYS produced, I3), [optional] device argmax.

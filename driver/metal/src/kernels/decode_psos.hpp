@@ -26,7 +26,10 @@ bool load_decode_psos(RawMetalContext& ctx,
                       bool with_argmax = false,
                       std::string* err = nullptr,
                       bool fuse_residual = false,
-                      bool gdn_prep = false);
+                      bool gdn_prep = false,
+                      /// Compile the routed mixture's kernels. Only a
+                      /// checkpoint whose geometry has experts dispatches them.
+                      bool routed = false);
 
 // ── M>1 multi-batch PSOs (beta, multi-batch lane) ─────────────────────────────
 // The 4 kernel kinds whose M>1 form differs from the M=1 PSO (the rest just grid-widen
