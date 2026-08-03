@@ -201,14 +201,14 @@ void copy_extent(
 }
 
 
-/// Where a load's wall clock went, printed when `PIE_METAL_LOAD_TRACE` is set.
+/// Where a load's wall clock went. Disabled; `on` is a compile-time false.
 ///
 /// Staging a stock gpt-oss checkpoint runs two transforms over twenty billion
 /// weights, and "the load is slow" is not a statement anyone can act on: the
 /// question is always whether the time is in the arithmetic, in the file, or in
 /// the allocator. This answers it without a profiler.
 struct LoadTrace {
-    bool on = std::getenv("PIE_METAL_LOAD_TRACE") != nullptr;
+    bool on = false;
     double scratch_alloc_ms = 0, scratch_free_ms = 0;
     double extent_ms = 0, bulk_ms = 0, scale_ms = 0, encode_ms = 0;
     std::uint64_t scale_out_bytes = 0, encode_in_bytes = 0, scratch_bytes = 0;
@@ -697,11 +697,9 @@ StagedWeights stage_plan_weights(
         const auto layout = pie_loader::stream_pack_layout(std::move(entries));
         for (const auto& e : layout.entries) pack_offset[e.id] = e.offset;
 
-        const char* dir = std::getenv("PIE_METAL_STREAM_DIR");
         std::error_code ec;
         const std::filesystem::path root =
-            dir != nullptr ? std::filesystem::path(dir)
-                           : std::filesystem::temp_directory_path() / "pie-metal-stream";
+            std::filesystem::temp_directory_path() / "pie-metal-stream";
         std::filesystem::create_directories(root, ec);
         const std::string key = pie_loader::bytes_to_string(load_plan.cache_key);
         auto pack = std::make_shared<pie_loader::StreamPack>(

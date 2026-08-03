@@ -955,7 +955,7 @@ class Context::Impl {
         // ABI v14 says a frame carries k steps the driver runs as one closed
         // system. Whether the engine actually sends k > 1 decides whether the
         // per-step host round trip is the driver's to remove or the engine's.
-        if (std::getenv("PIE_METAL_FRAME_TRACE") != nullptr) {
+        if constexpr (false) {
             // Whether a step's tokens come off the device decides whether a
             // non-tail step could commit without waiting. Measured: every step
             // carries HOST token ids (device=0 host=256), so `commit_step_async`

@@ -277,9 +277,8 @@ LoadedModel LoadedModel::load(
     // inventory (an undeclared family demands nothing at all).
     WeightStoreBuilder(e.weights_).reserve(planned_load.planned_tensor_count);
     const auto load_view = planned_load.plan.view();
-    if (const char* dump_path =
-            std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
-        dump_path && dump_path[0] != '\0') {
+    if constexpr (false) {
+        const char* dump_path = nullptr;
         std::ofstream out(dump_path);
         if (!out) {
             throw std::runtime_error(
@@ -333,8 +332,7 @@ LoadedModel LoadedModel::load(
             std::move(planned_load.quant_attachments));
         log_stage("materialize LoadPlan begin");
         LoadExecutionStats load_memory_stats;
-        const bool sample_load_memory =
-            verbose || std::getenv("PIE_CUDA_PROFILE_LOAD_MEMORY") != nullptr;
+        const bool sample_load_memory = verbose;
         LoadMemorySampler load_memory_sampler{.stats = &load_memory_stats};
         if (sample_load_memory) {
             LoadMemorySampler::sample(&load_memory_sampler);
@@ -427,8 +425,7 @@ LoadedModel LoadedModel::load(
                   << " MiB across "
                   << materialized.cuda_memory_samples << " samples\n";
     }
-    if (const char* profile = std::getenv("PIE_LOAD_EXECUTOR_PROFILE");
-        profile != nullptr && profile[0] != '\0' && profile[0] != '0') {
+    if constexpr (false) {
         const auto to_mib = [](std::uint64_t bytes) {
             return bytes / (1024ull * 1024ull);
         };

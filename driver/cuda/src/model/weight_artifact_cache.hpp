@@ -114,10 +114,7 @@ inline bool read_weight_artifact_cache(
 
     const bool verify =
         std::getenv("PIE_CUDA_WEIGHT_CACHE_NO_VERIFY") == nullptr;
-    const bool profile = []{
-        const char* p = std::getenv("PIE_LOAD_EXECUTOR_PROFILE");
-        return p != nullptr && p[0] != '\0' && p[0] != '0';
-    }();
+    constexpr bool profile = false;
     const auto t0 = std::chrono::steady_clock::now();
 
     // A local lane pool sized like the cold reader path; restore streams the

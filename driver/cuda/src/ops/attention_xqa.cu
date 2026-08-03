@@ -111,12 +111,7 @@ bool xqa_ratio_supported(int ratio) {
     return ratio == 2 || ratio == 4 || ratio == 5 || ratio == 8;
 }
 
-bool xqa_gqa2_page16_enabled() {
-    const char* env = std::getenv("PIE_CUDA_XQA_GQA2_P16");
-    if (!env) return false;
-    return env[0] == '1' || env[0] == 'y' || env[0] == 'Y' ||
-           env[0] == 't' || env[0] == 'T';
-}
+bool xqa_gqa2_page16_enabled() { return false; }
 
 }  // namespace
 

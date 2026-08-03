@@ -937,8 +937,8 @@ CudaMemoryPlan plan_cuda_memory(
     // Planner introspection: the selected plan alone cannot tell you WHY it
     // won, nor what the score-ranked runner-up was. Both are needed to judge
     // whether an override is load-bearing or dead weight.
-    if (const char* dump = std::getenv("PIE_CUDA_PLANNER_DUMP")) {
-        const int want = std::max(1, std::atoi(dump));
+    if constexpr (false) {
+        const int want = 1;
         std::vector<const Candidate*> ranked;
         ranked.reserve(candidates.size());
         for (const auto& c : candidates) ranked.push_back(&c);

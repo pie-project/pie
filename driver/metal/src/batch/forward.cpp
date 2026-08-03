@@ -1812,7 +1812,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
 
     const auto step_t0 = std::chrono::steady_clock::now();
     if (!schedule.is_pure_decode) {
-        if (std::getenv("PIE_METAL_PREFILL_TRACE") == nullptr)
+        if constexpr (true)
             return run_prefill_step(schedule, in, err, ptir);
         // Whether prompts are spread out in time or arriving together and just
         // not being grouped is the difference between a scheduler problem and a
@@ -1889,7 +1889,7 @@ bool MetalExecutor::Impl::run_batch_step(const BatchSchedule& schedule, const Ba
     // driver's per-step CPU with nothing else folded in.  It reads 0.013ms at 32
     // lanes, which is how the search for a throughput gap was steered away from
     // the driver and into the engine.
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double sum[2][33] = {};
         static double wall[33] = {};
         static double enc[33] = {};
@@ -2025,7 +2025,7 @@ bool MetalExecutor::Impl::run_prefill_step(
         return fail("Metal command timed out before its completion fence");
     // Prefill meter.  Prefill fires are few and long, so the per-row cost is what
     // compares across arms -- a raw total confuses "faster" with "shorter prompt".
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double ms[2] = {};
         static double rows[2] = {};
         static double enc[2] = {};
@@ -3336,7 +3336,7 @@ bool MetalExecutor::run_simple_batch_forward(const std::vector<MemberForwardDesc
     // Without it a question like "what bounds gpt-oss in a batch" can only be
     // answered from the outside, where the driver's time and the engine's are
     // added together.
-    if (std::getenv("PIE_METAL_GPU_METER") != nullptr) {
+    if constexpr (false) {
         static double gpu[33] = {};
         static double enc[33] = {};
         static double wall[33] = {};
