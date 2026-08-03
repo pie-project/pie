@@ -20,6 +20,7 @@
 #include <string>
 #include <algorithm>
 #include <functional>
+#include <chrono>
 #include <vector>
 
 #include <unistd.h>
@@ -152,6 +153,52 @@ int main() {
     expect(single.completed && !single.gpu_error, "run_step still completes cleanly");
     expect(static_cast<const std::uint32_t*>(outs[0].contents_ptr)[7] == 1000u + 7u,
            "run_step wrote the expected value");
+
+    // ── Abandoning a wait ────────────────────────────────────────────────────
+    //
+    // A GPU that never signals used to be invisible. `run_steps` retried the
+    // five-second wait in a bare `while` loop, so the driver sat inside
+    // `waitUntilSignaledValue` indefinitely and printed nothing -- twenty-two
+    // minutes of it, on the checkpoint that sent this here. Meanwhile
+    // `StepTiming::timed_out` meant "the FIRST probe expired", which a slow but
+    // perfectly healthy step also does, and the one caller that acted on it
+    // killed the load for being slow. The reporting existed; the loop made it
+    // unreachable.
+    //
+    // Kept last in this file on purpose: it ends the context. Abandoning a wait
+    // does not abandon the command buffer, and `[allocator reset]` requires
+    // every buffer drawn from it to have completed -- so a context that stopped
+    // waiting can never encode again, and says so rather than resetting an
+    // allocator out from under live work.
+    std::printf("[abandoning a wait]\n");
+    ctx->force_next_wait_timeout_for_test();
+    const auto before = std::chrono::steady_clock::now();
+    const StepTiming abandoned = ctx->run_step([&](StepEncoder& se) {
+        se.set_pso(pso);
+        se.set_argtable_ordinal(0);
+        se.dispatch(Grid{kElems, 1, 1}, Threadgroup{32, 1, 1});
+    });
+    expect(!abandoned.succeeded(), "a wait the driver gave up on is not a success");
+    expect(abandoned.timed_out, "and it says so: timed_out");
+    expect(!abandoned.completed,
+           "and does NOT claim completed -- the fence was never observed");
+
+    const StepTiming after = ctx->run_step([&](StepEncoder& se) {
+        se.set_pso(pso);
+        se.set_argtable_ordinal(0);
+        se.dispatch(Grid{kElems, 1, 1}, Threadgroup{32, 1, 1});
+    });
+    expect(!after.succeeded() && after.timed_out,
+           "every later step on that context fails too, rather than resetting an "
+           "allocator whose command buffers may still be running");
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before)
+            .count();
+    // Both calls above are the give-up path. If the second one had gone back to
+    // the queue it would have spent the whole budget, which is a minute.
+    expect(elapsed_ms < 1000.0,
+           "and fails immediately rather than spending the budget again (" +
+               std::to_string(int(elapsed_ms)) + " ms)");
 
     return finish("commit_batch_feedback_test");
 }

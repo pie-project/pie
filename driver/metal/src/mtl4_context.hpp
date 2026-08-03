@@ -89,7 +89,14 @@ struct StepTiming {
     // the time the step returned -- it is delivered asynchronously.
     double gpu_ms      = 0.0;
     bool completed = false;    // event fence reached; command resources may be released
-    bool timed_out = false;    // the initial bounded wait expired before the fence
+    // The driver stopped waiting for the fence. It used to mean "the first
+    // five-second probe expired", which a slow-but-healthy step also does --
+    // so the one caller that acted on it killed slow steps, while a step that
+    // never completed was retried forever and reported nothing at all. It now
+    // means the wait was abandoned, `completed` is false, and the context is
+    // finished: its command buffers may still be running, so no allocator it
+    // owns can be reset.
+    bool timed_out = false;
     bool gpu_error = false;    // commit feedback reported a GPU-side error
     // What the GPU said, when it said anything. `gpu_error` alone sent every
     // caller to the same "timed out before its completion fence" message, so a
@@ -384,22 +391,12 @@ class RawMetalContext {
     // Most recent Metal 4 commit feedback (GPU-measured timing, GPU-side error).
     // Delivered asynchronously, so it may lag the last committed step.
     GpuCommitFeedback last_commit_feedback() const;
+    // Makes the next wait abandon immediately rather than spend its budget, so
+    // the abandon path can be tested without a wedged GPU or a minute of
+    // waiting. The context is genuinely finished afterwards, exactly as it
+    // would be in the real case.
     void force_next_wait_timeout_for_test();
 
-    // ── Pipelined async commit (downclock-ceiling prototype) ──
-    // Encode+commit a step WITHOUT waiting for completion (returns the signalled event value),
-    // so the next step's commit follows back-to-back and the GPU never drains between steps.
-    // The device-fed NextToken removes the host dependency, making this safe in principle; the
-    // caller is responsible for the WAR hazard on per-step-mutated argtables/IO (the prototype
-    // keeps binds constant = timing-only, valid for the clock question since GPU work is
-    // identical regardless of data). Pair with sync_event() to bound in-flight / drain.
-    uint64_t commit_step_async(const std::function<void(StepEncoder&)>& encode_fn, int ab = 0);
-    // As above, but the committed CB waits for `wait_value` on the queue timeline before it
-    // executes (GPU-side serialization for the autoregressive single-stream dependency).
-    uint64_t commit_step_async_dep(const std::function<void(StepEncoder&)>& encode_fn, int ab,
-                                   uint64_t wait_value);
-    // Wait until the queue has signalled >= value (bounds in-flight to `depth` and final drain).
-    void     sync_event(uint64_t value);
     uint64_t last_event() const;
 
     // ── Continuous-async GPU keepalive (downclock proof-of-ceiling) ──

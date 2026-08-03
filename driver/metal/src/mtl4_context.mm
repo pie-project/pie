@@ -134,6 +134,8 @@ struct RawMetalContext::Impl {
     bool saw_ptir_compile = false;
     bool last_ptir_fast_math_disabled = false;
     std::atomic<bool> force_wait_timeout_once{false};
+    // Set when a wait was abandoned. Sticky: see run_steps.
+    bool wedged = false;
 
     // Standalone-buffer allocation accounting (all non-heap buffers,
     // including buffers retained by the transient pool).
@@ -194,6 +196,9 @@ struct RawMetalContext::Impl {
 
     id<MTL4ArgumentTable> argtable_for(int ordinal, bool create);
     void collect_elastic_releases();
+    // Wait for the queue to reach `value`, bounded. False means the driver
+    // gave up and the context is finished; see the definition.
+    bool await_event(uint64_t value);
     void drain_mapping_through(uint64_t value);
     uint64_t schedule_mapping(
         id<MTLBuffer> buffer,
@@ -238,10 +243,50 @@ void RawMetalContext::Impl::collect_elastic_releases() {
     pending_elastic_releases.erase(out, pending_elastic_releases.end());
 }
 
+// How long the driver waits for a completion fence before it stops waiting.
+// Split into probes so a step that is merely slow is still counted as slow the
+// moment it passes the first one, while the budget is what decides to stop.
+//
+// A step here is a command buffer for one token or one prefill chunk, and the
+// slowest measured on this machine -- a 192-token prefill through a 30B
+// mixture -- is about 200 ms. Two orders of magnitude past that is not a slow
+// GPU; it is one that is not coming back, and waiting on it produced no
+// diagnostic whatsoever. The symptom that brought this here was twenty-two
+// minutes of silence inside `waitUntilSignaledValue`, with the driver's own
+// "timed out before its completion fence" message sitting unreachable behind
+// a bare retry loop.
+static constexpr int kWaitProbeMs = 5000;
+static constexpr int kWaitProbes  = 12;
+
+bool RawMetalContext::Impl::await_event(uint64_t value) {
+    if (event == nil) return true;
+    for (int probe = 0; probe < kWaitProbes; ++probe) {
+        if (force_wait_timeout_once.exchange(false)) break;
+        if ([event waitUntilSignaledValue:value timeoutMS:kWaitProbeMs]) return true;
+        if (probe == 0) m0_timing_counters().record_forward_wait_timeout();
+    }
+    // Sticky. A command buffer that has not signalled may still be executing,
+    // and both things this driver does after a wait -- resetting the allocator
+    // a buffer was drawn from, and releasing the heaps it reads -- are unsafe
+    // while that is true. There is no way back from here, so say so once and
+    // refuse everything after, rather than waiting forever in silence.
+    if (!wedged) {
+        wedged = true;
+        fprintf(stderr,
+                "[pie-metal] the GPU did not reach event %llu within %d ms; this context is "
+                "abandoned because its command buffers may still be running\n",
+                (unsigned long long)value, kWaitProbes * kWaitProbeMs);
+    }
+    return false;
+}
+
 void RawMetalContext::Impl::drain_mapping_through(uint64_t value) {
-    if (value != 0 && event != nil) {
-        while (![event waitUntilSignaledValue:value timeoutMS:5000]) {
-        }
+    if (value != 0 && !await_event(value)) {
+        // Deliberately NOT collecting: `collect_elastic_releases` hands heaps
+        // back, and the wait that would have proved nothing is still reading
+        // them is the one that just failed. Leaking them is the safe half of a
+        // bad situation; the destructor that used to sit here forever was not.
+        return;
     }
     collect_elastic_releases();
 }
@@ -1791,6 +1836,10 @@ StepTiming RawMetalContext::run_steps(
     auto& I = *impl_;
     StepTiming tm;
     ab &= 1;
+    if (I.wedged) {
+        tm.timed_out = true;
+        return tm;
+    }
     if (encode_fns.empty()) {
         tm.completed = true;
         return tm;
@@ -1824,19 +1873,12 @@ StepTiming RawMetalContext::run_steps(
     const uint64_t signalled = I.commit_and_signal(cbs.data(), cbs.size(), 0);
 
     const auto wait_begin = M0TimingCounters::Clock::now();
-    BOOL signaled = I.force_wait_timeout_once.exchange(false)
-                        ? NO
-                        : [I.event waitUntilSignaledValue:signalled
-                                               timeoutMS:5000];
-    tm.timed_out = signaled == NO;
-    if (tm.timed_out) {
-        m0_timing_counters().record_forward_wait_timeout();
+    if (I.await_event(signalled)) {
+        tm.completed = true;
+    } else {
+        tm.timed_out = true;
+        tm.completed = false;
     }
-    while (signaled == NO) {
-        signaled = [I.event waitUntilSignaledValue:signalled
-                                        timeoutMS:5000];
-    }
-    tm.completed = true;
     m0_timing_counters().record_forward_wait(
         M0TimingCounters::Clock::now() - wait_begin);
     double t2 = nowms();
@@ -1849,43 +1891,6 @@ StepTiming RawMetalContext::run_steps(
 
 void RawMetalContext::force_next_wait_timeout_for_test() {
     impl_->force_wait_timeout_once.store(true);
-}
-
-uint64_t RawMetalContext::commit_step_async(const std::function<void(StepEncoder&)>& encode_fn,
-                                            int ab) {
-    return commit_step_async_dep(encode_fn, ab, 0);
-}
-
-uint64_t RawMetalContext::commit_step_async_dep(const std::function<void(StepEncoder&)>& encode_fn,
-                                                int ab, uint64_t wait_value) {
-    auto& I = *impl_;
-    ab &= 1;
-    // Caller guarantees the allocator for `ab` is free (its prior step completed) via
-    // sync_event() before reuse — depth-2 pipelining over the two double-buffered allocators.
-    [I.alloc[ab] reset];
-    id<MTL4CommandBuffer> cb = [I.dev newCommandBuffer];
-    [cb beginCommandBufferWithAllocator:I.alloc[ab]];
-    [cb useResidencySet:I.rs];
-    id<MTL4ComputeCommandEncoder> en = [cb computeCommandEncoder];
-    I.step.en  = en;
-    I.step.ctx = &I;
-    StepEncoder se(&I.step);
-    encode_fn(se);
-    [en endEncoding];
-    [cb endCommandBuffer];
-    I.step.en = nil;
-    // GPU-side serialization: make this CB wait for `wait_value` (the prior step's completion)
-    // on the queue timeline before executing. This enforces the autoregressive token dependency
-    // (single-stream steps CANNOT overlap on the GPU) while keeping the HOST non-blocking, so
-    // the host CB-build for step i+1 overlaps GPU(i) and step i+1 starts the instant i finishes
-    // (zero host gap -> holds the clock). Without it the GPU overlaps independent CBs = the
-    // throughput regime, not single-stream.
-    return I.commit_and_signal(&cb, 1, wait_value);
-}
-
-void RawMetalContext::sync_event(uint64_t value) {
-    while (![impl_->event waitUntilSignaledValue:value timeoutMS:5000]) {
-    }
 }
 
 uint64_t RawMetalContext::last_event() const { return impl_->ev_val; }

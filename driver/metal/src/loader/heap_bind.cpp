@@ -359,9 +359,16 @@ class TranscodeGpu {
             encoder.set_argtable_ordinal(ordinal);
             encoder.dispatch(Grid{threads, 1, 1}, Threadgroup{width, 1, 1});
         });
-        if (timing.timed_out) {
+        if (!timing.succeeded()) {
+            // This used to read `timing.timed_out`, back when that meant "took
+            // longer than five seconds" -- so a transform over a large expert
+            // bank on a busy machine was killed for being slow, and one that
+            // genuinely never finished was waited on forever instead. It now
+            // means the driver gave up, which is the thing worth throwing on.
             throw std::runtime_error(
-                "metal storage executor: a load-time transform did not complete");
+                "metal storage executor: a load-time transform did not complete" +
+                (timing.gpu_error_text.empty() ? std::string()
+                                               : ": " + timing.gpu_error_text));
         }
         return true;
     }
