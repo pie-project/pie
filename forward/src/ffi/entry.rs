@@ -73,6 +73,10 @@ pub struct PieForwardLlamaLikeFacts {
     pub fused_qkv: u8,
     /// The lm_head weight is the embedding table; non-zero is true.
     pub tied_embeddings: u8,
+    /// Qwen-2 family attention biases (`{q,k,v}_proj.bias` bound and
+    /// added to the raw projections); non-zero is true. Appended field:
+    /// existing zero-initialized C callers read as false.
+    pub qkv_bias: u8,
 }
 
 /// Validate the C facts into the tracer's own type.
@@ -102,6 +106,7 @@ fn read_facts(facts: &PieForwardLlamaLikeFacts) -> Result<LlamaLikeFacts, PieFor
         qk_norm,
         fused_qkv: facts.fused_qkv != 0,
         tied_embeddings: facts.tied_embeddings != 0,
+        qkv_bias: facts.qkv_bias != 0,
     })
 }
 

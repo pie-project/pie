@@ -78,6 +78,13 @@ pub struct LlamaLikeFacts {
     pub fused_qkv: bool,
     /// The lm_head weight is the embedding table (weight tying).
     pub tied_embeddings: bool,
+    /// Qwen-2 family attention biases: the checkpoint ships
+    /// `{q,k,v}_proj.bias` and the forward adds them to the raw
+    /// projections (after the lora correction, before norms/rope — the
+    /// hand-written `maybe_add_bias` position). Serde-defaulted so
+    /// pre-bias facts JSON reads back unchanged (append-only discipline).
+    #[serde(default)]
+    pub qkv_bias: bool,
 }
 
 impl LlamaLikeFacts {
@@ -87,6 +94,38 @@ impl LlamaLikeFacts {
 
     pub fn kv_width(&self) -> u32 {
         self.kv_heads * self.head_dim
+    }
+
+    /// Qwen2.5-1.5B-Instruct (Qwen/Qwen2.5-1.5B-Instruct config.json):
+    /// the fifth llama_like configuration, and the first with attention
+    /// biases (`qkv_bias: true` — Qwen2ForCausalLM binds
+    /// `{q,k,v}_proj.bias` and the forward adds them to the raw
+    /// projections; the AddBias rung). GQA (12 q / 2 kv heads), head_dim
+    /// 128 (hidden 1536 / 12 — no config key; the derivation matches the
+    /// driver's), no qk-norm, tied embeddings (`tie_word_embeddings:
+    /// true`). `rope_theta: 1e6` and `sliding_window` (unused:
+    /// `use_sliding_window: false`) are backend cfg the trace
+    /// deliberately lacks. `fused_qkv: true` is the binding fact: the
+    /// checkpoint ships three raw bf16 projections under canonical names
+    /// and the dense join re-fuses the WEIGHTS (biases stay separate
+    /// tensors, added after the split — the hand-written order).
+    pub fn qwen2_5_1_5b() -> Self {
+        Self {
+            hidden: 1536,
+            layers: 28,
+            q_heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+            intermediate: 8960,
+            vocab: 151_936,
+            rope: RopeKind::Standard,
+            norm_variant: NormVariant::Plain,
+            norm_placement: NormPlacement::Pre,
+            qk_norm: QkNorm::Off,
+            fused_qkv: true,
+            tied_embeddings: true,
+            qkv_bias: true,
+        }
     }
 
     /// Qwen3-0.6B, the workspace's parity model.
@@ -105,6 +144,7 @@ impl LlamaLikeFacts {
             qk_norm: QkNorm::PerHead,
             fused_qkv: true,
             tied_embeddings: true,
+            qkv_bias: false,
         }
     }
 
@@ -139,6 +179,7 @@ impl LlamaLikeFacts {
             qk_norm: QkNorm::Off,
             fused_qkv: false,
             tied_embeddings: false,
+            qkv_bias: false,
         }
     }
 
@@ -175,6 +216,7 @@ impl LlamaLikeFacts {
             qk_norm: QkNorm::Off,
             fused_qkv: true,
             tied_embeddings: false,
+            qkv_bias: false,
         }
     }
 
@@ -222,6 +264,7 @@ impl LlamaLikeFacts {
             qk_norm: QkNorm::Global,
             fused_qkv: false,
             tied_embeddings: false,
+            qkv_bias: false,
         }
     }
 }

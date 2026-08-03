@@ -145,6 +145,9 @@ enum class PieForwardOpKind : uint32_t {
   /// `param0`, tail-region count in `param1`; the split is the
   /// fire's hook-free prefix row count, a runtime input.
   Peel = 26,
+  /// Broadcast bias add over `[rows, width]` (Qwen-2 family qkv
+  /// biases): weight name in `name`, width from the value's shape.
+  AddBias = 27,
 };
 
 /// Mirrors [`crate::trace::NormVariant`].
@@ -259,6 +262,10 @@ struct PieForwardLlamaLikeFacts {
   uint8_t fused_qkv;
   /// The lm_head weight is the embedding table; non-zero is true.
   uint8_t tied_embeddings;
+  /// Qwen-2 family attention biases (`{q,k,v}_proj.bias` bound and
+  /// added to the raw projections); non-zero is true. Appended field:
+  /// existing zero-initialized C callers read as false.
+  uint8_t qkv_bias;
 };
 
 /// One symbolic extent. `value` is meaningful only under

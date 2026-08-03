@@ -298,6 +298,13 @@ pub enum OpKind {
         weight: String,
         variant: NormVariant,
     },
+    /// Broadcast bias add over `[rows, width]`: `x[r, :] += bias`. The
+    /// Qwen-2 family's attention biases (`{q,k,v}_proj.bias`), applied to
+    /// the raw projections after the lora correction and before
+    /// norms/rope — the hand-written `maybe_add_bias` position
+    /// (llama_like.cpp). The kernel is 1:1 (`launch_add_bias_bf16`), so
+    /// the semantic and lowered traces state the same op.
+    AddBias { weight: String },
     /// Per-head RMSNorm of packed `[rows, heads * head_dim]` Q or K.
     /// `variant` selects the weight fold exactly as on [`OpKind::Rmsnorm`]:
     /// qwen3/olmo-style checkpoints multiply `w` directly (`Plain`), while
@@ -896,6 +903,17 @@ impl TraceBuilder {
             OpKind::Rmsnorm {
                 weight: weight.to_string(),
                 variant,
+            },
+            vec![x],
+            vec![(shape, DType::BF16)],
+        )[0]
+    }
+
+    pub fn add_bias(&mut self, x: ValueId, weight: &str) -> ValueId {
+        let shape = self.values[x as usize].shape.clone();
+        self.push(
+            OpKind::AddBias {
+                weight: weight.to_string(),
             },
             vec![x],
             vec![(shape, DType::BF16)],

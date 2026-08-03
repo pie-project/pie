@@ -40,6 +40,7 @@ fn c_facts_qwen3() -> PieForwardLlamaLikeFacts {
         qk_norm: PieForwardQkNorm::from(facts.qk_norm) as u32,
         fused_qkv: u8::from(facts.fused_qkv),
         tied_embeddings: u8::from(facts.tied_embeddings),
+        qkv_bias: u8::from(facts.qkv_bias),
     }
 }
 
@@ -73,6 +74,7 @@ fn expect_kind(kind: &OpKind) -> PieForwardOpKind {
         OpKind::Guard { .. } => PieForwardOpKind::Guard,
         OpKind::HookSite { .. } => PieForwardOpKind::HookSite,
         OpKind::Peel { .. } => PieForwardOpKind::Peel,
+        OpKind::AddBias { .. } => PieForwardOpKind::AddBias,
     }
 }
 
@@ -265,6 +267,7 @@ fn entry_honours_post_norm_and_global_qk_norm() {
         qk_norm: PieForwardQkNorm::from(facts.qk_norm) as u32,
         fused_qkv: u8::from(facts.fused_qkv),
         tied_embeddings: u8::from(facts.tied_embeddings),
+        qkv_bias: u8::from(facts.qkv_bias),
     };
     let mut out = PieForwardPlan::default();
     assert_eq!(

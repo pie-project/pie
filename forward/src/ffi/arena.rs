@@ -146,6 +146,13 @@ fn flatten_kind(arena: &mut PlanArena, interner: &mut Interner, kind: &OpKind) -
             0,
             PIE_FORWARD_NO_VALUE,
         ),
+        OpKind::AddBias { weight } => (
+            PieForwardOpKind::AddBias,
+            name(arena, weight),
+            0,
+            0,
+            PIE_FORWARD_NO_VALUE,
+        ),
         OpKind::RmsnormPerHead {
             weight,
             head_dim,

@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include "kernels/add_bias.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
 #include "kernels/head_dim_pad.hpp"
@@ -222,7 +223,11 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // Post-norm placement (olmo2/olmo3) is admitted: the trace carries the
     // matmul(beta=0) → rmsnorm → residual_add triplet and the executor
     // launches the hand-written post-norm block's kernels.
-    if (fwd_cfg.use_qkv_bias) return out;                      // Qwen-2 bias
+    // Qwen-2 bias is admitted (OpKind::AddBias since the qwen2_5 rung):
+    // the trace states the three broadcast adds after the lora guard and
+    // before norms/rope, the executor launches the hand-written
+    // `maybe_add_bias` kernels. Guarded below on the tensors actually
+    // being bound.
     if (fwd_cfg.tp_size > 1) return out;                       // all-reduces
     // Padded head_dim (Phi-3-mini, 96 → 128) is admitted: the pad/strip
     // launches around KV-write/attention are emitter knowledge (the trace
@@ -243,6 +248,14 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
             return out;
         }
         if ((layer.qkv_proj_fused != nullptr) != fused_qkv) return out;
+        // A bias config whose tensors did not bind would make the traced
+        // AddBias ops unlaunchable; a bias-less config with stray bias
+        // tensors would mean the fact lies the other way.
+        if (fwd_cfg.use_qkv_bias &&
+            (layer.q_bias == nullptr || layer.k_bias == nullptr ||
+             layer.v_bias == nullptr)) {
+            return out;
+        }
     }
     // q/k-norm convention, from the bound tensor shape — the same evidence
     // the hand-written `rmsnorm_qk` dispatches on, resolved once here
@@ -292,6 +305,7 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
             : PieForwardNormPlacement::Pre);
     facts.qk_norm = static_cast<std::uint32_t>(qk_norm);
     facts.fused_qkv = fused_qkv ? 1 : 0;
+    facts.qkv_bias = fwd_cfg.use_qkv_bias ? 1 : 0;
     // A binding fact, like fused_qkv: bind_llama_like aliases lm_head to
     // embed when the checkpoint ties them, so pointer equality is the truth.
     facts.tied_embeddings = (w.lm_head == w.embed) ? 1 : 0;
@@ -319,7 +333,11 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // qk_norm was resolved from the bound shapes right here).
     cuda.decode_fused_post = (decode_fused_post_enabled() &&
                               cache.format().is_native_bf16() &&
-                              cfg.head_dim == cfg.head_dim_kernel)
+                              cfg.head_dim == cfg.head_dim_kernel &&
+                              // The fused epilogue has no bias step —
+                              // the hand-written predicate's term, here
+                              // since the build gate admits bias now.
+                              !fwd_cfg.use_qkv_bias)
                                  ? 1
                                  : 0;
     // workspace.cpp:33 allocates ws.rope_table unconditionally; the
@@ -354,6 +372,7 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         "/qk" + std::to_string(facts.qk_norm) +
         "/fq" + std::to_string(facts.fused_qkv) +
         "/te" + std::to_string(facts.tied_embeddings) +
+        "/qb" + std::to_string(facts.qkv_bias) +
         "/xqa" + std::to_string(cuda.xqa_decode) +
         "/dfp" + std::to_string(cuda.decode_fused_post) +
         "/rt" + std::to_string(cuda.rope_table) +
@@ -663,6 +682,32 @@ void llama_like_forward_declared(
                 // so gather-then-norm equals norm-then-gather), and copying
                 // that block whole is what keeps the two paths bit-identical.
                 require(w.final_norm, name);
+            } else {
+                throw_unknown_weight(name);
+            }
+            break;
+        }
+        case PieForwardOpKind::AddBias: {
+            // Qwen-2 family qkv biases: broadcast add onto the raw
+            // projection, the hand-written `maybe_add_bias` calls
+            // (llama_like.cpp) argument for argument. The trace states
+            // the op after the lora guard and before norms/rope, which
+            // is exactly where the hand-written block sits.
+            const std::string_view name = plan.weight_name(op);
+            const ParsedWeightName nm = parse_weight_name(name);
+            const auto& layer = layer_of(w, nm, name);
+            if (nm.field == "q_bias") {
+                kernels::launch_add_bias_bf16(
+                    ws.q.data(), require(layer.q_bias, name)->data(),
+                    N, Hq, stream);
+            } else if (nm.field == "k_bias") {
+                kernels::launch_add_bias_bf16(
+                    ws.k.data(), require(layer.k_bias, name)->data(),
+                    N, Hk, stream);
+            } else if (nm.field == "v_bias") {
+                kernels::launch_add_bias_bf16(
+                    ws.v.data(), require(layer.v_bias, name)->data(),
+                    N, Hk, stream);
             } else {
                 throw_unknown_weight(name);
             }
@@ -1162,14 +1207,37 @@ void llama_like_forward_declared(
                 // `prefill_plan` for prefill-shaped fires and
                 // `prefill_decode_plan` for the decode-shaped
                 // force_prefill fallback — the fire's shape names which
-                // one this stated kernel runs against.
+                // one this stated kernel runs against. Under
+                // force_prefill_path prepare deliberately builds NO plan
+                // (llama_like.cpp's early return) and the hand-written
+                // body's final else runs the PLAN-LESS prefill launcher;
+                // mirror it launcher for launcher (qwen2_5, the first
+                // force-prefill deployment through the walk).
                 const ops::PrefillPlanCache* pp =
                     is_pure_decode ? prefill_decode_plan : prefill_plan;
                 if (pp == nullptr) {
-                    throw std::runtime_error(
-                        "declared forward: trace states the flashinfer "
-                        "prefill kernel but prepare built no plan for "
-                        "this fire shape");
+                    if (!fwd_cfg.force_prefill_path) {
+                        throw std::runtime_error(
+                            "declared forward: trace states the "
+                            "flashinfer prefill kernel but prepare built "
+                            "no plan for this fire shape");
+                    }
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    auto kv_view = cache.layer_view(L);
+                    ops::launch_attention_flashinfer_prefill(
+                        attn_q, kv_view, attn_out_buf,
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        qo_indptr_h, kv_page_indptr_h,
+                        N, R, num_q_heads, attn_ws, stream,
+                        layer_window_left,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    break;
                 }
                 auto kv_view = cache.layer_view(L);
                 ops::dispatch_attention_flashinfer_prefill_bf16(

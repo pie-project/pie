@@ -39,7 +39,7 @@ use crate::trace::{FireClass, ForwardPlan, NormVariant, OpKind, RopeKind};
 /// the live parity gate is what holds them together.
 pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String {
     format!(
-        "llama_like/h{}/l{}/qh{}/kvh{}/hd{}/i{}/v{}/rope{}/nv{}/np{}/qk{}/fq{}/te{}/xqa{}/dfp{}/rt{}/fpp{}",
+        "llama_like/h{}/l{}/qh{}/kvh{}/hd{}/i{}/v{}/rope{}/nv{}/np{}/qk{}/fq{}/te{}/qb{}/xqa{}/dfp{}/rt{}/fpp{}",
         facts.hidden,
         facts.layers,
         facts.q_heads,
@@ -66,6 +66,7 @@ pub fn facts_digest(facts: &LlamaLikeFacts, cuda: &LlamaLikeCudaFacts) -> String
         },
         u8::from(facts.fused_qkv),
         u8::from(facts.tied_embeddings),
+        u8::from(facts.qkv_bias),
         u8::from(cuda.xqa_decode),
         u8::from(cuda.decode_fused_post),
         u8::from(cuda.rope_table),
