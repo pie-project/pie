@@ -130,7 +130,11 @@ int expected_per_layer(const LlamaGeometry& g) {
     n += 1;                    // QmvO
     n += 1;                    // AttnResidual
     n += 1;                    // FfnNorm
-    n += g.is_moe() ? 7 : 4;   // router+topk+gate+up+silu+down+combine, or gate+up+silu+down
+    // router+topk+sort+gather+gate+up+silu+down+scatter+combine, or the dense
+    // gate+up+silu+down. The three reordering stages are what let the routed
+    // projections be matmuls: they put the rows that share an expert next to
+    // each other and put the results back.
+    n += g.is_moe() ? 10 : 4;
     n += 1;                    // FfnResidual
     return n;
 }
@@ -321,10 +325,20 @@ void check_scratch(const char* who, const LlamaGeometry& g) {
               std::string(who) + ": the logits are vocab-wide");
 
     int slotted = 0;
-    for (const ValueExtent& e : ext) if (e.rows_are_slots != 0) ++slotted;
-    // gate, up, silu-out and down-out per routed layer.
-    expect_eq(slotted, g.is_moe() ? 4 * g.n_layers : 0,
-              std::string(who) + ": only the expert stack is slot-major");
+    int sorted = 0;
+    for (const ValueExtent& e : ext) {
+        if (e.rows_are_slots != 0) ++slotted;
+        if (e.rows_are_sorted != 0) ++sorted;
+    }
+    // Only the scatter's output is in slot order now: everything between the
+    // gather and the scatter is expert-major and PADDED, which is a different
+    // and larger row count.
+    expect_eq(slotted, g.is_moe() ? 1 * g.n_layers : 0,
+              std::string(who) + ": only the combine's input is slot-major");
+    // The sort's three index outputs share one value each -- perm, row_expert,
+    // tile_expert -- plus the gather's rows, gate, up, silu-out and down-out.
+    expect_eq(sorted, g.is_moe() ? 8 * g.n_layers : 0,
+              std::string(who) + ": the sorted stack is everything between the gather and the scatter");
 
     bool sized = true;
     for (std::size_t v = 0; v < ext.size(); ++v) {
@@ -646,8 +660,8 @@ int main() {
     };
     expect_eq(n(qwen3) - n(llama3), 2 * llama3.n_layers, "qk-norm costs 2/layer (dense)");
     expect_eq(n(qwen3_moe) - n(moe_no_qknorm), 2 * llama3.n_layers, "qk-norm costs 2/layer (routed)");
-    expect_eq(n(moe_no_qknorm) - n(llama3), 3 * llama3.n_layers, "routing costs 3/layer (no qk-norm)");
-    expect_eq(n(qwen3_moe) - n(qwen3), 3 * llama3.n_layers, "routing costs 3/layer (qk-norm)");
+    expect_eq(n(moe_no_qknorm) - n(llama3), 6 * llama3.n_layers, "routing costs 6/layer (no qk-norm)");
+    expect_eq(n(qwen3_moe) - n(qwen3), 6 * llama3.n_layers, "routing costs 6/layer (qk-norm)");
 
     // `ffn_width` is the one geometry accessor the encoder trusts to pick
     // between the dense and per-expert intermediate size.

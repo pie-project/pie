@@ -947,6 +947,50 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
         return k == Kind::ExpertGate || k == Kind::ExpertUp || k == Kind::ExpertSiluMul ||
                k == Kind::ExpertDown;
     };
+
+    // The permutation the GPU actually produced, per layer.
+    //
+    // Read rather than predicted, and that is not a weakening: the sort's
+    // scatter ranks each pair with an atomic, so the order WITHIN one expert's
+    // run is whatever the threads raced to, and a host that recomputed it would
+    // be asserting an order the kernel never promised. What the kernel does
+    // promise -- that every pair gets exactly one position and that the row it
+    // lands on reads its own expert -- is checked below, and once the mapping
+    // is known the projections' arithmetic is compared element for element as
+    // before.
+    std::vector<const std::int32_t*> perm_of(std::size_t(g.n_layers), nullptr);
+    if (g.is_moe()) {
+        for (std::size_t i = 0; i < dag.size(); ++i) {
+            if (dag[i].kind != Kind::ExpertSort) continue;
+            // The sort's FIRST write is `perm`; see `build_llama_scratch`.
+            int pv = -1;
+            for (const Use& u : plan.uses) {
+                if (u.is_write && u.index == int(i) && (pv < 0 || u.value < pv)) pv = u.value;
+            }
+            if (pv < 0) continue;
+            const SlotHandle& slot = b.pool[std::size_t(col.color_of_value[std::size_t(pv)])];
+            if (slot.contents() == nullptr) continue;
+            perm_of[std::size_t(dag[i].layer)] = static_cast<const std::int32_t*>(slot.contents());
+        }
+    }
+
+    // Where token `row`'s k slots landed, as (buffer row, reference slot)
+    // pairs. Empty for a dense model or a layer whose sort was not readable,
+    // which is what puts the caller back on the flat layout.
+    const auto sorted_pairs = [&](int layer, int row) {
+        std::vector<std::pair<int, int>> out;
+        if (layer < 0 || !g.is_moe()) return out;
+        const std::int32_t* perm = perm_of[std::size_t(layer)];
+        if (perm == nullptr) return out;
+        const int kk = g.experts_per_token;
+        const int padded = llama_moe_sorted_rows(g, rows);
+        for (int pp = 0; pp < padded; ++pp) {
+            const std::int32_t sel = perm[pp];
+            if (sel >= 0 && sel / kk == row) out.push_back({pp, int(sel % kk)});
+        }
+        return out;
+    };
+
     auto compare_all = [&](const Trace& want, int row, int label, bool skip_slots = false) {
         for (std::size_t i = 0; i < dag.size(); ++i) {
             const auto it = want.find(int(i));
@@ -957,6 +1001,36 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
             const int c = col.color_of_value[std::size_t(v)];
             const SlotHandle& slot = b.pool[std::size_t(c)];
             if (slot.contents() == nullptr) continue;
+            // Between the gather and the scatter the rows are in EXPERT order,
+            // padded, so `row * width` is not where this row's slots landed.
+            // `perm` says where they did.
+            if (is_expert_sorted(dag[i].kind)) {
+                const std::size_t width =
+                    it->second.size() / std::size_t(g.experts_per_token);
+                for (const auto& pr : sorted_pairs(dag[i].layer, row)) {
+                    const std::size_t off = std::size_t(pr.first) * width;
+                    if ((off + width) * 2 > slot.size) continue;
+                    const auto* raw =
+                        static_cast<const std::uint16_t*>(slot.contents()) + off;
+                    Vec got(width);
+                    for (std::size_t e = 0; e < width; ++e) got[e] = from_bf16(raw[e]);
+                    const Vec ref_slot(it->second.begin() + std::size_t(pr.second) * width,
+                                       it->second.begin() + (std::size_t(pr.second) + 1) * width);
+                    ++compared;
+                    const float w1 = rel_l2(got, ref_slot);
+                    if (w1 > worst) worst = w1;
+                    if (w1 > tol && first_bad < 0) {
+                        first_bad = int(i);
+                        char buf[176];
+                        std::snprintf(buf, sizeof buf,
+                                      "row %d slot %d at sorted %d, dispatch %d (kind %d, layer %d)",
+                                      label, pr.second, pr.first, int(i), int(dag[i].kind),
+                                      dag[i].layer);
+                        first_bad_name = buf;
+                    }
+                }
+                continue;
+            }
             const std::size_t w = it->second.size();
             const std::size_t off = std::size_t(row) * w;
             if ((off + w) * 2 > slot.size) continue;
@@ -1282,6 +1356,34 @@ void run_case(const char* who, LlamaGeometry g, RawMetalContext& ctx,
             const SlotHandle& slot = b.pool[std::size_t(c)];
             if (slot.contents() == nullptr) continue;
             const auto* raw = static_cast<const std::uint16_t*>(slot.contents());
+            // The expert-sorted values hold the same numbers in the order the
+            // router grouped them, so they are compared slot by slot through
+            // the permutation rather than as one flat vector.
+            if (is_expert_sorted(dag[i].kind)) {
+                const std::size_t width =
+                    it->second.size() / std::size_t(g.experts_per_token);
+                for (const auto& pr : sorted_pairs(dag[i].layer, 0)) {
+                    Vec got(width);
+                    for (std::size_t e = 0; e < width; ++e) {
+                        got[e] = from_bf16(raw[std::size_t(pr.first) * width + e]);
+                    }
+                    const Vec ref_slot(it->second.begin() + std::size_t(pr.second) * width,
+                                       it->second.begin() + (std::size_t(pr.second) + 1) * width);
+                    ++compared;
+                    const float ws = rel_l2(got, ref_slot);
+                    if (ws > worst) worst = ws;
+                    if (ws > tol && first_bad < 0) {
+                        first_bad = int(i);
+                        char buf[176];
+                        std::snprintf(buf, sizeof buf,
+                                      "token %d slot %d at sorted %d, dispatch %d (kind %d, layer %d)",
+                                      step, pr.second, pr.first, int(i), int(dag[i].kind),
+                                      dag[i].layer);
+                        first_bad_name = buf;
+                    }
+                }
+                continue;
+            }
             Vec got(it->second.size());
             for (std::size_t e = 0; e < got.size(); ++e) got[e] = from_bf16(raw[e]);
             ++compared;
@@ -1420,6 +1522,22 @@ int main() {
              /*rows=*/16, /*paged=*/true);
     run_case("qwen3-moe (routed, 16 rows: GEMM for the dense projections)", moe, *ctx,
              kernels_dir, 0.12f, /*rows=*/16, /*paged=*/true);
+
+    // The batched mixture itself. Every routed case above stays on the matvec
+    // because `moe_should_batch` wants an expert's run to half fill a tile --
+    // eight experts and a tile of sixteen means sixty-four pairs, which two
+    // slots a token does not reach until thirty-two rows. At forty-eight the
+    // sort pads, the three routed projections become `affine_qmm_t_routed`, and
+    // this is the ONLY case that runs them.
+    //
+    // Stated as an expectation rather than assumed, because the threshold is
+    // arithmetic on the geometry and a change to either side of it would
+    // silently move this case back onto the path the other five already cover.
+    expect(llama_moe_tile_rows(moe, 48) == pie::metal::shared_kernels::kMoeTileRows,
+           "48 routed rows take the batched path");
+    expect(llama_moe_tile_rows(moe, 16) == 1, "16 routed rows do not");
+    run_case("qwen3-moe (routed, 48 rows: the batched mixture)", moe, *ctx, kernels_dir, 0.12f,
+             /*rows=*/48, /*paged=*/true);
 
     // The same eight rows as the two-request case below, but as ONE request.
     // It is what separates "eight rows is wrong" from "two requests is wrong",

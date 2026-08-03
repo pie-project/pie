@@ -24,6 +24,7 @@
 #include "../../model/qwen3_5/decode_dispatch.hpp"
 #include "../../model/qwen3_5/decode_dispatch_mb.hpp"
 #include "decode_consts.hpp"
+#include "scratch.hpp"
 
 namespace pie::metal::llama {
 
@@ -87,6 +88,11 @@ Kernel shared_kind(Kind k, const LlamaGeometry& g) {
         case Kind::RouterTopK:      return Kernel::GoRouterTopK;
         case Kind::ExpertSiluMul:   return Kernel::SiluMul;
         case Kind::ExpertCombine:   return Kernel::GoExpertCombine;
+        // Weightless: `weight_binds` has no case for these, which is the
+        // point -- the reordering moves rows and indices, not parameters.
+        case Kind::ExpertSort:      return Kernel::LlMoeSort;
+        case Kind::ExpertGather:    return Kernel::LlMoeGather;
+        case Kind::ExpertScatter:   return Kernel::LlMoeScatter;
     }
     return Kernel::Rms;
 }
@@ -122,6 +128,12 @@ Kernel pso_kind(Kind k) {
         case Kind::ExpertUp:
         case Kind::ExpertDown:  return Kernel::LlExpertGate;
         case Kind::RouterTopK:  return Kernel::GoRouterTopK;
+        // `pso_for` answers for these three off the family's own PSOs and
+        // never reaches here -- but naming them keeps the fall-through value
+        // meaning "nothing claimed this kind".
+        case Kind::ExpertSort:    return Kernel::LlMoeSort;
+        case Kind::ExpertGather:  return Kernel::LlMoeGather;
+        case Kind::ExpertScatter: return Kernel::LlMoeScatter;
         case Kind::ExpertCombine: return Kernel::GoExpertCombine;
         case Kind::EmbedGather: return Kernel::EmbedGather;
         case Kind::KvAppend:    return Kernel::KvAppend;
@@ -185,9 +197,20 @@ Pso pso_for(const Dispatch& d, const LlamaGeometry& g, const DecodeStepPsos& bas
         case Kind::RowGather:     return ll.row_gather;
         case Kind::RouterTopK:    return ll.router_topk;
         case Kind::ExpertCombine: return ll.expert_combine;
+        case Kind::ExpertSort:    return ll.moe_sort;
+        case Kind::ExpertGather:  return ll.moe_gather;
+        case Kind::ExpertScatter: return ll.moe_scatter;
         case Kind::ExpertGate:
         case Kind::ExpertUp:
-        case Kind::ExpertDown:    return ll.qmv_routed;
+        case Kind::ExpertDown: {
+            // Asked with the same row count `launch_shape` uses, because the
+            // two answers must agree: a matmul pipeline under a matvec grid
+            // reads `tile_expert` off the end of the routing.
+            const int bn = llama_moe_qmm_bn(d.kind, g, R);
+            if (bn == 0) return ll.qmv_routed;
+            const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
+            return ll.qmm_routed[slot].valid() ? ll.qmm_routed[slot] : ll.qmv_routed;
+        }
         default:
             break;
     }
@@ -286,6 +309,28 @@ int llama_qmm_bn(Kind k, const LlamaGeometry& g, int rows) {
     return qmm_bn(kn.N, llama_qmm_rows(rows));
 }
 
+int llama_moe_pairs(const LlamaGeometry& g, int rows) {
+    return (rows < 1 ? 1 : rows) * (g.is_moe() ? g.experts_per_token : 1);
+}
+
+/// The tile the sort pads each expert's run to: 1 leaves the projections
+/// matvecs, `kMoeTileRows` makes them matmuls. One question asked in one place,
+/// because the sort, the launch shapes, the pipeline choice and the pool sizer
+/// all have to give the same answer -- a sort that padded to 16 under a matvec
+/// launched for 8 rows would run the projection over a fraction of its input.
+int llama_moe_tile_rows(const LlamaGeometry& g, int rows) {
+    if (!g.is_moe()) return 1;
+    return shared_kernels::moe_tile_rows(llama_moe_pairs(g, rows), g.n_experts);
+}
+
+/// The routed matmul's column tile, or 0 when the batch stays a matvec.
+int llama_moe_qmm_bn(Kind k, const LlamaGeometry& g, int rows) {
+    if (!is_routed(k) || llama_moe_tile_rows(g, rows) <= 1) return 0;
+    const KN kn = qmv_kn(k, g);
+    if (kn.N == 0) return 0;
+    return qmm_bn(kn.N, llama_moe_sorted_rows(g, rows));
+}
+
 void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadgroup& tg,
                   int rows, int head_rows) {
     const int R = rows < 1 ? 1 : rows;
@@ -306,6 +351,23 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
     // the expert slot: every slot after the first is never dispatched at all
     // and its output stays whatever the pool held. The first expert is right,
     // so the model still produces text.
+    // The routed projections run on the SORTED rows, whose count is neither R
+    // nor R*k: the sort pads every expert's run to a whole tile. Asked before
+    // the shared matvec branch for the same reason `is_routed` is -- `qmv_kn`
+    // answers for these kinds too, and the dense shape would launch them over
+    // the token count.
+    if (is_routed(d.kind)) {
+        const KN kn = qmv_kn(d.kind, g);
+        const int sorted = llama_moe_sorted_rows(g, R);
+        if (const int bn = llama_moe_qmm_bn(d.kind, g, R); bn > 0) {
+            qmm_t_dispatch(kn.N, sorted, bn, shared_kernels::kMoeTileRows, grid, tg);
+            return;
+        }
+        // One sorted row per (token, slot) pair, and the expert axis is gone --
+        // the pair's expert is `row_expert[p]`, not `tid.z`.
+        routed_qmv_dispatch(kn.N, 1, grid, tg, sorted);
+        return;
+    }
     if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
         const int m = d.kind == Kind::LmHead ? S : R;
         // Once the batch fills a tile, a dense projection becomes a matmul.
@@ -393,18 +455,25 @@ void launch_shape(const Dispatch& d, const LlamaGeometry& g, Grid& grid, Threadg
         case Kind::RouterTopK:
             router_topk_dispatch(g.n_experts, grid, tg, R);
             return;
-        // The three routed matvecs are handled by the `qmv_kn` branch above,
-        // which answers for them: they reach here only if that ever stops
-        // being true.
-        case Kind::ExpertGate:
-        case Kind::ExpertUp:
-            routed_qmv_dispatch(g.moe_intermediate, g.experts_per_token, grid, tg, R);
+        // The three routed projections are handled by the `is_routed` branch
+        // above, which answers for them: they reach here only if that ever
+        // stops being true.
+        case Kind::ExpertSort:
+            moe_route_sort_dispatch(g.n_experts, grid, tg);
             return;
-        case Kind::ExpertDown:
-            routed_qmv_dispatch(g.hidden, g.experts_per_token, grid, tg, R);
+        case Kind::ExpertGather:
+            moe_route_rows_dispatch(g.hidden, llama_moe_sorted_rows(g, R), grid, tg);
+            return;
+        case Kind::ExpertScatter:
+            // Over the SORTED rows, not the slot stack: the padding rows are
+            // the ones that must be skipped, and only the sorted side knows
+            // which they are.
+            moe_route_rows_dispatch(g.hidden, llama_moe_sorted_rows(g, R), grid, tg);
             return;
         case Kind::ExpertSiluMul:
-            expert_silu_dispatch(g.moe_intermediate, g.experts_per_token, grid, tg, R);
+            // The slot axis is gone -- a sorted row IS a slot -- so this is the
+            // dense elementwise shape over a taller batch.
+            elementwise_mb_dispatch(g.moe_intermediate, llama_moe_sorted_rows(g, R), grid, tg);
             return;
         case Kind::ExpertCombine:
             expert_combine_dispatch(g.hidden, grid, tg, R);

@@ -43,6 +43,12 @@ constexpr std::uint8_t ResidX = 0, ResidR = 1, ResidOut = 2;
 constexpr std::uint8_t RouterLogits = 0, RouterIds = 1, RouterWeights = 2;
 constexpr std::uint8_t CombineY = 0, CombineWeights = 1, CombineOut = 2;
 constexpr std::uint8_t GatherIn = 0, GatherOut = 1;
+// The batched mixture's reordering. `QmvTileExpert` sits clear of the matvec's
+// eleven slots because one ordinal serves both pipelines; see `bind::GoQmv`.
+constexpr std::uint8_t QmvTileExpert = 12;
+constexpr std::uint8_t SortIds = 0, SortPerm = kMoeSortPermBind, SortRowExpert = 2,
+                       SortTileExpert = 3;
+constexpr std::uint8_t RowsIn = 0, RowsOut = 1, RowsPerm = 2;
 }  // namespace bi
 
 ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeometry& g) {
@@ -59,6 +65,7 @@ ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeo
     int gp = -1, up = -1, act = -1;
     int block = -1;  // a block's output, between its projection and its residual add
     int router_logits = -1, expert_ids = -1, expert_weights = -1;
+    int perm = -1, row_expert = -1, tile_expert = -1, sorted_x = -1, sorted_out = -1;
 
     for (std::size_t di = 0; di < dag.size(); ++di) {
         const Dispatch& d = dag[di];
@@ -179,34 +186,61 @@ ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeo
                 wr(o, bi::RouterIds, expert_ids);
                 wr(o, bi::RouterWeights, expert_weights);
                 break;
+            case Kind::ExpertSort:
+                // Three outputs, all live until the scatter: the permutation,
+                // the per-row expert the matvec form reads, and the per-tile
+                // expert the matmul form reads.
+                perm = fresh();
+                row_expert = fresh();
+                tile_expert = fresh();
+                rd(o, bi::SortIds, expert_ids);
+                wr(o, bi::SortPerm, perm);
+                wr(o, bi::SortRowExpert, row_expert);
+                wr(o, bi::SortTileExpert, tile_expert);
+                break;
+            case Kind::ExpertGather:
+                sorted_x = fresh();
+                rd(o, bi::RowsIn, normed);
+                wr(o, bi::RowsOut, sorted_x);
+                rd(o, bi::RowsPerm, perm);
+                break;
             case Kind::ExpertGate:
                 gp = fresh();
-                rd(o, bi::QmvX, normed);
-                rd(o, bi::QmvExpertIds, expert_ids);
+                rd(o, bi::QmvX, sorted_x);
+                rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert);
                 wr(o, bi::QmvOut, gp);
                 break;
             case Kind::ExpertUp:
                 up = fresh();
-                rd(o, bi::QmvX, normed);
-                rd(o, bi::QmvExpertIds, expert_ids);
+                rd(o, bi::QmvX, sorted_x);
+                rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert);
                 wr(o, bi::QmvOut, up);
                 break;
             case Kind::ExpertSiluMul:
-                // Elementwise over the whole [rows, k, width] stack: the slot
-                // axis needs no special handling here because gate, up and out
-                // are all laid out the same way.
+                // Elementwise over the sorted stack. The slot axis is gone --
+                // a sorted row IS a slot -- so this is the dense kernel over a
+                // taller batch rather than a strided one.
                 act = fresh();
                 rd(o, bi::SiluGate, gp);
                 rd(o, bi::SiluUp, up);
                 wr(o, bi::SiluOut, act);
                 break;
             case Kind::ExpertDown:
-                // Still [rows, k, hidden]: each slot projects back on its own,
-                // and the k results are only summed by ExpertCombine.
-                block = fresh();
+                // Still sorted: the k results per token are only brought back
+                // together by the scatter, and only summed by ExpertCombine.
+                sorted_out = fresh();
                 rd(o, bi::QmvX, act);
-                rd(o, bi::QmvExpertIds, expert_ids);
-                wr(o, bi::QmvOut, block);
+                rd(o, bi::QmvExpertIds, row_expert);
+                rd(o, bi::QmvTileExpert, tile_expert);
+                wr(o, bi::QmvOut, sorted_out);
+                break;
+            case Kind::ExpertScatter:
+                block = fresh();
+                rd(o, bi::RowsIn, sorted_out);
+                wr(o, bi::RowsOut, block);
+                rd(o, bi::RowsPerm, perm);
                 break;
             case Kind::ExpertCombine: {
                 const int combined = fresh();
@@ -259,6 +293,12 @@ ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeo
     plan.expert_ids_value = expert_ids;
     plan.expert_weights_value = expert_weights;
     return plan;
+}
+
+int llama_moe_sorted_rows(const LlamaGeometry& g, int rows) {
+    if (!g.is_moe()) return rows < 1 ? 1 : rows;
+    const int n = (rows < 1 ? 1 : rows) * g.experts_per_token;
+    return shared_kernels::moe_sorted_rows(n, g.n_experts);
 }
 
 std::vector<ValueExtent> llama_value_extents(const std::vector<Dispatch>& dag,
@@ -324,13 +364,32 @@ std::vector<ValueExtent> llama_value_extents(const std::vector<Dispatch>& dag,
                 // That is k extra elements per routed layer.
                 e.elems = g.experts_per_token * 2;
                 break;
+            case Kind::ExpertSort:
+                // Three int32 outputs. Two are one entry per sorted row and
+                // one is per TILE, which is never more, so all three are sized
+                // as the taller of them. An int32 is TWO of this pool's
+                // elements -- the pool is measured in activation elements and
+                // allocated at two bytes each -- which is the same trap
+                // `RouterTopK` documents above.
+                e.elems = 2;
+                e.rows_are_sorted = 1;
+                break;
+            case Kind::ExpertGather:
+                e.elems = g.hidden;
+                e.rows_are_sorted = 1;
+                break;
             case Kind::ExpertGate:
             case Kind::ExpertUp:
             case Kind::ExpertSiluMul:
                 e.elems = g.moe_intermediate;
-                e.rows_are_slots = 1;
+                e.rows_are_sorted = 1;
                 break;
             case Kind::ExpertDown:
+                e.elems = g.hidden;
+                e.rows_are_sorted = 1;
+                break;
+            case Kind::ExpertScatter:
+                // Back to the slot stack the combine reads.
                 e.elems = g.hidden;
                 e.rows_are_slots = 1;
                 break;
@@ -351,6 +410,7 @@ std::vector<ValueExtent> llama_value_extents(const std::vector<Dispatch>& dag,
         ValueExtent& slot = ext[std::size_t(u.value)];
         if (e.elems > slot.elems) slot.elems = e.elems;
         if (e.rows_are_slots != 0) slot.rows_are_slots = 1;
+        if (e.rows_are_sorted != 0) slot.rows_are_sorted = 1;
     }
     return ext;
 }
@@ -381,7 +441,9 @@ std::vector<std::size_t> llama_pool_elems(const std::vector<Dispatch>& dag,
         // token; the expert stack k per token.
         const bool tail = is_tail(dag[std::size_t(u.index)].kind);
         const ValueExtent& e = ext[std::size_t(u.value)];
-        const int n = e.rows_are_slots != 0 ? rows * k : (tail ? head_rows : rows);
+        const int n = e.rows_are_sorted != 0 ? llama_moe_sorted_rows(g, rows)
+                      : e.rows_are_slots != 0 ? rows * k
+                      : (tail ? head_rows : rows);
         const std::size_t need = std::size_t(n) * std::size_t(e.elems);
         elems[std::size_t(c)] = std::max(elems[std::size_t(c)], need);
     }

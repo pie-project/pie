@@ -40,10 +40,13 @@ namespace pie::metal::llama {
 // where they live, but nothing in `router_topk` or `expert_combine` is
 // gpt-oss-specific, and this family dispatches both.
 using shared_kernels::ExpertCombineParams;
+using shared_kernels::MoeRouteParams;
 using shared_kernels::RouterParams;
 using shared_kernels::RowGatherParams;
 using shared_kernels::elementwise_dispatch;
 using shared_kernels::expert_combine_dispatch;
+using shared_kernels::moe_route_rows_dispatch;
+using shared_kernels::moe_route_sort_dispatch;
 using shared_kernels::routed_qmv_dispatch;
 using shared_kernels::router_topk_dispatch;
 
@@ -60,12 +63,22 @@ struct LlamaPsos {
     /// The routed matvec. Unbiased: Qwen's experts carry no bias, unlike
     /// gpt-oss's.
     Pso qmv_routed{};
+    /// The expert-major reordering the batched form runs on.
+    Pso moe_sort{};
+    Pso moe_gather{};
+    Pso moe_scatter{};
+    /// The routed matmul, one column tile per entry: bn 16, 32, 64. The row
+    /// tile does not vary -- `kMoeTileRows` is what the sort padded to, and a
+    /// second row tile would be a second thing for the sort to agree with.
+    Pso qmm_routed[3]{};
 
     bool dense_valid() const {
         return sdpa_d128.valid() && sdpa_paged_d128.valid() && row_gather.valid();
     }
     bool moe_valid() const {
-        return router_topk.valid() && expert_combine.valid() && qmv_routed.valid();
+        return router_topk.valid() && expert_combine.valid() && qmv_routed.valid() &&
+               moe_sort.valid() && moe_gather.valid() && moe_scatter.valid() &&
+               qmm_routed[0].valid() && qmm_routed[1].valid() && qmm_routed[2].valid();
     }
     /// A dense checkpoint must not be held to the MoE PSOs: compiling them for
     /// a model that never dispatches them would make an unrelated shader error

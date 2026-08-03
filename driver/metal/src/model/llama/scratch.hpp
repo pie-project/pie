@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "../family_coloring.hpp"
+#include "../shared_kernels.hpp"
 #include "decode_step.hpp"
 #include "geometry.hpp"
 
@@ -48,7 +49,25 @@ struct ScratchPlan {
 struct ValueExtent {
     int elems = 0;   // per row
     int rows_are_slots = 0;  // 1 if the value is [rows * experts_per_token, elems]
+    /// 1 if the value is [`llama_moe_sorted_rows(rows)`, elems] -- the expert-
+    /// major order the batched mixture works in, which is TALLER than the slot
+    /// stack because every expert's run is padded to a whole tile.
+    int rows_are_sorted = 0;
 };
+
+/// How many expert-sorted rows a batch of `rows` tokens produces, at worst.
+///
+/// The pool is sized from this, and a batch smaller than the one it was sized
+/// for produces fewer -- the bound rises with the row count on both sides of
+/// the point where the sort starts padding.
+int llama_moe_sorted_rows(const LlamaGeometry& g, int rows);
+
+/// The bind index `ExpertSort` writes its permutation to.
+///
+/// Exported because the golden-tap dump has to READ that permutation to publish
+/// the routed intermediates in the slot-major layout every reference speaks,
+/// and a second spelling of the number would be a second thing to keep true.
+constexpr std::uint8_t kMoeSortPermBind = 1;
 
 ScratchPlan build_llama_scratch(const std::vector<Dispatch>& dag, const LlamaGeometry& g);
 

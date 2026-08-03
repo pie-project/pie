@@ -22,10 +22,13 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "../shared_kernels.hpp"
+#include "encode.hpp"
+#include "scratch.hpp"
 
 namespace pie::metal::llama {
 
 using shared_kernels::ExpertCombineParams;
+using shared_kernels::MoeRouteParams;
 using shared_kernels::RmsParams;
 using shared_kernels::RouterParams;
 using shared_kernels::RowGatherParams;
@@ -88,25 +91,16 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Qmv::N, kn.N, &count);
             if (is_routed(d.kind)) {
                 using Q = bind::GoQmv;
-                // gate and up read ONE shared vector for every slot; down reads
-                // a per-slot one out of the SwiGLU stack. See the file header.
-                const std::int32_t slot_stride =
-                    d.kind == Kind::ExpertDown ? std::int32_t(g.moe_intermediate) : 0;
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::XSlotStride, slot_stride,
-                                         &count);
-                // The token row's pitch. For down that is k times its slot,
-                // because each row carries the whole stack.
-                const std::int32_t row_stride =
-                    d.kind == Kind::ExpertDown
-                        ? std::int32_t(g.moe_intermediate) * std::int32_t(K)
-                        : std::int32_t(g.hidden);
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::XRowStride, row_stride,
-                                         &count);
-                // How a dispatch finds ITS row's ids. Every row routes
-                // independently, which is why a batched MoE is not one wider
-                // matmul.
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::SlotsPerRow,
-                                         std::int32_t(K), &count);
+                // The matvec form now reads the SORTED stack, one row per
+                // (token, slot) pair rather than k slots hanging off a token
+                // row. That collapses all three of these to the dense case:
+                // no slot axis, a row pitch that is just the input width, and
+                // one expert per row -- the sort is what made the pair axis
+                // disappear, and `row_expert` is what replaced `tid.z`.
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::XSlotStride, 0, &count);
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::XRowStride,
+                                         std::int32_t(kn.K), &count);
+                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)Q::SlotsPerRow, 1, &count);
             }
             continue;
         }
@@ -214,11 +208,15 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                          &count);
                 break;
             case Kind::ExpertSiluMul:
-                // The whole [rows, k, moe_intermediate] stack, flat: gate, up
-                // and out share a layout, so the slot axis is just more elements.
+                // The whole SORTED stack, flat: gate, up and out share a
+                // layout, so the pair axis is just more elements. Sized off
+                // the sorted count and not `rows * k`, because the sort pads
+                // every expert's run to a tile and the padding rows are real
+                // rows of the buffers this reads.
                 bind_const<std::int32_t>(
                     ctx, ord, (std::uint8_t)bind::SiluMul::Width,
-                    std::int32_t(R * K * std::uint32_t(g.moe_intermediate)), &count);
+                    std::int32_t(llama_moe_sorted_rows(g, int(R)) * g.moe_intermediate),
+                    &count);
                 break;
 
             // ── routing ──
@@ -227,6 +225,26 @@ int bind_llama_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
                                      std::uint32_t(g.experts_per_token)};
                 bind_const<RouterParams>(ctx, ord, (std::uint8_t)bind::GoRouterTopK::Params, p,
                                          &count);
+                break;
+            }
+            case Kind::ExpertSort:
+            case Kind::ExpertGather:
+            case Kind::ExpertScatter: {
+                // One params struct for all three, so the sort's padding and
+                // the row movers' bounds cannot disagree. `width` is only read
+                // by the two row movers, and both move hidden-wide rows.
+                const int sorted = llama_moe_sorted_rows(g, int(R));
+                const MoeRouteParams p{
+                    std::uint32_t(int(R) * int(K)),
+                    std::uint32_t(g.n_experts),
+                    K,
+                    std::uint32_t(llama_moe_tile_rows(g, int(R))),
+                    std::uint32_t(sorted),
+                    std::uint32_t(g.hidden)};
+                const std::uint8_t idx = d.kind == Kind::ExpertSort
+                                             ? (std::uint8_t)bind::MoeRouteSort::Params
+                                             : (std::uint8_t)bind::MoeRouteRows::Params;
+                bind_const<MoeRouteParams>(ctx, ord, idx, p, &count);
                 break;
             }
             case Kind::ExpertCombine: {

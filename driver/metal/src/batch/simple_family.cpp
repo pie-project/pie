@@ -97,6 +97,13 @@ struct Tap {
     const char* name;
     std::uint8_t out_bind;
     int width;
+    // Set only for a value the expert sort reordered. The dump then un-permutes
+    // it back to slot-major, so a batched mixture publishes the same tensor
+    // shape a decode does and no reader has to know the sort happened. `width`
+    // stays the PUBLISHED width -- `slots * per-slot` -- as it is for a decode.
+    const std::int32_t* perm = nullptr;
+    int perm_rows = 0;
+    int slots = 0;
 };
 using G4Tap = Tap;
 
@@ -224,6 +231,11 @@ void dump_taps_from(const std::vector<Dispatch>& dag, const Coloring& col,
         const std::string name = dag[di].layer < 0
             ? std::string(t.name)
             : std::to_string(dag[di].layer) + "." + t.name;
+        if (t.perm != nullptr) {
+            dump_golden_bf16_sorted(name, src, t.perm, t.perm_rows, rows, t.slots,
+                                    t.width / t.slots);
+            continue;
+        }
         dump_golden_bf16(name, src, is_tail(dag[di]) ? head_rows : rows, t.width, t.width);
     }
 }
@@ -887,6 +899,23 @@ void dump_ll_taps(const std::vector<llama::Dispatch>& dag, const llama::LlamaGeo
             writes[std::size_t(u.index)] = int(u.bind_index);
         }
     }
+    // The sort's permutation, per layer, so the routed intermediates can be
+    // published in the layout they had before it ran. Read from the pool
+    // because the within-expert order is the GPU's to decide.
+    std::vector<const std::int32_t*> perm_of(std::size_t(g.n_layers), nullptr);
+    for (const llama::Use& u : plan.uses) {
+        if (!u.is_write || u.bind_index != llama::kMoeSortPermBind) continue;
+        if (u.index < 0 || std::size_t(u.index) >= dag.size()) continue;
+        const llama::Dispatch& d = dag[std::size_t(u.index)];
+        if (d.kind != llama::Kind::ExpertSort || d.layer < 0) continue;
+        if (std::size_t(d.layer) >= perm_of.size()) continue;
+        for (const auto& sb : col.per_dispatch[std::size_t(u.index)]) {
+            if (sb.bind_index != llama::kMoeSortPermBind) continue;
+            if (sb.color < 0 || std::size_t(sb.color) >= pool.size()) continue;
+            perm_of[std::size_t(d.layer)] =
+                static_cast<const std::int32_t*>(pool[std::size_t(sb.color)].contents());
+        }
+    }
     dump_taps_from(
         dag, col, pool, logits, rows, head_rows,
         [&](const llama::Dispatch& d, Tap& t) {
@@ -897,6 +926,12 @@ void dump_ll_taps(const std::vector<llama::Dispatch>& dag, const llama::LlamaGeo
             if (!ll_tap_for(d, g, t)) return false;
             if (writes[di] < 0) return false;
             t.out_bind = std::uint8_t(writes[di]);
+            if (llama::is_expert_sorted(d.kind) && d.layer >= 0 &&
+                std::size_t(d.layer) < perm_of.size() && perm_of[std::size_t(d.layer)] != nullptr) {
+                t.perm = perm_of[std::size_t(d.layer)];
+                t.perm_rows = llama::llama_moe_sorted_rows(g, rows);
+                t.slots = g.experts_per_token;
+            }
             return true;
         },
         [](const llama::Dispatch& d) { return llama::is_tail(d.kind); });

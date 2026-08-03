@@ -28,6 +28,24 @@ bool build_llama_psos(RawMetalContext& ctx, const std::string& kernels_dir,
         specs.push_back({"gptoss.metal", "expert_combine_bfloat16", &out.expert_combine});
         specs.push_back({"quantized_qmv.metal", "affine_qmv_routed_bfloat16_gs_64_b_4",
                          &out.qmv_routed});
+        specs.push_back({"moe_route.metal", "moe_route_sort", &out.moe_sort});
+        specs.push_back({"moe_route.metal", "moe_route_gather", &out.moe_gather});
+        specs.push_back({"moe_route.metal", "moe_route_scatter", &out.moe_scatter});
+        // The batched form's three column tiles. `bm` is `kMoeTileRows`, which
+        // is what the sort padded every expert's run to -- naming it here would
+        // be a second statement of the same number, so it is spelled from the
+        // constant.
+        static const std::string routed[3] = {
+            "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" +
+                std::to_string(shared_kernels::kMoeTileRows) + "_bn_16",
+            "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" +
+                std::to_string(shared_kernels::kMoeTileRows) + "_bn_32",
+            "affine_qmm_t_routed_bfloat16_gs_64_b_4_bm_" +
+                std::to_string(shared_kernels::kMoeTileRows) + "_bn_64",
+        };
+        for (int i = 0; i < 3; ++i) {
+            specs.push_back({"quantized_qmm_t.metal", routed[i].c_str(), &out.qmm_routed[i]});
+        }
     }
     for (const Spec& spec : specs) {
         std::string compile_error;

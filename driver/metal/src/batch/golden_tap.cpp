@@ -170,6 +170,28 @@ void dump_golden_bf16(const std::string& name,
     write_npy(dir + "/" + name + ".npy", out, rows, width);
 }
 
+void dump_golden_bf16_sorted(const std::string& name,
+                             const void* bf16,
+                             const std::int32_t* perm,
+                             int stored_rows,
+                             int rows,
+                             int slots,
+                             int width) {
+    const std::string& dir = golden_tap_dir();
+    if (dir.empty() || bf16 == nullptr || perm == nullptr) return;
+    if (rows <= 0 || slots <= 0 || width <= 0 || stored_rows <= 0) return;
+    const auto* src = static_cast<const std::uint16_t*>(bf16);
+    std::vector<float> out(std::size_t(rows) * std::size_t(slots) * std::size_t(width), 0.0f);
+    for (int p = 0; p < stored_rows; ++p) {
+        const std::int32_t sel = perm[p];
+        if (sel < 0 || sel >= rows * slots) continue;
+        const std::size_t dst = std::size_t(sel) * std::size_t(width);
+        const std::size_t s = std::size_t(p) * std::size_t(width);
+        for (int i = 0; i < width; ++i) out[dst + std::size_t(i)] = bf16_to_f32(src[s + std::size_t(i)]);
+    }
+    write_npy(dir + "/" + name + ".npy", out, rows, slots * width);
+}
+
 void dump_golden_tokens(const std::uint32_t* ids, int n) {
     const std::string& dir = golden_tap_dir();
     if (dir.empty() || ids == nullptr || n <= 0) return;

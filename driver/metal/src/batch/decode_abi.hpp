@@ -376,7 +376,18 @@ enum class GoQmv : uint8_t {
     // ITS row's ids: at M>1 every row routes independently, which is why a
     // batched MoE is not one wider matmul.
     SlotsPerRow = 11,
+    // The expert each ROW TILE of the batched form reads, from
+    // `moe_route_sort`. Clear of the matvec's slots because one argument table
+    // ordinal serves both pipelines -- the row count picks which runs, and the
+    // host binds every slot either way.
+    TileExpert = 12,
 };
+
+// moe_route_sort / moe_route_gather / moe_route_scatter: the expert-major
+// reordering a batched mixture runs on. The sort's four outputs and the two
+// row-movers share no layout, so they get their own tables.
+enum class MoeRouteSort : uint8_t { ExpertIds = 0, Perm = 1, RowExpert = 2, TileExpert = 3, Params = 4 };
+enum class MoeRouteRows : uint8_t { In = 0, Out = 1, Perm = 2, Params = 3 };
 
 // router_topk: top-k over the router's logits, then a softmax over the k that
 // survive. Emits both halves of the routing decision.
@@ -502,7 +513,14 @@ enum class Kernel : uint8_t {
     LlRouter,            // mlp.gate  (the routing logits; no bias)
     LlExpertGate,        // mlp.experts.gate_proj  (stacked over experts)
     LlExpertUp,          // mlp.experts.up_proj
-    LlExpertDown         // mlp.experts.down_proj
+    LlExpertDown,        // mlp.experts.down_proj
+    // The batched mixture's expert-major reordering. Weightless -- they move
+    // rows and indices, not parameters -- but they are still kinds, and giving
+    // them names is what keeps `pso_kind` from having to answer with the
+    // fall-through value and hide a real gap behind it.
+    LlMoeSort,
+    LlMoeGather,
+    LlMoeScatter
 };
 
 // ── Bucketed command-buffer key (relaxes "byte-identical CB" → "byte-identical

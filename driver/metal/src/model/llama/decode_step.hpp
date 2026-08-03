@@ -48,13 +48,29 @@ enum class Kind : std::uint8_t {
     // projection, so it goes through the same kernel rather than a new one.
     Router,
     RouterTopK,
+    /// Group the (token, slot) pairs by expert.
+    ///
+    /// The three routed projections read a DIFFERENT weight matrix per pair,
+    /// which is the whole reason a mixture's prefill does not improve with
+    /// length the way a dense one does. Sorting the pairs by expert makes each
+    /// expert's rows contiguous, and a contiguous run against one weight slice
+    /// is the matmul this driver already has.
+    ///
+    /// It runs at M=1 too, where it is a grouping with no padding and the
+    /// projections stay matvecs. That is deliberate: the routed dataflow has
+    /// one shape rather than a decode shape and a prefill shape that would have
+    /// to be kept agreeing.
+    ExpertSort,
+    /// The FFN norm's rows, in the sorted order.
+    ExpertGather,
     /// The three routed projections. Each reads the expert stack at
-    /// `expert_id * N * K` and serves one of the `experts_per_token` slots,
-    /// which is what `tid.z` selects.
+    /// `expert_id * N * K` and serves one sorted row.
     ExpertGate, ExpertUp,
-    /// SwiGLU over the `[rows, k, moe_intermediate]` stack.
+    /// SwiGLU over the sorted `[sorted_rows, moe_intermediate]` stack.
     ExpertSiluMul,
     ExpertDown,
+    /// Undo the sort, back into the `[rows, k, hidden]` stack.
+    ExpertScatter,
     /// Sum the k experts' outputs, weighted by the router's softmax.
     ExpertCombine,
 
@@ -123,10 +139,13 @@ inline std::vector<Dispatch> build_llama_dag(const LlamaGeometry& g, bool with_a
         if (g.is_moe()) {
             emit(Kind::Router, L);
             emit(Kind::RouterTopK, L);
+            emit(Kind::ExpertSort, L);
+            emit(Kind::ExpertGather, L);
             emit(Kind::ExpertGate, L);
             emit(Kind::ExpertUp, L);
             emit(Kind::ExpertSiluMul, L);
             emit(Kind::ExpertDown, L);
+            emit(Kind::ExpertScatter, L);
             emit(Kind::ExpertCombine, L);
         } else {
             emit(Kind::QmvGate, L);
@@ -147,6 +166,17 @@ inline std::vector<Dispatch> build_llama_dag(const LlamaGeometry& g, bool with_a
 /// Whether a kind reads a quantized weight stack indexed by the router.
 inline bool is_routed(Kind k) {
     return k == Kind::ExpertGate || k == Kind::ExpertUp || k == Kind::ExpertDown;
+}
+
+/// Whether a kind's output has one row per SORTED (token, slot) pair.
+///
+/// Between the gather and the scatter every activation is in expert order and
+/// padded to whole tiles, so it has more rows than `rows * experts_per_token`.
+/// Three places ask -- the scratch sizer, the launch shapes and the golden-tap
+/// dumper -- and a disagreement is an overrun, so they ask here.
+inline bool is_expert_sorted(Kind k) {
+    return k == Kind::ExpertGather || k == Kind::ExpertGate || k == Kind::ExpertUp ||
+           k == Kind::ExpertSiluMul || k == Kind::ExpertDown;
 }
 
 /// Whether a kind is a matvec -- the step's bandwidth, and what any performance

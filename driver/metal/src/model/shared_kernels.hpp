@@ -39,6 +39,14 @@ struct ExpertCombineParams {  // gptoss.metal         (buffer 3)
     std::uint32_t width;
     std::uint32_t experts_per_token;
 };
+struct MoeRouteParams {     // moe_route.metal:34
+    std::uint32_t n;
+    std::uint32_t n_experts;
+    std::uint32_t experts_per_token;
+    std::uint32_t tile_rows;
+    std::uint32_t padded;
+    std::uint32_t width;
+};
 
 /// Flat elementwise `dispatchThreads` grid: one thread per element, capped at a
 /// 256-wide threadgroup.
@@ -99,6 +107,68 @@ inline void routed_qmv_dispatch(int N, int experts_per_token, Grid& g, Threadgro
     const std::uint32_t slots = std::uint32_t(experts_per_token > 0 ? experts_per_token : 1);
     g = Grid{32u * r, std::uint32_t(N > 0 ? N : 1) / 4u, slots};
     tg = Threadgroup{32, 2, 1};
+}
+
+/// The tile a batched mixture pads each expert's run to.
+///
+/// `kQmmBM`'s narrow tile rather than the wide one, and deliberately: the
+/// padding an expert wastes is up to `tile - 1` rows, paid `n_experts` times,
+/// so the wide tile doubles the waste to buy a shape the routed case rarely
+/// fills anyway.
+constexpr int kMoeTileRows = 16;
+
+/// When sorting the rows by expert pays for itself.
+///
+/// The sort turns `n` matvecs into `ceil(count_e / tile)` summed over the
+/// experts -- fewer reads of each expert's weights, but a tile that is only
+/// part full does the arithmetic of a whole one. The two meet when an expert's
+/// run half fills a tile, which for `min(n, n_experts)` touched experts is
+/// `n >= n_experts * tile / 2`.
+///
+/// Below that the matvec wins outright, and it is not close: a decode routes
+/// eight pairs over a hundred and twenty-eight experts, where every tile would
+/// be one live row in sixteen.
+inline bool moe_should_batch(int n_pairs, int n_experts) {
+    return n_experts > 0 && n_pairs >= n_experts * kMoeTileRows / 2;
+}
+
+/// Rows each expert's run is padded to, for a batch of `n_pairs`.
+inline int moe_tile_rows(int n_pairs, int n_experts) {
+    return moe_should_batch(n_pairs, n_experts) ? kMoeTileRows : 1;
+}
+
+/// How many sorted rows a batch of `n_pairs` can produce.
+///
+/// The worst case, not the actual: the real count depends on how the router
+/// spread the rows, which is a number the GPU has and the host would have to
+/// stall to read. Every touched expert can waste `tile - 1` rows and at most
+/// `min(n_pairs, n_experts)` experts are touched, so this bound is reached and
+/// cannot be tightened without the routing itself.
+inline int moe_sorted_rows(int n_pairs, int n_experts) {
+    const int n = n_pairs > 0 ? n_pairs : 0;
+    const int tile = moe_tile_rows(n, n_experts);
+    if (tile <= 1) return n;
+    const int touched = n < n_experts ? n : n_experts;
+    const int bound = n + touched * (tile - 1);
+    return ((bound + tile - 1) / tile) * tile;
+}
+
+/// `moe_route_sort`: one threadgroup, sized to the expert count it scans.
+inline void moe_route_sort_dispatch(int n_experts, Grid& g, Threadgroup& tg) {
+    std::uint32_t w = std::uint32_t(n_experts < 1 ? 1 : n_experts);
+    w = (w + 31u) / 32u * 32u;
+    if (w > kRouterMaxExperts) w = kRouterMaxExperts;
+    g = Grid{w, 1, 1};
+    tg = Threadgroup{w, 1, 1};
+}
+
+/// `moe_route_gather` / `moe_route_scatter`: one thread per element of the
+/// sorted stack. `rows` is the padded count, because the padding rows are what
+/// the gather has to zero.
+inline void moe_route_rows_dispatch(int width, int rows, Grid& g, Threadgroup& tg) {
+    const std::uint32_t w = std::uint32_t(width > 0 ? width : 1);
+    g = Grid{w, std::uint32_t(rows > 0 ? rows : 1), 1};
+    tg = Threadgroup{w < 256u ? w : 256u, 1, 1};
 }
 
 /// Bind a POD constant value into a fresh resident slot at (ordinal, index).

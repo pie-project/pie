@@ -69,6 +69,22 @@ int llama_qmm_rows(int rows);
 /// for, which is what the scratch must be sized against.
 int llama_qmm_pool_rows(int max_rows);
 
+/// The (token, slot) pairs a batch of `rows` routes: `rows * experts_per_token`.
+int llama_moe_pairs(const LlamaGeometry& g, int rows);
+
+/// The rows the sort pads each expert's run to: 1 leaves the routed
+/// projections matvecs, `shared_kernels::kMoeTileRows` makes them matmuls.
+///
+/// One question in one place. The sort kernel, the three projections' launch
+/// shapes, their pipeline choice and the pool sizer all have to give the same
+/// answer -- a sort that padded to 16 under a matvec launched for the unpadded
+/// count would run the projection over a fraction of its input, and the model
+/// would still produce text.
+int llama_moe_tile_rows(const LlamaGeometry& g, int rows);
+
+/// The routed matmul's column tile, or 0 when the batch stays a matvec.
+int llama_moe_qmm_bn(Kind k, const LlamaGeometry& g, int rows);
+
 /// Whether a kind is a dense projection, and so a GEMM candidate. NOT the
 /// routed three -- each row picks its own experts, so a tile spanning rows
 /// would span weights.

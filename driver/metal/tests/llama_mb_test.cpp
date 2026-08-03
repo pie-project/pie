@@ -118,9 +118,16 @@ void check_degenerates_to_m1(const char* who, const LlamaGeometry& g) {
         Threadgroup want_tg{};
         const KN kn = qmv_kn(d.kind, g);
         if (kn.N != 0) {
+            // The routed three run on the SORTED rows -- one per (token, slot)
+            // pair, with no expert axis, because `moe_route_sort` put the pair
+            // in the row index and `row_expert` replaced `tid.z`. At one row
+            // that is eight rows and one slot where it used to be one row and
+            // eight slots: the same threads, decomposed by what the kernel now
+            // indexes by.
             const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
                                 d.kind == Kind::ExpertDown;
-            routed_qmv_dispatch(kn.N, routed ? g.experts_per_token : 1, want, want_tg, 1);
+            routed_qmv_dispatch(kn.N, 1, want, want_tg,
+                                routed ? llama_moe_sorted_rows(g, 1) : 1);
         } else {
             switch (d.kind) {
                 case Kind::EmbedGather: embed_dispatch(g.hidden, want, want_tg); break;
@@ -142,6 +149,10 @@ void check_degenerates_to_m1(const char* who, const LlamaGeometry& g) {
                     break;
                 case Kind::Sdpa: sdpa_dispatch(g.n_q_heads, want, want_tg); break;
                 case Kind::SiluMul: elementwise_dispatch(g.intermediate, want, want_tg); break;
+                case Kind::ExpertSiluMul:
+                    elementwise_dispatch(g.moe_intermediate * llama_moe_sorted_rows(g, 1), want,
+                                         want_tg);
+                    break;
                 default: continue;  // routed odds and ends, covered by their own arms
             }
         }
