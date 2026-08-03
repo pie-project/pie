@@ -340,6 +340,16 @@ def build_config(args: argparse.Namespace):
         max_concurrent_processes = None  # serializer drops field → engine default
     else:
         max_concurrent_processes = args.concurrency
+    # Decouple the engine's admission cap from the client's offered
+    # concurrency. Setting them equal (the default above) means every request
+    # the client holds open is also admitted, so under KV oversubscription the
+    # whole fleet stays resident and thrashes. Overriding lets an experiment
+    # ask what the pool can actually sustain while the OFFERED load is
+    # unchanged -- the client still holds `--concurrency` requests open, they
+    # just queue for a seat.
+    _cap_override = os.environ.get("PIE_BENCH_ADMISSION_CAP")
+    if _cap_override:
+        max_concurrent_processes = int(_cap_override)
     requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,

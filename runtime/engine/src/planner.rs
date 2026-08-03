@@ -716,9 +716,40 @@ struct Inner {
     /// whenever a process retires or host room returns, i.e. whenever the
     /// answer could actually have changed.
     prepare_blocked: HashSet<ProcessId>,
+    /// Destructions ordered but not yet paid out — see [`Inner::kill_in_flight`].
+    killing: HashSet<ProcessId>,
 }
 
 impl Inner {
+    /// A starvation kill has been ordered whose pages have not come back yet.
+    ///
+    /// `evicting` covers reclaim by *transfer*; this covers reclaim by
+    /// *destruction*, and the two must gate identically — neither is a reason
+    /// to start another. The window is not the one the `outcome: Some(_)`
+    /// check already covers: setting the victim's outcome only wakes it. Its
+    /// pages return when its store drops, which is a WASM unwind later —
+    /// milliseconds, against the microseconds its waiter takes to collect the
+    /// error and vacate the queue. In between, `free` is still 0 and nothing
+    /// marks a reclaim as under way, so every planner poke ordered another
+    /// kill. Measured on D/512 under the supply-stall rule: **250 kills/s
+    /// sustained, 3590 total for 768 requests, and a resident set that ended
+    /// exactly where it started (541)** — the destructions raced each other
+    /// instead of the deficit.
+    ///
+    /// Self-clearing on both exits, so it cannot wedge the deadlock breaker
+    /// it guards: the victim either dies (leaves `procs`) or survives the
+    /// error and re-contends (a fresh unmet ask), and either way stops
+    /// counting. `unregister` prunes the set so it stays bounded.
+    fn kill_in_flight(&self) -> bool {
+        self.killing.iter().any(|pid| {
+            self.procs.contains_key(pid)
+                && !self
+                    .queue
+                    .values()
+                    .any(|waiter| waiter.pid == *pid && waiter.is_unmet())
+        })
+    }
+
     fn nonresident_count(&self) -> usize {
         self.procs
             .values()
@@ -933,6 +964,7 @@ impl ResidencyPlanner {
         let (signal, removed) = self.with_inner(|inner| {
             let signal = inner.procs.remove(&pid).map(|proc| proc.signal);
             inner.evicting.remove(&pid);
+            inner.killing.remove(&pid);
             // Teardown returns this process's host slots (and drops it from
             // the candidate pool either way), so re-arm the parked victims.
             inner.host_swap_blocked.clear();
@@ -2143,6 +2175,14 @@ impl ResidencyPlanner {
             );
         }
         let (free, total) = self.port.device_stats();
+        // A destruction already ordered has not been paid out yet: gate the
+        // rung that DESTROYS, and only that one. The cheaper rungs above
+        // (salvage, last-resort eviction) stay open — they are what we would
+        // rather have happen — and eviction's own load control keeps using
+        // the wedge predicate unchanged.
+        if self.with_inner(|inner| inner.kill_in_flight()) {
+            return;
+        }
         // Pick the victim OUTSIDE the lock: the choice needs reclaim quotes,
         // and quoting takes store locks (`quote_and_pick` has the same rule).
         let Some(victim_key) = self.pick_starvation_victim() else {
@@ -2175,7 +2215,9 @@ impl ResidencyPlanner {
                 total,
                 cause,
             }));
-            Some((notify.clone(), victim_pid))
+            let notify = notify.clone();
+            inner.killing.insert(victim_pid);
+            Some((notify, victim_pid))
         });
         if let Some((notify, victim_pid)) = notify {
             self.stats.starvations.fetch_add(1, Ordering::Relaxed);
@@ -3221,6 +3263,73 @@ mod starvation_race_tests {
         assert!(
             d.eviction_deferrals_total > 0,
             "the load-control rung must record the deferral it made"
+        );
+
+        parked.abort();
+    }
+
+    /// The destruction guard clears on BOTH of its exits, so it can never
+    /// wedge the deadlock breaker it rate-limits.
+    ///
+    /// Ordering a kill only wakes the victim; its pages return when its
+    /// store drops, a WASM unwind later. Without a marker for that window
+    /// every planner poke ordered another destruction — 250 kills/s on
+    /// D/512, 3590 for 768 requests, resident set unchanged. The marker is
+    /// only safe if it lifts by itself, which is what this pins down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ordered_kill_stops_counting_once_the_victim_dies_or_re_contends() {
+        let pool = Arc::new(RacePool::new(4));
+        let planner = Arc::new(ResidencyPlanner::new(
+            pool.clone(),
+            PlannerConfig::default(),
+        ));
+
+        // A running holder keeps the wedge predicate false throughout, so
+        // the rung under test is never entered for real.
+        let holder = ProcessId::new_v4();
+        planner.register(holder);
+        planner.note_admitted(holder);
+
+        let victim = ProcessId::new_v4();
+        planner.register(victim);
+        planner.note_admitted(victim);
+        planner.with_inner(|inner| inner.killing.insert(victim));
+        assert!(
+            planner.with_inner(|inner| inner.kill_in_flight()),
+            "an ordered destruction counts until it is paid out"
+        );
+
+        // Exit 1 — the victim dies: its pages are back, nothing is owed.
+        planner.unregister(victim);
+        assert!(
+            !planner.with_inner(|inner| inner.kill_in_flight()),
+            "a retired victim cannot still owe pages"
+        );
+
+        // Exit 2 — the victim survives the error and asks again. It is a
+        // legal target once more, so the marker must lift for it too.
+        let survivor = ProcessId::new_v4();
+        planner.register(survivor);
+        planner.note_admitted(survivor);
+        planner.with_inner(|inner| inner.killing.insert(survivor));
+        assert!(planner.with_inner(|inner| inner.kill_in_flight()));
+
+        let demand = Demand {
+            kv_pages: 1, // the pool starts empty, so even one page must park
+            rs_slots: 0,
+        };
+        let p = planner.clone();
+        let parked = tokio::spawn(async move { p.acquire(survivor, survivor, demand).await });
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            if planner.diagnostics().queue.len() == 1 {
+                break;
+            }
+        }
+        assert_eq!(planner.diagnostics().queue.len(), 1, "the ask must park");
+        assert!(
+            !planner.with_inner(|inner| inner.kill_in_flight()),
+            "a fresh unmet ask means the victim survived and is contending again"
         );
 
         parked.abort();
