@@ -832,3 +832,12 @@ Consolidated sweep at tip `4dcd7b112` (default-on era): forward 78 +
 engine 395 + ABI green; qwen3 GEN short byte-stable vs the prior
 sweep; holed mixed tokens historical; hook battery 12/12 runs — the
 supergraph default holds under the whole net.
+
+Campaign step 1 landed (`c25a45026`): LoraStageArena on the Workspace
+— 256-aligned bump allocation, grow-on-demand with retired blocks
+held for in-flight readers, stream-safe per-fire reset. The cast
+buffers and the pointer slab no longer cudaMallocAsync at body time;
+the comment that justified it ("a lora fire never enters capture") is
+retired. Gate: solo lora byte-stable across a cross-build stash diff;
+zero-adapter equivalence holds. Step 2: slab uploads to a
+prepare-style stage pass, then the fingerprint + eligibility.
