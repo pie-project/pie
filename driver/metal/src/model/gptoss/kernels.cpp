@@ -10,6 +10,12 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     const int router_bits = g.router_bits;
     // The attention width is the geometry's, not a literal: see the header.
     const std::string d = "_d_" + std::to_string(g.head_dim);
+    // The expert bank's codec chooses its matvec. Same kernel body, same routed
+    // offsets, same bias epilogue -- the codec is a template parameter, so the
+    // only thing that differs here is which instantiation is named.
+    const std::string routed_name = g.mxfp4_experts
+                                        ? "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4"
+                                        : "affine_qmv_routed_bias_bfloat16_gs_64_b_4";
     const std::string sink_name = "sdpa_vector_decode_sink_bfloat16" + d;
     const std::string sink_paged_name = "sdpa_paged_decode_sink_bfloat16" + d;
     const std::string dir =
@@ -23,8 +29,7 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
     const Spec specs[] = {
         {"quantized_qmv.metal", "affine_qmv_tail_bfloat16_gs_64_b_4", &out.qmv_tail},
         {"quantized_qmv.metal", "affine_qmv_tail_bias_bfloat16_gs_64_b_4", &out.qmv_tail_bias},
-        {"quantized_qmv.metal", "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
-         &out.qmv_routed_bias},
+        {"quantized_qmv.metal", routed_name.c_str(), &out.qmv_routed_bias},
         {"quantized_qmv.metal", "affine_qmv_u8_bias_bfloat16_gs_64", &out.qmv_u8_bias},
         {"gptoss.metal", "router_topk_bfloat16", &out.router_topk},
         {"gptoss.metal", "gptoss_swiglu_bfloat16", &out.swiglu},

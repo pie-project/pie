@@ -362,22 +362,16 @@ int main(int argc, char** argv) {
             // logit -- none of which any other entry exercises at all.
             {"Gemma-4-E2B", 35, 0, {56971, 55353, 374, 56971, 55353, 374},
              {785, 6722, 48352, 6722, 48352, 6722}},
+            // gpt-oss-20b. The only MXFP4 checkpoint here, and the row that
+            // says the driver reads openai's format rather than converting it:
+            // until the expert bank was bound as the E2M1 nibbles and E8M0
+            // block exponents it ships as, the loader dequantized it and
+            // re-quantized it affine-U4, and no row could exist -- mlx's
+            // quantizer and this one disagree on 8.2% of codes, always by one,
+            // so the two runs did not hold the same weights. They do now.
+            {"gpt-oss-20b", 24, 32, {13, 279, 410, 12038, 410, 25},
+             {785, 6722, 315, 9625, 1455, 12095}},
         };
-        // gpt-oss-20b is deliberately absent, and the reason is a capability
-        // this driver already declares it does not have: `native_mxfp4_moe`
-        // (`context.cpp`). Every published mlx conversion keeps the MoE experts
-        // in openai's MXFP4 -- E2M1 nibbles in blocks of 32 under E8M0
-        // exponents -- and no matvec here reads that, so the loader decodes it
-        // and re-encodes it affine-U4 g64. mlx-lm reads the MXFP4 directly.
-        //
-        // So the two runs do not hold the same expert weights, and no row here
-        // could say they produce the same tokens. Handing the oracle the same
-        // step (`tests/parity/gptoss_requantized_ref.py`) closes most of it --
-        // five of six tokens instead of two -- but not all: mlx's own affine
-        // quantizer disagrees with this one on 8.2% of codes, always by one,
-        // and its weights cannot be replaced with these without passing through
-        // it again. A row gating five tokens would be a row fitted to its
-        // answer.
         //
         // What IS checked, and is the evidence for this family, is the tap
         // comparison under the same re-quantization: no tap collapses, every

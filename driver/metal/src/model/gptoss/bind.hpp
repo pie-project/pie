@@ -37,6 +37,10 @@ struct KvPages {
 int router_bits_from_extents(std::uint64_t weight_bytes, std::uint64_t scale_bytes);
 
 /// The same, looked up by name in a staged weight set.
+/// Whether the staged expert bank is native MXFP4 (no `.biases`) or the affine
+/// U4 the loader used to convert it to.
+bool mxfp4_experts_from_weights(const std::unordered_map<std::string, SlotHandle>& weights);
+
 int router_bits_from_weights(const std::unordered_map<std::string, SlotHandle>& weights);
 
 /// Everything staged before a step can be bound.

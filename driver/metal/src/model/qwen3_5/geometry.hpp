@@ -34,6 +34,12 @@ struct DecodeGeometry {
     int n_experts = 0;
     int experts_per_token = 0;
     int moe_intermediate = 0;
+    /// The bank is stored in the MXFP4 the checkpoint published rather than
+    /// re-quantized to affine U4 at load. It changes what is BOUND -- MXFP4 has
+    /// block exponents and no zero point, so there is no `.biases` to bind --
+    /// which is why a codec belongs in the geometry and not only in a kernel
+    /// name. Solved from the staged tensors, never assumed.
+    bool mxfp4_experts = false;
     /// The dense FFN every routed member runs BESIDE the bank, on every token,
     /// added to the mixture under a one-scalar-per-token sigmoid gate. Zero
     /// only for a routing that has none -- and no member of this family

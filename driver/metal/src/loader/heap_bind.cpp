@@ -1161,6 +1161,14 @@ void push_quant(std::vector<WeightBind>& out, const std::string& base) {
     out.push_back({2, base + ".biases"});
 }
 
+/// The MXFP4 flavour: a `.scales` of block exponents and no zero point. The
+/// third slot is left unbound because the format has nothing to put in it, and
+/// the kernel that reads these never loads from it.
+void push_mxfp4(std::vector<WeightBind>& out, const std::string& base) {
+    out.push_back({0, base + ".weight"});
+    out.push_back({1, base + ".scales"});
+}
+
 }  // namespace
 
 std::vector<WeightBind> weight_binds(
@@ -1168,8 +1176,14 @@ std::vector<WeightBind> weight_binds(
     int layer,
     const DecodeGeometry& g,
     bool gdn_prep) {
-    (void)g;
     std::vector<WeightBind> weights;
+    const auto push_expert = [&](std::vector<WeightBind>& o, const std::string& base) {
+        if (g.mxfp4_experts) {
+            push_mxfp4(o, base);
+        } else {
+            push_quant(o, base);
+        }
+    };
     const std::string prefix = layer >= 0 ? layer_prefix(layer) : std::string();
     switch (kind) {
     case Kernel::EmbedGather:
@@ -1281,16 +1295,16 @@ std::vector<WeightBind> weight_binds(
         weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.router.bias"});
         break;
     case Kernel::GoExpertGate:
-        push_quant(weights, prefix + "mlp.experts.gate_proj");
+        push_expert(weights, prefix + "mlp.experts.gate_proj");
         weights.push_back(
             {(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.gate_proj.bias"});
         break;
     case Kernel::GoExpertUp:
-        push_quant(weights, prefix + "mlp.experts.up_proj");
+        push_expert(weights, prefix + "mlp.experts.up_proj");
         weights.push_back({(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.up_proj.bias"});
         break;
     case Kernel::GoExpertDown:
-        push_quant(weights, prefix + "mlp.experts.down_proj");
+        push_expert(weights, prefix + "mlp.experts.down_proj");
         weights.push_back(
             {(std::uint8_t)bind::GoQmv::Bias, prefix + "mlp.experts.down_proj.bias"});
         break;
@@ -1309,13 +1323,13 @@ std::vector<WeightBind> weight_binds(
         push_quant(weights, prefix + "mlp.gate");
         break;
     case Kernel::LlExpertGate:
-        push_quant(weights, prefix + "mlp.experts.gate_proj");
+        push_expert(weights, prefix + "mlp.experts.gate_proj");
         break;
     case Kernel::LlExpertUp:
-        push_quant(weights, prefix + "mlp.experts.up_proj");
+        push_expert(weights, prefix + "mlp.experts.up_proj");
         break;
     case Kernel::LlExpertDown:
-        push_quant(weights, prefix + "mlp.experts.down_proj");
+        push_expert(weights, prefix + "mlp.experts.down_proj");
         break;
 
     // ── The Qwen3.5 mixture's shared expert ──

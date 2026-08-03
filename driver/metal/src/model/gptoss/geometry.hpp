@@ -80,6 +80,14 @@ struct GptOssGeometry {
     /// wrong text rather than as a crash.
     int router_bits = 8;
 
+    /// The expert bank is read in the MXFP4 the checkpoint published, rather
+    /// than dequantized and re-quantized to affine U4 at load. Solved the same
+    /// way `router_bits` is -- from the tensors that were staged -- because
+    /// `config.json` says "mxfp4" for a checkpoint the loader may still have
+    /// converted, and the only honest witness of which happened is what is in
+    /// the heap. Chooses both what is bound and which matvec runs.
+    bool mxfp4_experts = false;
+
     int max_tokens = 1;
     int max_requests = 1;
     int max_slots = 1;

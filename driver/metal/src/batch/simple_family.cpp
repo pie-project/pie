@@ -637,6 +637,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
         // than defaulted: the 4- and 8-bit matvecs read incompatible packings,
         // and either over the other's bytes routes to the wrong experts, which
         // survives as fluent wrong text instead of as an error.
+        g_.mxfp4_experts = gptoss::mxfp4_experts_from_weights(b_.weights);
         g_.router_bits = gptoss::router_bits_from_weights(b_.weights);
         if (g_.router_bits == 0) {
             if (err) {

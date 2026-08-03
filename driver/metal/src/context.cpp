@@ -515,7 +515,7 @@ class Context::Impl {
             {"backend", "metal"},
             {"unified_memory", true},
             {"fp8_native", false},
-            {"native_mxfp4_moe", false},
+            {"native_mxfp4_moe", true},
             {"storage_alignment", alignment},
             {"storage_max_tile_bytes", kMetalMaxTileBytes},
             {"storage_tile_map_mask", kMetalTileMapMask},

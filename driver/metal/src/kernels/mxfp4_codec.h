@@ -14,9 +14,8 @@
 // MXFP4 cannot borrow the affine dot, whose trick is that `scale * code + bias`
 // is linear in the code.
 //
-// E8M0: an unsigned power of two, 127-biased, one per 32-element block. 0xff is
-// the NaN encoding; no published checkpoint contains one, and reproducing the
-// arithmetic rather than guarding it is what keeps this identical to MLX.
+// E8M0: an unsigned power of two, 127-biased, one per 32-element block, with
+// 0xff reserved for NaN.
 
 #pragma once
 
@@ -28,5 +27,8 @@ constant float kMxfp4Lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f, 
 inline float mxfp4_lo(uint8_t byte) { return kMxfp4Lut[byte & 0xf]; }
 inline float mxfp4_hi(uint8_t byte) { return kMxfp4Lut[byte >> 4]; }
 
-/// One block's E8M0 exponent as a multiplier.
-inline float mxfp4_block_scale(uint8_t code) { return exp2(float(int(code) - 127)); }
+/// One block's E8M0 exponent as a multiplier. 0xff is the NaN encoding; every
+/// other code is an exact power of two.
+inline float mxfp4_block_scale(uint8_t code) {
+  return code == 0xff ? NAN : ldexp(1.0f, int(code) - 127);
+}

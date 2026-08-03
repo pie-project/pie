@@ -22,6 +22,12 @@
 // table, a bias, and a sum in double. The tolerance is set by the bf16 the
 // kernel writes, not by the arithmetic.
 //
+// Only the matvec: gpt-oss's routed experts never reach the batched matmul.
+// Each row picks its own experts, so a tile spanning rows would span weights --
+// `gptoss_is_dense_proj` says so and excludes the three -- and the prefill runs
+// the same routed matvec with a row axis. An MXFP4 tile loader would be an
+// entrypoint nothing dispatches.
+//
 // K is 2880 because that is gpt-oss's, and because it is the interesting one:
 // 2880 = 256 * 11 + 64, so the reduction has a tail that most lanes must sit
 // out. A kernel that reads past it reads the next output row's codes.
@@ -224,90 +230,6 @@ int main() {
                   "slot %d row %d)",
                   double(worst), worst_slot, worst_row);
     expect(worst < 6e-3f, msg);
-
-    // ── the same weights through the prefill's matmul ──
-    //
-    // The decode reads a row at a time; the prompt reads a TILE, through a
-    // different loader that expands the codes into threadgroup memory before
-    // the simdgroup matmul touches them. The two share the format and nothing
-    // else, so a codec that is right in one is not thereby right in the other
-    // -- and since the gate prompt goes through the prefill, a driver that got
-    // only the decode right would still not match mlx-lm on its first token.
-    //
-    // The tile is BM=16 rows by BN=16 columns; kN is 16, so the grid is one
-    // column tile, and the routing hands every tile the same expert. The
-    // reference is the one above, re-read at M rows.
-    constexpr int kRows = 16;
-    const Pso qmm = ctx->compile_pso_from_file(kernels_dir + "/quantized_qmm_t.metal",
-                                               "mxfp4_qmm_t_routed_bfloat16_gs_32_b_4_bm_16_bn_16",
-                                               &err);
-    if (!qmm.valid()) {
-        expect(false, "the MXFP4 matmul builds: " + err);
-        std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
-        return 1;
-    }
-    expect(true, "the MXFP4 matmul builds");
-
-    std::vector<std::uint16_t> xm(std::size_t(kRows) * kK);
-    for (auto& v : xm) v = to_bf16((float(next(seed) >> 8) / float(1u << 24) - 0.5f) * 2.0f);
-    const int tile_expert[1] = {3};
-
-    SlotHandle xm_buf = ctx->create_standalone_buffer(xm.size() * 2);
-    SlotHandle ym_buf = ctx->create_standalone_buffer(std::size_t(kRows) * kN * 2);
-    SlotHandle te_buf = ctx->create_standalone_buffer(sizeof(int));
-    std::memcpy(xm_buf.contents(), xm.data(), xm.size() * 2);
-    std::memset(ym_buf.contents(), 0x7f, ym_buf.size);
-    *static_cast<int*>(te_buf.contents()) = tile_expert[0];
-
-    const int qmm_ordinal = 1;
-    ctx->arg_bind_ordinal(qmm_ordinal, 0, w_buf);
-    ctx->arg_bind_ordinal(qmm_ordinal, 1, s_buf);
-    ctx->arg_bind_ordinal(qmm_ordinal, 2, b_buf);  // unread
-    ctx->arg_bind_ordinal(qmm_ordinal, 3, xm_buf);
-    ctx->arg_bind_ordinal(qmm_ordinal, 4, ym_buf);
-    ctx->arg_bind_ordinal(qmm_ordinal, 5, k_buf);
-    ctx->arg_bind_ordinal(qmm_ordinal, 6, n_buf);
-    ctx->arg_bind_ordinal(qmm_ordinal, 12, te_buf);
-    ctx->make_resident();
-
-    ctx->run_step([&](auto& encoder) {
-        encoder.set_pso(qmm);
-        encoder.set_argtable_ordinal(qmm_ordinal);
-        encoder.dispatch(Grid{32u * (kN / 16u), 2u * (kRows / 16u), 2}, Threadgroup{32, 2, 2});
-    });
-
-    const auto* gotm = static_cast<const std::uint16_t*>(ym_buf.contents());
-    float worst_m = 0.0f;
-    int worst_r = -1, worst_c = -1;
-    for (int r = 0; r < kRows; ++r) {
-        for (int n = 0; n < kN; ++n) {
-            const int row = tile_expert[0] * kN + n;
-            double acc = 0.0;
-            for (int k = 0; k < kK; ++k) {
-                const std::uint32_t word = w[std::size_t(row) * words + k / 8];
-                const int code = int((word >> (4 * (k % 8))) & 0xf);
-                const double factor =
-                    std::ldexp(1.0, int(scales[std::size_t(row) * groups + k / 32]) - 127);
-                acc += double(from_bf16(xm[std::size_t(r) * kK + k])) * double(mxfp4_value(code)) *
-                       factor;
-            }
-            const float mine = from_bf16(gotm[std::size_t(r) * kN + n]);
-            const float rel = float(std::fabs(mine - float(acc))) /
-                              std::fmax(1e-6f, float(std::fabs(acc)));
-            if (rel > worst_m) {
-                worst_m = rel;
-                worst_r = r;
-                worst_c = n;
-            }
-        }
-    }
-    // Looser than the matvec: the tile loader rounds every expanded weight to
-    // bf16 BEFORE the matmul, where the matvec keeps them in float, so the
-    // product carries the weight's rounding as well as the output's.
-    std::snprintf(msg, sizeof msg,
-                  "and every tile of the prefill matmul does too (worst rel %.5f at row %d col %d)",
-                  double(worst_m), worst_r, worst_c);
-    expect(worst_m < 3e-2f, msg);
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -17,15 +17,12 @@ Usage: gptoss_mlx_taps.py <model_path> <comma_token_ids> <out_dir>
 import sys
 
 import mlx.core as mx
-from taps_common import open_taps, requantize_mxfp4
+from taps_common import open_taps
 from mlx_lm.models.gpt_oss import mlx_topk, swiglu
 
 
 def main():
     top, ids, dump, out_dir = open_taps(sys.argv)
-    # The driver's expert weights, not the checkpoint's: see `requantize_mxfp4`.
-    # Without this the taps diverge from layer 4 on with nothing wrong.
-    requantize_mxfp4(top)
     m = top.model
     n = len(ids)
 

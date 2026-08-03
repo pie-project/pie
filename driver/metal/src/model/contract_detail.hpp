@@ -175,6 +175,60 @@ inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
         .expect(std::vector<std::int64_t>{rows, logical_cols});
 }
 
+/// Declare an MXFP4 weight the checkpoint SHIPPED, without decoding it.
+///
+/// The counterpart of `push_mlx_affine_stacked` for the other 4-bit format mlx
+/// publishes. `mlx_lm` writes MXFP4 as a `.weight` of U32 -- eight nibbles to a
+/// little-endian word -- beside a U8 `.scales` of E8M0 block exponents, and no
+/// `.biases`, because a block's values are a table lookup times a power of two
+/// and there is no zero point to subtract.
+///
+/// This is a transmute and not a decode: the bytes staged into the heap are the
+/// checkpoint's own. The alternative -- dequantize to BF16 and re-quantize
+/// affine -- is what the loader did, and it is the one lossy step in a
+/// checkpoint that is otherwise read verbatim. It costs no accuracy that can be
+/// pointed at in a tap, and it costs the ability to be compared against mlx-lm
+/// at all, because the two quantizers disagree on 8.2% of codes.
+inline void push_mlx_mxfp4_stacked(ModelContract& out, const SourceTensor& raw,
+                                   const SourceTensor& scales, std::string output) {
+    if (raw.shape.size() < 2 || scales.shape.size() != raw.shape.size()) {
+        fail("MXFP4 pair '" + std::string(raw.name) + "' and its scales differ in rank");
+    }
+    if (!is_raw(scales.encoding, PieLoaderDType::U8)) {
+        fail("MXFP4 pair '" + std::string(raw.name) +
+             "' has scales that are not the U8 E8M0 block exponents this format stores");
+    }
+    std::int64_t rows = 1;
+    for (std::size_t i = 0; i + 1 < raw.shape.size(); ++i) {
+        if (raw.shape[i] != scales.shape[i]) {
+            fail("MXFP4 pair '" + std::string(raw.name) +
+                 "' disagrees with its scales on the stacked axes");
+        }
+        rows *= raw.shape[i];
+    }
+    // A U32 word holds eight nibbles; a block is 32 elements under one
+    // exponent. Both counts must agree on the column width, and the shapes are
+    // the only thing that says so.
+    const std::int64_t groups = scales.shape.back();
+    if (groups <= 0 || raw.shape.back() != groups * 4) {
+        fail("MXFP4 pair '" + std::string(raw.name) + "' packs " +
+             std::to_string(raw.shape.back()) + " words against " + std::to_string(groups) +
+             " blocks, and eight nibbles to a word over 32-element blocks needs " +
+             std::to_string(groups * 4));
+    }
+    const std::int64_t cols = groups * 32;
+
+    PieLoaderQuantSpecView quant =
+        pie_loader::quant_spec(PieLoaderQuantScheme::Mxfp4E2M1E8M0, PieLoaderDType::BF16);
+    quant.bits_per_element = 4;
+    quant.group_size = 32;
+    quant.channel_axis = 1;
+    const PieLoaderEncodingSpec encoding = pie_loader::quantized(quant);
+    out.define(std::move(output),
+               out.transmute(out.src(std::string(raw.name)), {rows, cols}, encoding), encoding)
+        .expect(std::vector<std::int64_t>{rows, cols});
+}
+
 /// The 4-bit case, under the name the families already call.
 ///
 /// This used to be a second implementation that accepted rank 2 only, which is

@@ -25,46 +25,6 @@ except ImportError as missing:  # pragma: no cover - a setup error, not a code p
     )
 
 
-def requantize_mxfp4(model):
-    """Re-express every MXFP4 module as the affine-U4 g64 the DRIVER holds.
-
-    gpt-oss is the one family whose weights this driver does not read as
-    shipped. Every published mlx conversion keeps the MoE experts in openai's
-    MXFP4 -- E2M1 nibbles in blocks of 32 under E8M0 exponents -- and no kernel
-    here reads that, so the loader decodes it and re-encodes it affine-U4 g64.
-
-    mlx-lm does not take that step. So an oracle run on the checkpoint as
-    shipped is an oracle for a model with DIFFERENT expert weights, and the
-    difference shows up as a smooth cosine decay with depth -- not a collapse,
-    which is what a defect looks like, and the two are easy to confuse when
-    only the tokens are compared.
-
-    This is applied unconditionally rather than behind a flag: the driver always
-    re-quantizes, so re-quantizing is not an option the caller has, it is what
-    the comparison IS. Returns how many modules were changed.
-    """
-    changed = 0
-    for _, module in model.named_modules():
-        if getattr(module, "mode", None) != "mxfp4":
-            continue
-        values = mx.dequantize(
-            module.weight,
-            module.scales,
-            getattr(module, "biases", None),
-            group_size=module.group_size,
-            bits=module.bits,
-            mode="mxfp4",
-        )
-        w, s, b = mx.quantize(values, group_size=64, bits=4, mode="affine")
-        module.weight, module.scales, module.biases = w, s, b
-        module.group_size, module.bits, module.mode = 64, 4, "affine"
-        changed += 1
-    if changed:
-        mx.eval(model.parameters())
-        print(f"re-quantized {changed} MXFP4 modules to affine g64/b4", file=sys.stderr)
-    return changed
-
-
 def open_taps(argv):
     """`<model_path> <comma_token_ids> <out_dir>` -> (model, ids, dump, out_dir).
 
