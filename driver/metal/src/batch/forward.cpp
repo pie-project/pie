@@ -2907,6 +2907,20 @@ bool MetalExecutor::run_paged_batch_forward(const std::vector<MemberForwardDesc>
         }
         const std::size_t request_count =
             d.qo_indptr.size() - 1;
+        // A hybrid family's linear attention state is not in the KV pages. A
+        // member that names no slot is asking a recurrent decoder to run with
+        // no history and to write its own nowhere -- which is exactly what a
+        // caller that never learned about slots sends, and exactly what used
+        // to be accepted. It ran: every member fell to slot zero, the fire
+        // computed each sequence on top of the last one's state, and the
+        // answers came back confident and wrong. The two-member gate caught it
+        // at a relative error of 0.5 only because someone went looking.
+        if (rs_slots() > 0 && !d.has_rs_slot) {
+            reject(i,
+                   "this decoder carries recurrent state, so a paged member "
+                   "must name the slot its state lives in");
+            continue;
+        }
         const bool legacy_single_rs =
             d.has_rs_slot && request_count == 1 &&
             d.request_rs_slot_ids.empty();

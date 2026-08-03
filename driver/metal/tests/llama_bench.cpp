@@ -61,12 +61,16 @@ struct Seq {
     std::vector<std::uint32_t> tokens;
     std::vector<std::uint32_t> pages;
     std::uint32_t next_position = 0;
+    /// Which recurrent-state slot this sequence's linear-attention history
+    /// lives in. A hybrid family carries per-sequence state that is NOT in the
+    /// KV pages, and two sequences sharing a slot overwrite each other's.
+    std::uint32_t rs_slot = 0;
 };
 
 /// `n` new tokens starting at the sequence's current position, reading only the
 /// last row -- the descriptor the runtime builds for a fire.
 MemberForwardDesc desc_for(Seq& s, std::uint32_t n, std::uint32_t page_size,
-                           std::uint32_t& next_free_page) {
+                           std::uint32_t& next_free_page, std::uint32_t rs_slots = 0) {
     MemberForwardDesc d;
     d.sequence_id = s.id;
     d.requires_paged = true;
@@ -92,6 +96,20 @@ MemberForwardDesc desc_for(Seq& s, std::uint32_t n, std::uint32_t page_size,
     d.kv_last_page_lens = {end % page_size == 0 ? page_size : end % page_size};
     d.readout_local_indices = {n - 1};
     d.sampling_indptr = {0u, 1u};
+    // A hybrid family carries per-sequence linear-attention state that is NOT
+    // in the KV pages. The slot is where that state lives, and a sequence that
+    // starts at position zero has none to read yet -- it RESETS, and every
+    // continuation of it reads what the fire before wrote. A family with no
+    // recurrent slots at all wants none of this said.
+    if (rs_slots > 0) {
+        d.has_rs_slot = true;
+        d.rs_slot_id = s.rs_slot;
+        d.rs_reset = s.next_position == 0;
+        d.request_rs_slot_ids = {s.rs_slot};
+        d.request_rs_reset = {std::uint8_t(d.rs_reset ? 1 : 0)};
+        d.request_rs_read = {std::uint8_t(d.rs_reset ? 0 : 1)};
+        d.request_rs_write = {std::uint8_t(1)};
+    }
     return d;
 }
 
@@ -137,7 +155,7 @@ std::vector<float> row_of(const LogitsOut& out, std::uint32_t row) {
 int fire(MetalExecutor& exec, Seq& s, std::uint32_t n, std::uint32_t page_size,
          std::uint32_t& next_free_page, bool want_token = false,
          LogitsOut* staged = nullptr) {
-    MemberForwardDesc d = desc_for(s, n, page_size, next_free_page);
+    MemberForwardDesc d = desc_for(s, n, page_size, next_free_page, exec.rs_slots());
     LogitsOut out;
     std::string err;
     if (!exec.forward(d, out, &err)) {
@@ -487,12 +505,17 @@ int main(int argc, char** argv) {
             Seq a, b;
             a.id = next_id++;
             a.tokens = p0;
+            a.rs_slot = 0;
             b.id = next_id++;
             b.tokens = p1;
+            // Its OWN recurrent slot. A hybrid family's per-sequence linear
+            // attention state is not in the KV pages, so two members sharing a
+            // slot in one fire compute each other's history.
+            b.rs_slot = 1;
             std::uint32_t page = 0;
             std::vector<MemberForwardDesc> descs;
-            descs.push_back(desc_for(a, std::uint32_t(p0.size()), page_size, page));
-            descs.push_back(desc_for(b, std::uint32_t(p1.size()), page_size, page));
+            descs.push_back(desc_for(a, std::uint32_t(p0.size()), page_size, page, exec.rs_slots()));
+            descs.push_back(desc_for(b, std::uint32_t(p1.size()), page_size, page, exec.rs_slots()));
             std::vector<LogitsOut> outs(2);
             std::vector<std::uint8_t> ok(2, 0);
             std::vector<std::string> errs(2);
