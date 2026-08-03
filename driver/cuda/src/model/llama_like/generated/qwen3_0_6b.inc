@@ -61,6 +61,12 @@ const LoraTable* lora)
                      N, R);
     }
 
+    FirePageMask page_mask(hooks, stream);
+    const std::uint32_t* attn_page_indices = kv_page_indices;
+    const std::uint32_t* attn_page_indptr = kv_page_indptr;
+    const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
+    std::optional<LayerScoreCapture> score_capture;
+
     std::optional<LoraFireStateHandle> lora_state;
     if (lora != nullptr && lora->usable()) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
@@ -138,10 +144,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 0u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -157,10 +172,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -213,17 +231,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 0u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(0u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(0);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(0u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -238,16 +323,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -309,17 +398,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 0u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(0u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(0);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(0u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -334,16 +490,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -436,10 +596,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 1u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -455,10 +624,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -511,17 +683,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 1u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(1u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(1);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(1u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -536,16 +775,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -607,17 +850,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 1u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(1u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(1);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(1u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -632,16 +942,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -734,10 +1048,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 2u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -753,10 +1076,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -809,17 +1135,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 2u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(2u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(2);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(2u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -834,16 +1227,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -905,17 +1302,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 2u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(2u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(2);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(2u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -930,16 +1394,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -1032,10 +1500,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 3u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -1051,10 +1528,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1107,17 +1587,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 3u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(3u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(3);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(3u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -1132,16 +1679,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1203,17 +1754,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 3u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(3u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(3);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(3u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -1228,16 +1846,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -1330,10 +1952,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 4u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -1349,10 +1980,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1405,17 +2039,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 4u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(4u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(4);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(4u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -1430,16 +2131,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1501,17 +2206,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 4u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(4u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(4);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(4u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -1526,16 +2298,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -1628,10 +2404,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 5u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -1647,10 +2432,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1703,17 +2491,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 5u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(5u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(5);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(5u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -1728,16 +2583,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -1799,17 +2658,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 5u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(5u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(5);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(5u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -1824,16 +2750,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -1926,10 +2856,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 6u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -1945,10 +2884,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2001,17 +2943,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 6u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(6u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(6);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(6u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -2026,16 +3035,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2097,17 +3110,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 6u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(6u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(6);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(6u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -2122,16 +3202,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -2224,10 +3308,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 7u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -2243,10 +3336,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2299,17 +3395,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 7u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(7u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(7);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(7u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -2324,16 +3487,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2395,17 +3562,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 7u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(7u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(7);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(7u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -2420,16 +3654,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -2522,10 +3760,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 8u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -2541,10 +3788,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2597,17 +3847,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 8u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(8u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(8);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(8u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -2622,16 +3939,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2693,17 +4014,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 8u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(8u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(8);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(8u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -2718,16 +4106,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -2820,10 +4212,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 9u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -2839,10 +4240,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2895,17 +4299,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 9u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(9u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(9);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(9u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -2920,16 +4391,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -2991,17 +4466,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 9u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(9u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(9);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(9u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -3016,16 +4558,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -3118,10 +4664,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 10u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -3137,10 +4692,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3193,17 +4751,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 10u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(10u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(10);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(10u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -3218,16 +4843,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3289,17 +4918,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 10u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(10u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(10);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(10u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -3314,16 +5010,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -3416,10 +5116,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 11u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -3435,10 +5144,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3491,17 +5203,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 11u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(11u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(11);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(11u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -3516,16 +5295,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3587,17 +5370,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 11u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(11u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(11);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(11u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -3612,16 +5462,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -3714,10 +5568,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 12u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -3733,10 +5596,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3789,17 +5655,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 12u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(12u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(12);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(12u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -3814,16 +5747,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -3885,17 +5822,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 12u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(12u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(12);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(12u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -3910,16 +5914,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -4012,10 +6020,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 13u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -4031,10 +6048,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4087,17 +6107,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 13u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(13u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(13);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(13u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -4112,16 +6199,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4183,17 +6274,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 13u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(13u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(13);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(13u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -4208,16 +6366,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -4310,10 +6472,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 14u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -4329,10 +6500,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4385,17 +6559,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 14u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(14u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(14);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(14u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -4410,16 +6651,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4481,17 +6726,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 14u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(14u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(14);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(14u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -4506,16 +6818,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -4608,10 +6924,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 15u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -4627,10 +6952,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4683,17 +7011,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 15u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(15u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(15);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(15u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -4708,16 +7103,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4779,17 +7178,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 15u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(15u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(15);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(15u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -4804,16 +7270,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -4906,10 +7376,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 16u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -4925,10 +7404,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -4981,17 +7463,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 16u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(16u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(16);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(16u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -5006,16 +7555,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5077,17 +7630,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 16u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(16u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(16);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(16u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -5102,16 +7722,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -5204,10 +7828,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 17u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -5223,10 +7856,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5279,17 +7915,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 17u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(17u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(17);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(17u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -5304,16 +8007,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5375,17 +8082,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 17u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(17u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(17);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(17u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -5400,16 +8174,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -5502,10 +8280,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 18u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -5521,10 +8308,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5577,17 +8367,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 18u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(18u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(18);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(18u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -5602,16 +8459,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5673,17 +8534,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 18u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(18u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(18);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(18u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -5698,16 +8626,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -5800,10 +8732,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 19u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -5819,10 +8760,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5875,17 +8819,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 19u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(19u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(19);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(19u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -5900,16 +8911,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -5971,17 +8986,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 19u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(19u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(19);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(19u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -5996,16 +9078,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -6098,10 +9184,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 20u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -6117,10 +9212,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6173,17 +9271,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 20u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(20u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(20);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(20u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -6198,16 +9363,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6269,17 +9438,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 20u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(20u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(20);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(20u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -6294,16 +9530,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -6396,10 +9636,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 21u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -6415,10 +9664,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6471,17 +9723,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 21u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(21u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(21);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(21u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -6496,16 +9815,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6567,17 +9890,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 21u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(21u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(21);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(21u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -6592,16 +9982,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -6694,10 +10088,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 22u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -6713,10 +10116,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6769,17 +10175,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 22u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(22u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(22);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(22u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -6794,16 +10267,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -6865,17 +10342,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 22u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(22u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(22);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(22u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -6890,16 +10434,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -6992,10 +10540,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 23u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -7011,10 +10568,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7067,17 +10627,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 23u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(23u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(23);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(23u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -7092,16 +10719,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7163,17 +10794,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 23u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(23u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(23);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(23u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -7188,16 +10886,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -7290,10 +10992,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 24u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -7309,10 +11020,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7365,17 +11079,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 24u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(24u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(24);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(24u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -7390,16 +11171,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7461,17 +11246,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 24u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(24u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(24);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(24u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -7486,16 +11338,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -7588,10 +11444,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 25u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -7607,10 +11472,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7663,17 +11531,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 25u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(25u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(25);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(25u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -7688,16 +11623,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7759,17 +11698,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 25u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(25u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(25);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(25u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -7784,16 +11790,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -7886,10 +11896,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 26u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -7905,10 +11924,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -7961,17 +11983,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 26u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(26u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(26);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(26u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -7986,16 +12075,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -8057,17 +12150,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 26u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(26u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(26);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(26u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -8082,16 +12242,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -8184,10 +12348,19 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 27u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -8203,10 +12376,13 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else if (lora != nullptr && lora->usable()) {
         ops::gemm_act_x_w(cublas.handle(),
@@ -8259,17 +12435,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 27u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(27u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(27);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(27u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -8284,16 +12527,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     } else {
         ops::gemm_act_x_w(cublas.handle(),
@@ -8355,17 +12602,84 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            score_capture.emplace(hooks, 27u,
+                static_cast<std::uint32_t>(num_q_heads),
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.decode_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no decode plan");
+            }
+            if (!score_capture || !score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture decode stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(27u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
+            {
+                auto kv_view = cache.layer_view(27);
+                ops::dispatch_attention_flashinfer_decode_capture(
+                    *plan_state.decode_plan,
+                    ws.q.data(), kv_view, ws.attn_out.data(),
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
+                    attn_ws, stream,
+                    score_capture->raw(), score_capture->indptr_d(),
+                    /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                score_capture->publish(
+                    attn_page_indptr, attn_last_page_lens,
+                    cache.page_size());
+            }
         } else {
+            if (page_mask.written_for(27u)) {
+                if (!plan_state.decode_plan) {
+                    throw std::runtime_error(
+                        "attn_page_mask was written but this layer does "
+                        "not take the paged decode path");
+                }
+                if (!ops::decode_plan_is_page_count_independent(
+                        *plan_state.decode_plan)) {
+                    throw std::runtime_error(
+                        "attn_page_mask requires a page-count-independent "
+                        "decode plan; this fire planned split-KV");
+                }
+                page_mask.compact(
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    static_cast<std::uint32_t>(R), stream);
+                attn_page_indices = page_mask.page_indices();
+                attn_page_indptr = page_mask.page_indptr();
+                attn_last_page_lens = page_mask.last_page_lens();
+            }
             if (!plan_state.decode_plan) {
                 throw std::runtime_error(
                     "generated forward: prepare built no decode plan");
@@ -8380,16 +12694,20 @@ const LoraTable* lora)
                 ops::dispatch_attention_flashinfer_decode(
                     *plan_state.decode_plan,
                     ws.q.data(), kv_view, ws.attn_out.data(),
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_page_indices, attn_page_indptr,
+                    attn_last_page_lens,
                     attn_ws, stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.scores = score_capture ? score_capture->scores()
+                                         : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -8510,6 +12828,12 @@ const LoraTable* lora)
                      N, R);
     }
 
+    FirePageMask page_mask(hooks, stream);
+    const std::uint32_t* attn_page_indices = kv_page_indices;
+    const std::uint32_t* attn_page_indptr = kv_page_indptr;
+    const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
+    std::optional<LayerPrefillScoreCapture> prefill_score_capture;
+
     std::optional<LoraFireStateHandle> lora_state;
     if (lora != nullptr && lora->usable()) {
         lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I,
@@ -8573,10 +12897,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 0u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -8592,17 +12926,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 0u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(0);
@@ -8610,10 +12958,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(0u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(0);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -8632,10 +13006,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                0u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -8728,10 +13106,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 1u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -8747,17 +13135,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 1u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(1);
@@ -8765,10 +13167,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(1u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(1);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -8787,10 +13215,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                1u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -8883,10 +13315,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 2u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -8902,17 +13344,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 2u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(2);
@@ -8920,10 +13376,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(2u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(2);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -8942,10 +13424,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                2u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -9038,10 +13524,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 3u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -9057,17 +13553,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 3u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(3);
@@ -9075,10 +13585,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(3u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(3);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -9097,10 +13633,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                3u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -9193,10 +13733,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 4u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -9212,17 +13762,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 4u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(4);
@@ -9230,10 +13794,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(4u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(4);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -9252,10 +13842,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                4u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -9348,10 +13942,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 5u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -9367,17 +13971,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 5u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(5);
@@ -9385,10 +14003,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(5u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(5);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -9407,10 +14051,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                5u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -9503,10 +14151,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 6u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -9522,17 +14180,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 6u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(6);
@@ -9540,10 +14212,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(6u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(6);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -9562,10 +14260,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                6u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -9658,10 +14360,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 7u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -9677,17 +14389,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 7u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(7);
@@ -9695,10 +14421,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(7u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(7);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -9717,10 +14469,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                7u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -9813,10 +14569,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 8u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -9832,17 +14598,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 8u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(8);
@@ -9850,10 +14630,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(8u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(8);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -9872,10 +14678,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                8u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -9968,10 +14778,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 9u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -9987,17 +14807,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 9u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(9);
@@ -10005,10 +14839,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(9u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(9);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -10027,10 +14887,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                9u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -10123,10 +14987,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 10u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -10142,17 +15016,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 10u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(10);
@@ -10160,10 +15048,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(10u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(10);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -10182,10 +15096,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                10u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -10278,10 +15196,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 11u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -10297,17 +15225,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 11u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(11);
@@ -10315,10 +15257,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(11u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(11);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -10337,10 +15305,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                11u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -10433,10 +15405,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 12u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -10452,17 +15434,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 12u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(12);
@@ -10470,10 +15466,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(12u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(12);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -10492,10 +15514,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                12u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -10588,10 +15614,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 13u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -10607,17 +15643,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 13u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(13);
@@ -10625,10 +15675,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(13u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(13);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -10647,10 +15723,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                13u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -10743,10 +15823,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 14u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -10762,17 +15852,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 14u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(14);
@@ -10780,10 +15884,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(14u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(14);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -10802,10 +15932,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                14u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -10898,10 +16032,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 15u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -10917,17 +16061,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 15u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(15);
@@ -10935,10 +16093,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(15u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(15);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -10957,10 +16141,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                15u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -11053,10 +16241,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 16u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -11072,17 +16270,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 16u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(16);
@@ -11090,10 +16302,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(16u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(16);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -11112,10 +16350,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                16u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -11208,10 +16450,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 17u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -11227,17 +16479,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 17u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(17);
@@ -11245,10 +16511,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(17u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(17);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -11267,10 +16559,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                17u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -11363,10 +16659,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 18u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -11382,17 +16688,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 18u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(18);
@@ -11400,10 +16720,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(18u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(18);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -11422,10 +16768,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                18u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -11518,10 +16868,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 19u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -11537,17 +16897,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 19u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(19);
@@ -11555,10 +16929,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(19u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(19);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -11577,10 +16977,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                19u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -11673,10 +17077,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 20u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -11692,17 +17106,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 20u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(20);
@@ -11710,10 +17138,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(20u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(20);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -11732,10 +17186,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                20u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -11828,10 +17286,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 21u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -11847,17 +17315,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 21u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(21);
@@ -11865,10 +17347,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(21u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(21);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -11887,10 +17395,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                21u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -11983,10 +17495,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 22u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -12002,17 +17524,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 22u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(22);
@@ -12020,10 +17556,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(22u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(22);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -12042,10 +17604,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                22u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -12138,10 +17704,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 23u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -12157,17 +17733,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 23u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(23);
@@ -12175,10 +17765,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(23u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(23);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -12197,10 +17813,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                23u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -12293,10 +17913,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 24u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -12312,17 +17942,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 24u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(24);
@@ -12330,10 +17974,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(24u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(24);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -12352,10 +18022,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                24u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -12448,10 +18122,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 25u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -12467,17 +18151,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 25u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(25);
@@ -12485,10 +18183,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(25u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(25);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -12507,10 +18231,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                25u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -12603,10 +18331,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 26u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -12622,17 +18360,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 26u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(26);
@@ -12640,10 +18392,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(26u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(26);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -12662,10 +18440,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                26u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),
@@ -12758,10 +18540,20 @@ const LoraTable* lora)
     }
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 27u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         if (!plan_state.prefill_plan) {
             throw std::runtime_error(
@@ -12777,17 +18569,31 @@ const LoraTable* lora)
                 attn_ws, stream);
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     } else {
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            prefill_score_capture.emplace(hooks, 27u,
+                static_cast<std::uint32_t>(num_q_heads),
+                plan_state.prefill_score_window,
+                /*capturable=*/true, stream);
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttnProj, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
         }
         {
             auto kv_view = cache.layer_view(27);
@@ -12795,10 +18601,36 @@ const LoraTable* lora)
                 kv_view, kv_page_indices, kv_page_indptr_h[R], stream);
         }
         if (hooks != nullptr && hooks->wants_attn_score) {
-            throw std::runtime_error(
-                "generated forward: capture dispatch reached the "
-                "static form (the dispatch gate routes hooks to "
-                "the interpreter walk)");
+            if (!plan_state.prefill_plan) {
+                throw std::runtime_error(
+                    "generated forward: prepare built no prefill plan");
+            }
+            if (!prefill_score_capture ||
+                !prefill_score_capture->active()) {
+                throw std::runtime_error(
+                    "generated forward: capture prefill stated but no "
+                    "active score capture (guard/pred drift)");
+            }
+            if (page_mask.written_for(27u)) {
+                throw std::runtime_error(
+                    "attn_page_mask was written but this layer does "
+                    "not take the paged decode path");
+            }
+            {
+                auto kv_view = cache.layer_view(27);
+                ops::dispatch_attention_flashinfer_prefill_capture_bf16(
+                    *plan_state.prefill_plan,
+                    ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,
+                    ws.attn_out.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, attn_ws, stream,
+                    prefill_score_capture->raw(),
+                    prefill_score_capture->folded(),
+                    prefill_score_capture->indptr_d(),
+                    prefill_score_capture->window(),
+                    /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                prefill_score_capture->publish();
+            }
         } else {
             if (!plan_state.prefill_plan) {
                 throw std::runtime_error(
@@ -12817,10 +18649,14 @@ const LoraTable* lora)
             }
         }
         if (hooks != nullptr) {
-            throw std::runtime_error(
-                "generated forward: hooked fire reached the static "
-                "form (the dispatch gate routes hooks to the "
-                "interpreter walk)");
+            invoke_stage_hook(
+                hooks, StageHookPoint::OnAttn, ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                27u, stream, /*query_is_f32=*/false,
+                {.scores = prefill_score_capture
+                     ? prefill_score_capture->scores()
+                     : nullptr});
         }
     }
     ops::gemm_act_x_w(cublas.handle(),

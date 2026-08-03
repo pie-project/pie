@@ -163,6 +163,23 @@ fn emit_class_fn(
     b.line("    }");
     b.line("");
 
+    // The hook sidebands (the interpreter's fire-level preamble,
+    // hoisted statically): the page-mask sink the OnAttnProj sites
+    // offer, the per-layer score capture the attention publishes
+    // through, and the per-layer (possibly compacted) page list the
+    // attention emissions consume. All argument-driven — an unhooked
+    // fire constructs an inactive mask and none of it launches.
+    b.line("    FirePageMask page_mask(hooks, stream);");
+    b.line("    const std::uint32_t* attn_page_indices = kv_page_indices;");
+    b.line("    const std::uint32_t* attn_page_indptr = kv_page_indptr;");
+    b.line("    const std::uint32_t* attn_last_page_lens = kv_last_page_lens;");
+    if is_decode {
+        b.line("    std::optional<LayerScoreCapture> score_capture;");
+    } else {
+        b.line("    std::optional<LayerPrefillScoreCapture> prefill_score_capture;");
+    }
+    b.line("");
+
     // A stated lora correction obligates the fire staging: the emitter
     // saw the op, so the generated file constructs the handle (the
     // interpreter's lora_state, hoisted here statically).
@@ -561,25 +578,92 @@ fn emit_op(
             weights,
             state,
         } => emit_launch(b, kernel, weights, state.as_ref(), op, facts, is_decode, win),
-        OpKind::HookSite { .. } => {
-            // A3: the sites live in the ONE body every unmasked fire
-            // walks — on an unhooked fire they are argument no-ops
-            // (zero launches), which for the static form is an empty
-            // statement. A HOOKED fire transliterates to a REFUSAL:
-            // the static form does not carry the hook sideband
-            // machinery (page-mask brackets, score captures), and the
-            // dispatch in declared_forward.cpp routes hooked fires to
-            // the interpreter walk — the throw is the honest text of
-            // that gate, unreachable while it holds.
+        OpKind::HookSite { stage, layer } => {
+            // The interpreter's site handler, transliterated with the
+            // stage and layer as constants. Null hooks skip everything
+            // (argument no-op, zero launches).
             b.stmt("if (hooks != nullptr) {");
-            b.stmt("    throw std::runtime_error(");
-            b.stmt("        \"generated forward: hooked fire reached the static \"");
-            b.stmt("        \"form (the dispatch gate routes hooks to the \"");
-            b.stmt("        \"interpreter walk)\");");
+            match stage {
+                crate::trace::HookStage::OnAttnProj => {
+                    b.stmt("    attn_page_indices = kv_page_indices;");
+                    b.stmt("    attn_page_indptr = kv_page_indptr;");
+                    b.stmt("    attn_last_page_lens = kv_last_page_lens;");
+                    b.stmt("    page_mask.begin_layer(stream);");
+                    if is_decode {
+                        b.stmt(&format!(
+                            "    score_capture.emplace(hooks, {layer}u,"
+                        ));
+                        b.stmt("        static_cast<std::uint32_t>(num_q_heads),");
+                        b.stmt("        /*capturable=*/true, stream);");
+                    } else {
+                        b.stmt(&format!(
+                            "    prefill_score_capture.emplace(hooks, {layer}u,"
+                        ));
+                        b.stmt("        static_cast<std::uint32_t>(num_q_heads),");
+                        b.stmt("        plan_state.prefill_score_window,");
+                        b.stmt("        /*capturable=*/true, stream);");
+                    }
+                    b.stmt("    invoke_stage_hook(");
+                    b.stmt("        hooks, StageHookPoint::OnAttnProj, ws.q.data(),");
+                    b.stmt("        static_cast<std::uint32_t>(N),");
+                    b.stmt("        static_cast<std::uint32_t>(Hq),");
+                    b.stmt(&format!("        {layer}u, stream, /*query_is_f32=*/false,"));
+                    b.stmt("        {.mask_sink = page_mask.sink()});");
+                }
+                crate::trace::HookStage::OnAttn => {
+                    b.stmt("    invoke_stage_hook(");
+                    b.stmt("        hooks, StageHookPoint::OnAttn, ws.q.data(),");
+                    b.stmt("        static_cast<std::uint32_t>(N),");
+                    b.stmt("        static_cast<std::uint32_t>(Hq),");
+                    b.stmt(&format!("        {layer}u, stream, /*query_is_f32=*/false,"));
+                    if is_decode {
+                        b.stmt("        {.scores = score_capture ? score_capture->scores()");
+                        b.stmt("                                 : nullptr});");
+                    } else {
+                        b.stmt("        {.scores = prefill_score_capture");
+                        b.stmt("             ? prefill_score_capture->scores()");
+                        b.stmt("             : nullptr});");
+                    }
+                }
+            }
             b.stmt("}");
         }
         other => panic!("emitter: op kind {other:?} out of scope for the qwen3 classes"),
     }
+}
+
+
+/// The page-mask bracket the interpreter's `resolve_masked_pages` runs
+/// before an attention launch, emitted with the layer constant. A
+/// written mask substitutes the layer's page list into the SAME stated
+/// kernel — legal only on the page-count-independent paged decode plan
+/// (the hand-written contract; anything else throws).
+fn emit_masked_pages_bracket(b: &mut Body, layer: u32, takes_paged_decode: bool) {
+    b.stmt(&format!("if (page_mask.written_for({layer}u)) {{"));
+    if takes_paged_decode {
+        b.stmt("    if (!plan_state.decode_plan) {");
+        b.stmt("        throw std::runtime_error(");
+        b.stmt("            \"attn_page_mask was written but this layer does \"");
+        b.stmt("            \"not take the paged decode path\");");
+        b.stmt("    }");
+        b.stmt("    if (!ops::decode_plan_is_page_count_independent(");
+        b.stmt("            *plan_state.decode_plan)) {");
+        b.stmt("        throw std::runtime_error(");
+        b.stmt("            \"attn_page_mask requires a page-count-independent \"");
+        b.stmt("            \"decode plan; this fire planned split-KV\");");
+        b.stmt("    }");
+        b.stmt("    page_mask.compact(");
+        b.stmt("        kv_page_indices, kv_page_indptr, kv_last_page_lens,");
+        b.stmt("        static_cast<std::uint32_t>(R), stream);");
+        b.stmt("    attn_page_indices = page_mask.page_indices();");
+        b.stmt("    attn_page_indptr = page_mask.page_indptr();");
+        b.stmt("    attn_last_page_lens = page_mask.last_page_lens();");
+    } else {
+        b.stmt("    throw std::runtime_error(");
+        b.stmt("        \"attn_page_mask was written but this layer does \"");
+        b.stmt("        \"not take the paged decode path\");");
+    }
+    b.stmt("}");
 }
 
 fn emit_launch(
@@ -677,6 +761,7 @@ fn emit_launch(
         }
         "launch_attention_xqa_decode_bf16_prepared" => {
             let layer = state.expect("attention addresses kv state").layer;
+            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/false);
             b.stmt(&format!("{{"));
             b.stmt(&format!(
                 "    auto kv_view = cache.layer_view({layer});"
@@ -729,6 +814,7 @@ fn emit_launch(
         }
         "dispatch_attention_flashinfer_decode" => {
             let layer = state.expect("attention addresses kv state").layer;
+            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
             assert!(
                 facts.norm_placement == NormPlacement::Pre,
                 "window resolution below assumes the in-scope configs"
@@ -757,7 +843,8 @@ fn emit_launch(
             b.stmt("    ops::dispatch_attention_flashinfer_decode(");
             b.stmt("        *plan_state.decode_plan,");
             b.stmt("        ws.q.data(), kv_view, ws.attn_out.data(),");
-            b.stmt("        kv_page_indices, kv_page_indptr, kv_last_page_lens,");
+            b.stmt("        attn_page_indices, attn_page_indptr,");
+            b.stmt("        attn_last_page_lens,");
             b.stmt("        attn_ws, stream, layer_window_left,");
             b.stmt("        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);");
             b.stmt("}");
@@ -801,14 +888,68 @@ fn emit_launch(
             b.stmt("    H, Hq, Hk,");
             b.stmt("    ws.q.data(), ws.v.data(), ws.gate.data());");
         }
-        "dispatch_attention_flashinfer_decode_capture"
-        | "dispatch_attention_flashinfer_prefill_capture_bf16" => {
-            // Score-capturing dispatches live in the HasStageHooks arm;
-            // same refusal contract as the HookSite emission above.
-            b.stmt("throw std::runtime_error(");
-            b.stmt("    \"generated forward: capture dispatch reached the \"");
-            b.stmt("    \"static form (the dispatch gate routes hooks to \"");
-            b.stmt("    \"the interpreter walk)\");");
+        "dispatch_attention_flashinfer_decode_capture" => {
+            // The interpreter's capture-decode handler, layer constant.
+            let layer = state.expect("attention addresses kv state").layer;
+            b.stmt("if (!plan_state.decode_plan) {");
+            b.stmt("    throw std::runtime_error(");
+            b.stmt("        \"generated forward: prepare built no decode plan\");");
+            b.stmt("}");
+            b.stmt("if (!score_capture || !score_capture->active()) {");
+            b.stmt("    throw std::runtime_error(");
+            b.stmt("        \"generated forward: capture decode stated but no \"");
+            b.stmt("        \"active score capture (guard/pred drift)\");");
+            b.stmt("}");
+            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/true);
+            b.stmt(&format!("{{"));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+            b.stmt("    ops::dispatch_attention_flashinfer_decode_capture(");
+            b.stmt("        *plan_state.decode_plan,");
+            b.stmt("        ws.q.data(), kv_view, ws.attn_out.data(),");
+            b.stmt("        attn_page_indices, attn_page_indptr,");
+            b.stmt("        attn_last_page_lens,");
+            b.stmt("        attn_ws, stream,");
+            b.stmt("        score_capture->raw(), score_capture->indptr_d(),");
+            b.stmt("        /*window_left=*/-1,");
+            b.stmt("        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);");
+            b.stmt("    score_capture->publish(");
+            b.stmt("        attn_page_indptr, attn_last_page_lens,");
+            b.stmt("        cache.page_size());");
+            b.stmt("}");
+        }
+        "dispatch_attention_flashinfer_prefill_capture_bf16" => {
+            let layer = state.expect("attention addresses kv state").layer;
+            let plan_cache = if is_decode {
+                "plan_state.prefill_decode_plan"
+            } else {
+                "plan_state.prefill_plan"
+            };
+            b.stmt(&format!("if (!{plan_cache}) {{"));
+            b.stmt("    throw std::runtime_error(");
+            b.stmt("        \"generated forward: prepare built no prefill plan\");");
+            b.stmt("}");
+            b.stmt("if (!prefill_score_capture ||");
+            b.stmt("    !prefill_score_capture->active()) {");
+            b.stmt("    throw std::runtime_error(");
+            b.stmt("        \"generated forward: capture prefill stated but no \"");
+            b.stmt("        \"active score capture (guard/pred drift)\");");
+            b.stmt("}");
+            emit_masked_pages_bracket(b, layer, /*takes_paged_decode=*/false);
+            b.stmt(&format!("{{"));
+            b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+            b.stmt("    ops::dispatch_attention_flashinfer_prefill_capture_bf16(");
+            b.stmt(&format!("        *{plan_cache},"));
+            b.stmt("        ws.q.data(), kv_view.k_bf16_pages, kv_view.v_bf16_pages,");
+            b.stmt("        ws.attn_out.data(),");
+            b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
+            b.stmt("        kv_last_page_lens, attn_ws, stream,");
+            b.stmt("        prefill_score_capture->raw(),");
+            b.stmt("        prefill_score_capture->folded(),");
+            b.stmt("        prefill_score_capture->indptr_d(),");
+            b.stmt("        prefill_score_capture->window(),");
+            b.stmt("        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);");
+            b.stmt("    prefill_score_capture->publish();");
+            b.stmt("}");
         }
         other => panic!("emitter: stated kernel {other} out of scope"),
     }
