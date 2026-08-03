@@ -371,6 +371,28 @@ impl Channel {
     }
 }
 
+/// Seed a channel straight from an iterator, without materializing a `Vec`
+/// first: `Channel::from_iter(0..n)` rather than
+/// `Channel::from((0..n).collect::<Vec<_>>())`. Page tables, position vectors
+/// and write-slot maps are all built this way.
+///
+/// `IntoConst` cannot accept iterators — a blanket impl over `IntoIterator`
+/// collides with the scalar impls — so the element types are spelled out here
+/// instead, which is also what makes `.collect::<Channel>()` infer.
+macro_rules! channel_from_iter {
+    ($t:ty) => {
+        impl FromIterator<$t> for Channel {
+            fn from_iter<I: IntoIterator<Item = $t>>(iter: I) -> Channel {
+                Channel::from(iter.into_iter().collect::<Vec<$t>>())
+            }
+        }
+    };
+}
+channel_from_iter!(u32);
+channel_from_iter!(i32);
+channel_from_iter!(f32);
+channel_from_iter!(bool);
+
 /// The result of [`Channel::take`]/[`Channel::read`]. In a stage closure it is
 /// an in-program value (via [`AsTensor`]); on the host [`get`](Self::get) /
 /// [`bytes`](Self::bytes) await the committed value.
@@ -489,14 +511,6 @@ impl WorkingSet {
         WorkingSet {
             kv: Rc::new(KvWorkingSet::new()),
         }
-    }
-
-    /// Tokens per KV page for this working set's model — the constant every
-    /// page-geometry expression divides by, so it reads next to the working
-    /// set it is used with. A cached [`crate::model::kv_page_size`], not a
-    /// property of this handle: the engine serves one model.
-    pub fn page_size(&self) -> u32 {
-        kv_page_size()
     }
 
     /// Current logical extent in pages, including reserved-but-unwritten space.
