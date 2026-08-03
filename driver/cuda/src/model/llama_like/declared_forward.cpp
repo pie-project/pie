@@ -194,6 +194,7 @@ inline const void* bf16_row(const void* base, int row, int width) {
 // in `llama_like_forward_declared` runs it only on exact match.
 #include "model/llama_like/generated/qwen3_0_6b.inc"
 #include "model/llama_like/generated/olmo2_1b.inc"
+#include "model/llama_like/generated/qwen2_5_1_5b.inc"
 
 // PIE_DECLARED_FORWARD_GENERATED=1 routes digest-matched fires through
 // the generated static form instead of the interpreter walk — the third
@@ -420,6 +421,7 @@ void llama_like_forward_declared(
     if (generated_forward_enabled() &&
         declared.facts_digest != kGeneratedDigest_qwen3_0_6b &&
         declared.facts_digest != kGeneratedDigest_olmo2_1b &&
+        declared.facts_digest != kGeneratedDigest_qwen2_5_1_5b &&
         std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
         // Silent non-engagement is this path's failure mode; say why.
         std::fprintf(stderr,
@@ -428,6 +430,8 @@ void llama_like_forward_declared(
                      declared.facts_digest.c_str(),
                      kGeneratedDigest_qwen3_0_6b,
                      kGeneratedDigest_olmo2_1b);
+        std::fprintf(stderr, "  emitted: %s\n",
+                     kGeneratedDigest_qwen2_5_1_5b);
     }
     // A1 (the class-collapse amendment): a custom mask no longer picks a
     // class — the decode/prefill traces carry it as their HasCustomMask
@@ -458,6 +462,11 @@ void llama_like_forward_declared(
         if (declared.facts_digest == kGeneratedDigest_olmo2_1b) {
             run(generated_llama_like_decode_olmo2_1b,
                 generated_llama_like_prefill_olmo2_1b);
+            return;
+        }
+        if (declared.facts_digest == kGeneratedDigest_qwen2_5_1_5b) {
+            run(generated_llama_like_decode_qwen2_5_1_5b,
+                generated_llama_like_prefill_qwen2_5_1_5b);
             return;
         }
     }

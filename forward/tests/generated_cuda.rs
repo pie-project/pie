@@ -57,6 +57,19 @@ fn committed_incs_are_regeneration_clean() {
             "olmo2_1b",
         ),
     );
+    check(
+        "qwen2_5_1_5b",
+        &emit_llama_like_cuda_inc(
+            &LlamaLikeFacts::qwen2_5_1_5b(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: true,
+            },
+            "qwen2_5_1_5b",
+        ),
+    );
     check_q35(
         "qwen3_5_0_8b",
         &pie_forward::emit_qwen35::emit_qwen35_cuda_inc(

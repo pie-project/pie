@@ -436,6 +436,23 @@ fn emit_op(
             ));
             b.stmt(&format!("    {output}, N, {width}, eps, stream);"));
         }
+        OpKind::AddBias { weight } => {
+            // Qwen-2 family qkv biases: the hand-written `maybe_add_bias`
+            // calls, target buffer and width resolved at EMISSION time
+            // from the weight's field name (the interpreter dispatches on
+            // the same suffix at walk time).
+            let (layer, field) = split_layer_weight(weight)
+                .unwrap_or_else(|| panic!("emitter: unknown bias weight {weight}"));
+            let (buf, width) = match field {
+                "q_bias" => ("ws.q.data()", "Hq"),
+                "k_bias" => ("ws.k.data()", "Hk"),
+                "v_bias" => ("ws.v.data()", "Hk"),
+                other => panic!("emitter: bias field {other} out of scope"),
+            };
+            b.stmt("kernels::launch_add_bias_bf16(");
+            b.stmt(&format!("    {buf}, {},", require(layer, field, weight)));
+            b.stmt(&format!("    N, {width}, stream);"));
+        }
         OpKind::Matmul {
             weight,
             beta_one,
@@ -881,11 +898,45 @@ fn emit_launch(
             // The class is static here: this function IS the prefill (or
             // the decode force_prefill fallback) — the plan-cache binding
             // the interpreter derives from `is_pure_decode` is a constant.
-            let plan_cache = if is_decode {
-                "plan_state.prefill_decode_plan"
-            } else {
-                "plan_state.prefill_plan"
-            };
+            // And on the DECODE side the whole question is static: the
+            // only decode-class trace that states this launch is the
+            // force_prefill arm, whose prepare deliberately builds no
+            // plan (llama_like.cpp's early return) — so the generated
+            // form emits the hand-written final else's PLAN-LESS
+            // launcher directly, no runtime plan check at all (the
+            // interpreter needs the fallback branch; the emitter does
+            // not).
+            if is_decode {
+                b.stmt(&format!("{{"));
+                b.stmt(&format!(
+                    "    auto kv_view = cache.layer_view({layer});"
+                ));
+                b.stmt(&format!(
+                    "    const int layer_window_left ="
+                ));
+                b.stmt(&format!(
+                    "        (!fwd_cfg.per_layer_window_left.empty() &&"
+                ));
+                b.stmt(&format!(
+                    "         {layer} < static_cast<int>(fwd_cfg.per_layer_window_left.size()))"
+                ));
+                b.stmt(&format!(
+                    "            ? fwd_cfg.per_layer_window_left[{layer}]"
+                ));
+                b.stmt("            : fwd_cfg.sliding_window;");
+                b.stmt("    ops::launch_attention_flashinfer_prefill(");
+                b.stmt("        ws.q.data(), kv_view, ws.attn_out.data(),");
+                b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
+                b.stmt("        kv_last_page_lens,");
+                b.stmt("        qo_indptr_h, kv_page_indptr_h,");
+                b.stmt("        N, R, num_q_heads, attn_ws, stream,");
+                b.stmt("        layer_window_left,");
+                b.stmt("        /*logits_soft_cap=*/0.f,");
+                b.stmt("        /*sm_scale_override=*/-1.f);");
+                b.stmt("}");
+                return;
+            }
+            let plan_cache = "plan_state.prefill_plan";
             b.stmt(&format!("if (!{plan_cache}) {{"));
             b.stmt("    throw std::runtime_error(");
             b.stmt("        \"generated forward: prepare built no prefill plan\");");

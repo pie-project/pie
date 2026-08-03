@@ -74,6 +74,28 @@ fn main() {
         ),
     );
 
+    // Qwen2.5-1.5B on L40S: the first bias deployment (AddBias ops in
+    // both class fns) and the first force-prefill one (GQA 6 is outside
+    // the flashinfer decode set, XQA off live) — the decode class emits
+    // the PLAN-LESS prefill launcher directly, the static mirror of the
+    // hand-written final else. Facts guessed from the 2026-08-03
+    // interpreter-leg run; the live digest judges them on first boot.
+    write_inc(
+        "qwen2_5_1_5b",
+        &emit_llama_like_cuda_inc(
+            &LlamaLikeFacts::qwen2_5_1_5b(),
+            &LlamaLikeCudaFacts {
+                xqa_decode: false,
+                // The derivation's !use_qkv_bias term forces this off —
+                // the fused epilogue has no bias step.
+                decode_fused_post: false,
+                rope_table: true,
+                force_prefill_path: true,
+            },
+            "qwen2_5_1_5b",
+        ),
+    );
+
     // Qwen3.5-0.8B hybrid on L40S (decode + prefill; the MTP service
     // classes stay on the interpreter walk). The cuda facts fixture is
     // the SYNTHETIC set — the live digest judges and corrects it on
