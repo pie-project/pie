@@ -881,6 +881,15 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     const bool has_lora_fire = in.lora != nullptr;
     HookGraphKeyState* lora_store = nullptr;
     HookGraphKeyState::Entry* lora_entry = nullptr;
+    // PIE_LORA_GRAPH=0 keeps lora fires eager (the measurement/rollback
+    // lever; default on since step 3b's batteries).
+    static const bool lora_graphs_enabled = [] {
+        const char* v = std::getenv("PIE_LORA_GRAPH");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (run_graph && has_lora_fire && !lora_graphs_enabled) {
+        run_graph = false;
+    }
     if (run_graph && has_lora_fire) {
         if (lora_fingerprint == 0) {
             // The model has no stage support (or nothing usable) — a

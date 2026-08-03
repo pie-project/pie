@@ -876,3 +876,34 @@ byte-stable (replay correctness), zero-equivalence all-True, non-lora
 paths untouched. What remains of the campaign: step 4, union entry —
 lora as a resolved path in the supergraph build (k=2: mask x lora),
 which folds the last per-attachment exec split for decode fires.
+
+## The campaign's step 4, resolved by argument (2026-08-03)
+
+Should lora fold INTO the supergraph union (mask x lora, four resolved
+paths)? No — the physics says the separate store IS the terminal
+design. A captured lora arm bakes the adapter staging (GEMM shapes
+from ranks and lane counts; cuBLAS grouped calls take host shape
+arrays), so any exec containing a lora path is FINGERPRINT-KEYED — and
+a union exec would then duplicate every NON-lora path into every
+adapter-set's exec: 4-path walks x per-fingerprint copies, memory and
+instantiation multiplying for zero sharing. The 3b shape is right:
+plain/supergraph execs shared across everything non-lora; lora execs
+per fingerprint carrying only the lora walk. The same argument
+resolves HOOKS-into-union: hook execs bake program-set sideband state,
+so folding them would duplicate the plain paths per program set — the
+existing hook store is the terminal design too. The union's true axis
+is exactly what it holds today: predicates whose arms bake NO
+per-fire-class state (mask, write-desc, Peel endpoints).
+
+**Measured payoff** (release, L40S, lora-probe 128-step decode x3):
+eager 174-211 steps/s -> graph 225-243 steps/s — ~25% throughput on a
+lora-serving workload's steady state, ranges disjoint.
+PIE_LORA_GRAPH=0 is the rollback/measurement lever.
+
+The supergraph thread's remaining REAL work is therefore: Peel mixed
+fires (device-read row windows — kernel surgery; buys mixed-hook
+replay stability and any future row-windowed union axis), and the
+long-horizon capture-safety reworks if hooks/lora ever need to shed
+their fingerprints (device-indirected shapes — blocked on kernel/API
+support, e.g. device-side grouped GEMM shapes, which cuBLAS does not
+offer today).
