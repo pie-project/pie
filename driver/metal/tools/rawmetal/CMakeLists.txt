@@ -5,10 +5,13 @@ function(add_rawmetal_tool target)
     PIE_METAL_TOOL_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernels")
 endfunction()
 
-add_rawmetal_tool(decoder_smoke decoder_smoke.cpp)
-if(PIE_LOADER_STATICLIB)
-  target_link_libraries(decoder_smoke PRIVATE ${PIE_LOADER_STATICLIB})
-endif()
+# `decoder_smoke` was removed with `NativeAccess`. It was the standalone gate
+# for driving `MetalExecutor` on a real checkpoint, written when it was the only
+# way to do so -- but it reached the executor through a private `*_native`
+# surface and a `friend` declaration, and its `setup_native` hard-coded
+# `arch_name = "qwen3_5"` and passed no config facts, so it could not load any
+# checkpoint that shipped after it was written. `tests/llama_bench` does what it
+# was for through the PUBLIC path, on four families, gated against mlx-lm.
 add_rawmetal_tool(rawmetal_harness harness_main.cpp harness.cpp)
 add_rawmetal_tool(rawmetal_microbench bench_kernels.cpp harness.cpp)
 add_rawmetal_tool(roofline_probe roofline_probe.cpp harness.cpp)

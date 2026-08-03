@@ -52,7 +52,6 @@ struct SlotHandle;
 
 namespace pie::metal::batch {
 
-struct NativeAccess;
 
 // One member's forward request for this fire: the NEW tokens/positions this
 // fire adds (prefill chunk or a single decode token — never the full
@@ -754,40 +753,6 @@ class MetalExecutor {
         std::string* err);
 
   private:
-    friend struct NativeAccess;
-
-    bool setup_native(
-        const std::string& checkpoint_dir,
-        const std::string& kernels_dir,
-        const ::pie::metal::DecodeGeometry& geometry,
-        std::string* error);
-    bool setup_kv_pool_native(
-        std::uint32_t total_pages,
-        std::uint32_t page_size,
-        std::string* error);
-    void reset_state_native();
-    void reset_state_native(std::uint32_t slot);
-    bool copy_state_slot_native(
-        std::uint32_t src_slot,
-        std::uint32_t dst_slot,
-        std::string* error);
-    ::pie::metal::StepTiming step_native(
-        std::uint32_t token_id,
-        std::uint32_t position,
-        std::uint32_t slot);
-    bool run_batch_step_native(
-        const ::pie::metal::BatchSchedule& schedule,
-        const ::pie::metal::BatchStepInputs& inputs,
-        std::string* error);
-    std::uint64_t paged_bind_generation_native() const;
-    const ::pie::metal::KvPagePool& kv_pool_native() const;
-    int vocab_native() const;
-    void copy_logits_f32_native(float* output) const;
-    void copy_batch_logits_f32_native(
-        std::uint32_t token_row,
-        float* output) const;
-    std::uint32_t argmax_native() const;
-
     // Shared body of `forward` (single member) and `forward_batch` (one member
     // at a time, in the scheduled order). `batch_serialized` = true forces the
     // cross-sequence "another sequence is ring-backed" gate OFF: within a batch

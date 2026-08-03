@@ -8,10 +8,21 @@ property of the COMPARISON, not of the model, and a dumper that got any of it
 subtly different would be diffed against the others' output as if it had not.
 """
 import os
+import sys
 
-import mlx.core as mx
-import numpy as np
-from mlx_lm import load
+try:
+    import mlx.core as mx
+    import numpy as np
+    from mlx_lm import load
+except ImportError as missing:  # pragma: no cover - a setup error, not a code path
+    sys.exit(
+        f"{missing}\n"
+        "These scripts need the pinned mlx-lm that produced every reference in\n"
+        "this tree. See tests/parity/requirements.txt:\n"
+        "  python3.14 -m venv ~/.cache/pie-metal/mlxenv\n"
+        "  ~/.cache/pie-metal/mlxenv/bin/pip install -r requirements.txt\n"
+        "then run these with ~/.cache/pie-metal/mlxenv/bin/python."
+    )
 
 
 def open_taps(argv):
