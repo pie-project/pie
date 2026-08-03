@@ -106,11 +106,11 @@ async fn main(input: Input) -> Result<Output> {
     // The fragment is the *bytes* the rolled-back tokens covered, not their
     // text: a prefix test on decoded strings would break on tokens whose bytes
     // are not valid UTF-8 on their own, which is most multi-byte tokens.
-    let (ids, byte_sequences) = model::vocabs();
+    let vocabs = model::vocabs();
     let mut token_bytes: Vec<&[u8]> = vec![&[]; vocab as usize];
-    for (&id, bytes) in ids.iter().zip(byte_sequences.iter()) {
-        if (id as usize) < token_bytes.len() {
-            token_bytes[id as usize] = bytes.as_slice();
+    for token in &vocabs {
+        if (token.id as usize) < token_bytes.len() {
+            token_bytes[token.id as usize] = token.bytes.as_slice();
         }
     }
 

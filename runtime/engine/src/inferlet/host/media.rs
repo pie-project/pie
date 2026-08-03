@@ -149,9 +149,13 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
         Ok(self.ctx().table.get(&this)?.span.position_span)
     }
 
-    async fn grid(&mut self, this: Resource<Image>) -> Result<(u32, u32, u32)> {
+    async fn grid(&mut self, this: Resource<Image>) -> Result<pie::inferlet::media::MergedGrid> {
         let g = self.ctx().table.get(&this)?.span.grid;
-        Ok((g.t, g.h, g.w))
+        Ok(pie::inferlet::media::MergedGrid {
+            t: g.t,
+            h: g.h,
+            w: g.w,
+        })
     }
 
     async fn prefix_tokens(&mut self, this: Resource<Image>) -> Result<Vec<u32>> {

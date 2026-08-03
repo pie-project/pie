@@ -85,7 +85,12 @@ impl pie::inferlet::tools::HostDecoder for ProcessCtx {
         let event = decoder.inner.feed(&tokens);
         Ok(Ok(match event {
             ToolEvent::Start => pie::inferlet::tools::Event::Start,
-            ToolEvent::Call(name, args) => pie::inferlet::tools::Event::Call((name, args)),
+            ToolEvent::Call(name, args) => {
+                pie::inferlet::tools::Event::Call(pie::inferlet::tools::ToolCall {
+                    name,
+                    arguments_json: args,
+                })
+            }
         }))
     }
 
