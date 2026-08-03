@@ -106,8 +106,8 @@ rust-version = "1.91"
 #
 # or add a `[patch]` section, which leaves this file alone.
 [workspace.dependencies]
-ztensor = { git = "https://github.com/pie-project/ztensor", rev = "b3c6980105c9d48f37729b7784ed84ef02fa0443" }
-ztensor-compat = { git = "https://github.com/pie-project/ztensor", rev = "b3c6980105c9d48f37729b7784ed84ef02fa0443" }
+ztensor = { git = "https://github.com/pie-project/ztensor", rev = "1e4166012f3081940c6853d6248e81a3828eb000" }
+ztensor-compat = { git = "https://github.com/pie-project/ztensor", rev = "1e4166012f3081940c6853d6248e81a3828eb000" }
 
 # Shared lint table. Opt in per crate with `[lints] workspace = true`; today
 # only the `compiler/*` crates do, because they are the only ones at zero

@@ -70,6 +70,10 @@ enum class PieLoaderCheckpointFormat : uint32_t {
   /// Appended: adding a value in the middle would renumber `Unknown` under
   /// every driver already compiled against this header.
   Zt = 3,
+  Npz = 4,
+  Pt = 5,
+  Hdf5 = 6,
+  Onnx = 7,
 };
 
 enum class PieLoaderSeverity : uint32_t {

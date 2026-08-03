@@ -677,6 +677,10 @@ pub enum PieLoaderCheckpointFormat {
     /// Appended: adding a value in the middle would renumber `Unknown` under
     /// every driver already compiled against this header.
     Zt = 3,
+    Npz = 4,
+    Pt = 5,
+    Hdf5 = 6,
+    Onnx = 7,
 }
 
 impl From<crate::types::CheckpointFormat> for PieLoaderCheckpointFormat {
@@ -686,6 +690,10 @@ impl From<crate::types::CheckpointFormat> for PieLoaderCheckpointFormat {
             crate::types::CheckpointFormat::Gguf => Self::Gguf,
             crate::types::CheckpointFormat::Unknown => Self::Unknown,
             crate::types::CheckpointFormat::Zt => Self::Zt,
+            crate::types::CheckpointFormat::Npz => Self::Npz,
+            crate::types::CheckpointFormat::Pt => Self::Pt,
+            crate::types::CheckpointFormat::Hdf5 => Self::Hdf5,
+            crate::types::CheckpointFormat::Onnx => Self::Onnx,
         }
     }
 }

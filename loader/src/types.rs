@@ -67,12 +67,15 @@ impl DType {
 
 /// Which on-disk format a checkpoint file is.
 ///
-/// `Unknown` keeps its ABI value, so `Zt` is appended rather than slotted in
-/// beside its siblings: a C caller compiled against the older header still
-/// reads every value it knew as the number it knew. It also still covers the
-/// formats the loader reads but does not name here — `.npz`, `.pt`, `.h5`,
-/// `.onnx` — which are read through the same projection and would each be
-/// another ABI value.
+/// One variant per format the loader can read, which is every format
+/// `ztensor-compat` projects — the loader enables all of them. `Unknown` is
+/// therefore not a "cannot read this" marker; it is what a *newer* zTensor
+/// would report for a format this build has no name for yet, and
+/// `checkpoint_format` has a test that keeps it unreachable until then.
+///
+/// New variants are appended rather than slotted in beside their siblings:
+/// these numbers cross the C ABI, so a driver compiled against an older header
+/// must keep reading every value it knew as the number it knew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CheckpointFormat {
     Safetensors,
@@ -80,6 +83,14 @@ pub enum CheckpointFormat {
     Unknown,
     /// The loader's own container (`.zt`), including a root that names shards.
     Zt,
+    /// NumPy's zip archive (`.npz`).
+    Npz,
+    /// PyTorch's pickle archive (`.pt`).
+    Pt,
+    /// HDF5 (`.h5`), including Keras checkpoints.
+    Hdf5,
+    /// ONNX protobuf (`.onnx`), read for its initializers.
+    Onnx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

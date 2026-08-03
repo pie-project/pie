@@ -120,6 +120,13 @@ fn checkpoint_format(label: &str) -> CheckpointFormat {
         "zt" => CheckpointFormat::Zt,
         "safetensors" => CheckpointFormat::Safetensors,
         "gguf" => CheckpointFormat::Gguf,
+        "npz" => CheckpointFormat::Npz,
+        "pt" => CheckpointFormat::Pt,
+        "hdf5" => CheckpointFormat::Hdf5,
+        "onnx" => CheckpointFormat::Onnx,
+        // Only reachable if zTensor learns a format this build has no name
+        // for; `every_format_zt_can_report_has_a_name` fails when that day
+        // comes rather than letting a file be labelled as nothing.
         _ => CheckpointFormat::Unknown,
     }
 }
@@ -388,6 +395,27 @@ mod tests {
         assert_eq!(tensor.span_bytes, 32);
         assert_eq!(tensor.file_offset % 65536, 0);
         assert_eq!(tensor.encoding, Encoding::Raw(DType::BF16));
+    }
+
+    /// Every format zTensor can report has a name here.
+    ///
+    /// The loader compiles in every `ztensor-compat` projection, so it reads
+    /// all of them — and a file it read perfectly well used to be handed to
+    /// the driver labelled `Unknown`, which reads as "could not identify" when
+    /// the truth was "did not bother to say".
+    ///
+    /// `Unknown` stays for the case this cannot cover: a newer zTensor
+    /// reporting a format this build predates. That is exactly when this test
+    /// fails, which is the point of it.
+    #[test]
+    fn every_format_zt_can_report_has_a_name() {
+        for label in ztensor_compat::FORMATS {
+            assert_ne!(
+                checkpoint_format(label),
+                CheckpointFormat::Unknown,
+                "zTensor reports {label:?}, which CheckpointFormat does not name"
+            );
+        }
     }
 
     /// A quant attribute the loader cannot represent is refused, not rounded.
