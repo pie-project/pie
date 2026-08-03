@@ -2526,7 +2526,6 @@ impl BatchScheduler {
             progress |= Self::retire_ready_launches(
                 &mut in_flight_launches,
                 &mut instances,
-                &mut pending,
                 &stats,
                 &mut frame_policy,
             );
@@ -4091,7 +4090,6 @@ impl BatchScheduler {
     fn retire_ready_launches(
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         instances: &mut HashMap<u64, TrackedInstance>,
-        pending: &mut PendingQueue,
         stats: &Arc<SchedulerStats>,
         frame_policy: &mut FramePolicy,
     ) -> bool {
@@ -4202,16 +4200,6 @@ impl BatchScheduler {
     }
 
     /// Unstamped (rider) launches currently queued — the fire-timing
-    /// `untracked_ready` gauge. Riders dispatch outside sealed waves, so a
-    /// monotonic climb here means untracked work is starving behind the
-    /// fleet (the successor of the old quorum W1 leak gate).
-    fn queued_untracked_riders(pending: &VecDeque<QueuedItem>) -> usize {
-        pending
-            .iter()
-            .filter(|item| matches!(item, QueuedItem::Launch(request) if request.frame.is_none()))
-            .count()
-    }
-
     /// Retire every settled control this pass. Concurrent standalone copies
     /// settle in device order, not post order, so the sweep cannot stop at
     /// the first control that is still outstanding.

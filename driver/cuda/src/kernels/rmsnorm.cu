@@ -380,23 +380,13 @@ __global__ void rmsnorm_residual_add_scale_rmsnorm_bf16_kernel(
 
 // True when every row of a [num_rows, hidden] bf16 view starts on a 16-byte
 // boundary and is a whole number of 8-element vectors.
-inline bool rmsnorm_vec8_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_RMSNORM_VEC8");
-        if (v == nullptr || v[0] == '\0') return true;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
 inline bool rmsnorm_vec8_ok(const void* x, const void* y, const void* weight,
                             int hidden, int x_row_stride, int y_row_stride)
 {
     auto aligned = [](const void* p) {
         return (reinterpret_cast<std::uintptr_t>(p) & 15u) == 0;
     };
-    return rmsnorm_vec8_enabled() &&
-           hidden % 8 == 0 && x_row_stride % 8 == 0 && y_row_stride % 8 == 0 &&
+    return hidden % 8 == 0 && x_row_stride % 8 == 0 && y_row_stride % 8 == 0 &&
            aligned(x) && aligned(y) && aligned(weight);
 }
 
