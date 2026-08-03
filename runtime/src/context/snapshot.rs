@@ -15,7 +15,7 @@ use anyhow::Result;
 use tokio::sync::oneshot;
 
 use super::rs_cache::RsState;
-use super::{Context, ContextId, ContextManager, State};
+use super::{Context, ContextId, ContextManager, OpenReport, State};
 
 use crate::driver::{self, DriverId};
 use crate::process::ProcessId;
@@ -38,7 +38,7 @@ impl ContextManager {
         &mut self,
         id: ContextId,
         owner: ProcessId,
-        response: oneshot::Sender<Result<ContextId>>,
+        response: oneshot::Sender<Result<(ContextId, OpenReport)>>,
     ) {
         let (needed, driver_idx) = match self.contexts.get(&id) {
             Some(ctx) => {
@@ -74,7 +74,7 @@ impl ContextManager {
         // We use the source context for contention — the fork inherits
         // the source's scheduling state.
         self.when_allocated_allow_off_gpu(id, driver_idx, needed, move |mgr, gpu_pages| {
-            let result = (|| -> Result<ContextId> {
+            let result = (|| -> Result<(ContextId, OpenReport)> {
                 let ctx = mgr
                     .contexts
                     .get(&id)
@@ -190,25 +190,34 @@ impl ContextManager {
                 );
 
                 // Spawn replay for committed suffix if needed.
-                let has_replay = if let Some(slot) = rs_replay_slot {
-                    mgr.spawn_full_rs_replay_pass(
-                        new_id,
-                        driver_idx,
-                        slot,
-                        prefix_len,
-                        scratch_pages,
-                        suffix_pages,
-                    )?
+                // `rs_replayed` is tracked separately from `has_replay`: the
+                // recurrent-state path and the KV-page path are independent, and
+                // a caller needs to distinguish them (see `OpenReport`).
+                let (has_replay, rs_replayed) = if let Some(slot) = rs_replay_slot {
+                    (
+                        mgr.spawn_full_rs_replay_pass(
+                            new_id,
+                            driver_idx,
+                            slot,
+                            prefix_len,
+                            scratch_pages,
+                            suffix_pages,
+                        )?,
+                        true,
+                    )
                 } else if suffix_count > 0 {
                     if !scratch_pages.is_empty() {
                         mgr.gpu_stores[driver_idx].free(&scratch_pages);
                     }
-                    mgr.spawn_replay_passes(new_id, driver_idx, prefix_len, suffix_pages)?
+                    (
+                        mgr.spawn_replay_passes(new_id, driver_idx, prefix_len, suffix_pages)?,
+                        false,
+                    )
                 } else {
                     if !scratch_pages.is_empty() {
                         mgr.gpu_stores[driver_idx].free(&scratch_pages);
                     }
-                    false
+                    (false, false)
                 };
 
                 if has_replay {
@@ -221,7 +230,12 @@ impl ContextManager {
                 mgr.process_entry(owner).context_ids.push(new_id);
                 mgr.publish_context_counts(new_id);
 
-                Ok(new_id)
+                let report = OpenReport {
+                    resident_prefix_pages: prefix_len as u32,
+                    replayed_pages: suffix_count as u32,
+                    rs_replayed,
+                };
+                Ok((new_id, report))
             })();
             let _ = response.send(result);
         });
@@ -397,7 +411,7 @@ impl ContextManager {
         username: String,
         name: String,
         owner: ProcessId,
-        response: oneshot::Sender<Result<ContextId>>,
+        response: oneshot::Sender<Result<(ContextId, OpenReport)>>,
     ) {
         // Estimate pages needed: working swap-in + committed suffix restoration.
         let key = (username.clone(), name.clone());
@@ -479,7 +493,7 @@ impl ContextManager {
         name: String,
         owner: ProcessId,
         gpu_pages: Vec<super::pagestore::PhysicalPageId>,
-    ) -> Result<ContextId> {
+    ) -> Result<(ContextId, OpenReport)> {
         let key = (username, name);
         let snapshot_id = *self
             .snapshots
@@ -599,26 +613,34 @@ impl ContextManager {
             },
         );
 
-        // Spawn replay for committed suffix if needed.
-        let has_replay = if let Some(slot) = rs_replay_slot {
-            self.spawn_full_rs_replay_pass(
-                new_id,
-                driver_idx,
-                slot,
-                prefix_len,
-                scratch_pages,
-                suffix_pages,
-            )?
+        // Spawn replay for committed suffix if needed. `rs_replayed` is tracked
+        // separately: the recurrent-state path is independent of the KV-page
+        // one, and a caller needs to tell them apart (see `OpenReport`).
+        let (has_replay, rs_replayed) = if let Some(slot) = rs_replay_slot {
+            (
+                self.spawn_full_rs_replay_pass(
+                    new_id,
+                    driver_idx,
+                    slot,
+                    prefix_len,
+                    scratch_pages,
+                    suffix_pages,
+                )?,
+                true,
+            )
         } else if suffix_count > 0 {
             if !scratch_pages.is_empty() {
                 self.gpu_stores[driver_idx].free(&scratch_pages);
             }
-            self.spawn_replay_passes(new_id, driver_idx, prefix_len, suffix_pages)?
+            (
+                self.spawn_replay_passes(new_id, driver_idx, prefix_len, suffix_pages)?,
+                false,
+            )
         } else {
             if !scratch_pages.is_empty() {
                 self.gpu_stores[driver_idx].free(&scratch_pages);
             }
-            false
+            (false, false)
         };
 
         if has_replay {
@@ -631,6 +653,11 @@ impl ContextManager {
         self.process_entry(owner).context_ids.push(new_id);
         self.publish_context_counts(new_id);
 
-        Ok(new_id)
+        let report = OpenReport {
+            resident_prefix_pages: prefix_len as u32,
+            replayed_pages: suffix_count as u32,
+            rs_replayed,
+        };
+        Ok((new_id, report))
     }
 }
