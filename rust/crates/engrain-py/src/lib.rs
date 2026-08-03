@@ -580,6 +580,16 @@ impl Matcher {
         self.inner.configurations()
     }
 
+    /// How deep the deepest live configuration's stack is.
+    ///
+    /// The cheap form of `max(len(stack) for _, stack in configurations())`,
+    /// which a serving batch runs once per row on any step that met the
+    /// device's depth ceiling. Going through `configurations` clones every
+    /// stack of every row to read one integer from each.
+    fn max_stack_depth(&self) -> usize {
+        self.inner.max_stack_depth()
+    }
+
     #[getter]
     fn parser_state(&self) -> u32 {
         self.inner.parser_state()

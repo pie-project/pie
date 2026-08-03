@@ -19,12 +19,18 @@ statement that you want to make those decisions yourself.
 from __future__ import annotations
 
 from engrain._engrain import Compiler, pack_configurations
-from engrain.device import DeviceBatch, DeviceGrammar, ResidentTables
+from engrain.device import (
+    DeviceBatch,
+    DeviceGrammar,
+    ResidentTables,
+    StackTooDeep,
+)
 
 __all__ = [
     "Compiler",
     "DeviceBatch",
     "DeviceGrammar",
     "ResidentTables",
+    "StackTooDeep",
     "pack_configurations",
 ]

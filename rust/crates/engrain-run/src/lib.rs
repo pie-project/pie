@@ -150,6 +150,21 @@ impl Matcher {
             .collect()
     }
 
+    /// How deep the deepest live configuration's stack is.
+    ///
+    /// Separate from `configurations` because the caller that wants this wants
+    /// only this: a serving batch that has met the device's depth ceiling has
+    /// to find which rows are responsible, and cloning every stack of every row
+    /// to measure one integer per row is what made that scan cost more per step
+    /// than the fill it was protecting.
+    pub fn max_stack_depth(&self) -> usize {
+        self.configs
+            .iter()
+            .map(|config| config.stack.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The parser stack of the first live configuration.
     pub fn stack(&self) -> &[u32] {
         self.configs

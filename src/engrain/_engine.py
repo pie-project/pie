@@ -2726,6 +2726,23 @@ class ResidentTables:
 _SIGNED = {"action_values", "action_extra"}
 
 
+class StackTooDeep(ValueError):
+    """A parse went deeper than the batch was built for.
+
+    A run-time ceiling rather than an admission-time one: the depth a parse
+    reaches is a property of the document, and a schema with an unbounded array
+    reaches any depth given a long enough one. Carries the numbers so a caller
+    can build a deeper batch and carry on, rather than parse them back out of a
+    message or rescan every row to find out who is responsible - which at a
+    serving batch costs more per step than the fill it is protecting.
+    """
+
+    def __init__(self, needed: int, limit: int) -> None:
+        super().__init__(f"a stack of {needed} exceeds the batch's limit of {limit}")
+        self.needed = needed
+        self.limit = limit
+
+
 class DeviceGrammar:
     """A pool of compiled grammars, resident on the GPU as one arena.
 
@@ -3684,10 +3701,7 @@ class DeviceBatch:
             matchers, self.configs
         )
         if deep > self.grammar.max_stack:
-            raise ValueError(
-                f"a stack of {deep} exceeds the batch's limit of "
-                f"{self.grammar.max_stack}"
-            )
+            raise StackTooDeep(deep, self.grammar.max_stack)
 
         def view(blob, shape):
             return torch.frombuffer(bytearray(blob), dtype=torch.int32).view(*shape)
@@ -3739,10 +3753,7 @@ class DeviceBatch:
                 f"{width} configurations exceeds the batch's limit of {self.configs}"
             )
         if deep > self.grammar.max_stack:
-            raise ValueError(
-                f"a stack of {deep} exceeds the batch's limit of "
-                f"{self.grammar.max_stack}"
-            )
+            raise StackTooDeep(deep, self.grammar.max_stack)
 
         # Built as one flat list and converted once. Writing each stack into a
         # numpy slice instead is a numpy call per configuration, and at a

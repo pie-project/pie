@@ -285,11 +285,20 @@ def main() -> int:
 
         seconds: list[float] = []
         produced: list[int] = []
+        longest: list[int] = []
+        capped: list[int] = []
         for _ in range(arguments.repeats):
             started = time.perf_counter()
             outputs = llm.generate(prompts, params, use_tqdm=False)
             seconds.append(time.perf_counter() - started)
-            produced.append(sum(len(o.outputs[0].token_ids) for o in outputs))
+            lengths = [len(o.outputs[0].token_ids) for o in outputs]
+            produced.append(sum(lengths))
+            # The wall clock is the makespan, and the makespan is the longest
+            # request, not the average one. Two engines can generate almost the
+            # same number of tokens and still run for very different times if
+            # one of them has a tail that never stops.
+            longest.append(max(lengths))
+            capped.append(sum(1 for n in lengths if n >= arguments.max_tokens))
 
         rates = [
             count / elapsed for count, elapsed in zip(produced, seconds, strict=True)
@@ -319,6 +328,8 @@ def main() -> int:
             "seconds": _quantiles(seconds),
             "tokens_per_second": _quantiles(rates),
             "tokens_generated_p50": statistics.median(produced),
+            "longest_request_p50": statistics.median(longest),
+            "hit_the_cap_p50": statistics.median(capped),
             "valid_last_run": valid,
             "requests": batch,
         }
@@ -329,6 +340,8 @@ def main() -> int:
             f"[p25 {rate['p25']:.0f}, p75 {rate['p75']:.0f}, "
             f"range {rate['min']:.0f}-{rate['max']:.0f}]  "
             f"{row['tokens_generated_p50']} tokens  "
+            f"(longest {row['longest_request_p50']}, "
+            f"{row['hit_the_cap_p50']} at the cap)  "
             f"{distinct} schemas  {valid}/{batch} valid",
             flush=True,
         )

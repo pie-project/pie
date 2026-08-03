@@ -11,7 +11,8 @@ research tree imports it from. The name here is the public one.
 from engrain._engine import (  # noqa: F401
     DeviceBatch,
     DeviceGrammar,
+    StackTooDeep,
     ResidentTables,
 )
 
-__all__ = ["DeviceBatch", "DeviceGrammar", "ResidentTables"]
+__all__ = ["DeviceBatch", "DeviceGrammar", "ResidentTables", "StackTooDeep"]
