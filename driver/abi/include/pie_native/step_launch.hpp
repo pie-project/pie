@@ -78,6 +78,11 @@ struct StepLaunch {
     // attribution CSR). PIE_HOOK_FREE_PREFIX_UNPLANNED = no plan sent.
     std::uint32_t planned_hook_free_prefix_rows =
         PIE_HOOK_FREE_PREFIX_UNPLANNED;
+    // NS-2: the scheduler's planned unmasked prefix in WIRE rows
+    // (fire_plan's attention_mask site; hook-free steps only).
+    // PIE_UNMASKED_PREFIX_UNPLANNED = no plan sent.
+    std::uint32_t planned_unmasked_prefix_rows =
+        PIE_UNMASKED_PREFIX_UNPLANNED;
 };
 
 }  // namespace pie_native

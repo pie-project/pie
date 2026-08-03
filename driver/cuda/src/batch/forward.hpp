@@ -230,6 +230,14 @@ struct ForwardFn {
         // row splits and the hook fingerprint can drop the split. Null
         // everywhere else — eager fires keep the host windows.
         const std::uint32_t* peel_window_d = nullptr;
+
+        // NS-2 (spatial mask fire, eager-first): when != UINT32_MAX the
+        // attention splits at this wire row — decode kernel over
+        // [0, split), custom-mask kernel over [split, N) reading the
+        // rebased suffix CSRs below (uploaded per fire by the engine).
+        std::uint32_t unmasked_prefix_rows = 0xffffffffu;
+        const std::uint32_t* mask_suffix_qo_indptr_d = nullptr;
+        const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr;
     };
 
     struct PrepareInputs {
@@ -251,6 +259,12 @@ struct ForwardFn {
         // SM90-vs-FA2 is chosen, and only FA2 is instrumented. Zero on the
         // paths that run no stage hooks.
         std::uint32_t attn_score_window = 0;
+        // NS-2: the scheduler-planned unmasked wire-row prefix
+        // (PIE_UNMASKED_PREFIX_UNPLANNED-equivalent UINT32_MAX = no plan /
+        // no split). When 0 < value < R on a masked pure-decode fire and
+        // the spatial-mask gate is on, prepare builds BOTH the prefix
+        // decode plan and the rebased suffix mask plan.
+        std::uint32_t unmasked_prefix_rows = 0xffffffffu;
     };
 
     // The arch implementation. context.cpp sets this once at construction;
@@ -617,6 +631,8 @@ struct ForwardDispatchInputs {
     int num_sampling = 0;
     bool is_pure_decode = false;
     bool have_custom_mask = false;
+    // NS-2: planned unmasked wire-row prefix (UINT32_MAX = no split).
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu;
     // Direct non-graph prefill/mixed launches may gather the requested hidden
     // rows before lm_head instead of materializing [N, vocab] logits.
     bool compact_logits = false;

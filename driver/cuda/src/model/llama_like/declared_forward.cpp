@@ -420,7 +420,10 @@ void llama_like_forward_declared(
     const std::int32_t* custom_mask_indptr_d,
     const StageHooks* stage_hooks,
     const LoraTable* lora,
-    const std::uint32_t* peel_window_d)
+    const std::uint32_t* peel_window_d,
+    std::uint32_t unmasked_prefix_rows,
+    const std::uint32_t* mask_suffix_qo_indptr_d,
+    const std::uint32_t* mask_suffix_kv_page_indptr_d)
 {
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
@@ -455,7 +458,11 @@ void llama_like_forward_declared(
     // complete): the emitter constructs the lora staging AND the hook
     // sidebands (page mask, score captures) and spells the sites,
     // brackets and corrections with constant layers.
-    if (generated_forward_enabled()) {
+    if (generated_forward_enabled() &&
+        !(unmasked_prefix_rows != 0xffffffffu &&
+          plan_state.spatial_mask_split >= 0)) {
+        // (Spatial-mask fires walk the interpreter until the NS-4 union
+        // pass reaches the emitter.)
         const auto run = [&](auto decode_fn, auto prefill_fn) {
             (is_pure_decode ? decode_fn : prefill_fn)(
                 w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
@@ -1221,6 +1228,62 @@ void llama_like_forward_declared(
                         "prefill kernel but prepare built no plan");
                 }
                 auto kv_view = cache.layer_view(L);
+                // NS-2 (the spatial mask fire): the attention SPLITS —
+                // the deployment's decode dispatch serves the unmasked
+                // prefix rows and the custom kernel serves the REBASED
+                // masked suffix. Everything else in the walk stays
+                // full-N shared (the work-sharing). The stated kernel is
+                // still the custom dispatch; the prefix's decode launch
+                // is this site's NS-2 sibling until the NS-4 union pass
+                // states both.
+                if (is_pure_decode && plan_state.spatial_mask_split >= 0 &&
+                    unmasked_prefix_rows != 0xffffffffu) {
+                    const int split = plan_state.spatial_mask_split;
+                    if (split !=
+                        static_cast<int>(unmasked_prefix_rows)) {
+                        throw std::runtime_error(
+                            "spatial mask: the planned split and the "
+                            "prepared split drifted");
+                    }
+                    if (plan_state.use_xqa_decode) {
+                        throw std::runtime_error(
+                            "spatial mask: the XQA prefix is not wired "
+                            "yet (its fire-wide prepare is R-shaped)");
+                    }
+                    if (decode_plan == nullptr ||
+                        mask_suffix_qo_indptr_d == nullptr ||
+                        mask_suffix_kv_page_indptr_d == nullptr) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but the prefix "
+                            "plan or suffix CSRs are missing");
+                    }
+                    const int rs = R - split;
+                    const int layer_window_left =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    ops::dispatch_attention_flashinfer_decode(
+                        *decode_plan,
+                        attn_q, kv_view, attn_out_buf,
+                        kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        attn_ws, stream, layer_window_left,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    ops::dispatch_attention_flashinfer_prefill_custom(
+                        *mask_plan,
+                        bf16_row(attn_q, split, Hq), kv_view,
+                        bf16_row(attn_out_buf, split, Hq),
+                        mask_suffix_qo_indptr_d,
+                        kv_page_indices + kv_page_indptr_h[split],
+                        mask_suffix_kv_page_indptr_d,
+                        kv_last_page_lens + split,
+                        custom_mask_d, custom_mask_indptr_d + split,
+                        attn_ws, stream);
+                    (void)rs;
+                    break;
+                }
                 ops::dispatch_attention_flashinfer_prefill_custom(
                     *mask_plan,
                     attn_q, kv_view, attn_out_buf,

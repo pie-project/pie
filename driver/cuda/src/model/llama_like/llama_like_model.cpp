@@ -91,7 +91,8 @@ void LlamaLikeModel::prepare(AttentionWorkspace& attn_ws,
         in.num_requests,
         in.is_pure_decode,
         in.have_custom_mask,
-        in.attn_score_window);
+        in.attn_score_window,
+        in.unmasked_prefix_rows);
 }
 
 void LlamaLikeModel::body(Workspace& ws,
@@ -137,7 +138,10 @@ void LlamaLikeModel::body(Workspace& ws,
             in.custom_mask_d, in.custom_mask_indptr_d,
             in.stage_hooks,
             in.lora,
-            in.peel_window_d);
+            in.peel_window_d,
+            in.unmasked_prefix_rows,
+            in.mask_suffix_qo_indptr_d,
+            in.mask_suffix_kv_page_indptr_d);
         return;
     }
     llama_like_forward_paged(
@@ -155,7 +159,10 @@ void LlamaLikeModel::body(Workspace& ws,
         /*vision=*/nullptr,
         in.stage_hooks,
         in.lora,
-        in.peel_window_d);
+        in.peel_window_d,
+        in.unmasked_prefix_rows,
+        in.mask_suffix_qo_indptr_d,
+        in.mask_suffix_kv_page_indptr_d);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {

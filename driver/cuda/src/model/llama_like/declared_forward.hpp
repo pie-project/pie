@@ -201,7 +201,14 @@ void llama_like_forward_declared(
     // so the captured exec replays across row splits. Null (eager, and
     // every non-hook path) keeps the host windows — no wasted threads
     // where no capture needs stability.
-    const std::uint32_t* peel_window_d = nullptr);
+    const std::uint32_t* peel_window_d = nullptr,
+    // NS-2 (the spatial mask fire): when != UINT32_MAX the attention
+    // splits at this wire row — decode dispatch over [0, split), the
+    // custom-mask kernel over the REBASED suffix CSRs below. Must agree
+    // with plan_state.spatial_mask_split (drift throws).
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu,
+    const std::uint32_t* mask_suffix_qo_indptr_d = nullptr,
+    const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr);
 
 // The unionized supergraph (S3): whether this deployment's digest has an
 // emitted `..._supergraph_build`, and the digest-dispatched build call

@@ -56,6 +56,12 @@ struct PersistentInputs {
     // the captured devwin kernels read it so the exec stops baking the
     // row split (north-star-dsl.md, the device-window campaign).
     DeviceBuffer<std::uint32_t> peel_window;
+    // NS-2 (the spatial mask fire): the masked SUFFIX sub-batch's rebased
+    // device CSRs — qo_indptr rebased by the split, kv_page_indptr by its
+    // page base — uploaded per fire when the fire splits its attention.
+    // R+1 capacity each; every other suffix array is a pointer offset.
+    DeviceBuffer<std::uint32_t> mask_suffix_qo_indptr;
+    DeviceBuffer<std::uint32_t> mask_suffix_kv_page_indptr;
     DeviceBuffer<std::int32_t>  custom_mask_indptr;
     // Stable staging for a device-derived dense bool mask before
     // `launch_pack_dense_mask` writes `custom_mask`. One byte per source bit;

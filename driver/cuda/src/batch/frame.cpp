@@ -2420,6 +2420,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                     engine.dispatch->launch_wants_attn_score(s.dispatch_view)
                         ? model::default_attn_score_window()
                         : 0u,
+                .unmasked_prefix_rows =
+                    s.dispatch_view.planned_unmasked_prefix_rows,
             });
         engine.attn_ws.end_plan_update(cublas.stream());
         plan_timer.stop();
@@ -2574,6 +2576,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .num_sampling = s.num_sampling,
             .is_pure_decode = s.is_pure_decode,
             .have_custom_mask = s.have_custom_mask,
+            .unmasked_prefix_rows =
+                s.dispatch_view.planned_unmasked_prefix_rows,
             .compact_logits = s.compact_logits,
             .structured_window_left = s.structured_window_left,
             .has_write_desc = s.has_write_desc,

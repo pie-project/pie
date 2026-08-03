@@ -738,6 +738,19 @@ bool forward_graph_replay_eligible(
 // PIE_SUPERGRAPH=0 disarms it. Fires outside the union (hooks, lora,
 // score-wanting, windowed, prefill-shaped) take their existing paths
 // untouched; the gate only reroutes union-eligible decode fires.
+// NS-2 (the spatial mask fire): eager-first gate, default OFF until the
+// ladder's batteries pass. When armed, a hook-free lora-free masked
+// pure-decode fire with a planned 0 < unmasked prefix < R splits its
+// attention: decode kernel over the prefix, custom kernel over the
+// rebased suffix. Such fires run EAGER for now (NS-3 windows the arms).
+static bool spatial_mask_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_SPATIAL_MASK");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
 static bool supergraph_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("PIE_SUPERGRAPH");
@@ -779,7 +792,28 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.num_clips,
         hook_blocks,
         in.lora != nullptr);
-    bool run_graph = graph_eligible;
+    const bool use_spatial_mask = spatial_mask_enabled() &&
+        in.is_pure_decode && in.have_custom_mask && !has_hooks &&
+        in.lora == nullptr &&
+        in.unmasked_prefix_rows != 0xffffffffu &&
+        in.unmasked_prefix_rows > 0 &&
+        in.unmasked_prefix_rows < static_cast<std::uint32_t>(in.forward_R);
+    bool run_graph = graph_eligible && !use_spatial_mask;
+    if (!use_spatial_mask && in.is_pure_decode && in.have_custom_mask &&
+        std::getenv("PIE_SPATIAL_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "[spatial-mask] REJECT R=%d planned=%u hooks=%d "
+                     "lora=%d enabled=%d\n",
+                     in.forward_R, in.unmasked_prefix_rows,
+                     has_hooks ? 1 : 0, in.lora != nullptr ? 1 : 0,
+                     spatial_mask_enabled() ? 1 : 0);
+    }
+    if (use_spatial_mask && std::getenv("PIE_SPATIAL_MASK_TRACE")) {
+        std::fprintf(stderr,
+                     "[spatial-mask] R=%d split=%u (prefix decode + suffix "
+                     "custom, one fire)\n",
+                     in.forward_R, in.unmasked_prefix_rows);
+    }
     std::uint64_t hook_fingerprint = 0;
     // Eager-path unification (the increment-4 "future point"): the
     // fire-level `prepare_replay` pass runs for EVERY pure-decode hook fire
@@ -1183,6 +1217,32 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.precomputed_embeddings       = in.precomputed_embeddings;
     fwd_in.stage_hooks                  = in.stage_hooks;
     fwd_in.lora                         = in.lora;
+    if (use_spatial_mask) {
+        // The masked suffix's rebased device CSRs (pure decode: qo is the
+        // identity, kv_page_indptr rebases by its page base; every other
+        // suffix array is a pointer offset in the body). Synchronous
+        // copies: tiny, eager-only, and the host staging dies here.
+        const int split = static_cast<int>(in.unmasked_prefix_rows);
+        const int rs = in.forward_R - split;
+        std::vector<std::uint32_t> qo(static_cast<std::size_t>(rs) + 1);
+        std::vector<std::uint32_t> kvpp(static_cast<std::size_t>(rs) + 1);
+        const std::uint32_t page_base = in.h_kvpp_forward[split];
+        for (int i = 0; i <= rs; ++i) {
+            qo[static_cast<std::size_t>(i)] = static_cast<std::uint32_t>(i);
+            kvpp[static_cast<std::size_t>(i)] =
+                in.h_kvpp_forward[split + i] - page_base;
+        }
+        CUDA_CHECK(cudaMemcpy(
+            pi.mask_suffix_qo_indptr.data(), qo.data(),
+            qo.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            pi.mask_suffix_kv_page_indptr.data(), kvpp.data(),
+            kvpp.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+        fwd_in.unmasked_prefix_rows = in.unmasked_prefix_rows;
+        fwd_in.mask_suffix_qo_indptr_d = pi.mask_suffix_qo_indptr.data();
+        fwd_in.mask_suffix_kv_page_indptr_d =
+            pi.mask_suffix_kv_page_indptr.data();
+    }
     forward_fn.invoke_body(ws, kv_cache, attn_ws, cublas, fwd_in);
     if (hook_prepared && in.stage_hooks->verify_replay_capture != nullptr) {
         // Prepared-EAGER hook fire (the unified seam, no capture): the same

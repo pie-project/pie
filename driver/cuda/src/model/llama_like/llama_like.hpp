@@ -142,6 +142,10 @@ struct LlamaLikePlanState {
     // the layout oscillation cost the union key one orphan capture per
     // request, and today's masked-variant graphs the same churn.
     ops::PrefillPlanCachePtr mask_decode_plan;
+    // NS-2: when >= 0, this fire's attention splits at this wire row —
+    // decode-side plans cover [0, split), mask_decode_plan covers the
+    // REBASED suffix. -1 = fire-level plans (the pre-NS-2 shape).
+    int spatial_mask_split = -1;
     bool use_prefill_plan = false;
     bool use_prefill_decode_plan = false;
     bool use_mask_decode_plan = false;
@@ -187,7 +191,12 @@ void prepare_llama_like_decode_plan(
     // Non-zero when the fire's PTIR programs read `AttnScore`; the prefill
     // plan is then built for the FA2 score-capturing dispatch. Decided here
     // and not in the body because SM90-vs-FA2 is a plan-time choice.
-    std::uint32_t attn_score_window = 0);
+    std::uint32_t attn_score_window = 0,
+    // NS-2: the planned unmasked wire-row prefix (UINT32_MAX = no split).
+    // When 0 < value < R on a masked pure-decode fire and PIE_SPATIAL_MASK
+    // is armed, prepare builds the PREFIX decode plan and the rebased
+    // SUFFIX mask plan, and records the split on the plan state.
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu);
 
 std::uint32_t llama_like_supergraph_graph_layout(
     const LlamaLikePlanState& state);
@@ -255,7 +264,12 @@ void llama_like_forward_paged(
     // memory), non-null ONLY on hook-graph captures: the fused-decode
     // Peel then emits BOTH regions through the devwin kernel forms so the
     // captured exec replays across row splits. Null keeps host windows.
-    const std::uint32_t* peel_window_d = nullptr);
+    const std::uint32_t* peel_window_d = nullptr,
+    // NS-2: see declared_forward.hpp — the spatial mask split and the
+    // rebased suffix CSRs (UINT32_MAX / null = fire-level mask arm).
+    std::uint32_t unmasked_prefix_rows = 0xffffffffu,
+    const std::uint32_t* mask_suffix_qo_indptr_d = nullptr,
+    const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr);
 
 // The fire-scoped lora staging (`LoraFireState` in llama_like.cpp — the
 // adapter cast + grouping built once per fire), behind an opaque handle so

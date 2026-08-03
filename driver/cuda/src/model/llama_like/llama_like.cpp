@@ -674,7 +674,8 @@ void prepare_llama_like_decode_plan(
     int num_requests,
     bool is_pure_decode,
     bool have_custom_mask,
-    std::uint32_t attn_score_window)
+    std::uint32_t attn_score_window,
+    std::uint32_t unmasked_prefix_rows)
 {
     // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
     // pinned/device buffers in `attn_ws` that the captured body reads via
@@ -686,6 +687,76 @@ void prepare_llama_like_decode_plan(
     state.use_prefill_decode_plan = false;
     state.use_mask_decode_plan = false;
     state.prefill_score_window = 0;
+    state.spatial_mask_split = -1;
+    // NS-2 (the spatial mask fire, PIE_SPATIAL_MASK): a masked pure-decode
+    // fire with a planned 0 < unmasked prefix < R builds BOTH plans — the
+    // decode side over the prefix (a recursive prepare with the same host
+    // CSR arrays truncated to `split`), then the mask plan over the
+    // REBASED suffix. The gate conditions mirror run_forward_dispatch's
+    // exactly (the engine plans UNPLANNED for hooked/lora fires, so those
+    // never reach here with a split).
+    static const bool spatial_mask_on = [] {
+        const char* v = std::getenv("PIE_SPATIAL_MASK");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (spatial_mask_on && have_custom_mask && is_pure_decode &&
+        unmasked_prefix_rows != 0xffffffffu &&
+        unmasked_prefix_rows > 0 &&
+        unmasked_prefix_rows < static_cast<std::uint32_t>(num_requests) &&
+        // The XQA prefix is not wired (its fire-wide prepare is R-shaped);
+        // deployments that would pick XQA keep the fire-level mask arm.
+        !(fwd_cfg.use_xqa_decode && cache.format().is_native_bf16() &&
+          !cache.hnd_layout())) {
+        const int split = static_cast<int>(unmasked_prefix_rows);
+        const int rs = num_requests - split;
+        // Prefix decode plans (xqa / flashinfer decode / prefill-decode —
+        // whichever this deployment picks), over the same arrays at R' =
+        // split. Pure decode: total_tokens' == split.
+        prepare_llama_like_decode_plan(
+            state, attn_ws, cache, cfg, fwd_cfg,
+            qo_indptr_h, kv_page_indices_d, kv_page_indptr_h,
+            kv_page_indptr_d, kv_last_page_lens_h, kv_last_page_lens_d,
+            split, split, /*is_pure_decode=*/true,
+            /*have_custom_mask=*/false, attn_score_window);
+        // The recursion reset the state flags; restore the split AFTER it.
+        std::vector<std::uint32_t> qo_suffix(
+            static_cast<std::size_t>(rs) + 1);
+        std::vector<std::uint32_t> kvpp_suffix(
+            static_cast<std::size_t>(rs) + 1);
+        const std::uint32_t page_base = kv_page_indptr_h[split];
+        for (int i = 0; i <= rs; ++i) {
+            qo_suffix[static_cast<std::size_t>(i)] =
+                static_cast<std::uint32_t>(i);
+            kvpp_suffix[static_cast<std::size_t>(i)] =
+                kv_page_indptr_h[split + i] - page_base;
+        }
+        if (!state.mask_decode_plan) {
+            state.mask_decode_plan = ops::make_prefill_plan();
+        }
+        const int T = (fwd_cfg.tp_size > 0) ? fwd_cfg.tp_size : 1;
+        ops::plan_attention_flashinfer_prefill_bf16(
+            *state.mask_decode_plan,
+            qo_suffix.data(),
+            kvpp_suffix.data(),
+            kv_last_page_lens_h + split,
+            rs,
+            rs,
+            cfg.num_attention_heads / T,
+            cfg.num_key_value_heads / T,
+            cfg.head_dim_kernel,
+            cache.page_size(),
+            attn_ws,
+            /*stream=*/nullptr,
+            fwd_cfg.decode_plan_cuda_graph,
+            /*window_left=*/-1,
+            /*full_attention_variant=*/false,
+            cache.hnd_layout(),
+            /*causal_mask=*/false,
+            /*custom_mask=*/true);
+        state.use_mask_decode_plan = true;
+        state.spatial_mask_split = split;
+        return;
+    }
     if (have_custom_mask) {
         // Pure-decode custom-mask fires plan into their DEDICATED slot
         // (see LlamaLikePlanState::mask_decode_plan); prefill-shaped
@@ -928,7 +999,10 @@ void llama_like_forward_paged(
     const LlamaLikeVisionInputs* vision,
     const StageHooks* hooks,
     const LoraTable* lora,
-    const std::uint32_t* peel_window_d)
+    const std::uint32_t* peel_window_d,
+    std::uint32_t unmasked_prefix_rows,
+    const std::uint32_t* mask_suffix_qo_indptr_d,
+    const std::uint32_t* mask_suffix_kv_page_indptr_d)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
     // shapes; the local *_local fields just shadow the unsharded value.
@@ -1602,12 +1676,49 @@ void llama_like_forward_paged(
                 throw std::runtime_error(
                     "custom attention mask has no prepared prefill plan");
             }
-            ops::dispatch_attention_flashinfer_prefill_custom(
-                *mask_plan,
-                attn_q, kv_view, attn_out_buf,
-                qo_indptr, kv_page_indices, kv_page_indptr,
-                kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
-                attn_ws, stream);
+            // NS-2 (the spatial mask fire): decode dispatch over the
+            // unmasked prefix, the custom kernel over the REBASED masked
+            // suffix — two kernels, one fire, everything else full-N
+            // shared. Mirrors the interpreter's split branch exactly.
+            if (is_pure_decode && plan_state.spatial_mask_split >= 0 &&
+                unmasked_prefix_rows != 0xffffffffu) {
+                const int split = plan_state.spatial_mask_split;
+                if (split != static_cast<int>(unmasked_prefix_rows)) {
+                    throw std::runtime_error(
+                        "spatial mask: the planned split and the prepared "
+                        "split drifted");
+                }
+                if (decode_plan == nullptr ||
+                    mask_suffix_qo_indptr_d == nullptr ||
+                    mask_suffix_kv_page_indptr_d == nullptr) {
+                    throw std::runtime_error(
+                        "spatial mask: split active but the prefix plan "
+                        "or suffix CSRs are missing");
+                }
+                ops::dispatch_attention_flashinfer_decode(
+                    *decode_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    attn_ws, stream, layer_window_left,
+                    /*logits_soft_cap=*/0.f, sm_scale_override);
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *mask_plan,
+                    bf16_row(attn_q, split, Hq), kv_view,
+                    bf16_row(attn_out_buf, split, Hq),
+                    mask_suffix_qo_indptr_d,
+                    kv_page_indices + kv_page_indptr_h[split],
+                    mask_suffix_kv_page_indptr_d,
+                    kv_last_page_lens + split,
+                    custom_mask_d, custom_mask_indptr_d + split,
+                    attn_ws, stream);
+            } else {
+                ops::dispatch_attention_flashinfer_prefill_custom(
+                    *mask_plan,
+                    attn_q, kv_view, attn_out_buf,
+                    qo_indptr, kv_page_indices, kv_page_indptr,
+                    kv_last_page_lens, custom_mask_d, custom_mask_indptr_d,
+                    attn_ws, stream);
+            }
         } else if (plan_state.use_prefill_plan && prefill_plan != nullptr) {
             const int num_pages_in_batch = kv_page_indptr_h[R];
             kernels::launch_dequant_kv_cache_layer_to_bf16_active(

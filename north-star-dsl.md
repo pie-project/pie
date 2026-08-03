@@ -1199,3 +1199,39 @@ NS-2 — the spatial mask fire, design:
 - Graph path: the supergraph mask arm keeps serving masked fires
   until NS-3 windows the arms (region windows + window-nonempty
   conditionals); NS-2 is eager-first.
+
+## NS-2 built end to end — and its live subject is scheduler-blocked (2026-08-03)
+
+The spatial mask fire is implemented across every layer: the engine
+plans the unmasked prefix (attention_mask site → wire rows, lora and
+hooks excluded at the planner so prepare's gate and dispatch's gate
+cannot drift), the value crosses the ABI in the claimed reserved
+step slot (PieStepDesc.planned_unmasked_prefix_rows), prepare builds
+BOTH plans (prefix decode via a recursive prepare at R'=split — XQA
+deployments guarded to the fire-level arm — and the custom plan over
+the REBASED suffix), the eager dispatch uploads the two rebased
+suffix CSRs (pi.mask_suffix_{qo,kv_page}_indptr; every other suffix
+array is a pointer offset), and both bodies (interpreter and
+hand-written) split the attention: decode kernel over [0, split),
+custom kernel over the suffix, everything else full-N shared.
+Spatial fires refuse graph capture (NS-3's job) and the generated
+path (NS-4's job). PIE_SPATIAL_MASK arms it, default off.
+
+Live: the crossing is verified (solo masked fires arrive with
+planned=0 — the correct all-masked answer), outputs all byte-stable.
+But the split never engaged, and the reject trace shows why: EVERY
+masked fire is R=1. `mask_blocks_composition` (scheduler/worker.rs)
+refuses wire-BRLE-masked lanes into composed batches in both
+directions — "wire masks index the wire request layout composition
+replaces". Only STRUCTURED device masks compose (the Stage 2 item A
+relax). So the spatial mask fire's SUBJECT — a masked+plain
+pure-decode co-batch — cannot form today.
+
+The unblocking campaign, next: the wire-BRLE compose relax. The
+frame assembly must re-index masked lanes' BRLE rows against the
+composed layout and synthesize causal rows for the mask-free lanes
+(the machinery the structured path already has); the grouping rule
+then admits wire-masked lanes. Independently valuable — the code
+comment itself prices the solo regime at 1.8-2.3x per token for the
+co-batched plain lanes — and it is the LAST precondition for the
+spatial mask fire's first live engagement.

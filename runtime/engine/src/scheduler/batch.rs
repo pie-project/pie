@@ -103,6 +103,59 @@ fn planned_prefix_wire_rows(
     first_hook_row
 }
 
+/// NS-2: the attention_mask site's unmasked prefix, converted to WIRE
+/// rows through the attribution CSR — the value
+/// [`StepSubmission::planned_unmasked_prefix_rows`] carries. Meaningful
+/// only on hook-free steps with at least one masked member (the
+/// seriation nests mask under hooks, so a hooked step's masked members
+/// are not contiguous); everything else is UNPLANNED and the driver
+/// keeps the fire-level mask arm.
+fn planned_unmasked_prefix_wire_rows(
+    plan: &fire_plan::FirePlan,
+    ordered: &[Box<PendingRequest>],
+    row_indptr: &[u32],
+) -> u32 {
+    if ordered.iter().any(|req| req.hook_program || req.lora_program)
+        || !ordered.iter().any(|req| req.request.has_user_mask)
+    {
+        return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
+    }
+    if row_indptr.len() != ordered.len() + 1 {
+        return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
+    }
+    let total = *row_indptr.last().expect("indptr has a total");
+    if total == 0 {
+        return 0;
+    }
+    let mut first_masked_row = total;
+    for (member, req) in ordered.iter().enumerate() {
+        if !req.request.has_user_mask {
+            continue;
+        }
+        let (lo, hi) = (row_indptr[member], row_indptr[member + 1]);
+        if hi <= lo {
+            return 0;
+        }
+        first_masked_row = first_masked_row.min(lo);
+    }
+    if let Some(site) = plan
+        .sites
+        .iter()
+        .find(|site| site.name == fire_plan::SITE_ATTENTION_MASK)
+    {
+        let unmasked_members = match site.lowering {
+            fire_plan::Lowering::Prefix { fast_rows } => fast_rows as usize,
+            _ => unreachable!("a masked step always plans the Prefix arm"),
+        };
+        debug_assert_eq!(
+            first_masked_row,
+            row_indptr[unmasked_members.min(ordered.len())],
+            "the plan's member prefix and the row-span scan must agree"
+        );
+    }
+    first_masked_row
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RequestCapacityUsage {
     pub(crate) forward_requests: usize,
@@ -512,6 +565,8 @@ pub(crate) fn build_frame_submission(
         // compiled-plan derivation and refuses the launch on drift.
         let planned_hook_free_prefix_rows =
             planned_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
+        let planned_unmasked_prefix_rows =
+            planned_unmasked_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
         steps.push(StepSubmission {
             plan: build.plan,
             roster_rows,
@@ -520,6 +575,7 @@ pub(crate) fn build_frame_submission(
             terminal_cells: build.terminal_cells,
             program_row_indptr: build.program_row_indptr,
             planned_hook_free_prefix_rows,
+            planned_unmasked_prefix_rows,
             logical_fire_ids: build.logical_fire_ids,
             channel_expected_head: build.channel_expected_head,
             channel_expected_tail: build.channel_expected_tail,
