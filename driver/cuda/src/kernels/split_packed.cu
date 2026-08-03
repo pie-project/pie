@@ -76,6 +76,7 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_kernel(
     const std::uint32_t* __restrict__ w_page,
     const std::uint32_t* __restrict__ w_off,
     const std::uint8_t* __restrict__ row_valid,
+    const std::uint32_t* __restrict__ win,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -85,6 +86,12 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_kernel(
     float eps)
 {
     const int r = blockIdx.x;
+    // Peel device window (prefix form): this kernel owns rows
+    // [0, win[0]) — the hook-free prefix — and the grid spans the full
+    // lane count so a captured launch replays across row splits. The
+    // early-out is uniform per block (r is blockIdx.x) and sits before
+    // any __syncthreads, so the shared reduction never diverges.
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int head_idx = blockIdx.y;
     const bool is_q = head_idx < num_q_heads;
     if (!is_q && row_valid != nullptr && row_valid[r] == 0) return;
@@ -206,6 +213,7 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_warp_kernel(
     const std::uint32_t* __restrict__ w_page,
     const std::uint32_t* __restrict__ w_off,
     const std::uint8_t* __restrict__ row_valid,
+    const std::uint32_t* __restrict__ win,
     int num_requests,
     int num_q_heads,
     int num_kv_heads,
@@ -226,6 +234,10 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_warp_kernel(
     if (unit >= num_requests * total_qk_heads) return;
 
     const int r = unit / total_qk_heads;
+    // Peel device window (prefix form): rows [0, win[0]) only. One warp
+    // is one (row, head) unit, so the early-out is warp-uniform and the
+    // FULL_MASK shuffles below never see a partial warp.
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
     const int head_idx = unit - r * total_qk_heads;
     const bool is_q = head_idx < num_q_heads;
     if (!is_q && row_valid != nullptr && row_valid[r] == 0) return;
@@ -565,7 +577,11 @@ void launch_split_gate_up_bf16(
         inter);
 }
 
-void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+// Shared dispatch for the fused decode epilogue: `num_requests` sizes
+// the grid; `win` (nullable) is the Peel device window's prefix form —
+// rows [0, win[0]) — read per-row so the launch shape stops depending
+// on the split.
+static void qkv_decode_fused_dispatch(
     const void* packed,
     void* q_out,
     void* k_pages,
@@ -580,6 +596,7 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
     const std::uint32_t* w_page,
     const std::uint32_t* w_off,
     const std::uint8_t* row_valid,
+    const std::uint32_t* win,
     int num_requests,
     int num_q_heads,
     int num_kv_heads,
@@ -606,7 +623,7 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                     static_cast<const __nv_bfloat16*>(q_weight),             \
                     static_cast<const __nv_bfloat16*>(k_weight),             \
                     positions, rope_table, kv_page_indices, kv_page_indptr,  \
-                    kv_last_page_lens, w_page, w_off, row_valid,             \
+                    kv_last_page_lens, w_page, w_off, row_valid, win,        \
                     num_requests, num_q_heads,                               \
                     num_kv_heads, page_size, hnd_layout, theta, eps);        \
         } else {                                                             \
@@ -619,7 +636,7 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                     static_cast<const __nv_bfloat16*>(q_weight),             \
                     static_cast<const __nv_bfloat16*>(k_weight),             \
                     positions, rope_table, kv_page_indices, kv_page_indptr,  \
-                    kv_last_page_lens, w_page, w_off, row_valid,             \
+                    kv_last_page_lens, w_page, w_off, row_valid, win,        \
                     num_requests, num_q_heads,                               \
                     num_kv_heads, page_size, hnd_layout, theta, eps);        \
         }                                                                    \
@@ -657,6 +674,7 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                 w_page,
                 w_off,
                 row_valid,
+                win,
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
@@ -681,6 +699,7 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                 w_page,
                 w_off,
                 row_valid,
+                win,
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
@@ -689,6 +708,75 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                 theta,
                 eps);
     }
+}
+
+void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+    const void* packed,
+    void* q_out,
+    void* k_pages,
+    void* v_pages,
+    const void* q_weight,
+    const void* k_weight,
+    const std::int32_t* positions,
+    const float* rope_table,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* w_page,
+    const std::uint32_t* w_off,
+    const std::uint8_t* row_valid,
+    int num_requests,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    bool hnd_layout,
+    float theta,
+    float eps,
+    cudaStream_t stream)
+{
+    qkv_decode_fused_dispatch(
+        packed, q_out, k_pages, v_pages, q_weight, k_weight,
+        positions, rope_table,
+        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+        w_page, w_off, row_valid, /*win=*/nullptr,
+        num_requests, num_q_heads, num_kv_heads, head_dim,
+        page_size, hnd_layout, theta, eps, stream);
+}
+
+void launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+    const void* packed,
+    void* q_out,
+    void* k_pages,
+    void* v_pages,
+    const void* q_weight,
+    const void* k_weight,
+    const std::int32_t* positions,
+    const float* rope_table,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* w_page,
+    const std::uint32_t* w_off,
+    const std::uint8_t* row_valid,
+    const std::uint32_t* win_d,
+    int n_max,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int page_size,
+    bool hnd_layout,
+    float theta,
+    float eps,
+    cudaStream_t stream)
+{
+    qkv_decode_fused_dispatch(
+        packed, q_out, k_pages, v_pages, q_weight, k_weight,
+        positions, rope_table,
+        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+        w_page, w_off, row_valid, win_d,
+        n_max, num_q_heads, num_kv_heads, head_dim,
+        page_size, hnd_layout, theta, eps, stream);
 }
 
 void launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(

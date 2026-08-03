@@ -5754,7 +5754,11 @@ std::uint64_t Dispatch::prepare_attention_phases(
     std::uint64_t fingerprint = 0xcbf29ce484222325ull;
     hook_fp_mix(fingerprint, layers);
     hook_fp_mix(fingerprint, state.lanes.size());
-    hook_fp_mix(fingerprint, in.hook_free_prefix_rows);
+    // The row split (hook_free_prefix_rows) is deliberately NOT mixed:
+    // since the Peel device-window campaign the captured body reads the
+    // split from pi.peel_window at replay (devwin kernels, full-N
+    // grids), so a mixed fire's exec is split-independent and must not
+    // churn when lane composition moves the split.
     hook_fp_mix(fingerprint, in.num_q_heads);
     hook_fp_mix(fingerprint, in.wants_attn_score ? 1u : 0u);
     hook_fp_mix_ptr(fingerprint, impl_->hook_layer_table);

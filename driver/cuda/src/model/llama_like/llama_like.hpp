@@ -250,7 +250,12 @@ void llama_like_forward_paged(
     // vanishes with no adapters). Non-null: the body applies
     // `x(W+BA)^T = xW^T + (xA^T)B^T` at each lane's declared sites, scoped
     // to that lane's token rows.
-    const LoraTable* lora = nullptr);
+    const LoraTable* lora = nullptr,
+    // The Peel device window word ({tail_start, tail_len} in device
+    // memory), non-null ONLY on hook-graph captures: the fused-decode
+    // Peel then emits BOTH regions through the devwin kernel forms so the
+    // captured exec replays across row splits. Null keeps host windows.
+    const std::uint32_t* peel_window_d = nullptr);
 
 // The fire-scoped lora staging (`LoraFireState` in llama_like.cpp — the
 // adapter cast + grouping built once per fire), behind an opaque handle so

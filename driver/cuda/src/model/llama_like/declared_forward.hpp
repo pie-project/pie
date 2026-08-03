@@ -194,7 +194,14 @@ void llama_like_forward_declared(
     // take the HasLora guard arms — the general sequence plus the
     // `pie_lora_qkv_correction` pseudo-symbol (LoraFireState::apply
     // behind the registry, staged once per fire).
-    const LoraTable* lora);
+    const LoraTable* lora,
+    // The Peel device window word ({tail_start, tail_len} in device
+    // memory), non-null ONLY on hook-graph captures: the walk then emits
+    // BOTH Peel regions unconditionally through the devwin kernel forms,
+    // so the captured exec replays across row splits. Null (eager, and
+    // every non-hook path) keeps the host windows — no wasted threads
+    // where no capture needs stability.
+    const std::uint32_t* peel_window_d = nullptr);
 
 // The unionized supergraph (S3): whether this deployment's digest has an
 // emitted `..._supergraph_build`, and the digest-dispatched build call

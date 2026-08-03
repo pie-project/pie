@@ -40,7 +40,8 @@ bool has_write_desc,
 const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
-const LoraTable* lora)
+const LoraTable* lora,
+const std::uint32_t* peel_window_d)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
@@ -5185,7 +5186,8 @@ bool has_write_desc,
 const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
-const LoraTable* lora)
+const LoraTable* lora,
+const std::uint32_t* peel_window_d)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
@@ -11311,6 +11313,7 @@ const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
 const LoraTable* lora,
+const std::uint32_t* peel_window_d,
     batch::SupergraphBuilder& sg)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:

@@ -167,7 +167,8 @@ const PARAMS: &str = "\
     const std::uint8_t* custom_mask_d,\n\
     const std::int32_t* custom_mask_indptr_d,\n\
     const StageHooks* hooks,\n\
-    const LoraTable* lora";
+    const LoraTable* lora,\n\
+    const std::uint32_t* peel_window_d";
 
 fn emit_class_fn(
     plan: &ForwardPlan,
@@ -364,13 +365,21 @@ fn emit_class_fn(
     b.out
 }
 
-/// The Peel row window, threaded through region emission (A3): fixed
-/// C++ expressions for the region's row start and count. `None` is the
-/// full-N walk.
+/// The Peel row window, threaded through region emission (A3). `None`
+/// is the full-N walk. `Host` carries fixed C++ expressions for the
+/// region's row start and count. The `Dev*` variants are the
+/// device-window campaign's graph-path forms: the split lives in the
+/// `peel_window_d` word ({tail_start, tail_len}); the prefix region is
+/// [0, word[0]) and every windowed launch takes the devwin kernel at
+/// the full-N grid, so a captured exec replays across row splits.
 #[derive(Clone, Copy)]
-struct Win {
-    start: &'static str,
-    len: &'static str,
+enum Win {
+    Host {
+        start: &'static str,
+        len: &'static str,
+    },
+    DevPrefix,
+    DevTail,
 }
 
 /// Emit ops `[start, end)`: a Guard consumes its region ops into an
@@ -443,13 +452,31 @@ fn emit_range(
             }
             // A3: both regions, complementary row ranges, empty ranges
             // skipped — the interpreter's Peel walk as fixed `if`s over
-            // the derived `fast_rows` local.
+            // the derived `fast_rows` local. Device-window mode
+            // (peel_window_d, hook captures only): BOTH regions emit
+            // unconditionally through the devwin kernel forms, so the
+            // captured exec replays across row splits.
             let mut region = i + 1;
+            b.stmt("if (peel_window_d != nullptr) {");
+            b.indent += 1;
+            emit_range(
+                b, plan, facts, cuda, is_decode, sg, region,
+                region + *prefix_ops as usize, Some(Win::DevPrefix),
+            );
+            emit_range(
+                b, plan, facts, cuda, is_decode, sg,
+                region + *prefix_ops as usize,
+                region + *prefix_ops as usize + *tail_ops as usize,
+                Some(Win::DevTail),
+            );
+            b.indent -= 1;
+            b.stmt("} else {");
+            b.indent += 1;
             b.stmt("if (fast_rows > 0) {");
             b.indent += 1;
             emit_range(
                 b, plan, facts, cuda, is_decode, sg, region, region + *prefix_ops as usize,
-                Some(Win { start: "0", len: "fast_rows" }),
+                Some(Win::Host { start: "0", len: "fast_rows" }),
             );
             b.indent -= 1;
             b.stmt("}");
@@ -458,8 +485,10 @@ fn emit_range(
             b.indent += 1;
             emit_range(
                 b, plan, facts, cuda, is_decode, sg, region, region + *tail_ops as usize,
-                Some(Win { start: "fast_rows", len: "(N - fast_rows)" }),
+                Some(Win::Host { start: "fast_rows", len: "(N - fast_rows)" }),
             );
+            b.indent -= 1;
+            b.stmt("}");
             b.indent -= 1;
             b.stmt("}");
             i = region + *tail_ops as usize;
@@ -744,23 +773,34 @@ fn emit_op(
             }
         }
         OpKind::SplitQkv { .. } => {
-            if let Some(w) = win {
-                // A Peel region's split: the window's rows at their
-                // absolute offsets (the interpreter's windowed form).
-                let (s, n) = (w.start, w.len);
-                b.stmt("kernels::launch_split_qkv_bf16(");
-                b.stmt(&format!(
-                    "    bf16_row(ws.qkv_fused.data(), {s}, Hq + 2 * Hk),"
-                ));
-                b.stmt(&format!("    bf16_row(ws.q.data(), {s}, Hq),"));
-                b.stmt(&format!("    bf16_row(ws.k.data(), {s}, Hk),"));
-                b.stmt(&format!("    bf16_row(ws.v.data(), {s}, Hk),"));
-                b.stmt(&format!("    {n}, Hq, Hk, stream);"));
-            } else {
-                b.stmt("kernels::launch_split_qkv_bf16(");
-                b.stmt("    ws.qkv_fused.data(),");
-                b.stmt("    ws.q.data(), ws.k.data(), ws.v.data(),");
-                b.stmt("    N, Hq, Hk, stream);");
+            match win {
+                Some(Win::Host { start: s, len: n }) => {
+                    // A Peel region's split: the window's rows at their
+                    // absolute offsets (the interpreter's windowed form).
+                    b.stmt("kernels::launch_split_qkv_bf16(");
+                    b.stmt(&format!(
+                        "    bf16_row(ws.qkv_fused.data(), {s}, Hq + 2 * Hk),"
+                    ));
+                    b.stmt(&format!("    bf16_row(ws.q.data(), {s}, Hq),"));
+                    b.stmt(&format!("    bf16_row(ws.k.data(), {s}, Hk),"));
+                    b.stmt(&format!("    bf16_row(ws.v.data(), {s}, Hk),"));
+                    b.stmt(&format!("    {n}, Hq, Hk, stream);"));
+                }
+                Some(Win::DevTail) => {
+                    b.stmt("kernels::launch_split_qkv_bf16_devwin(");
+                    b.stmt("    ws.qkv_fused.data(),");
+                    b.stmt("    ws.q.data(), ws.k.data(), ws.v.data(),");
+                    b.stmt("    peel_window_d, N, Hq, Hk, stream);");
+                }
+                Some(Win::DevPrefix) => {
+                    panic!("emitter: the tail split in a Peel prefix region")
+                }
+                None => {
+                    b.stmt("kernels::launch_split_qkv_bf16(");
+                    b.stmt("    ws.qkv_fused.data(),");
+                    b.stmt("    ws.q.data(), ws.k.data(), ws.v.data(),");
+                    b.stmt("    N, Hq, Hk, stream);");
+                }
             }
         }
         OpKind::Rope { kind, partial } => {
@@ -1013,6 +1053,27 @@ fn emit_launch(
             } else {
                 "nullptr"
             };
+            if matches!(win, Some(Win::DevPrefix)) {
+                // Device-window capture: the prefix form — the word's
+                // START is this kernel's row count.
+                b.stmt("kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(");
+                b.stmt("    ws.qkv_fused.data(),");
+                b.stmt("    ws.q.data(),");
+                b.stmt(&format!("    cache.k({layer}), cache.v({layer}),"));
+                b.stmt(&format!("    {},", require(ql, "q_norm", q_norm)));
+                b.stmt(&format!("    {},", require(ql, "k_norm", k_norm)));
+                b.stmt("    positions,");
+                b.stmt(&format!("    {table},"));
+                b.stmt("    kv_page_indices, kv_page_indptr, kv_last_page_lens,");
+                b.stmt("    has_write_desc ? w_page_d : nullptr,");
+                b.stmt("    has_write_desc ? w_off_d : nullptr,");
+                b.stmt("    row_valid_d,");
+                b.stmt("    peel_window_d,");
+                b.stmt("    N, num_q_heads, num_kv_heads, d,");
+                b.stmt("    cache.page_size(), cache.hnd_layout(),");
+                b.stmt("    cfg.rope_theta, eps, stream);");
+                return;
+            }
             b.stmt("kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(");
             b.stmt("    ws.qkv_fused.data(),");
             b.stmt("    ws.q.data(),");
@@ -1027,14 +1088,35 @@ fn emit_launch(
             b.stmt("    row_valid_d,");
             // Windowed (A3): a Peel's prefix region owns rows
             // [0, fast_rows); outside a peel this is R (pure decode).
-            let rows = win.map_or("R", |w| w.len);
+            let rows = match win {
+                Some(Win::Host { len, .. }) => len,
+                Some(Win::DevTail) => {
+                    panic!("emitter: the fused epilogue in a Peel tail region")
+                }
+                Some(Win::DevPrefix) => unreachable!(),
+                None => "R",
+            };
             b.stmt(&format!("    {rows}, num_q_heads, num_kv_heads, d,"));
             b.stmt("    cache.page_size(), cache.hnd_layout(),");
             b.stmt("    cfg.rope_theta, eps, stream);");
         }
         "launch_write_kv_explicit_bf16" => {
             let layer = state.expect("kv write addresses kv state").layer;
-            let (s_, n_) = win.map_or(("0", "N"), |w| (w.start, w.len));
+            if matches!(win, Some(Win::DevTail)) {
+                b.stmt(&format!("{{"));
+                b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
+                b.stmt("    kernels::launch_write_kv_explicit_bf16_devwin(");
+                b.stmt("        kv_view, ws.k.data(), ws.v.data(),");
+                b.stmt("        w_page_d, w_off_d,");
+                b.stmt("        peel_window_d, N, stream, row_valid_d);");
+                b.stmt("}");
+                return;
+            }
+            let (s_, n_) = match win {
+                Some(Win::Host { start, len }) => (start, len),
+                None => ("0", "N"),
+                Some(_) => panic!("emitter: KV write in a Peel prefix region"),
+            };
             if padded {
                 // A windowed write never coincides with padding (the Peel
                 // exists only in the fused deployment, whose facts require
@@ -1082,9 +1164,26 @@ fn emit_launch(
             } else {
                 "kv_view, ws.k.data(), ws.v.data(),"
             };
+            if matches!(win, Some(Win::DevTail)) {
+                b.stmt(&format!("{{"));
+                b.stmt(&format!(
+                    "    auto kv_view = cache.layer_view({layer});"
+                ));
+                b.stmt("    kernels::launch_write_kv_to_pages_bf16_devwin(");
+                b.stmt(&format!("        {kv_bufs}"));
+                b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
+                b.stmt("        kv_last_page_lens,");
+                b.stmt("        peel_window_d, N, R, stream, row_valid_d);");
+                b.stmt("}");
+                return;
+            }
             b.stmt(&format!("{{"));
             b.stmt(&format!("    auto kv_view = cache.layer_view({layer});"));
-            let first = win.map_or("0", |w| w.start);
+            let first = match win {
+                Some(Win::Host { start, .. }) => start,
+                None => "0",
+                Some(_) => panic!("emitter: KV write in a Peel prefix region"),
+            };
             b.stmt("    kernels::launch_write_kv_to_pages(");
             b.stmt(&format!("        {kv_bufs}"));
             b.stmt("        qo_indptr, kv_page_indices, kv_page_indptr,");
@@ -1097,7 +1196,24 @@ fn emit_launch(
         "launch_qk_rmsnorm_rope_bf16" => {
             let (q_norm, k_norm) = (&weights[0], &weights[1]);
             let (ql, _) = split_layer_weight(q_norm).expect("q_norm layer");
-            let (s_, n_) = win.map_or(("0", "N"), |w| (w.start, w.len));
+            if matches!(win, Some(Win::DevTail)) {
+                b.stmt("kernels::launch_qk_rmsnorm_rope_bf16_devwin(");
+                b.stmt("    ws.q.data(), ws.k.data(),");
+                b.stmt(&format!("    {},", require(ql, "q_norm", q_norm)));
+                b.stmt(&format!("    {},", require(ql, "k_norm", k_norm)));
+                b.stmt("    positions,");
+                b.stmt("    peel_window_d, N,");
+                b.stmt("    num_q_heads, num_kv_heads, d,");
+                b.stmt("    cfg.rope_theta, eps, stream);");
+                return;
+            }
+            let (s_, n_) = match win {
+                Some(Win::Host { start, len }) => (start, len),
+                None => ("0", "N"),
+                Some(_) => {
+                    panic!("emitter: qk-norm+rope in a Peel prefix region")
+                }
+            };
             b.stmt("kernels::launch_qk_rmsnorm_rope_bf16(");
             b.stmt(&format!("    bf16_row(ws.q.data(), {s_}, Hq),"));
             b.stmt(&format!("    bf16_row(ws.k.data(), {s_}, Hk),"));

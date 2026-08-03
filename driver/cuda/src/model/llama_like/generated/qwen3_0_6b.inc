@@ -40,7 +40,8 @@ bool has_write_desc,
 const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
-const LoraTable* lora)
+const LoraTable* lora,
+const std::uint32_t* peel_window_d)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
@@ -354,8 +355,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[0].qkv_proj_fused, "layer.0.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(0), cache.v(0),
@@ -367,44 +368,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[0].q_norm, "layer.0.q_norm")->data(),
                 require(w.layers[0].k_norm, "layer.0.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(0);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(0);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(0), cache.v(0),
+                    require(w.layers[0].q_norm, "layer.0.q_norm")->data(),
+                    require(w.layers[0].k_norm, "layer.0.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[0].q_norm, "layer.0.q_norm")->data(),
+                    require(w.layers[0].k_norm, "layer.0.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(0);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(0);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -808,8 +858,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[1].qkv_proj_fused, "layer.1.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(1), cache.v(1),
@@ -821,44 +871,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[1].q_norm, "layer.1.q_norm")->data(),
                 require(w.layers[1].k_norm, "layer.1.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(1);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(1);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(1), cache.v(1),
+                    require(w.layers[1].q_norm, "layer.1.q_norm")->data(),
+                    require(w.layers[1].k_norm, "layer.1.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[1].q_norm, "layer.1.q_norm")->data(),
+                    require(w.layers[1].k_norm, "layer.1.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(1);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(1);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -1262,8 +1361,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[2].qkv_proj_fused, "layer.2.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(2), cache.v(2),
@@ -1275,44 +1374,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[2].q_norm, "layer.2.q_norm")->data(),
                 require(w.layers[2].k_norm, "layer.2.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(2);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(2);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(2), cache.v(2),
+                    require(w.layers[2].q_norm, "layer.2.q_norm")->data(),
+                    require(w.layers[2].k_norm, "layer.2.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[2].q_norm, "layer.2.q_norm")->data(),
+                    require(w.layers[2].k_norm, "layer.2.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(2);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(2);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -1716,8 +1864,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[3].qkv_proj_fused, "layer.3.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(3), cache.v(3),
@@ -1729,44 +1877,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[3].q_norm, "layer.3.q_norm")->data(),
                 require(w.layers[3].k_norm, "layer.3.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(3);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(3);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(3), cache.v(3),
+                    require(w.layers[3].q_norm, "layer.3.q_norm")->data(),
+                    require(w.layers[3].k_norm, "layer.3.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[3].q_norm, "layer.3.q_norm")->data(),
+                    require(w.layers[3].k_norm, "layer.3.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(3);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(3);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -2170,8 +2367,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[4].qkv_proj_fused, "layer.4.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(4), cache.v(4),
@@ -2183,44 +2380,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[4].q_norm, "layer.4.q_norm")->data(),
                 require(w.layers[4].k_norm, "layer.4.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(4);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(4);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(4), cache.v(4),
+                    require(w.layers[4].q_norm, "layer.4.q_norm")->data(),
+                    require(w.layers[4].k_norm, "layer.4.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[4].q_norm, "layer.4.q_norm")->data(),
+                    require(w.layers[4].k_norm, "layer.4.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(4);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(4);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -2624,8 +2870,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[5].qkv_proj_fused, "layer.5.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(5), cache.v(5),
@@ -2637,44 +2883,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[5].q_norm, "layer.5.q_norm")->data(),
                 require(w.layers[5].k_norm, "layer.5.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(5);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(5);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(5), cache.v(5),
+                    require(w.layers[5].q_norm, "layer.5.q_norm")->data(),
+                    require(w.layers[5].k_norm, "layer.5.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[5].q_norm, "layer.5.q_norm")->data(),
+                    require(w.layers[5].k_norm, "layer.5.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(5);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(5);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -3078,8 +3373,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[6].qkv_proj_fused, "layer.6.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(6), cache.v(6),
@@ -3091,44 +3386,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[6].q_norm, "layer.6.q_norm")->data(),
                 require(w.layers[6].k_norm, "layer.6.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(6);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(6);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(6), cache.v(6),
+                    require(w.layers[6].q_norm, "layer.6.q_norm")->data(),
+                    require(w.layers[6].k_norm, "layer.6.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[6].q_norm, "layer.6.q_norm")->data(),
+                    require(w.layers[6].k_norm, "layer.6.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(6);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(6);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -3532,8 +3876,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[7].qkv_proj_fused, "layer.7.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(7), cache.v(7),
@@ -3545,44 +3889,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[7].q_norm, "layer.7.q_norm")->data(),
                 require(w.layers[7].k_norm, "layer.7.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(7);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(7);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(7), cache.v(7),
+                    require(w.layers[7].q_norm, "layer.7.q_norm")->data(),
+                    require(w.layers[7].k_norm, "layer.7.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[7].q_norm, "layer.7.q_norm")->data(),
+                    require(w.layers[7].k_norm, "layer.7.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(7);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(7);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -3986,8 +4379,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[8].qkv_proj_fused, "layer.8.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(8), cache.v(8),
@@ -3999,44 +4392,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[8].q_norm, "layer.8.q_norm")->data(),
                 require(w.layers[8].k_norm, "layer.8.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(8);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(8);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(8), cache.v(8),
+                    require(w.layers[8].q_norm, "layer.8.q_norm")->data(),
+                    require(w.layers[8].k_norm, "layer.8.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[8].q_norm, "layer.8.q_norm")->data(),
+                    require(w.layers[8].k_norm, "layer.8.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(8);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(8);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -4440,8 +4882,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[9].qkv_proj_fused, "layer.9.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(9), cache.v(9),
@@ -4453,44 +4895,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[9].q_norm, "layer.9.q_norm")->data(),
                 require(w.layers[9].k_norm, "layer.9.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(9);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(9);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(9), cache.v(9),
+                    require(w.layers[9].q_norm, "layer.9.q_norm")->data(),
+                    require(w.layers[9].k_norm, "layer.9.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[9].q_norm, "layer.9.q_norm")->data(),
+                    require(w.layers[9].k_norm, "layer.9.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(9);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(9);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -4894,8 +5385,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[10].qkv_proj_fused, "layer.10.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(10), cache.v(10),
@@ -4907,44 +5398,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[10].q_norm, "layer.10.q_norm")->data(),
                 require(w.layers[10].k_norm, "layer.10.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(10);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(10);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(10), cache.v(10),
+                    require(w.layers[10].q_norm, "layer.10.q_norm")->data(),
+                    require(w.layers[10].k_norm, "layer.10.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[10].q_norm, "layer.10.q_norm")->data(),
+                    require(w.layers[10].k_norm, "layer.10.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(10);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(10);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -5348,8 +5888,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[11].qkv_proj_fused, "layer.11.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(11), cache.v(11),
@@ -5361,44 +5901,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[11].q_norm, "layer.11.q_norm")->data(),
                 require(w.layers[11].k_norm, "layer.11.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(11);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(11);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(11), cache.v(11),
+                    require(w.layers[11].q_norm, "layer.11.q_norm")->data(),
+                    require(w.layers[11].k_norm, "layer.11.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[11].q_norm, "layer.11.q_norm")->data(),
+                    require(w.layers[11].k_norm, "layer.11.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(11);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(11);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -5802,8 +6391,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[12].qkv_proj_fused, "layer.12.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(12), cache.v(12),
@@ -5815,44 +6404,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[12].q_norm, "layer.12.q_norm")->data(),
                 require(w.layers[12].k_norm, "layer.12.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(12);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(12);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(12), cache.v(12),
+                    require(w.layers[12].q_norm, "layer.12.q_norm")->data(),
+                    require(w.layers[12].k_norm, "layer.12.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[12].q_norm, "layer.12.q_norm")->data(),
+                    require(w.layers[12].k_norm, "layer.12.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(12);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(12);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -6256,8 +6894,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[13].qkv_proj_fused, "layer.13.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(13), cache.v(13),
@@ -6269,44 +6907,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[13].q_norm, "layer.13.q_norm")->data(),
                 require(w.layers[13].k_norm, "layer.13.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(13);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(13);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(13), cache.v(13),
+                    require(w.layers[13].q_norm, "layer.13.q_norm")->data(),
+                    require(w.layers[13].k_norm, "layer.13.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[13].q_norm, "layer.13.q_norm")->data(),
+                    require(w.layers[13].k_norm, "layer.13.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(13);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(13);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -6710,8 +7397,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[14].qkv_proj_fused, "layer.14.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(14), cache.v(14),
@@ -6723,44 +7410,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[14].q_norm, "layer.14.q_norm")->data(),
                 require(w.layers[14].k_norm, "layer.14.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(14);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(14);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(14), cache.v(14),
+                    require(w.layers[14].q_norm, "layer.14.q_norm")->data(),
+                    require(w.layers[14].k_norm, "layer.14.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[14].q_norm, "layer.14.q_norm")->data(),
+                    require(w.layers[14].k_norm, "layer.14.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(14);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(14);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -7164,8 +7900,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[15].qkv_proj_fused, "layer.15.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(15), cache.v(15),
@@ -7177,44 +7913,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[15].q_norm, "layer.15.q_norm")->data(),
                 require(w.layers[15].k_norm, "layer.15.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(15);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(15);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(15), cache.v(15),
+                    require(w.layers[15].q_norm, "layer.15.q_norm")->data(),
+                    require(w.layers[15].k_norm, "layer.15.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[15].q_norm, "layer.15.q_norm")->data(),
+                    require(w.layers[15].k_norm, "layer.15.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(15);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(15);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -7618,8 +8403,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[16].qkv_proj_fused, "layer.16.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(16), cache.v(16),
@@ -7631,44 +8416,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[16].q_norm, "layer.16.q_norm")->data(),
                 require(w.layers[16].k_norm, "layer.16.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(16);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(16);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(16), cache.v(16),
+                    require(w.layers[16].q_norm, "layer.16.q_norm")->data(),
+                    require(w.layers[16].k_norm, "layer.16.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[16].q_norm, "layer.16.q_norm")->data(),
+                    require(w.layers[16].k_norm, "layer.16.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(16);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(16);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -8072,8 +8906,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[17].qkv_proj_fused, "layer.17.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(17), cache.v(17),
@@ -8085,44 +8919,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[17].q_norm, "layer.17.q_norm")->data(),
                 require(w.layers[17].k_norm, "layer.17.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(17);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(17);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(17), cache.v(17),
+                    require(w.layers[17].q_norm, "layer.17.q_norm")->data(),
+                    require(w.layers[17].k_norm, "layer.17.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[17].q_norm, "layer.17.q_norm")->data(),
+                    require(w.layers[17].k_norm, "layer.17.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(17);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(17);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -8526,8 +9409,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[18].qkv_proj_fused, "layer.18.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(18), cache.v(18),
@@ -8539,44 +9422,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[18].q_norm, "layer.18.q_norm")->data(),
                 require(w.layers[18].k_norm, "layer.18.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(18);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(18);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(18), cache.v(18),
+                    require(w.layers[18].q_norm, "layer.18.q_norm")->data(),
+                    require(w.layers[18].k_norm, "layer.18.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[18].q_norm, "layer.18.q_norm")->data(),
+                    require(w.layers[18].k_norm, "layer.18.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(18);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(18);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -8980,8 +9912,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[19].qkv_proj_fused, "layer.19.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(19), cache.v(19),
@@ -8993,44 +9925,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[19].q_norm, "layer.19.q_norm")->data(),
                 require(w.layers[19].k_norm, "layer.19.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(19);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(19);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(19), cache.v(19),
+                    require(w.layers[19].q_norm, "layer.19.q_norm")->data(),
+                    require(w.layers[19].k_norm, "layer.19.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[19].q_norm, "layer.19.q_norm")->data(),
+                    require(w.layers[19].k_norm, "layer.19.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(19);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(19);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -9434,8 +10415,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[20].qkv_proj_fused, "layer.20.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(20), cache.v(20),
@@ -9447,44 +10428,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[20].q_norm, "layer.20.q_norm")->data(),
                 require(w.layers[20].k_norm, "layer.20.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(20);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(20);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(20), cache.v(20),
+                    require(w.layers[20].q_norm, "layer.20.q_norm")->data(),
+                    require(w.layers[20].k_norm, "layer.20.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[20].q_norm, "layer.20.q_norm")->data(),
+                    require(w.layers[20].k_norm, "layer.20.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(20);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(20);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -9888,8 +10918,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[21].qkv_proj_fused, "layer.21.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(21), cache.v(21),
@@ -9901,44 +10931,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[21].q_norm, "layer.21.q_norm")->data(),
                 require(w.layers[21].k_norm, "layer.21.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(21);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(21);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(21), cache.v(21),
+                    require(w.layers[21].q_norm, "layer.21.q_norm")->data(),
+                    require(w.layers[21].k_norm, "layer.21.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[21].q_norm, "layer.21.q_norm")->data(),
+                    require(w.layers[21].k_norm, "layer.21.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(21);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(21);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -10342,8 +11421,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[22].qkv_proj_fused, "layer.22.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(22), cache.v(22),
@@ -10355,44 +11434,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[22].q_norm, "layer.22.q_norm")->data(),
                 require(w.layers[22].k_norm, "layer.22.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(22);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(22);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(22), cache.v(22),
+                    require(w.layers[22].q_norm, "layer.22.q_norm")->data(),
+                    require(w.layers[22].k_norm, "layer.22.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[22].q_norm, "layer.22.q_norm")->data(),
+                    require(w.layers[22].k_norm, "layer.22.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(22);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(22);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -10796,8 +11924,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[23].qkv_proj_fused, "layer.23.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(23), cache.v(23),
@@ -10809,44 +11937,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[23].q_norm, "layer.23.q_norm")->data(),
                 require(w.layers[23].k_norm, "layer.23.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(23);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(23);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(23), cache.v(23),
+                    require(w.layers[23].q_norm, "layer.23.q_norm")->data(),
+                    require(w.layers[23].k_norm, "layer.23.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[23].q_norm, "layer.23.q_norm")->data(),
+                    require(w.layers[23].k_norm, "layer.23.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(23);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(23);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -11250,8 +12427,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[24].qkv_proj_fused, "layer.24.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(24), cache.v(24),
@@ -11263,44 +12440,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[24].q_norm, "layer.24.q_norm")->data(),
                 require(w.layers[24].k_norm, "layer.24.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(24);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(24);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(24), cache.v(24),
+                    require(w.layers[24].q_norm, "layer.24.q_norm")->data(),
+                    require(w.layers[24].k_norm, "layer.24.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[24].q_norm, "layer.24.q_norm")->data(),
+                    require(w.layers[24].k_norm, "layer.24.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(24);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(24);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -11704,8 +12930,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[25].qkv_proj_fused, "layer.25.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(25), cache.v(25),
@@ -11717,44 +12943,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[25].q_norm, "layer.25.q_norm")->data(),
                 require(w.layers[25].k_norm, "layer.25.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(25);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(25);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(25), cache.v(25),
+                    require(w.layers[25].q_norm, "layer.25.q_norm")->data(),
+                    require(w.layers[25].k_norm, "layer.25.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[25].q_norm, "layer.25.q_norm")->data(),
+                    require(w.layers[25].k_norm, "layer.25.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(25);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(25);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -12158,8 +13433,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[26].qkv_proj_fused, "layer.26.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(26), cache.v(26),
@@ -12171,44 +13446,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[26].q_norm, "layer.26.q_norm")->data(),
                 require(w.layers[26].k_norm, "layer.26.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(26);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(26);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(26), cache.v(26),
+                    require(w.layers[26].q_norm, "layer.26.q_norm")->data(),
+                    require(w.layers[26].k_norm, "layer.26.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[26].q_norm, "layer.26.q_norm")->data(),
+                    require(w.layers[26].k_norm, "layer.26.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(26);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(26);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -12612,8 +13936,8 @@ const LoraTable* lora)
             ws.norm_x.data(),
             ops::WeightView(*require(w.layers[27].qkv_proj_fused, "layer.27.qkv")),
             ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
-        if (fast_rows > 0) {
-            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+        if (peel_window_d != nullptr) {
+            kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
                 ws.qkv_fused.data(),
                 ws.q.data(),
                 cache.k(27), cache.v(27),
@@ -12625,44 +13949,93 @@ const LoraTable* lora)
                 has_write_desc ? w_page_d : nullptr,
                 has_write_desc ? w_off_d : nullptr,
                 row_valid_d,
-                fast_rows, num_q_heads, num_kv_heads, d,
+                peel_window_d,
+                N, num_q_heads, num_kv_heads, d,
                 cache.page_size(), cache.hnd_layout(),
                 cfg.rope_theta, eps, stream);
-        }
-        if (fast_rows < N) {
-            kernels::launch_split_qkv_bf16(
-                bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
-                bf16_row(ws.v.data(), fast_rows, Hk),
-                (N - fast_rows), Hq, Hk, stream);
-            kernels::launch_qk_rmsnorm_rope_bf16(
-                bf16_row(ws.q.data(), fast_rows, Hq),
-                bf16_row(ws.k.data(), fast_rows, Hk),
+            kernels::launch_split_qkv_bf16_devwin(
+                ws.qkv_fused.data(),
+                ws.q.data(), ws.k.data(), ws.v.data(),
+                peel_window_d, N, Hq, Hk, stream);
+            kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                ws.q.data(), ws.k.data(),
                 require(w.layers[27].q_norm, "layer.27.q_norm")->data(),
                 require(w.layers[27].k_norm, "layer.27.k_norm")->data(),
-                positions + fast_rows, (N - fast_rows),
+                positions,
+                peel_window_d, N,
                 num_q_heads, num_kv_heads, d,
                 cfg.rope_theta, eps, stream);
             if (has_write_desc) {
                 {
                     auto kv_view = cache.layer_view(27);
-                    kernels::launch_write_kv_explicit_bf16(
-                        kv_view,
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        w_page_d + fast_rows, w_off_d + fast_rows,
-                        (N - fast_rows), stream,
-                        row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
                 }
             } else {
                 {
                     auto kv_view = cache.layer_view(27);
-                    kernels::launch_write_kv_to_pages(
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
                         kv_view, ws.k.data(), ws.v.data(),
                         qo_indptr, kv_page_indices, kv_page_indptr,
                         kv_last_page_lens,
-                        N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            }
+        } else {
+            if (fast_rows > 0) {
+                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                    ws.qkv_fused.data(),
+                    ws.q.data(),
+                    cache.k(27), cache.v(27),
+                    require(w.layers[27].q_norm, "layer.27.q_norm")->data(),
+                    require(w.layers[27].k_norm, "layer.27.k_norm")->data(),
+                    positions,
+                    static_cast<const float*>(ws.rope_table.data()),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    has_write_desc ? w_page_d : nullptr,
+                    has_write_desc ? w_off_d : nullptr,
+                    row_valid_d,
+                    fast_rows, num_q_heads, num_kv_heads, d,
+                    cache.page_size(), cache.hnd_layout(),
+                    cfg.rope_theta, eps, stream);
+            }
+            if (fast_rows < N) {
+                kernels::launch_split_qkv_bf16(
+                    bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    bf16_row(ws.v.data(), fast_rows, Hk),
+                    (N - fast_rows), Hq, Hk, stream);
+                kernels::launch_qk_rmsnorm_rope_bf16(
+                    bf16_row(ws.q.data(), fast_rows, Hq),
+                    bf16_row(ws.k.data(), fast_rows, Hk),
+                    require(w.layers[27].q_norm, "layer.27.q_norm")->data(),
+                    require(w.layers[27].k_norm, "layer.27.k_norm")->data(),
+                    positions + fast_rows, (N - fast_rows),
+                    num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, eps, stream);
+                if (has_write_desc) {
+                    {
+                        auto kv_view = cache.layer_view(27);
+                        kernels::launch_write_kv_explicit_bf16(
+                            kv_view,
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            w_page_d + fast_rows, w_off_d + fast_rows,
+                            (N - fast_rows), stream,
+                            row_valid_d != nullptr ? row_valid_d + fast_rows : nullptr);
+                    }
+                } else {
+                    {
+                        auto kv_view = cache.layer_view(27);
+                        kernels::launch_write_kv_to_pages(
+                            kv_view, ws.k.data(), ws.v.data(),
+                            qo_indptr, kv_page_indices, kv_page_indptr,
+                            kv_last_page_lens,
+                            N, R, stream, row_valid_d, /*first_token=*/fast_rows);
+                    }
                 }
             }
         }
@@ -12871,7 +14244,8 @@ bool has_write_desc,
 const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
-const LoraTable* lora)
+const LoraTable* lora,
+const std::uint32_t* peel_window_d)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:
     // the staging aliases are the plain buffers).
@@ -18857,6 +20231,7 @@ const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
 const LoraTable* lora,
+const std::uint32_t* peel_window_d,
     batch::SupergraphBuilder& sg)
 {
     // Locals mirror the interpreter's preamble (unpadded shape:

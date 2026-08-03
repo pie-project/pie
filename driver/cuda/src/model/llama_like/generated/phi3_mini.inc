@@ -40,7 +40,8 @@ bool has_write_desc,
 const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
-const LoraTable* lora)
+const LoraTable* lora,
+const std::uint32_t* peel_window_d)
 {
     // Locals mirror the interpreter's preamble — PADDED shape
     // (Phi-3's 96 -> 128): the attention consumes zero-padded
@@ -8410,7 +8411,8 @@ bool has_write_desc,
 const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
-const LoraTable* lora)
+const LoraTable* lora,
+const std::uint32_t* peel_window_d)
 {
     // Locals mirror the interpreter's preamble — PADDED shape
     // (Phi-3's 96 -> 128): the attention consumes zero-padded
@@ -15917,6 +15919,7 @@ const std::uint8_t* custom_mask_d,
 const std::int32_t* custom_mask_indptr_d,
 const StageHooks* hooks,
 const LoraTable* lora,
+const std::uint32_t* peel_window_d,
     batch::SupergraphBuilder& sg)
 {
     // Locals mirror the interpreter's preamble — PADDED shape

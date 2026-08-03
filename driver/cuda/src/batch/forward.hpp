@@ -222,6 +222,14 @@ struct ForwardFn {
         // its projection GEMMs; a body that cannot must not advertise
         // `has_lora`, and the bind gate then refuses the program instead.
         const model::LoraTable* lora = nullptr;
+
+        // The Peel device window word (pi.peel_window: {tail_start,
+        // tail_len} over token rows), non-null ONLY on hook-graph
+        // captures. The body then emits BOTH Peel regions through the
+        // device-window kernel forms, so the captured exec replays across
+        // row splits and the hook fingerprint can drop the split. Null
+        // everywhere else — eager fires keep the host windows.
+        const std::uint32_t* peel_window_d = nullptr;
     };
 
     struct PrepareInputs {

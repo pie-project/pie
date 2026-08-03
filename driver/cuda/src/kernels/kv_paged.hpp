@@ -53,6 +53,26 @@ void launch_write_kv_to_pages(
     // prefix is owned by the fused decode QKV kernel.
     int first_token = 0);
 
+// Peel device-window variant (TAIL form) of the CSR-derived append: the
+// {start, len} token window rides in device memory; the grid spans every
+// token (`n_max`) and out-of-window rows early-out, so a captured launch
+// replays across row splits (the host form bakes the split as
+// `first_token` + a split-dependent grid). Indexing stays absolute.
+// Native-bf16 cache only; envelope maintenance not wired (throws).
+void launch_write_kv_to_pages_bf16_devwin(
+    KvCacheLayerView layer,
+    const void* k_curr,                            // [n_max, h_kv, d]
+    const void* v_curr,
+    const std::uint32_t* qo_indptr,                // [R+1]
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,           // [R+1]
+    const std::uint32_t* kv_last_page_lens,        // [R]
+    const std::uint32_t* win_d,                    // device {start, len}
+    int n_max,
+    int num_requests,
+    cudaStream_t stream,
+    const std::uint8_t* row_valid = nullptr);
+
 void launch_write_kv_to_pages_at_positions_bf16(
     KvCacheLayerView layer,
     const void* k_curr,                            // [total_tokens, h_kv, d]

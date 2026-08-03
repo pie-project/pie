@@ -50,6 +50,12 @@ struct PersistentInputs {
     // uploaded per fire before a supergraph replay; the graph's embedded
     // set_cond kernels read it to arm the conditional branches.
     DeviceBuffer<std::uint8_t>  supergraph_preds;
+    // The Peel device window word: {start, len} of the hook-visible TAIL
+    // region over token rows ({fast_rows, N - fast_rows}); the prefix
+    // region is [0, start). Uploaded per fire before a hook-graph replay;
+    // the captured devwin kernels read it so the exec stops baking the
+    // row split (north-star-dsl.md, the device-window campaign).
+    DeviceBuffer<std::uint32_t> peel_window;
     DeviceBuffer<std::int32_t>  custom_mask_indptr;
     // Stable staging for a device-derived dense bool mask before
     // `launch_pack_dense_mask` writes `custom_mask`. One byte per source bit;

@@ -419,7 +419,8 @@ void llama_like_forward_declared(
     const std::uint8_t* custom_mask_d,
     const std::int32_t* custom_mask_indptr_d,
     const StageHooks* stage_hooks,
-    const LoraTable* lora)
+    const LoraTable* lora,
+    const std::uint32_t* peel_window_d)
 {
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
@@ -465,7 +466,7 @@ void llama_like_forward_declared(
                 logit_row_indices_d, num_logit_rows,
                 w_page_d, w_off_d, row_valid_d, has_write_desc,
                 custom_mask_d, custom_mask_indptr_d,
-                stage_hooks, lora);
+                stage_hooks, lora, peel_window_d);
         };
         if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
             run(generated_llama_like_decode_qwen3_0_6b,
@@ -643,10 +644,19 @@ void llama_like_forward_declared(
     // it (offset zero + full length is the identity).
     int win_start = 0;
     int win_len = N;
+    // Device-window mode (peel_window_d != nullptr, hook captures only):
+    // the walk emits BOTH Peel regions at full-N grids and the windowed
+    // call forms read the split from the device word — so the captured
+    // launches are split-independent and the hook fingerprint can drop
+    // the row split. The region marker tells each windowed site which
+    // face of the word it consumes (prefix = [0, w0), tail = {w0, w1}).
+    enum class WinRegion { Full, Prefix, Tail };
+    WinRegion win_region = WinRegion::Full;
     struct WinEvent {
         std::size_t at;
         int start;
         int len;
+        WinRegion region = WinRegion::Full;
     };
     std::vector<WinEvent> win_events;
     for (std::size_t i = 0; i < op_count; ++i) {
@@ -659,6 +669,7 @@ void llama_like_forward_declared(
             if (!win_events.empty() && i == win_events.back().at) {
                 win_start = win_events.back().start;
                 win_len = win_events.back().len;
+                win_region = win_events.back().region;
                 win_events.pop_back();
                 continue;
             }
@@ -873,6 +884,13 @@ void llama_like_forward_declared(
             // full-N consumers (hooks, attention) see one contiguous
             // buffer — the hand-written tail split verbatim. Offset 0 +
             // full length is the plain full-N split.
+            if (peel_window_d != nullptr && win_region == WinRegion::Tail) {
+                kernels::launch_split_qkv_bf16_devwin(
+                    ws.qkv_fused.data(),
+                    ws.q.data(), ws.k.data(), ws.v.data(),
+                    peel_window_d, N, Hq, Hk, stream);
+                break;
+            }
             kernels::launch_split_qkv_bf16(
                 bf16_row(ws.qkv_fused.data(), win_start, Hq + 2 * Hk),
                 bf16_row(ws.q.data(), win_start, Hq),
@@ -1003,6 +1021,27 @@ void llama_like_forward_declared(
                     plan.inputs(op).size >= 2 && !ws.rope_table.empty()
                         ? static_cast<const float*>(ws.rope_table.data())
                         : nullptr;
+                if (peel_window_d != nullptr) {
+                    // Device-window capture: the prefix form — the word's
+                    // START is this kernel's row count.
+                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+                        ws.qkv_fused.data(),
+                        ws.q.data(),
+                        cache.k(q_nm.layer), cache.v(q_nm.layer),
+                        require(layer.q_norm, q_name)->data(),
+                        require(layer.k_norm, k_name)->data(),
+                        positions,
+                        table,
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        has_write_desc ? w_page_d : nullptr,
+                        has_write_desc ? w_off_d : nullptr,
+                        row_valid_d,
+                        peel_window_d,
+                        N, num_q_heads, num_kv_heads, d,
+                        cache.page_size(), cache.hnd_layout(),
+                        cfg.rope_theta, eps, stream);
+                    break;
+                }
                 kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                     ws.qkv_fused.data(),
                     ws.q.data(),
@@ -1040,6 +1079,18 @@ void llama_like_forward_declared(
                 // hook-visible rows at their absolute offsets (the
                 // hand-written tail call); offset 0 + full length is
                 // the plain full-N form.
+                if (peel_window_d != nullptr &&
+                    win_region == WinRegion::Tail) {
+                    kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                        ws.q.data(), ws.k.data(),
+                        require(layer.q_norm, q_name)->data(),
+                        require(layer.k_norm, k_name)->data(),
+                        positions,
+                        peel_window_d, N,
+                        num_q_heads, num_kv_heads, d,
+                        cfg.rope_theta, eps, stream);
+                    break;
+                }
                 kernels::launch_qk_rmsnorm_rope_bf16(
                     bf16_row(ws.q.data(), win_start, Hq),
                     bf16_row(ws.k.data(), win_start, Hk),
@@ -1197,6 +1248,14 @@ void llama_like_forward_declared(
                 // Windowed (A3): the tail rows' cells only, from their
                 // slice of the descriptors — the hand-written tail
                 // write; offset 0 + full length is the plain form.
+                if (peel_window_d != nullptr &&
+                    win_region == WinRegion::Tail) {
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view, attn_k, attn_v,
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
+                    break;
+                }
                 kernels::launch_write_kv_explicit_bf16(
                     kv_view,
                     bf16_row(attn_k, win_start, Hk),
@@ -1249,6 +1308,15 @@ void llama_like_forward_declared(
                 // the fused-prefix rows the peel's other region already
                 // wrote — the hand-written tail call verbatim (0 is the
                 // plain form's default).
+                if (peel_window_d != nullptr &&
+                    win_region == WinRegion::Tail) {
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
+                        kv_view, attn_k, attn_v,
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        peel_window_d, N, R, stream, row_valid_d);
+                    break;
+                }
                 kernels::launch_write_kv_to_pages(
                     kv_view, attn_k, attn_v,
                     qo_indptr, kv_page_indices, kv_page_indptr,
@@ -1339,13 +1407,24 @@ void llama_like_forward_declared(
             const std::size_t tail_len = op.param1;
             const std::size_t tail_start = i + 1 + prefix_len;
             const std::size_t end = tail_start + tail_len;
+            if (peel_window_d != nullptr) {
+                // Device-window capture: BOTH regions are emitted — an
+                // empty region's kernels launch and early-out on the
+                // device word, so the captured exec replays across
+                // splits. No host skips, no host windows.
+                win_events.push_back({end, 0, N, WinRegion::Full});
+                win_events.push_back({tail_start, 0, N, WinRegion::Tail});
+                win_region = WinRegion::Prefix;
+                break;
+            }
             const int tail_rows = N - fast_rows;
-            win_events.push_back({end, 0, N});
+            win_events.push_back({end, 0, N, WinRegion::Full});
             if (fast_rows > 0) {
                 win_start = 0;
                 win_len = fast_rows;
                 if (tail_rows > 0) {
-                    win_events.push_back({tail_start, fast_rows, tail_rows});
+                    win_events.push_back(
+                        {tail_start, fast_rows, tail_rows, WinRegion::Full});
                 } else {
                     guard_skips.emplace_back(tail_start, tail_len);
                 }
@@ -1609,7 +1688,8 @@ bool llama_like_forward_supergraph_build(
                  logit_row_indices_d, num_logit_rows, w_page_d, w_off_d,
                  row_valid_d, has_write_desc, custom_mask_d,
                  custom_mask_indptr_d,
-                 /*hooks=*/nullptr, /*lora=*/nullptr, sg);
+                 /*hooks=*/nullptr, /*lora=*/nullptr,
+                 /*peel_window_d=*/nullptr, sg);
     };
     if (declared.facts_digest == kGeneratedDigest_qwen3_0_6b) {
         run(generated_llama_like_decode_qwen3_0_6b_supergraph_build);

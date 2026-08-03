@@ -136,7 +136,8 @@ void LlamaLikeModel::body(Workspace& ws,
             in.runtime_window_left,
             in.custom_mask_d, in.custom_mask_indptr_d,
             in.stage_hooks,
-            in.lora);
+            in.lora,
+            in.peel_window_d);
         return;
     }
     llama_like_forward_paged(
@@ -153,7 +154,8 @@ void LlamaLikeModel::body(Workspace& ws,
         in.runtime_window_left,
         /*vision=*/nullptr,
         in.stage_hooks,
-        in.lora);
+        in.lora,
+        in.peel_window_d);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {

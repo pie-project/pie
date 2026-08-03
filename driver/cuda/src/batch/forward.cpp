@@ -375,6 +375,12 @@ cudaGraphExec_t capture_forward_graph_exec(
         // captured body makes for every other `pi.*` buffer.
         fwd_in.stage_hooks = stage_hooks;
         fwd_in.lora = lora;
+        // Peel device-window campaign: a hook capture reads the row split
+        // from the device word, so the exec replays across compositions
+        // and the fingerprint no longer keys on it. Non-hook captures keep
+        // host windows (their split is degenerate and capture-stable).
+        fwd_in.peel_window_d =
+            stage_hooks != nullptr ? pi.peel_window.data() : nullptr;
         if (use_supergraph) {
             // The union body: the mask/write-desc data pointers must be
             // the persistent buffers UNCONDITIONALLY — a masked replay
@@ -1103,6 +1109,19 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
             CUDA_CHECK(cudaMemcpyAsync(
                 engine.inputs.supergraph_preds.data(), preds,
                 sizeof(preds), cudaMemcpyHostToDevice, cublas.stream()));
+        }
+        if (has_hooks) {
+            // Arm the fire's Peel window: the captured devwin kernels read
+            // {tail_start, tail_len} from this word, so ONE exec serves
+            // every row split (the device-window campaign's endpoint).
+            const std::uint32_t fast = std::min(
+                in.stage_hooks->hook_free_prefix_rows,
+                static_cast<std::uint32_t>(std::max(in.forward_R, 0)));
+            const std::uint32_t win[2] = {
+                fast, static_cast<std::uint32_t>(in.forward_N) - fast};
+            CUDA_CHECK(cudaMemcpyAsync(
+                engine.inputs.peel_window.data(), win, sizeof(win),
+                cudaMemcpyHostToDevice, cublas.stream()));
         }
         CUDA_CHECK(cudaGraphLaunch(exec, cublas.stream()));
         return;

@@ -36,6 +36,7 @@ __global__ void write_kv_kernel(
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
     const std::uint8_t* __restrict__ row_valid,
+    const std::uint32_t* __restrict__ win,
     int R,
     int page_size,
     int h_kv,
@@ -48,6 +49,15 @@ __global__ void write_kv_kernel(
     // tail write is the same write it always was, just not launched for rows
     // another kernel owns.
     const int t = blockIdx.x + first_token;
+    // Peel device window (tail form): when armed, the {start, len} word
+    // replaces the host `first_token` split — the grid spans every token
+    // and out-of-window rows early-out, so a captured launch replays
+    // across row splits.
+    if (win != nullptr) {
+        const int w0 = static_cast<int>(win[0]);
+        const int w1 = static_cast<int>(win[1]);
+        if (t < w0 || t >= w0 + w1) return;
+    }
     if (row_valid != nullptr && row_valid[t] == 0) return;
 
     const int r = find_request(qo_indptr, R, t);
@@ -662,7 +672,8 @@ void launch_write_kv_to_pages_bf16(
             static_cast<__nv_bfloat16*>(k_pages),
             static_cast<__nv_bfloat16*>(v_pages),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            row_valid, num_requests, page_size, num_kv_heads, head_dim,
+            row_valid, /*win=*/nullptr,
+            num_requests, page_size, num_kv_heads, head_dim,
             first_token);
     } else {
         write_kv_kernel<false><<<launch_tokens, BLOCK, 0, stream>>>(
@@ -671,7 +682,8 @@ void launch_write_kv_to_pages_bf16(
             static_cast<__nv_bfloat16*>(k_pages),
             static_cast<__nv_bfloat16*>(v_pages),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            row_valid, num_requests, page_size, num_kv_heads, head_dim,
+            row_valid, /*win=*/nullptr,
+            num_requests, page_size, num_kv_heads, head_dim,
             first_token);
     }
 }
@@ -917,6 +929,58 @@ void launch_write_kv_explicit_bf16_devwin(
             static_cast<__nv_bfloat16*>(layer.v_pages),
             w_page, w_off, row_valid, win_d, n_max, layer.page_size,
             layer.num_kv_heads, layer.head_dim);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_write_kv_to_pages_bf16_devwin(
+    KvCacheLayerView layer,
+    const void* k_curr,
+    const void* v_curr,
+    const std::uint32_t* qo_indptr,
+    const std::uint32_t* kv_page_indices,
+    const std::uint32_t* kv_page_indptr,
+    const std::uint32_t* kv_last_page_lens,
+    const std::uint32_t* win_d,
+    int n_max,
+    int num_requests,
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
+{
+    if (!layer.is_native_bf16()) {
+        throw std::runtime_error(
+            "write_kv_to_pages_bf16_devwin requires native bf16 KV cache "
+            "(the same argument as the host first_token form)");
+    }
+    if (n_max <= 0) return;
+    // Envelope maintenance (quest) is NOT wired on this variant yet —
+    // same disposition as the explicit devwin write.
+    if (layer.has_envelopes()) {
+        throw std::runtime_error(
+            "write_kv_to_pages_bf16_devwin: envelope maintenance not yet "
+            "windowed — use the host-window form");
+    }
+    constexpr int BLOCK = 256;
+    if (layer.hnd_layout) {
+        write_kv_kernel<true><<<n_max, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            row_valid, win_d,
+            num_requests, layer.page_size, layer.num_kv_heads,
+            layer.head_dim, /*first_token=*/0);
+    } else {
+        write_kv_kernel<false><<<n_max, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            row_valid, win_d,
+            num_requests, layer.page_size, layer.num_kv_heads,
+            layer.head_dim, /*first_token=*/0);
     }
     CUDA_CHECK(cudaGetLastError());
 }

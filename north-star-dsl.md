@@ -937,3 +937,57 @@ Order: kernels first (each with an A/B against the host-window form),
 then the plumbing, then the fingerprint change, batteries at each
 step. This is deliberate multi-cycle kernel surgery — correctness
 gates are the mixed-hook battery and the full sweep.
+
+## The Peel device-window campaign — landed upfront, batteries deferred (2026-08-03)
+
+Directive: implement the whole remaining campaign in one pass, test
+after. Everything below compiles clean (full driver build); the
+correctness gates (kernel A/B extension, mixed-hook battery, full
+sweep) are the NEXT cycle's work and nothing here is verified live yet.
+
+The five parts:
+1. Kernel 4 — the fused decode epilogue's PREFIX form. Both kernel
+   templates (block + warp) gained a nullable `win` param: rows
+   [0, win[0]) — the window word's START is the prefix's row count,
+   because the word stores the TAIL {start, len} and the prefix ends
+   where the tail starts. One shared dispatch
+   (`qkv_decode_fused_dispatch`); the host launcher passes null, the
+   `_devwin` launcher passes the word and grids at full N. The warp
+   kernel's early-out is warp-uniform (one warp = one (row, head)
+   unit), so the FULL_MASK shuffles never see a partial warp; the
+   block kernel's sits before any __syncthreads.
+2. Kernel 5 — `launch_write_kv_to_pages_bf16_devwin` (TAIL form):
+   `write_kv_kernel` gained the same nullable `win`; the devwin
+   launcher grids every token, out-of-window rows early-out, indexing
+   stays absolute, `first_token` rests at 0. Native-bf16 only;
+   envelope maintenance refuses (the explicit devwin's disposition).
+3. Plumbing — `pi.peel_window` (u32x2 {tail_start, tail_len});
+   `ForwardInputs::peel_window_d`, set ONLY on hook captures
+   (`capture_forward_graph_exec`); `run_forward_dispatch` uploads
+   {fast, N-fast} before EVERY hook-graph launch, beside the
+   supergraph pred upload.
+4. Win threading — the interpreter's Peel walk, the hand-written
+   body's fused branch, and the emitter's Peel emission all branch on
+   `peel_window_d`: device mode emits BOTH regions unconditionally
+   (an empty region's kernels launch and early-out on the word) via
+   the five devwin forms; host mode keeps the fast_rows ifs and
+   caller-offset windows — eager fires pay zero wasted threads. The
+   emitter's `Win` became an enum (Host {start, len} | DevPrefix |
+   DevTail); misplaced-window emissions panic. The hand-written
+   `fused_decode_qkv_post` predicate drops its `fast_rows > 0` term
+   in device mode only — the branch must not depend on the capture
+   fire's split. All five generated forms re-emitted (the sixth,
+   qwen3_5, does not consume the split and is untouched).
+5. The fingerprint — `prepare_attention_phases` no longer mixes
+   `hook_free_prefix_rows`. Safe because llama_like is the ONLY model
+   with `supports_hook_graph_capture`, and both its bodies (declared/
+   generated and hand-written) now read the split from the device
+   word on captures. Lane `token_start` terms still mix — hooked
+   lanes MOVING is real baked state; the campaign's claim is only
+   that the hook-free prefix growing/shrinking stops churning execs.
+
+Deferred (the next cycle's gates, in order): test_peel_window A/B
+cases for kernels 4+5; the mixed-hook battery proving one exec
+replays across compositions ([hook-graph] replay counts where
+captures used to churn); byte parity of hooked fires against the
+pre-campaign tip; the full consolidated sweep.

@@ -927,7 +927,8 @@ void llama_like_forward_paged(
     int runtime_window_left,
     const LlamaLikeVisionInputs* vision,
     const StageHooks* hooks,
-    const LoraTable* lora)
+    const LoraTable* lora,
+    const std::uint32_t* peel_window_d)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
     // shapes; the local *_local fields just shadow the unsharded value.
@@ -1139,7 +1140,11 @@ void llama_like_forward_paged(
             : std::min(static_cast<int>(hooks->hook_free_prefix_rows), R);
         const bool fused_decode_qkv_post =
             use_fused_qkv &&
-            fast_rows > 0 &&
+            // Device-window capture (peel_window_d): the branch must not
+            // depend on THIS fire's split — the captured body emits both
+            // Peel regions windowed, and a replay may put any row count
+            // in either. Host mode keeps the fast_rows>0 economy.
+            (peel_window_d != nullptr || fast_rows > 0) &&
             decode_fused_post_enabled() &&
             // A fused edge cannot be a merge point (§5.1): the fused decode
             // kernel writes V straight to the paged cache, so there is no
@@ -1180,30 +1185,56 @@ void llama_like_forward_paged(
                         static_cast<const float*>(ws.rope_table.data());
                     rope_table_ready = true;
                 }
-                kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
-                    ws.qkv_fused.data(),
-                    ws.q.data(),
-                    cache.k(L), cache.v(L),
-                    layer.q_norm->data(), layer.k_norm->data(),
-                    positions,
-                    rope_table,
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    has_write_desc ? w_page_d : nullptr,
-                    has_write_desc ? w_off_d : nullptr,
-                    row_valid_d,
-                    fast_rows, num_q_heads_local, num_kv_heads_local, d,
-                    cache.page_size(), cache.hnd_layout(),
-                    cfg.rope_theta, eps, stream);
-                if (unfused_tail_rows > 0) {
-                    // The hook-visible tail: split into ws.q/k/v at their
-                    // ABSOLUTE row offsets, so the full-N hook below still
-                    // observes one contiguous query buffer.
-                    kernels::launch_split_qkv_bf16(
-                        bf16_row(ws.qkv_fused.data(), fast_rows, Hq + 2 * Hk),
-                        bf16_row(ws.q.data(), fast_rows, Hq),
-                        bf16_row(ws.k.data(), fast_rows, Hk),
-                        bf16_row(ws.v.data(), fast_rows, Hk),
-                        unfused_tail_rows, Hq, Hk, stream);
+                if (peel_window_d != nullptr) {
+                    // Device-window capture: both regions launch at the
+                    // full-N grid and read the split from the device word,
+                    // so the exec replays across row splits.
+                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16_devwin(
+                        ws.qkv_fused.data(),
+                        ws.q.data(),
+                        cache.k(L), cache.v(L),
+                        layer.q_norm->data(), layer.k_norm->data(),
+                        positions,
+                        rope_table,
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        has_write_desc ? w_page_d : nullptr,
+                        has_write_desc ? w_off_d : nullptr,
+                        row_valid_d,
+                        peel_window_d,
+                        N, num_q_heads_local, num_kv_heads_local, d,
+                        cache.page_size(), cache.hnd_layout(),
+                        cfg.rope_theta, eps, stream);
+                    kernels::launch_split_qkv_bf16_devwin(
+                        ws.qkv_fused.data(),
+                        ws.q.data(), ws.k.data(), ws.v.data(),
+                        peel_window_d, N, Hq, Hk, stream);
+                } else {
+                    kernels::launch_qkv_decode_qk_norm_rope_write_kv_bf16(
+                        ws.qkv_fused.data(),
+                        ws.q.data(),
+                        cache.k(L), cache.v(L),
+                        layer.q_norm->data(), layer.k_norm->data(),
+                        positions,
+                        rope_table,
+                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                        has_write_desc ? w_page_d : nullptr,
+                        has_write_desc ? w_off_d : nullptr,
+                        row_valid_d,
+                        fast_rows, num_q_heads_local, num_kv_heads_local, d,
+                        cache.page_size(), cache.hnd_layout(),
+                        cfg.rope_theta, eps, stream);
+                    if (unfused_tail_rows > 0) {
+                        // The hook-visible tail: split into ws.q/k/v at their
+                        // ABSOLUTE row offsets, so the full-N hook below still
+                        // observes one contiguous query buffer.
+                        kernels::launch_split_qkv_bf16(
+                            bf16_row(ws.qkv_fused.data(), fast_rows,
+                                     Hq + 2 * Hk),
+                            bf16_row(ws.q.data(), fast_rows, Hq),
+                            bf16_row(ws.k.data(), fast_rows, Hk),
+                            bf16_row(ws.v.data(), fast_rows, Hk),
+                            unfused_tail_rows, Hq, Hk, stream);
+                    }
                 }
             } else {
                 kernels::launch_split_qkv_bf16(
@@ -1291,7 +1322,15 @@ void llama_like_forward_paged(
             // postprocess above. The hook-visible tail takes the same
             // per-head-norm + standard-rope transform the predicate
             // guaranteed, over its own rows only.
-            if (unfused_tail_rows > 0) {
+            if (peel_window_d != nullptr) {
+                kernels::launch_qk_rmsnorm_rope_bf16_devwin(
+                    ws.q.data(), ws.k.data(),
+                    layer.q_norm->data(), layer.k_norm->data(),
+                    positions,
+                    peel_window_d, N,
+                    num_q_heads_local, num_kv_heads_local, d,
+                    cfg.rope_theta, eps, stream);
+            } else if (unfused_tail_rows > 0) {
                 kernels::launch_qk_rmsnorm_rope_bf16(
                     bf16_row(ws.q.data(), fast_rows, Hq),
                     bf16_row(ws.k.data(), fast_rows, Hk),
@@ -1381,7 +1420,22 @@ void llama_like_forward_paged(
             // Rows [0, fast_rows) were already written by
             // launch_qkv_decode_qk_norm_rope_write_kv_bf16; only the
             // hook-visible tail still needs its K/V appended.
-            if (unfused_tail_rows > 0) {
+            if (peel_window_d != nullptr) {
+                if (has_write_desc) {
+                    kernels::launch_write_kv_explicit_bf16_devwin(
+                        kv_view,
+                        ws.k.data(), ws.v.data(),
+                        w_page_d, w_off_d,
+                        peel_window_d, N, stream, row_valid_d);
+                } else {
+                    kernels::launch_write_kv_to_pages_bf16_devwin(
+                        kv_view,
+                        ws.k.data(), ws.v.data(),
+                        qo_indptr, kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        peel_window_d, N, R, stream, row_valid_d);
+                }
+            } else if (unfused_tail_rows > 0) {
                 if (has_write_desc) {
                     kernels::launch_write_kv_explicit_bf16(
                         kv_view,
