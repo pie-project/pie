@@ -865,3 +865,14 @@ step-3b fingerprint. A lora fire's body is now launches-only end to
 end. Live: 128 interpreter-leg fires on the engine-staged state; solo
 byte-stable both legs. 3b next: the fingerprint-keyed exec store +
 eligibility + capture-with-lora.
+
+Step 3b landed (`4ae61cef6`): lora fires capture and replay CUDA
+graphs. The eligibility's !has_lora term retired; kGvLora keys the
+shapes; the fingerprint-partitioned store reuses the hook struct and
+churn discipline (fingerprint = entry hash — a changed lane structure
+selects a different entry, no stale path). Live: 18 captures across
+R buckets and adapter fingerprints, silent replays between, solo
+byte-stable (replay correctness), zero-equivalence all-True, non-lora
+paths untouched. What remains of the campaign: step 4, union entry —
+lora as a resolved path in the supergraph build (k=2: mask x lora),
+which folds the last per-attachment exec split for decode fires.
