@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include "batch/supergraph.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/embed.hpp"
 #include "kernels/gather_rows.hpp"
