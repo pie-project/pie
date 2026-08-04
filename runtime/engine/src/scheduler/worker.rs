@@ -581,8 +581,7 @@ impl LaunchGrouping {
         let spatial_composable_masked_envelope = spatial_mask_compose_enabled()
             && wire_mask_on_device_geometry
             && request.request.token_ids.len() <= 1
-            && !request.has_multi_token_row()
-            && !request.hook_program;
+            && !request.has_multi_token_row();
         let wire_mask_on_device_geometry_blocks =
             wire_mask_on_device_geometry && !spatial_composable_masked_envelope;
         if self.count != 0
@@ -599,14 +598,14 @@ impl LaunchGrouping {
                     && ((!spatial_mixed_compose_enabled()
                          && self.has_multi_token)
                         || self.has_structured_mask
-                        || self.has_hook
                         || self.has_masked_device_geometry))
                 || self.has_masked_device_geometry
                 || (self.has_wire_masked_envelope
                     && ((!spatial_mixed_compose_enabled()
                          && request.has_multi_token_row())
                         || request.request.structured_device_mask
-                        || request.hook_program))
+                        || (request.hook_program
+                            && request.request.has_user_mask)))
                 || (wire_masked && self.has_structured_mask)
                 || (request.request.structured_device_mask && self.has_user_mask))
         {

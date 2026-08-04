@@ -1905,7 +1905,14 @@ void llama_like_forward_paged(
         const std::uint32_t* attn_page_indptr = kv_page_indptr;
         const std::uint32_t* attn_last_page_lens = kv_last_page_lens;
         if (page_mask.written_for(static_cast<std::uint32_t>(L))) {
-            if (!use_decode_path || decode_plan == nullptr) {
+            // AC-4: a SPATIAL fire's hooked lanes ride the prefix decode
+            // dispatch, which consumes the substituted views — the split
+            // branch is a paged-decode consumer too.
+            const bool spatial_decode_consumer =
+                plan_state.spatial_mask_split >= 0 &&
+                is_pure_decode && decode_plan != nullptr;
+            if ((!use_decode_path && !spatial_decode_consumer) ||
+                decode_plan == nullptr) {
                 throw std::runtime_error(
                     "attn_page_mask was written but this layer does not take "
                     "the paged decode path, which is the only one whose page "
@@ -2037,11 +2044,14 @@ void llama_like_forward_paged(
                             "spatial mask: split active but prepare built "
                             "no prefix decode plan");
                     } else {
+                        // AC-4: the ATTN page views (hook-narrowed when
+                        // sites ran, aliases of the raw CSRs otherwise)
+                        // — hooked prefix lanes keep their page masks.
                         ops::dispatch_attention_flashinfer_decode(
                             *decode_plan,
                             attn_q, kv_view, attn_out_buf,
-                            kv_page_indices, kv_page_indptr,
-                            kv_last_page_lens,
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
                             attn_ws, stream, layer_window_left,
                             /*logits_soft_cap=*/0.f, sm_scale_override);
                     }
@@ -2391,6 +2401,11 @@ void llama_like_forward_paged(
         // RESTORED before the tail, so the one tail reads layer-k
         // hidden for the truncated rows and layer-L for everyone else.
         const int t_start = static_cast<int>(full_depth_rows);
+        // The truncated middle ends where the first full-depth suffix
+        // block begins — the hooked block when present (its start rides
+        // the hook-free-prefix word via fast_rows... the mask split is
+        // the v0 anchor; hooked+depth composition keeps m_start = the
+        // mask word since hooked lanes sort between).
         const int m_start = plan_state.spatial_mask_split;
         // t_start == 0 is legal: no plain block, the truncated middle
         // starts at row 0 ([truncated | masked]).

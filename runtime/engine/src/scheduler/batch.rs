@@ -136,7 +136,7 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
         // tail. A single lane carrying BOTH axes still declines (its
         // correction span would cross the depth window — the PQ-tree
         // class, refused as safe degradation for now).
-        if req.hook_program
+        if (req.hook_program && req.request.max_layers.is_some())
             || (req.lora_program && req.request.max_layers.is_some())
             // AC-1: a lane on BOTH window axes is the PQ-tree class.
             || (req.request.has_user_mask && req.request.max_layers.is_some())
@@ -160,10 +160,21 @@ fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
     // after it must be masked (full-depth), every truncated member
     // contiguous. dsplit = the block's start; its end derives from the
     // mask word driver-side.
+    // AC-4: the full-depth suffix behind the truncated middle may hold
+    // hooked lanes then masked lanes (the seriation's order) — both are
+    // full-depth. The driver's stash window is anchored on the MASK
+    // word, so a hooked suffix without a masked lane behind it has no
+    // anchor and declines (safe degradation; the hook-word anchor is
+    // the recorded refinement).
+    if ordered.iter().any(|r| r.hook_program)
+        && !ordered.iter().any(|r| r.request.has_user_mask)
+    {
+        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
+    }
     let masked_tail = ordered
         .iter()
         .rev()
-        .take_while(|r| r.request.has_user_mask)
+        .take_while(|r| r.request.has_user_mask || r.hook_program)
         .count();
     let split = ordered.len() - masked_tail - truncated;
     if ordered[split..ordered.len() - masked_tail]
@@ -191,11 +202,13 @@ fn planned_unmasked_prefix_wire_rows(
     ordered: &[Box<PendingRequest>],
     row_indptr: &[u32],
 ) -> u32 {
-    // AC-2: lora members no longer suppress the plan — the correction
-    // applies to its spans wherever they sit in the unmasked prefix
-    // (span-grouped, window-free); hooks still do (the hook peel owns
-    // the suffix).
-    if ordered.iter().any(|req| req.hook_program)
+    // AC-4: hooks no longer suppress the plan either — the order is
+    // [plain | truncated | hooked | masked], so the mask window is
+    // still the suffix and hooked lanes sit in the unmasked prefix. A
+    // lane on BOTH axes (a masked hook program) remains the refusal.
+    if ordered
+        .iter()
+        .any(|req| req.hook_program && req.request.has_user_mask)
         || !ordered.iter().any(|req| req.request.has_user_mask)
     {
         return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
@@ -582,8 +595,8 @@ pub(crate) fn build_frame_submission(
                 order.sort_by_key(|&i| {
                     (
                         group[i].request.device_resolved_geometry,
-                        group[i].hook_program,
                         group[i].request.has_user_mask,
+                        group[i].hook_program,
                         // STRUCTURAL S-2 (found by AC-0: the lora x
                         // depth pair PANICKED this parity assert — the
                         // reference comparator must carry every
