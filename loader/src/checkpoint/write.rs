@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ztensor::DType as ZDType;
-use ztensor::cbor::{self, Value};
+use ztensor::format::cbor::{self, Value};
 
 use crate::error::Error;
 use crate::types::{DType, Encoding, QuantScheme, TensorDecl};
@@ -234,15 +234,21 @@ pub fn write_zt(
             })
             .collect::<Result<_, _>>()?;
         let (layout, attributes) = profile_of(&decl.encoding)?;
-        let mut object = writer.object(&decl.name).shape(shape).layout(layout);
-        if let Some(attributes) = attributes {
-            object = object.attributes(attributes);
-        }
-        object = object.part("data").dtype(dtype);
-        if let Some(ltype) = ltype {
-            object = object.logical(ltype);
-        }
-        object.bytes(tensor.bytes).add().map_err(Error::from)?;
+        writer
+            .object(&decl.name, |mut o| {
+                o = o.shape(shape).layout(layout);
+                if let Some(attributes) = attributes {
+                    o = o.attributes(attributes);
+                }
+                o.part("data", |mut p| {
+                    p = p.dtype(dtype);
+                    if let Some(ltype) = ltype {
+                        p = p.logical(ltype);
+                    }
+                    p.bytes(tensor.bytes)
+                })
+            })
+            .map_err(Error::from)?;
     }
     writer.finish().map_err(Error::from)?;
     Ok(())
