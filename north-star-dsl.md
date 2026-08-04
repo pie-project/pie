@@ -2204,3 +2204,13 @@ number taken on faith. Zero incidents; mistral (a force_prefill
 deployment) serves 32-adapter fires cleanly. lora-probe geometry is
 now argument-driven (layers/d_in/d_out) — any llama-like checkpoint
 can run this battery.
+
+## FINAL GATE (2026-08-04)
+
+All suites at the tip: 578 passed / 0 failed (engine, forward, abi,
+codegen). Tree clean, both branches pushed, release binary current,
+config restored to the serving default. Every directed rock stands
+done, rescoped-with-evidence, or measured-to-the-hardware-limit; the
+diagnostic instruments (fire trace, census, logit probe,
+geometry-parameterized benches) live in the wiki for the next
+hardware or the next directive.
