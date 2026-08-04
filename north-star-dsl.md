@@ -1467,3 +1467,50 @@ builder is its organ); PQ-tree seriation when the axes stop nesting
 split under XQA and padded head dims (both guarded to the fire-level
 arm); and flashinfer-side device row windows (which would collapse
 the split-keyed exec family to one exec per bucket).
+
+## THE REVIEW LANDS: THE MASK SPLIT BECOMES VOCABULARY (2026-08-04)
+
+The post-v1 review's finding, accepted whole: the two live window
+axes lived in different layers — the hook axis as IR (OpKind::Peel)
+and the mask axis as C++ text the emitter printed into the custom
+arm. Same failure the DSL exists to kill ("the smarts accumulated
+there"), relocated from the driver into the emitter; no golden could
+pin it and no second backend could consume it. The review's own
+sentence is the fix: Peel is already the word for "two regions that
+both run over complementary row ranges" — only the split's SOURCE
+differs. So Peel gained a WINDOW AXIS (PeelWindow: HookFreePrefix,
+the serde default keeping every pre-window golden byte-identical;
+UnmaskedPrefix, the spatial mask split), and the mask arm of the
+decode declaration now STATES the split (dsl::peel_masked) exactly
+where prepare's deployment gate holds (!xqa && !padded). The axis
+crosses the FFI as the Peel's aux run (empty = hook, [1] = mask).
+
+Two consequences the lift forced, both improvements the text form
+had hidden: (a) the UNPLANNED endpoint is the peel's own degenerate
+form (tail-only, full-N, fire-level addressing) — the fire-level
+custom dispatch is not a separate op; (b) the prefix region states
+THE DEPLOYMENT'S decode form, not a hardcoded decode dispatch —
+qwen2_5 (force_prefill: GQA ratio outside the decode kernel's set)
+states dequant staging + the plan-free prefill launcher over
+[0, split), which CLOSED A LIVE LANDMINE: since spatial default-on,
+a masked mixed fire on qwen2_5 threw "no prefix decode plan" on all
+three legs. The emitter text could never have said this per
+deployment without another nested runtime branch; the trace says it
+per deployment for free, because deployments are what traces are.
+
+Emitter and interpreter are region walkers again: emit_cuda spells
+the window plumbing once at the Peel and the attention arms key
+their addressing on the region marker (Win::MaskPrefix/MaskTail);
+declared_forward's walk carries mask-region events as a SEPARATE
+axis from the hook window (they never nest — the engine plans
+UNPLANNED for hooked fires). Goldens now pin the split as structure
+(qwen3/mistral: decode-region prefix; qwen2_5: dequant+prefill
+prefix; phi3 padded: no peel). Verified live, all three legs:
+canonical masked solo byte-equal, solo oracle byte-equal to the
+pre-campaign reference, mixed masked+2-plain engaging planned
+splits (R=4 split=2, ~22 fires/leg) with plains byte-consistent
+across legs. Board: use_prefill_decode_plan (Hopper) prefix
+polymorphism — the prefix region's plan-family choice under sm>=9
+is not yet stated; off on sm_89.
+
+Commit 797cdefc6.
