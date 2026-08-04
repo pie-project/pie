@@ -16,6 +16,13 @@ mod template;
 pub use optimize::Objective;
 use template::default_config_content;
 
+/// The generated default config, for tests in this module's children that
+/// need a document the schema accepts.
+#[cfg(test)]
+pub(crate) fn default_config_for_test() -> String {
+    default_config_content()
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
     /// Every key: what it is worth now, and what it means.

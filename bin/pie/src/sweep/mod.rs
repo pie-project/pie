@@ -210,6 +210,66 @@ pub async fn measure(
     })
 }
 
+/// Measure every candidate, interleaved.
+///
+/// One fleet per candidate per pass, cycling, rather than all of a candidate's
+/// fleets back to back. Batched repeats share whatever state the machine is in
+/// for those few seconds, so they measure the WITHIN-BURST variation and report
+/// it as the uncertainty — which made `Round::beats` over-confident by the
+/// difference. Measured: a candidate's own reported spread was 1.2-2.7% while
+/// the same knobs re-measured at the end of the sweep landed 3.4% away.
+///
+/// Interleaving spreads each candidate's fleets across the whole run, so a slow
+/// stretch of machine time lands on every candidate instead of on whichever one
+/// happened to occupy it — and the spread it reports is the one that matters.
+pub async fn sweep_all(
+    addr: &str,
+    program: &str,
+    inputs: &[String],
+    candidates: &[Knobs],
+    repeats: usize,
+    mut on_pass: impl FnMut(usize, usize),
+) -> Result<Vec<Round>> {
+    let repeats = repeats.max(1);
+    let mut throughputs: Vec<Vec<f64>> = vec![Vec::with_capacity(repeats); candidates.len()];
+    let mut p95s: Vec<Vec<f64>> = vec![Vec::with_capacity(repeats); candidates.len()];
+    let mut failed = vec![0usize; candidates.len()];
+
+    for pass in 0..repeats {
+        for (index, knobs) in candidates.iter().enumerate() {
+            pie_engine::scheduler::reconfigure(
+                knobs.frame_size,
+                knobs.submit_depth,
+                knobs.dispatch_depth,
+            )
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("apply {knobs}"))?;
+            let run = fleet::run(addr, program, inputs).await;
+            throughputs[index].push(run.throughput_tok_s());
+            p95s[index].push(run.lane_percentile_us(95) as f64);
+            failed[index] += run.failed_lanes();
+        }
+        on_pass(pass + 1, repeats);
+    }
+
+    Ok(candidates
+        .iter()
+        .enumerate()
+        .map(|(index, knobs)| {
+            let (throughput_tok_s, throughput_rel_sigma) = median_and_rel_sigma(&throughputs[index]);
+            let (lane_p95, _) = median_and_rel_sigma(&p95s[index]);
+            Round {
+                knobs: *knobs,
+                throughput_tok_s,
+                throughput_rel_sigma,
+                lane_p95_us: lane_p95 as u128,
+                failed_lanes: failed[index],
+                repeats,
+            }
+        })
+        .collect())
+}
+
 /// Every knob combination worth measuring, given the driver's staging bound.
 ///
 /// Enumerated rather than searched, and the plan's §8 argues why: the feasible

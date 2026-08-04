@@ -226,6 +226,27 @@ pub fn lane_inputs(fleet: usize, tokens: usize) -> Vec<String> {
     (0..fleet).map(|_| tokens.to_string()).collect()
 }
 
+/// Write the winning knobs into a config document.
+///
+/// Through `typed_by_schema`, the same path `pie config set` uses, so a value
+/// the schema would refuse is refused here too rather than written and
+/// discovered at the next boot. It also means the joint staging bound is
+/// checked on the way in: `SchedulerConfig::validate` runs on each candidate
+/// document, and it sees both factors at once.
+pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
+    let mut content = content.to_string();
+    for (key, value) in [
+        ("runtime.frame_size", knobs.frame_size),
+        ("runtime.frame_submit_depth", knobs.submit_depth),
+        ("runtime.frame_dispatch_depth", knobs.dispatch_depth),
+    ] {
+        let (updated, _) = typed_by_schema(&content, key, &value.to_string())
+            .with_context(|| format!("write {key}"))?;
+        content = updated;
+    }
+    Ok(content)
+}
+
 /// Boot once, sweep, report.
 pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
     let (cfg_path, origin) = startup::cli_config_path(global);
@@ -294,20 +315,18 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
                 )
             })?;
 
-        let mut rounds = Vec::with_capacity(plan.len());
-        for (index, knobs) in plan.iter().enumerate() {
-            let round = sweep::measure(&addr, &args.program, &inputs, *knobs, args.repeats)
-                .await
-                .with_context(|| format!("candidate {} of {}", index + 1, plan.len()))?;
-            println!(
-                "  [{}/{}] {knobs} → {:.0} tok/s ±{:.1}%",
-                index + 1,
-                plan.len(),
-                round.throughput_tok_s,
-                round.throughput_rel_sigma * 100.0
-            );
-            rounds.push(round);
-        }
+        // Interleaved: one fleet per candidate per pass. Batched repeats would
+        // report the within-burst spread as the uncertainty, and that spread is
+        // what decides which differences count.
+        let rounds = sweep::sweep_all(
+            &addr,
+            &args.program,
+            &inputs,
+            &plan,
+            args.repeats,
+            |pass, total| println!("  pass {pass}/{total} over {} candidates", plan.len()),
+        )
+        .await?;
         anyhow::Ok(rounds)
     }
     .await?;
@@ -317,17 +336,8 @@ pub async fn run(global: &startup::GlobalArgs, args: Args) -> Result<()> {
     if let Some(best) = winner(&rounds, &baseline)
         && args.write
     {
-        let mut content = content;
-        for (key, value) in [
-            ("runtime.frame_size", best.knobs.frame_size),
-            ("runtime.frame_submit_depth", best.knobs.submit_depth),
-            ("runtime.frame_dispatch_depth", best.knobs.dispatch_depth),
-        ] {
-            let (updated, _) = typed_by_schema(&content, key, &value.to_string())?;
-            content = updated;
-        }
-        std::fs::write(&cfg_path, &content)
-            .map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
+        let content = apply(&content, best.knobs)?;
+        std::fs::write(&cfg_path, &content).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
         wrote = true;
     }
 
@@ -415,6 +425,49 @@ mod tests {
         // Same gap, quiet measurements: a result.
         let rounds = vec![round(BASE, 1200.0, 0.005), round(fast, 1230.0, 0.005)];
         assert_eq!(winner(&rounds, &BASE).map(|r| r.knobs), Some(fast));
+    }
+
+    #[test]
+    fn the_winner_is_written_through_the_schema() {
+        // The apply path is only reached when a candidate wins, which on a
+        // healthy machine is rare -- so it is tested here rather than left to
+        // be exercised for the first time on someone's config.
+        let content = crate::ops::config::default_config_for_test();
+        let updated = apply(
+            &content,
+            Knobs {
+                frame_size: 3,
+                submit_depth: 4,
+                dispatch_depth: 2,
+            },
+        )
+        .expect("a valid combination applies");
+        let parsed: toml::Value = toml::from_str(&updated).unwrap();
+        let runtime = parsed.get("runtime").and_then(|r| r.as_table()).unwrap();
+        assert_eq!(runtime["frame_size"].as_integer(), Some(3));
+        assert_eq!(runtime["frame_submit_depth"].as_integer(), Some(4));
+        assert_eq!(runtime["frame_dispatch_depth"].as_integer(), Some(2));
+        // Typed, not stringified: `pie config set` had this exact bug.
+        assert!(!updated.contains("frame_size = \"3\""));
+    }
+
+    #[test]
+    fn a_combination_the_engine_would_refuse_is_never_written() {
+        // 4 * 4 = 16 exceeds the driver's staging pool. Writing it would produce
+        // a config that parses and then blocks every submit with no diagnostic
+        // -- the failure `UPLOAD_STAGING_DEPTH` exists to make loud.
+        let content = crate::ops::config::default_config_for_test();
+        let error = apply(
+            &content,
+            Knobs {
+                frame_size: 4,
+                submit_depth: 3,
+                dispatch_depth: 4,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("frame"), "got: {error}");
     }
 
     #[test]
