@@ -93,10 +93,9 @@ rust-version = "1.91"
 # dance: `ztensor` owns the container format and its validation,
 # `ztensor-compat` owns the foreign-format projections.
 #
-# 2.1 rewrites the crate surface (modules on the spec's layers, scoped object
-# builders, `Source::provenance`) and is not on crates.io yet, so the `[patch]`
-# at the bottom of this file points at a sibling checkout. The requirement here
-# is the real one, and drops the patch once 2.1 is published.
+# 2.1 rewrote the crate surface: the modules follow the spec's layers, object
+# builders are scoped, and `Source::provenance` replaced the two half-questions
+# that preceded it.
 [workspace.dependencies]
 ztensor = "2.1"
 ztensor-compat = "2.1"
@@ -165,14 +164,3 @@ inherits = "release"
 lto = "thin"
 panic = "abort"
 strip = "symbols"
-
-# `ztensor` 2.1 is not on crates.io yet: it rewrites the crate surface and is
-# held back until that shape stops moving. Until then the requirement in
-# `[workspace.dependencies]` resolves against a sibling checkout.
-#
-# This section is the whole of the local arrangement. Deleting it once 2.1 is
-# published is the entire migration, and nothing above has to change — which
-# is why it is a patch and not a path dependency.
-[patch.crates-io]
-ztensor = { path = "../../ztensor/ztensor" }
-ztensor-compat = { path = "../../ztensor/ztensor-compat" }
