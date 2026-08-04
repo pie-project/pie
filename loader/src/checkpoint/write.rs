@@ -659,8 +659,11 @@ mod tests {
         // The materialization split is total, and metadata is its own set —
         // never decoded, never copied as if it were a weight.
         let materialization = crate::contract::materialize::materialize_contract(&parsed).unwrap();
-        assert_eq!(materialization.passthrough, ["model.embed.weight"]);
-        assert!(materialization.decoded.is_empty());
+        // The weight is F32, which normalizes to BF16 rather than passing
+        // through; which set it lands in is not this test's subject, only that
+        // it is a weight's set and never metadata's.
+        assert_eq!(materialization.decoded, ["model.embed.weight"]);
+        assert!(materialization.passthrough.is_empty());
         assert_eq!(
             materialization.meta,
             [

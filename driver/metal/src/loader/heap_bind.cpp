@@ -18,7 +18,10 @@
 #include "heap_bind.hpp"
 #include "heap_bind_metal.hpp"
 
+#include <map>
+
 #include <algorithm>
+#include <map>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -1029,6 +1032,17 @@ StagedWeights stage_plan_weights(
             throw std::runtime_error("heap_alloc failed for program-owned weights region");
         }
     }
+    // Said once, here, because here is where it becomes true. It used to be
+    // said by each family after staging returned, in four copies of one
+    // sentence -- and two of those copies still claimed a pack after the
+    // mapping path replaced it, which is what a restatement does when the
+    // thing it restates moves.
+    if (b.streamed_bytes > 0) {
+        std::fprintf(stderr,
+                     "[pie-metal] %.2f GB of weights %s, and out of the heap\n",
+                     double(b.streamed_bytes) / 1e9,
+                     map_in_place ? "bound where they lie" : "packed once, then mapped");
+    }
     if (compact) {
         // Each buffer pulls its own bytes, so the bulk writes are skipped below:
         // they address the arena the plan laid out, which no longer exists. Only
@@ -1041,6 +1055,48 @@ StagedWeights stage_plan_weights(
             view.copy_storage_bytes(src.file_id, src.file_offset, src.bytes,
                                     static_cast<std::uint8_t*>(b.weights_region.contents()) + off,
                                     load.max_tile_bytes());
+        }
+    }
+    // What loading this checkpoint still costs, in the only unit that matters
+    // on unified memory: bytes the driver has to write. Zero means every weight
+    // was bound where it lay, which is what `pie model convert` exists to
+    // arrange -- so when it is NOT zero, the ops that kept it from being zero
+    // are named, because each one is work that belongs at convert time.
+    if (std::getenv("PIE_METAL_LOAD_TRACE") != nullptr) {
+        std::fprintf(stderr, "[pie-metal] load: heap %.1f MB of %.1f MB weights\n",
+                     double(compact ? compact_bytes : weights_bytes) / 1e6,
+                     double(weights_bytes) / 1e6);
+        if (compact) {
+            std::map<std::string, std::pair<std::size_t, std::uint64_t>> by_op;
+            for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
+                const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
+                std::uint32_t out_id = 0;
+                const char* tag = nullptr;
+                switch (instr.op.tag) {
+                case pie_loader::PieLoaderStorageOp::Tag::TileMap:
+                    if (instr.op.tile_map.output_buffers.len == 0) break;
+                    out_id = instr.op.tile_map.output_buffers.ptr[0];
+                    tag = "TileMap";
+                    break;
+                case pie_loader::PieLoaderStorageOp::Tag::Fill:
+                    out_id = instr.op.fill.buffer_id;
+                    tag = "Fill";
+                    break;
+                case pie_loader::PieLoaderStorageOp::Tag::ExtentWrite:
+                    out_id = instr.op.extent_write.dest.buffer_id;
+                    tag = "ExtentWrite";
+                    break;
+                default: break;
+                }
+                if (tag == nullptr) continue;
+                auto& e = by_op[tag];
+                e.first += 1;
+                e.second += index.buffer(out_id).bytes;
+            }
+            for (const auto& [op, count] : by_op) {
+                std::fprintf(stderr, "[pie-metal] load: %-12s %5zu ops  %8.1f MB\n", op.c_str(),
+                             count.first, double(count.second) / 1e6);
+            }
         }
     }
     LoadTrace trace;
@@ -1285,11 +1341,6 @@ BoundDecode stage_decode_storage(
         b.weights_region = staged.weights_region;
         b.weights = std::move(staged.weights);
         b.weight_mapping = std::move(staged.weight_mapping);
-        if (staged.streamed_bytes > 0) {
-            std::fprintf(stderr,
-                         "[pie-metal] %.2f GB of weights bound where they lie, and out of the heap\n",
-                         double(staged.streamed_bytes) / 1e9);
-        }
     }
 
     // ── KV region: k/v pages per full-attn layer (append-only, I4) ──

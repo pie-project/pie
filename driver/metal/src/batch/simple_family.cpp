@@ -290,12 +290,6 @@ class Gemma4Engine final : public SimpleFamilyEngine {
             // own mapping -- must outlive them; see the
             // gpt-oss engine below.
             weight_mapping_ = std::move(staged.weight_mapping);
-            if (staged.streamed_bytes > 0) {
-                std::fprintf(stderr,
-                             "[pie-metal] gemma4: %.2f GB of weights bound where they lie, and out of "
-                             "the heap\n",
-                             double(staged.streamed_bytes) / 1e9);
-            }
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging gemma4's weights: ") + e.what();
             return false;
@@ -637,12 +631,6 @@ class GptOssEngine final : public SimpleFamilyEngine {
             // `staged.weights` and letting `staged` die unmaps it under them,
             // which reads as weights of exactly zero.
             weight_mapping_ = std::move(staged.weight_mapping);
-            if (staged.streamed_bytes > 0) {
-                std::fprintf(stderr,
-                             "[pie-metal] gpt-oss: %.2f GB of experts streamed from a pack, "
-                             "and out of the heap\n",
-                             double(staged.streamed_bytes) / 1e9);
-            }
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging gpt-oss's weights: ") + e.what();
             return false;
@@ -1011,12 +999,6 @@ class LlamaEngine final : public SimpleFamilyEngine {
             // The pack must outlive the weights that point into it; see the
             // gpt-oss engine above.
             weight_mapping_ = std::move(staged.weight_mapping);
-            if (staged.streamed_bytes > 0) {
-                std::fprintf(stderr,
-                             "[pie-metal] llama: %.2f GB of FFN weights streamed from a pack, "
-                             "and out of the heap\n",
-                             double(staged.streamed_bytes) / 1e9);
-            }
         } catch (const std::exception& e) {
             if (err) *err = std::string("staging llama's weights: ") + e.what();
             return false;
