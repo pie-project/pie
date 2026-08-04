@@ -22,6 +22,15 @@ fi
 printf '%s\n' "$PUBLIC_KEY" > "$authorized_keys"
 chmod 600 "$authorized_keys"
 
+# The same care the image takes with authorized_keys applies to the host key, which
+# is the half that was originally missed. The image ships no /etc/ssh/ssh_host_*,
+# because it is public and anonymously pullable: a baked host key would publish the
+# private identity every pod presents, and impersonating a pod would raise no
+# host-key warning precisely because clients already trust that key. So each
+# container mints its own here, before sshd can start. ssh-keygen -A creates only
+# what is missing, so a container that restarts keeps the identity it generated.
+ssh-keygen -A
+
 if [ "$#" -eq 0 ]; then
   set -- -D -e
 fi

@@ -238,6 +238,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # No libssl here either: the binary is rustls-only. libgomp1 is the host-side
 # OpenMP runtime the CUDA driver's C++ may pull; the linker assertion at the end
 # of this stage is what actually decides whether this list is complete.
+#
+# The host keys are deleted rather than generated. This image is public and
+# anonymously pullable, so a baked /etc/ssh/ssh_host_* would ship the private half
+# of the identity that every pod launched from it presents: anyone who pulls the
+# image could impersonate any such pod, and because the key would be the one
+# clients already trust, the impersonation would raise no host-key warning. The
+# deletion is not redundant with skipping ssh-keygen -A — Ubuntu's
+# openssh-server postinst generates them at install time. The entrypoint makes a
+# fresh set per container instead.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -249,7 +258,7 @@ RUN apt-get update \
     && sed -ri 's/^#?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
     && sed -ri 's/^#?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
     && sed -ri 's/^#?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config \
-    && ssh-keygen -A
+    && rm -f /etc/ssh/ssh_host_*
 
 COPY --from=builder /usr/local/bin/pie /usr/local/bin/pie
 # Carries both the pre-provisioned python-WASM runtime and the baked config.
@@ -305,7 +314,15 @@ RUN set -eu; \
              echo "  Build through scripts/build-runner-image.sh; it is what knows whether the tooling is committed." >&2; \
              exit 1; }; \
     printf '%s\n' "${PIE_REV}" > /opt/pie-rev; \
-    printf '%s\n' "${PIE_TOOLING_REV}" > /opt/pie-tooling-rev
+    printf '%s\n' "${PIE_TOOLING_REV}" > /opt/pie-tooling-rev; \
+    host_keys="$(ls /etc/ssh/ssh_host_* 2>/dev/null || true)"; \
+    if [ -n "${host_keys}" ]; then \
+        echo "ERROR: this image contains SSH host keys, which it must never ship:" >&2; \
+        printf '  %s\n' ${host_keys} >&2; \
+        echo "  The image is public: a baked host key publishes the private identity every" >&2; \
+        echo "  pod presents. The entrypoint generates a fresh one per container instead." >&2; \
+        exit 1; \
+    fi
 
 EXPOSE 22/tcp 8080/tcp
 ENTRYPOINT ["/usr/local/bin/runpod-sshd-entrypoint"]

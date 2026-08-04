@@ -197,9 +197,6 @@ print(f"    immutable ref: {repo}@{digest}")
 PY
 }
 
-printf '%s' "${REV}" | grep -Eq '^[0-9a-f]{40}$' \
-    || die "--rev must be a 40-character lowercase commit sha (got '${REV}')"
-
 if [ -n "${VERIFY_ONLY}" ]; then
     verify_published "${REPO}" "${VERIFY_ONLY}" "${REV}"
     exit 0
