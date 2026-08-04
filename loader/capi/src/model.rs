@@ -21,6 +21,7 @@ use pie_loader::cache_key::{ArtifactInputs, artifact_cache_key};
 use pie_loader::plan::compile as compile_load_plan;
 
 use pie_model::common::facts::ModelFacts;
+use pie_model::common::policy::Mxfp4MoePolicy;
 use pie_model::common::policy::{
     Component, FamilyKnobs, Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant,
 };
@@ -48,6 +49,14 @@ pub struct PieLoaderModelFactsView {
     pub num_experts: u32,
     pub head_dim: u32,
     pub mamba_groups: u32,
+    /// `tie_word_embeddings`, as the config states it (HF defaults it true).
+    pub tied_embeddings: bool,
+    /// `quantization.bits` from an mlx-converted checkpoint, 0 if undeclared.
+    pub mlx_quant_bits: u32,
+    /// `quantization.group_size` beside it, 0 if undeclared.
+    pub mlx_quant_group_size: u32,
+    /// Gemma-4's `num_kv_shared_layers`, 0 for families without KV sharing.
+    pub num_kv_shared_layers: u32,
 }
 
 /// The per-family switches, wire form. Mirrors [`FamilyKnobs`] field for
@@ -120,6 +129,10 @@ unsafe fn read_model_request(
         num_experts: req.facts.num_experts,
         head_dim: req.facts.head_dim,
         mamba_groups: req.facts.mamba_groups,
+        tied_embeddings: req.facts.tied_embeddings,
+        mlx_quant_bits: req.facts.mlx_quant_bits,
+        mlx_quant_group_size: req.facts.mlx_quant_group_size,
+        num_kv_shared_layers: req.facts.num_kv_shared_layers,
     };
     let policy = Policy {
         projections: enum_field(
@@ -182,7 +195,7 @@ unsafe fn read_model_request(
 /// `req` and everything its pointers reach must be live for the call.
 unsafe fn compile_model_request(
     req: &PieLoaderModelRequest,
-) -> Result<(pie_loader::plan::LoadPlan, String), (PieLoaderStatus, String)> {
+) -> Result<(pie_loader::plan::LoadPlan, String, Mxfp4MoePolicy), (PieLoaderStatus, String)> {
     let bad = |err: String| (PieLoaderStatus::InvalidRequest, err);
     if req.checkpoint.is_null() {
         return Err(bad(
@@ -205,15 +218,16 @@ unsafe fn compile_model_request(
     let (facts, policy) = unsafe { read_model_request(req) }?;
     let source = unsafe { super::checkpoint::arena_of(req.checkpoint) };
 
-    let contract = pie_model::contract::author(&facts, &source.metadata, &target, &policy)
-        .map_err(|err| (compile_error_status(&err), err.to_string()))?
-        .ok_or_else(|| {
-            bad(format!(
-                "no author for model_type '{}'; author a contract and call \
-                 pie_loader_compile_contract instead",
-                facts.model_type
-            ))
-        })?;
+    let (contract, resolved_moe) =
+        pie_model::contract::author_with_policy(&facts, &source.metadata, &target, &policy)
+            .map_err(|err| (compile_error_status(&err), err.to_string()))?
+            .ok_or_else(|| {
+                bad(format!(
+                    "no author for model_type '{}'; author a contract and call \
+                     pie_loader_compile_contract instead",
+                    facts.model_type
+                ))
+            })?;
 
     compile_load_plan(&source.metadata, &contract, target)
         .map_err(|err| (compile_error_status(&err), err.to_string()))
@@ -230,20 +244,27 @@ unsafe fn compile_model_request(
                     component: 0,
                 },
             );
-            (plan, cache_key)
+            (plan, cache_key, resolved_moe)
         })
 }
 
 /// Author this model's contract and compile it into a plan, in one call.
 ///
+/// `out_mxfp4_moe`, when non-null, receives the author's resolved
+/// [`Mxfp4MoePolicy`] as its wire value — the answer the bind path branches
+/// on, handed back rather than recomputed, because a family may override the
+/// device rule.
+///
 /// # Safety
 ///
 /// `req` and everything its pointers reach must be live for the call.
-/// `out_plan` is a writable slot; `out_diags` is null or a writable slot.
+/// `out_plan` is a writable slot; `out_diags` and `out_mxfp4_moe` are null
+/// or writable slots.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_loader_compile_model(
     req: *const PieLoaderModelRequest,
     out_plan: *mut *mut PieLoaderPlan,
+    out_mxfp4_moe: *mut u32,
     out_diags: *mut *mut PieLoaderDiagnostics,
 ) -> PieLoaderStatus {
     if !out_diags.is_null() {
@@ -262,8 +283,11 @@ pub unsafe extern "C" fn pie_loader_compile_model(
     }
 
     let status = match unsafe { compile_model_request(&*req) } {
-        Ok((plan, cache_key)) => {
+        Ok((plan, cache_key, resolved_moe)) => {
             unsafe { *out_plan = arena::build(&plan, &cache_key) };
+            if !out_mxfp4_moe.is_null() {
+                unsafe { *out_mxfp4_moe = resolved_moe as u32 };
+            }
             PieLoaderStatus::Ok
         }
         Err((status, message)) => {

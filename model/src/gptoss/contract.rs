@@ -10,7 +10,8 @@ use pie_loader::contract::{Expr, GroupContract, Scales, TensorContract};
 use pie_loader::error::Error;
 use pie_loader::types::{DType, Encoding, QuantGranularity, RepackLayout, ScaleForm, TensorId};
 
-use crate::common::builder::{Builder, align_up, mxfp4_encoding};
+use crate::common::builder::{Builder, align_up, is_raw, mxfp4_encoding};
+use crate::common::mlx;
 use crate::common::policy::Mxfp4MoePolicy;
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
@@ -331,6 +332,250 @@ fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
         }
         for id in consumed {
             b.consume(id);
+        }
+    }
+    Ok(())
+}
+
+/// The Metal lowering. Ported from
+/// `driver/metal/src/model/gptoss/gptoss_contract.hpp`: rename for MLX's
+/// binder, pair the affine triplets (deriving the width from the group-64
+/// kernels' equation), accept shipped MXFP4 by transmute, and — for the
+/// projections the published checkpoint left in BF16 — quantize into the
+/// affine layout at load, because every matvec here is a quantized one.
+pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
+    let mut declared = 0usize;
+    for raw in b.tensors().to_vec() {
+        // The published checkpoint's MXFP4 experts are consumed as a pair
+        // and declared from the `_blocks` half below; `runtime_name` is not
+        // asked about them, because the names they produce are the split
+        // projections', which no per-tensor mapping can state.
+        if raw.name.ends_with("_scales")
+            || raw.name.ends_with("_blocks")
+            || raw.name.ends_with("_bias")
+        {
+            continue;
+        }
+        let Some(output) = gptoss_mlx_name(&raw.name)? else {
+            continue;
+        };
+        if raw.name.ends_with(".weight") && is_raw(&raw.encoding, DType::U32) {
+            let base = &raw.name[..raw.name.len() - ".weight".len()];
+            let scales = b.find(&format!("{base}.scales"));
+            let biases = b.find(&format!("{base}.biases"));
+            let Some(scales) = scales else {
+                return fail(format!(
+                    "Metal GptOss: '{}' is a packed weight with no scales, which no                      scheme here describes",
+                    raw.name
+                ));
+            };
+            let Some(biases) = biases else {
+                // Scales with no zero points is MXFP4, which `mlx_lm convert
+                // -q` leaves the MoE experts in. The loader decodes MXFP4
+                // already, so it is accepted by transmute rather than
+                // refused.
+                mlx::push_mlx_mxfp4_stacked(b, raw, scales, output)?;
+                declared += 1;
+                continue;
+            };
+            // Width comes from the tensors, not from the config: gpt-oss
+            // states no quantization block, and these kernels are group-64,
+            // so `bits = packed_cols / (2 * groups)`.
+            let packed_cols = *raw.shape.last().unwrap_or(&0);
+            let groups = *scales.shape.last().unwrap_or(&0);
+            if groups <= 0 || packed_cols % (2 * groups) != 0 {
+                return fail(format!(
+                    "Metal GptOss: '{}' is not quantized in groups of 64, which is                      what these kernels read",
+                    raw.name
+                ));
+            }
+            let bits = packed_cols / (2 * groups);
+            if bits != 4 && bits != 8 {
+                return fail(format!(
+                    "Metal GptOss: '{}' is {bits}-bit, and only 4 and 8 are                      described here",
+                    raw.name
+                ));
+            }
+            mlx::push_mlx_affine_stacked(b, raw, scales, biases, bits, 64, output)?;
+        } else if raw.name.ends_with(".weight")
+            && raw.shape.len() == 2
+            && is_raw(&raw.encoding, DType::BF16)
+        {
+            // A projection the published checkpoint left in BF16, read by a
+            // quantized matvec — so the loader quantizes it on the way in.
+            // Rank is what separates these from the norms, which must stay
+            // values.
+            mlx::push_encoded_affine(b, Expr::src(&raw.name), raw.shape[0], raw.shape[1], output)?;
+        } else {
+            mlx::push_direct(b, raw, output);
+        }
+        declared += 1;
+    }
+    declare_mxfp4_experts_mlx(b, &mut declared)?;
+    if declared == 0 {
+        return fail("Metal GptOss schema found no decoder tensors");
+    }
+    Ok(())
+}
+
+fn gptoss_mlx_name(raw_name: &str) -> Result<Option<String>, Error> {
+    // The head is its own tensor here — NOT the embedding under another name.
+    if raw_name.starts_with("lm_head.") {
+        return Ok(Some(raw_name.to_string()));
+    }
+    let Some(rest) = raw_name.strip_prefix("model.") else {
+        return fail(format!(
+            "Metal GptOss schema has no declared mapping or skip for '{raw_name}'"
+        ));
+    };
+    if rest.starts_with("embed_tokens.") {
+        return Ok(Some(rest.to_string()));
+    }
+    if rest == "norm.weight" {
+        return Ok(Some("final_norm.weight".to_string()));
+    }
+    let (layer, member) = mlx::layer_member(rest, "GptOss", raw_name)?;
+    Ok(Some(format!("layers.{layer}.{member}")))
+}
+
+/// Declare the experts the way the PUBLISHED checkpoint stores them: the
+/// fused `gate_up_proj` holds gate at even rows and up at odd ones, so each
+/// half is a strided read; the halves are MXFP4 and are decoded then
+/// re-encoded as the affine-U4 the matvecs read — the same two steps
+/// `mlx_lm convert --dequantize` then `-q` performs, done at load time.
+///
+/// The split happens where a stride IS lowered — on the source extent — and
+/// each half is published as the plain bytes it is before anything
+/// reinterprets it, because a width-changing transmute may only rename a
+/// whole tensor. Select, publish, then reinterpret the published name.
+fn declare_mxfp4_experts_mlx(b: &mut Builder<'_>, declared: &mut usize) -> Result<(), Error> {
+    const BLOCKS: &str = "_blocks";
+    for blocks in b.tensors().to_vec() {
+        let Some(base) = blocks.name.strip_suffix(BLOCKS).map(str::to_string) else {
+            continue;
+        };
+        let Some(scales) = b.find(&format!("{base}_scales")) else {
+            return fail(format!(
+                "Metal GptOss: '{}' is an MXFP4 block tensor with no '_scales'                  beside it",
+                blocks.name
+            ));
+        };
+        // `[experts, rows, groups, 16]` of nibbles against
+        // `[experts, rows, groups]` of exponents.
+        if blocks.shape.len() != 4
+            || scales.shape.len() != 3
+            || blocks.shape[3] != 16
+            || blocks.shape[..3] != scales.shape[..]
+        {
+            return fail(format!(
+                "Metal GptOss: MXFP4 tensor '{}' is not shaped                  [experts, rows, groups, 16] against its scales",
+                blocks.name
+            ));
+        }
+        let experts = blocks.shape[0];
+        let stored_rows = blocks.shape[1];
+        let groups = blocks.shape[2];
+        let cols = groups * 32;
+
+        let Some(mapped) = gptoss_mlx_name(&base)? else {
+            continue;
+        };
+        let fused = base.ends_with("gate_up_proj");
+        if !fused && !base.ends_with("down_proj") {
+            return fail(format!(
+                "Metal GptOss: MXFP4 tensor '{}' is neither the fused gate/up                  projection nor the down projection",
+                blocks.name
+            ));
+        }
+        // `layers.N.mlp.experts.gate_up_proj` → `layers.N.mlp.experts.`
+        let prefix = &mapped[..mapped.len() - if fused { 12 } else { 9 }];
+        let bias = b.find(&format!("{base}_bias")).cloned();
+
+        let halves: &[(&str, i64)] = if fused {
+            &[("gate_proj", 0), ("up_proj", 1)]
+        } else {
+            &[("down_proj", 0)]
+        };
+        let rows = if fused { stored_rows / 2 } else { stored_rows };
+
+        for (half, first_row) in halves {
+            let name = format!("{prefix}{half}");
+            let select =
+                |b: &mut Builder<'_>, source: &str, shape: Vec<i64>, as_name: String| -> Expr {
+                    let expr = if fused {
+                        Expr::src(source).stride(1, *first_row, rows, 2)
+                    } else {
+                        Expr::src(source)
+                    };
+                    if let Some(index) =
+                        b.define(as_name.clone(), expr, Encoding::Raw(DType::U8), Some(shape))
+                    {
+                        b.mark_internal(index);
+                    }
+                    Expr::out(&as_name)
+                };
+            let half_blocks = select(
+                b,
+                &blocks.name,
+                vec![experts, rows, groups, 16],
+                format!("{name}.mxfp4_blocks"),
+            );
+            let half_scales = select(
+                b,
+                &scales.name,
+                vec![experts, rows, groups],
+                format!("{name}.mxfp4_exponents"),
+            );
+
+            let values = mlx::mxfp4_values(
+                b,
+                half_blocks,
+                half_scales,
+                experts * rows,
+                cols,
+                format!("{name}.mxfp4_scales"),
+            )?;
+            if let Some(index) = b.define(
+                format!("{name}.dequantized"),
+                values,
+                Encoding::Raw(DType::BF16),
+                Some(vec![experts * rows, cols]),
+            ) {
+                b.mark_internal(index);
+            }
+            mlx::push_encoded_affine(
+                b,
+                Expr::out(&format!("{name}.dequantized")),
+                experts * rows,
+                cols,
+                format!("{name}.weight"),
+            )?;
+            if let Some(bias) = &bias {
+                if bias.shape.len() != 2 || bias.shape != [experts, stored_rows] {
+                    return fail(format!(
+                        "Metal GptOss: '{}' does not match the projection it biases",
+                        bias.name
+                    ));
+                }
+                let expr = if fused {
+                    Expr::src(&bias.name).stride(1, *first_row, rows, 2)
+                } else {
+                    Expr::src(&bias.name)
+                };
+                b.define(
+                    format!("{name}.bias"),
+                    expr,
+                    bias.encoding.clone(),
+                    Some(vec![experts, rows]),
+                );
+            }
+            *declared += 1;
+        }
+        let (blocks_id, scales_id) = (blocks.id, scales.id);
+        b.consume(blocks_id);
+        b.consume(scales_id);
+        if let Some(bias) = &bias {
+            b.consume(bias.id);
         }
     }
     Ok(())

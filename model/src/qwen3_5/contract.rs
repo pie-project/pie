@@ -13,6 +13,7 @@ use pie_loader::error::Error;
 use pie_loader::types::{DType, Encoding, QuantScheme};
 
 use crate::common::builder::{Builder, author_dense_contract, is_raw};
+use crate::common::mlx;
 use crate::common::moe::hf_moe_expert_stacks;
 
 /// qwen3_5, qwen3_5_text: a dense hybrid decoder under the usual names.
@@ -338,4 +339,62 @@ fn shared_expert_gate_up_joins(b: &mut Builder<'_>) {
         shared_expert_gate_up_join(b, &prefix);
     }
     shared_expert_gate_up_join(b, "mtp.layers.0.");
+}
+
+/// The Metal lowering: rename for MLX's binder, bind in place. Ported from
+/// `driver/metal/src/model/qwen3_5/qwen3_5_contract.hpp`; also answers for
+/// `qwen3_next` and `qwen3_6`, the mlx-side spellings of the same hybrid.
+pub fn author_qwen3_5_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
+    let has_lm_head = b.tensors().iter().any(|raw| {
+        raw.name.starts_with("lm_head.") || raw.name.starts_with("language_model.lm_head.")
+    });
+    let tied = b.facts().tied_embeddings && !has_lm_head;
+    mlx::author_mlx_file(b, "Qwen3.5", &move |_, raw_name| {
+        qwen3_5_mlx_name(raw_name, tied)
+    })
+}
+
+fn qwen3_5_mlx_name(raw_name: &str, tied: bool) -> Result<Option<String>, Error> {
+    // Not the text decoder. The vision tower has the same two spellings as
+    // the decoder does; `mtp.` is the multi-token-prediction head, which this
+    // driver does not run.
+    for skip in ["visual.", "vision_tower.", "mtp."] {
+        if mlx::has_wrapper_member(raw_name, skip) {
+            return Ok(None);
+        }
+    }
+    // The output projection: spelled bare by the HF release and under the
+    // wrapper by the mlx repack. Untied it keeps its own name; tied it lands
+    // on `shared_embedding` beside the table it IS.
+    for head in ["lm_head.", "language_model.lm_head."] {
+        if let Some(tail) = raw_name.strip_prefix(head) {
+            return Ok(Some(if tied {
+                format!("shared_embedding.{tail}")
+            } else {
+                format!("lm_head.{tail}")
+            }));
+        }
+    }
+    let Some(decoder) = mlx::decoder_member(raw_name) else {
+        return mlx::fail(format!(
+            "Metal Qwen3.5 schema has no declared mapping or skip for '{raw_name}'"
+        ));
+    };
+    if let Some(tail) = decoder.strip_prefix("embed_tokens.") {
+        return Ok(Some(if tied {
+            format!("shared_embedding.{tail}")
+        } else {
+            format!("embed_tokens.{tail}")
+        }));
+    }
+    if decoder == "norm.weight" {
+        return Ok(Some("final_norm.weight".to_string()));
+    }
+    let (layer, member) = mlx::layer_member(decoder, "Qwen3.5", raw_name)?;
+    if let Some(renamed) = mlx::routed_expert_member(
+        raw_name, member, "Qwen3.5", /*has_shared_expert=*/ true,
+    )? {
+        return Ok(Some(format!("layers.{layer}.{renamed}")));
+    }
+    Ok(Some(format!("layers.{layer}.{member}")))
 }

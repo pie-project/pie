@@ -16,6 +16,8 @@ pub mod builder;
 #[cfg(feature = "contract")]
 pub mod facts;
 #[cfg(feature = "contract")]
+pub mod mlx;
+#[cfg(feature = "contract")]
 pub mod moe;
 #[cfg(feature = "contract")]
 pub mod policy;

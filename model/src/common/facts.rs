@@ -14,7 +14,7 @@
 //! read them itself — at which point the request keeps only the policy.
 
 /// What one authoring call knows about the model, beyond its files.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelFacts {
     /// `model_type` from `config.json` — the key every aspect registry
     /// dispatches on.
@@ -36,4 +36,38 @@ pub struct ModelFacts {
     /// has either factor as an extent — the product is all that is ever
     /// stored.
     pub mamba_groups: u32,
+    /// `tie_word_embeddings`, defaulting to true when the config is silent.
+    ///
+    /// What the config SAYS; a shipped `lm_head` is what the checkpoint DOES,
+    /// and when they disagree the tensors win — the MLX authors check both.
+    pub tied_embeddings: bool,
+    /// `quantization.bits` from an `mlx_lm`-converted checkpoint, 0 when the
+    /// config declares none.
+    pub mlx_quant_bits: u32,
+    /// `quantization.group_size` beside it, 0 when undeclared.
+    pub mlx_quant_group_size: u32,
+    /// Gemma-4's `num_kv_shared_layers`, 0 for every family without KV
+    /// sharing: the tail of the stack attends KV an earlier layer wrote, so
+    /// its own k/v projections are dead weight a contract must not declare.
+    pub num_kv_shared_layers: u32,
+}
+
+impl Default for ModelFacts {
+    fn default() -> Self {
+        Self {
+            model_type: String::new(),
+            quant_method: String::new(),
+            num_hidden_layers: 0,
+            num_experts: 0,
+            head_dim: 0,
+            mamba_groups: 0,
+            // The one non-zero default: HF's own default for
+            // `tie_word_embeddings` is true, and the MLX authors read this
+            // field the way the config is read.
+            tied_embeddings: true,
+            mlx_quant_bits: 0,
+            mlx_quant_group_size: 0,
+            num_kv_shared_layers: 0,
+        }
+    }
 }

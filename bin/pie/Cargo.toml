@@ -51,6 +51,7 @@ pie-tokenizer = { path = "../../runtime/tokenizer" }
 # writes the result as the `pie.model/1` descriptor, so the runtime and the
 # driver stop re-deriving it from HF quirks at every boot.
 pie-model-config = { path = "../../runtime/model-config" }
+pie-model = { path = "../../model", features = ["contract"] }
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.

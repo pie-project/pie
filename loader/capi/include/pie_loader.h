@@ -950,6 +950,14 @@ struct PieLoaderModelFactsView {
   uint32_t num_experts;
   uint32_t head_dim;
   uint32_t mamba_groups;
+  /// `tie_word_embeddings`, as the config states it (HF defaults it true).
+  bool tied_embeddings;
+  /// `quantization.bits` from an mlx-converted checkpoint, 0 if undeclared.
+  uint32_t mlx_quant_bits;
+  /// `quantization.group_size` beside it, 0 if undeclared.
+  uint32_t mlx_quant_group_size;
+  /// Gemma-4's `num_kv_shared_layers`, 0 for families without KV sharing.
+  uint32_t num_kv_shared_layers;
 };
 
 /// The per-family switches, wire form. Mirrors [`FamilyKnobs`] field for
@@ -1144,12 +1152,19 @@ void pie_loader_release_diagnostics(PieLoaderDiagnostics *diags);
 
 /// Author this model's contract and compile it into a plan, in one call.
 ///
+/// `out_mxfp4_moe`, when non-null, receives the author's resolved
+/// [`Mxfp4MoePolicy`] as its wire value — the answer the bind path branches
+/// on, handed back rather than recomputed, because a family may override the
+/// device rule.
+///
 /// # Safety
 ///
 /// `req` and everything its pointers reach must be live for the call.
-/// `out_plan` is a writable slot; `out_diags` is null or a writable slot.
+/// `out_plan` is a writable slot; `out_diags` and `out_mxfp4_moe` are null
+/// or writable slots.
 PieLoaderStatus pie_loader_compile_model(const PieLoaderModelRequest *req,
                                          PieLoaderPlan **out_plan,
+                                         uint32_t *out_mxfp4_moe,
                                          PieLoaderDiagnostics **out_diags);
 
 /// Open an artifact for `key` at `path`.

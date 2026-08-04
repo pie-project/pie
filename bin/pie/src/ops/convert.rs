@@ -87,7 +87,7 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
 /// The pie that is running, as recorded in what it writes.
 ///
 /// The same string `pie --version` prints.
-fn pie_version() -> &'static str {
+pub(crate) fn pie_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
@@ -399,7 +399,7 @@ fn remove_cache_file(path: &Path) -> Result<()> {
 /// copies. The spool is the buffer between the two orders, and it is a file
 /// rather than a map so the buffer costs disk instead of memory — the
 /// decoded set is the whole model for an F16 checkpoint.
-struct Spool {
+pub(crate) struct Spool {
     path: PathBuf,
     file: std::fs::File,
     index: BTreeMap<String, (u64, u64)>,
@@ -407,7 +407,7 @@ struct Spool {
 }
 
 impl Spool {
-    fn create(out_file: &Path) -> Result<Self> {
+    pub(crate) fn create(out_file: &Path) -> Result<Self> {
         // Beside the artifact, so it lands on the same filesystem the bytes
         // are headed for anyway.
         let path = out_file.with_extension("spool.tmp");
@@ -430,7 +430,7 @@ impl Spool {
         })
     }
 
-    fn read(&mut self, name: &str) -> Result<Vec<u8>> {
+    pub(crate) fn read(&mut self, name: &str) -> Result<Vec<u8>> {
         let (offset, len) = *self
             .index
             .get(name)
@@ -444,7 +444,7 @@ impl Spool {
         Ok(bytes)
     }
 
-    fn remove(self) {
+    pub(crate) fn remove(self) {
         drop(self.file);
         std::fs::remove_file(&self.path).ok();
     }
@@ -475,7 +475,7 @@ impl TensorSink for Spool {
 ///
 /// Renders to stderr only when stderr is a terminal, throttled so the redraw
 /// never becomes the work. The name shown is the last tensor published.
-struct ProgressLine {
+pub(crate) struct ProgressLine {
     terminal: bool,
     last_draw: std::time::Instant,
     current: String,
@@ -483,7 +483,7 @@ struct ProgressLine {
 }
 
 impl ProgressLine {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         use std::io::IsTerminal;
         Self {
             terminal: std::io::stderr().is_terminal(),
@@ -493,7 +493,7 @@ impl ProgressLine {
         }
     }
 
-    fn render(&mut self, progress: &Progress<'_>) {
+    pub(crate) fn render(&mut self, progress: &Progress<'_>) {
         if !self.terminal {
             return;
         }
@@ -523,7 +523,7 @@ impl ProgressLine {
         );
     }
 
-    fn finish(&mut self) {
+    pub(crate) fn finish(&mut self) {
         if self.drew {
             eprintln!();
         }
@@ -531,13 +531,13 @@ impl ProgressLine {
 }
 
 /// What `convert` was pointed at, once the pointing is resolved.
-struct Source {
+pub(crate) struct Source {
     /// The path the loader reads — a snapshot directory or a single file.
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     /// The artifact's name in the store, without the `.zt` suffix.
-    name: String,
+    pub(crate) name: String,
     /// Where the bytes came from, recorded in the artifact's provenance.
-    origin: String,
+    pub(crate) origin: String,
 }
 
 impl Source {
@@ -546,7 +546,7 @@ impl Source {
     /// A plan carries its own file table and the executor uses it; this is only
     /// the base for entries that are relative, which is why a single-file
     /// source resolves against the file's directory rather than the file.
-    fn base(&self) -> PathBuf {
+    pub(crate) fn base(&self) -> PathBuf {
         if self.path.is_file() {
             self.path
                 .parent()
@@ -567,7 +567,7 @@ impl Source {
 /// ID and a relative directory share a spelling — `qwen/qwen3-0.6b` is a repo
 /// ID unless there is a directory of that name, in which case the user plainly
 /// meant the directory.
-fn resolve_source(source: &str) -> Result<Source> {
+pub(crate) fn resolve_source(source: &str) -> Result<Source> {
     let path = Path::new(source);
     if path.exists() {
         let name = if path.is_file() {
@@ -633,7 +633,7 @@ fn store_name(repo_id: &str) -> String {
 }
 
 /// `$PIE_HOME/models/<name>.zt` — one model, one file, one flat directory.
-fn store_path(name: &str) -> PathBuf {
+pub(crate) fn store_path(name: &str) -> PathBuf {
     startup::paths::pie_home()
         .join("models")
         .join(format!("{name}.zt"))
@@ -641,7 +641,7 @@ fn store_path(name: &str) -> PathBuf {
 
 /// Where `--out` puts the artifact: a `.zt` path names the file, anything else
 /// is a directory to put `<name>.zt` in.
-fn artifact_path(out: &Path, name: &str) -> PathBuf {
+pub(crate) fn artifact_path(out: &Path, name: &str) -> PathBuf {
     if out
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zt"))
@@ -675,7 +675,7 @@ fn tokenizer_path(source: &Source) -> Option<PathBuf> {
 /// checkpoint. An *unreadable or unrecognized* one is an error, for the same
 /// reason a broken tokenizer is: the artifact would not serve, and the failure
 /// belongs at import where it can be read once.
-fn compile_descriptor(source: &Source) -> Result<Option<Vec<u8>>> {
+pub(crate) fn compile_descriptor(source: &Source) -> Result<Option<Vec<u8>>> {
     if source.path.is_file() {
         return Ok(None);
     }
@@ -707,7 +707,7 @@ fn compile_descriptor(source: &Source) -> Result<Option<Vec<u8>>> {
 /// splits); today that refusal surfaces at serve boot, after a model has been
 /// downloaded and loaded. Failing here means it surfaces once, at import, with
 /// the reason — and never produces an artifact that cannot serve.
-fn compile_tokenizer(
+pub(crate) fn compile_tokenizer(
     source: &Source,
 ) -> Result<Option<pie_tokenizer::canonical::CanonicalTokenizer>> {
     let Some(path) = tokenizer_path(source) else {

@@ -131,6 +131,10 @@ fn a_llama_request_compiles_to_a_plan_through_the_abi() {
             num_experts: 0,
             head_dim: 16,
             mamba_groups: 0,
+            tied_embeddings: true,
+            mlx_quant_bits: 0,
+            mlx_quant_group_size: 0,
+            num_kv_shared_layers: 0,
         },
         projections: 0,
         naming: 0,
@@ -152,7 +156,9 @@ fn a_llama_request_compiles_to_a_plan_through_the_abi() {
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { pie_loader_compile_model(&request, &mut plan, &mut diags) };
+    let mut resolved_moe = u32::MAX;
+    let status =
+        unsafe { pie_loader_compile_model(&request, &mut plan, &mut resolved_moe, &mut diags) };
     if status != PieLoaderStatus::Ok {
         let mut listed = String::new();
         if !diags.is_null() {
@@ -168,6 +174,8 @@ fn a_llama_request_compiles_to_a_plan_through_the_abi() {
         panic!("compile_model failed ({status:?}):\n{listed}");
     }
     assert!(!plan.is_null());
+    // Auto on a device without native MXFP4 resolves to RoutedDecode (wire 0).
+    assert_eq!(resolved_moe, 0, "resolved moe policy was not written back");
 
     // The plan is the llama contract's: the fused QKV bank exists and the
     // tensor table is the size the author declared.
@@ -192,7 +200,14 @@ fn a_llama_request_compiles_to_a_plan_through_the_abi() {
     unknown.facts.model_type = bytes("not_a_model");
     let mut no_plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut unknown_diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { pie_loader_compile_model(&unknown, &mut no_plan, &mut unknown_diags) };
+    let status = unsafe {
+        pie_loader_compile_model(
+            &unknown,
+            &mut no_plan,
+            std::ptr::null_mut(),
+            &mut unknown_diags,
+        )
+    };
     assert_eq!(status, PieLoaderStatus::InvalidRequest);
     assert!(no_plan.is_null());
     unsafe { pie_loader_release_diagnostics(unknown_diags) };

@@ -19,7 +19,7 @@ use pie_loader::plan::StorageTarget;
 
 use crate::common::builder::Builder;
 use crate::common::facts::ModelFacts;
-use crate::common::policy::Policy;
+use crate::common::policy::{Mxfp4MoePolicy, Policy};
 
 /// Author the load contract for one model type.
 ///
@@ -32,6 +32,40 @@ pub fn author(
     target: &StorageTarget,
     policy: &Policy,
 ) -> Result<Option<ModelContract>, Error> {
+    Ok(author_with_policy(facts, metadata, target, policy)?.map(|(contract, _)| contract))
+}
+
+/// [`author`], also answering how the author resolved the MXFP4 MoE request.
+///
+/// The bind path branches on the *author's* answer — a family may override
+/// the device rule (DeepSeek-V4 does) — so a caller that authored on this
+/// side of a boundary has to be handed the answer back rather than
+/// recomputing it and disagreeing.
+pub fn author_with_policy(
+    facts: &ModelFacts,
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+    policy: &Policy,
+) -> Result<Option<(ModelContract, Mxfp4MoePolicy)>, Error> {
+    // The Metal lowering: same families, a different point in policy space.
+    // The rows mirror each Metal schema's `is_supported_model_type` list.
+    if policy.naming == crate::common::policy::Naming::Mlx {
+        let author = match facts.model_type.as_str() {
+            "llama" | "llama3" | "mistral" | "qwen2" | "qwen3" | "qwen3_moe" | "qwen2_moe" => {
+                crate::llama::contract::author_llama_mlx
+            }
+            "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next"
+            | "qwen3_next_text" | "qwen3_6" => crate::qwen3_5::contract::author_qwen3_5_mlx,
+            "gemma4" | "gemma4_text" => crate::gemma::contract::author_gemma4_mlx,
+            "gpt_oss" => crate::gptoss::contract::author_gpt_oss_mlx,
+            _ => return Ok(None),
+        };
+        let mut builder = Builder::new(metadata, facts, target, policy);
+        author(&mut builder)?;
+        let resolved = builder.mxfp4_moe();
+        return builder.finish().map(|contract| Some((contract, resolved)));
+    }
+
     let author = match facts.model_type.as_str() {
         // ── llama lineage: dense/GQA decoders sharing one storage schema.
         "qwen3" | "qwen2" | "llama" | "llama3" | "mistral" => {
@@ -75,5 +109,6 @@ pub fn author(
     };
     let mut builder = Builder::new(metadata, facts, target, policy);
     author(&mut builder)?;
-    builder.finish().map(Some)
+    let resolved = builder.mxfp4_moe();
+    builder.finish().map(|contract| Some((contract, resolved)))
 }

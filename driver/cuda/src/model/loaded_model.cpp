@@ -15,6 +15,7 @@
 #include "distributed.hpp"
 #include "ops/gemm.hpp"
 #include "loader/load_plan_bridge.hpp"
+#include "loader/rust_author.hpp"
 #include "loader/load_plan_executor.hpp"
 #include "model/descriptor.hpp"
 #include "model/registry.hpp"
@@ -240,9 +241,23 @@ LoadedModel LoadedModel::load(
         .head_dim = static_cast<std::uint32_t>(std::max(0, e.hf_.head_dim)),
         .mamba_groups = static_cast<std::uint32_t>(std::max(0, e.hf_.mamba_n_groups)),
     };
-    pie_loader::ModelContract contract;
+    // Two authors, one toggle. PIE_CUDA_RUST_AUTHOR routes the boot through
+    // pie_loader_compile_model — facts and policy in, plan out, the contract
+    // never crossing the ABI — while the C++ author below stays the default
+    // and the differential oracle until the per-family diffs have run on
+    // this hardware (`plan/model-in-rust.md` §8). Same request, same target;
+    // the plans should be byte-equal, and the cache key says whether they
+    // are.
     model::Mxfp4MoePolicy mxfp4_moe_policy = model::Mxfp4MoePolicy::RoutedDecode;
-    {
+    LoadPlanResult planned_load = [&]() -> LoadPlanResult {
+        if (rust_author_enabled()) {
+            return prepare_load_plan_rust_author(
+                checkpoint, facts, device_target,
+                model::resolve_runtime_quant(runtime_quant, fp8_native),
+                mxfp4_moe, component, boot_cfg.model.stream_routed_experts,
+                &mxfp4_moe_policy);
+        }
+        pie_loader::ModelContract contract;
         model::ContractBuilder builder(
             checkpoint, facts, device_target,
             model::resolve_runtime_quant(runtime_quant, fp8_native),
@@ -251,16 +266,16 @@ LoadedModel LoadedModel::load(
         arch->author_contract(builder);
         builder.finish();
         mxfp4_moe_policy = builder.mxfp4_moe();
-    }
+        return prepare_load_plan(checkpoint, contract, device_target);
+    }();
 
     // The policy is the *author's* answer, not the plan's -- and it is read
-    // back off the builder rather than recomputed, so there is one answer
+    // back off the author rather than recomputed, so there is one answer
     // rather than two that have to be kept agreeing. An expert weight is MXFP4
     // in the plan because a contract node says so, and this is the decision
-    // that node was written from.
+    // that node was written from. The Rust author hands the same answer back
+    // through the entry's out-parameter.
     e.mxfp4_moe_policy_ = mxfp4_moe_policy;
-
-    LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
     log_stage("compile LoadPlan done");
 
     log_stage("open checkpoint source begin");

@@ -146,6 +146,31 @@ class LoadPlan {
         return LoadPlan(raw);
     }
 
+    /// Author this model's contract on the Rust side and compile it, in one
+    /// call — the §6 request boundary of `plan/model-in-rust.md`. The facts
+    /// and policy cross as a handful of scalars; no contract crosses at all.
+    ///
+    /// `out_mxfp4_moe` receives the author's resolved policy as its wire
+    /// value: the bind path branches on the author's answer, and a family may
+    /// override the device rule, so the answer is handed back rather than
+    /// recomputed.
+    static LoadPlan compile_model(const PieLoaderModelRequest& request,
+                                  std::uint32_t* out_mxfp4_moe) {
+        PieLoaderPlan* raw = nullptr;
+        LoadPlanDiagnostics diags;
+        const PieLoaderStatus status =
+            pie_loader_compile_model(&request, &raw, out_mxfp4_moe, diags.slot());
+        if (status != PieLoaderStatus::Ok) {
+            throw std::runtime_error(
+                "load plan: rust-author compile failed (" + status_name(status) +
+                "): " + diags.text());
+        }
+        if (raw == nullptr) {
+            throw std::runtime_error("load plan: compile returned no plan");
+        }
+        return LoadPlan(raw);
+    }
+
     /// Re-check the plan against the contract it was compiled from.
     ///
     /// Not a tautology across a process or a cache: the plan may have come from

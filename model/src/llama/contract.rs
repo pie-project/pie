@@ -11,6 +11,7 @@ use pie_loader::contract::Expr;
 use pie_loader::error::Error;
 
 use crate::common::builder::{Builder, author_dense_contract};
+use crate::common::mlx;
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))
@@ -107,4 +108,86 @@ fn phi3_gate_up_split(b: &mut Builder<'_>, raw: &RawTensor) -> Result<(), Error>
         );
     }
     Ok(())
+}
+
+/// The Metal lowering of the llama-shaped families: rename for MLX's binder,
+/// bind in place. Ported from
+/// `driver/metal/src/model/llama/llama_contract.hpp` — what is
+/// family-specific is the tensor NAMES, and the mechanics are
+/// [`mlx::author_mlx_file`].
+pub fn author_llama_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
+    // `tie_word_embeddings` is what the config SAYS; a shipped `lm_head` is
+    // what the checkpoint DOES. When they disagree the tensors win, because
+    // mapping a real `lm_head` onto `shared_embedding` declares that name
+    // twice and the load fails with a duplicate rather than with the
+    // disagreement.
+    let has_lm_head = b
+        .tensors()
+        .iter()
+        .any(|raw| raw.name.starts_with("lm_head."));
+    let tied = b.facts().tied_embeddings && !has_lm_head;
+    mlx::author_mlx_file(b, "llama", &move |_, raw_name| {
+        llama_mlx_name(raw_name, tied)
+    })
+}
+
+/// The runtime name for a checkpoint tensor, or `None` to skip it. Every
+/// name is either mapped or explicitly skipped; an unrecognised one is an
+/// error, because a tensor declared under its checkpoint name would never be
+/// found by the binder.
+fn llama_mlx_name(raw_name: &str, tied: bool) -> Result<Option<String>, Error> {
+    // A multimodal release wraps the decoder. Text decode binds none of the
+    // towers.
+    for skip in [
+        "model.visual.",
+        "model.vision_tower.",
+        "model.audio_tower.",
+        "visual.",
+    ] {
+        if raw_name.starts_with(skip) {
+            return Ok(None);
+        }
+    }
+    // Rotary inverse frequencies are recomputed on the GPU from `rope_theta`,
+    // so a checkpoint that persists them is shipping a derived tensor.
+    if raw_name.contains("rotary_emb.inv_freq") {
+        return Ok(None);
+    }
+
+    if let Some(tail) = raw_name.strip_prefix("lm_head.") {
+        return Ok(Some(if tied {
+            format!("shared_embedding.{tail}")
+        } else {
+            format!("lm_head.{tail}")
+        }));
+    }
+
+    // Some releases nest the decoder one level deeper. Accept either.
+    let rest = raw_name
+        .strip_prefix("model.language_model.")
+        .or_else(|| raw_name.strip_prefix("model."));
+    let Some(rest) = rest else {
+        return mlx::fail(format!(
+            "Metal llama schema has no declared mapping or skip for '{raw_name}'"
+        ));
+    };
+
+    if let Some(tail) = rest.strip_prefix("embed_tokens.") {
+        return Ok(Some(if tied {
+            format!("shared_embedding.{tail}")
+        } else {
+            format!("embed_tokens.{tail}")
+        }));
+    }
+    if rest == "norm.weight" {
+        return Ok(Some("final_norm.weight".to_string()));
+    }
+
+    let (layer, member) = mlx::layer_member(rest, "llama", raw_name)?;
+    // The mixture's naming is the same rule in every routed family, so it is
+    // asked of one place rather than restated here.
+    if let Some(renamed) = mlx::routed_expert_member(raw_name, member, "llama", false)? {
+        return Ok(Some(format!("layers.{layer}.{renamed}")));
+    }
+    Ok(Some(format!("layers.{layer}.{member}")))
 }

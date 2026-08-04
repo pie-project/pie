@@ -11,6 +11,7 @@ use pie_loader::contract::Expr;
 use pie_loader::error::Error;
 
 use crate::common::builder::{Builder, author_dense_contract};
+use crate::common::mlx;
 
 /// gemma4, gemma4_text.
 pub fn author_gemma4(b: &mut Builder<'_>) -> Result<(), Error> {
@@ -66,4 +67,78 @@ fn fold_router_scale(b: &mut Builder<'_>) -> Result<(), Error> {
         b.consume(raw.id);
     }
     Ok(())
+}
+
+/// The Metal lowering: rename for MLX's binder, bind in place. Ported from
+/// `driver/metal/src/model/gemma4/gemma4_contract.hpp`.
+pub fn author_gemma4_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
+    // KV is shared over the tail of the stack:
+    // `layer >= num_hidden_layers - num_kv_shared_layers` attends KV an
+    // earlier layer wrote, and the checkpoint still ships its dead k/v/k_norm.
+    let first_shared = if b.facts().num_kv_shared_layers > 0 {
+        i64::from(b.facts().num_hidden_layers) - i64::from(b.facts().num_kv_shared_layers)
+    } else {
+        -1
+    };
+    mlx::author_mlx_file(b, "Gemma4", &move |_, raw_name| {
+        gemma4_mlx_name(raw_name, first_shared)
+    })
+}
+
+fn gemma4_mlx_name(raw_name: &str, first_shared_layer: i64) -> Result<Option<String>, Error> {
+    // The towers. Text decode binds none of it.
+    for skip in [
+        "audio_tower.",
+        "vision_tower.",
+        "embed_audio.",
+        "embed_vision.",
+    ] {
+        if mlx::has_wrapper_member(raw_name, skip) {
+            return Ok(None);
+        }
+    }
+    // Gemma 4 ships tied embeddings; a checkpoint carrying both would declare
+    // `shared_embedding` twice and be rejected as a duplicate, which is the
+    // truthful outcome.
+    if let Some(tail) = raw_name.strip_prefix("lm_head.") {
+        return Ok(Some(format!("shared_embedding.{tail}")));
+    }
+    let Some(rest) = mlx::decoder_member(raw_name) else {
+        return mlx::fail(format!(
+            "Metal Gemma4 schema has no declared mapping or skip for '{raw_name}'"
+        ));
+    };
+    if let Some(tail) = rest.strip_prefix("embed_tokens.") {
+        return Ok(Some(format!("shared_embedding.{tail}")));
+    }
+    // The PLE table and its projection are layer-less and keep their own
+    // names.
+    for direct in [
+        "embed_tokens_per_layer.",
+        "per_layer_model_projection.",
+        "per_layer_projection_norm.",
+    ] {
+        if rest.starts_with(direct) {
+            return Ok(Some(rest.to_string()));
+        }
+    }
+    if rest == "norm.weight" {
+        return Ok(Some("final_norm.weight".to_string()));
+    }
+    let (layer, member) = mlx::layer_member(rest, "Gemma4", raw_name)?;
+    // A KV-shared layer attends the KV an earlier layer wrote, so its own
+    // k/v projections and k-norm are never bound.
+    let index: i64 = layer.parse().expect("validated digits");
+    if first_shared_layer >= 0 && index >= first_shared_layer {
+        for unused in [
+            "self_attn.k_proj.",
+            "self_attn.v_proj.",
+            "self_attn.k_norm.",
+        ] {
+            if member.starts_with(unused) {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(format!("layers.{layer}.{member}")))
 }
