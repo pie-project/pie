@@ -133,7 +133,14 @@ void LlamaLikeModel::body(Workspace& ws,
         // The trace committed to the fused QKV binding; a workspace without
         // the packed buffer cannot honour it (same availability check the
         // hand-written `use_fused_qkv` makes).
-        (!declared_.fused_qkv || !ws.qkv_fused.empty());
+        (!declared_.fused_qkv || !ws.qkv_fused.empty()) &&
+        // ④ Act 1 (banded depth): the declared walker has no banded
+        // form yet — a banded fire falls back to the hand-written body
+        // (the per-fire fallback this gate exists for). Without this
+        // term the declared leg silently demotes mixed-k fires to full
+        // depth (caught live at 14B: R=8 co-fires, no [depth-bands],
+        // no DECLINE).
+        plan_.depth_band_count < 2;
     if (declared_eligible) {
         llama_like_forward_declared(
             declared_, weights_, hf_config_, fwd_cfg_, plan_,

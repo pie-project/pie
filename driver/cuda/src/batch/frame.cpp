@@ -2579,56 +2579,78 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     // Plan-once-per-frame: a step whose every plan input is content-
     // identical to the frame's previous step skips the hook — the
     // workspace already holds the identical plan.
+    // V2 rung ④ Act 1 (banded depth, PIE_DEPTH_BANDS): distinct-k
+    // truncation bands from the region table, deepest-first. OUTSIDE
+    // the plan-skip conditional: the graph gate consumes the band
+    // count every step, and a skip-plan step (content-identical plan
+    // inputs — the 14B envelope's steady state) must not read an empty
+    // vector and replay a demoted graph (caught live at 14B: R=8
+    // co-fires, no [depth-bands], no DECLINE). Armed
+    // only on plain pure-decode fires (no mask/hook/multi-token
+    // region anywhere, no trunc×lora lane), 2..3 distinct k, bands
+    // contiguous after the plain prefix (the seriation's order —
+    // anything else declines to today's full-depth degradation).
+    s.depth_band_k.clear();
+    s.depth_band_rows.clear();
+    {
+        // DEFAULT ON since the 7B pricing (the demotion was the
+        // bug — a co-fired lane's k is honored, layer-skip pays
+        // 1.26x on draft fleets); PIE_DEPTH_BANDS=0 disarms.
+        static const bool bands_on = [] {
+            const char* v = std::getenv("PIE_DEPTH_BANDS");
+            return v == nullptr || v[0] != '0';
+        }();
+        const auto& ind = s.dispatch_view.region_row_indptr;
+        if (bands_on && s.is_pure_decode && !s.have_custom_mask &&
+            !ind.empty()) {
+            const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
+            const std::uint32_t* rk = s.dispatch_view.region_k.data();
+            const std::size_t nreg = ind.size() - 1;
+            bool ok = true;
+            bool seen_trunc = false;
+            for (std::size_t r = 0; r < nreg && ok; ++r) {
+                if (rsig[r] &
+                    (PIE_REGION_SIG_HOOK | PIE_REGION_SIG_MASK |
+                     PIE_REGION_SIG_MULTI_TOKEN)) {
+                    ok = false;
+                } else if (rsig[r] & PIE_REGION_SIG_TRUNCATED) {
+                    if (rsig[r] & PIE_REGION_SIG_LORA) { ok = false; break; }
+                    if (seen_trunc &&
+                        rk[r] >= s.depth_band_k.back()) { ok = false; break; }
+                    seen_trunc = true;
+                    s.depth_band_k.push_back(rk[r]);
+                    s.depth_band_rows.push_back(ind.data()[r]);
+                } else if (seen_trunc) {
+                    ok = false;  // a full-depth region after a band
+                }
+            }
+            if (!ok || s.depth_band_k.size() < 2 ||
+                s.depth_band_k.size() > 3) {
+                s.depth_band_k.clear();
+                s.depth_band_rows.clear();
+            }
+            if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                             "[band-gate] ok=%d nreg=%zu bands=%zu",
+                             ok ? 1 : 0, nreg, s.depth_band_k.size());
+                for (std::size_t r = 0; r < nreg; ++r) {
+                    std::fprintf(stderr, " sig%zu=%u k=%u", r, rsig[r],
+                                 rk[r]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        } else if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[band-gate] skip on=%d pure=%d mask=%d "
+                         "empty=%d\n",
+                         bands_on ? 1 : 0, s.is_pure_decode ? 1 : 0,
+                         s.have_custom_mask ? 1 : 0,
+                         ind.empty() ? 1 : 0);
+        }
+    }
     if (!s.rs_is_fold && !s.skip_plan) {
         compose_timer.stop();
         EnqTimer plan_timer(EnqProfile::kAttnPlan);
-        // V2 rung ④ Act 1 (banded depth, PIE_DEPTH_BANDS): distinct-k
-        // truncation bands from the region table, deepest-first. Armed
-        // only on plain pure-decode fires (no mask/hook/multi-token
-        // region anywhere, no trunc×lora lane), 2..3 distinct k, bands
-        // contiguous after the plain prefix (the seriation's order —
-        // anything else declines to today's full-depth degradation).
-        s.depth_band_k.clear();
-        s.depth_band_rows.clear();
-        {
-            // DEFAULT ON since the 7B pricing (the demotion was the
-            // bug — a co-fired lane's k is honored, layer-skip pays
-            // 1.26x on draft fleets); PIE_DEPTH_BANDS=0 disarms.
-            static const bool bands_on = [] {
-                const char* v = std::getenv("PIE_DEPTH_BANDS");
-                return v == nullptr || v[0] != '0';
-            }();
-            const auto& ind = s.dispatch_view.region_row_indptr;
-            if (bands_on && s.is_pure_decode && !s.have_custom_mask &&
-                !ind.empty()) {
-                const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
-                const std::uint32_t* rk = s.dispatch_view.region_k.data();
-                const std::size_t nreg = ind.size() - 1;
-                bool ok = true;
-                bool seen_trunc = false;
-                for (std::size_t r = 0; r < nreg && ok; ++r) {
-                    if (rsig[r] &
-                        (PIE_REGION_SIG_HOOK | PIE_REGION_SIG_MASK |
-                         PIE_REGION_SIG_MULTI_TOKEN)) {
-                        ok = false;
-                    } else if (rsig[r] & PIE_REGION_SIG_TRUNCATED) {
-                        if (rsig[r] & PIE_REGION_SIG_LORA) { ok = false; break; }
-                        if (seen_trunc &&
-                            rk[r] >= s.depth_band_k.back()) { ok = false; break; }
-                        seen_trunc = true;
-                        s.depth_band_k.push_back(rk[r]);
-                        s.depth_band_rows.push_back(ind.data()[r]);
-                    } else if (seen_trunc) {
-                        ok = false;  // a full-depth region after a band
-                    }
-                }
-                if (!ok || s.depth_band_k.size() < 2 ||
-                    s.depth_band_k.size() > 3) {
-                    s.depth_band_k.clear();
-                    s.depth_band_rows.clear();
-                }
-            }
-        }
         engine.attn_ws.begin_plan_update();
         engine.forward_fn.invoke_prepare(
             engine.attn_ws,

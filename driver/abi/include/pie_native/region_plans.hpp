@@ -15,6 +15,7 @@
 // the table states FACTS, these rules turn them into the PLANS.
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -134,7 +135,15 @@ inline bool derive_region_plans(const LaunchView& view, RegionPlans& out) {
 // populated; no table -> everything UNPLANNED, the legacy discipline.
 inline void apply_region_plans(LaunchView& view) {
     RegionPlans d;
-    derive_region_plans(view, d);
+    const bool present = derive_region_plans(view, d);
+    if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+        std::fprintf(stderr, "[region] table=%d regions=%zu k=%d\n",
+                     present ? 1 : 0,
+                     present ? view.region_row_indptr.size() - 1 : 0,
+                     d.max_layers == 0xffffffffu
+                         ? -1
+                         : static_cast<int>(d.max_layers));
+    }
     view.planned_hook_free_prefix_rows = d.hook_free_prefix_rows;
     view.planned_unmasked_prefix_rows = d.unmasked_prefix_rows;
     view.planned_max_layers = d.max_layers;

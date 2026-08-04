@@ -1328,6 +1328,11 @@ void prepare_llama_like_decode_plan(
             }
             state.depth_band_count = depth_band_count;
         }
+        if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[band-prep] prefill-branch in=%u stamped=%u\n",
+                         depth_band_count, state.depth_band_count);
+        }
         return;
     }
     if (!state.decode_plan) {
@@ -1397,6 +1402,11 @@ void prepare_llama_like_decode_plan(
                 cache.hnd_layout());
         }
         state.depth_band_count = depth_band_count;
+    }
+    if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[band-prep] decode-branch in=%u stamped=%u\n",
+                     depth_band_count, state.depth_band_count);
     }
 }
 
