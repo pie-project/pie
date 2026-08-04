@@ -26,18 +26,18 @@ use std::path::PathBuf;
 
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::contract::ModelContract;
-use pie_loader::ffi::contract::read_contract;
-use pie_loader::ffi::view::verify_marshalled;
 use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::plan::{
     CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
     compiler_version,
 };
-use pie_loader::testkit::contract_writer::write_contract;
 use pie_loader::types::{
     BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
 };
 use pie_loader::verify::ContractView;
+use pie_loader_capi::contract::read_contract;
+use pie_loader_capi::contract_writer::write_contract;
+use pie_loader_capi::view::verify_marshalled;
 
 // ── the checkpoints ─────────────────────────────────────────────────
 

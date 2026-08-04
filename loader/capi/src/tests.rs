@@ -9,8 +9,8 @@
 use super::arena::{self, view};
 use super::entry::{PieLoaderDiagnostics, PieLoaderStatus, PieLoaderTargetSpec};
 use super::types::*;
-use crate::plan::*;
-use crate::types::*;
+use pie_loader::plan::*;
+use pie_loader::types::*;
 
 /// Bind an instruction's operands, asserting the operation it is.
 ///
@@ -335,7 +335,7 @@ fn verify_diagnostics(plan: &LoadPlan) -> String {
     let pod = arena::build(plan, arena::UNKEYED);
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::testkit::contract_writer::write_contract(&minimal_contract());
+    let owned = crate::contract_writer::write_contract(&minimal_contract());
     let mut req = contract_request(handle, owned.view());
     req.target.tp_rank = 1;
     req.target.tp_size = 4;
@@ -697,7 +697,7 @@ fn nested_slices_survive_arena_growth() {
 #[test]
 fn quant_scheme_discriminants_are_stable() {
     // The generated header is the only definition of these values, so a
-    // reordering of `crate::types::QuantScheme` must not silently renumber the
+    // reordering of `pie_loader::types::QuantScheme` must not silently renumber the
     // wire format. Pinning the two that differ from the enum this replaces is
     // enough to catch a reorder.
     assert_eq!(
@@ -782,7 +782,7 @@ fn target_spec() -> PieLoaderTargetSpec {
 fn compile_with_target(mutate: impl FnOnce(&mut PieLoaderTargetSpec)) -> (PieLoaderStatus, String) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let mut req = contract_request(handle, owned.view());
     mutate(&mut req.target);
 
@@ -890,7 +890,7 @@ fn null_arguments_never_dereference() {
 
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let status = unsafe {
@@ -926,7 +926,7 @@ fn verify_rejects_a_plan_compiled_with_a_different_fusion_setting() {
     // wrote (`architecture.md` §8.1).
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -975,11 +975,11 @@ fn all_messages(diags: *mut PieLoaderDiagnostics) -> String {
 /// holding different programs and each believing the other's plan.
 fn verify_against(
     plan: *const PieLoaderPlan,
-    contract: &crate::contract::ModelContract,
+    contract: &pie_loader::contract::ModelContract,
 ) -> (PieLoaderStatus, String) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::testkit::contract_writer::write_contract(contract);
+    let owned = crate::contract_writer::write_contract(contract);
     let req = contract_request(handle, owned.view());
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
     let status = unsafe { super::entry::pie_loader_verify_contract(plan, &req, &mut diags) };
@@ -993,7 +993,7 @@ fn verify_against(
 fn with_fixture_plan(body: impl FnOnce(*mut PieLoaderPlan)) {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
@@ -1021,7 +1021,7 @@ fn the_contract_a_plan_was_compiled_from_verifies_against_it() {
 
 #[test]
 fn a_contract_naming_a_tensor_the_plan_does_not_deliver_is_a_violation() {
-    use crate::contract::{Expr, ModelContract, TensorContract};
+    use pie_loader::contract::{Expr, ModelContract, TensorContract};
     with_fixture_plan(|plan| {
         let mut other = fused_contract();
         other.tensors.push(TensorContract::new(
@@ -1092,7 +1092,7 @@ fn a_declared_encoding_that_disagrees_with_the_plan_is_a_violation() {
 /// agree, and nothing else forces them to.
 #[test]
 fn dtype_survives_the_c_boundary() {
-    use crate::types::DType;
+    use pie_loader::types::DType;
     for dtype in [
         DType::F32,
         DType::F16,
@@ -1116,7 +1116,7 @@ fn dtype_survives_the_c_boundary() {
 
 #[test]
 fn quant_scheme_survives_the_c_boundary() {
-    use crate::types::QuantScheme;
+    use pie_loader::types::QuantScheme;
     for scheme in [
         QuantScheme::None,
         QuantScheme::Fp8E4M3,
@@ -1215,8 +1215,8 @@ fn contract_request(
 /// A contract may not be empty — one that declared nothing would compile to a
 /// plan that loads nothing — so "state as little as possible" is one tensor
 /// with its shape left unstated.
-fn minimal_contract() -> crate::contract::ModelContract {
-    use crate::contract::{Expr, ModelContract, TensorContract};
+fn minimal_contract() -> pie_loader::contract::ModelContract {
+    use pie_loader::contract::{Expr, ModelContract, TensorContract};
     ModelContract {
         alignment: 256,
         tensors: vec![TensorContract::inferred(
@@ -1229,8 +1229,8 @@ fn minimal_contract() -> crate::contract::ModelContract {
 }
 
 /// A contract that fuses the fixture's two tensors along axis 0.
-fn fused_contract() -> crate::contract::ModelContract {
-    use crate::contract::{Expr, ModelContract, TensorContract};
+fn fused_contract() -> pie_loader::contract::ModelContract {
+    use pie_loader::contract::{Expr, ModelContract, TensorContract};
     ModelContract {
         alignment: 256,
         tensors: vec![TensorContract::new(
@@ -1251,9 +1251,9 @@ fn fused_contract() -> crate::contract::ModelContract {
 
 /// A contract that publishes a weight and declares a second tensor as its
 /// scales, so the `scales` half of the contract ABI has something to carry.
-fn scaled_contract() -> crate::contract::ModelContract {
-    use crate::contract::{Expr, ModelContract, Scales, TensorContract};
-    use crate::types::{QuantGranularity, ScaleForm};
+fn scaled_contract() -> pie_loader::contract::ModelContract {
+    use pie_loader::contract::{Expr, ModelContract, Scales, TensorContract};
+    use pie_loader::types::{QuantGranularity, ScaleForm};
     ModelContract {
         alignment: 256,
         tensors: vec![
@@ -1307,7 +1307,7 @@ fn an_opened_checkpoint_reports_the_tensors_a_contract_can_name() {
 fn a_contract_compiles_and_verifies_without_naming_a_model() {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1344,8 +1344,8 @@ fn a_contract_naming_a_tensor_the_checkpoint_lacks_is_a_message_not_a_crash() {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
     let mut model = fused_contract();
-    model.tensors[0].expr = crate::contract::Expr::Src("missing.weight".to_string());
-    let owned = crate::testkit::contract_writer::write_contract(&model);
+    model.tensors[0].expr = pie_loader::contract::Expr::Src("missing.weight".to_string());
+    let owned = crate::contract_writer::write_contract(&model);
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1366,7 +1366,7 @@ fn a_contract_whose_declared_shape_is_wrong_fails_to_compile() {
     let handle = open_checkpoint(&dir);
     let mut model = fused_contract();
     model.tensors[0].shape = Some(vec![8, 4]);
-    let owned = crate::testkit::contract_writer::write_contract(&model);
+    let owned = crate::contract_writer::write_contract(&model);
     let req = contract_request(handle, owned.view());
 
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
@@ -1393,7 +1393,7 @@ fn a_contract_whose_declared_shape_is_wrong_fails_to_compile() {
 fn an_out_of_range_scale_granularity_is_rejected_not_transmuted() {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let mut owned = crate::testkit::contract_writer::write_contract(&scaled_contract());
+    let mut owned = crate::contract_writer::write_contract(&scaled_contract());
     let scaled = owned.first_scaled().expect("the fixture declares scales");
     owned.set_raw_scale_codes(scaled, 9, 1);
     let req = contract_request(handle, owned.view());
@@ -1415,7 +1415,7 @@ fn an_out_of_range_scale_granularity_is_rejected_not_transmuted() {
 fn an_out_of_range_scale_form_is_rejected_not_transmuted() {
     let dir = contract_fixture();
     let handle = open_checkpoint(&dir);
-    let mut owned = crate::testkit::contract_writer::write_contract(&scaled_contract());
+    let mut owned = crate::contract_writer::write_contract(&scaled_contract());
     let scaled = owned.first_scaled().expect("the fixture declares scales");
     owned.set_raw_scale_codes(scaled, 0, 4);
     let req = contract_request(handle, owned.view());
@@ -1435,7 +1435,7 @@ fn an_out_of_range_scale_form_is_rejected_not_transmuted() {
 
 #[test]
 fn a_contract_request_with_no_checkpoint_is_rejected() {
-    let owned = crate::testkit::contract_writer::write_contract(&fused_contract());
+    let owned = crate::contract_writer::write_contract(&fused_contract());
     let req = contract_request(std::ptr::null(), owned.view());
     let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
     let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
@@ -1626,7 +1626,7 @@ fn storage_op_tags_are_the_wire_values() {
 /// whose round trip nothing else would exercise.
 #[test]
 fn a_gather_carries_its_indices_across_the_ffi() {
-    use crate::contract::{Expr, ModelContract, TensorContract};
+    use pie_loader::contract::{Expr, ModelContract, TensorContract};
     let contract = ModelContract {
         alignment: 256,
         tensors: vec![TensorContract::inferred(
@@ -1636,7 +1636,7 @@ fn a_gather_carries_its_indices_across_the_ffi() {
         )],
         groups: Vec::new(),
     };
-    let owned = crate::testkit::contract_writer::write_contract(&contract);
+    let owned = crate::contract_writer::write_contract(&contract);
     let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
     assert_eq!(read, contract);
 }
@@ -1648,7 +1648,7 @@ fn a_gather_carries_its_indices_across_the_ffi() {
 /// whole-contract equality is the check that pins that encoding down.
 #[test]
 fn a_group_survives_the_contract_ffi() {
-    use crate::contract::{Expr, GroupContract, ModelContract, TensorContract};
+    use pie_loader::contract::{Expr, GroupContract, ModelContract, TensorContract};
     let contract = ModelContract {
         alignment: 256,
         tensors: vec![TensorContract::inferred(
@@ -1684,7 +1684,7 @@ fn a_group_survives_the_contract_ffi() {
             },
         ],
     };
-    let owned = crate::testkit::contract_writer::write_contract(&contract);
+    let owned = crate::contract_writer::write_contract(&contract);
     let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
     assert_eq!(read, contract);
 }
@@ -1697,8 +1697,8 @@ fn a_group_survives_the_contract_ffi() {
 /// a GEMM is about to read as swizzled.
 #[test]
 fn a_repack_that_names_no_kernel_is_refused_at_the_boundary() {
-    use crate::contract::{Expr, ModelContract, TensorContract, TensorType};
-    use crate::types::RepackLayout;
+    use pie_loader::contract::{Expr, ModelContract, TensorContract, TensorType};
+    use pie_loader::types::RepackLayout;
     let contract = ModelContract {
         alignment: 256,
         tensors: vec![TensorContract::inferred(
@@ -1711,7 +1711,7 @@ fn a_repack_that_names_no_kernel_is_refused_at_the_boundary() {
         )],
         groups: Vec::new(),
     };
-    let mut owned = crate::testkit::contract_writer::write_contract(&contract);
+    let mut owned = crate::contract_writer::write_contract(&contract);
     let node = owned.first_repack().expect("the contract has a Repack");
     owned.set_raw_repack_layout(node, PieLoaderRepackLayout::None as u32);
     let err = unsafe { super::contract::read_contract(&owned.view()) }.unwrap_err();

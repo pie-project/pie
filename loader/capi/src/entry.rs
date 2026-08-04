@@ -20,11 +20,11 @@
 
 use std::path::PathBuf;
 
-use crate::cache_key::{ArtifactInputs, artifact_cache_key};
-use crate::checkpoint::read::parse_checkpoint_metadata;
-use crate::error::Error;
-use crate::plan::LoadPlan;
-use crate::plan::compile as compile_load_plan;
+use pie_loader::cache_key::{ArtifactInputs, artifact_cache_key};
+use pie_loader::checkpoint::read::parse_checkpoint_metadata;
+use pie_loader::error::Error;
+use pie_loader::plan::LoadPlan;
+use pie_loader::plan::compile as compile_load_plan;
 
 use super::arena;
 use super::checkpoint::PieLoaderCheckpoint;
@@ -318,8 +318,8 @@ unsafe fn compile_contract_request(
 
 /// A contract request with its target resolved and its contract materialized.
 struct CheckedContractRequest {
-    model: crate::contract::ModelContract,
-    target: crate::plan::StorageTarget,
+    model: pie_loader::contract::ModelContract,
+    target: pie_loader::plan::StorageTarget,
 }
 
 /// Validate a contract request without touching the filesystem.
@@ -507,7 +507,7 @@ pub unsafe extern "C" fn pie_loader_verify_contract(
         Ok(checked) => {
             verify_plan_contract(
                 plan,
-                &crate::verify::ContractView::of(&checked.model),
+                &pie_loader::verify::ContractView::of(&checked.model),
                 &mut sink,
             );
         }
@@ -553,7 +553,7 @@ pub unsafe extern "C" fn pie_loader_release_diagnostics(diags: *mut PieLoaderDia
 /// Two different questions are answered here.
 ///
 /// The first — is this plan *self-consistent and still true of the files it
-/// names*? — is [`crate::verify`]'s, and is asked against a [`PlanView`] built
+/// names*? — is [`pie_loader::verify`]'s, and is asked against a [`PlanView`] built
 /// from the marshalled plan the driver is actually holding. Verifying the C
 /// view rather than the Rust one is deliberate: it puts a marshalling bug in
 /// scope, which it would not be if this re-read the plan the driver never sees.
@@ -564,7 +564,7 @@ pub unsafe extern "C" fn pie_loader_release_diagnostics(diags: *mut PieLoaderDia
 /// consistency detects it.
 fn verify_plan_contract(
     plan: &PieLoaderPlan,
-    contract: &crate::verify::ContractView<'_>,
+    contract: &pie_loader::verify::ContractView<'_>,
     sink: &mut DiagnosticSink,
 ) {
     let view = match unsafe { super::view::plan_view(plan) } {
@@ -574,7 +574,7 @@ fn verify_plan_contract(
             return;
         }
     };
-    if let Err(violations) = crate::verify::verify(&view, Some(contract)) {
+    if let Err(violations) = pie_loader::verify::verify(&view, Some(contract)) {
         for violation in violations {
             sink.error(violation.to_string());
         }

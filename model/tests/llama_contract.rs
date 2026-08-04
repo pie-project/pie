@@ -31,9 +31,7 @@ use std::path::PathBuf;
 use pie_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
 use pie_loader::plan::StorageTarget;
 use pie_loader::plan::compile as compile_load_plan;
-use pie_loader::types::{
-    BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId,
-};
+use pie_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use pie_loader::verify::ContractView;
 
 use pie_model::common::facts::ModelFacts;
@@ -224,7 +222,7 @@ fn check(name: &str, target: &StorageTarget) {
     let plan = compile_load_plan(&metadata, &contract, target.clone())
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
     if let Err(violations) =
-        pie_loader::ffi::view::verify_marshalled(&plan, Some(&ContractView::of(&contract)))
+        pie_loader_capi::view::verify_marshalled(&plan, Some(&ContractView::of(&contract)))
     {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(

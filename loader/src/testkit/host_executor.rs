@@ -642,9 +642,7 @@ impl HostExecutor<'_, '_> {
             for word in chunk.chunks(8) {
                 let mut out: u32 = 0;
                 for (k, &value) in word.iter().enumerate() {
-                    let code = (((value as f32) - bias) / scale)
-                        .round()
-                        .clamp(0.0, 15.0) as u32;
+                    let code = (((value as f32) - bias) / scale).round().clamp(0.0, 15.0) as u32;
                     out |= code << (k * 4);
                 }
                 packed.extend_from_slice(&out.to_le_bytes());

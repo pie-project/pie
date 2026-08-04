@@ -1,7 +1,7 @@
 //! pie-loader-cbindgen — decoupled generator for the committed C header.
 //!
-//! Emits `loader/include/pie_loader.h` from the `#[repr(C)]` surface in
-//! `pie-loader::ffi`. The build graph consumes the committed header; developers
+//! Emits `loader/capi/include/pie_loader.h` from the `#[repr(C)]` surface in
+//! `pie-loader-capi`. The build graph consumes the committed header; developers
 //! and CI run this tool to refresh it.
 //!
 //! The header is the *only* definition of the loader's C vocabulary. It replaces
@@ -14,18 +14,18 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let loader_crate = manifest.join("..");
+    let capi_crate = manifest.join("..");
     let config_path = manifest.join("cbindgen.toml");
-    let out = loader_crate.join("include").join("pie_loader.h");
+    let out = capi_crate.join("include").join("pie_loader.h");
 
     let config = cbindgen::Config::from_file(&config_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", config_path.display()));
 
     cbindgen::Builder::new()
-        .with_crate(&loader_crate)
+        .with_crate(&capi_crate)
         .with_config(config)
         .generate()
-        .expect("generate pie_loader.h from pie-loader::ffi")
+        .expect("generate pie_loader.h from pie-loader-capi")
         .write_to_file(&out);
 
     eprintln!("wrote {}", out.display());

@@ -1,0 +1,47 @@
+[package]
+name = "pie-loader-capi"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The loader's C ABI: repr(C) marshalling, extern entry points, and the committed pie_loader.h."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+# `links` lets downstream build scripts (`worker/build.rs`) discover the
+# generated C++ header directory via `DEP_PIE_LOADER_INCLUDE`, which is how
+# the native drivers get `pie_loader.h` on their include path. The key kept
+# its name when the ABI moved out of `pie-loader`, so nothing downstream had
+# to learn a new one.
+links = "pie_loader"
+
+[lib]
+name = "pie_loader_capi"
+path = "src/lib.rs"
+
+# The loader as a tool: compile, inspect, check and replay a plan without a
+# GPU, a runtime, or a driver. It lives beside the ABI because its `verify`
+# checks the *marshalled* view — the tool exists to exercise exactly the
+# surface this crate owns.
+[[bin]]
+name = "pie-loader"
+path = "src/main.rs"
+required-features = ["tool"]
+
+[features]
+default = ["tool"]
+# What the tool needs beyond the ABI: the loader's host executor and oracle.
+# A driver build turns default features off and links none of it.
+tool = ["pie-loader/testkit"]
+
+[dependencies]
+# `default-features = false` keeps the compiler's testkit out of a driver
+# link; the `tool` feature turns it back on for the CLI alone.
+pie-loader = { path = "..", default-features = false }
+serde_json = "1.0"
+
+[dev-dependencies]
+# The unit tests replay plans through the host executor.
+pie-loader = { path = "..", features = ["testkit"] }
+# The CLI's convert test reads the artifact it wrote back through ztensor.
+half = "2"
+ztensor = { workspace = true }

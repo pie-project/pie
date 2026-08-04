@@ -60,8 +60,12 @@ members = [
     "driver/dummy",
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
     # drivers at cold start, not by the serving runtime (see loader/architecture.md).
+    # `loader` is the compiler alone; `loader/capi` is its C ABI — the repr(C)
+    # marshalling, the extern entry points, the committed pie_loader.h and the
+    # `pie-loader` CLI — which is what the drivers actually link.
     "loader",
-    "loader/cbindgen",
+    "loader/capi",
+    "loader/capi/cbindgen",
     "sdk/python-server",
     # Thin binary shells composing the `startup` skeleton + role lib(s). `bin/pie` is the
     # composition root (deps all three role libs; the standalone).

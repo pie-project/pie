@@ -1,6 +1,6 @@
 //! The materialized-weight artifact, across the ABI.
 //!
-//! [`crate::weight_store`] owns the format; this is how the driver drives it.
+//! [`pie_loader::weight_store`] owns the format; this is how the driver drives it.
 //! Two shapes, because the two directions are not symmetric.
 //!
 //! Writing is a **stream**. The payloads live in device memory and are copied
@@ -24,8 +24,8 @@
 use std::ffi::c_void;
 use std::path::Path;
 
-use crate::types::DType;
-use crate::weight_store::{Artifact, ArtifactWriter, Quant, Tensor, View};
+use pie_loader::types::DType;
+use pie_loader::weight_store::{Artifact, ArtifactWriter, Quant, Tensor, View};
 
 use super::entry::{PieLoaderDiagnostics, PieLoaderStatus};
 use super::types::{PieLoaderBytes, PieLoaderDType, PieLoaderI64Slice, PieLoaderSlice};
@@ -716,7 +716,7 @@ pub unsafe extern "C" fn pie_loader_weight_store_close(store: *mut PieLoaderWeig
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi::pie_loader_release_diagnostics;
+    use crate::pie_loader_release_diagnostics;
 
     fn bytes(s: &str) -> PieLoaderBytes {
         PieLoaderBytes {

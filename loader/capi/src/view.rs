@@ -1,6 +1,6 @@
 //! Reading a marshalled plan back as a safe view.
 //!
-//! The mirror of [`super::arena`]: that module writes a [`crate::plan::LoadPlan`]
+//! The mirror of [`super::arena`]: that module writes a [`pie_loader::plan::LoadPlan`]
 //! into the POD form the driver holds, and this one reads that POD form back.
 //!
 //! Verification runs *here*, on the marshalled bytes, and nowhere else. There is
@@ -13,8 +13,8 @@
 use super::arena;
 use super::entry::as_str;
 use super::types::*;
-use crate::plan::LoadPlan;
-use crate::verify::{Certificate, ContractView, Violation, verify};
+use pie_loader::plan::LoadPlan;
+use pie_loader::verify::{Certificate, ContractView, Violation, verify};
 
 /// Compile-free verification of a plan, as the driver will see it.
 ///
@@ -135,7 +135,7 @@ pub(super) unsafe fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     }
 }
 
-/// Reconstruct the safe view [`crate::verify`] works on from the POD plan.
+/// Reconstruct the safe view [`pie_loader::verify`] works on from the POD plan.
 ///
 /// This is the only place that dereferences the plan's slice pointers, so it is
 /// where a malformed handle is caught rather than propagated. Names are decoded
@@ -148,11 +148,11 @@ pub(super) unsafe fn slice_of<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 /// any plan produced by [`pie_loader_compile`].
 pub(super) unsafe fn plan_view(
     plan: &PieLoaderPlan,
-) -> Result<crate::verify::PlanView<'_>, String> {
+) -> Result<pie_loader::verify::PlanView<'_>, String> {
     let instrs = unsafe { slice_of(plan.instrs.ptr, plan.instrs.len) };
     let mut files = Vec::with_capacity(plan.files.len);
     for file in unsafe { slice_of(plan.files.ptr, plan.files.len) } {
-        files.push(crate::verify::FileView {
+        files.push(pie_loader::verify::FileView {
             id: file.id,
             path: unsafe { as_str(&file.path, "file.path") }
                 .map_err(|err| format!("file {}: {err}", file.id))?,
@@ -161,7 +161,7 @@ pub(super) unsafe fn plan_view(
     }
     let mut sources = Vec::with_capacity(plan.sources.len);
     for source in unsafe { slice_of(plan.sources.ptr, plan.sources.len) } {
-        sources.push(crate::verify::SourceView {
+        sources.push(pie_loader::verify::SourceView {
             name: unsafe { as_str(&source.name, "source.name") }
                 .map_err(|err| format!("source tensor {}: {err}", source.id))?,
             file_id: source.file_id,
@@ -171,7 +171,7 @@ pub(super) unsafe fn plan_view(
     }
     let mut tensors = Vec::with_capacity(plan.tensors.len);
     for tensor in unsafe { slice_of(plan.tensors.ptr, plan.tensors.len) } {
-        tensors.push(crate::verify::TensorView::new(
+        tensors.push(pie_loader::verify::TensorView::new(
             unsafe { as_str(&tensor.name, "tensor.name") }
                 .map_err(|err| format!("tensor {}: {err}", tensor.id))?,
             unsafe { slice_of(tensor.shape.ptr, tensor.shape.len) },
@@ -193,7 +193,7 @@ pub(super) unsafe fn plan_view(
             ),
             PieLoaderStorageOp::ExtentWrite { source, .. }
             | PieLoaderStorageOp::BulkExtentWrite { source, .. } => {
-                reads.push(crate::verify::ReadView {
+                reads.push(pie_loader::verify::ReadView {
                     instr: instr.id,
                     file_id: source.file_id,
                     file_offset: source.file_offset,
@@ -204,7 +204,7 @@ pub(super) unsafe fn plan_view(
                 source, has_source, ..
             } => {
                 if *has_source {
-                    reads.push(crate::verify::ReadView {
+                    reads.push(pie_loader::verify::ReadView {
                         instr: instr.id,
                         file_id: source.file_id,
                         file_offset: source.file_offset,
@@ -224,7 +224,7 @@ pub(super) unsafe fn plan_view(
         }
     }
 
-    Ok(crate::verify::PlanView {
+    Ok(pie_loader::verify::PlanView {
         compiler_version: plan.compiler_version,
         files,
         sources,
@@ -239,15 +239,17 @@ pub(super) unsafe fn plan_view(
 /// The inverse of `arena::split_encoding`: rebuild an [`Encoding`] from the flat
 /// fields a POD view carries, so a marshalled tensor can be compared against
 /// one the loader still holds in typed form.
-fn join_encoding(tensor: &PieLoaderTensorDeclView) -> crate::types::Encoding {
+fn join_encoding(tensor: &PieLoaderTensorDeclView) -> pie_loader::types::Encoding {
     match tensor.encoding_kind {
-        PieLoaderEncodingKind::Quant => crate::types::Encoding::Quant(crate::types::QuantSpec {
-            scheme: tensor.quant_scheme.into(),
-            logical_dtype: tensor.dtype.into(),
-            bits_per_element: tensor.quant_bits_per_element,
-            group_size: tensor.quant_group_size,
-            channel_axis: None,
-        }),
-        _ => crate::types::Encoding::Raw(tensor.dtype.into()),
+        PieLoaderEncodingKind::Quant => {
+            pie_loader::types::Encoding::Quant(pie_loader::types::QuantSpec {
+                scheme: tensor.quant_scheme.into(),
+                logical_dtype: tensor.dtype.into(),
+                bits_per_element: tensor.quant_bits_per_element,
+                group_size: tensor.quant_group_size,
+                channel_axis: None,
+            })
+        }
+        _ => pie_loader::types::Encoding::Raw(tensor.dtype.into()),
     }
 }

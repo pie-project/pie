@@ -10,7 +10,7 @@
 //!
 //! # Why a flat array
 //!
-//! An [`crate::contract::Expr`] is a tree with `Box` and `Vec` in it, neither of
+//! An [`pie_loader::contract::Expr`] is a tree with `Box` and `Vec` in it, neither of
 //! which has a stable layout, so it cannot cross as itself. The standard
 //! encoding is a topologically sorted node array where every edge is an index —
 //! the same shape as an SSA function body, and for the same reason. Two
@@ -29,22 +29,22 @@
 //! the largest contract, borrowed for one call — and buys the property that a
 //! field the caller forgot is a zero, not garbage from another variant.
 
-use crate::contract::{
-    Expr, GroupContract, ModelContract, ScaleFactor, Scales, TensorContract, TensorType, Visibility,
-};
-use crate::ffi::types::{
+use crate::types::{
     PieLoaderBytes, PieLoaderDType, PieLoaderEncodingKind, PieLoaderI64Slice,
     PieLoaderQuantGranularity, PieLoaderQuantScheme, PieLoaderRepackLayout, PieLoaderScaleForm,
     PieLoaderSlice, PieLoaderU32Slice, PieLoaderVisibility,
 };
-use crate::types::{
+use pie_loader::contract::{
+    Expr, GroupContract, ModelContract, ScaleFactor, Scales, TensorContract, TensorType, Visibility,
+};
+use pie_loader::types::{
     Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,
 };
 
 /// `PieLoaderExprNode::src` when the node has no single operand.
 pub const PIE_LOADER_NO_NODE: u32 = u32::MAX;
 
-/// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
+/// Which constructor a node is. Mirrors [`pie_loader::contract::Expr`] exactly; a
 /// variant added there without a variant here is a compile error in
 /// `read_expr`.
 #[repr(u32)]
@@ -64,7 +64,7 @@ pub enum PieLoaderExprKind {
     Scale = 11,
     /// The two group nodes. Both stand for an index the contract does not
     /// name, so both are an error outside a
-    /// [`GroupContract`](crate::contract::GroupContract) -- which the C ABI
+    /// [`GroupContract`](pie_loader::contract::GroupContract) -- which the C ABI
     /// cannot declare yet, so a C++ author has no use for these today. They are
     /// numbered here because the numbering is the ABI, and appending later
     /// would be a second decision to get right.
@@ -101,7 +101,7 @@ impl TryFrom<u32> for PieLoaderExprKind {
 /// of numbers, which is what a designated initializer is good at.
 pub const PIE_LOADER_NO_AXIS: i32 = -1;
 
-/// [`crate::types::QuantSpec`], flattened.
+/// [`pie_loader::types::QuantSpec`], flattened.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderQuantSpecView {
@@ -128,7 +128,7 @@ impl Default for PieLoaderQuantSpecView {
     }
 }
 
-/// [`crate::types::Encoding`], flattened. `kind` selects which half is read.
+/// [`pie_loader::types::Encoding`], flattened. `kind` selects which half is read.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PieLoaderEncodingSpec {
@@ -331,7 +331,7 @@ pub struct PieLoaderScalesView {
     /// containing slice is borrowed — before `read_scales` could reject it.
     /// `read_scales` converts it.
     ///
-    /// [`PieLoaderTargetSpec::encode_scratch_dtype`]: crate::ffi::entry::PieLoaderTargetSpec::encode_scratch_dtype
+    /// [`PieLoaderTargetSpec::encode_scratch_dtype`]: crate::entry::PieLoaderTargetSpec::encode_scratch_dtype
     pub granularity: u32,
     /// Elements of `of` per scale entry, for `PerGroup`.
     pub group_size: u32,
@@ -688,7 +688,7 @@ unsafe fn read_tensors(
 //
 // The loader writes two of these formats in production: a checkpoint's tensor
 // table (`ffi::checkpoint`) and, in tests, a whole contract
-// (`crate::testkit::contract_writer`). Flattening a *contract* is not on the load path
+// (`crate::contract_writer`). Flattening a *contract* is not on the load path
 // and lives in the latter.
 
 pub(crate) fn write_quant(spec: &QuantSpec) -> PieLoaderQuantSpecView {

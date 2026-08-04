@@ -97,6 +97,10 @@ pie-driver-dummy = { path = "../driver/dummy" }
 # fixture builder, CPU executor). Nothing under `ffi/` reaches them, and this is
 # what keeps that true.
 pie-loader = { path = "../loader", default-features = false }
+# The loader's C ABI. Depended on for two build-time reasons: the entry-point
+# anchor in `embedded_driver.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
+# `links = "pie_loader"` metadata — which `build.rs` hands to the C++ drivers.
+pie-loader-capi = { path = "../loader/capi", default-features = false }
 # The artifact's compiled metadata is lifted here and handed to the runtime
 # whole: `pie-model` owns the shape it arrives in, `pie-tokenizer` names the
 # objects that make up a `pie.tokenizer/1`.

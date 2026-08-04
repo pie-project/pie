@@ -30,6 +30,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 [dev-dependencies]
 # The contract tests compile and verify what the authors declare, which is
-# the loader's whole job; the tests are the first caller of the pipeline the
-# capi crate will expose.
+# the loader's whole job; the marshalled-view verifier they finish with lives
+# in the ABI crate, the same pipeline a driver boot runs.
 pie-loader = { path = "../loader", default-features = false }
+pie-loader-capi = { path = "../loader/capi", default-features = false }

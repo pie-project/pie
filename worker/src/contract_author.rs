@@ -20,7 +20,7 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use pie_loader::contract::ModelContract;
-use pie_loader::ffi::contract::PieLoaderModelContractView;
+use pie_loader_capi::contract::PieLoaderModelContractView;
 
 /// The policy half of an authoring request; everything the load path reads
 /// from its boot config, restated for a caller that has no boot.
@@ -90,7 +90,7 @@ pub fn author_contract(request: &AuthorRequest<'_>) -> Result<ModelContract> {
     // The view borrows from `owner`; convert before releasing, and release on
     // every path.
     let view = unsafe { view.assume_init() };
-    let contract = unsafe { pie_loader::ffi::contract::read_contract(&view) };
+    let contract = unsafe { pie_loader_capi::contract::read_contract(&view) };
     unsafe { pie_cuda_author_release(owner) };
     contract.map_err(|err| anyhow!("the authored contract did not read back: {err}"))
 }

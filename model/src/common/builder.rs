@@ -202,11 +202,7 @@ impl<'a> Builder<'a> {
     /// the knob asks the checkpoint rather than declaring.
     pub fn source_prefix(&mut self, prefix: &str) {
         self.source_prefix.clear();
-        if self
-            .tensors
-            .iter()
-            .any(|raw| raw.name.starts_with(prefix))
-        {
+        if self.tensors.iter().any(|raw| raw.name.starts_with(prefix)) {
             self.source_prefix = prefix.to_string();
         }
     }
@@ -325,7 +321,11 @@ impl<'a> Builder<'a> {
     /// the tensor and the axis.
     pub fn local_extent(&self, full: i64) -> i64 {
         let world = i64::from(self.target.tp_size.max(1));
-        if full % world == 0 { full / world } else { full }
+        if full % world == 0 {
+            full / world
+        } else {
+            full
+        }
     }
 
     /// The `[start, start + len)` band of `expr`, split across ranks.
@@ -368,7 +368,12 @@ impl<'a> Builder<'a> {
         // about the weight — here, once, before the family's own rule is
         // consulted, which is what makes the pairing unforgettable for a
         // family that supplied its own `shard_axis_fn`.
-        for suffix in [".weight_scale_inv", ".weight_scale", ".weight_packed", ".scale"] {
+        for suffix in [
+            ".weight_scale_inv",
+            ".weight_scale",
+            ".weight_packed",
+            ".scale",
+        ] {
             if let Some(base) = name.strip_suffix(suffix) {
                 let of_weight = (self.shard_axis_fn)(&format!("{base}.weight"));
                 return of_weight.or_else(|| (self.shard_axis_fn)(base));
@@ -891,10 +896,7 @@ impl<'a> Builder<'a> {
         scheme: QuantScheme,
     ) -> Result<(), Error> {
         if raw.shape.len() != 2 {
-            return fail(format!(
-                "runtime_quant source '{}' must be 2-D",
-                raw.name
-            ));
+            return fail(format!("runtime_quant source '{}' must be 2-D", raw.name));
         }
         // Allowed sources are BF16/FP16/FP32 raw, handled by the executor's
         // bf16 cast path, and FP8 (E4M3) raw: those weights ship quantized,

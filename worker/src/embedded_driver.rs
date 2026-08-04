@@ -20,15 +20,16 @@ use crate::config::{
 };
 use crate::driver_ffi::Flavor;
 
-/// Anchors `pie-loader`'s C entry points into the final binary.
+/// Anchors the loader ABI's C entry points into the final binary.
 ///
-/// `pie-loader` is an rlib and the only callers of `pie_loader_compile_contract`
-/// and friends are the C++ drivers, which link *after* Rust. A linker never
-/// pulls an rlib member in on behalf of a C++ reference, so without a reference
-/// from reachable Rust the entry points are simply absent and the failure
-/// surfaces as an undefined symbol at final link (`loader/architecture.md`
-/// §3.4). The `#[used]` table inside `pie_loader::ffi::entry` keeps all six
-/// alive once the object is pulled in; this static is what pulls it in.
+/// `pie-loader-capi` is an rlib and the only callers of
+/// `pie_loader_compile_contract` and friends are the C++ drivers, which link
+/// *after* Rust. A linker never pulls an rlib member in on behalf of a C++
+/// reference, so without a reference from reachable Rust the entry points are
+/// simply absent and the failure surfaces as an undefined symbol at final
+/// link (`loader/architecture.md` §3.4). The `#[used]` table inside
+/// `pie_loader_capi::entry` keeps all six alive once the object is pulled in;
+/// this static is what pulls it in.
 ///
 /// **This is load-bearing.** No Rust in this process calls the loader any more —
 /// §12 step 2 moved plan compilation behind the FFI and row 12 moved contract
@@ -36,10 +37,10 @@ use crate::driver_ffi::Flavor;
 /// file in the link.
 #[used]
 static PIE_LOADER_ENTRY_ANCHOR: unsafe extern "C" fn(
-    *const pie_loader::ffi::entry::PieLoaderContractRequest,
-    *mut *mut pie_loader::ffi::PieLoaderPlan,
-    *mut *mut pie_loader::ffi::PieLoaderDiagnostics,
-) -> pie_loader::ffi::PieLoaderStatus = pie_loader::ffi::entry::pie_loader_compile_contract;
+    *const pie_loader_capi::entry::PieLoaderContractRequest,
+    *mut *mut pie_loader_capi::PieLoaderPlan,
+    *mut *mut pie_loader_capi::PieLoaderDiagnostics,
+) -> pie_loader_capi::PieLoaderStatus = pie_loader_capi::entry::pie_loader_compile_contract;
 
 #[cfg(feature = "driver-cuda")]
 #[repr(C)]

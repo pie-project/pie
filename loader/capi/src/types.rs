@@ -8,13 +8,15 @@
 //! Two rules govern this module:
 //!
 //! * **No owning types.** Every aggregate is a pointer + length pair into an
-//!   arena owned by [`crate::ffi::arena::PlanArena`]. Slices stay valid exactly
+//!   arena owned by [`crate::arena::PlanArena`]. Slices stay valid exactly
 //!   as long as the `PieLoaderPlan` that produced them.
 //! * **No `Option`, no niches.** `Option<T>` is spelled as an explicit
 //!   `has_*: bool` companion, matching the C++ views this replaces, so the
 //!   layout is legible from C without knowing Rust's niche rules.
 
-use crate::types::{BackendKind, DType, QuantGranularity, QuantScheme, RepackLayout, ScaleForm};
+use pie_loader::types::{
+    BackendKind, DType, QuantGranularity, QuantScheme, RepackLayout, ScaleForm,
+};
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
 /// default on `PieLoaderStorageInstrView::buffer_id`.
@@ -29,7 +31,7 @@ pub const PIE_LOADER_NO_TENSOR: u32 = u32::MAX;
 // producing a plan the device cannot run.
 //
 // These live here, in the module that owns the C surface, because the header is
-// where they have to be correct. `crate::plan` states the same six bits.
+// where they have to be correct. `pie_loader::plan` states the same six bits.
 // Restated here rather than aliased because cbindgen emits a literal and cannot
 // follow a path — and because the arrow used to run the other way, with the
 // compiler importing its own serialization format's constants. Two independent
@@ -160,7 +162,7 @@ pub enum PieLoaderEncodingKind {
     Quant = 1,
 }
 
-/// Discriminants follow `crate::types::QuantScheme` declaration order, which is
+/// Discriminants follow `pie_loader::types::QuantScheme` declaration order, which is
 /// *not* the order of the hand-written C++ enum this replaces (`MlxAffineU4` is
 /// eighth here and last there). The mismatch was invisible while the boundary
 /// was JSON, because the C++ parser mapped by name. Now that the two sides share
@@ -364,9 +366,9 @@ pub enum PieLoaderTileMapKind {
     Scale = 8,
 }
 
-impl From<crate::plan::TileMapKind> for PieLoaderTileMapKind {
-    fn from(value: crate::plan::TileMapKind) -> Self {
-        use crate::plan::TileMapKind as K;
+impl From<pie_loader::plan::TileMapKind> for PieLoaderTileMapKind {
+    fn from(value: pie_loader::plan::TileMapKind) -> Self {
+        use pie_loader::plan::TileMapKind as K;
         match value {
             K::Cast => Self::Cast,
             K::Decode => Self::Decode,
@@ -392,9 +394,9 @@ pub enum PieLoaderTransformFusion {
     Fp8ToMxfp4 = 1,
 }
 
-impl From<crate::plan::TransformFusion> for PieLoaderTransformFusion {
-    fn from(value: crate::plan::TransformFusion) -> Self {
-        use crate::plan::TransformFusion as F;
+impl From<pie_loader::plan::TransformFusion> for PieLoaderTransformFusion {
+    fn from(value: pie_loader::plan::TransformFusion) -> Self {
+        use pie_loader::plan::TransformFusion as F;
         match value {
             F::None => Self::None,
             F::Fp8ToMxfp4 => Self::Fp8ToMxfp4,
@@ -500,7 +502,7 @@ pub struct PieLoaderTensorDeclView {
 
 pub type PieLoaderTensorDeclSlice = PieLoaderSlice<PieLoaderTensorDeclView>;
 
-/// Whether a declared tensor is bound by the driver. Mirrors [`Visibility`](crate::types::Visibility).
+/// Whether a declared tensor is bound by the driver. Mirrors [`Visibility`](pie_loader::types::Visibility).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PieLoaderVisibility {
@@ -683,17 +685,17 @@ pub enum PieLoaderCheckpointFormat {
     Onnx = 7,
 }
 
-impl From<crate::types::CheckpointFormat> for PieLoaderCheckpointFormat {
-    fn from(value: crate::types::CheckpointFormat) -> Self {
+impl From<pie_loader::types::CheckpointFormat> for PieLoaderCheckpointFormat {
+    fn from(value: pie_loader::types::CheckpointFormat) -> Self {
         match value {
-            crate::types::CheckpointFormat::Safetensors => Self::Safetensors,
-            crate::types::CheckpointFormat::Gguf => Self::Gguf,
-            crate::types::CheckpointFormat::Unknown => Self::Unknown,
-            crate::types::CheckpointFormat::Zt => Self::Zt,
-            crate::types::CheckpointFormat::Npz => Self::Npz,
-            crate::types::CheckpointFormat::Pt => Self::Pt,
-            crate::types::CheckpointFormat::Hdf5 => Self::Hdf5,
-            crate::types::CheckpointFormat::Onnx => Self::Onnx,
+            pie_loader::types::CheckpointFormat::Safetensors => Self::Safetensors,
+            pie_loader::types::CheckpointFormat::Gguf => Self::Gguf,
+            pie_loader::types::CheckpointFormat::Unknown => Self::Unknown,
+            pie_loader::types::CheckpointFormat::Zt => Self::Zt,
+            pie_loader::types::CheckpointFormat::Npz => Self::Npz,
+            pie_loader::types::CheckpointFormat::Pt => Self::Pt,
+            pie_loader::types::CheckpointFormat::Hdf5 => Self::Hdf5,
+            pie_loader::types::CheckpointFormat::Onnx => Self::Onnx,
         }
     }
 }
@@ -760,7 +762,7 @@ pub struct PieLoaderStorageInstrView {
 /// What an instruction does, as a tagged union carrying only that operation's
 /// operands.
 ///
-/// This mirrors `crate::plan::StorageInstr` variant for variant. It was a flat
+/// This mirrors `pie_loader::plan::StorageInstr` variant for variant. It was a flat
 /// struct of 32 members with a `kind` tag until every reader had grown a
 /// defence against the members that tag left meaningless: `if (!instr.has_source
 /// || !instr.has_dest)` in three executors, `inputs.size() != 1` around a
@@ -898,8 +900,8 @@ pub struct PieLoaderTargetView {
     pub block_scale_rows: u32,
 }
 
-impl From<&crate::plan::StorageTarget> for PieLoaderTargetView {
-    fn from(value: &crate::plan::StorageTarget) -> Self {
+impl From<&pie_loader::plan::StorageTarget> for PieLoaderTargetView {
+    fn from(value: &pie_loader::plan::StorageTarget) -> Self {
         Self {
             backend: value.backend.into(),
             tp_rank: value.tp_rank,
@@ -962,7 +964,7 @@ pub struct PieLoaderPlan {
 /// is the drift `PieLoaderTileMapKind::capability_bit` would otherwise turn
 /// into a mis-dispatched kernel.
 const _: () = {
-    use crate::plan as p;
+    use pie_loader::plan as p;
     assert!(PIE_LOADER_TILE_MAP_CAST == p::TILE_MAP_CAST);
     assert!(PIE_LOADER_TILE_MAP_DECODE == p::TILE_MAP_DECODE);
     assert!(PIE_LOADER_TILE_MAP_ENCODE == p::TILE_MAP_ENCODE);

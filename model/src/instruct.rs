@@ -131,8 +131,12 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         "qwen2" => Arc::new(crate::qwen3::chat::qwen2::new(tokenizer)),
         "llama2" => Arc::new(crate::llama::chat::llama2::LlamaInstruct::new(tokenizer)),
         "llama3" | "l4ma" => Arc::new(crate::llama::chat::llama3::LlamaInstruct::new(tokenizer)),
-        "r1" | "deepseek_v3" | "deepseek_v4" => Arc::new(crate::r1::chat::R1Instruct::new(tokenizer)),
-        "kimi_k2" | "kimi_k25" | "kimi_k3" => Arc::new(crate::kimi::chat::KimiInstruct::new(tokenizer)),
+        "r1" | "deepseek_v3" | "deepseek_v4" => {
+            Arc::new(crate::r1::chat::R1Instruct::new(tokenizer))
+        }
+        "kimi_k2" | "kimi_k25" | "kimi_k3" => {
+            Arc::new(crate::kimi::chat::KimiInstruct::new(tokenizer))
+        }
         "glm_moe_dsa" => Arc::new(QwenInstruct::new(
             tokenizer,
             ChatMLConfig {
@@ -168,7 +172,9 @@ pub fn create(arch_name: &str, tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
             tokenizer,
             crate::gemma::chat::gemma4::Gemma4Variant::Gemma4Text,
         )),
-        "mistral3" | "ministral3" => Arc::new(crate::mistral::chat::MistralInstruct::new(tokenizer)),
+        "mistral3" | "ministral3" => {
+            Arc::new(crate::mistral::chat::MistralInstruct::new(tokenizer))
+        }
         "olmo2" => Arc::new(crate::olmo::chat::olmo2::Olmo2Instruct::new(tokenizer)),
         "olmo3" => Arc::new(crate::olmo::chat::olmo3::OlmoInstruct::new(tokenizer)),
         "phi3" => Arc::new(crate::phi::chat::Phi3Instruct::new(tokenizer)),

@@ -14,13 +14,13 @@
 //! not part of it: no `extern "C"` function reaches this code, and cbindgen
 //! emits nothing from it.
 
-use crate::contract::{Expr, ModelContract, ScaleFactor, Visibility};
-use crate::ffi::contract::{
+use crate::contract::{
     PieLoaderExprKind, PieLoaderExprNode, PieLoaderExprNodeSlice, PieLoaderGroupContractSlice,
     PieLoaderGroupContractView, PieLoaderModelContractView, PieLoaderScalesView,
     PieLoaderTensorContractSlice, PieLoaderTensorContractView, write_encoding,
 };
-use crate::ffi::types::*;
+use crate::types::*;
+use pie_loader::contract::{Expr, ModelContract, ScaleFactor, Visibility};
 
 /// A contract flattened into the POD form, with its backing storage.
 ///
@@ -90,7 +90,7 @@ impl OwnedContract {
     /// Write a raw integer into a node's `repack_layout`, for the same reason
     /// [`set_raw_scale_codes`](Self::set_raw_scale_codes) exists.
     ///
-    /// [`RepackLayout`](crate::types::RepackLayout) has no member for "no
+    /// [`RepackLayout`](pie_loader::types::RepackLayout) has no member for "no
     /// layout", so a typed builder cannot express the zero an all-zero node
     /// carries — which is exactly the value the boundary has to reject.
     pub fn set_raw_repack_layout(&mut self, node: usize, layout: u32) {
@@ -305,7 +305,7 @@ impl OwnedContract {
     /// Flatten one declaration. Shared by the contract's tensors and a group's.
     fn write_tensor(
         &mut self,
-        tensor: &crate::contract::TensorContract,
+        tensor: &pie_loader::contract::TensorContract,
     ) -> PieLoaderTensorContractView {
         let owned = self;
         let root = owned.write_expr(&tensor.expr);

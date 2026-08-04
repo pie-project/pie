@@ -23,12 +23,12 @@
 
 use std::path::PathBuf;
 
-use crate::checkpoint::CheckpointMetadata;
-use crate::ffi::contract::{PieLoaderEncodingSpec, write_encoding};
-use crate::ffi::types::{
+use crate::contract::{PieLoaderEncodingSpec, write_encoding};
+use crate::types::{
     PieLoaderBytes, PieLoaderCheckpointFileSlice, PieLoaderCheckpointFileView,
     PieLoaderCheckpointFormat, PieLoaderI64Slice,
 };
+use pie_loader::checkpoint::CheckpointMetadata;
 
 /// One tensor as it appears in the checkpoint.
 ///
@@ -72,7 +72,7 @@ impl Default for PieLoaderRawTensorSlice {
 /// matters, because the ranks of a TP group compile in parallel from one
 /// checkpoint.
 ///
-/// [`pie_loader_close_checkpoint`]: crate::ffi::entry::pie_loader_close_checkpoint
+/// [`pie_loader_close_checkpoint`]: crate::entry::pie_loader_close_checkpoint
 #[repr(C)]
 #[derive(Debug)]
 pub struct PieLoaderCheckpoint {

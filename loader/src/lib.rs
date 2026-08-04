@@ -17,7 +17,6 @@ pub mod contract;
 pub mod dump;
 pub mod error;
 pub mod extent;
-pub mod ffi;
 pub mod plan;
 #[cfg(feature = "testkit")]
 pub mod testkit;

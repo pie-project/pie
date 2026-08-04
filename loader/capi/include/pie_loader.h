@@ -44,10 +44,6 @@ constexpr static const uint32_t PIE_LOADER_TILE_MAP_SCALE = (1 << 7);
 
 constexpr static const uint32_t PIE_LOADER_FUSION_FP8_TO_MXFP4 = (1 << 0);
 
-/// The pie-level schema above the container. An artifact written under a
-/// different one is a miss, not an error: the driver recomputes.
-constexpr static const uint64_t SCHEMA_VERSION = 1;
-
 enum class PieLoaderStatus : uint32_t {
   Ok = 0,
   /// The request was malformed: a null pointer, a non-UTF-8 path, an
@@ -83,7 +79,7 @@ enum class PieLoaderSeverity : uint32_t {
   Error = 1,
 };
 
-/// Whether a declared tensor is bound by the driver. Mirrors [`Visibility`](crate::types::Visibility).
+/// Whether a declared tensor is bound by the driver. Mirrors [`Visibility`](pie_loader::types::Visibility).
 enum class PieLoaderVisibility : uint32_t {
   /// A runtime weight, bound by name.
   Public = 0,
@@ -114,7 +110,7 @@ enum class PieLoaderEncodingKind : uint32_t {
   Quant = 1,
 };
 
-/// Discriminants follow `crate::types::QuantScheme` declaration order, which is
+/// Discriminants follow `pie_loader::types::QuantScheme` declaration order, which is
 /// *not* the order of the hand-written C++ enum this replaces (`MlxAffineU4` is
 /// eighth here and last there). The mismatch was invisible while the boundary
 /// was JSON, because the C++ parser mapped by name. Now that the two sides share
@@ -210,7 +206,7 @@ enum class PieLoaderScaleForm : uint32_t {
   Bf16AffineFactors = 2,
 };
 
-/// Which constructor a node is. Mirrors [`crate::contract::Expr`] exactly; a
+/// Which constructor a node is. Mirrors [`pie_loader::contract::Expr`] exactly; a
 /// variant added there without a variant here is a compile error in
 /// `read_expr`.
 enum class PieLoaderExprKind : uint32_t {
@@ -228,22 +224,13 @@ enum class PieLoaderExprKind : uint32_t {
   Scale = 11,
   /// The two group nodes. Both stand for an index the contract does not
   /// name, so both are an error outside a
-  /// [`GroupContract`](crate::contract::GroupContract) -- which the C ABI
+  /// [`GroupContract`](pie_loader::contract::GroupContract) -- which the C ABI
   /// cannot declare yet, so a C++ author has no use for these today. They are
   /// numbered here because the numbering is the ABI, and appending later
   /// would be a second decision to get right.
   SrcIndexed = 12,
   Select = 13,
 };
-
-/// Which slice of a tensor-parallel world an expression is being read for.
-///
-/// The whole of a target's rank-dependence, as one value. [`Expr::Shard`] is
-/// the only node that consults it, and it is carried rather than threaded so
-/// that the type checker and the specializer cannot be given different answers:
-/// they share one [`Resolver`](crate::contract::infer::Resolver), so they share
-/// this.
-struct Partition;
 
 /// A borrowed UTF-8 string. Not NUL-terminated: plan strings come from Rust
 /// `String`s, and copying them only to append a NUL would double the arena for
@@ -273,7 +260,7 @@ using PieLoaderCheckpointFileSlice = PieLoaderSlice<PieLoaderCheckpointFileView>
 
 using PieLoaderI64Slice = PieLoaderSlice<int64_t>;
 
-/// [`crate::types::QuantSpec`], flattened.
+/// [`pie_loader::types::QuantSpec`], flattened.
 struct PieLoaderQuantSpecView {
   /// A `PieLoaderQuantScheme` value, as `uint32_t`.
   uint32_t scheme;
@@ -286,7 +273,7 @@ struct PieLoaderQuantSpecView {
   int32_t channel_axis;
 };
 
-/// [`crate::types::Encoding`], flattened. `kind` selects which half is read.
+/// [`pie_loader::types::Encoding`], flattened. `kind` selects which half is read.
 struct PieLoaderEncodingSpec {
   /// A `PieLoaderEncodingKind` value, as `uint32_t`.
   uint32_t kind;
@@ -325,7 +312,7 @@ struct PieLoaderRawTensorSlice {
 /// matters, because the ranks of a TP group compile in parallel from one
 /// checkpoint.
 ///
-/// [`pie_loader_close_checkpoint`]: crate::ffi::entry::pie_loader_close_checkpoint
+/// [`pie_loader_close_checkpoint`]: crate::entry::pie_loader_close_checkpoint
 struct PieLoaderCheckpoint {
   PieLoaderCheckpointFileSlice files;
   /// Every tensor in every file, in the order the reader found them.
@@ -504,7 +491,7 @@ struct PieLoaderScalesView {
   /// containing slice is borrowed — before `read_scales` could reject it.
   /// `read_scales` converts it.
   ///
-  /// [`PieLoaderTargetSpec::encode_scratch_dtype`]: crate::ffi::entry::PieLoaderTargetSpec::encode_scratch_dtype
+  /// [`PieLoaderTargetSpec::encode_scratch_dtype`]: crate::entry::PieLoaderTargetSpec::encode_scratch_dtype
   uint32_t granularity;
   /// Elements of `of` per scale entry, for `PerGroup`.
   uint32_t group_size;
@@ -680,7 +667,7 @@ struct PieLoaderDestExtentView {
 /// What an instruction does, as a tagged union carrying only that operation's
 /// operands.
 ///
-/// This mirrors `crate::plan::StorageInstr` variant for variant. It was a flat
+/// This mirrors `pie_loader::plan::StorageInstr` variant for variant. It was a flat
 /// struct of 32 members with a `kind` tag until every reader had grown a
 /// defence against the members that tag left meaningless: `if (!instr.has_source
 /// || !instr.has_dest)` in three executors, `inputs.size() != 1` around a
@@ -1027,8 +1014,6 @@ struct PieLoaderWeightStore {
   PieLoaderWeightQuantSlice quants;
   void *owner;
 };
-
-
 
 extern "C" {
 

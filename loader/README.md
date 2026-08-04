@@ -17,14 +17,17 @@ target carries the numbers a device measured.
 ## Build and check
 
 ```sh
-cargo test -p pie-loader                     # 247 tests, no GPU needed
+cargo test -p pie-loader -p pie-loader-capi  # the compiler and its C ABI, no GPU needed
 cargo clippy -p pie-loader --all-targets
-cargo run -p pie-loader-cbindgen             # regenerate include/pie_loader.h
+cargo run -p pie-loader-cbindgen             # regenerate capi/include/pie_loader.h
 UPDATE_GOLDEN=1 cargo test -p pie-loader --test golden_plans
 ```
 
-The generated header is committed. Regenerating it must leave it byte-identical
-unless the ABI changed on purpose; `driver/{cuda,metal}` compile against it.
+Two crates: `pie-loader` is the compiler and knows nothing of C;
+`pie-loader-capi` (`capi/`) is the repr(C) marshalling, the extern entry
+points, the `pie-loader` CLI, and the committed header. Regenerating the
+header must leave it byte-identical unless the ABI changed on purpose;
+`driver/{cuda,metal}` compile against it.
 
 ## The tool
 

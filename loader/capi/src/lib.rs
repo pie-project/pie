@@ -1,15 +1,24 @@
-//! The loader's FFI boundary.
+//! The loader's C ABI, as a crate of its own.
+//!
+//! `pie-loader` is the compiler and knows nothing of C; this crate is where
+//! its plans become `#[repr(C)]` and its entry points become symbols a driver
+//! links. Splitting the two makes the layering a dependency arrow instead of
+//! a module convention — the compiler cannot reach the ABI, and everything
+//! that must version with the header lives next to the header.
 //!
 //! `types` is the published `#[repr(C)]` vocabulary, `arena` turns a compiled
-//! [`LoadPlan`](crate::plan::LoadPlan) into it, and `entry` holds the
+//! [`LoadPlan`](pie_loader::plan::LoadPlan) into it, and `entry` holds the
 //! `extern "C"` functions the driver calls. `contract` and `checkpoint` read the
 //! two inputs back the other way — what the driver asks for, and which
 //! checkpoint to ask it of. `weight_store` is a surface of its own: the
 //! materialized-weight artifact, which is about finished device memory rather
 //! than about compiling anything, and carries its own entry points for that
-//! reason. The generated header (`loader/include/pie_loader.h`) is the C view of
-//! exactly those six files; `view` is Rust-side borrowing helpers over them and
-//! publishes nothing.
+//! reason. The generated header (`loader/capi/include/pie_loader.h`) is the C
+//! view of exactly those six files; `view` is Rust-side borrowing helpers over
+//! them and publishes nothing. `contract_writer` publishes nothing either: it
+//! is the test-side stand-in for a C++ author, building the same POD graph a
+//! driver would, and it lives here because the graph it writes is this
+//! crate's.
 //!
 //! This is the only boundary the design has (`architecture.md` §10). There is
 //! no serialized form: a plan is compiled and executed in one process, so a
@@ -19,6 +28,7 @@
 pub mod arena;
 pub mod checkpoint;
 pub mod contract;
+pub mod contract_writer;
 pub mod entry;
 pub mod types;
 pub mod view;
@@ -30,8 +40,8 @@ pub use entry::{
 };
 pub use types::*;
 
-use crate::plan::StorageTarget;
-use crate::types::{BackendKind, DType};
+use pie_loader::plan::StorageTarget;
+use pie_loader::types::{BackendKind, DType};
 
 /// Build the compiler's [`StorageTarget`] from the driver's measured spec.
 ///
@@ -69,7 +79,7 @@ fn storage_target(
     // has never heard of: that bit would silently pass
     // `validate_target_support` and then fail as an unrecognized kernel
     // dispatch at load time, far from its cause (`architecture.md` §8).
-    let known = crate::plan::passes::tile::tile_map_mask(kind);
+    let known = pie_loader::plan::passes::tile::tile_map_mask(kind);
     if spec.tile_map_mask & !known != 0 {
         return Err(format!(
             "target claims tile map transforms {:#x} that the {} backend model \
@@ -96,7 +106,7 @@ fn storage_target(
     })
 }
 
-#[cfg(all(test, feature = "testkit"))]
+#[cfg(test)]
 mod tests;
 
 /// The lowercase name a driver would recognize, for messages only.

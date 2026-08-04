@@ -11,8 +11,8 @@
 //! reclaims it. Between those two points nothing mutates, so handing the plan to
 //! another thread is sound.
 
-use crate::plan::{DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr};
-use crate::types::{Encoding, QuantScheme, Visibility};
+use pie_loader::plan::{DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr};
+use pie_loader::types::{Encoding, QuantScheme, Visibility};
 
 use super::types::*;
 
@@ -168,8 +168,8 @@ impl PlanArena {
         // place that knows how to name its own instructions.
         let mut arena = self;
         let cache_key = arena.store_str(cache_key);
-        let summary = arena.store_str(&crate::dump::describe(plan));
-        let stats_json = arena.store_str(&crate::dump::plan_stats_json(plan));
+        let summary = arena.store_str(&pie_loader::dump::describe(plan));
+        let stats_json = arena.store_str(&pie_loader::dump::plan_stats_json(plan));
         let owner = Box::into_raw(Box::new(arena)).cast::<std::ffi::c_void>();
         Box::into_raw(Box::new(PieLoaderPlan {
             files,

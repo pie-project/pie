@@ -34,7 +34,9 @@ pub fn author(
 ) -> Result<Option<ModelContract>, Error> {
     let author = match facts.model_type.as_str() {
         // ── llama lineage: dense/GQA decoders sharing one storage schema.
-        "qwen3" | "qwen2" | "llama" | "llama3" | "mistral" => crate::llama::contract::author_llama_like,
+        "qwen3" | "qwen2" | "llama" | "llama3" | "mistral" => {
+            crate::llama::contract::author_llama_like
+        }
         "mistral3" | "ministral3" | "olmo2" | "olmo3" => crate::llama::contract::author_dense,
         "phi3" => crate::llama::contract::author_phi3,
         _ => return Ok(None),

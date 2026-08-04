@@ -16,8 +16,9 @@ struct PieLoaderPlan;
 }
 """
 
-# The loader's C surface is exactly `src/ffi/`. Everything else in the crate is
-# the compiler's internal IR, which has no `#[repr(C)]` and must not leak.
+# The loader's C surface is exactly this crate (`loader/capi`). The compiler
+# crate below it is internal IR with no `#[repr(C)]` and must not leak, which
+# `parse_deps = false` guarantees structurally: cbindgen never reads it.
 [parse]
 parse_deps = false
 

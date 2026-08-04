@@ -26,7 +26,12 @@ pub fn hf_shard_axis(name: &str) -> Option<u8> {
     // about the weight. Whether the scale has an axis to split at all is a
     // question about its shape, and `Builder::splittable_axis` answers that
     // one.
-    for suffix in [".weight_scale_inv", ".weight_scale", ".weight_packed", ".scale"] {
+    for suffix in [
+        ".weight_scale_inv",
+        ".weight_scale",
+        ".weight_packed",
+        ".scale",
+    ] {
         if let Some(base) = name.strip_suffix(suffix) {
             let of_weight = hf_shard_axis(&format!("{base}.weight"));
             return of_weight.or_else(|| hf_shard_axis(base));

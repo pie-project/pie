@@ -55,7 +55,6 @@ use pie_loader::checkpoint::write::{WriteTensor, write_zt};
 use pie_loader::contract::ModelContract;
 use pie_loader::dump::dump_load_plan_json;
 use pie_loader::error::Error;
-use pie_loader::ffi::view::verify_marshalled;
 use pie_loader::plan::compile as compile_load_plan;
 use pie_loader::plan::{
     CONVERT_TILE_MAP_MASK, CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan,
@@ -63,6 +62,7 @@ use pie_loader::plan::{
 };
 use pie_loader::types::{BackendKind, DType};
 use pie_loader::verify::ContractView;
+use pie_loader_capi::view::verify_marshalled;
 
 const USAGE: &str = "\
 usage: pie-loader <command> SNAPSHOT CONTRACT [BACKEND] [FUSION] [TP] [TARGET]
