@@ -905,11 +905,42 @@ impl ContextManager {
         }
     }
 
+    /// Context ids currently protected by an in-flight `retain-snapshot`.
+    ///
+    /// `active_snapshots` is keyed by `(username, name, owner)`; each key is
+    /// resolved through the `snapshots` name map to the context it protects.
+    ///
+    /// Why this is needed: `retain_snapshot` arrived together with
+    /// `enforce_snapshot_retention`, which **deletes**. The scheduler's eviction
+    /// path only **suspends**, and never consulted the map — so a snapshot
+    /// pinned by an in-flight request was safe from deletion but not from having
+    /// its pages taken. That is not free: the pages come back via replay forward
+    /// passes on the next open, which is the cost the retain was meant to avoid.
+    ///
+    /// Computed once per scan rather than per candidate; `active_snapshots`
+    /// holds only in-flight requests and is small.
+    fn retained_snapshot_ctx_ids(&self) -> std::collections::HashSet<ContextId> {
+        self.active_snapshots
+            .keys()
+            .filter_map(|(username, name, _)| {
+                self.snapshots
+                    .get(&(username.clone(), name.clone()))
+                    .copied()
+            })
+            .collect()
+    }
+
     /// Find the best eviction victim context on a driver.
     ///
-    /// Priority: defaulted contexts first (regardless of bid), then by
-    /// lowest bid, then by most-recently-spawned process (FCFS tiebreaker),
-    /// then by context id so the result is deterministic.
+    /// Priority: contexts NOT protected by an in-flight retain first, then
+    /// defaulted contexts (regardless of bid), then by lowest bid, then by
+    /// most-recently-spawned process (FCFS tiebreaker), then by context id so
+    /// the result is deterministic.
+    ///
+    /// Retention is a *preference*, not a veto: if every candidate on the driver
+    /// is retained, one is still chosen. A hard skip could leave a fully-retained
+    /// driver unable to free pages at all, trading a slow request for a stuck
+    /// one.
     ///
     /// Non-defaulted victims must have bid ≤ requester_bid.
     /// Defaulted victims are always eligible (they can't pay rent).
@@ -919,10 +950,13 @@ impl ContextManager {
         requester_bid: f64,
         requester: Option<ContextId>,
     ) -> Option<ContextId> {
-        // (defaulted, bid, spawn_time, ctx_id) — best victim has highest
-        // defaulted, lowest bid, latest spawn_time. `spawn_time` is `None` for a
-        // context with no owning process; see `newer_for_eviction`.
-        let mut best: Option<(bool, f64, Option<Instant>, ContextId)> = None;
+        let retained = self.retained_snapshot_ctx_ids();
+
+        // (retained, defaulted, bid, spawn_time, ctx_id) — best victim is
+        // un-retained first, then highest defaulted, lowest bid, latest
+        // spawn_time. `spawn_time` is `None` for a context with no owning
+        // process; see `newer_for_eviction`.
+        let mut best: Option<(bool, bool, f64, Option<Instant>, ContextId)> = None;
 
         for (&ctx_id, ctx) in &self.contexts {
             if requester == Some(ctx_id) {
@@ -954,24 +988,30 @@ impl ContextManager {
                 .and_then(|pid| self.processes.get(&pid))
                 .map(|p| p.created_at);
 
-            let dominated = if let Some((best_def, best_bid, best_time, best_id)) = best {
-                // Prefer defaulted over non-defaulted
-                (ctx.defaulted && !best_def)
-                // Same default status: prefer lower bid
-                || (ctx.defaulted == best_def && ctx.bid < best_bid)
-                // Same default + bid: prefer later spawn (FCFS), ties on ctx_id
-                || (ctx.defaulted == best_def
-                    && ctx.bid == best_bid
-                    && Self::newer_for_eviction(spawn_time, best_time, ctx_id, best_id))
+            let is_retained = retained.contains(&ctx_id);
+
+            let dominated = if let Some((best_ret, best_def, best_bid, best_time, best_id)) = best {
+                // Strongest preference: do not take pages from a snapshot an
+                // in-flight request is holding.
+                (!is_retained && best_ret)
+                    || (is_retained == best_ret
+                        // Prefer defaulted over non-defaulted
+                        && ((ctx.defaulted && !best_def)
+                        // Same default status: prefer lower bid
+                        || (ctx.defaulted == best_def && ctx.bid < best_bid)
+                        // Same default + bid: prefer later spawn (FCFS), ties on ctx_id
+                        || (ctx.defaulted == best_def
+                            && ctx.bid == best_bid
+                            && Self::newer_for_eviction(spawn_time, best_time, ctx_id, best_id))))
             } else {
                 true
             };
             if dominated {
-                best = Some((ctx.defaulted, ctx.bid, spawn_time, ctx_id));
+                best = Some((is_retained, ctx.defaulted, ctx.bid, spawn_time, ctx_id));
             }
         }
 
-        best.map(|(_, _, _, ctx_id)| ctx_id)
+        best.map(|(_, _, _, _, ctx_id)| ctx_id)
     }
 
     /// Helper: enqueue a context for restoration.
@@ -1930,5 +1970,50 @@ mod tests {
                 "victim must not depend on per-map hash seeding"
             );
         }
+    }
+
+    /// Name a fixture context as a snapshot and pin it with `retain_snapshot`,
+    /// the way an in-flight request does.
+    fn retain(mgr: &mut ContextManager, name: &str, ctx_id: ContextId) {
+        mgr.snapshots
+            .insert(("u".to_string(), name.to_string()), ctx_id);
+        mgr.retain_snapshot("u".to_string(), name.to_string(), ProcessId::new_v4())
+            .expect("retain_snapshot");
+    }
+
+    /// A snapshot pinned by an in-flight request must not be the victim while
+    /// any unretained candidate exists.
+    ///
+    /// `active_snapshots` previously guarded only `enforce_snapshot_retention`,
+    /// which DELETES. The scheduler SUSPENDS and ignored the map entirely, so a
+    /// retained snapshot was safe from deletion but not from losing its pages —
+    /// and those come back only via replay forward passes, which is exactly the
+    /// cost the retain was meant to prevent.
+    #[test]
+    fn retained_snapshot_is_spared_when_an_alternative_exists() {
+        let mut mgr = ownerless_ctx_fixture(3);
+        // ctx 3 would otherwise win on the ctx_id tiebreak.
+        retain(&mut mgr, "conv/pinned", 3);
+
+        let victim = mgr.find_eviction_victim(0, 1.0, None);
+        assert_ne!(victim, Some(3), "a retained snapshot must be spared");
+        assert_eq!(victim, Some(2), "the best unretained candidate wins instead");
+    }
+
+    /// Retention is a preference, not a veto.
+    ///
+    /// If every candidate on the driver is retained, one must still be chosen —
+    /// a hard skip would leave the driver unable to free pages at all, trading a
+    /// slow request for a stuck one.
+    #[test]
+    fn retained_snapshot_is_still_evictable_when_it_is_the_only_candidate() {
+        let mut mgr = ownerless_ctx_fixture(1);
+        retain(&mut mgr, "conv/only", 1);
+
+        assert_eq!(
+            mgr.find_eviction_victim(0, 1.0, None),
+            Some(1),
+            "with no alternative, a retained snapshot must still be evictable"
+        );
     }
 }
