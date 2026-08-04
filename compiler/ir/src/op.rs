@@ -262,10 +262,15 @@ pub enum Op {
     Transpose(ValueId),
 
     // ── scan (last axis; per-row for rank ≥ 2) ───────────────────────────
-    /// Inclusive prefix sum along the last axis; shape preserved.
+    /// Inclusive prefix sum along the last axis; shape and dtype preserved.
+    ///
+    /// Numeric, not F32-only, and that matters: a prefix sum over lengths is
+    /// how a ragged tensor's row offsets are built, and offsets are U32. An
+    /// F32-only scan makes an author round-trip `u32 → f32 → u32`, which is
+    /// exact only below 2^24 and silently is not above it.
     CumSum(ValueId),
-    /// Inclusive prefix product along the last axis; shape
-    /// preserved.
+    /// Inclusive prefix product along the last axis; shape and dtype
+    /// preserved. Numeric, like [`Op::CumSum`]; integer overflow wraps.
     CumProd(ValueId),
 
     // ── order ────────────────────────────────────────────────────────────

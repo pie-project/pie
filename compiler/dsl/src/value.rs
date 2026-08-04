@@ -926,11 +926,14 @@ pub fn reduce_argmax(x: impl AsTensor) -> Tensor {
         ValueType::new(reduce_shape(t.shape), DType::I32)
     })
 }
-/// Inclusive prefix sum along the last axis; `F32` only, shape preserved.
+/// Inclusive prefix sum along the last axis; numeric, shape and dtype
+/// preserved. Integer lanes scan in their own dtype and wrap on overflow, so
+/// a `u32` offset scan stays exact past 2^24.
 pub fn cumsum(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumSum, |t| t)
 }
-/// Inclusive prefix product along the last axis; `F32` only, shape preserved.
+/// Inclusive prefix product along the last axis; numeric, shape and dtype
+/// preserved. Integer lanes wrap on overflow.
 pub fn cumprod(x: impl AsTensor) -> Tensor {
     emit_unary(&x, Op::CumProd, |t| t)
 }

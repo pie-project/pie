@@ -153,6 +153,32 @@ pub(super) fn combine_argmax(left: ArgmaxCandidate, right: ArgmaxCandidate) -> A
     }
 }
 
+/// Inclusive prefix scan of each row, combining with `combine`.
+///
+/// Sequential and left-to-right, unlike [`reduce_tree`]'s width-32 tree: a
+/// scan's every prefix is an output, so there is no associativity freedom for
+/// a launch geometry to spend and no canonical tree to pin. The caller passes
+/// the combiner rather than an `Add` bound so that integer lanes can say
+/// `wrapping_add` — a scan whose sum leaves the dtype must wrap the way the
+/// device wraps, not panic in a debug build and wrap in a release one.
+pub(super) fn scan_rows<T: Copy>(
+    lanes: &[T],
+    rows: usize,
+    identity: T,
+    combine: impl Fn(T, T) -> T,
+) -> Vec<T> {
+    let len = lanes.len().checked_div(rows).unwrap_or(0);
+    let mut out = Vec::with_capacity(lanes.len());
+    for row in 0..rows {
+        let mut acc = identity;
+        for &lane in &lanes[row * len..(row + 1) * len] {
+            acc = combine(acc, lane);
+            out.push(acc);
+        }
+    }
+    out
+}
+
 /// Argmax with the pinned contract: lower index wins ties; NaN never selected
 /// (all-NaN row -> 0), evaluated through the canonical tree.
 pub(super) fn argmax_row(row: &[f32]) -> i32 {

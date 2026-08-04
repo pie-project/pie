@@ -478,3 +478,48 @@ fn the_extremum_rule_pins_nan_and_signed_zero() {
         }
     }
 }
+
+/// A `u32` prefix scan is exact where an `f32` one is not.
+///
+/// This is the reason `cumsum` stopped being F32-only. Ragged row offsets are
+/// built by scanning per-row lengths, the offsets are `u32`, and the only way
+/// to scan them under the old rule was `u32 -> f32 -> u32`. That round trip is
+/// exact below 2^24 and rounds above it, so a long enough context produced
+/// offsets that were wrong by one element and nothing anywhere said so.
+///
+/// The `f32` column is computed here rather than asserted from memory: the
+/// claim is not "16777217 is unrepresentable", it is "the old lowering and the
+/// new one disagree, and the new one is right".
+#[test]
+fn an_integer_scan_stays_exact_past_the_float_mantissa() {
+    let lengths: Vec<u32> = vec![16_777_216, 1, 1, 1];
+
+    let exact = scan_rows(&lengths, 1, 0u32, u32::wrapping_add);
+    assert_eq!(exact, vec![16_777_216, 16_777_217, 16_777_218, 16_777_219]);
+
+    let through_f32: Vec<u32> = scan_rows(
+        &lengths.iter().map(|&n| n as f32).collect::<Vec<f32>>(),
+        1,
+        0.0f32,
+        |a, b| a + b,
+    )
+    .into_iter()
+    .map(|x| x as u32)
+    .collect();
+    assert_eq!(
+        through_f32,
+        vec![16_777_216; 4],
+        "the f32 round trip this op was widened to remove: every +1 past the \
+         mantissa rounds back to even, so three more tokens move no offset"
+    );
+
+    // Rows scan independently, and a product wraps rather than panicking.
+    assert_eq!(
+        scan_rows(&[1u32, 2, 3, 4, 5, 6], 2, 0u32, u32::wrapping_add),
+        vec![1, 3, 6, 4, 9, 15]
+    );
+    assert_eq!(
+        scan_rows(&[1u32 << 31, 2, 3], 1, 1u32, u32::wrapping_mul),
+        vec![1 << 31, 0, 0]
+    );
+}
