@@ -2601,3 +2601,19 @@ masked×depth stash/restore detour (D2D copies at layer k) is
 subsumed: the truncated middle is just another region whose rows
 leave the iteration space at their boundary. Delete it; re-run the
 1.32-2.25x depth pricing to capture the win.
+
+## ACT 1'S PROBLEM STATEMENT, MEASURED (2026-08-04)
+
+The uniform_k join refusal turns out to guard only BOTH-AXES lanes
+(mask+depth); plain mixed-k decode lanes already co-fire. The
+③c-ii boot's trace shows it live: `[fire] R=4 ... k=-1` — a k=8, a
+k=12 and full-depth lanes joined in one fire that runs EVERYONE at
+full depth (the S-2 mixed-k decline's safe degradation), then the
+drain solos show `k=12`, `k=8` once the group dissolves. The depth
+axis is thus TODAY exactly where the mask axis was before NS-2: the
+special form pays the general form's price whenever it composes.
+Banded depth is pure DRIVER work (no engine relax needed — the joins
+already happen): serve the table's deepest-first bands with a prefix
+decode plan per boundary, behind PIE_DEPTH_BANDS until priced. The
+A/B is ready-made: today's R=4-at-full-depth fire vs the banded fire,
+same lanes.
