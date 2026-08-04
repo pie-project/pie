@@ -168,23 +168,27 @@ fn list() -> Result<()> {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     if entries.is_empty() {
-        println!("(no models in cache)");
+        println!("nothing downloaded yet");
+        println!("  `pie model download <repo-id>` fetches one");
         println!("\n{}", hub.display());
         return Ok(());
     }
 
-    let colorize = std::io::stdout().is_terminal();
-    let (green, dim, reset) = if colorize {
-        ("\x1b[32m", "\x1b[2m", "\x1b[0m")
-    } else {
-        ("", "", "")
-    };
+    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
+    let (dim, reset) = (palette.dim(), palette.reset());
     for (repo_id, ok, info) in &entries {
-        if *ok {
-            println!("  {green}✓{reset} {repo_id} {dim}({info}){reset}");
+        // `✓` is reserved for "this command did something". A model pie can
+        // serve is unremarkable; one it cannot is the row worth finding, so
+        // that is the one that carries a mark.
+        let mark = if *ok {
+            crate::ui::Mark::Plain
         } else {
-            println!("  {dim}○ {repo_id} ({info}){reset}");
-        }
+            crate::ui::Mark::Absent
+        };
+        println!(
+            "  {} {repo_id} {dim}({info}){reset}",
+            mark.render(&palette)
+        );
     }
     println!("\n{dim}{}{reset}", hub.display());
     Ok(())
@@ -226,7 +230,11 @@ fn download(repo_id: String, all: bool) -> Result<()> {
         progress.finish();
         result
     })?;
-    println!("✓ Downloaded to {}", snapshot_path.display());
+    println!(
+        "{} downloaded to {}",
+        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
+        snapshot_path.display()
+    );
 
     // Post-download compatibility check. The cache layout puts
     // `snapshots/<commit>/` two levels below the repo dir we want to
@@ -237,19 +245,21 @@ fn download(repo_id: String, all: bool) -> Result<()> {
         .map(|p| p.to_path_buf());
     if let Some(repo_dir) = repo_dir {
         let (ok, info) = check_pie_compatibility(&repo_dir);
-        let colorize = std::io::stdout().is_terminal();
-        let (green, yellow, dim, reset) = if colorize {
-            ("\x1b[32m", "\x1b[33m", "\x1b[2m", "\x1b[0m")
-        } else {
-            ("", "", "", "")
-        };
+        let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
+        let (dim, reset) = (palette.dim(), palette.reset());
         println!();
         if ok {
-            println!("{green}✓{reset} Pie compatible (arch: {info})");
+            println!(
+                "{} pie can serve this (arch: {info})",
+                crate::ui::Mark::Did.render(&palette)
+            );
             println!("Add to config.toml:");
             println!("  {dim}hf_repo = \"{repo_id}\"{reset}");
         } else {
-            println!("{yellow}!{reset} Not Pie compatible ({info})");
+            println!(
+                "{} pie cannot serve this ({info})",
+                crate::ui::Mark::Warn.render(&palette)
+            );
         }
     }
     Ok(())
@@ -304,7 +314,8 @@ impl ProgressBar {
                 started: Instant::now(),
                 last_draw: Mutex::new(Instant::now()),
                 finished: AtomicBool::new(false),
-                is_tty: std::io::stderr().is_terminal(),
+                is_tty: crate::ui::colour_enabled(crate::ui::Stream::Stderr)
+                    || std::io::stderr().is_terminal(),
             }),
         }
     }
@@ -347,14 +358,18 @@ impl ProgressBar {
         let bar_width = 30usize;
         let filled = (pct * bar_width as f64).round() as usize;
         let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-        let line = format!(
-            "\r\x1b[K  {bar} {pct:>5.1}% {done} / {total} @ {rate}/s",
+        let body = format!(
+            "  {bar} {pct:>5.1}% {done} / {total} @ {rate}",
             pct = pct * 100.0,
-            done = format_bytes(done),
-            total = format_bytes(total),
-            rate = format_bytes(rate as u64),
+            done = crate::ui::bytes(done),
+            total = crate::ui::bytes(total),
+            rate = crate::ui::rate(rate),
         );
-        eprint!("{line}");
+        // Cut to the terminal. A line that wraps puts the cursor on a second
+        // screen row, and the `\r` that starts the next redraw then returns to
+        // the start of THAT row -- leaving the first one behind as debris for
+        // the rest of the download.
+        eprint!("\r\x1b[K{}", crate::ui::clip(&body, crate::ui::width()));
         let _ = std::io::stderr().flush();
     }
 }
@@ -417,20 +432,6 @@ impl ProgressHandler for ProgressBar {
     }
 }
 
-fn format_bytes(n: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if n >= GIB {
-        format!("{:.2} GiB", n as f64 / GIB as f64)
-    } else if n >= MIB {
-        format!("{:.1} MiB", n as f64 / MIB as f64)
-    } else if n >= KIB {
-        format!("{:.1} KiB", n as f64 / KIB as f64)
-    } else {
-        format!("{n} B")
-    }
-}
 
 // -----------------------------------------------------------------------------
 // remove
@@ -477,7 +478,10 @@ fn remove(repo_id: String, skip_confirm: bool) -> Result<()> {
     // moot here because the cross-repo blob sharing it accounts for
     // doesn't exist in the on-disk layout.
     std::fs::remove_dir_all(&model_dir).map_err(|e| anyhow!("remove {model_dir:?}: {e}"))?;
-    println!("✓ Removed");
+    println!(
+        "{} removed",
+        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout))
+    );
     Ok(())
 }
 
@@ -588,10 +592,4 @@ mod tests {
         assert_eq!(info, "no config");
     }
 
-    #[test]
-    fn format_bytes_units() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
-        assert!(format_bytes(2_500_000_000).starts_with("2."));
-    }
 }

@@ -77,7 +77,11 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
     }
     std::fs::write(&cfg_path, default_config_content())
         .map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
-    println!("✓ Configuration file created at {cfg_path:?}");
+    println!(
+        "{} config written to {}",
+        crate::ui::Mark::Did.render(&crate::ui::Palette::for_stream(crate::ui::Stream::Stdout)),
+        cfg_path.display()
+    );
     // Writing a config file does not install anything. This used to fetch the
     // Python-WASM runtime here, and told you to rerun `pie config init
     // --force` if it failed -- overwriting your config to retry a download.
@@ -124,12 +128,8 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>) -> Result<()> {
         );
     }
 
-    let colorize = std::io::stdout().is_terminal();
-    let (dim, bold, reset) = if colorize {
-        ("\x1b[2m", "\x1b[1m", "\x1b[0m")
-    } else {
-        ("", "", "")
-    };
+    let palette = crate::ui::Palette::for_stream(crate::ui::Stream::Stdout);
+    let (dim, bold, reset) = (palette.dim(), palette.bold(), palette.reset());
 
     // Column widths from the rows actually being printed, so a filtered
     // listing is not padded out to the width of the ones it excluded.
@@ -167,16 +167,24 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>) -> Result<()> {
             // A marker rather than a colour: this is the column a person scans
             // for -- what have I actually changed? -- and it has to survive a
             // pipe.
-            let mark = if is_set(&file, &field.key) { "*" } else { " " };
+            let mark = if is_set(&file, &field.key) {
+                crate::ui::Mark::Chosen
+            } else {
+                crate::ui::Mark::Plain
+            }
+            .render(&palette);
             println!(
                 "{mark} {:<name_width$}  {:<value_width$}  {dim}{}{reset}",
                 leaf(&field.key),
-                clip(&effective(&file, field), value_width),
-                clip(&plain(&field.doc), 64),
+                crate::ui::clip(&effective(&file, field), value_width),
+                crate::ui::clip(
+                    &plain(&field.doc),
+                    crate::ui::width().saturating_sub(name_width + value_width + 6),
+                ),
             );
         }
     }
-    println!("\n{dim}* set in {}{reset}", cfg_path.display());
+    println!("\n{dim}• set in {}{reset}", cfg_path.display());
     Ok(())
 }
 
@@ -203,15 +211,6 @@ fn plain(doc: &str) -> String {
     doc.replace("**", "")
 }
 
-/// Cut to `width`, on a word boundary, with an ellipsis to say so.
-fn clip(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(width).collect();
-    let cut = clipped.rfind(' ').unwrap_or(clipped.len());
-    format!("{}…", clipped[..cut].trim_end())
-}
 
 fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
     let (cfg_path, origin) = startup::cli_config_path(global);

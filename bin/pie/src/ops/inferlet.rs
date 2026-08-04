@@ -5,13 +5,14 @@
 //! same cache at boot, so a CLI with its own idea of the layout would be a
 //! CLI that can hide a program from the thing meant to run it.
 
-use std::io::IsTerminal;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 
 use pie_engine::inferlet::program::{Manifest, ProgramName, Repository};
+
+use crate::ui::{self, Palette, Stream};
 
 
 #[derive(Subcommand, Debug)]
@@ -70,12 +71,12 @@ fn list() -> Result<()> {
     let repo = open(String::new());
     let cached = repo.cached();
     if cached.is_empty() {
-        println!("no inferlets downloaded (they arrive on first use, or with");
-        println!("`pie inferlet download <name>`)");
+        println!("nothing downloaded yet");
+        println!("  inferlets arrive on first use, or with `pie inferlet download <name>`");
         return Ok(());
     }
-    let colorize = std::io::stdout().is_terminal();
-    let (dim, reset) = if colorize { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
+    let palette = Palette::for_stream(Stream::Stdout);
+    let (dim, reset) = (palette.dim(), palette.reset());
     let width = cached
         .iter()
         .map(|(name, _, _)| name.name.len() + name.version.len() + 1)
@@ -83,43 +84,17 @@ fn list() -> Result<()> {
         .unwrap_or(0);
     for (name, manifest, size) in &cached {
         let id = format!("{}@{}", name.name, name.version);
-        let description = summarize(manifest.package.description.as_deref().unwrap_or(""));
-        println!("  {id:<width$}  {:>8}  {dim}{description}{reset}", human(*size));
+        // Descriptions are author-written and unbounded -- one in the test set
+        // runs to a paragraph on mask semantics -- so the row is cut to what is
+        // left of the terminal. `pie inferlet info` prints the whole thing.
+        let room = ui::width().saturating_sub(width + 14);
+        let description = ui::clip(
+            manifest.package.description.as_deref().unwrap_or("").lines().next().unwrap_or("").trim(),
+            room,
+        );
+        println!("  {id:<width$}  {:>8}  {dim}{description}{reset}", ui::bytes(*size));
     }
     Ok(())
-}
-
-/// A manifest description down to one line's worth.
-///
-/// These are author-written and unbounded -- one in the test set runs to a
-/// full paragraph on mask semantics -- so a listing that printed them whole
-/// would wrap into unreadability and bury the rows around it. Cut on a word
-/// boundary; `pie inferlet info` prints the whole thing.
-fn summarize(description: &str) -> String {
-    const WIDTH: usize = 72;
-    let line = description.lines().next().unwrap_or("").trim();
-    if line.chars().count() <= WIDTH {
-        return line.to_string();
-    }
-    let clipped: String = line.chars().take(WIDTH).collect();
-    let cut = clipped.rfind(' ').unwrap_or(clipped.len());
-    format!("{}…", clipped[..cut].trim_end())
-}
-
-/// Bytes as the largest binary unit that leaves a number worth reading.
-fn human(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 3] = [("MiB", 1 << 20), ("KiB", 1 << 10), ("B", 1)];
-    for (suffix, scale) in UNITS {
-        if bytes >= scale {
-            let value = bytes as f64 / scale as f64;
-            return if scale == 1 || value >= 100.0 {
-                format!("{value:.0}{suffix}")
-            } else {
-                format!("{value:.1}{suffix}")
-            };
-        }
-    }
-    "0B".to_string()
 }
 
 async fn download(args: TargetArgs, global: &startup::GlobalArgs) -> Result<()> {
@@ -273,12 +248,16 @@ fn validate_bare_inferlet_name(name: &str) -> Result<()> {
 }
 
 fn print_manifest(program: &ProgramName, manifest: &Manifest) {
-    let colorize = std::io::stdout().is_terminal();
-    let (bold, dim, cyan, green, reset) = if colorize {
-        ("\x1b[1m", "\x1b[2m", "\x1b[36m", "\x1b[32m", "\x1b[0m")
-    } else {
-        ("", "", "", "", "")
-    };
+    let palette = Palette::for_stream(Stream::Stdout);
+    let (bold, dim, cyan, green, reset) = (
+        palette.bold(),
+        palette.dim(),
+        // Cyan is this one screen's own accent for parameter names; the shared
+        // palette carries the roles every command uses, not every colour.
+        if palette.enabled() { "\x1b[36m" } else { "" },
+        palette.green(),
+        palette.reset(),
+    );
 
     println!("{bold}{program}{reset}");
     if let Some(description) = &manifest.package.description {
@@ -343,21 +322,6 @@ fn parameter_type_name(param_type: &pie_engine::inferlet::program::ParameterType
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_long_description_is_cut_on_a_word_boundary() {
-        assert_eq!(summarize("short"), "short");
-        // A real one from the test set: a paragraph that would wrap the row
-        // into unreadability and bury the rows around it.
-        let long = "Overview §6.2 beam search, DESIGN B form (logical mask-out \
-                    and lazy compaction): the guest beam epilogue appends each \
-                    survivor's new token";
-        let cut = summarize(long);
-        assert!(cut.chars().count() <= 73, "got {} chars", cut.chars().count());
-        assert!(cut.ends_with('…'));
-        assert!(!cut.contains("  "), "should not end mid-space: {cut:?}");
-        // Only the first line, so a multi-line description cannot break the row.
-        assert_eq!(summarize("first\nsecond"), "first");
-    }
 
     #[test]
     fn latest_version_from_registry_json_uses_first_version() {

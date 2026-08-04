@@ -20,6 +20,8 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use crate::ui::{Mark, Palette, Stream};
+
 /// `pie doctor` entry point. Returns whether pie can boot.
 pub fn doctor(global: &startup::GlobalArgs) -> Result<bool> {
     let mut warnings = 0usize;
@@ -165,12 +167,13 @@ enum Status {
 }
 
 fn print_check(key: &str, value: &str, status: Status) {
-    let glyph = match status {
-        Status::Pass => "✓",
-        Status::Warn => "!",
-        Status::Fail => "✗",
+    let palette = Palette::for_stream(Stream::Stdout);
+    let mark = match status {
+        Status::Pass => Mark::Did,
+        Status::Warn => Mark::Warn,
+        Status::Fail => Mark::Blocked,
     };
-    println!("  {glyph} {:<20} {}", key, value);
+    println!("  {} {:<20} {}", mark.render(&palette), key, value);
 }
 
 /// Only ever called for checks that cannot fail; the config section counts

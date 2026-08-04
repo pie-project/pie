@@ -172,15 +172,19 @@ impl ProgressLine {
             (progress.read_bytes * 100 / progress.total_read_bytes).min(100)
         };
         let filled = (percent / 5) as usize;
-        let gb = |bytes: u64| bytes as f64 / 1e9;
-        eprint!(
-            "\r  [{}{}] {percent:3}%  {:.2}/{:.2} GB  {:<48.48}",
-            "#".repeat(filled),
-            "-".repeat(20 - filled),
-            gb(progress.read_bytes),
-            gb(progress.total_read_bytes),
-            self.current
+        // Same bar glyphs and the same binary units as `pie model download`.
+        // This drew `#`/`-` in decimal GB while that drew blocks in GiB, so
+        // the two progress displays in one CLI disagreed about both the shape
+        // of a bar and the size of a gigabyte.
+        let body = format!(
+            "  {}{} {percent:3}%  {}/{}  {}",
+            "█".repeat(filled),
+            "░".repeat(20 - filled),
+            crate::ui::bytes(progress.read_bytes),
+            crate::ui::bytes(progress.total_read_bytes),
+            self.current,
         );
+        eprint!("\r\x1b[K{}", crate::ui::clip(&body, crate::ui::width()));
     }
 
     fn finish(&mut self) {
