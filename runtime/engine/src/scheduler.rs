@@ -437,6 +437,8 @@ pub(crate) struct GuestPhaseAcc {
     pub park_free_n: AtomicU64,
     pub park_ns: AtomicU64,
     pub park_max_ns: AtomicU64,
+    /// Head-harmless free-list bypass grants (`PIE_ALLOC_FAST_SMALL=1`).
+    pub fast_small_n: AtomicU64,
 }
 
 /// Per-lane run-ahead probe: at every seal, how deep each awaited lane's
@@ -544,6 +546,7 @@ pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
     park_free_n: AtomicU64::new(0),
     park_ns: AtomicU64::new(0),
     park_max_ns: AtomicU64::new(0),
+    fast_small_n: AtomicU64::new(0),
 };
 
 pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {

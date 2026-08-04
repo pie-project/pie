@@ -1302,6 +1302,35 @@ impl ResidencyPlanner {
             // under "dies ... derivatives of implicit membership".
             let uncontended = self.waiters.load(Ordering::Acquire) == 0
                 && self.nonresident.load(Ordering::Acquire) == 0;
+            // Opt-in (`PIE_ALLOC_FAST_SMALL=1`) head-harmless bypass: even
+            // with the fast path closed, serve THIS ask straight from the
+            // free lists when free pages cover the ask AND the FCFS head's
+            // remaining shortfall — the head could not have used what this
+            // ask takes, so no page the head is entitled to is diverted.
+            // (12% of contended parks happen with free >= demand; under
+            // strict FCFS they wait for the queue anyway.) Exact
+            // arithmetic, no constants; racing drains are safe because
+            // `try_reserve` simply fails and the ask parks as before.
+            if !uncontended && fast_small_bypass_enabled() && demand.rs_slots == 0 {
+                let (free_now, _) = self.port.device_stats();
+                let head_covered = self.with_inner(|inner| {
+                    let head_shortfall = inner
+                        .unmet_head()
+                        .map(|(_, waiter)| {
+                            waiter.kv_need().saturating_sub(inner.accum.len() as u32)
+                        })
+                        .unwrap_or(0);
+                    free_now >= demand.kv_pages.saturating_add(head_shortfall)
+                });
+                if head_covered && let Some(grant) = self.try_reserve(demand) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    crate::scheduler::GUEST_PHASES
+                        .fast_small_n
+                        .fetch_add(1, Relaxed);
+                    self.note_progress(pid);
+                    return Ok(Acquired::Granted(grant));
+                }
+            }
             if !uncontended {
                 // E6 progress: this process is asking to fire again. Under
                 // contention only — the same condition the zero-demand path
@@ -3207,6 +3236,15 @@ enum Board {
 }
 
 /// Saturating microseconds for the stat counters.
+/// `PIE_ALLOC_FAST_SMALL=1`: allow the head-harmless free-list bypass in
+/// `acquire` (see the comment at its use site). Default off.
+fn fast_small_bypass_enabled() -> bool {
+    static CONFIGURED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("PIE_ALLOC_FAST_SMALL").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
 fn micros(elapsed: Duration) -> u64 {
     elapsed.as_micros().min(u128::from(u64::MAX)) as u64
 }

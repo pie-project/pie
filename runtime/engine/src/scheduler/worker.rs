@@ -4761,11 +4761,12 @@ impl BatchScheduler {
             take(&gacc.fsub_ns) / 1_000,
             take(&gacc.fsub_max_ns) / 1_000,
         );
-        let (alloc_park_n, alloc_park_free_n, alloc_park, alloc_park_max) = (
+        let (alloc_park_n, alloc_park_free_n, alloc_park, alloc_park_max, alloc_fast_small) = (
             take(&gacc.park_n),
             take(&gacc.park_free_n),
             take(&gacc.park_ns) / 1_000,
             take(&gacc.park_max_ns) / 1_000,
+            take(&gacc.fast_small_n),
         );
         let (retire_instances, retire_mark, retire_resolve, retire_drop, retire_emit, retire_n) = (
             take(&acc.retire_instances_ns) / 1_000,
@@ -4905,6 +4906,7 @@ impl BatchScheduler {
                 ("alloc_park_free_n", alloc_park_free_n),
                 ("alloc_park_us", alloc_park),
                 ("alloc_park_max_us", alloc_park_max),
+                ("alloc_fast_small_n", alloc_fast_small),
                 (
                     "guest_resume_us",
                     if guest_resume_n > 0 {
