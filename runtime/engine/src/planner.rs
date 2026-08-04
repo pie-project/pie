@@ -2036,7 +2036,26 @@ impl ResidencyPlanner {
     fn victim_set(&self) -> Option<VictimSet> {
         self.with_inner(|inner| {
             let (head, waiter) = inner.unmet_head()?;
-            let missing = waiter.kv_need().saturating_sub(inner.accum.len() as u32);
+            // The round covers the head's shortfall PLUS the queued
+            // quantum-ask stream (the same demand `supply_stalled` orders
+            // the round for): sizing by the head alone kept rounds at ~one
+            // victim, so the supply RATE saturated at the round latency and
+            // the early gate moved nothing (free 2.0 pages, parks
+            // unchanged — measured). Rule A untouched: restores still do
+            // not count.
+            let queued_quantum: u32 = inner
+                .queue
+                .values()
+                .filter(|queued| queued.is_unmet())
+                .filter_map(|queued| match &queued.kind {
+                    WaitKind::Allocation { demand, .. } if demand.kv_pages == 1 => Some(1),
+                    _ => None,
+                })
+                .sum();
+            let missing = waiter
+                .kv_need()
+                .max(queued_quantum)
+                .saturating_sub(inner.accum.len() as u32);
             // Evictions already in flight fund the head when they land;
             // never over-evict for pages that are already on their way.
             let expected: u32 = inner.evicting.values().map(|mark| mark.pages).sum();
