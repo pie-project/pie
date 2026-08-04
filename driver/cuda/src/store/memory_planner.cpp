@@ -333,6 +333,9 @@ CudaMemoryPlan plan_cuda_memory(
         policy_profiles = {"latency"};
     }
     const bool score_as_auto = auto_profile && !narrow_latency_auto;
+    // Read once: this boot either measures or serves, and the answer decides
+    // both which candidates exist and which one gets built.
+    const bool calibrating = planner_calibration_requested();
     const std::vector<int> kv_page_sizes =
         derive_kv_page_size_candidates(cfg, hf, prop);
 
@@ -502,7 +505,23 @@ CudaMemoryPlan plan_cuda_memory(
     if (policy_profile == "latency") {
         Rs.push_back(std::max(1, decode_target / 4));
     }
-    uniq_clip_desc(Ns, prefill_cap);
+    // A calibration boot searches the space the DEVICE allows, not the space
+    // the score prefers. `Ns` and `Rs` above are generated from this profile's
+    // targets and then clipped by `prefill_cap` -- which is the analytic model
+    // both proposing the candidates and bounding them, so a measurement taken
+    // inside it can trim the model's answer but never overrule it. That is the
+    // circularity: `prefer_qwen3_8b_prefill_shape` claims the budget should be
+    // HIGHER than the generic cap, and a sweep confined below the cap cannot
+    // evaluate that claim in either direction.
+    //
+    // So widen both ladders to a geometric sweep and let the only real
+    // boundary do the cutting: `arena + persistent_bytes >= budget` below,
+    // which is memory, not preference.
+    if (calibrating) {
+        for (int n = 256; n <= 131072; n *= 2) Ns.push_back(n);
+        for (int r = 16; r <= 4096; r *= 2) Rs.push_back(r);
+    }
+    uniq_clip_desc(Ns, calibrating ? 131072 : prefill_cap);
     uniq_clip_desc(Rs, 4096);
     // Quest key envelopes are `[num_pages, kv_heads, head_dim]` bf16 x2 per
     // layer, i.e. per PAGE rather than per token, so they do not scale with
@@ -902,6 +921,44 @@ CudaMemoryPlan plan_cuda_memory(
                           << " to re-calibrate.\n";
             }
         }
+    }
+    // A calibration boot builds the CEILING of the feasible region rather than
+    // the score's pick, because a bigger arena can run a smaller shape and not
+    // the other way round. With the ceiling built, the sweep's downward-only
+    // ladder stops being a restriction and becomes the correct direction.
+    //
+    // The ceiling is the largest explorable rectangle: the sweep runs shapes
+    // with `requests <= max_requests` and `tokens <= max_workspace_tokens`, so
+    // the box it can cover is the product. This is one point on a frontier, not
+    // the frontier -- a taller box is a narrower one -- and covering the whole
+    // frontier would take more than one calibration boot. Worth saying rather
+    // than implying.
+    //
+    // The small KV pool this leaves is free here: a calibration boot serves
+    // nothing, so pages it does not have are pages nothing wanted.
+    if (calibrating) {
+        best_it = std::max_element(
+            candidates.begin(), candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+                const auto area = [](const Candidate& c) {
+                    return static_cast<std::int64_t>(c.plan.max_workspace_tokens) *
+                           static_cast<std::int64_t>(c.plan.max_requests);
+                };
+                return area(a) < area(b);
+            });
+        std::cerr << "[pie-driver-cuda] memory planner: calibration boot -- "
+                  << candidates.size() << " candidates fit the "
+                  << (budget / (1024 * 1024)) << " MiB budget; building the "
+                  << "largest at N=" << best_it->plan.max_workspace_tokens
+                  << " R=" << best_it->plan.max_requests
+                  << " page_size=" << best_it->plan.kv_page_size
+                  << " (score would have picked N="
+                  << std::max_element(
+                         candidates.begin(), candidates.end(),
+                         [](const Candidate& a, const Candidate& b) {
+                             return a.score < b.score;
+                         })->plan.max_workspace_tokens
+                  << ")\n";
     }
     if (best_it == candidates.end()) {
         if (prefer_qwen3_8b_prefill_shape) {

@@ -345,6 +345,45 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
         // tolerance by sqrt(2) exactly where it did the most damage.
         double sigma;
     };
+    // A prompt length where every budget funds the same shape reads the SAME
+    // sample for all of them, so its ratio is identically 1.0 and it can never
+    // separate two budgets. It can still set the tolerance, though: a budget
+    // that is best everywhere has no argmin, so the seeded `max()` records the
+    // FIRST prompt length, and on this data that is exactly one of these. The
+    // result was that a rung carrying no information decided how much slower a
+    // smaller budget was allowed to be -- 14% sigma there stepped down to a
+    // budget measuring 18.5% slower where it mattered.
+    //
+    // Drop them from the scoring pass. They are not bad measurements; they just
+    // answer a question nobody asked.
+    const auto discriminates = [&](int L) {
+        const PlannerShapeSample* first = nullptr;
+        for (int budget : budgets) {
+            const PlannerShapeSample* s = rate_at(budget, L);
+            if (s == nullptr) continue;
+            if (first == nullptr) {
+                first = s;
+            } else if (s != first) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<int> scoring_lens;
+    for (int L : prompt_lens) {
+        if (discriminates(L)) scoring_lens.push_back(L);
+    }
+    if (scoring_lens.empty()) {
+        return refuse("no prompt length separates the budgets");
+    }
+    if (scoring_lens.size() != prompt_lens.size() && engine.verbose) {
+        std::cerr << "[pie-driver-cuda] planner calibration: "
+                  << (prompt_lens.size() - scoring_lens.size())
+                  << " of " << prompt_lens.size()
+                  << " prompt lengths fund one shape for every budget and "
+                  << "cannot separate them; scoring on the rest\n";
+    }
+
     int chosen_budget = 0;
     double chosen_score = -1.0;
     double chosen_sigma = 0.0;
@@ -358,7 +397,7 @@ std::size_t calibrate_memory_planner(BatchEngine& engine,
         double worst = std::numeric_limits<double>::max();
         double worst_rel_sigma = 0.0;
         bool complete = true;
-        for (int L : prompt_lens) {
+        for (int L : scoring_lens) {
             const PlannerShapeSample* here = rate_at(budget, L);
             if (here == nullptr || here->tokens_per_s <= 0.0) {
                 complete = false;
