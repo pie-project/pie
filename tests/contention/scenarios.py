@@ -37,9 +37,9 @@ for 8192-16384 pages against device pools of 12-256, which took the server to
 32.3 GB RSS and pushed the host into reclaim -- ``/proc/pressure/memory``
 ``full avg10`` hit 66% during a run against 0.11% idle. The engine convoys
 badly on that: a thread that stalls in the allocator while holding the global
-KV store mutex freezes every lane behind it, and the KV lock trace
-(``PIE_KV_LOCK_TRACE=1``) caught single ``create_working_set`` calls holding it
-for 1.07s, 1.55s and 5.74s. Downstream that reads as 9-18 lanes falling silent
+KV store mutex freezes every lane behind it, and a KV lock trace (since
+removed, along with the ``PIE_KV_LOCK_TRACE`` switch that armed it) caught
+single ``create_working_set`` calls holding it for 1.07s, 1.55s and 5.74s. Downstream that reads as 9-18 lanes falling silent
 at once, ``[frame-stall]``, and ``submit deadline exceeded`` -- i.e. it looks
 exactly like an engine scheduling bug. Every scenario that was flaky used
 16384; none that used <= 512 ever was.

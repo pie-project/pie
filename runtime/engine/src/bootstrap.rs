@@ -57,7 +57,6 @@ impl RuntimeShutdown {
         for driver_id in self.driver_ids {
             let _ = driver::backend::unregister_driver(driver_id);
         }
-        crate::store::registry::dump_kv_lock_trace()?;
         scheduler_result
     }
 }
