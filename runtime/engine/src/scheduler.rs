@@ -457,6 +457,9 @@ pub(crate) struct RunAheadAcc {
     pub arrq0: AtomicU64,
     pub arrq1: AtomicU64,
     pub arrq2: AtomicU64,
+    /// Ready-mode (`PIE_SEAL_MODE=ready`) early boundary opens: seals taken
+    /// with awaited lanes still missing because the device was idle.
+    pub early_open: AtomicU64,
     /// Implicit rejoins (parked lane accepted a fire) since the last wave.
     pub rejoins: AtomicU64,
     /// Awaited lanes seen blocking the gate, summed over gate evaluations.
@@ -496,6 +499,7 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
     arrq0: AtomicU64::new(0),
     arrq1: AtomicU64::new(0),
     arrq2: AtomicU64::new(0),
+    early_open: AtomicU64::new(0),
     rejoins: AtomicU64::new(0),
     blocking: AtomicU64::new(0),
     blk_owed: AtomicU64::new(0),

@@ -99,6 +99,19 @@ pub(super) fn configured_max_in_flight() -> usize {
     })
 }
 
+/// `PIE_SEAL_MODE=ready`: when the device is idle and at least one lane's
+/// next frame is arrival-complete, OPEN the boundary with that subset
+/// instead of holding for every awaited lane. Late lanes stream into the
+/// same boundary as fresh partitions when they arrive (the §20.49
+/// partition machinery), so nothing is excluded — the boundary just opens
+/// before they get there. The wait-all rule keeps guarding what it must:
+/// dense gathering while an epoch executes (`executing` still parks).
+/// Default: strict wait-all.
+fn seal_mode_ready() -> bool {
+    static CONFIGURED: OnceLock<bool> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| std::env::var("PIE_SEAL_MODE").is_ok_and(|value| value == "ready"))
+}
+
 /// The frame identity one fire carries from `forward.submit`: which lane
 /// (pipeline scope), which frame of that lane, which wave slot, and how many
 /// fires the whole frame holds (so arrival completeness is decidable).
@@ -1508,6 +1521,24 @@ impl FramePolicy {
                     // An epoch is executing: its retirements re-decide and
                     // the gather continues in the background.
                     return FramePlan::Park;
+                }
+                if seal_mode_ready() && self.have_seal_candidate() {
+                    // Ready mode: the device is idle and sealable work
+                    // exists. Open the boundary with the arrival-complete
+                    // subset instead of holding — the missing lanes join
+                    // this same boundary as fresh partitions on arrival.
+                    crate::scheduler::RUN_AHEAD
+                        .early_open
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.strict_watchdog_deadline = None;
+                    match self.seal() {
+                        Some(FramePlan::Dispatch(_)) => continue,
+                        Some(plan) => return plan,
+                        // Candidates exist but none sealed (e.g. every
+                        // ready lane is capacity-deferred): fall through
+                        // to the ordinary hold.
+                        None => {}
+                    }
                 }
                 let deadline = self
                     .strict_watchdog_deadline
