@@ -658,8 +658,8 @@ impl DefaultAbiBuilder<'_> {
         if self.target.tp_size > 1 && arch.pack_kind == crate::storage::ExpertPackKind::None {
             return Err(CompileError::InvalidInput(
                 "stream_routed_experts with tp_size>1 requires a per-rank \
-                 expert pack (supported: gpt_oss, mixtral); other arches \
-                 still require tp_size=1"
+                 expert pack (supported: gpt_oss, mixtral, qwen3_moe, \
+                 qwen3_5_moe); other arches still require tp_size=1"
                     .to_string(),
             ));
         }
@@ -1191,6 +1191,11 @@ impl DefaultAbiBuilder<'_> {
 
     fn add_fused_moe_gate_up_tp_slices(&mut self) -> Result<(), CompileError> {
         if self.target.tp_size <= 1 {
+            return Ok(());
+        }
+        // Streamed fused banks are densified offline into a per-rank pack;
+        // do not also emit resident TP ByteSpans from the same HF tensors.
+        if self.target.stream_routed_experts {
             return Ok(());
         }
         let candidates: Vec<RawTensor> = self

@@ -474,12 +474,14 @@ int run_impl(int argc,
                       << engine.hf_config().model_type << "')\n";
             return 2;
         }
-        // TP+streaming: GPT-OSS / Mixtral build per-rank contiguous expert packs.
+        // TP+streaming: GPT-OSS / Mixtral / Qwen MoE build per-rank packs.
         // Other arches still rely on strided HF extents the streamer cannot
         // page — reject here so --tp-size overrides fail before compile.
-        if (cfg.distributed.tp_size > 1 && !is_gpt_oss_arch && !is_mixtral_arch) {
+        if (cfg.distributed.tp_size > 1 && !is_gpt_oss_arch && !is_mixtral_arch &&
+            !is_qwen3_5_moe_arch) {
             std::cerr << "[pie-driver-cuda] model.stream_routed_experts with "
-                         "tp_size>1 is only supported for gpt_oss and mixtral (got '"
+                         "tp_size>1 is only supported for gpt_oss, mixtral, and "
+                         "qwen3_moe/qwen3_5_moe (got '"
                       << engine.hf_config().model_type << "', tp_size="
                       << cfg.distributed.tp_size << ")\n";
             return 1;

@@ -71,6 +71,13 @@ stay resident).
 - Mixtral `MixtralTpBf16`: contiguous BF16 `w1`/`w3` row slices and densified
   `w2` columns under `tp_size > 1`; at `tp_size = 1` Mixtral still pages full
   HF experts (`pack_kind = None`).
+- Qwen3.5-MoE `Qwen35MoeTpBf16`: contiguous fused BF16 `gate_up`/`down` local-I
+  sections under `tp_size > 1` (gate/up halves concatenated, down columns
+  densified); shared expert and router stay resident. At `tp_size = 1`, fused
+  banks page as full HF expert slices (`pack_kind = None`).
+- Qwen3-MoE `Qwen3MoeTpBf16`: contiguous named BF16 `gate`/`up`/`down` local-I
+  sections under `tp_size > 1` (down columns densified); at `tp_size = 1`,
+  named experts page as full HF tensors (`pack_kind = None`).
 
 Arches without a per-rank pack still reject `stream_routed_experts &&
 tp_size > 1`.

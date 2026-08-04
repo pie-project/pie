@@ -2283,27 +2283,72 @@ fn qwen35_moe_stream_routed_experts_fused_plan() {
     assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 2);
     // Per-expert slices: gate_up 2*I*H*2 bytes, down H*I*2 bytes.
     assert_eq!(streamed.stream.section_bytes, vec![8192, 4096]);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::None
+    );
 }
 
 #[test]
-fn qwen35_moe_stream_routed_experts_rejects_tensor_parallel() {
+fn qwen35_moe_stream_plan_tp_local_section_bytes() {
+    // Fused [E=2, 2I=64, H=64] / [E=2, H=64, I=32], tp=2 → I_local=16.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>| {
+        let bytes = shape.iter().fold(2u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64]);
+    push(next(), "model.layers.0.mlp.gate.weight", vec![2, 64]);
+    push(
+        next(),
+        "model.layers.0.mlp.experts.gate_up_proj",
+        vec![2, 64, 64],
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.experts.down_proj",
+        vec![2, 64, 32],
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.shared_expert.gate_proj.weight",
+        vec![32, 64],
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.shared_expert.up_proj.weight",
+        vec![32, 64],
+    );
+    push(
+        next(),
+        "model.layers.0.mlp.shared_expert.down_proj.weight",
+        vec![64, 32],
+    );
     let meta = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
             path: "qwen35-moe.safetensors".into(),
-            size_bytes: 64,
+            size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![RawTensor {
-            id: TensorId(0),
-            name: "model.layers.0.mlp.experts.gate_up_proj".into(),
-            file_id: FileId(0),
-            file_offset: 0,
-            span_bytes: 64,
-            shape: vec![32, 1],
-            encoding: Encoding::Raw(DType::BF16),
-            layout: Layout::dense(1),
-        }],
+        tensors,
     };
     let cfg = pie_weight_loader::config::ModelConfig {
         model_type: "qwen3_5_moe".to_string(),
@@ -2319,10 +2364,34 @@ fn qwen35_moe_stream_routed_experts_rejects_tensor_parallel() {
         stream_routed_experts: true,
         ..StorageTarget::default()
     };
-    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("per-rank"), "unexpected error: {err}");
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 2);
+    // I_local=16, H=64 → [2*I*H*2, H*I*2] = [4096, 2048]
+    assert_eq!(streamed.stream.section_bytes, vec![4096, 2048]);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::Qwen35MoeTpBf16
+    );
+    assert_eq!(streamed.stream.bindings[0].file_id.0, 0);
+    assert_eq!(streamed.stream.bindings[0].file_offset, 0);
+    assert_eq!(streamed.stream.bindings[0].span_bytes, 4096);
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("mlp.shared_expert.")),
+        "shared expert must remain resident under TP+streaming"
+    );
+    assert!(
+        !streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.contains("mlp.experts.gate_up_proj")
+                || t.name.contains("mlp.experts.down_proj")),
+        "fused routed banks must not be resident under TP stream plan"
+    );
 }
 
 #[test]
@@ -2411,6 +2480,10 @@ fn qwen3_moe_stream_routed_experts_named_plan() {
     assert_eq!(streamed.stream.num_layers, 1);
     assert_eq!(streamed.stream.num_experts, 2);
     assert_eq!(streamed.stream.sections_per_expert, 3);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::None
+    );
     assert_eq!(streamed.stream.template.len(), 3);
     assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 3);
     for id in &streamed.stream.template {
@@ -2420,24 +2493,46 @@ fn qwen3_moe_stream_routed_experts_named_plan() {
 }
 
 #[test]
-fn qwen3_moe_stream_routed_experts_rejects_tensor_parallel() {
+fn qwen3_moe_stream_plan_tp_local_section_bytes() {
+    // gate/up: [I=32, H=16], down: [H=16, I=32], tp=2 → I_local=16.
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>| {
+        let bytes = shape.iter().fold(2u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "model.embed_tokens.weight", vec![64]);
+    push(next(), "model.layers.0.mlp.gate.weight", vec![2, 16]);
+    for e in 0..2 {
+        let prefix = format!("model.layers.0.mlp.experts.{e}");
+        push(next(), &format!("{prefix}.gate_proj.weight"), vec![32, 16]);
+        push(next(), &format!("{prefix}.up_proj.weight"), vec![32, 16]);
+        push(next(), &format!("{prefix}.down_proj.weight"), vec![16, 32]);
+    }
     let meta = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
             path: "qwen3-moe.safetensors".into(),
-            size_bytes: 64,
+            size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![RawTensor {
-            id: TensorId(0),
-            name: "model.layers.0.mlp.experts.0.gate_proj.weight".into(),
-            file_id: FileId(0),
-            file_offset: 0,
-            span_bytes: 64,
-            shape: vec![32, 1],
-            encoding: Encoding::Raw(DType::BF16),
-            layout: Layout::dense(1),
-        }],
+        tensors,
     };
     let cfg = pie_weight_loader::config::ModelConfig {
         model_type: "qwen3_moe".to_string(),
@@ -2453,9 +2548,22 @@ fn qwen3_moe_stream_routed_experts_rejects_tensor_parallel() {
         stream_routed_experts: true,
         ..StorageTarget::default()
     };
-    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("per-rank"), "unexpected error: {err}");
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 3);
+    // I_local=16, H=16 → [I*H*2, I*H*2, H*I*2] = [512, 512, 512]
+    assert_eq!(streamed.stream.section_bytes, vec![512, 512, 512]);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::Qwen3MoeTpBf16
+    );
+    assert_eq!(streamed.stream.bindings[0].file_id.0, 0);
+    assert_eq!(streamed.stream.bindings[0].file_offset, 0);
+    assert_eq!(streamed.stream.bindings[0].span_bytes, 512);
+    assert!(
+        !streamed.tensors.iter().any(|t| t.name.contains("mlp.experts.")),
+        "TP stream plan must exclude Qwen3-MoE expert tensors from resident ABI"
+    );
 }
 

@@ -177,6 +177,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/gpt_oss_eager_bf16_pack.cpp
   src/model/gpt_oss_routed_mxfp4_pack.cpp
   src/model/mixtral_tp_bf16_pack.cpp
+  src/model/qwen35_moe_tp_bf16_pack.cpp
+  src/model/qwen3_moe_tp_bf16_pack.cpp
   src/model/weight_store.cpp
   src/mla_cache.cpp
   src/model/loaded_model.cpp

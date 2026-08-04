@@ -836,8 +836,129 @@ pub(crate) const QWEN3_MOE_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     pack_kind: ExpertPackKind::None,
 };
 
-pub(crate) fn select_qwen3_moe(_target: &StorageTarget) -> Option<StreamArchDesc> {
-    Some(QWEN3_MOE_STREAM_ARCH)
+fn qwen3_moe_find_tensor<'a>(
+    metadata: &'a CheckpointMetadata,
+    name: &str,
+) -> Result<&'a RawTensor, CompileError> {
+    metadata
+        .tensors
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| {
+            CompileError::InvalidInput(format!(
+                "stream_routed_experts: missing Qwen3-MoE expert tensor '{name}'"
+            ))
+        })
+}
+
+/// TP-local BF16 section sizes for plain Qwen3-MoE packs under `tp_size>1`.
+///
+/// HF: gate/up `[I, H]`, down `[H, I]`. Pack stores dense `I_local` slices so
+/// the streamer can page contiguous extents (down columns are strided in HF).
+pub(crate) fn qwen3_moe_tp_section_bytes(
+    gate: &RawTensor,
+    up: &RawTensor,
+    down: &RawTensor,
+    target: &StorageTarget,
+) -> Result<[u64; 3], CompileError> {
+    if gate.shape.len() != 2 || up.shape.len() != 2 || down.shape.len() != 2 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: Qwen3-MoE TP pack expects 2-D \
+             gate/up/down tensors"
+                .to_string(),
+        ));
+    }
+    let i_full = gate.shape[0];
+    let hidden = gate.shape[1];
+    if up.shape != gate.shape {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: Qwen3-MoE up shape {:?} must match gate {:?}",
+            up.shape, gate.shape
+        )));
+    }
+    if down.shape[0] != hidden || down.shape[1] != i_full {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: Qwen3-MoE down expected [{hidden}, {i_full}], \
+             got {:?}",
+            down.shape
+        )));
+    }
+    let (_local_start, local_intermediate) = tp_local_range(i_full, target)?;
+    let i_local = local_intermediate as u64;
+    let h = hidden as u64;
+    let gate_bytes = i_local * h * 2;
+    let down_bytes = h * i_local * 2;
+    Ok([gate_bytes, gate_bytes, down_bytes])
+}
+
+fn qwen3_moe_tp_collect_bindings(
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    let e = num_experts as u64;
+    if e == 0 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: Qwen3-MoE num_experts must be > 0".to_string(),
+        ));
+    }
+    const SECTION_ALIGN: u64 = 256;
+    let mut bindings = Vec::with_capacity(
+        (num_layers as usize) * (num_experts as usize) * QWEN3_MOE_EXPERT_SECTIONS.len(),
+    );
+    let mut section_bytes: Option<[u64; 3]> = None;
+    let mut section_offsets = [0u64; 3];
+    let mut slot_bytes = 0u64;
+    for layer in 0..num_layers {
+        let prefix = format!("model.layers.{layer}.mlp.experts.0.");
+        let gate = qwen3_moe_find_tensor(metadata, &format!("{prefix}gate_proj.weight"))?;
+        let up = qwen3_moe_find_tensor(metadata, &format!("{prefix}up_proj.weight"))?;
+        let down = qwen3_moe_find_tensor(metadata, &format!("{prefix}down_proj.weight"))?;
+        let bytes = qwen3_moe_tp_section_bytes(gate, up, down, target)?;
+        if let Some(prev) = section_bytes {
+            if prev != bytes {
+                return Err(CompileError::InvalidInput(format!(
+                    "stream_routed_experts: Qwen3-MoE TP section sizes differ \
+                     across layers (layer {layer})"
+                )));
+            }
+        } else {
+            let mut off = 0u64;
+            for s in 0..3 {
+                section_offsets[s] = off;
+                off = align_up_u64(off + bytes[s], SECTION_ALIGN);
+            }
+            slot_bytes = off;
+            section_bytes = Some(bytes);
+        }
+        for expert in 0..e {
+            let base = (layer as u64 * e + expert) * slot_bytes;
+            for s in 0..3 {
+                bindings.push(StreamBinding {
+                    file_id: crate::types::FileId(0),
+                    file_offset: base + section_offsets[s],
+                    span_bytes: bytes[s],
+                });
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) const QWEN3_MOE_TP_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: QWEN3_MOE_EXPERT_SECTIONS,
+    is_streamed: is_qwen3_moe_routed_expert_tensor,
+    collect_bindings: qwen3_moe_tp_collect_bindings,
+    pack_kind: ExpertPackKind::Qwen3MoeTpBf16,
+};
+
+pub(crate) fn select_qwen3_moe(target: &StorageTarget) -> Option<StreamArchDesc> {
+    if target.tp_size > 1 {
+        Some(QWEN3_MOE_TP_STREAM_ARCH)
+    } else {
+        Some(QWEN3_MOE_STREAM_ARCH)
+    }
 }
 
 /// Qwen3.5/3.6-MoE fused BF16 banks — must match `qwen_moe_expert_sections.hpp`.
@@ -937,8 +1058,139 @@ pub(crate) const QWEN35_MOE_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     pack_kind: ExpertPackKind::None,
 };
 
-pub(crate) fn select_qwen35_moe(_target: &StorageTarget) -> Option<StreamArchDesc> {
-    Some(QWEN35_MOE_STREAM_ARCH)
+fn qwen35_moe_prefix_root(metadata: &CheckpointMetadata) -> &'static str {
+    if metadata
+        .tensors
+        .iter()
+        .any(|t| t.name.starts_with("model.language_model.layers."))
+    {
+        "model.language_model.layers."
+    } else {
+        "model.layers."
+    }
+}
+
+/// TP-local BF16 section sizes for Qwen3.5-MoE fused packs under `tp_size>1`.
+///
+/// HF: gate_up `[E, 2I, H]`, down `[E, H, I]`. Pack stores dense local slices
+/// so gate/up row halves and down columns can be paged contiguously.
+pub(crate) fn qwen35_moe_tp_section_bytes(
+    gate_up: &RawTensor,
+    down: &RawTensor,
+    target: &StorageTarget,
+) -> Result<[u64; 2], CompileError> {
+    if gate_up.shape.len() != 3 || down.shape.len() != 3 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: Qwen3.5-MoE TP pack expects 3-D fused \
+             gate_up/down tensors"
+                .to_string(),
+        ));
+    }
+    if gate_up.shape[1] % 2 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: Qwen3.5-MoE gate_up expected [E, 2I, H], \
+             got {:?}",
+            gate_up.shape
+        )));
+    }
+    let i_full = gate_up.shape[1] / 2;
+    let hidden = gate_up.shape[2];
+    if down.shape[1] != hidden || down.shape[2] != i_full {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: Qwen3.5-MoE down expected [E, {hidden}, \
+             {i_full}], got {:?}",
+            down.shape
+        )));
+    }
+    if gate_up.shape[0] != down.shape[0] {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: Qwen3.5-MoE expert counts differ \
+             (gate_up E={}, down E={})",
+            gate_up.shape[0], down.shape[0]
+        )));
+    }
+    let (_local_start, local_intermediate) = tp_local_range(i_full, target)?;
+    let i_local = local_intermediate as u64;
+    let h = hidden as u64;
+    let gu_bytes = 2 * i_local * h * 2;
+    let dn_bytes = h * i_local * 2;
+    Ok([gu_bytes, dn_bytes])
+}
+
+fn qwen35_moe_tp_collect_bindings(
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    let e = num_experts as u64;
+    if e == 0 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: Qwen3.5-MoE num_experts must be > 0".to_string(),
+        ));
+    }
+    const SECTION_ALIGN: u64 = 256;
+    let prefix_root = qwen35_moe_prefix_root(metadata);
+    let mut bindings = Vec::with_capacity(
+        (num_layers as usize) * (num_experts as usize) * QWEN35_MOE_EXPERT_SECTIONS.len(),
+    );
+    let mut section_bytes: Option<[u64; 2]> = None;
+    let mut section_offsets = [0u64; 2];
+    let mut slot_bytes = 0u64;
+    for layer in 0..num_layers {
+        let prefix = format!("{prefix_root}{layer}.mlp.experts.");
+        let gate_up = qwen35_moe_find_tensor(metadata, &format!("{prefix}gate_up_proj"))?;
+        let down = qwen35_moe_find_tensor(metadata, &format!("{prefix}down_proj"))?;
+        if gate_up.shape[0] as u64 != e || down.shape[0] as u64 != e {
+            return Err(CompileError::InvalidInput(format!(
+                "stream_routed_experts: Qwen3.5-MoE fused bank expert count \
+                 at layer {layer} does not match num_experts={num_experts}"
+            )));
+        }
+        let bytes = qwen35_moe_tp_section_bytes(gate_up, down, target)?;
+        if let Some(prev) = section_bytes {
+            if prev != bytes {
+                return Err(CompileError::InvalidInput(format!(
+                    "stream_routed_experts: Qwen3.5-MoE TP section sizes differ \
+                     across layers (layer {layer})"
+                )));
+            }
+        } else {
+            let mut off = 0u64;
+            for s in 0..2 {
+                section_offsets[s] = off;
+                off = align_up_u64(off + bytes[s], SECTION_ALIGN);
+            }
+            slot_bytes = off;
+            section_bytes = Some(bytes);
+        }
+        for expert in 0..e {
+            let base = (layer as u64 * e + expert) * slot_bytes;
+            for s in 0..2 {
+                bindings.push(StreamBinding {
+                    file_id: crate::types::FileId(0),
+                    file_offset: base + section_offsets[s],
+                    span_bytes: bytes[s],
+                });
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) const QWEN35_MOE_TP_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: QWEN35_MOE_EXPERT_SECTIONS,
+    is_streamed: is_qwen35_moe_streamed_expert_tensor,
+    collect_bindings: qwen35_moe_tp_collect_bindings,
+    pack_kind: ExpertPackKind::Qwen35MoeTpBf16,
+};
+
+pub(crate) fn select_qwen35_moe(target: &StorageTarget) -> Option<StreamArchDesc> {
+    if target.tp_size > 1 {
+        Some(QWEN35_MOE_TP_STREAM_ARCH)
+    } else {
+        Some(QWEN35_MOE_STREAM_ARCH)
+    }
 }
 
 fn ends_with_any(value: &str, suffixes: &[&str]) -> bool {

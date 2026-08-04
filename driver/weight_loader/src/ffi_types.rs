@@ -611,6 +611,8 @@ pub enum PieLoaderExpertPackKind {
     GptOssEagerBf16 = 2,
     GptOssRoutedMxfp4 = 3,
     MixtralTpBf16 = 4,
+    Qwen35MoeTpBf16 = 5,
+    Qwen3MoeTpBf16 = 6,
 }
 
 /// Deferred expert-load plan exposed to the C++ stream cache.

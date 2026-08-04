@@ -194,6 +194,10 @@ pub enum ExpertPackKind {
     GptOssRoutedMxfp4 = 3,
     /// Contiguous TP-local Mixtral BF16 w1/w2/w3 (tp_size>1 densify).
     MixtralTpBf16 = 4,
+    /// Contiguous TP-local Qwen3.5-MoE fused BF16 gate_up/down (tp_size>1).
+    Qwen35MoeTpBf16 = 5,
+    /// Contiguous TP-local Qwen3-MoE named BF16 gate/up/down (tp_size>1).
+    Qwen3MoeTpBf16 = 6,
 }
 
 /// One deferred source extent for a streamed expert section.

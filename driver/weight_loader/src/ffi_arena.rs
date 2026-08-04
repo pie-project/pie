@@ -193,6 +193,12 @@ impl FfiArena {
                     crate::storage::ExpertPackKind::MixtralTpBf16 => {
                         PieLoaderExpertPackKind::MixtralTpBf16
                     }
+                    crate::storage::ExpertPackKind::Qwen35MoeTpBf16 => {
+                        PieLoaderExpertPackKind::Qwen35MoeTpBf16
+                    }
+                    crate::storage::ExpertPackKind::Qwen3MoeTpBf16 => {
+                        PieLoaderExpertPackKind::Qwen3MoeTpBf16
+                    }
                 },
             },
         }
