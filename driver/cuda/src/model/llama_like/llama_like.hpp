@@ -142,10 +142,16 @@ struct LlamaLikePlanState {
     // the layout oscillation cost the union key one orphan capture per
     // request, and today's masked-variant graphs the same churn.
     ops::PrefillPlanCachePtr mask_decode_plan;
-    // NS-2: when >= 0, this fire's attention splits at this wire row —
-    // decode-side plans cover [0, split), mask_decode_plan covers the
-    // REBASED suffix. -1 = fire-level plans (the pre-NS-2 shape).
+    // NS-2: when >= 0, this fire's attention splits at this REQUEST
+    // index — the prefix plans cover requests [0, split),
+    // mask_decode_plan covers the REBASED suffix. -1 = fire-level
+    // plans (the pre-NS-2 shape).
     int spatial_mask_split = -1;
+    // The mixed fire (M-2): the split's TOKEN-ROW offset (q/out
+    // pointer arithmetic). Equal to spatial_mask_split on pure-decode
+    // fires; diverges when prefill rows share the fire. -1 with
+    // spatial_mask_split >= 0 never happens (set together).
+    int spatial_mask_row_split = -1;
     bool use_prefill_plan = false;
     bool use_prefill_decode_plan = false;
     bool use_mask_decode_plan = false;

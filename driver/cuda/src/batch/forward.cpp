@@ -815,6 +815,18 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         in.lora == nullptr &&
         in.unmasked_prefix_rows != 0xffffffffu &&
         in.unmasked_prefix_rows < static_cast<std::uint32_t>(in.forward_R);
+    // THE MIXED FIRE (M-2): a prefill-shaped fire with a planned
+    // unmasked prefix — prefill + plain-decode rows serve the causal
+    // dispatch, the masked 1-token suffix the custom dispatch. The
+    // planned word counts TOKEN ROWS here; the request split derives
+    // from the host qo indptr (the suffix starts on a request
+    // boundary). Prepare re-validates the shape and keeps the
+    // fire-level arm when it does not hold.
+    const bool use_spatial_mask_mixed = spatial_mask_enabled() &&
+        !in.is_pure_decode && in.have_custom_mask && !has_hooks &&
+        in.lora == nullptr &&
+        in.unmasked_prefix_rows != 0xffffffffu &&
+        in.unmasked_prefix_rows > 0;
     bool run_graph = graph_eligible;
     if (!use_spatial_mask && in.is_pure_decode && in.have_custom_mask &&
         std::getenv("PIE_SPATIAL_MASK_TRACE")) {
@@ -1032,8 +1044,9 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 has_hooks ? in.stage_hooks : nullptr,
                 use_supergraph,
                 in.lora,
-                use_spatial_mask ? in.unmasked_prefix_rows
-                                 : 0xffffffffu);
+                (use_spatial_mask || use_spatial_mask_mixed)
+                    ? in.unmasked_prefix_rows
+                    : 0xffffffffu);
             if (has_hooks) {
                 // The capture is the one moment the model's per-layer hook
                 // coverage is observable; a body that skipped hooks would
@@ -1256,12 +1269,28 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.precomputed_embeddings       = in.precomputed_embeddings;
     fwd_in.stage_hooks                  = in.stage_hooks;
     fwd_in.lora                         = in.lora;
-    if (use_spatial_mask) {
+    if (use_spatial_mask || use_spatial_mask_mixed) {
         // The masked suffix's rebased device CSRs (pure decode: qo is the
         // identity, kv_page_indptr rebases by its page base; every other
         // suffix array is a pointer offset in the body). Synchronous
         // copies: tiny, eager-only, and the host staging dies here.
-        const int split = static_cast<int>(in.unmasked_prefix_rows);
+        // Mixed fires: the planned word is token rows — the REQUEST
+        // split is the request whose qo entry equals it (the seriation
+        // puts the 1-token masked suffix last, so the boundary is a
+        // request boundary; no match means the shape is off and prepare
+        // keeps the fire-level arm, so the upload is harmless).
+        int split = static_cast<int>(in.unmasked_prefix_rows);
+        if (use_spatial_mask_mixed) {
+            split = -1;
+            for (int r = 0; r <= in.forward_R; ++r) {
+                if (in.h_qo_forward[r] == in.unmasked_prefix_rows) {
+                    split = r;
+                    break;
+                }
+                if (in.h_qo_forward[r] > in.unmasked_prefix_rows) break;
+            }
+            if (split < 0) split = in.forward_R;
+        }
         const int rs = in.forward_R - split;
         std::vector<std::uint32_t> qo(static_cast<std::size_t>(rs) + 1);
         std::vector<std::uint32_t> kvpp(static_cast<std::size_t>(rs) + 1);
