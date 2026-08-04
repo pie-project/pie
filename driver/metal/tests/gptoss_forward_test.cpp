@@ -170,12 +170,44 @@ int main(int argc, char** argv) {
     }
     std::string kernels_dir = PIE_METAL_KERNELS_DIR_FOR_TEST;
 
+    // Before the checkpoint gate, because this needs no checkpoint and is the
+    // one thing here that would otherwise never run on a machine without one.
+    //
+    // The attention width used to be the literal 64 that every released gpt-oss
+    // happens to use, while the geometry read it from the config. A d=64
+    // pipeline handed wider heads does not fail -- it strides past the end of
+    // each head and writes zeros, which is a model that runs and says nothing.
+    // There is no pipeline cache, so identity proves nothing; what proves the
+    // width was read is the NAME the load fails on.
+    {
+        std::printf("[the attention width is the geometry's]\n");
+        auto probe_ctx = RawMetalContext::create(16u << 20);
+        if (!probe_ctx) {
+            expect(false, "RawMetalContext::create");
+        } else {
+            GptOssGeometry odd;
+            std::string gerr;
+            if (!geometry_from_facts(Facts{}, odd, &gerr)) {
+                expect(false, "geometry: " + gerr);
+            } else {
+                odd.head_dim = 96;
+                GptOssPsos p_odd;
+                std::string e_odd;
+                const bool ok = build_gptoss_psos(*probe_ctx, kernels_dir, odd, p_odd, &e_odd);
+                expect(!ok, "an uninstantiated head width (96) is refused");
+                expect(!ok && e_odd.find("_d_96") != std::string::npos,
+                       "and the refusal names the width that has no kernel: " + e_odd);
+            }
+        }
+    }
+
     {
         std::string probe = ckpt + "/config.json";
         FILE* f = std::fopen(probe.c_str(), "rb");
         if (f == nullptr) {
-            std::printf("gpt-oss forward: SKIP (no checkpoint at %s)\n", ckpt.c_str());
-            return 0;
+            std::printf("gpt-oss forward: SKIP the checkpoint half (none at %s)\n",
+                        ckpt.c_str());
+            return failures == 0 ? 0 : 1;
         }
         std::fclose(f);
     }
@@ -272,8 +304,11 @@ int main(int argc, char** argv) {
 
     GptOssPsos psos;
     DecodeStepPsos base;
-    if (!build_gptoss_psos(*ctx, kernels_dir, g.router_bits, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/false, &err)) {
+    if (!build_gptoss_psos(*ctx, kernels_dir, g, psos, &err) ||
+        // gpt-oss's shared table is affine b4/g64; its mxfp4 entrypoints are
+        // named directly in `gptoss/kernels.cpp`.
+        !load_decode_psos(*ctx, kernels_dir, base, pie::metal::AffineFormat{4, 64},
+                          /*with_argmax=*/false, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

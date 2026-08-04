@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mtl4_context.hpp"
+#include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
 #include "model/contract.hpp"
 #include "forward.hpp"
@@ -85,7 +86,7 @@ class SimpleFamilyEngine {
     /// this from a path that has a `DecodeGeometry` and no config, and the
     /// predicate never wanted more than the one bit anyway.
     static std::function<bool(const std::string&)> stream_predicate(
-        model::ModelFamily family, bool stream_routed_experts);
+        bool stream_routed_experts);
 
     /// One fire: several requests' new tokens sharing a command buffer.
     ///
@@ -115,6 +116,15 @@ class SimpleFamilyEngine {
 
     virtual int vocab() const = 0;
     virtual int n_layers() const = 0;
+
+    /// What the heap actually holds, and how much of it a token reads.
+    ///
+    /// The counting RULE lives once, in `pie::metal::weight_bytes`. What each
+    /// family supplies is the two numbers only it knows -- the width of its
+    /// expert bank and how much of it a token pulls -- because a mixture's size
+    /// and its cost are different questions and nothing in the tensor names
+    /// answers the second.
+    virtual WeightBytes weight_bytes() const = 0;
 
     /// Whether this family stores its KV in pages the runtime allocates, and so
     /// can hold several sequences at once. False means a single-sequence ring:

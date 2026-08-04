@@ -60,9 +60,7 @@ async fn main(input: String) -> Result<String> {
     // and the copy_into move. Flat pool position `wpos` maps to physical page
     // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
     let ws = WorkingSet::new();
-    let pool = ws
-        .reserve(POOL_PAGES)
-        .map_err(|e| format!("ws.reserve pool: {e}"))?;
+    let pool = ws.reserve(POOL_PAGES).context("ws.reserve pool")?;
     let pool_ids = pool.ids().to_vec(); // [POOL_PAGES]
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect();
     let phys0 = pool_ids[0];
@@ -95,21 +93,23 @@ async fn main(input: String) -> Result<String> {
 
     let pidx_const: Vec<u32> = (0..=B).map(|b| b * POOL_PAGES).collect();
     let page_indptr = Channel::from_shaped([B + 1], pidx_const.clone()).named("page_indptr");
-    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
+    let lanes_b = Channel::from_iter(0u32..=B).named("embed_indptr");
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &lanes_b)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &klen,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &pos,
-        Some(&mask),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &pos,
+            mask: Some(&mask),
+        },
     )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block (identical to beam-designb).
@@ -119,7 +119,7 @@ async fn main(input: String) -> Result<String> {
         );
         let (s, i) = top_k(reshape(cand, [B * v]), B);
         let parent = div(&i, v);
-        let tok_i = cast(rem(&i, v), DType::I32);
+        let tok_i = cast(rem(&i, v), dtype::i32);
 
         // 2. flat tail-append positions: wpos = fill + lane.
         let base = fill.take();
@@ -207,7 +207,7 @@ async fn main(input: String) -> Result<String> {
         }
 
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
 
         // The physical KV move rides the SAME FIFO right behind this fire: it
         // happens-after this step's KV writes (BOS is safely written), and
@@ -219,24 +219,21 @@ async fn main(input: String) -> Result<String> {
             let dst_page = pool_ids[(DST_FLAT / PAGE_T) as usize];
             let dst_off = DST_FLAT % PAGE_T;
             ws.copy_into(&pipeline, &[dst_page], &[dst_off], &[src_page], &[src_off])
-                .map_err(|e| format!("copy_into @{step}: {e}"))?;
+                .with_context(|| format!("copy_into @{step}"))?;
         }
 
         let picked = out
-            .take()
-            .get::<i32>()
+            .take_host::<Vec<i32>>()
             .await
-            .map_err(|e| format!("out.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         let _parents = out_par
-            .take()
-            .get::<u32>()
+            .take_host::<Vec<u32>>()
             .await
-            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         let _scr = out_scr
-            .take()
-            .get::<f32>()
+            .take_host::<Vec<f32>>()
             .await
-            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

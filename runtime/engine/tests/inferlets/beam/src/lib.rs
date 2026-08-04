@@ -61,21 +61,22 @@ async fn main(_input: String) -> Result<String> {
     let ws = WorkingSet::new();
 
     let fwd = ForwardPass::new();
-    let lanes_b = Channel::from((0u32..=B).collect::<Vec<_>>()).named("embed_indptr");
-    let page_rows =
-        Channel::from((0u32..=B).map(|i| i * P).collect::<Vec<_>>()).named("page_indptr");
+    let lanes_b = Channel::from_iter(0u32..=B).named("embed_indptr");
+    let page_rows = Channel::from_iter((0u32..=B).map(|i| i * P)).named("page_indptr");
     fwd.embed(&toks, &lanes_b)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &klen,
-        &pages,
-        &page_rows,
-        &w_slot,
-        &w_off,
-        &pos,
-        Some(&kvm),
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &klen,
+            pages: &pages,
+            page_indptr: &page_rows,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &pos,
+            mask: Some(&kvm),
+        },
     )?;
     fwd.epilogue(move || {
         // cand = running scores ⊕ log_softmax(logits); (s, i) = top_k over [B*V].
@@ -120,7 +121,7 @@ async fn main(_input: String) -> Result<String> {
         tfill.put(&off1);
         w_slot.put(&slot); // next step's write descriptor
         w_off.put(&off);
-        let tok_i = cast(rem(&i, v), DType::I32);
+        let tok_i = cast(rem(&i, v), dtype::i32);
         toks.put(&tok_i);
         scores.put(&s);
         out.put(&tok_i); // host-facing token (back-pressure)
@@ -138,25 +139,22 @@ async fn main(_input: String) -> Result<String> {
         // Fresh headroom for this fire: B grant ids from the working set (D2).
         let grant = ws
             .reserve(B)
-            .map_err(|e| format!("ws.reserve @{step}: {e}"))?;
+            .with_context(|| format!("ws.reserve @{step}"))?;
         fresh.put(grant);
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
         let picked = out
-            .take()
-            .get::<i32>()
+            .take_host::<Vec<i32>>()
             .await
-            .map_err(|e| format!("out.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         let _parents = out_par
-            .take()
-            .get::<u32>()
+            .take_host::<Vec<u32>>()
             .await
-            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         let _scr = out_scr
-            .take()
-            .get::<f32>()
+            .take_host::<Vec<f32>>()
             .await
-            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            .with_context(|| format!("@{step}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

@@ -508,6 +508,7 @@ fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
 pub(crate) fn create_driver_backend_group(
     rank_options: &[DriverOptions],
     snapshot_dir: &Path,
+    descriptor: Option<&[u8]>,
     group_id: usize,
     tp_launches: &[TpLaunch],
     component: pie_driver_abi::ModelComponent,
@@ -539,7 +540,7 @@ pub(crate) fn create_driver_backend_group(
         }
         let state_dir = local_driver_state_dir(group_id, Some(tp))?;
         let toml_path = state_dir.join("driver.toml");
-        write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp))?;
+        write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, Some(tp), descriptor)?;
         config_blobs.push(toml_path.to_string_lossy().into_owned().into_bytes());
     }
 
@@ -727,6 +728,8 @@ mod tests {
         let mut group = create_driver_backend(
             &options,
             &snapshot,
+            // A test snapshot, not an artifact: no compiled descriptor.
+            None,
             0,
             None,
             pie_driver_abi::ModelComponent::Encode,
@@ -897,6 +900,7 @@ mod tests {
         let mut full = create_driver_backend(
             &full_options,
             &snapshot,
+            None,
             1,
             None,
             pie_driver_abi::ModelComponent::Full,

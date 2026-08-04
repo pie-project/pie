@@ -14,6 +14,7 @@
 #include "../../batch/decode_abi.hpp"
 #include "../../loader/heap_bind.hpp"
 #include "../../mtl4_context.hpp"
+#include "../family_coloring.hpp"
 #include "decode_step.hpp"
 #include "geometry.hpp"
 #include "scratch.hpp"
@@ -34,16 +35,9 @@ struct BoundGemma4 {
     std::vector<SlotHandle> pool;  // activation buffers, indexed by colour
 };
 
-struct ScratchBind {
-    std::uint8_t bind_index = 0;
-    int color = -1;
-};
-
-struct ScratchColoring {
-    std::vector<std::vector<ScratchBind>> per_dispatch;
-    int colors_used = 0;
-    bool hazard_free = false;
-};
+// Shared: the colouring adapter and its result are identical across families.
+using model::ScratchBind;
+using model::ScratchColoring;
 
 /// Colour the dataflow's live ranges onto pool buffers, honouring the barriers
 /// the encoder will drop.

@@ -13,28 +13,18 @@ fewer names than this does; cosine_bisect skips whatever only one side has.
 
 Usage: gemma4_mlx_taps.py <model_path> <comma_token_ids> <out_dir>
 """
-import os
 import sys
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
-from mlx_lm import load
+from taps_common import open_taps
 
 
 def main():
-    model_path, ids_csv, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-    ids = [int(x) for x in ids_csv.strip().split(",") if x]
-    os.makedirs(out_dir, exist_ok=True)
-
-    top, _ = load(model_path)
+    top, ids, dump, out_dir = open_taps(sys.argv)
     lm = top.language_model
     m = lm.model
     cfg = m.config
-
-    def dump(name, t):
-        a = np.array(mx.astype(t, mx.float32)).reshape(len(ids), -1)
-        np.save(os.path.join(out_dir, name + ".npy"), a)
 
     x = mx.array([ids])
     n = len(ids)

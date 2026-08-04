@@ -173,6 +173,12 @@ impl Channel {
     pub fn dtype(&self) -> DType {
         self.state.borrow().dtype
     }
+
+    /// The channel's name, as set by [`named`](Self::named) — `chN` if it was
+    /// never named. Frontends use it to label host-readback errors.
+    pub fn name(&self) -> String {
+        self.state.borrow().name.clone()
+    }
     /// The [`Shape`] of one cell (a single queue slot's tensor).
     pub fn shape(&self) -> Shape {
         self.state.borrow().shape

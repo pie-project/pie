@@ -179,6 +179,13 @@ pub struct DriverConfig {
 pub struct SchedulerConfig {
     /// Wall-clock cap on a single forward-pass request, in seconds.
     pub request_timeout_secs: u64,
+    /// How long a lane holding the frame wait-set may go without submitting
+    /// before the leash drops it from the wait-set. Not a verdict. See
+    /// `crate::scheduler::configured_submit_deadline`.
+    pub submit_deadline_us: u64,
+    /// How long a lane may stay silent in total before its process is
+    /// terminated. See `crate::scheduler::configured_silence_timeout`.
+    pub silence_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -476,6 +483,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     // (Context actor `context::spawn` removed — Phase 5. The unified arena
     // registry above is the per-model/driver physical home now.)
+    crate::scheduler::set_submit_deadline(std::time::Duration::from_micros(
+        scheduler.submit_deadline_us,
+    ));
+    crate::scheduler::set_silence_timeout(std::time::Duration::from_secs(
+        scheduler.silence_timeout_secs,
+    ));
     let scheduler_shutdown = crate::scheduler::spawn(
         &drivers,
         kv_page_size as u32,

@@ -73,6 +73,13 @@ pub struct LaunchPlan {
     pub single_token_mode: bool,
     pub device_resolved_geometry: bool,
     pub has_user_mask: bool,
+    /// The program binds an `AttnMask` descriptor port to a CHANNEL, so the
+    /// driver resolves a dense per-cell mask pre-forward. Such a fire must be
+    /// submitted SOLO: a multi-program batch cannot merge one program's dense
+    /// mask with another's geometry, and the driver fails loud rather than
+    /// execute a wrong one.
+    #[serde(default)]
+    pub dense_device_mask: bool,
     /// Exclusive physical KV page high-water required before this launch.
     #[serde(default)]
     pub required_kv_pages: u32,

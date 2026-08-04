@@ -9,6 +9,15 @@ use crate::inferlet::host::pie;
 use anyhow::Result;
 use pie_model as model;
 
+/// `pie_model` still hands token tables back as two parallel vectors; the WIT
+/// surface names the pairing instead.
+fn token_table((ids, bytes): (Vec<u32>, Vec<Vec<u8>>)) -> Vec<pie::inferlet::tokenizer::Token> {
+    ids.into_iter()
+        .zip(bytes)
+        .map(|(id, bytes)| pie::inferlet::tokenizer::Token { id, bytes })
+        .collect()
+}
+
 impl pie::inferlet::tokenizer::Host for ProcessCtx {
     async fn encode(&mut self, text: String) -> Result<Vec<u32>> {
         let ids = model::model().tokenize(&text);
@@ -19,15 +28,15 @@ impl pie::inferlet::tokenizer::Host for ProcessCtx {
         Ok(Ok(model::model().detokenize(&tokens)))
     }
 
-    async fn vocabs(&mut self) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
-        Ok(model::model().get_vocabs())
+    async fn vocabs(&mut self) -> Result<Vec<pie::inferlet::tokenizer::Token>> {
+        Ok(token_table(model::model().get_vocabs()))
     }
 
     async fn split_regex(&mut self) -> Result<String> {
         Ok(model::model().get_split_regex())
     }
 
-    async fn special_tokens(&mut self) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
-        Ok(model::model().get_special_tokens())
+    async fn special_tokens(&mut self) -> Result<Vec<pie::inferlet::tokenizer::Token>> {
+        Ok(token_table(model::model().get_special_tokens()))
     }
 }

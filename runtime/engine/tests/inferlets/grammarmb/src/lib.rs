@@ -82,8 +82,7 @@ async fn main(input: String) -> Result<String> {
 
     let ws = WorkingSet::new();
     let max_pages = (max_tokens as u32 + 1).div_ceil(PAGE_T).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // tok_in and KvLen are device loop-carried (seeded; each fire's epilogue
     // advances the post-write readable extent by one). Each fire therefore
@@ -92,14 +91,14 @@ async fn main(input: String) -> Result<String> {
     // host-writer allowed mask. tok_out: the SOLE host-reader output (no
     // raw-logits reader — mirrors the old single-`[Token]` M-batch-eligible
     // shape).
-    let tok_in = Channel::from(vec![seed_tok]).named("tok_in");
-    let kv_len = Channel::from(vec![1u32]).named("kv_len");
-    let embed_indptr = Channel::from(vec![0u32, 1]).named("embed_indptr");
-    let positions = Channel::from(vec![0u32]).named("positions");
-    let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-    let page_indptr = Channel::from(vec![0u32, 1]).named("page_indptr");
-    let w_slot = Channel::from(vec![0u32]).named("w_slot");
-    let w_off = Channel::from(vec![0u32]).named("w_off");
+    let tok_in = Channel::from([seed_tok]).named("tok_in");
+    let kv_len = Channel::from([1u32]).named("kv_len");
+    let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
+    let positions = Channel::from([0u32]).named("positions");
+    let pages = Channel::from_iter(0..max_pages).named("pages");
+    let page_indptr = Channel::from([0u32, 1]).named("page_indptr");
+    let w_slot = Channel::from([0u32]).named("w_slot");
+    let w_off = Channel::from([0u32]).named("w_off");
     let gmask = Channel::new([vocab], dtype::bool).named("gmask");
     let tok_out = Channel::new([1], dtype::i32).named("tok_out");
 
@@ -107,18 +106,20 @@ async fn main(input: String) -> Result<String> {
     fwd.embed(&tok_in, &embed_indptr)?;
     fwd.attention(
         &ws,
-        ..,
-        ..,
-        &kv_len,
-        &pages,
-        &page_indptr,
-        &w_slot,
-        &w_off,
-        &positions,
-        None,
+        KvGeometry {
+            readable_pages: ..,
+            writable_pages: ..,
+            kv_len: &kv_len,
+            pages: &pages,
+            page_indptr: &page_indptr,
+            w_slot: &w_slot,
+            w_off: &w_off,
+            positions: &positions,
+            mask: None,
+        },
     )?;
     fwd.epilogue(move || {
-        let length = kv_len.take().tensor();
+        let length = kv_len.take();
         // Takes + compute first, PUTS last (value-id discipline).
         let m = gmask.take(); // [V] bool, host-fed per step
         let lg = intrinsics::logits(); // [V] f32 (read-out row)
@@ -150,12 +151,11 @@ async fn main(input: String) -> Result<String> {
 
         gmask.put(mask_bool);
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
         let token = tok_out
-            .take()
-            .get::<i32>()
+            .take_host::<i32>()
             .await
-            .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
+            .with_context(|| format!("@{step}"))? as u32;
 
         // Grammar conformance: the masked argmax MUST be in this request's alphabet.
         if !alphabet.contains(&token) {

@@ -14,7 +14,6 @@
 //! extra host round-trip channels from the cost of the algorithm itself.
 
 use inferlet::ptir::attention::prelude::*;
-use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -75,7 +74,7 @@ async fn main(input: Input) -> Result<Output> {
     let temperature = input.temperature;
     let want_stats = input.stats;
     let ws = WorkingSet::new();
-    let page_size = ws.page_size();
+    let page_size = kv_page_size();
 
     if max_tokens == 0 {
         return Ok(Output {
@@ -86,14 +85,13 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = wit_model::encode(&input.prompt);
+    let mut prompt = model::encode(&input.prompt);
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(max_pages).context("reserve KV")?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
@@ -117,19 +115,15 @@ async fn main(input: Input) -> Result<Output> {
     for &(base, end) in &spans {
         let len = end - base;
 
-        let toks_p =
-            Channel::from(prompt_i32[base as usize..end as usize].to_vec()).named("toks_p");
-        let embed_indptr_p = Channel::from(vec![0u32, len]).named("embed_indptr_p");
-        let positions_p = Channel::from((base..end).collect::<Vec<_>>()).named("positions_p");
-        let pages_p = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages_p");
-        let page_indptr_p =
-            Channel::from(vec![0u32, end.div_ceil(page_size)]).named("page_indptr_p");
-        let w_slot_p =
-            Channel::from((base..end).map(|p| p / page_size).collect::<Vec<_>>()).named("w_slot_p");
-        let w_off_p =
-            Channel::from((base..end).map(|p| p % page_size).collect::<Vec<_>>()).named("w_off_p");
-        let kv_len_p = Channel::from(vec![end]).named("kv_len_p");
-        let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
+        let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
+        let embed_indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
+        let positions_p = Channel::from_iter(base..end).named("positions_p");
+        let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+        let page_indptr_p = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
+        let w_slot_p = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
+        let w_off_p = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
+        let kv_len_p = Channel::from([end]).named("kv_len_p");
+        let rng_p = Channel::from([input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
         let s1_out_p = Channel::new([1], dtype::f32).named("s1_out_p");
         let s2_out_p = Channel::new([1], dtype::f32).named("s2_out_p");
@@ -138,15 +132,17 @@ async fn main(input: Input) -> Result<Output> {
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
-            ..,
-            ..,
-            &kv_len_p,
-            &pages_p,
-            &page_indptr_p,
-            &w_slot_p,
-            &w_off_p,
-            &positions_p,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: None,
+            },
         )?;
         fwd_p.epilogue(move || {
             let r = rng_p.take();
@@ -155,7 +151,7 @@ async fn main(input: Input) -> Result<Output> {
             let r_next = add(&r, iota(2));
             tok_out_p.put(&token);
             if want_stats {
-                let mirror = reshape(cast(&token, DType::F32), [1]);
+                let mirror = reshape(cast(&token, dtype::f32), [1]);
                 s1_out_p.put(&mirror);
                 s2_out_p.put(&mirror);
             }
@@ -164,27 +160,24 @@ async fn main(input: Input) -> Result<Output> {
 
         fwd_p
             .submit(&pipe)
-            .map_err(|e| format!("prefill submit @{base}: {e}"))?;
+            .with_context(|| format!("prefill submit @{base}"))?;
 
         // Every chunk samples; only the last chunk's token continues the
         // prompt. The intermediate takes cannot be skipped -- an epilogue put
         // has to be drained or the channel fills.
         g0 = tok_out_p
-            .take()
-            .get::<i32>()
+            .take_host::<i32>()
             .await
-            .map_err(|e| format!("g0 take @{base}: {e}"))?[0];
+            .with_context(|| format!("@{base}"))?;
         if want_stats {
             s1_out_p
-                .take()
-                .get::<f32>()
+                .take_host::<Vec<f32>>()
                 .await
-                .map_err(|e| format!("s1 take @{base}: {e}"))?;
+                .with_context(|| format!("@{base}"))?;
             s2_out_p
-                .take()
-                .get::<f32>()
+                .take_host::<Vec<f32>>()
                 .await
-                .map_err(|e| format!("s2 take @{base}: {e}"))?;
+                .with_context(|| format!("@{base}"))?;
         }
     }
     generated.push(g0 as u32);
@@ -192,7 +185,7 @@ async fn main(input: Input) -> Result<Output> {
     // ── DECODE LOOP (1-wide, run-ahead). ──
     if generated.len() < max_tokens {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
+        let rng = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng");
         let tok_out = Channel::new([1], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("tok_out");
@@ -202,31 +195,32 @@ async fn main(input: Input) -> Result<Output> {
         let s2_out = Channel::new([1], dtype::f32)
             .capacity(channel_capacity() as u32)
             .named("s2_out");
-        let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
-        let positions = Channel::from(vec![n]).named("positions");
-        let pages = Channel::from((0..max_pages).collect::<Vec<_>>()).named("pages");
-        let page_indptr =
-            Channel::from(vec![0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
-        let w_slot = Channel::from(vec![n / page_size]).named("w_slot");
-        let w_off = Channel::from(vec![n % page_size]).named("w_off");
-        let kv_len = Channel::from(vec![n + 1]).named("kv_len");
+        let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
+        let positions = Channel::from([n]).named("positions");
+        let pages = Channel::from_iter(0..max_pages).named("pages");
+        let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
+        let w_slot = Channel::from([n / page_size]).named("w_slot");
+        let w_off = Channel::from([n % page_size]).named("w_off");
+        let kv_len = Channel::from([n + 1]).named("kv_len");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
-            ..,
-            (n / page_size)..,
-            &kv_len,
-            &pages,
-            &page_indptr,
-            &w_slot,
-            &w_off,
-            &positions,
-            None,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: (n / page_size)..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
         )?;
         fwd.epilogue(move || {
-            let length = kv_len.take().tensor();
+            let length = kv_len.take();
             let r = rng.take();
             let logits = intrinsics::logits();
             let token = step(logits, temperature, &r);
@@ -244,7 +238,7 @@ async fn main(input: Input) -> Result<Output> {
             page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
             tok_out.put(&token);
             if want_stats {
-                let mirror = reshape(cast(&token, DType::F32), [1]);
+                let mirror = reshape(cast(&token, dtype::f32), [1]);
                 s1_out.put(&mirror);
                 s2_out.put(&mirror);
             }
@@ -254,21 +248,18 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
-                .take()
-                .get::<i32>()
+                .take_host::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{}: {e}", generated.len()))?[0];
+                .with_context(|| format!("@{}", generated.len()))?;
             if want_stats {
                 s1_out
-                    .take()
-                    .get::<f32>()
+                    .take_host::<Vec<f32>>()
                     .await
-                    .map_err(|e| format!("s1_out.take @{}: {e}", generated.len()))?;
+                    .with_context(|| format!("@{}", generated.len()))?;
                 s2_out
-                    .take()
-                    .get::<f32>()
+                    .take_host::<Vec<f32>>()
                     .await
-                    .map_err(|e| format!("s2_out.take @{}: {e}", generated.len()))?;
+                    .with_context(|| format!("@{}", generated.len()))?;
             }
             generated.push(t as u32);
             Ok(ControlFlow::Continue(()))
@@ -279,7 +270,7 @@ async fn main(input: Input) -> Result<Output> {
 
     Ok(Output {
         sampler: "naive-baseline",
-        text: wit_model::decode(&generated)?,
+        text: model::decode(&generated)?,
         count: generated.len(),
         stats: want_stats,
     })

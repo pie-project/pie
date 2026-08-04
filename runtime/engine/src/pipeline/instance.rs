@@ -378,13 +378,11 @@ pub struct BoundForwardPass {
     /// Shape-derived decode layout whose values are resolved by the driver.
     pub decode_envelope: Option<crate::pipeline::fire::geometry::DecodeEnvelope>,
     /// The pass binds an `AttnMask` descriptor channel (dense device mask).
-    /// Detected at bind, but NOT yet consulted: the intended rule — such
-    /// fires are marked mask-carrying on the launch plan so the scheduler
-    /// batches them SOLO, because the composed multi-program batch does not
-    /// merge dense device masks (v1 scope) — is unwired, here and at the
-    /// second copy of the same flag, [`crate::pipeline::fire::lease::DevGeo`]'s
-    /// `has_mask`. The `allow` marks that gap rather than hiding it.
-    #[allow(dead_code)]
+    /// Carried onto every fire's launch plan as
+    /// [`crate::driver::LaunchPlan::dense_device_mask`], which is what keeps
+    /// such a fire out of a shared wave: the composed multi-program batch
+    /// does not merge dense device masks (v1 scope) and the driver fails
+    /// loud rather than execute a wrong one.
     pub dense_mask: bool,
     /// Host mirror of the instance's committed channel state (seeds, then
     /// per-fire stage folds): the value oracle for evaluated fire geometry.

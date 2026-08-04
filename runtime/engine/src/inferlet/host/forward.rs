@@ -1360,6 +1360,10 @@ impl pie::inferlet::forward::Host for ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         self.core_submit(on, slots).await
     }
+
+    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
+        crate::pipeline::fire::park_frame(self, on)
+    }
 }
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
@@ -1400,6 +1404,10 @@ impl pie::inferlet::forward_recurrent::Host for ProcessCtx {
     ) -> Anyhow<Result<(), String>> {
         self.core_submit(on, slots).await
     }
+
+    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
+        crate::pipeline::fire::park_frame(self, on)
+    }
 }
 
 impl pie::inferlet::forward_recurrent::HostForwardPass for ProcessCtx {
@@ -1427,6 +1435,10 @@ impl pie::inferlet::forward_hybrid::Host for ProcessCtx {
         slots: Vec<Option<Resource<ForwardPass>>>,
     ) -> Anyhow<Result<(), String>> {
         self.core_submit(on, slots).await
+    }
+
+    async fn park(&mut self, on: Resource<crate::pipeline::Pipeline>) -> Anyhow<()> {
+        crate::pipeline::fire::park_frame(self, on)
     }
 }
 

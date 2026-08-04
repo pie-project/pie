@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ztensor::DType as ZDType;
-use ztensor::cbor::Value;
+use ztensor::cbor::{self, Value};
 
 use crate::error::Error;
 use crate::types::{DType, Encoding, QuantScheme, TensorDecl};
@@ -106,9 +106,9 @@ fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Erro
         };
         return Ok((
             name,
-            Some(Value::Map(vec![
-                (Value::Text("elems_per_block".into()), Value::Uint(elems)),
-                (Value::Text("block_bytes".into()), Value::Uint(bytes)),
+            Some(cbor::map([
+                ("elems_per_block", elems),
+                ("block_bytes", bytes),
             ])),
         ));
     }
@@ -120,14 +120,7 @@ fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Erro
         // sub-byte float and the scale form is fixed by that specification.
         QuantScheme::Mxfp4E2M1E8M0 => Ok((
             "zt.mx/1",
-            Some(Value::Map(vec![
-                (Value::Text("axis".into()), Value::Uint(axis)),
-                (Value::Text("block_size".into()), Value::Uint(group)),
-                (
-                    Value::Text("scale_form".into()),
-                    Value::Text("e8m0_exponent".into()),
-                ),
-            ])),
+            Some(cbor::map([("axis", axis), ("block_size", group)])),
         )),
 
         // FP8 weights are not group-quantized codes: they are plain f8
@@ -162,23 +155,20 @@ fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Erro
             };
             Ok((
                 "zt.quant_group/1",
-                Some(Value::Map(vec![
-                    (Value::Text("axis".into()), Value::Uint(axis)),
-                    (Value::Text("bits".into()), Value::Uint(bits)),
-                    (Value::Text("group_size".into()), Value::Uint(group)),
+                Some(cbor::map([
+                    ("axis", Value::from(axis)),
+                    ("bits", Value::from(bits)),
+                    ("group_size", Value::from(group)),
                     (
-                        Value::Text("packing".into()),
-                        Value::Map(vec![
-                            (Value::Text("order".into()), Value::Text(order.into())),
-                            (Value::Text("per_word".into()), Value::Uint(per_word)),
-                            (Value::Text("word".into()), Value::Text(word.into())),
+                        "packing",
+                        cbor::map([
+                            ("order", Value::from(order)),
+                            ("per_word", Value::from(per_word)),
+                            ("word", Value::from(word)),
                         ]),
                     ),
-                    (
-                        Value::Text("scale_form".into()),
-                        Value::Text(scale_form.into()),
-                    ),
-                    (Value::Text("zero_point".into()), zero),
+                    ("scale_form", Value::from(scale_form)),
+                    ("zero_point", zero),
                 ])),
             ))
         }
@@ -186,24 +176,18 @@ fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Erro
 }
 
 fn zero_none() -> Value {
-    Value::Map(vec![(
-        Value::Text("form".into()),
-        Value::Text("none".into()),
-    )])
+    cbor::map([("form", "none")])
 }
 
 fn zero_implied(value: u64) -> Value {
-    Value::Map(vec![
-        (Value::Text("form".into()), Value::Text("implied".into())),
-        (Value::Text("value".into()), Value::Uint(value)),
+    cbor::map([
+        ("form", Value::from("implied")),
+        ("value", Value::from(value)),
     ])
 }
 
 fn zero_tensor(packing: &str) -> Value {
-    Value::Map(vec![
-        (Value::Text("form".into()), Value::Text("tensor".into())),
-        (Value::Text("packing".into()), Value::Text(packing.into())),
-    ])
+    cbor::map([("form", "tensor"), ("packing", packing)])
 }
 
 /// Writes a checkpoint one tensor at a time, payloads in chunks.

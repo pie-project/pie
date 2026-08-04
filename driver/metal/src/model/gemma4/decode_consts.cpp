@@ -22,27 +22,16 @@
 
 #include "../../batch/decode_abi.hpp"
 #include "kernels.hpp"
+#include "../shared_kernels.hpp"
 
 namespace pie::metal::gemma4 {
 namespace {
 
-// Replicated EXACTLY from the .metal sources; see kernels.hpp for the others.
-struct RmsParams {  // rms_norm.metal:22 (buffer 3)
-    float eps;
-    std::uint32_t axis_size;
-    std::uint32_t w_stride;
-    std::uint32_t plus_one;
-};
+using shared_kernels::RmsParams;
 
 template <class V>
 inline void bind_const(RawMetalContext& ctx, int ord, std::uint8_t idx, const V& val, int* count) {
-    SlotHandle s = ctx.const_slot(ord, idx, sizeof(V));
-    if (!s.valid()) {
-        throw std::runtime_error("gemma4 consts: heap_alloc failed (budget too small)");
-    }
-    std::memcpy(s.contents(), &val, sizeof(V));
-    ctx.arg_bind_ordinal(ord, idx, s);
-    if (count != nullptr) ++*count;
+    shared_kernels::bind_const(ctx, ord, idx, val, count, "gemma4");
 }
 
 /// Gemma 4 stores plain RMS weights. `plus_one` stays 0 — the `(1 + w)` gain is

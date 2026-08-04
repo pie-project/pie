@@ -5,8 +5,24 @@
 
 namespace pie::metal::gptoss {
 
-bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int router_bits,
-                       GptOssPsos& out, std::string* err) {
+bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir,
+                       const GptOssGeometry& g, GptOssPsos& out, std::string* err) {
+    // The attention width is the geometry's, not a literal: see the header.
+    const std::string d = "_d_" + std::to_string(g.head_dim);
+    // The expert bank's codec chooses its matvec. Same kernel body, same routed
+    // offsets, same bias epilogue -- the codec is a template parameter, so the
+    // only thing that differs here is which instantiation is named.
+    const std::string routed_name = g.mxfp4_experts
+                                        ? "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4"
+                                        : "affine_qmv_routed_bias_bfloat16_gs_64_b_4";
+    // The router's width is the checkpoint's to state. It is the same dense
+    // biased matvec at either width, so an unsolved one fails by NAME here --
+    // there is no instantiation to compile -- rather than silently defaulting
+    // to the common one and reading the bytes at half the stride.
+    const std::string router_name = "affine_qmv_tail_bias_bfloat16_gs_64_b_" +
+                                    std::to_string(g.router_bits);
+    const std::string sink_name = "sdpa_vector_decode_sink_bfloat16" + d;
+    const std::string sink_paged_name = "sdpa_paged_decode_sink_bfloat16" + d;
     const std::string dir =
         kernels_dir.empty() || kernels_dir.back() == '/' ? kernels_dir : kernels_dir + "/";
     struct Spec {
@@ -18,14 +34,13 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int
     const Spec specs[] = {
         {"quantized_qmv.metal", "affine_qmv_tail_bfloat16_gs_64_b_4", &out.qmv_tail},
         {"quantized_qmv.metal", "affine_qmv_tail_bias_bfloat16_gs_64_b_4", &out.qmv_tail_bias},
-        {"quantized_qmv.metal", "affine_qmv_routed_bias_bfloat16_gs_64_b_4",
-         &out.qmv_routed_bias},
-        {"quantized_qmv.metal", "affine_qmv_u8_bias_bfloat16_gs_64", &out.qmv_u8_bias},
+        {"quantized_qmv.metal", routed_name.c_str(), &out.qmv_routed_bias},
+        {"quantized_qmv.metal", router_name.c_str(), &out.qmv_router},
         {"gptoss.metal", "router_topk_bfloat16", &out.router_topk},
         {"gptoss.metal", "gptoss_swiglu_bfloat16", &out.swiglu},
         {"gptoss.metal", "expert_combine_bfloat16", &out.expert_combine},
-        {"sdpa_sliding.metal", "sdpa_vector_decode_sink_bfloat16_d_64", &out.sdpa_sink},
-        {"sdpa_paged.metal", "sdpa_paged_decode_sink_bfloat16_d_64", &out.sdpa_sink_paged},
+        {"sdpa_sliding.metal", sink_name.c_str(), &out.sdpa_sink},
+        {"sdpa_paged.metal", sink_paged_name.c_str(), &out.sdpa_sink_paged},
         {"rope.metal", "rope_neox_freqs_mb_bfloat16", &out.rope_freqs_mb},
         {"row_gather.metal", "row_gather_bfloat16", &out.row_gather},
         {"rope.metal", "rope_neox_freqs_decode_bfloat16", &out.rope_freqs},
@@ -40,23 +55,6 @@ bool build_gptoss_psos(RawMetalContext& ctx, const std::string& kernels_dir, int
             }
             return false;
         }
-    }
-    // The router's width is the checkpoint's to state, and the two kernels read
-    // incompatible packings, so an unsolved width is refused here rather than
-    // defaulted to the common one.
-    switch (router_bits) {
-        case 8: out.qmv_router = out.qmv_u8_bias; break;
-        // The dense biased 4-bit matvec: the router is [n_experts, hidden] with
-        // a bias, which is the same shape as an attention projection.
-        case 4: out.qmv_router = out.qmv_tail_bias; break;
-        default:
-            if (err != nullptr) {
-                *err = "gpt-oss PSOs: the router's quantization width could not be solved "
-                       "from the checkpoint (got " +
-                       std::to_string(router_bits) +
-                       "); only 4- and 8-bit routers have a kernel here";
-            }
-            return false;
     }
     return true;
 }

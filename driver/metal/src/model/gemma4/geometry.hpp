@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kernels/affine_format.hpp"
+
 /// Gemma 4 decode geometry.
 ///
 /// Ported from the bring-up harness (`tools/rawmetal/gemma4_abi.hpp`), whose
@@ -40,6 +42,10 @@ struct Gemma4Geometry {
     int n_kv_heads = 1;
     /// Sliding layers. Full layers use `global_head_dim`.
     int head_dim = 256;
+    /// The affine width and group every quantized kernel name here is spelled
+    /// with. See `AffineFormat`: they are one fact, the config states it, and
+    /// a pipeline built for the wrong pair answers instead of failing.
+    AffineFormat quant{4, 64};
     int global_head_dim = 512;
     /// Full layers rotate a quarter of their head; sliding layers rotate all of it.
     float full_partial_rotary = 0.25f;
@@ -60,9 +66,6 @@ struct Gemma4Geometry {
 
     /// `out = cap * tanh(logits / cap)`; 0 disables.
     float final_softcap = 30.0f;
-
-    int q_group = 64;
-    int q_bits = 4;
 
     /// Tokens the KV cache is sized for. The SDPA and append strides are read
     /// off it ([n_kv_heads, kv_max_ctx, head_dim]), so it has no useful default:

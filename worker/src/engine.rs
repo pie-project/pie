@@ -963,6 +963,7 @@ fn create_driver_group(
             return crate::embedded_driver::create_driver_backend_group(
                 &rank_opts,
                 snapshot_dir,
+                descriptor,
                 group_idx,
                 &tp_launches,
                 component,
