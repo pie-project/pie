@@ -173,6 +173,13 @@ struct LlamaLikePlanState {
     std::vector<std::uint32_t> prefill_decode_qo_indptr_h;
 };
 
+// The mixed fire's dedicated suffix-plan workspace (llama_like.cpp):
+// the prefix causal plan and the suffix custom plan are both
+// prefill-family and must not share one AttentionWorkspace's scheduling
+// buffers. Prepare plans the suffix against this; the mixed dispatch
+// sites pair with it.
+AttentionWorkspace& spatial_suffix_attn_ws();
+
 // Refresh the decode plan for the current fire. Caller invokes this
 // BEFORE either a direct forward call OR a graph replay, outside any
 // capture region. Pure decode plans the flashinfer decode/predecode path;

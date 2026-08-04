@@ -1280,17 +1280,38 @@ void llama_like_forward_declared(
                 // composed-envelope lanes' host views are
                 // placeholders, no host rebase).
                 if (mask_region == MaskRegion::Tail) {
+                    // Two domains (the mixed fire): request split for
+                    // CSR/mask-indptr offsets, token-row split for the
+                    // q/out pointers — equal on pure-decode fires. The
+                    // suffix plan lives in its DEDICATED slot for every
+                    // planned tail (the mixed fire's prefill slot holds
+                    // the prefix CAUSAL plan), planned against the
+                    // dedicated suffix workspace.
                     const int split = plan_state.spatial_mask_split;
+                    const int split_rows =
+                        plan_state.spatial_mask_row_split >= 0
+                            ? plan_state.spatial_mask_row_split
+                            : split;
+                    const ops::PrefillPlanCache* tail_plan =
+                        plan_state.use_mask_decode_plan
+                            ? plan_state.mask_decode_plan.get()
+                            : nullptr;
+                    if (tail_plan == nullptr) {
+                        throw std::runtime_error(
+                            "spatial mask: peel tail without a suffix "
+                            "mask plan");
+                    }
                     ops::dispatch_attention_flashinfer_prefill_custom(
-                        *mask_plan,
-                        bf16_row(attn_q, split, Hq), kv_view,
-                        bf16_row(attn_out_buf, split, Hq),
+                        *tail_plan,
+                        bf16_row(attn_q, split_rows, Hq), kv_view,
+                        bf16_row(attn_out_buf, split_rows, Hq),
                         mask_suffix_qo_indptr_d,
                         kv_page_indices,
                         kv_page_indptr + split,
                         kv_last_page_lens + split,
                         custom_mask_d, custom_mask_indptr_d + split,
-                        attn_ws, stream);
+                        is_pure_decode ? attn_ws : spatial_suffix_attn_ws(),
+                        stream);
                     break;
                 }
                 ops::dispatch_attention_flashinfer_prefill_custom(

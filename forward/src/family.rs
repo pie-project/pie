@@ -383,7 +383,7 @@ fn llama_like_text(
                     }
                     a
                 }
-                Some((_, FireClass::Prefill)) => {
+                Some((c, FireClass::Prefill)) => {
                     let q = general_qkv();
                     let (g, a) =
                         dsl::guarded_value(m.trace(), Some(l), attn_out_shape.clone());
@@ -394,7 +394,39 @@ fn llama_like_text(
                         // sites bracket the dispatch (null scores at
                         // OnAttn — no capture variant publishes).
                         dsl::hook_site(HookStage::OnAttnProj, &q, l);
-                        cuda::attention_flashinfer_prefill_custom_region(&q, &w.kv);
+                        // The MIXED FIRE: the prefill-class mask arm
+                        // states the same UnmaskedPrefix peel as the
+                        // decode class — prefix region = the causal
+                        // dispatch behind its dequant staging (any mix
+                        // of prefill and plain-decode requests, ragged
+                        // qo), tail = the custom dispatch over the
+                        // masked 1-token suffix. UNPLANNED (prepare
+                        // declined the shape, hooks/lora, disarmed
+                        // gate) collapses to tail-only full-N — the
+                        // fire-level custom dispatch as the peel's
+                        // endpoint. Padded head dims keep the
+                        // fire-level word (prepare's gate mirror).
+                        if c.head_dim_padded {
+                            cuda::attention_flashinfer_prefill_custom_region(
+                                &q, &w.kv,
+                            );
+                        } else {
+                            dsl::peel_masked(
+                                m.trace(),
+                                Some(l),
+                                || {
+                                    cuda::dequant_only(&w.kv);
+                                    cuda::attention_flashinfer_prefill_region(
+                                        &q, &w.kv,
+                                    );
+                                },
+                                || {
+                                    cuda::attention_flashinfer_prefill_custom_region(
+                                        &q, &w.kv,
+                                    )
+                                },
+                            );
+                        }
                         dsl::hook_site(HookStage::OnAttn, &q, l);
                     })
                     .otherwise(|| {

@@ -81,6 +81,14 @@ inline bool spatial_stream_enabled() {
     return on;
 }
 
+}  // namespace
+
+// The interpreter's TU pairs the mixed tail dispatch against the same
+// dedicated workspace the mixed prepare planned into.
+AttentionWorkspace& spatial_suffix_attn_ws() { return spatial_suffix_ws(); }
+
+namespace {
+
 inline SpatialSideStream& spatial_side_stream() {
     static SpatialSideStream s;
     return s;

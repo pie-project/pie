@@ -470,6 +470,15 @@ fn emit_range(
                 b.stmt("    unmasked_prefix_rows != 0xffffffffu) {");
                 b.indent += 1;
                 b.stmt("const int split = plan_state.spatial_mask_split;");
+                // Two domains (the mixed fire): `split` is the REQUEST
+                // index (CSR/mask-indptr offsets), `split_rows` the
+                // TOKEN-ROW offset (q/out pointers) — equal on
+                // pure-decode fires, divergent when prefill rows share
+                // the fire. The planned word is the request domain.
+                b.stmt("const int split_rows =");
+                b.stmt("    plan_state.spatial_mask_row_split >= 0");
+                b.stmt("        ? plan_state.spatial_mask_row_split");
+                b.stmt("        : split;");
                 b.stmt("if (split !=");
                 b.stmt("    static_cast<int>(unmasked_prefix_rows)) {");
                 b.stmt("    throw std::runtime_error(");
@@ -1372,7 +1381,7 @@ fn emit_launch(
                 // == split, and every CSR's `[0, split]` head is the
                 // prefix's truth (the launcher reads no further).
                 let (n_rows, n_reqs) = if win == Some(Win::MaskPrefix) {
-                    ("split", "split")
+                    ("split_rows", "split")
                 } else {
                     ("N", "R")
                 };
@@ -1504,7 +1513,11 @@ fn emit_launch(
             // supergraph axiom — no mutable plan sharing across fire
             // classes), prefill-shaped masked fires keep `prefill_plan`.
             let layer = state.expect("attention addresses kv state").layer;
-            let plan_cache = if is_decode {
+            // The suffix plan lives in the DEDICATED slot for every
+            // planned peel tail (both classes — the mixed fire's prefill
+            // slot holds the PREFIX CAUSAL plan); fire-level
+            // prefill-shaped masked fires keep the prefill slot.
+            let plan_cache = if is_decode || win == Some(Win::MaskTail) {
                 "plan_state.mask_decode_plan"
             } else {
                 "plan_state.prefill_plan"
@@ -1527,16 +1540,31 @@ fn emit_launch(
                 // `+split` indptr — the composed device truth, no host
                 // rebase). `split` is the peel's emitted local.
                 Some(Win::MaskTail) => {
+                    // The workspace pairs with the PLAN's: the decode
+                    // class plans the suffix into attn_ws (its prefix
+                    // is a DECODE plan — no prefill-family collision),
+                    // the mixed/prefill class into the dedicated
+                    // suffix workspace (its prefix causal plan owns
+                    // attn_ws).
+                    let ws = if is_decode {
+                        "attn_ws"
+                    } else {
+                        "spatial_suffix_attn_ws()"
+                    };
                     b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
                     b.stmt(&format!("        *{plan_cache},"));
-                    b.stmt(&format!("        bf16_row({q_buf}, split, Hq), kv_view,"));
-                    b.stmt(&format!("        bf16_row({out_buf}, split, Hq),"));
+                    b.stmt(&format!(
+                        "        bf16_row({q_buf}, split_rows, Hq), kv_view,"
+                    ));
+                    b.stmt(&format!(
+                        "        bf16_row({out_buf}, split_rows, Hq),"
+                    ));
                     b.stmt("        mask_suffix_qo_indptr_d,");
                     b.stmt("        kv_page_indices,");
                     b.stmt("        kv_page_indptr + split,");
                     b.stmt("        kv_last_page_lens + split,");
                     b.stmt("        custom_mask_d, custom_mask_indptr_d + split,");
-                    b.stmt("        attn_ws, stream);");
+                    b.stmt(&format!("        {ws}, stream);"));
                 }
                 // Fire-level: outside a peel (prefill-shaped masked
                 // fires, padded/XQA deployments) and the peel's
