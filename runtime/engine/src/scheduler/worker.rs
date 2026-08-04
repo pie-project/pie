@@ -4429,6 +4429,7 @@ impl BatchScheduler {
         for request in &requests {
             if let Some(instance) = instances.get_mut(&request.instance_id) {
                 instance.in_flight += 1;
+                instance.tokens_posted += request.request.token_ids.len() as u64;
             }
         }
         *lane_token += 1;
@@ -5393,6 +5394,52 @@ struct TrackedInstance {
     /// synthesized-fire ticket reservation.
     #[allow(dead_code)]
     channel_ids: Vec<u64>,
+    /// S1 groundwork: tokens across all launches POSTED for this instance —
+    /// the worker's mirror of the device's kv_len (posting order is per-lane
+    /// execution order). Clone eligibility checks
+    /// `tokens_posted + k <= kv_write_upper_bounds[0]` (token units), which
+    /// is sufficient because the fire build backs the WHOLE writable span
+    /// (`ensure_backed_reserved(ws, writable.end)`), so any in-span write is
+    /// backed and its translation entries are stable absent CoW.
+    tokens_posted: u64,
+}
+
+/// S1: whether `request` is a valid synthesis SOURCE for its lane's next
+/// decode continuation. Every predicate is self-describing from the plan
+/// plus worker-owned state — no locks, no guest context (the scouting
+/// table in continuation-waves.md). `tokens_posted_after` is the
+/// instance's posted-token count INCLUDING this request; `step_tokens` is
+/// what the continuation would add (k slots x 1 for decode).
+#[allow(dead_code)] // wired by S1 synthesis; predicate landed with the groundwork
+fn synth_eligible(
+    request: &PendingRequest,
+    tokens_posted_after: u64,
+    step_tokens: u64,
+) -> bool {
+    let plan = &request.request;
+    // Device-resolved decode: the geometry template is clonable verbatim
+    // (token_ids are placeholder zeros — the token is device-carried).
+    plan.device_resolved_geometry
+        // Device-class mask only: a Host-lowered mask is re-evaluated per
+        // fire against the host shadow and flips class between fires.
+        && plan.masks.is_empty()
+        && !plan.has_user_mask
+        // Pure-KV: every RS field is per-fire allocator state.
+        && plan.rs_slot_ids.is_empty()
+        && plan.rs_buffer_slot_ids.is_empty()
+        && plan.rs_buffer_read_slot_ids.is_empty()
+        && plan.rs_translation.is_empty()
+        // One scalar writable span whose backing the fire build already
+        // ensured end-to-end (`ensure_backed_reserved(ws, writable.end)`):
+        // an in-span continuation needs no grant and its translation
+        // snapshot cannot drift (no materialization; forks excluded below).
+        && plan.kv_write_upper_bounds.len() == 1
+        && tokens_posted_after.saturating_add(step_tokens) <= plan.kv_write_upper_bounds[0]
+        // Framed fires from unforked processes only (CoW guard, v1).
+        && request.frame.is_some()
+        && request
+            .process_id
+            .is_some_and(|pid| !crate::scheduler::has_forked(pid))
 }
 
 impl TrackedInstance {
@@ -5403,6 +5450,7 @@ impl TrackedInstance {
             in_flight: 0,
             next_target_epoch: pie_waker::FIRST_COMPLETION_EPOCH,
             channel_ids,
+            tokens_posted: 0,
         }
     }
 
@@ -7573,6 +7621,43 @@ mod tests {
             None,
             false,
         ))
+    }
+
+    #[test]
+    fn synth_eligibility_is_span_and_shape_gated() {
+        let pid = ProcessId::new_v4();
+        let mut request = dummy_launch_request(pid, 1);
+        request.request.device_resolved_geometry = true;
+        request.request.kv_write_lower_bounds = vec![0];
+        request.request.kv_write_upper_bounds = vec![64];
+        request.frame = Some(FrameStamp {
+            lane: pid,
+            seq: 1,
+            slot: 0,
+            fires: 1,
+        });
+        // In-span decode continuation: eligible.
+        assert!(synth_eligible(&request, 30, 2));
+        // Span exhausted: the continuation would write past the backed
+        // writable frontier.
+        assert!(!synth_eligible(&request, 63, 2));
+        // Host-class mask flips per fire: ineligible.
+        request.request.has_user_mask = true;
+        assert!(!synth_eligible(&request, 30, 2));
+        request.request.has_user_mask = false;
+        // RS-bearing pass: per-fire allocator state, ineligible.
+        request.request.rs_slot_ids = vec![7];
+        assert!(!synth_eligible(&request, 30, 2));
+        request.request.rs_slot_ids = Vec::new();
+        // Not device-resolved: nothing to clone.
+        request.request.device_resolved_geometry = false;
+        assert!(!synth_eligible(&request, 30, 2));
+        request.request.device_resolved_geometry = true;
+        // A forked process is refused wholesale (CoW guard).
+        crate::scheduler::mark_forked(pid);
+        assert!(!synth_eligible(&request, 30, 2));
+        crate::scheduler::forget_forked(pid);
+        assert!(synth_eligible(&request, 30, 2));
     }
 
     #[test]

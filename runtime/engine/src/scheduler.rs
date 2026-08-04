@@ -666,6 +666,29 @@ pub(crate) fn cont_cancel_debt_add(pid: ProcessId, frames: u64) {
         .fetch_add(frames, std::sync::atomic::Ordering::AcqRel);
 }
 
+/// S1 groundwork: processes that ever forked a KV working set. A fork's
+/// copy-on-write can rewrite translation entries behind a cloned plan's
+/// snapshot, so continuation synthesis refuses these pids wholesale (v1;
+/// a per-working-set generation mirror can replace this if forked
+/// workloads ever need synthesis).
+fn forked_pids() -> &'static std::sync::Mutex<std::collections::HashSet<ProcessId>> {
+    static SET: OnceLock<std::sync::Mutex<std::collections::HashSet<ProcessId>>> = OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+pub(crate) fn mark_forked(pid: ProcessId) {
+    forked_pids().lock().unwrap().insert(pid);
+}
+
+#[allow(dead_code)] // read by S1 synthesis eligibility
+pub(crate) fn has_forked(pid: ProcessId) -> bool {
+    forked_pids().lock().unwrap().contains(&pid)
+}
+
+pub(crate) fn forget_forked(pid: ProcessId) {
+    forked_pids().lock().unwrap().remove(&pid);
+}
+
 pub(crate) fn cont_cancel_debt_take(pid: ProcessId) -> u64 {
     let handle = cont_cancel_debt_map().lock().unwrap().get(&pid).cloned();
     handle.map_or(0, |debt| {
