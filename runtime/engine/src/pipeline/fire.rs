@@ -1599,6 +1599,26 @@ pub async fn submit_frame<C: FireContext>(
                 });
             }
         }
+        // Re-prime: the scheduler flagged this lane as retiring with zero
+        // inventory (a park or eviction consumed its queued frame while it
+        // could not produce). One extra continuation here is the only
+        // moment production can exceed one frame per settle; credit is
+        // capped at 2 and the ring is sized for it.
+        if crate::scheduler::prime_hint_take(ctx.process_id()) {
+            let credit = {
+                let pipeline = ctx.resources().get(&this)?;
+                pipeline.cont_credit.load(std::sync::atomic::Ordering::Acquire)
+            };
+            if credit < 2 && matches!(submit_frame_slots(ctx, &this, &fired).await?, Ok(())) {
+                let pipeline = ctx.resources().get(&this)?;
+                pipeline
+                    .cont_credit
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                crate::scheduler::GUEST_PHASES
+                    .cont_reprime
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         return Ok(Ok(()));
     }
     submit_frame_slots(ctx, &this, &fired).await

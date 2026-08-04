@@ -723,6 +723,8 @@ impl FramePolicy {
         // the next wave (arrival-time sampling can't see this).
         {
             let acc = &crate::scheduler::RUN_AHEAD;
+            let cont = crate::pipeline::fire::cont_wave_enabled();
+            let mut hints: Vec<ProcessId> = Vec::new();
             let (mut r0, mut r1, mut r2) = (0u64, 0u64, 0u64);
             for state in self.lanes.values().filter(|state| state.awaited) {
                 let complete = state
@@ -731,7 +733,12 @@ impl FramePolicy {
                     .filter(|frame| frame.is_complete())
                     .count();
                 match complete {
-                    0 => r0 += 1,
+                    0 => {
+                        r0 += 1;
+                        if cont && let Some(owner) = state.owner {
+                            hints.push(owner);
+                        }
+                    }
                     1 => r1 += 1,
                     _ => r2 += 1,
                 }
@@ -739,6 +746,9 @@ impl FramePolicy {
             acc.retq0.fetch_add(r0, Ordering::Relaxed);
             acc.retq1.fetch_add(r1, Ordering::Relaxed);
             acc.retq2.fetch_add(r2, Ordering::Relaxed);
+            if !hints.is_empty() {
+                crate::scheduler::prime_hint_mark(hints);
+            }
         }
         for lane in lanes {
             self.in_flight_lanes.remove(&lane);

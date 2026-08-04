@@ -442,6 +442,8 @@ pub(crate) struct GuestPhaseAcc {
     /// Continuation-wave submits (`PIE_CONT_WAVE=1`): armed / failed-skipped.
     pub cont_ok: AtomicU64,
     pub cont_fail: AtomicU64,
+    /// Extra continuations emitted on a scheduler prime hint.
+    pub cont_reprime: AtomicU64,
 }
 
 /// Per-lane run-ahead probe: at every seal, how deep each awaited lane's
@@ -537,6 +539,27 @@ pub(crate) static RUN_AHEAD: RunAheadAcc = RunAheadAcc {
 /// measure how long a woken lane takes to actually resume on the runtime.
 pub(crate) static LAST_RESOLVE_US: AtomicU64 = AtomicU64::new(0);
 
+/// Continuation-wave prime hints: processes whose lane retired with an EMPTY
+/// frame queue (zero run-ahead inventory). The fire path re-primes such a
+/// lane on its next eligible submit — emits one extra continuation — which
+/// is the only moment production can transiently exceed one frame per
+/// settle and rebuild the inventory that allocation parks consumed.
+/// Event-driven: set at retirement, consumed at submit, no timers.
+fn prime_hints() -> &'static std::sync::Mutex<std::collections::HashSet<ProcessId>> {
+    static HINTS: OnceLock<std::sync::Mutex<std::collections::HashSet<ProcessId>>> =
+        OnceLock::new();
+    HINTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub(crate) fn prime_hint_mark(pids: impl IntoIterator<Item = ProcessId>) {
+    let mut hints = prime_hints().lock().unwrap();
+    hints.extend(pids);
+}
+
+pub(crate) fn prime_hint_take(pid: ProcessId) -> bool {
+    prime_hints().lock().unwrap().remove(&pid)
+}
+
 pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
     wake_woken: AtomicU64::new(0),
     wake_empty: AtomicU64::new(0),
@@ -560,6 +583,7 @@ pub(crate) static GUEST_PHASES: GuestPhaseAcc = GuestPhaseAcc {
     fast_small_n: AtomicU64::new(0),
     cont_ok: AtomicU64::new(0),
     cont_fail: AtomicU64::new(0),
+    cont_reprime: AtomicU64::new(0),
 };
 
 pub(crate) static LOOP_PHASES: LoopPhaseAcc = LoopPhaseAcc {
