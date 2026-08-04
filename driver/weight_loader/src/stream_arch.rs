@@ -169,7 +169,7 @@ pub(crate) fn dsv4_tp_section_bytes(
             w2_scale.shape
         )));
     }
-    let (_local_start, local_intermediate) = tp_local_range(i_full, target)?;
+    let (_local_start, local_intermediate) = crate::abi::local_range(i_full, target)?;
     if local_intermediate % 32 != 0 {
         return Err(CompileError::InvalidInput(format!(
             "stream_routed_experts: DeepSeek-V4 TP shard \
@@ -382,19 +382,6 @@ fn align_up_u64(v: u64, a: u64) -> u64 {
     (v + a - 1) / a * a
 }
 
-fn tp_local_range(full: i64, target: &StorageTarget) -> Result<(i64, i64), CompileError> {
-    let world = i64::from(target.tp_size.max(1));
-    let rank = i64::from(target.tp_rank);
-    if full % world != 0 {
-        return Err(CompileError::InvalidInput(format!(
-            "dimension {full} is not divisible by tp_size {}",
-            target.tp_size
-        )));
-    }
-    let local = full / world;
-    Ok((rank * local, local))
-}
-
 /// Marlin per-expert section byte sizes from GPT-OSS fused HF bank shapes.
 /// Uses TP-local intermediate (`I_full / tp_size`), then pads to 128 for Marlin.
 pub(crate) fn gpt_oss_native_section_bytes(
@@ -421,7 +408,7 @@ pub(crate) fn gpt_oss_native_section_bytes(
     }
     let full_intermediate = (fused_rows / 2) as i64;
     let (_local_start, local_intermediate) =
-        tp_local_range(full_intermediate, target)?;
+        crate::abi::local_range(full_intermediate, target)?;
     if local_intermediate % 32 != 0 {
         return Err(CompileError::InvalidInput(format!(
             "stream_routed_experts: GPT-OSS native TP shard I_local={local_intermediate} \
@@ -556,7 +543,7 @@ pub(crate) fn gpt_oss_routed_tp_section_bytes(
         )));
     }
     let full_intermediate = (fused_rows / 2) as i64;
-    let (_local_start, local_intermediate) = tp_local_range(full_intermediate, target)?;
+    let (_local_start, local_intermediate) = crate::abi::local_range(full_intermediate, target)?;
     if local_intermediate % 32 != 0 {
         return Err(CompileError::InvalidInput(format!(
             "stream_routed_experts: GPT-OSS RoutedDecode TP shard \
@@ -674,7 +661,13 @@ fn gpt_oss_eager_bf16_section_bytes(
         )));
     }
     let full_intermediate = (fused_rows / 2) as i64;
-    let (_local_start, local_intermediate) = tp_local_range(full_intermediate, target)?;
+    let (_local_start, local_intermediate) = crate::abi::local_range(full_intermediate, target)?;
+    if local_intermediate % 32 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: GPT-OSS eager BF16 TP shard \
+             I_local={local_intermediate} must be divisible by 32"
+        )));
+    }
     let intermediate = local_intermediate as u64;
     let hidden = gu_groups * 32;
     let down_hidden = down_blocks.shape[1] as u64;
@@ -857,7 +850,7 @@ pub(crate) fn mixtral_tp_section_bytes(
             w2.shape
         )));
     }
-    let (_local_start, local_intermediate) = tp_local_range(i_full, target)?;
+    let (_local_start, local_intermediate) = crate::abi::local_range(i_full, target)?;
     let i_local = local_intermediate as u64;
     let h = hidden as u64;
     let w1_bytes = i_local * h * 2;
@@ -1051,7 +1044,7 @@ pub(crate) fn qwen3_moe_tp_section_bytes(
             down.shape
         )));
     }
-    let (_local_start, local_intermediate) = tp_local_range(i_full, target)?;
+    let (_local_start, local_intermediate) = crate::abi::local_range(i_full, target)?;
     let i_local = local_intermediate as u64;
     let h = hidden as u64;
     let gate_bytes = i_local * h * 2;
@@ -1277,7 +1270,7 @@ pub(crate) fn qwen35_moe_tp_section_bytes(
             gate_up.shape[0], down.shape[0]
         )));
     }
-    let (_local_start, local_intermediate) = tp_local_range(i_full, target)?;
+    let (_local_start, local_intermediate) = crate::abi::local_range(i_full, target)?;
     let i_local = local_intermediate as u64;
     let h = hidden as u64;
     let gu_bytes = 2 * i_local * h * 2;

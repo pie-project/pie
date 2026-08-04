@@ -87,6 +87,13 @@ struct GptOssRoutedMxfp4PackTraits {
         }
         ctx.hidden = ctx.gu_groups * 32;
         ctx.down_groups_full = static_cast<int>(dn_w_info.shape[2]);
+        if (ctx.down_groups_full != ctx.full_intermediate / 32) {
+            throw std::runtime_error(
+                "expert pack: RoutedDecode down groups " +
+                std::to_string(ctx.down_groups_full) +
+                " != full_intermediate/32 (" +
+                std::to_string(ctx.full_intermediate / 32) + ")");
+        }
         ctx.down_groups_local = ctx.local_intermediate / 32;
 
         const std::uint64_t i_local =
