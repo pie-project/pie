@@ -499,8 +499,7 @@ fn put_drains_a_peeked_port_and_leaves_a_consuming_one_alone() {
     );
 
     // The drain precedes the put it makes room for.
-    let pos_of =
-        |pred: &dyn Fn(&Op) -> bool| c.stages[0].ops.iter().position(|op| pred(op)).expect("op");
+    let pos_of = |pred: &dyn Fn(&Op) -> bool| c.stages[0].ops.iter().position(pred).expect("op");
     assert!(
         pos_of(&|op| matches!(op, Op::ChanTake(c) if *c == dense(pidx)))
             < pos_of(&|op| matches!(op, Op::ChanPut { chan, .. } if *chan == dense(pidx))),

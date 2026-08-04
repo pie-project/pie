@@ -353,9 +353,7 @@ pub(crate) fn symbolic_port_type(port: Port, value_type: ValueType) -> SymbolicT
         Port::RsBufferIndptr | Port::RsBufferLen | Port::RsFoldLen => {
             set_first_symbolic(&mut ty, SymbolicExtent::RowCount)
         }
-        Port::RsWSlot | Port::RsWOff => {
-            set_first_symbolic(&mut ty, SymbolicExtent::TokenCount)
-        }
+        Port::RsWSlot | Port::RsWOff => set_first_symbolic(&mut ty, SymbolicExtent::TokenCount),
     }
     ty
 }
