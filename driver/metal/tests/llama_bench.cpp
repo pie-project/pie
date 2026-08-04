@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +51,24 @@ bool exists(const std::string& dir) {
     if (f == nullptr) return false;
     std::fclose(f);
     return true;
+}
+
+/// How many bytes of weights this checkpoint is, off the filesystem.
+///
+/// The plan's own figure would be better, but it is behind `MetalExecutor` and
+/// the point of the probe is to run BEFORE one exists. The weight files are the
+/// same number to within their headers, and the probe only needs a capacity
+/// that is plainly under the model.
+std::uint64_t checkpoint_weight_bytes(const std::string& dir) {
+    std::uint64_t total = 0;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec || !entry.is_regular_file(ec)) continue;
+        const std::string ext = entry.path().extension().string();
+        if (ext != ".safetensors" && ext != ".zt" && ext != ".gguf" && ext != ".bin") continue;
+        total += entry.file_size(ec);
+    }
+    return total;
 }
 
 double now_s() {
@@ -306,14 +325,26 @@ int main(int argc, char** argv) {
     // one caller makes is not a check the driver makes.
     //
     // This costs nothing: the refusal happens before a byte is allocated.
-    {
-        RawMetalContext::set_device_working_set_bytes_for_test(256u << 20);
+    //
+    // Twice, at two capacities, because one of them proves nothing on its own.
+    // 256 MiB is under any checkpoint's SCRATCH, so it refuses even a driver
+    // that has forgotten the weights entirely -- which is exactly what happened
+    // when weights bound where they lie stopped being counted: a 17.17 GB model
+    // reported that it needed 0.326 GiB, and this probe still passed. Half the
+    // weights is a capacity only the right arithmetic refuses.
+    const std::uint64_t weight_bytes = checkpoint_weight_bytes(cfg.snapshot_dir);
+    for (const std::uint64_t hold :
+         {std::uint64_t(256u << 20), weight_bytes / 2}) {
+        if (hold == 0) continue;
+        RawMetalContext::set_device_working_set_bytes_for_test(std::size_t(hold));
         MetalExecutor probe;
         std::string too_big;
         const bool set_up = probe.setup(cfg, &too_big);
         RawMetalContext::set_device_working_set_bytes_for_test(0);
         if (set_up) {
-            std::printf("  FAIL  setup succeeded on a device that said it would hold 256 MiB\n");
+            std::printf("  FAIL  setup succeeded on a device that said it would hold %.2f GiB,"
+                        " against %.2f GiB of weights\n",
+                        double(hold) / (1 << 30), double(weight_bytes) / (1 << 30));
             return 1;
         }
         if (too_big.find("does not fit this GPU") == std::string::npos) {

@@ -789,11 +789,17 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // memory.
     const std::size_t heap_bytes = (weights >= streamed ? weights - streamed : 0) +
                                    SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
-    // `create` here takes no elastic budget, so the whole ask is the heap. The
-    // weight figure in the refusal is the heap's share, not the checkpoint's:
-    // bytes bound where they lie are not allocated here, and quoting the whole
-    // model against a heap that never holds it reads as a contradiction.
-    if (!fits_on_this_gpu(heap_bytes, 0, heap_bytes, err)) return false;
+    // What to ALLOCATE and what must be RESIDENT are two numbers, and this
+    // refusal is about the second. Weights bound where they lie leave the heap
+    // but not the working set -- `wrap_host_memory` puts them in the residency
+    // set and asks for them, and paging in Qwen3-30B's mapping costs 9.3 s of
+    // real I/O, which is not what an evictable byte costs. Subtracting them
+    // from the ask made a 17.17 GB model report that it needed 0.326 GiB, so
+    // the one guard meant to say "this will not fit" said nothing at all.
+    //
+    // `create` here takes no elastic budget, so the whole ask is the heap plus
+    // whatever was bound outside it.
+    if (!fits_on_this_gpu(heap_bytes + streamed, 0, weights, err)) return false;
     // Two marks, because between them lies the answer to "why is loading slow"
     // and the two halves have completely different causes. Everything up to
     // `staged` is the driver's own work -- copying, dequantizing, allocating --
@@ -936,7 +942,10 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
         plan_.kv_bytes + plan_.state_bytes + plan_.scratch_bytes +
         plan_.kv_pool_bytes + (taps ? 0u : scratch_pool_bytes);
 
-    if (!fits_on_this_gpu(heap_bytes, elastic_budget, resident_weights, err)) return false;
+    // Heap plus mapping: see `setup_simple`. What leaves the heap does not
+    // leave the working set.
+    if (!fits_on_this_gpu(heap_bytes + streamed, elastic_budget, plan_.weights_bytes, err))
+        return false;
 
     ctx_ = RawMetalContext::create(heap_bytes, elastic_budget);
     if (!ctx_) {
