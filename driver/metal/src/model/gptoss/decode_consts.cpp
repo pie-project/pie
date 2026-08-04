@@ -233,8 +233,6 @@ int bind_gptoss_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
 
             case Kind::AttnResidual:
             case Kind::FfnResidual:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width,
-                                         std::int32_t(R) * g.hidden, &count);
                 break;
 
             case Kind::EmbedGather:

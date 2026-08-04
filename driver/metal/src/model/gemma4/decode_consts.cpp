@@ -330,8 +330,6 @@ int bind_gemma4_consts(RawMetalContext& ctx, const std::vector<Dispatch>& dag,
             }
             // The one add this family does not fuse into a norm.
             case Kind::BranchAdd:
-                bind_const<std::int32_t>(ctx, ord, (std::uint8_t)bind::Residual::Width,
-                                         std::int32_t(R * std::uint32_t(g.hidden)), &count);
                 break;
 
             // ── elementwise ──

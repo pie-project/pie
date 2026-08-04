@@ -2426,11 +2426,10 @@ template <typename P, int group_size, int bits, int BM, int BK, int BN>
 
 // Sum the split_k slices and write the activation type, folding in the block
 // residual the fused projection would otherwise have applied.
-template <typename T, typename P, bool WITH_RESIDUAL>
+template <typename T, typename P>
 [[kernel]] void qmm_splitk_reduce(
     device T* y                 [[buffer(4)]],
     const constant int& N       [[buffer(6)]],
-    const device T* residual    [[buffer(7)]],
     const device P* partial     [[buffer(8)]],
     const constant int& stride  [[buffer(10)]],
     // NOT buffer(9). One argument table serves BOTH halves of a split
@@ -2444,7 +2443,6 @@ template <typename T, typename P, bool WITH_RESIDUAL>
   float acc = 0.0f;
   for (int s = 0; s < split_k; ++s)
     acc += float(partial[o + int64_t(s) * stride]);
-  if (WITH_RESIDUAL) acc += float(residual[o]);
   y[o] = static_cast<T>(acc);
 }
 
@@ -2498,18 +2496,10 @@ instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 64)
 
 
 template [[host_name("qmm_splitk_reduce_bfloat16")]] [[kernel]] void
-qmm_splitk_reduce<bfloat, bfloat, false>(
-    device bfloat*, const constant int&, const device bfloat*, const device bfloat*,
-    const constant int&, const constant int&, uint2);
-template [[host_name("qmm_splitk_reduce_residual_bfloat16")]] [[kernel]] void
-qmm_splitk_reduce<bfloat, bfloat, true>(
-    device bfloat*, const constant int&, const device bfloat*, const device bfloat*,
+qmm_splitk_reduce<bfloat, bfloat>(
+    device bfloat*, const constant int&, const device bfloat*,
     const constant int&, const constant int&, uint2);
 template [[host_name("qmm_splitk_reduce_f32_bfloat16")]] [[kernel]] void
-qmm_splitk_reduce<bfloat, float, false>(
-    device bfloat*, const constant int&, const device bfloat*, const device float*,
-    const constant int&, const constant int&, uint2);
-template [[host_name("qmm_splitk_reduce_residual_f32_bfloat16")]] [[kernel]] void
-qmm_splitk_reduce<bfloat, float, true>(
-    device bfloat*, const constant int&, const device bfloat*, const device float*,
+qmm_splitk_reduce<bfloat, float>(
+    device bfloat*, const constant int&, const device float*,
     const constant int&, const constant int&, uint2);

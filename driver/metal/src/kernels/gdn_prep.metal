@@ -12,7 +12,7 @@
 //         writes the q/k channels of new_conv_state. Emits to scratch:
 //           pre_q   [R, Hv, Dk]  fp32   (normalized + 1/sqrt(Dk)-prescaled q)
 //           pre_k   [R, Hv, Dk]  fp32   (normalized k)
-//           pre_gate[R, Hv, 2 ]  fp32   ({decay, beta} per head)
+//           pre_gate[R, 2*Hv + Hv*Dv] fp32 ({decay,beta} then precomputed V)
 //
 //   (2) gdn_core_recurrent<T>  grid {32, Vd, R*Hv}  tg {32,4,1}
 //         one simdgroup per (req, v-head, v-dim); reads pre_q/pre_k/pre_gate

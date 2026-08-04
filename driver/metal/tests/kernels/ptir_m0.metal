@@ -1,5 +1,5 @@
 #include <metal_stdlib>
-#include "ptir_rng.generated.metal"
+#include "../../src/kernels/ptir_rng.generated.metal"
 using namespace metal;
 
 struct PtirRngCase {

@@ -216,66 +216,6 @@ if(APPLE)
     "-framework Accelerate")
 endif()
 
-# -----------------------------------------------------------------------------
-# Native Metal shader compilation (optional, AOT)
-#
-# Default path is MLX JIT (`mlx::core::fast::metal_kernel`), where kernel
-# source lives as a string in a `.cpp` and any `.metal` file is just a
-# tooling mirror — nothing to compile here. Set -DPIE_METAL_BUILD_METALLIB=ON
-# to instead AOT-compile every standalone-compilable `src/kernels/*.metal`
-# into a default.metallib next to the binary.
-# -----------------------------------------------------------------------------
-option(PIE_METAL_BUILD_METALLIB "AOT-compile src/kernels/*.metal into default.metallib" OFF)
-
-set(PIE_METAL_SHADER_NAMES
-  argmax
-  attn_gate
-  bf16_gemv
-  embed_gather
-  gated_rms
-  gdn_core
-  gdn_prep
-  geglu_tanh
-  gemv_demo
-  kv_append
-  kv_append_paged
-  layer_scalar
-  logit_softcap
-  ple_combine
-  quantized_qmv
-  residual_add
-  rms_norm
-  rope
-  sdpa_paged
-  sdpa_sliding
-  sdpa_vector
-  silu_mul
-  vnorm)
-
-if(PIE_METAL_BUILD_METALLIB)
-  find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
-  set(PIE_METAL_AIR_FILES "")
-  foreach(shader_name ${PIE_METAL_SHADER_NAMES})
-    set(shader ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/${shader_name}.metal)
-    set(air_file ${CMAKE_BINARY_DIR}/metal/${shader_name}.air)
-    add_custom_command(
-      OUTPUT ${air_file}
-      COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -std=metal4.0 -c ${shader} -o ${air_file}
-      DEPENDS ${shader}
-      COMMENT "Compiling Metal shader ${shader_name}.metal")
-    list(APPEND PIE_METAL_AIR_FILES ${air_file})
-  endforeach()
-  set(PIE_METAL_METALLIB ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib)
-  add_custom_command(
-    OUTPUT ${PIE_METAL_METALLIB}
-    COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metallib ${PIE_METAL_AIR_FILES}
-            -o ${PIE_METAL_METALLIB}
-    DEPENDS ${PIE_METAL_AIR_FILES}
-    COMMENT "Linking default.metallib")
-  add_custom_target(pie_driver_metal_shaders ALL DEPENDS ${PIE_METAL_METALLIB})
-  add_dependencies(pie_driver_metal_lib pie_driver_metal_shaders)
-endif()
-
 # ---- the loader archive ----------------------------------------------------
 #
 # `src/batch/forward.cpp` compiles a LoadPlan, which means calling into
@@ -549,6 +489,8 @@ add_test(NAME executor_worker_test COMMAND executor_worker_test)
 
 if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
+  target_compile_definitions(ptir_m0_device_test PRIVATE
+    PIE_METAL_TEST_KERNELS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/kernels")
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   add_metal_linked_test(commit_batch_feedback_test tests/commit_batch_feedback_test.cpp)
   add_metal_linked_test(run_segments_test tests/run_segments_test.cpp)

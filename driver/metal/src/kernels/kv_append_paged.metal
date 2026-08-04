@@ -32,13 +32,11 @@ template <typename T>
     const device T* v_new   [[buffer(1)]],   // V
     device T* k_pages       [[buffer(2)]],   // KPages: [num_pages*page_size, n_kv_heads, head_dim]
     device T* v_pages       [[buffer(3)]],   // VPages
-    const device uint* position_ids      [[buffer(4)]],   // PositionPtr: [N] absolute positions (IO, u32)
     const constant int& head_dim         [[buffer(5)]],   // HeadDim
-    // buffers 6 (KHeadStride) + 7 (KSeqStride) = M=1 ring strides — bound, unused here.
-    const device uint* kv_page_indices   [[buffer(8)]],   // retained CSR read contract
-    const device uint* kv_page_indptr    [[buffer(9)]],
+    // Buffers 4, 6-9 and 11 belong to the shared ring/read ABI. The host
+    // validates the normalized write against that CSR before encoding; this
+    // kernel needs only the physical destination below.
     const constant int& page_size        [[buffer(10)]],  // PageSize
-    const device uint* req_of_token      [[buffer(11)]],  // ReqOfToken: [N] request id per token (IO, u32)
     const constant int& n_kv_heads       [[buffer(12)]],  // NKvHeads
     const device uint* w_page            [[buffer(13)]],  // explicit/normalized physical destination
     const device uint* w_off             [[buffer(14)]],  // explicit/normalized in-page offset
@@ -48,13 +46,6 @@ template <typename T>
   const int i = int(tid.z);   // token within the batch [0, N)
   if (d >= head_dim) return;
 
-  const uint r = req_of_token[i];
-  const uint p = position_ids[i];
-  // Keep the CSR and position arguments live in the ABI: attention reads them,
-  // and host validation establishes that the explicit write belongs to r/p.
-  (void)kv_page_indices;
-  (void)kv_page_indptr;
-  (void)r;
   const uint page = w_page[i];
   const size_t slot = size_t(page) * size_t(page_size) + size_t(w_off[i]);
 
@@ -70,9 +61,8 @@ template <typename T>
   template [[host_name("kv_append_paged_" #name)]]                \
   [[kernel]] void kv_append_paged<itype>(                         \
       const device itype*, const device itype*, device itype*,    \
-      device itype*, const device uint*, const constant int&,     \
-      const device uint*, const device uint*, const constant int&,\
-      const device uint*, const constant int&, const device uint*, \
+      device itype*, const constant int&, const constant int&,    \
+      const constant int&, const device uint*,                    \
       const device uint*, uint3);
 
 instantiate_kv_append_paged(bfloat16, bfloat)

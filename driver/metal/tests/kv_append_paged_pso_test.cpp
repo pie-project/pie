@@ -96,7 +96,9 @@ int main() {
     expect(ok, "load_multibatch_psos compiles successfully (" + err + ")");
     expect(psos.embed_mb.valid(), "embed_gather_mb_4bit_bfloat16_gs_64_b_4 compiled");
     expect(psos.rope_mb.valid(), "rope_neox_mb_bfloat16 compiled");
-    expect(psos.gdn_slotted.valid(), "gdn_core_slotted_bfloat16 compiled");
+    expect(psos.gdn_prep_slotted.valid(), "gdn_prep_slotted_bfloat16 compiled");
+    expect(psos.gdn_recurrent_slotted.valid(),
+           "gdn_core_recurrent_slotted_bfloat16 compiled");
     expect(psos.sdpa_paged.valid(), "sdpa_paged_decode_bfloat16_d_256 compiled");
     expect(psos.sdpa_paged_d512.valid(), "sdpa_paged_decode_bfloat16_d_512 (gemma4) compiled");
     expect(psos.kv_append_paged.valid(),
