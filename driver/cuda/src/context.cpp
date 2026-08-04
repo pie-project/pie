@@ -1,4 +1,5 @@
 #include <pie_native/step_launch.hpp>
+#include <pie_native/region_plans.hpp>
 #include "context.hpp"
 
 #include <algorithm>
@@ -265,13 +266,18 @@ struct LaunchScratch {
         view.kv_translation = pie_native::slice_from_u32(launch.kv_translation.ptr, launch.kv_translation.len);
         view.kv_translation_indptr = pie_native::slice_from_u32(launch.kv_translation_indptr.ptr, launch.kv_translation_indptr.len);
         view.ptir_program_row_indptr = pie_native::slice_from_u32(launch.ptir_program_row_indptr.ptr, launch.ptir_program_row_indptr.len);
-        view.planned_hook_free_prefix_rows = launch.planned_hook_free_prefix_rows;
-        view.planned_unmasked_prefix_rows = launch.planned_unmasked_prefix_rows;
-        view.planned_max_layers = launch.planned_max_layers;
-        view.planned_full_depth_rows = launch.planned_full_depth_rows;
         view.region_row_indptr = pie_native::slice_from_u32(launch.region_row_indptr.ptr, launch.region_row_indptr.len);
         view.region_sig = pie_native::slice_from_u32(launch.region_sig.ptr, launch.region_sig.len);
         view.region_k = pie_native::slice_from_u32(launch.region_k.ptr, launch.region_k.len);
+        // V2 rung 3c: the region table is the source of truth for the
+        // four planned words — derived here, before ANY consumer; the
+        // wire words are the strict tripwire for one more era.
+        pie_native::apply_region_plans(
+            view,
+            launch.planned_hook_free_prefix_rows,
+            launch.planned_unmasked_prefix_rows,
+            launch.planned_max_layers,
+            launch.planned_full_depth_rows);
         view.ptir_kv_write_lower_bounds = pie_native::slice_from_u64(
             launch.ptir_kv_write_lower_bounds.ptr,
             launch.ptir_kv_write_lower_bounds.len);
