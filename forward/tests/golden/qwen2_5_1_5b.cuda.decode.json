@@ -15807,5 +15807,6 @@
       ],
       "layer": null
     }
-  ]
+  ],
+  "depth_window": true
 }

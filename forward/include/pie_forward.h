@@ -427,6 +427,10 @@ struct PieForwardPlan {
   /// The tracer's content hash ([`crate::ffi::compiler_version`]), so two
   /// plans compare as stale-vs-fresh without re-tracing.
   uint64_t compiler_version;
+  /// STRUCTURAL S-3: non-zero when the declaration states the depth axis —
+  /// layer-tagged ops may run over the full-depth prefix window (or be
+  /// skipped on a uniform truncated fire), keyed on each op's layer tag.
+  uint8_t depth_window;
   void *owner;
 };
 

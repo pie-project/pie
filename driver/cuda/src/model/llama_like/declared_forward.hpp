@@ -208,7 +208,13 @@ void llama_like_forward_declared(
     // with plan_state.spatial_mask_split (drift throws).
     std::uint32_t unmasked_prefix_rows = 0xffffffffu,
     const std::uint32_t* mask_suffix_qo_indptr_d = nullptr,
-    const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr);
+    const std::uint32_t* mask_suffix_kv_page_indptr_d = nullptr,
+    // STRUCTURAL S-3/S-4: the depth axis — the suffix's uniform k and
+    // the union's request split (UINT32_MAX = unset). Honoured only when
+    // the fire's plan STATES the axis (ForwardPlan::depth_window); the
+    // router keeps unsupported shapes on the hand-written body.
+    std::uint32_t declared_max_layers = 0xffffffffu,
+    std::uint32_t declared_full_depth_rows = 0xffffffffu);
 
 // The unionized supergraph (S3): whether this deployment's digest has an
 // emitted `..._supergraph_build`, and the digest-dispatched build call

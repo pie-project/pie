@@ -423,7 +423,9 @@ void llama_like_forward_declared(
     const std::uint32_t* peel_window_d,
     std::uint32_t unmasked_prefix_rows,
     const std::uint32_t* mask_suffix_qo_indptr_d,
-    const std::uint32_t* mask_suffix_kv_page_indptr_d)
+    const std::uint32_t* mask_suffix_kv_page_indptr_d,
+    std::uint32_t declared_max_layers,
+    std::uint32_t declared_full_depth_rows)
 {
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
@@ -458,7 +460,10 @@ void llama_like_forward_declared(
     // complete): the emitter constructs the lora staging AND the hook
     // sidebands (page mask, score captures) and spells the sites,
     // brackets and corrections with constant layers.
-    if (generated_forward_enabled()) {
+    if (generated_forward_enabled() &&
+        // STRUCTURAL S-4: the generated leg does not state the depth
+        // window yet — depth fires take the interpreter walk below.
+        declared_max_layers == 0xffffffffu) {
         const auto run = [&](auto decode_fn, auto prefill_fn) {
             (is_pure_decode ? decode_fn : prefill_fn)(
                 w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
@@ -503,8 +508,33 @@ void llama_like_forward_declared(
     // arms, nothing below derives a path (north-star-dsl.md).
     const pie_forward::ForwardPlan& plan =
         is_pure_decode ? declared.decode : declared.prefill;
-    const int N = total_tokens;
-    const int R = num_requests;
+    // STRUCTURAL S-4: N/R are MUTABLE walk state — the depth window
+    // rebinds them per op (layer-tagged ops at layer >= k run over the
+    // full-depth prefix on a union fire, and are SKIPPED on a uniform
+    // truncated fire). Fire-level values stay in N_fire/R_fire.
+    const int N_fire = total_tokens;
+    const int R_fire = num_requests;
+    int N = total_tokens;
+    int R = num_requests;
+    const bool depth_stated = plan.view().depth_window != 0;
+    const int depth_k =
+        depth_stated && declared_max_layers != 0xffffffffu &&
+        declared_max_layers <
+            static_cast<std::uint32_t>(cfg.num_hidden_layers)
+            ? static_cast<int>(declared_max_layers)
+            : -1;
+    const bool depth_union = depth_k >= 0 &&
+        declared_full_depth_rows != 0xffffffffu;
+    const int depth_split =
+        depth_union ? static_cast<int>(declared_full_depth_rows) : N_fire;
+    if (depth_union &&
+        (depth_split <= 0 || depth_split >= R_fire ||
+         !plan_state.depth_prefix_decode_plan)) {
+        throw std::runtime_error(
+            "depth union (declared): planned split without a usable "
+            "prefix plan (gate drift)");
+    }
+    bool depth_tail_active = false;
     // The Peel split (A3): the hook-free prefix row count — the
     // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
     // the stated Peel op, not a choice: with no hooks every row is the
@@ -700,6 +730,20 @@ void llama_like_forward_declared(
         }
         if (i >= op_count) break;
         const PieForwardOp& op = plan.op(i);
+        // STRUCTURAL S-4: the depth window, per op, keyed on the op's
+        // OWN layer tag (the declaration's stated axis — the trace is
+        // layer-unrolled while k is a runtime input, so the window is a
+        // per-op rebind, not a region op). Uniform truncated fire:
+        // tail-layer ops are SKIPPED (the unchanged epilogue, layer -1,
+        // is the logit-lens head). Union fire: tail-layer ops run over
+        // the full-depth prefix rows.
+        if (depth_k >= 0) {
+            const bool tail_op = op.layer >= 0 && op.layer >= depth_k;
+            if (tail_op && !depth_union) continue;
+            depth_tail_active = depth_union && tail_op;
+            N = depth_tail_active ? depth_split : N_fire;
+            R = depth_tail_active ? depth_split : R_fire;
+        }
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
@@ -1136,6 +1180,27 @@ void llama_like_forward_declared(
                 break;
             }
             case LaunchKernel::AttentionFlashinferDecode: {
+                // STRUCTURAL S-4: tail-layer attention on a union fire
+                // pairs with the PREFIX plan and its dedicated
+                // workspace (the plan/workspace pairing rule).
+                if (depth_tail_active) {
+                    const int layer_window_left_d =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    auto kv_view_d = cache.layer_view(L);
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan_state.depth_prefix_decode_plan,
+                        attn_q, kv_view_d, attn_out_buf,
+                        kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        spatial_suffix_attn_ws(), stream,
+                        layer_window_left_d,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    break;
+                }
                 if (decode_plan == nullptr) {
                     throw std::runtime_error(
                         "declared forward: trace states the flashinfer "

@@ -57,7 +57,14 @@ pub fn llama_like_cuda(
     cuda: &LlamaLikeCudaFacts,
     class: FireClass,
 ) -> ForwardPlan {
-    llama_like_text(facts, Some((cuda, class)))
+    let mut plan = llama_like_text(facts, Some((cuda, class)));
+    // STRUCTURAL S-3: the lowered Decode class states the depth axis
+    // (see [`ForwardPlan::depth_window`]) exactly where its body can
+    // honour it — the same deployment gate as the mask peel's.
+    plan.depth_window = class == FireClass::Decode
+        && !cuda.xqa_decode
+        && !cuda.head_dim_padded;
+    plan
 }
 
 /// THE one llama_like text (north-star-dsl.md): computation and kernel

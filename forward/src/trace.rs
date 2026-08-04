@@ -641,6 +641,22 @@ pub struct ForwardPlan {
     pub family: String,
     pub values: Vec<ValueInfo>,
     pub ops: Vec<Op>,
+    /// STRUCTURAL S-3: the DECLARATION states the depth axis — every
+    /// layer-tagged op of this trace may run over the full-depth prefix
+    /// row window when the fire plans a depth split (layers `[k, L)` at
+    /// rows `[0, split)`), and may be SKIPPED entirely on a uniform
+    /// truncated fire. The trace is layer-unrolled while `k` is a
+    /// runtime input, so the axis is a trace-level capability keyed on
+    /// each op's own `layer` tag, not a region op at a static position
+    /// (the [`OpKind::Peel`] doc's row-window vocabulary, applied
+    /// per-layer). False for classes whose bodies cannot window
+    /// (XQA-deployment, padded head dims, prefill shapes).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub depth_window: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl ForwardPlan {
@@ -1331,6 +1347,7 @@ impl TraceBuilder {
             family: self.family,
             values: self.values,
             ops: self.ops,
+            depth_window: false,
         }
     }
 }
