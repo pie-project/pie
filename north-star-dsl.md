@@ -2729,3 +2729,38 @@ is now: one attach vocabulary on the surface, one dispatch statement
 in the text, one region table on the wire, one seriation invariant in
 the scheduler, and one walk per leg that serves it — with every
 degradation loud and every axis's plans derived, not declared twice.
+
+## STABILITY EVALUATION (2026-08-04): the churn fault, characterized
+
+A hostile-load evaluation (requested as such) over ~25 minutes and
+~11k lanes. The verdicts, in order of confidence:
+
+ENGINE ROBUSTNESS: EXCELLENT. Zero crashes, zero illegal access, zero
+panics across every phase; RSS flat (~6.7GB) over 1193 max-rate
+rounds; round walls flat; sequential traffic (the canonical battery)
+unaffected even on a heavily-abused engine. The correctness bar holds
+(ORACLE_EQ, census with its known phasing retry, bands batteries).
+
+LANE RELIABILITY UNDER CONCURRENT MULTI-AXIS CHURN: POOR — and
+PRE-EXISTING. The full 4-axis 9-lane concurrent round (2 plain +
+dense + doc-isolation + snapkv + 2 lora + k8 + k12, stagger ≤35ms)
+kills 63-90% of lanes: driver prepare refuses "ptir prologue or
+channel readiness did not commit" (refused=12/13 tickets,
+consume-head behind expectation), retries exhaust, the work item
+publishes Failed, channels poison. The control settles attribution:
+the PRE-V2 binary (28e343569, rebuilt in a worktree) fails the same
+soak at the same magnitude (63%) — nothing this session's arc caused
+or worsened. Bisection: masks+hook alone CLEAN, lora+draft alone
+CLEAN, lora×(mask|hook) in one gather FAILS (the lora lanes
+themselves often survive while poisoning neighbours). The "frame slot
+1" signature points at multi-step frames racing the run-ahead channel
+ticket expectations. Why the census never saw it: its subsets stop at
+5 lanes with wider stagger; the 9-lane union with ≤35ms stagger is
+past the boundary the campaign's batteries ever exercised.
+
+FILED as the third standing observation (with the numeric floor and
+the kvpp heisenbug — now sentry-fenced): the repro is
+.wiki/tart/stability_soak.py (minutes [gap] args) plus the bisect
+recipe above. This is ENGINE machinery (frames/tickets/run-ahead),
+not axis machinery — the fix lives upstream of the composition
+fabric.
