@@ -96,15 +96,21 @@ rust-version = "1.91"
 # dance: `ztensor` owns the container format and its validation,
 # `ztensor-compat` owns the foreign-format projections.
 #
-# Pointed at a sibling checkout rather than crates.io: the two are being
-# developed together, and 2.1's `Writer::append` is not published yet. Switch
-# back to a version requirement once it is.
+# Pointed at the repo rather than crates.io: the two are being developed
+# together and 2.1 is not published yet. A git dependency rather than a sibling
+# path, so a fresh clone and CI can build this workspace at all.
+#
+# Pinned by revision, not by branch. Cargo.lock is not tracked here, so a branch
+# would resolve to whatever v2's tip happened to be at clone time — and v2 does
+# move under us: `Writer::link_shard` was added and removed again within two
+# commits. Bump this deliberately. Switch to a version requirement once 2.1
+# ships.
 #
 #     ztensor = "2.1"
 #     ztensor-compat = "2.1"
 [workspace.dependencies]
-ztensor = { path = "../../ztensor/ztensor" }
-ztensor-compat = { path = "../../ztensor/ztensor-compat" }
+ztensor = { git = "https://github.com/pie-project/ztensor", rev = "eda8f631ffa4855e85185be16af09a8997db4fb9" }
+ztensor-compat = { git = "https://github.com/pie-project/ztensor", rev = "eda8f631ffa4855e85185be16af09a8997db4fb9" }
 
 # Shared lint table. Opt in per crate with `[lints] workspace = true`; today
 # only the `compiler/*` crates do, because they are the only ones at zero
