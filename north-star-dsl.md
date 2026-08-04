@@ -1739,3 +1739,21 @@ default path. The win scales with the suffix's work (longer masked
 KV, more masked lanes); at 1B/16-layers it is ~0.3ms per mixed fire.
 The directive's two-stream requirement is not just structural — it
 pays, measurably. Battery: .wiki/tart/heavy_overlap.py.
+
+## STRUCTURAL S-1 LANDS (2026-08-04) — the second class's first organ
+
+The layer-truncation channel runs end to end (5f1c5bb6e):
+LaunchPlan.max_layers -> the scheduler's solo blocking rule
+("truncated-depth" — the depth union is the next rung) -> the appended
+ABI word (planned_max_layers, MAX = full) -> graphs refuse, declared
+legs route to the hand-written body, the layer loop bounds at k and
+the UNCHANGED tail (final norm + lm_head) is the logit-lens head.
+Oracle on Qwen3-0.6B (28 layers): k=28 BYTE-IDENTICAL to unset (the
+channel is numerics-neutral and truncation at full depth is the
+identity); k=16/k=8 deterministic degraded drafts, deeper = better —
+logit-lens behavior, the layerskip-draft class's honest v0 head.
+Producer is a TEST SCAFFOLD (PIE_DEBUG_MAX_LAYERS stamps every fire)
+until slice B lands the WIT surface. Next rungs stand as recorded:
+S-B the inferlet-facing channel, S-2 depth seriation + wire, S-3 the
+FullDepthPrefix peel in the declaration, S-4 the walkers, S-5 the
+union oracle and the 1.53x measurement.
