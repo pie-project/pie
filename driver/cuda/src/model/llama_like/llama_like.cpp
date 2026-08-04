@@ -733,7 +733,8 @@ void prepare_llama_like_decode_plan(
     std::uint32_t attn_score_window,
     std::uint32_t unmasked_prefix_rows,
     const std::uint32_t* mask_suffix_page_counts_h,
-    const std::uint32_t* mask_suffix_last_lens_h)
+    const std::uint32_t* mask_suffix_last_lens_h,
+    std::uint32_t full_depth_rows)
 {
     // The prepare hook runs OUTSIDE any cuStreamCapture region. It updates
     // pinned/device buffers in `attn_ws` that the captured body reads via
@@ -1122,6 +1123,31 @@ void prepare_llama_like_decode_plan(
         decode_full_attention_variant_enabled() &&
             fwd_cfg.sliding_window < 0 && fwd_cfg.per_layer_window_left.empty(),
         cache.hnd_layout());
+    // STRUCTURAL S-2: the depth union's PREFIX plan — requests
+    // [0, split) at layers [k, L). Same planner family as the full plan
+    // above, so it plans against the SECONDARY workspace (the
+    // two-plans-one-workspace lesson); the body's range-2 dispatch pairs
+    // with it. Shape guards DECLINE (leave the slot null and the body's
+    // loud check speaks) rather than throw.
+    if (full_depth_rows != 0xffffffffu &&
+        full_depth_rows > 0 &&
+        full_depth_rows < static_cast<std::uint32_t>(num_requests) &&
+        is_pure_decode && !have_custom_mask) {
+        if (!state.depth_prefix_decode_plan) {
+            state.depth_prefix_decode_plan = ops::make_decode_plan();
+        }
+        ops::plan_attention_flashinfer_decode(
+            *state.depth_prefix_decode_plan, kv_page_indptr_h,
+            static_cast<int>(full_depth_rows),
+            num_q_heads_local, num_kv_heads_local, cfg.head_dim_kernel,
+            cache.page_size(), spatial_suffix_attn_ws(),
+            /*stream=*/nullptr,
+            fwd_cfg.decode_plan_cuda_graph,
+            decode_full_attention_variant_enabled() &&
+                fwd_cfg.sliding_window < 0 &&
+                fwd_cfg.per_layer_window_left.empty(),
+            cache.hnd_layout());
+    }
 }
 
 std::uint32_t llama_like_decode_graph_layout(
@@ -1399,14 +1425,6 @@ void llama_like_forward_paged(
     bool rope_table_ready = false;
     const float* rope_table = nullptr;
 
-    // STRUCTURAL S-2: the two-range body is the next slice — until it
-    // lands, a planned depth split must not silently run every row at
-    // the suffix's bound.
-    if (full_depth_rows != 0xffffffffu) {
-        throw std::runtime_error(
-            "depth union: planned full-depth split reached a body "
-            "without the two-range loop (S-2 driver slice owed)");
-    }
     // STRUCTURAL v0 (S-1): a truncated fire runs layers [0, k) and the
     // unchanged tail takes the head at layer k (logit lens). k == L is
     // the identity by construction.
@@ -1415,7 +1433,14 @@ void llama_like_forward_paged(
         max_layers < static_cast<std::uint32_t>(cfg.num_hidden_layers)
             ? static_cast<int>(max_layers)
             : cfg.num_hidden_layers;
-    for (int L = 0; L < layer_bound; ++L) {
+    // STRUCTURAL S-2: the layer body, parameterized by (rows, plan, ws)
+    // so the depth union can run it over two ranges. The lambda's
+    // parameters SHADOW the outer locals of the same names — the body
+    // text is unchanged. Depth fires are pure decode, so N == R and
+    // the full-depth prefix is rows [0, split) of every base array.
+    const auto run_layer = [&](const int L, const int N, const int R,
+                               const ops::DecodePlanCache* decode_plan,
+                               AttentionWorkspace& attn_ws) {
         const auto& layer = w.layers[L];
 
         // Pre-norm: norm(y) → norm_x; QKV reads from norm_x.
@@ -2297,6 +2322,48 @@ void llama_like_forward_paged(
                              static_cast<std::size_t>(L) * N * H;
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ds, static_cast<std::size_t>(N) * H, stream);
+        }
+    };
+    if (full_depth_rows != 0xffffffffu) {
+        // The depth union (S-2): layers [0, k) run every row, layers
+        // [k, L) run the full-depth prefix only, and the unchanged
+        // full-N tail below is BOTH heads (the suffix rows' hidden
+        // state froze at layer k — the logit-lens head; the one-tail
+        // design, north-star-dsl.md). Guards are loud: the engine
+        // plans this shape only for plain pure-decode fires.
+        const int split = static_cast<int>(full_depth_rows);
+        const ops::DecodePlanCache* prefix_plan =
+            plan_state.depth_prefix_decode_plan
+                ? plan_state.depth_prefix_decode_plan.get()
+                : nullptr;
+        if (layer_bound >= cfg.num_hidden_layers || split <= 0 ||
+            split >= R || !is_pure_decode || has_custom_mask ||
+            !use_decode_path || use_prefill_decode_path ||
+            use_xqa_decode_path) {
+            throw std::runtime_error(
+                "depth union: planned split reached an unsupported "
+                "fire shape (engine/driver gate drift)");
+        }
+        if (prefix_plan == nullptr) {
+            throw std::runtime_error(
+                "depth union: split active but prepare built no "
+                "prefix decode plan");
+        }
+        if (std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[depth-union] R=%d split=%d k=%d\n",
+                         R, split, layer_bound);
+        }
+        for (int L = 0; L < layer_bound; ++L) {
+            run_layer(L, N, R, decode_plan, attn_ws);
+        }
+        for (int L = layer_bound; L < cfg.num_hidden_layers; ++L) {
+            run_layer(L, split, split, prefix_plan,
+                      spatial_suffix_attn_ws());
+        }
+    } else {
+        for (int L = 0; L < layer_bound; ++L) {
+            run_layer(L, N, R, decode_plan, attn_ws);
         }
     }
 

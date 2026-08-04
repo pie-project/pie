@@ -142,6 +142,12 @@ struct LlamaLikePlanState {
     // the layout oscillation cost the union key one orphan capture per
     // request, and today's masked-variant graphs the same churn.
     ops::PrefillPlanCachePtr mask_decode_plan;
+    // STRUCTURAL S-2: the depth union's PREFIX decode plan (requests
+    // [0, split) at layers [k, L)); planned against the SECONDARY
+    // workspace (two same-family plans must not share scheduling
+    // buffers — the mixed-fire lesson; a depth fire is never also a
+    // spatial-mask fire, so the workspace is free).
+    ops::DecodePlanCachePtr depth_prefix_decode_plan;
     // NS-2: when >= 0, this fire's attention splits at this REQUEST
     // index — the prefix plans cover requests [0, split),
     // mask_decode_plan covers the REBASED suffix. -1 = fire-level
@@ -214,7 +220,12 @@ void prepare_llama_like_decode_plan(
     // ForwardFn::PrepareInputs) — required when the split is active on a
     // composed-envelope fire, else the host CSR slices serve.
     const std::uint32_t* mask_suffix_page_counts_h = nullptr,
-    const std::uint32_t* mask_suffix_last_lens_h = nullptr);
+    const std::uint32_t* mask_suffix_last_lens_h = nullptr,
+    // STRUCTURAL S-2: the depth union's request split (UINT32_MAX =
+    // uniform fire). When planned on a plain pure-decode fire, prepare
+    // ALSO builds the prefix decode plan (requests [0, split)) into its
+    // dedicated slot against the secondary workspace.
+    std::uint32_t full_depth_rows = 0xffffffffu);
 
 std::uint32_t llama_like_supergraph_graph_layout(
     const LlamaLikePlanState& state);

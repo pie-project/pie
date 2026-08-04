@@ -274,6 +274,9 @@ struct ForwardFn {
         // the spatial-mask gate is on, prepare builds BOTH the prefix
         // decode plan and the rebased suffix mask plan.
         std::uint32_t unmasked_prefix_rows = 0xffffffffu;
+        // STRUCTURAL S-2: the depth union's request split (UINT32_MAX =
+        // uniform); prepare builds the prefix decode plan when planned.
+        std::uint32_t full_depth_rows = 0xffffffffu;
         // NS-2: the masked program's RESOLVED per-suffix-lane geometry
         // (page counts / last-page lens), from the frame's spatial dense
         // pack. The suffix mask plan MUST use these — the host wire views

@@ -365,12 +365,16 @@ impl PendingRequest {
         if self.prebuilt && self.pipeline_id.is_none() {
             return Some("prebuilt-untracked");
         }
-        // STRUCTURAL v0 (S-1): a layer-truncated request fires alone —
-        // the depth UNION (full-depth members as a prefix-row peel) is
-        // the recorded next rung, and until it lands a truncated member
-        // in a shared fire would silently run other members' rows at
-        // the wrong depth.
-        if self.request.max_layers.is_some() {
+        // STRUCTURAL v0 (S-1): a layer-truncated request fires alone
+        // until the depth union is ARMED (S-2, PIE_DEPTH_UNION=1) —
+        // composed, the two-range body serves full members at depth L
+        // and the truncated tail at k with one head. The batch planner
+        // still declines any shape outside the v0 contract (masks,
+        // hooks, lora, multi-token, mixed k), which falls back to the
+        // fire-level uniform bound.
+        if self.request.max_layers.is_some()
+            && !crate::scheduler::batch::depth_union_enabled()
+        {
             return Some("truncated-depth");
         }
         if self.preserves_inner_rows() && self.request.qo_indptr.last().copied() == Some(0) {

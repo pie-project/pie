@@ -2606,6 +2606,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                         : 0u,
                 .unmasked_prefix_rows =
                     s.dispatch_view.planned_unmasked_prefix_rows,
+                .full_depth_rows =
+                    s.dispatch_view.planned_full_depth_rows,
                 .mask_suffix_page_counts_h =
                     s.spatial_suffix_page_counts.empty()
                         ? nullptr
