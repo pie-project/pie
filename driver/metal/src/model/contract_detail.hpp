@@ -135,16 +135,13 @@ inline void push_direct(ModelContract& out, const SourceTensor& raw, std::string
 /// describing a checkpoint that does not exist.
 inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
                                     const SourceTensor& scales, const SourceTensor& biases,
-                                    int bits, int declared_group_size, std::string output) {
+                                    int declared_bits_hint, int declared_group_size,
+                                    std::string output) {
     if (raw.shape.size() < 2 || scales.shape.size() != raw.shape.size() ||
         biases.shape.size() != scales.shape.size() ||
         !std::equal(biases.shape.begin(), biases.shape.end(), scales.shape.begin())) {
         fail("MLX affine triplet '" + std::string(raw.name) + "' has incompatible shapes");
     }
-    if (bits != 4 && bits != 8) {
-        fail("MLX affine triplet '" + std::string(raw.name) + "' has an unsupported width");
-    }
-    const int per_word = 32 / bits;
     std::int64_t rows = 1;
     for (std::size_t i = 0; i + 1 < raw.shape.size(); ++i) {
         if (raw.shape[i] != scales.shape[i]) {
@@ -153,24 +150,51 @@ inline void push_mlx_affine_stacked(ModelContract& out, const SourceTensor& raw,
         }
         rows *= raw.shape[i];
     }
-    const std::int64_t logical_cols = raw.shape.back() * per_word;
     const std::int64_t groups = scales.shape.back();
-    if (groups <= 0 || logical_cols % groups != 0) {
-        fail("MLX affine triplet '" + std::string(raw.name) + "' cannot derive a group size");
+    if (groups <= 0) {
+        fail("MLX affine triplet '" + std::string(raw.name) + "' has no groups");
+    }
+
+    // Three numbers -- width, group, packed columns -- and the shapes pin only
+    // their product: the same bytes are 8-bit g64 or 4-bit g128. So exactly one
+    // has to be told to us, and it should be the group, because the group is
+    // the one `config.json` states for the whole file while the WIDTH varies
+    // per tensor. mlx_lm leaves a small sensitive projection at 8 bits inside
+    // an otherwise 4-bit file (gpt-oss's router; gemma-4's dense MLP beside its
+    // 4-bit experts), and it records that as a per-tensor override we would
+    // otherwise have to parse.
+    //
+    // Deriving the width instead of assuming it reads those overrides for free,
+    // and it removes a refusal rather than adding a parser. It used to be the
+    // other way round, which is how a checkpoint that config.json describes
+    // exactly got told that config.json was wrong.
+    std::int64_t logical_cols = 0;
+    int bits = declared_bits_hint;
+    if (declared_group_size > 0) {
+        logical_cols = groups * declared_group_size;
+        const std::int64_t packed_bits = raw.shape.back() * 32;
+        if (logical_cols <= 0 || packed_bits % logical_cols != 0) {
+            fail("MLX affine triplet '" + std::string(raw.name) +
+                 "' cannot derive a width from groups of " +
+                 std::to_string(declared_group_size));
+        }
+        bits = static_cast<int>(packed_bits / logical_cols);
+    }
+    if (bits != 4 && bits != 8) {
+        fail("MLX affine triplet '" + std::string(raw.name) + "' has an unsupported width (" +
+             std::to_string(bits) + " bits)");
+    }
+    if (declared_group_size <= 0) {
+        // gpt-oss states no quantization at all, so here the width is the told
+        // number and the group is the derived one -- the same equation solved
+        // for the other unknown.
+        logical_cols = raw.shape.back() * (32 / bits);
+        if (logical_cols % groups != 0) {
+            fail("MLX affine triplet '" + std::string(raw.name) + "' cannot derive a group size");
+        }
     }
     const std::uint32_t group_size =
         u32_dim(logical_cols / groups, "MLX affine group size");
-    // The width came from the config and the group falls out of the shapes, so
-    // this is two sources meeting. They can only disagree if the width is
-    // wrong, and then the group is wrong by the same factor -- which is exactly
-    // how an 8-bit checkpoint read as 4-bit reports "g128".
-    if (declared_group_size > 0 && group_size != declared_group_size) {
-        fail("MLX affine triplet '" + std::string(raw.name) + "' is " + std::to_string(bits) +
-             "-bit in groups of " + std::to_string(group_size) + ", but config.json declares " +
-             "groups of " + std::to_string(declared_group_size) +
-             ". The tensors cannot tell these apart on their own: the same bytes are " +
-             "8-bit g64 or 4-bit g128, so one of the two numbers is being assumed.");
-    }
 
     PieLoaderQuantSpecView quant = pie_loader::quant_spec(
         bits == 4 ? PieLoaderQuantScheme::MlxAffineU4 : PieLoaderQuantScheme::Int8Asymmetric,
