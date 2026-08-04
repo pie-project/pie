@@ -980,7 +980,14 @@ void prepare_llama_like_decode_plan(
                     }
                 }
                 const int mid = split_req - P;
-                if (mid > 0 && P > 0 && !fwd_cfg.force_prefill_path &&
+                // PIE_MIXED_MID=0 disarms (the demotion-vs-decode A/B
+                // instrument; default ON).
+                static const bool mid_armed = [] {
+                    const char* v = std::getenv("PIE_MIXED_MID");
+                    return v == nullptr || v[0] != '0';
+                }();
+                if (mid_armed && mid > 0 && P > 0 &&
+                    !fwd_cfg.force_prefill_path &&
                     !fwd_cfg.use_prefill_decode_plan) {
                     // Middle decode plan over requests [P, split_req):
                     // kvpp rebased to the middle's page base (the
