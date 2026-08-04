@@ -60,7 +60,7 @@ enum Command {
         cmd: ops::cache::CacheCmd,
     },
 
-    /// Manage configuration (init / show / set).
+    /// Manage configuration (path / show / set / unset / init).
     Config {
         #[command(subcommand)]
         cmd: ops::config::ConfigCmd,
@@ -168,7 +168,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Config { cmd } => {
             startup::init_cli(&cli.global)?;
-            ops::config::run(cmd)?;
+            ops::config::run(cmd, &cli.global)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Inferlet { cmd } => {
