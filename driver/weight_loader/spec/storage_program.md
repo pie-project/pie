@@ -68,6 +68,10 @@ stay resident).
 - GPT-OSS `GptOssRoutedMxfp4` / Native Marlin / Eager BF16: section sizes use
   `I_local = I_full / tp_size`; builders apply the same row/column offsets as
   resident TP (RoutedDecode densifies strided down groups).
+- DeepSeek-V4 `Dsv4TpMxfp4`: contiguous MXFP4 `w1`/`w3` row slices and densified
+  `w2` columns (weight+scale) under `tp_size > 1`; shared experts / MTP /
+  router stay resident. At `tp_size = 1`, named experts page as full HF
+  tensors (`pack_kind = None`).
 - Mixtral `MixtralTpBf16`: contiguous BF16 `w1`/`w3` row slices and densified
   `w2` columns under `tp_size > 1`; at `tp_size = 1` Mixtral still pages full
   HF experts (`pack_kind = None`).

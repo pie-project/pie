@@ -613,6 +613,7 @@ pub enum PieLoaderExpertPackKind {
     MixtralTpBf16 = 4,
     Qwen35MoeTpBf16 = 5,
     Qwen3MoeTpBf16 = 6,
+    Dsv4TpMxfp4 = 7,
 }
 
 /// Deferred expert-load plan exposed to the C++ stream cache.

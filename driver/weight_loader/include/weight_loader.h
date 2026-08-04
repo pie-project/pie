@@ -56,6 +56,7 @@ enum class PieLoaderExpertPackKind {
   MixtralTpBf16 = 4,
   Qwen35MoeTpBf16 = 5,
   Qwen3MoeTpBf16 = 6,
+  Dsv4TpMxfp4 = 7,
 };
 
 enum class PieLoaderMxfp4MoePolicy {

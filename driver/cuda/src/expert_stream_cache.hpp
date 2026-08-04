@@ -18,9 +18,9 @@
 // lives in the weight loader / model forward, not here).
 //
 // Scope (v1): on-demand only — no prefetch, no popularity preload.
-// TP+streaming uses per-rank offline packs (GPT-OSS MXFP4/BF16/Marlin,
-// Mixtral BF16, Qwen3/3.5-MoE BF16) with dense local-I sections; other
-// arches remain tp_size=1.
+// TP+streaming uses per-rank offline packs (DeepSeek-V4 MXFP4, GPT-OSS
+// MXFP4/BF16/Marlin, Mixtral BF16, Qwen3/3.5-MoE BF16) with dense local-I
+// sections; other arches remain tp_size=1.
 // The table/slot bookkeeping (`ExpertSlotIndex`) is host-only so it can be
 // unit-tested without a GPU.
 

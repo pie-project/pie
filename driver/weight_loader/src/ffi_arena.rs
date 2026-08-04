@@ -199,6 +199,9 @@ impl FfiArena {
                     crate::storage::ExpertPackKind::Qwen3MoeTpBf16 => {
                         PieLoaderExpertPackKind::Qwen3MoeTpBf16
                     }
+                    crate::storage::ExpertPackKind::Dsv4TpMxfp4 => {
+                        PieLoaderExpertPackKind::Dsv4TpMxfp4
+                    }
                 },
             },
         }

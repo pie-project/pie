@@ -86,8 +86,176 @@ pub(crate) const DSV4_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
     pack_kind: ExpertPackKind::None,
 };
 
-pub(crate) fn select_dsv4(_target: &StorageTarget) -> Option<StreamArchDesc> {
-    Some(DSV4_STREAM_ARCH)
+fn dsv4_find_tensor<'a>(
+    metadata: &'a CheckpointMetadata,
+    name: &str,
+) -> Result<&'a RawTensor, CompileError> {
+    metadata
+        .tensors
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| {
+            CompileError::InvalidInput(format!(
+                "stream_routed_experts: missing DeepSeek-V4 expert tensor '{name}'"
+            ))
+        })
+}
+
+/// TP-local MXFP4 section sizes for DeepSeek-V4 packs under `tp_size>1`.
+///
+/// HF: w1/w3 weight `[I, H/2]`, scale `[I, H/32]`; w2 weight `[H, I/2]`,
+/// scale `[H, I/32]`. Pack stores dense `I_local` slices so w2 columns can be
+/// paged contiguously.
+pub(crate) fn dsv4_tp_section_bytes(
+    w1: &RawTensor,
+    w1_scale: &RawTensor,
+    w2: &RawTensor,
+    w2_scale: &RawTensor,
+    w3: &RawTensor,
+    w3_scale: &RawTensor,
+    target: &StorageTarget,
+) -> Result<[u64; 6], CompileError> {
+    if w1.shape.len() != 2
+        || w1_scale.shape.len() != 2
+        || w2.shape.len() != 2
+        || w2_scale.shape.len() != 2
+        || w3.shape.len() != 2
+        || w3_scale.shape.len() != 2
+    {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: DeepSeek-V4 TP pack expects 2-D \
+             w1/w2/w3 weight and scale tensors"
+                .to_string(),
+        ));
+    }
+    let i_full = w1.shape[0];
+    let h_packed = w1.shape[1]; // H/2
+    let hidden = h_packed * 2;
+    if hidden % 32 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: DeepSeek-V4 hidden={hidden} must be \
+             divisible by 32"
+        )));
+    }
+    if w3.shape != w1.shape {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: DeepSeek-V4 w3 shape {:?} must match w1 {:?}",
+            w3.shape, w1.shape
+        )));
+    }
+    let scale_cols = hidden / 32;
+    if w1_scale.shape != [i_full, scale_cols]
+        || w3_scale.shape != [i_full, scale_cols]
+    {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: DeepSeek-V4 w1/w3 scale expected \
+             [{i_full}, {scale_cols}], got w1_scale={:?} w3_scale={:?}",
+            w1_scale.shape, w3_scale.shape
+        )));
+    }
+    if w2.shape != [hidden, i_full / 2] || i_full % 2 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: DeepSeek-V4 w2 expected [{hidden}, {}], \
+             got {:?}",
+            i_full / 2,
+            w2.shape
+        )));
+    }
+    if w2_scale.shape != [hidden, i_full / 32] || i_full % 32 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: DeepSeek-V4 w2 scale expected \
+             [{hidden}, {}], got {:?}",
+            i_full / 32,
+            w2_scale.shape
+        )));
+    }
+    let (_local_start, local_intermediate) = tp_local_range(i_full, target)?;
+    if local_intermediate % 32 != 0 {
+        return Err(CompileError::InvalidInput(format!(
+            "stream_routed_experts: DeepSeek-V4 TP shard \
+             I_local={local_intermediate} must be divisible by 32"
+        )));
+    }
+    let i_local = local_intermediate as u64;
+    let h = hidden as u64;
+    let w13 = i_local * h / 2;
+    let s13 = i_local * h / 32;
+    let w2b = h * i_local / 2;
+    let s2 = h * i_local / 32;
+    Ok([w13, s13, w2b, s2, w13, s13])
+}
+
+fn dsv4_tp_collect_bindings(
+    metadata: &CheckpointMetadata,
+    target: &StorageTarget,
+    num_layers: u32,
+    num_experts: u32,
+) -> Result<Vec<StreamBinding>, CompileError> {
+    let e = num_experts as u64;
+    if e == 0 {
+        return Err(CompileError::InvalidInput(
+            "stream_routed_experts: DeepSeek-V4 num_experts must be > 0".to_string(),
+        ));
+    }
+    const SECTION_ALIGN: u64 = 256;
+    let mut bindings = Vec::with_capacity(
+        (num_layers as usize) * (num_experts as usize) * DSV4_EXPERT_SECTIONS.len(),
+    );
+    let mut section_bytes: Option<[u64; 6]> = None;
+    let mut section_offsets = [0u64; 6];
+    let mut slot_bytes = 0u64;
+    for layer in 0..num_layers {
+        let prefix = format!("layers.{layer}.ffn.experts.0.");
+        let w1 = dsv4_find_tensor(metadata, &format!("{prefix}w1.weight"))?;
+        let w1s = dsv4_find_tensor(metadata, &format!("{prefix}w1.scale"))?;
+        let w2 = dsv4_find_tensor(metadata, &format!("{prefix}w2.weight"))?;
+        let w2s = dsv4_find_tensor(metadata, &format!("{prefix}w2.scale"))?;
+        let w3 = dsv4_find_tensor(metadata, &format!("{prefix}w3.weight"))?;
+        let w3s = dsv4_find_tensor(metadata, &format!("{prefix}w3.scale"))?;
+        let bytes = dsv4_tp_section_bytes(w1, w1s, w2, w2s, w3, w3s, target)?;
+        if let Some(prev) = section_bytes {
+            if prev != bytes {
+                return Err(CompileError::InvalidInput(format!(
+                    "stream_routed_experts: DeepSeek-V4 TP section sizes differ \
+                     across layers (layer {layer})"
+                )));
+            }
+        } else {
+            let mut off = 0u64;
+            for s in 0..6 {
+                section_offsets[s] = off;
+                off = align_up_u64(off + bytes[s], SECTION_ALIGN);
+            }
+            slot_bytes = off;
+            section_bytes = Some(bytes);
+        }
+        for expert in 0..e {
+            let base = (layer as u64 * e + expert) * slot_bytes;
+            for s in 0..6 {
+                bindings.push(StreamBinding {
+                    file_id: crate::types::FileId(0),
+                    file_offset: base + section_offsets[s],
+                    span_bytes: bytes[s],
+                });
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+pub(crate) const DSV4_TP_STREAM_ARCH: StreamArchDesc = StreamArchDesc {
+    sections: DSV4_EXPERT_SECTIONS,
+    is_streamed: is_dsv4_routed_expert_tensor,
+    collect_bindings: dsv4_tp_collect_bindings,
+    pack_kind: ExpertPackKind::Dsv4TpMxfp4,
+};
+
+pub(crate) fn select_dsv4(target: &StorageTarget) -> Option<StreamArchDesc> {
+    if target.tp_size > 1 {
+        Some(DSV4_TP_STREAM_ARCH)
+    } else {
+        Some(DSV4_STREAM_ARCH)
+    }
 }
 
 /// Fixed GPT-OSS section order — must match `gpt_oss_expert_sections.hpp`.

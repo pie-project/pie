@@ -658,8 +658,8 @@ impl DefaultAbiBuilder<'_> {
         if self.target.tp_size > 1 && arch.pack_kind == crate::storage::ExpertPackKind::None {
             return Err(CompileError::InvalidInput(
                 "stream_routed_experts with tp_size>1 requires a per-rank \
-                 expert pack (supported: gpt_oss, mixtral, qwen3_moe, \
-                 qwen3_5_moe); other arches still require tp_size=1"
+                 expert pack (supported: deepseek_v4, gpt_oss, mixtral, \
+                 qwen3_moe, qwen3_5_moe); other arches still require tp_size=1"
                     .to_string(),
             ));
         }

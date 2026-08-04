@@ -390,8 +390,13 @@ CudaMemoryPlan plan_cuda_memory(
     if (per_kv_token_bytes == 0) {
         throw std::runtime_error("cuda memory planner: computed zero KV page bytes");
     }
+    // Sharded GQA/MHA: each rank holds 1/tp of the heads, so scale by tp to
+    // recover the model-wide KV footprint for heuristics. Replicated MQA
+    // (DeepSeek-V4) already stores the full KV on every rank.
     const std::size_t global_per_kv_token_bytes =
-        per_kv_token_bytes * static_cast<std::size_t>(tp_size);
+        (hf.model_type == "deepseek_v4")
+            ? per_kv_token_bytes
+            : per_kv_token_bytes * static_cast<std::size_t>(tp_size);
     const int throughput_decode_target =
         profile_decode_target("throughput", cfg, prop);
     const bool kv_heavy_auto_model =

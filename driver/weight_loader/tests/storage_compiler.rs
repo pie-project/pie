@@ -1231,6 +1231,10 @@ fn dsv4_stream_routed_experts_excludes_expert_tensors_from_program() {
     assert_eq!(streamed.stream.num_layers, 1);
     assert_eq!(streamed.stream.num_experts, 2);
     assert_eq!(streamed.stream.sections_per_expert, 6);
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::None
+    );
     assert_eq!(streamed.stream.template.len(), 6);
     assert_eq!(streamed.stream.bindings.len(), 1 * 2 * 6);
     assert!(streamed.stream.slot_bytes > 0);
@@ -1261,25 +1265,49 @@ fn dsv4_stream_routed_experts_excludes_expert_tensors_from_program() {
 }
 
 #[test]
-fn dsv4_stream_routed_experts_rejects_tensor_parallel() {
-    // Enough of a streamed tensor for skip_streamed to fire before the TP check.
+fn dsv4_stream_plan_tp_local_section_bytes() {
+    // I=64, H=64, tp=2 → I_local=32. MXFP4: w1/w3 [I,H/2]+[I,H/32], w2 [H,I/2]+[H,I/32].
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let mut push = |id: u32, name: &str, shape: Vec<i64>| {
+        let bytes = shape.iter().fold(1u64, |acc, d| acc * *d as u64);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::U8),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    };
+    let mut id = 0u32;
+    let mut next = || {
+        let v = id;
+        id += 1;
+        v
+    };
+    push(next(), "layers.0.ffn.gate.weight", vec![2, 64]);
+    push(next(), "layers.0.ffn.shared_experts.w1.weight", vec![32, 64]);
+    for e in 0..2 {
+        let prefix = format!("layers.0.ffn.experts.{e}");
+        push(next(), &format!("{prefix}.w1.weight"), vec![64, 32]);
+        push(next(), &format!("{prefix}.w1.scale"), vec![64, 2]);
+        push(next(), &format!("{prefix}.w2.weight"), vec![64, 32]);
+        push(next(), &format!("{prefix}.w2.scale"), vec![64, 2]);
+        push(next(), &format!("{prefix}.w3.weight"), vec![64, 32]);
+        push(next(), &format!("{prefix}.w3.scale"), vec![64, 2]);
+    }
     let meta = CheckpointMetadata {
         files: vec![CheckpointFile {
             id: FileId(0),
             path: "model.safetensors".into(),
-            size_bytes: 32,
+            size_bytes: offset,
             format: CheckpointFormat::Safetensors,
         }],
-        tensors: vec![RawTensor {
-            id: TensorId(0),
-            name: "layers.0.ffn.experts.0.w1.weight".into(),
-            file_id: FileId(0),
-            file_offset: 0,
-            span_bytes: 32,
-            shape: vec![32],
-            encoding: Encoding::Raw(DType::U8),
-            layout: Layout::dense(1),
-        }],
+        tensors,
     };
     let cfg = pie_weight_loader::config::ModelConfig {
         model_type: "deepseek_v4".to_string(),
@@ -1295,10 +1323,36 @@ fn dsv4_stream_routed_experts_rejects_tensor_parallel() {
         stream_routed_experts: true,
         ..StorageTarget::default()
     };
-    let err = pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("per-rank"), "unexpected error: {err}");
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&meta, &cfg, &target).unwrap();
+    let streamed = compile_storage_program(&meta, &cfg, &abi, target).unwrap();
+    assert_eq!(streamed.stream.sections_per_expert, 6);
+    // I_local=32, H=64 → [I*H/2, I*H/32, H*I/2, H*I/32, ...]
+    assert_eq!(
+        streamed.stream.section_bytes,
+        vec![1024, 64, 1024, 64, 1024, 64]
+    );
+    assert_eq!(
+        streamed.stream.pack_kind,
+        pie_weight_loader::storage::ExpertPackKind::Dsv4TpMxfp4
+    );
+    assert_eq!(streamed.stream.bindings[0].file_id.0, 0);
+    assert_eq!(streamed.stream.bindings[0].file_offset, 0);
+    assert_eq!(streamed.stream.bindings[0].span_bytes, 1024);
+    assert!(
+        streamed
+            .tensors
+            .iter()
+            .any(|t| t.name == "layers.0.ffn.shared_experts.w1.weight"),
+        "shared expert must remain resident under TP+streaming"
+    );
+    assert!(
+        !streamed
+            .tensors
+            .iter()
+            .any(|t| t.name.starts_with("layers.") && t.name.contains(".ffn.experts.")),
+        "main-stack routed experts must not be resident under TP stream plan"
+    );
 }
 
 #[test]

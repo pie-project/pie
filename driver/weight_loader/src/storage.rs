@@ -198,6 +198,8 @@ pub enum ExpertPackKind {
     Qwen35MoeTpBf16 = 5,
     /// Contiguous TP-local Qwen3-MoE named BF16 gate/up/down (tp_size>1).
     Qwen3MoeTpBf16 = 6,
+    /// Contiguous TP-local DeepSeek-V4 MXFP4 w1/w2/w3 × weight/scale (tp>1).
+    Dsv4TpMxfp4 = 7,
 }
 
 /// One deferred source extent for a streamed expert section.
