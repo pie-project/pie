@@ -1,4 +1,9 @@
-//! `pie inferlet info` — inspect registry inferlet metadata.
+//! `pie inferlet` — the programs pie runs, in the registry and on disk.
+//!
+//! `list`/`download`/`remove` all go through `pie_engine`'s `Repository`
+//! rather than touching `$PIE_HOME/programs` directly. The engine loads the
+//! same cache at boot, so a CLI with its own idea of the layout would be a
+//! CLI that can hide a program from the thing meant to run it.
 
 use std::io::IsTerminal;
 
@@ -6,13 +11,29 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 
-use pie_engine::inferlet::program::{Manifest, ProgramName};
+use pie_engine::inferlet::program::{Manifest, ProgramName, Repository};
 
 
 #[derive(Subcommand, Debug)]
 pub enum InferletCmd {
+    /// List the inferlets already downloaded.
+    List,
+
     /// Show manifest metadata and accepted input parameters.
     Info(InfoArgs),
+
+    /// Download an inferlet from the registry into the local cache.
+    Download(TargetArgs),
+
+    /// Delete a downloaded inferlet. Re-downloadable at any time.
+    Remove(TargetArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TargetArgs {
+    /// Inferlet name, with optional version (e.g. `chat-completion` or
+    /// `chat-completion@0.1.0`). Bare names take the newest version.
+    pub inferlet: String,
 }
 
 #[derive(Args, Debug)]
@@ -24,8 +45,136 @@ pub struct InfoArgs {
 
 pub async fn run(cmd: InferletCmd, global: &startup::GlobalArgs) -> Result<()> {
     match cmd {
+        InferletCmd::List => list(),
         InferletCmd::Info(args) => info(args, global).await,
+        InferletCmd::Download(args) => download(args, global).await,
+        InferletCmd::Remove(args) => remove(args).await,
     }
+}
+
+/// Where the engine keeps downloaded programs. One expression, so the CLI and
+/// `pie cache`'s registry entry cannot point at different directories.
+fn programs_dir() -> std::path::PathBuf {
+    pie_worker::paths::pie_home().join("programs")
+}
+
+/// Open the on-disk cache. The registry URL is only needed for downloads, so
+/// listing and removing work with an empty one rather than requiring a config.
+fn open(registry_url: String) -> Repository {
+    let mut repo = Repository::new(registry_url, programs_dir());
+    repo.load_program_cache();
+    repo
+}
+
+fn list() -> Result<()> {
+    let repo = open(String::new());
+    let cached = repo.cached();
+    if cached.is_empty() {
+        println!("no inferlets downloaded (they arrive on first use, or with");
+        println!("`pie inferlet download <name>`)");
+        return Ok(());
+    }
+    let colorize = std::io::stdout().is_terminal();
+    let (dim, reset) = if colorize { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
+    let width = cached
+        .iter()
+        .map(|(name, _, _)| name.name.len() + name.version.len() + 1)
+        .max()
+        .unwrap_or(0);
+    for (name, manifest, size) in &cached {
+        let id = format!("{}@{}", name.name, name.version);
+        let description = summarize(manifest.package.description.as_deref().unwrap_or(""));
+        println!("  {id:<width$}  {:>8}  {dim}{description}{reset}", human(*size));
+    }
+    Ok(())
+}
+
+/// A manifest description down to one line's worth.
+///
+/// These are author-written and unbounded -- one in the test set runs to a
+/// full paragraph on mask semantics -- so a listing that printed them whole
+/// would wrap into unreadability and bury the rows around it. Cut on a word
+/// boundary; `pie inferlet info` prints the whole thing.
+fn summarize(description: &str) -> String {
+    const WIDTH: usize = 72;
+    let line = description.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= WIDTH {
+        return line.to_string();
+    }
+    let clipped: String = line.chars().take(WIDTH).collect();
+    let cut = clipped.rfind(' ').unwrap_or(clipped.len());
+    format!("{}…", clipped[..cut].trim_end())
+}
+
+/// Bytes as the largest binary unit that leaves a number worth reading.
+fn human(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 3] = [("MiB", 1 << 20), ("KiB", 1 << 10), ("B", 1)];
+    for (suffix, scale) in UNITS {
+        if bytes >= scale {
+            let value = bytes as f64 / scale as f64;
+            return if scale == 1 || value >= 100.0 {
+                format!("{value:.0}{suffix}")
+            } else {
+                format!("{value:.1}{suffix}")
+            };
+        }
+    }
+    "0B".to_string()
+}
+
+async fn download(args: TargetArgs, global: &startup::GlobalArgs) -> Result<()> {
+    let (cfg_path, _) = startup::cli_config_path(global);
+    let cfg = crate::derive::load_worker_config(&cfg_path)?;
+    let name = resolve_inferlet_id(&args.inferlet, &cfg.server.registry).await?;
+    let mut repo = open(cfg.server.registry.clone());
+    if repo.exists(&name) {
+        println!("{}@{} already downloaded", name.name, name.version);
+        return Ok(());
+    }
+    // `force_overwrite: false` -- the `exists` check above already answered
+    // that, and reporting "already downloaded" beats silently doing nothing.
+    repo.add_from_registry(&name, false).await?;
+    println!("✓ downloaded {}@{}", name.name, name.version);
+    Ok(())
+}
+
+async fn remove(args: TargetArgs) -> Result<()> {
+    // Resolved against the local cache, never the registry: removing is about
+    // what is on this disk, and asking the network which version to delete
+    // would make the command fail while offline -- and could delete a version
+    // other than the one `list` just showed.
+    let mut repo = open(String::new());
+    let name = match args.inferlet.split_once('@') {
+        Some(_) => ProgramName::parse(&args.inferlet)?,
+        None => {
+            let matching: Vec<ProgramName> = repo
+                .cached()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .filter(|name| name.name == args.inferlet)
+                .collect();
+            match matching.len() {
+                0 => bail!("{} is not downloaded", args.inferlet),
+                1 => matching.into_iter().next().unwrap(),
+                _ => {
+                    let versions: Vec<String> =
+                        matching.iter().map(|n| n.version.clone()).collect();
+                    bail!(
+                        "{} has {} versions downloaded ({}); name the one to remove",
+                        args.inferlet,
+                        versions.len(),
+                        versions.join(", ")
+                    );
+                }
+            }
+        }
+    };
+    if repo.remove(&name)? {
+        println!("removed {}@{}", name.name, name.version);
+    } else {
+        println!("{}@{} is not downloaded", name.name, name.version);
+    }
+    Ok(())
 }
 
 async fn info(args: InfoArgs, global: &startup::GlobalArgs) -> Result<()> {
@@ -193,6 +342,22 @@ fn parameter_type_name(param_type: &pie_engine::inferlet::program::ParameterType
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_description_is_cut_on_a_word_boundary() {
+        assert_eq!(summarize("short"), "short");
+        // A real one from the test set: a paragraph that would wrap the row
+        // into unreadability and bury the rows around it.
+        let long = "Overview §6.2 beam search, DESIGN B form (logical mask-out \
+                    and lazy compaction): the guest beam epilogue appends each \
+                    survivor's new token";
+        let cut = summarize(long);
+        assert!(cut.chars().count() <= 73, "got {} chars", cut.chars().count());
+        assert!(cut.ends_with('…'));
+        assert!(!cut.contains("  "), "should not end mid-space: {cut:?}");
+        // Only the first line, so a multi-line description cannot break the row.
+        assert_eq!(summarize("first\nsecond"), "first");
+    }
 
     #[test]
     fn latest_version_from_registry_json_uses_first_version() {
