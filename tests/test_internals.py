@@ -225,18 +225,44 @@ class Approximations(unittest.TestCase):
         self.assertEqual(self.engine.compile_json_schema(schema).relaxations, [])
 
     def test_an_open_object_declares_that_a_declared_type_may_not_hold(self):
-        """The declaration has to match what the mask actually does.
+        """The default keeps the shared string, and says so.
 
-        Excluding the declared names from the generic key is exact and regular
-        and `Exact` does it. It is not the default because doing it per object
-        under a budget was measured at 4x compile time - p50 121 ms against 488
-        over the corpus - for 13% less over-acceptance, and tightening the
-        budget until compile recovered took the benefit with it.
+        Excluding the declared names is exact and regular and `exact=True` does
+        it. It is not the default because it is not affordable: one extra
+        string-shaped terminal does not add one group, it refines the whole
+        lexer state space, and over 40 corpus schemas that took the median
+        group count from 18,944 to 85,366 and the median compile from 60.1 ms
+        to 469.2.
         """
         schema = json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})
         grammar = self.engine.compile_json_schema(schema)
         self.assertEqual(len(grammar.relaxations), 1)
         self.assertTrue(self.accepts(grammar, '{"a":1}'))
+
+    def test_exact_excludes_each_object_s_own_names(self):
+        """A declared name has one reading under the object that declares it.
+
+        And a name another object declares is still an additional property
+        here, which is what keeps the exclusion from narrowing - the one thing
+        a lowering may not do.
+        """
+        schema = json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "p": {"type": "object", "properties": {"a": {"type": "string"}}},
+                    "q": {"type": "object", "properties": {"b": {"type": "integer"}}},
+                },
+            }
+        )
+        grammar = self.engine.compile_json_schema(schema, exact=True)
+        self.assertEqual(grammar.relaxations, [])
+        self.assertTrue(self.accepts(grammar, '{"p":{"a":"x"}}'))
+        self.assertFalse(self.accepts(grammar, '{"p":{"a":1}}'))
+        # `a` belongs to `p`, so under `q` it is an additional property and its
+        # declared type does not apply to it.
+        self.assertTrue(self.accepts(grammar, '{"q":{"a":"x"}}'))
+        self.assertTrue(self.accepts(grammar, '{"p":{"b":1}}'))
 
     def test_exact_enforces_it_and_then_declares_nothing(self):
         schema = json.dumps({"type": "object", "properties": {"a": {"type": "string"}}})

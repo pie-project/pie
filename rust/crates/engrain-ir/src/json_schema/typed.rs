@@ -682,14 +682,16 @@ impl<'a> Converter<'a> {
                 .flat_map(|declared| declared.keys())
                 .cloned()
                 .collect();
-            // Only at `Exact`, and that was measured rather than assumed:
-            // doing it per object under a budget - eight names, sixty-four
-            // bytes, sixteen distinct sets a schema - took over-acceptance
-            // from 101 walks to 88 and cost 4x compile time, p50 121 ms
-            // against 488, on the number this project is already worst at.
-            // Tightening the budget until compile recovered took the benefit
-            // with it: `required`, which is what the exclusion was for, went
-            // back to exactly where it had been.
+            // Per object, over its own names. One complement over every name
+            // the *document* declares was tried - one terminal for the schema
+            // instead of one per object, with each object handing back the
+            // names it does not declare - on the theory that terminals are
+            // what compile time is spent on. They are, but not by count: over
+            // 40 corpus schemas the shared shape took the median group count
+            // from 28,389 to 85,366 and the median compile from 102.7 ms to
+            // 478.9, because the complement of ninety-six names is a far
+            // larger automaton than the complement of three, and every state
+            // of it is a lexer state with an admitted set of its own.
             let excluded = self
                 .options
                 .precision
@@ -698,10 +700,7 @@ impl<'a> Converter<'a> {
                 .flatten();
             disjoint = excluded.is_some() || declared.is_empty();
             let name = match excluded {
-                Some(body) => self.lexeme(
-                    "key",
-                    seq(vec![lit("\""), body, lit("\"")]),
-                )?,
+                Some(body) => self.lexeme("key", seq(vec![lit("\""), body, lit("\"")]))?,
                 None => self.json_string(0, None)?,
             };
             repeatable.push(seq(vec![name, self.ws(), lit(":"), self.ws(), value]));
