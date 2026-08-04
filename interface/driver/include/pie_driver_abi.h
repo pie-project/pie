@@ -352,6 +352,11 @@
  */
 #define PIE_MAX_LAYERS_FULL UINT32_MAX
 
+/**
+ * [`PieStepDesc::planned_full_depth_rows`]'s "no depth split" sentinel.
+ */
+#define PIE_FULL_DEPTH_UNPLANNED UINT32_MAX
+
 #define CHANNEL_TICKET_NONE UINT64_MAX
 
 #define RS_FLAG_RESET 1
@@ -1454,6 +1459,13 @@ typedef struct PieStepDesc {
    * per-step word suffices until the depth union.
    */
   uint32_t planned_max_layers;
+  /**
+   * STRUCTURAL S-2: leading members at FULL depth (the depth
+   * seriation's request split; the truncated suffix's uniform k is
+   * `planned_max_layers`). [`PIE_FULL_DEPTH_UNPLANNED`] = a uniform
+   * fire; the driver must not depth-split.
+   */
+  uint32_t planned_full_depth_rows;
 } PieStepDesc;
 
 /**

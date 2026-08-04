@@ -1203,6 +1203,11 @@ pub struct PieStepDesc {
     /// steps carrying a truncation are SOLO (the scheduler's blocking
     /// rule), so one per-step word suffices until the depth union.
     pub planned_max_layers: u32,
+    /// STRUCTURAL S-2: leading members at FULL depth (the depth
+    /// seriation's request split; the truncated suffix's uniform k is
+    /// `planned_max_layers`). [`PIE_FULL_DEPTH_UNPLANNED`] = a uniform
+    /// fire; the driver must not depth-split.
+    pub planned_full_depth_rows: u32,
 }
 
 /// [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
@@ -1217,6 +1222,11 @@ pub const PIE_UNMASKED_PREFIX_UNPLANNED: u32 = u32::MAX;
 /// [`PieStepDesc::planned_max_layers`]'s "full model" sentinel (zero is
 /// never a legitimate depth).
 pub const PIE_MAX_LAYERS_FULL: u32 = u32::MAX;
+
+/// [`PieStepDesc::planned_full_depth_rows`]'s "no depth split" sentinel
+/// (zero would mean an all-truncated composed fire, a legal future
+/// value).
+pub const PIE_FULL_DEPTH_UNPLANNED: u32 = u32::MAX;
 
 impl Default for PieStepDesc {
     fn default() -> Self {
@@ -1275,6 +1285,7 @@ impl Default for PieStepDesc {
             planned_hook_free_prefix_rows: PIE_HOOK_FREE_PREFIX_UNPLANNED,
             planned_unmasked_prefix_rows: PIE_UNMASKED_PREFIX_UNPLANNED,
             planned_max_layers: PIE_MAX_LAYERS_FULL,
+            planned_full_depth_rows: PIE_FULL_DEPTH_UNPLANNED,
         }
     }
 }

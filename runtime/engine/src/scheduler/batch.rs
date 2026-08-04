@@ -576,6 +576,7 @@ pub(crate) fn build_frame_submission(
             program_row_indptr: build.program_row_indptr,
             planned_hook_free_prefix_rows,
             planned_unmasked_prefix_rows,
+            planned_full_depth_rows: pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED,
             logical_fire_ids: build.logical_fire_ids,
             channel_expected_head: build.channel_expected_head,
             channel_expected_tail: build.channel_expected_tail,

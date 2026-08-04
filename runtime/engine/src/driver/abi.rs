@@ -347,6 +347,7 @@ fn step_desc<'a>(
             .plan
             .max_layers
             .unwrap_or(pie_driver_abi::PIE_MAX_LAYERS_FULL),
+        planned_full_depth_rows: step.planned_full_depth_rows,
     }
 }
 

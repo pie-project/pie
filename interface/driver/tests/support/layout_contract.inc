@@ -245,6 +245,7 @@ PIE_FIELD(PieStepDesc, channel_ticket_indptr, 776)
 PIE_FIELD(PieStepDesc, planned_hook_free_prefix_rows, 792)
 PIE_FIELD(PieStepDesc, planned_unmasked_prefix_rows, 796)
 PIE_FIELD(PieStepDesc, planned_max_layers, 800)
+PIE_FIELD(PieStepDesc, planned_full_depth_rows, 804)
 
 PIE_LAYOUT(PieStepDescSlice, 16, 8)
 PIE_FIELD(PieStepDescSlice, ptr, 0)
