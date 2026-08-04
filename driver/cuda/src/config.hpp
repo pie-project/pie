@@ -21,6 +21,8 @@ namespace pie_cuda_driver {
 
 struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
+    // Materialized-weight artifact cache for THIS model. Empty = disabled.
+    std::string weight_cache_dir;
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
     int mtp_num_drafts = 3;
@@ -72,38 +74,22 @@ struct RuntimeConfig {
     bool verbose = false;
 };
 
-/// On-disk caches, from the engine's process-global `[cache]` section.
-///
-/// An empty directory means "derive it" -- `$XDG_CACHE_HOME/pie/<kind>`, else
-/// `$HOME/.cache/pie/<kind>` -- which is the same rule these paths followed
-/// when they came from the environment. `weight_dir` has no derived form:
-/// empty disables the artifact cache, because writing it is opt-in.
-struct CacheConfig {
-    std::string ptir_dir;
-    bool ptir_enabled = true;
-    std::string tuning_dir;
-    std::string weight_dir;
-    bool weight_verify = true;
-};
-
 struct Config {
     ModelConfig model;
     BatchingConfig batching;
     DistributedConfig distributed;
     RuntimeConfig runtime;
-    CacheConfig cache;
 };
 
-/// The process's cache configuration, published by `load_config` so the
-/// module/tuning/weight caches can reach it without threading a `Config`
-/// through every constructor. Written once during driver init, before any
-/// cache is constructed; read-only afterwards.
-inline CacheConfig& mutable_cache_config() {
-    static CacheConfig cache;
-    return cache;
+/// This model's materialized-weight artifact directory, published by
+/// `load_config` because the artifact cache is built from a place that never
+/// sees a `Config`. Empty disables the cache.
+inline std::string& mutable_weight_cache_dir() {
+    static std::string dir;
+    return dir;
 }
 
-inline const CacheConfig& cache_config() { return mutable_cache_config(); }
+inline const std::string& weight_cache_dir() { return mutable_weight_cache_dir(); }
 
 inline int parse_cuda_device_id(const std::string& device) {
     const auto colon = device.find(':');
@@ -135,6 +121,11 @@ inline Config load_config(const std::filesystem::path& path) {
 
     if (auto m = tbl["model"].as_table()) {
         c.model.snapshot_dir  = (*m)["snapshot_dir"].value_or(std::string{});
+        c.model.weight_cache_dir =
+            (*m)["weight_cache_dir"].value_or(std::string{});
+        // Published before returning: the artifact cache is constructed from
+        // somewhere that never sees this Config.
+        mutable_weight_cache_dir() = c.model.weight_cache_dir;
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.mtp_num_drafts = static_cast<int>(
@@ -226,18 +217,6 @@ inline Config load_config(const std::filesystem::path& path) {
     if (auto r = tbl["runtime"].as_table()) {
         c.runtime.verbose = (*r)["verbose"].value_or(c.runtime.verbose);
     }
-    if (auto cache = tbl["cache"].as_table()) {
-        c.cache.ptir_dir = (*cache)["ptir_dir"].value_or(std::string{});
-        c.cache.ptir_enabled =
-            (*cache)["ptir_enabled"].value_or(c.cache.ptir_enabled);
-        c.cache.tuning_dir = (*cache)["tuning_dir"].value_or(std::string{});
-        c.cache.weight_dir = (*cache)["weight_dir"].value_or(std::string{});
-        c.cache.weight_verify =
-            (*cache)["weight_verify"].value_or(c.cache.weight_verify);
-    }
-    // Publish before returning: the caches are built during driver init, from
-    // several places that never see this Config.
-    mutable_cache_config() = c.cache;
 
     if (c.model.snapshot_dir.empty()) {
         throw std::runtime_error("config: [model].snapshot_dir is required");

@@ -15,12 +15,13 @@
 // the loader codec's (loader/weight_store_codec.hpp), which this layer drives by
 // path and never looks inside.
 //
-// OFF BY DEFAULT — strictly opt-in via `[cache] weight_dir`. Left empty the
-// cache never reads or writes (zero disk). Even when enabled, the write
-// declines if free space < blob size + margin (the artifact is the size of the
-// materialized weights — tens to hundreds of GB). Each owned blob carries a
-// fast checksum verified on reload (skip with `[cache] weight_verify = false`);
-// key/format-version mismatch => miss.
+// Located by `[model] weight_cache_dir`, which the worker resolves to
+// $PIE_HOME/models when the operator leaves it empty. Empty here (the driver
+// was told nothing) disables the cache entirely: zero reads, zero writes. The
+// write declines if free space < blob size + margin, because the artifact is
+// the size of the materialized weights — tens to hundreds of GB. Every owned
+// blob carries a fast checksum, always verified on reload; a key or
+// format-version mismatch is a miss.
 
 #include <chrono>
 #include <cstdint>
@@ -44,10 +45,10 @@
 namespace pie_cuda_driver {
 
 // Returns the configured artifact cache directory, or empty if the feature is
-// disabled (`[cache] weight_dir` empty).
+// disabled (the driver was given no directory).
 inline std::filesystem::path weight_artifact_cache_dir()
 {
-    const std::string& dir = pie_cuda_driver::cache_config().weight_dir;
+    const std::string& dir = pie_cuda_driver::weight_cache_dir();
     return dir.empty() ? std::filesystem::path{} : std::filesystem::path(dir);
 }
 
@@ -77,8 +78,8 @@ inline bool write_weight_artifact_cache(
         if (!space_ec && space.available < need) {
             std::fprintf(stderr,
                 "[pie-driver-cuda] weight cache: declining write — need %.1f GiB "
-                "but only %.1f GiB free in %s (point [cache] weight_dir at a "
-                "disk with more space, or clear it to disable the cache)\n",
+                "but only %.1f GiB free in %s (point [model] weight_cache_dir "
+                "at a disk with more space)\n",
                 static_cast<double>(need) / (1024.0 * 1024.0 * 1024.0),
                 static_cast<double>(space.available) / (1024.0 * 1024.0 * 1024.0),
                 dir.string().c_str());
@@ -111,7 +112,10 @@ inline bool read_weight_artifact_cache(
         return false;
     }
 
-    const bool verify = pie_cuda_driver::cache_config().weight_verify;
+    // Always verify. A silently-corrupt weight artifact produces garbage
+    // tokens with no error, which is not a trade any operator should be
+    // offered for a few seconds of load time.
+    constexpr bool verify = true;
     constexpr bool profile = false;
     const auto t0 = std::chrono::steady_clock::now();
 

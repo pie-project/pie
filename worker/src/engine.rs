@@ -465,10 +465,15 @@ fn load_model_drivers(
     user_cfg: &config::Config,
     component: pie_driver_abi::ModelComponent,
 ) -> Result<LoadedModelDrivers> {
-    // Install `[cache]` before anything writes a driver startup TOML: the
-    // writers read it from the process-wide slot, and first-writer-wins means
-    // a later model cannot move a cache a live driver is already using.
-    crate::embedded_driver::set_cache_config(user_cfg.cache.clone());
+    // Resolve the weight-artifact directory here, before any driver startup
+    // TOML is written. `$PIE_HOME` is this layer's to know: the driver has
+    // never been told it, which is why the old env-var form fell back to XDG.
+    let weight_cache_dir = if user_cfg.model.weight_cache_dir.is_empty() {
+        crate::paths::pie_home().join("models").to_string_lossy().into_owned()
+    } else {
+        user_cfg.model.weight_cache_dir.clone()
+    };
+    crate::embedded_driver::set_weight_cache_dir(weight_cache_dir);
 
     let (driver_groups, snapshot_dir) = {
         let m = &user_cfg.model;
