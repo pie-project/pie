@@ -11,4 +11,4 @@ pub mod compose;
 pub mod derive;
 pub mod ops;
 
-pub use compose::{Mode, StandaloneHandle, run_standalone};
+pub use compose::{StandaloneHandle, run_standalone};

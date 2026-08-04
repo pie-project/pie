@@ -29,10 +29,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Boot the full engine in-proc on loopback (developer / local use).
-    Local,
-
-    /// Boot the full engine in-proc on the configured client address.
+    /// Boot the engine. Binds `server.host`, which is loopback by default.
     Serve,
 
     /// Manage HuggingFace-cached models (list / download / remove / optimize).
@@ -47,19 +44,19 @@ enum Command {
         cmd: RuntimeCmd,
     },
 
-    /// Inspect what pie has written under `$PIE_HOME`.
+    /// What pie has written under `$PIE_HOME` (list / clear).
     Cache {
         #[command(subcommand)]
         cmd: ops::cache::CacheCmd,
     },
 
-    /// Manage configuration (show / set / unset / init).
+    /// Manage configuration (list / show / set / unset / init).
     Config {
         #[command(subcommand)]
         cmd: ops::config::ConfigCmd,
     },
 
-    /// Inspect inferlets from the registry.
+    /// The programs pie runs (list / info / download / remove).
     Inferlet {
         #[command(subcommand)]
         cmd: ops::inferlet::InferletCmd,
@@ -83,8 +80,7 @@ enum RuntimeCmd {
 async fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Local => serve(cli.global, compose::Mode::Local).await,
-        Command::Serve => serve(cli.global, compose::Mode::Serve).await,
+        Command::Serve => serve(cli.global).await,
 
         Command::Model { cmd } => {
             startup::init_cli(&cli.global)?;
@@ -140,10 +136,10 @@ async fn main() -> anyhow::Result<ExitCode> {
     }
 }
 
-/// The `local`/`serve` path: full daemon `init` → derive the three typed role
-/// Configs from the standalone TOML → boot the in-proc cluster (golf's compose)
-/// → run until SIGINT/SIGTERM, then drain. One boot path, parameterized by mode.
-async fn serve(global: startup::GlobalArgs, mode: compose::Mode) -> anyhow::Result<ExitCode> {
+/// The `serve` path: full daemon `init` → derive the three typed role Configs
+/// from the standalone TOML → boot the in-proc cluster (golf's compose) → run
+/// until SIGINT/SIGTERM, then drain.
+async fn serve(global: startup::GlobalArgs) -> anyhow::Result<ExitCode> {
     let ctx = startup::init(
         startup::BootSpec::pie().version(env!("CARGO_PKG_VERSION")),
         global,
@@ -155,11 +151,10 @@ async fn serve(global: startup::GlobalArgs, mode: compose::Mode) -> anyhow::Resu
         .await
         .ok();
     let (controller, gateway, worker) = derive::derive_standalone(ctx.config_str())?;
-    let handle = compose::run_standalone(controller, gateway, worker, mode).await?;
+    let handle = compose::run_standalone(controller, gateway, worker).await?;
     tracing::info!(
         listen = %handle.listen_addr,
         worker = %handle.worker_addr,
-        ?mode,
         "pie standalone serving",
     );
     Ok(ctx

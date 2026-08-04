@@ -1,6 +1,6 @@
 //! P5a compose — the real in-proc standalone: an embedded controller actor, a
 //! gateway, and a worker co-resident over loopback. golf's overlay of delta's
-//! stub contract (`Mode`, `StandaloneHandle`, `run_standalone`).
+//! stub contract (`StandaloneHandle`, `run_standalone`).
 //!
 //! Topology is the same M3 dial-in as a real cluster, just collapsed into one
 //! process: the controller actor is embedded and a single cloneable `Handle`
@@ -17,16 +17,6 @@ use pie_ids::{GatewayId, NodeId, WorkerId};
 use pie_worker::ControlLink;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-
-/// Standalone run mode. `Local` and `Serve` boot the *same* in-proc cluster;
-/// they differ only in client-facing exposure (loopback vs the configured bind).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// `pie local` — loopback-only, developer one-shot/local use.
-    Local,
-    /// `pie serve` — bind the configured client address; persistent.
-    Serve,
-}
 
 /// In-proc adapter over the embedded controller `Handle`, implementing BOTH the
 /// worker [`ControlLink`] and the gateway [`pie_gateway::GatewayControl`] seams
@@ -101,19 +91,17 @@ pub async fn run_standalone(
     controller: pie_controller::Config,
     mut gateway: pie_gateway::Config,
     worker: pie_worker::Config,
-    mode: Mode,
 ) -> Result<StandaloneHandle> {
     // Embed the controller actor; one cloneable Handle drives both planes.
     let handle = pie_controller::embed(controller);
     let control = EmbeddedControl(handle.clone());
 
     // The in-proc gateway binds its worker-facing socket on an ephemeral
-    // loopback port so the embedded worker can dial in; `Local` also forces the
-    // client edge to loopback (`Serve` keeps the configured bind).
+    // loopback port so the embedded worker can dial in. The client edge binds
+    // what the config says -- there is no mode overriding it, because
+    // `server.host` already defaults to loopback and a second way to decide
+    // the bind address is a second thing that can disagree with the file.
     gateway.worker_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-    if mode == Mode::Local {
-        gateway.listen.set_ip(Ipv4Addr::LOCALHOST.into());
-    }
     let gw = pie_gateway::bind(gateway, control.clone())
         .await
         .context("bind in-proc gateway")?;
