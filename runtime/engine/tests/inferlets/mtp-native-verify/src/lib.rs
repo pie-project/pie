@@ -58,15 +58,11 @@ const PAGE_T: u32 = 16;
 
 /// Decode a `[k]`/`[k+1]` i32 host vector.
 async fn get_u32(t: inferlet::ptir::Taken) -> Result<Vec<u32>> {
-    t.get::<u32>()
-        .await
-        .map_err(|e| format!("tensor take: {e}"))
+    t.get::<u32>().await.context("tensor take")
 }
 
 async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
-    t.get::<i32>()
-        .await
-        .map_err(|e| format!("tensor take: {e}"))
+    t.get::<i32>().await.context("tensor take")
 }
 
 /// Committed length of a sentinel `[k+1]` tail = the count before the first
@@ -244,8 +240,7 @@ async fn bootstrap(
         drafts_out.put(&drafts);
     });
 
-    fwd.submit(pipeline)
-        .map_err(|e| format!("bootstrap submit: {e}"))?;
+    fwd.submit(pipeline).context("bootstrap submit")?;
     let seed = get_i32(seed_out.take())
         .await?
         .first()
@@ -452,8 +447,7 @@ async fn main(input: String) -> Result<String> {
         prompt.push(0);
     }
     let max_pages = (prompt.len() as u32 + MAX_TOKENS + k + 1).div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // ONE pipeline for the whole stream (R4-4): the bootstrap and every
     // verify window continue the same sequential decode, so all their fires
@@ -504,8 +498,7 @@ async fn main(input: String) -> Result<String> {
     while generated < MAX_TOKENS {
         if device {
             // Two fires, an empty buffer between windows.
-            rs.alloc_buffer(window_slabs)
-                .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+            rs.alloc_buffer(window_slabs).context("rs.alloc_buffer")?;
         } else {
             // One fire. The buffer never empties: it carries the previous
             // window's accepted prefix into this fire, which folds it while
@@ -516,7 +509,7 @@ async fn main(input: String) -> Result<String> {
             let live = pending_fold + kp1 + rs_page;
             while rs.buffer_size() * rs_page < live {
                 rs.alloc_buffer(window_slabs.max(1))
-                    .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+                    .context("rs.alloc_buffer")?;
             }
         }
 
@@ -546,13 +539,10 @@ async fn main(input: String) -> Result<String> {
             None => None,
         };
 
-        verify
-            .submit(&pipeline)
-            .map_err(|e| format!("verify submit: {e}"))?;
+        verify.submit(&pipeline).context("verify submit")?;
 
         if let Some(c) = device_commit.as_ref() {
-            c.submit(&pipeline)
-                .map_err(|e| format!("device commit submit: {e}"))?;
+            c.submit(&pipeline).context("device commit submit")?;
         }
 
         let commit = get_i32(commit_out.take()).await?;
@@ -600,7 +590,7 @@ async fn main(input: String) -> Result<String> {
             let remaining = rs.buffer_size();
             if remaining > 0 {
                 rs.free_buffer(&(0..remaining).collect::<Vec<_>>())
-                    .map_err(|e| format!("free_buffer: {e}"))?;
+                    .context("free_buffer")?;
             }
         } else {
             // The rejected tail never touched the recurrent state, so it is
@@ -609,8 +599,7 @@ async fn main(input: String) -> Result<String> {
             // while writing its own tokens over the slots just released.
             let rejected = kp1 - clen as u32;
             if rejected > 0 {
-                rs.discard_buffered(rejected)
-                    .map_err(|e| format!("discard_buffered: {e}"))?;
+                rs.discard_buffered(rejected).context("discard_buffered")?;
             }
             pending_fold = clen as u32;
         }

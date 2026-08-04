@@ -116,8 +116,7 @@ async fn main(input: String) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     let mut surprises: Vec<f32> = Vec::with_capacity(max_tokens);
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -180,19 +179,9 @@ async fn main(input: String) -> Result<String> {
     // (F7) right after the prefill submit only in the degenerate case where
     // zero decode fires follow.
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = tok_out_p
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
-    let s0 = s_out_p
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|e| format!("s0 take: {e}"))?[0];
+    fwd_p.submit(&pipe).context("prefill submit")?;
+    let g0 = tok_out_p.take().get::<i32>().await.context("g0 take")?[0];
+    let s0 = s_out_p.take().get::<f32>().await.context("s0 take")?[0];
 
     generated.push(g0 as u32);
     surprises.push(s0);
@@ -256,17 +245,17 @@ async fn main(input: String) -> Result<String> {
         for step in 1..max_tokens {
             mu_ch.put(vec![mu]);
             fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{step}: {e}"))?;
+                .with_context(|| format!("decode submit @{step}"))?;
             let t = tok_out
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0];
+                .with_context(|| format!("tok_out.take @{step}"))?[0];
             let s = s_out
                 .take()
                 .get::<f32>()
                 .await
-                .map_err(|e| format!("s_out.take @{step}: {e}"))?[0];
+                .with_context(|| format!("s_out.take @{step}"))?[0];
             generated.push(t as u32);
             surprises.push(s);
             mu -= lr * (s - tau);

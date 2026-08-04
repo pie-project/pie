@@ -60,9 +60,7 @@ async fn main(input: String) -> Result<String> {
     // and the copy_into move. Flat pool position `wpos` maps to physical page
     // `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
     let ws = WorkingSet::new();
-    let pool = ws
-        .reserve(POOL_PAGES)
-        .map_err(|e| format!("ws.reserve pool: {e}"))?;
+    let pool = ws.reserve(POOL_PAGES).context("ws.reserve pool")?;
     let pool_ids = pool.ids().to_vec(); // [POOL_PAGES]
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect();
     let phys0 = pool_ids[0];
@@ -209,7 +207,7 @@ async fn main(input: String) -> Result<String> {
         }
 
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
 
         // The physical KV move rides the SAME FIFO right behind this fire: it
         // happens-after this step's KV writes (BOS is safely written), and
@@ -221,24 +219,24 @@ async fn main(input: String) -> Result<String> {
             let dst_page = pool_ids[(DST_FLAT / PAGE_T) as usize];
             let dst_off = DST_FLAT % PAGE_T;
             ws.copy_into(&pipeline, &[dst_page], &[dst_off], &[src_page], &[src_off])
-                .map_err(|e| format!("copy_into @{step}: {e}"))?;
+                .with_context(|| format!("copy_into @{step}"))?;
         }
 
         let picked = out
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("out.take @{step}: {e}"))?;
+            .with_context(|| format!("out.take @{step}"))?;
         let _parents = out_par
             .take()
             .get::<u32>()
             .await
-            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+            .with_context(|| format!("out_par.take @{step}"))?;
         let _scr = out_scr
             .take()
             .get::<f32>()
             .await
-            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            .with_context(|| format!("out_scr.take @{step}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

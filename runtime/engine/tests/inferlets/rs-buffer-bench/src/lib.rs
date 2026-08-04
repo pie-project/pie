@@ -45,7 +45,7 @@ async fn main(input: String) -> Result<String> {
         let page = rs.buffer_page_size().max(1);
         let pages = (steps as u32 + 1).div_ceil(page) + 1;
         rs.alloc_buffer(pages)
-            .map_err(|e| format!("alloc_buffer({pages}): {e}"))?;
+            .with_context(|| format!("alloc_buffer({pages})"))?;
         pages
     } else {
         0
@@ -57,8 +57,7 @@ async fn main(input: String) -> Result<String> {
     let prompt = wit_model::encode(PROMPT);
     let n = prompt.len() as u32;
     let max_pages = (n + steps as u32 + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // ── Prefill. Folds, in BOTH arms: a buffer that starts out holding the
     // whole prompt would price the prompt, not the decode.
@@ -189,17 +188,12 @@ async fn main(input: String) -> Result<String> {
     // run-ahead scheduler uses and the one that fails on a linear model.
     let mut submitted = 0usize;
     if coframe {
-        submit_frame(&pipe, &[Some(&fwd_p), Some(&fwd)])
-            .map_err(|e| format!("first frame submit: {e}"))?;
+        submit_frame(&pipe, &[Some(&fwd_p), Some(&fwd)]).context("first frame submit")?;
         submitted = 1;
     } else {
-        fwd_p.submit(&pipe).map_err(|e| format!("prefill: {e}"))?;
+        fwd_p.submit(&pipe).context("prefill")?;
     }
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
     let mut generated: Vec<u32> = vec![g0 as u32];
 
     // Timed region: every decode fire, and nothing else. Allocation and
@@ -207,18 +201,14 @@ async fn main(input: String) -> Result<String> {
     let fires = steps - 1;
     let clock = std::time::Instant::now();
     while submitted < fires.min(window) {
-        fwd.submit(&pipe).map_err(|e| format!("decode: {e}"))?;
+        fwd.submit(&pipe).context("decode")?;
         submitted += 1;
     }
     for _ in 0..fires {
-        let t = out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("out take: {e}"))?[0];
+        let t = out.take().get::<i32>().await.context("out take")?[0];
         generated.push(t as u32);
         if submitted < fires {
-            fwd.submit(&pipe).map_err(|e| format!("decode: {e}"))?;
+            fwd.submit(&pipe).context("decode")?;
             submitted += 1;
         }
     }

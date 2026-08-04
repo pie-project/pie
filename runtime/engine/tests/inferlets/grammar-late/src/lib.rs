@@ -89,8 +89,7 @@ async fn main(input: String) -> Result<String> {
 
     let ws = WorkingSet::new();
     let max_pages = (max_tokens as u32 + 1).div_ceil(PAGE_T).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // Channels: tok_in and KvLen are device loop-carried (seeded; each fire's
     // epilogue advances the post-write readable extent by one), so each fire
@@ -163,17 +162,17 @@ async fn main(input: String) -> Result<String> {
 
         gmask.put(mask_bool);
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
         let token = tok_out
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("tok_out.take @{step}: {e}"))?[0] as u32;
+            .with_context(|| format!("tok_out.take @{step}"))?[0] as u32;
         let logits = raw
             .take()
             .get::<f32>()
             .await
-            .map_err(|e| format!("raw.take @{step}: {e}"))?;
+            .with_context(|| format!("raw.take @{step}"))?;
 
         // Assert #1 CONFORM: device token == host apply_mask_argmax(raw, mask).
         let host_token = apply_mask_argmax(&logits, &packed);

@@ -6,8 +6,7 @@ const MAX_PAGES: u32 = 1;
 
 fn geometry() -> Result<(WorkingSet, Channel)> {
     let ws = WorkingSet::new();
-    ws.reserve(MAX_PAGES)
-        .map_err(|error| format!("ws.reserve: {error}"))?;
+    ws.reserve(MAX_PAGES).context("ws.reserve")?;
     Ok((ws, Channel::from([1i32]).named("token")))
 }
 
@@ -93,50 +92,40 @@ async fn main(_input: String) -> Result<String> {
     });
 
     let pipeline = Pipeline::new();
-    mixed
-        .submit(&pipeline)
-        .map_err(|error| format!("mixed submit: {error}"))?;
+    mixed.submit(&pipeline).context("mixed submit")?;
     let token_value = mixed_token
         .take()
         .get::<u32>()
         .await
-        .map_err(|error| format!("mixed token: {error}"))?[0];
+        .context("mixed token")?[0];
     let scalar_value = mixed_scalar
         .take()
         .get::<f32>()
         .await
-        .map_err(|error| format!("mixed scalar: {error}"))?[0];
-    let vector_value = vector
-        .take()
-        .get::<u32>()
-        .await
-        .map_err(|error| format!("vector: {error}"))?;
-    let empty_prefix = prefix_len
-        .take()
-        .get::<u32>()
-        .await
-        .map_err(|error| format!("prefix: {error}"))?[0] as usize;
+        .context("mixed scalar")?[0];
+    let vector_value = vector.take().get::<u32>().await.context("vector")?;
+    let empty_prefix = prefix_len.take().get::<u32>().await.context("prefix")?[0] as usize;
     let samplers = [
         sampler_a
             .take()
             .get::<u32>()
             .await
-            .map_err(|error| error.to_string())?[0],
+            .context("sampler_a take")?[0],
         sampler_b
             .take()
             .get::<u32>()
             .await
-            .map_err(|error| error.to_string())?[0],
+            .context("sampler_b take")?[0],
         sampler_c
             .take()
             .get::<u32>()
             .await
-            .map_err(|error| error.to_string())?[0],
+            .context("sampler_c take")?[0],
         sampler_d
             .take()
             .get::<u32>()
             .await
-            .map_err(|error| error.to_string())?[0],
+            .context("sampler_d take")?[0],
     ];
     pipeline.close();
 
@@ -154,12 +143,8 @@ async fn main(_input: String) -> Result<String> {
     let entropy_pipeline = Pipeline::new();
     entropy_pass
         .submit(&entropy_pipeline)
-        .map_err(|error| format!("entropy submit: {error}"))?;
-    let entropy_value = entropy
-        .take()
-        .get::<f32>()
-        .await
-        .map_err(|error| format!("entropy: {error}"))?[0];
+        .context("entropy submit")?;
+    let entropy_value = entropy.take().get::<f32>().await.context("entropy")?[0];
     entropy_pipeline.close();
 
     let mixed_ok = token_value == 7 && (scalar_value - 1.25).abs() < f32::EPSILON;

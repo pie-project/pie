@@ -5,8 +5,7 @@ use inferlet::ptir::attention::prelude::*;
 async fn main(_input: String) -> Result<String> {
     let ws = WorkingSet::new();
     let max_pages = 1;
-    ws.reserve(max_pages)
-        .map_err(|error| format!("ws.reserve: {error}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     let token = Channel::from([1i32]).named("token");
     let embed_indptr = Channel::from([0u32, 1]).named("embed_indptr");
@@ -52,16 +51,11 @@ async fn main(_input: String) -> Result<String> {
     if !late_put {
         increment.put(vec![1u32]);
     }
-    pass.submit(&pipeline)
-        .map_err(|error| format!("submit: {error}"))?;
+    pass.submit(&pipeline).context("submit")?;
     if late_put {
         increment.put(vec![1u32]);
     }
-    let value = out
-        .take()
-        .get::<u32>()
-        .await
-        .map_err(|error| format!("take: {error}"))?[0];
+    let value = out.take().get::<u32>().await.context("take")?[0];
     pipeline.close();
 
     Ok(format!("value={value}"))

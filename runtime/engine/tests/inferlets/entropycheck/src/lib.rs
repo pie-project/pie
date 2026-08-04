@@ -23,8 +23,7 @@ async fn main(_input: String) -> Result<String> {
     }
     let n = prompt.len() as u32;
     let max_pages = n.div_ceil(page_size).max(1);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
 
     let toks = Channel::from(prompt_i32).named("toks");
@@ -72,12 +71,12 @@ async fn main(_input: String) -> Result<String> {
     });
 
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
+    fwd.submit(&pipeline).context("submit")?;
     let entropy = entropy_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("entropy take: {e}"))?[0];
+        .context("entropy take")?[0];
     pipeline.close();
 
     eprintln!("[ENTROPYCHECK] entropy={entropy}");

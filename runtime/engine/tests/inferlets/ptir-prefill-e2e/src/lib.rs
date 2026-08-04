@@ -62,9 +62,7 @@ async fn main(_input: String) -> Result<String> {
 
     // Shared physical page pool (the KV store both passes bind).
     let ws = WorkingSet::new();
-    let pool = ws
-        .reserve(POOL_PAGES)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    let pool = ws.reserve(POOL_PAGES).context("ws.reserve")?;
     let pool_ids = pool.ids().to_vec(); // [POOL_PAGES] physical
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
@@ -122,14 +120,8 @@ async fn main(_input: String) -> Result<String> {
     // fires below are submitted on this same pipeline (DECODE_STEPS > 0, so
     // finish() (F7) lands after the last decode submit, not here).
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p.submit(&pipe).context("prefill submit")?;
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
     println!("[prefill] N-wide fire committed; first generated token g0={g0}");
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
@@ -209,12 +201,12 @@ async fn main(_input: String) -> Result<String> {
     for step in 0..DECODE_STEPS {
         pool_ids_ch.put(pool_ids.clone());
         fwd.submit(&pipe)
-            .map_err(|e| format!("decode submit @{step}: {e}"))?;
+            .with_context(|| format!("decode submit @{step}"))?;
         let t = out
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("out.take @{step}: {e}"))?;
+            .with_context(|| format!("out.take @{step}"))?;
         if let Some(&t0) = t.first() {
             generated.push(t0 as u32);
         }

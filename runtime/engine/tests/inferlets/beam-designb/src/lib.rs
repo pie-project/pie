@@ -46,9 +46,7 @@ async fn main(_input: String) -> Result<String> {
     // port and the WSlot write descriptor. The flat pool position `wpos` maps to
     // physical page `pool_ids[wpos / PAGE_T]` at offset `wpos % PAGE_T`.
     let ws = WorkingSet::new();
-    let pool = ws
-        .reserve(POOL_PAGES)
-        .map_err(|e| format!("ws.reserve pool: {e}"))?;
+    let pool = ws.reserve(POOL_PAGES).context("ws.reserve pool")?;
     let pool_ids = pool.ids().to_vec(); // [POOL_PAGES] physical
     let tiled: Vec<u32> = (0..B).flat_map(|_| pool_ids.iter().copied()).collect(); // [B*POOL_PAGES]
     let phys0 = pool_ids[0]; // physical page holding the shared prefix (pos 0)
@@ -176,22 +174,22 @@ async fn main(_input: String) -> Result<String> {
     for step in 0..MAX_STEPS {
         pool_ids_ch.put(pool_ids.clone());
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
         let picked = out
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("out.take @{step}: {e}"))?;
+            .with_context(|| format!("out.take @{step}"))?;
         let _parents = out_par
             .take()
             .get::<u32>()
             .await
-            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+            .with_context(|| format!("out_par.take @{step}"))?;
         let _scr = out_scr
             .take()
             .get::<f32>()
             .await
-            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            .with_context(|| format!("out_scr.take @{step}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

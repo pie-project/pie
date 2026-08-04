@@ -59,8 +59,7 @@ async fn main(input: String) -> Result<String> {
     let prompt: Vec<u32> = vec![first_tok];
     let n = prompt.len() as u32;
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // ───────────────────────── 1. PREFILL FIRE (N=1) ────────────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
@@ -117,14 +116,8 @@ async fn main(input: String) -> Result<String> {
     // (F7) right after the prefill submit only in the degenerate case where
     // zero decode fires follow.
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p.submit(&pipe).context("prefill submit")?;
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     generated.push(g0 as u32);
@@ -187,12 +180,12 @@ async fn main(input: String) -> Result<String> {
 
         for step in 1..max_tokens {
             fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{step}: {e}"))?;
+                .with_context(|| format!("decode submit @{step}"))?;
             let t = out
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("out.take @{step}: {e}"))?;
+                .with_context(|| format!("out.take @{step}"))?;
             let Some(&t0) = t.first() else {
                 return Err(format!("out.take @{step}: empty tensor"));
             };

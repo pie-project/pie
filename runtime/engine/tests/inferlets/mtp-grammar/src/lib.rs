@@ -43,8 +43,7 @@ async fn main(_input: String) -> Result<String> {
     // out: the committed accept-prefix (host-reader).
     let out = Channel::new([kp1], dtype::i32).named("out");
     let ws = WorkingSet::new();
-    ws.reserve(kp1.div_ceil(PAGE_T))
-        .map_err(|e| format!("reserve KV: {e}"))?;
+    ws.reserve(kp1.div_ceil(PAGE_T)).context("reserve KV")?;
 
     let fwd = ForwardPass::new();
     fwd.embed(&toks, &lanes)?;
@@ -91,12 +90,8 @@ async fn main(_input: String) -> Result<String> {
     // decode loop + a real grammar mask land with charlie's MTP Stage-2 driver.
     let pipeline = Pipeline::new();
     gmask.put(vec![true; (kp1 * v) as usize]); // all-allow
-    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
-    let committed = out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("out.take: {e}"))?;
+    fwd.submit(&pipeline).context("submit")?;
+    let committed = out.take().get::<i32>().await.context("out.take")?;
 
     let result = format!(
         "MTP_GRAMMAR K={K} committed={} (SDK-authored §6.1 native-MTP+grammar, vocab={vocab})",

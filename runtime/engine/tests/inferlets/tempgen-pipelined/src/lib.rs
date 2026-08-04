@@ -34,8 +34,7 @@ async fn main(_input: String) -> Result<String> {
     };
     let n = prompt.len() as u32;
     let max_pages = (n + MAX_TOKENS as u32 + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // ──────────────── ONE PIPELINE, ONE STREAM (R4-4) ───────────────────────
     // Prefill then decode on a single pipeline: the prefill epilogue seeds
@@ -144,9 +143,7 @@ async fn main(_input: String) -> Result<String> {
 
     let pipe = Pipeline::new();
     let budget = MAX_TOKENS - 1;
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
+    fwd_p.submit(&pipe).context("prefill submit")?;
 
     // Prime + fill: up to DEPTH chain-linked fires upfront (none awaited);
     // finish() right after the last budget submit (F7); then FIFO drain +
@@ -154,17 +151,13 @@ async fn main(_input: String) -> Result<String> {
     let mut submitted = 0usize;
     while submitted < DEPTH.min(budget) {
         fwd.submit(&pipe)
-            .map_err(|e| format!("decode submit @{submitted}: {e}"))?;
+            .with_context(|| format!("decode submit @{submitted}"))?;
         submitted += 1;
     }
 
     // Host drain: the g0 copy first (the decode burst is already in the
     // engine while this take waits), then the decode ring with refill.
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
     let mut generated: Vec<u32> = Vec::with_capacity(MAX_TOKENS);
     eprintln!("[TEMPGEN_PIPELINED] got token: {g0}");
     generated.push(g0 as u32);
@@ -175,7 +168,7 @@ async fn main(_input: String) -> Result<String> {
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("out.take @{}: {e}", generated.len()))?;
+            .with_context(|| format!("out.take @{}", generated.len()))?;
         taken += 1;
         let Some(&t0) = t.first() else {
             return Err(format!("out.take @{}: empty tensor", generated.len()));
@@ -184,7 +177,7 @@ async fn main(_input: String) -> Result<String> {
         generated.push(t0 as u32);
         if submitted < budget {
             fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{submitted}: {e}"))?;
+                .with_context(|| format!("decode submit @{submitted}"))?;
             submitted += 1;
         }
     }

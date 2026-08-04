@@ -75,8 +75,7 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
 
     let ws = WorkingSet::new();
     let max_pages = n.div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // Seeded inputs (single fire: the host geometry prefill reads seeds) +
     // terminal [k]-Token reader outputs.
@@ -130,17 +129,17 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
     });
 
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
+    fwd.submit(&pipeline).context("submit")?;
     let tgt = target_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("target take: {e}"))?;
+        .context("target take")?;
     let ver = verify_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("verify take: {e}"))?;
+        .context("verify take")?;
     pipeline.close();
     Ok((tgt, ver))
 }

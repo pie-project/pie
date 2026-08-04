@@ -3,9 +3,9 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use inferlet::Result;
 use inferlet::grammar::{Grammar, Matcher};
 use inferlet::serde_json;
+use inferlet::{Context, Result};
 
 const GRAMMAR: &str = "root ::= [a-z]*";
 const ACCEPTED_TOKEN_ID: u32 = b'a' as u32;
@@ -78,7 +78,7 @@ async fn main(input: String) -> Result<String> {
         for _ in 0..iterations {
             matcher
                 .accept_tokens(black_box(&[ACCEPTED_TOKEN_ID]))
-                .map_err(|error| format!("accept-tokens: {error:?}"))?;
+                .context("accept-tokens")?;
         }
         accept_samples.push(per_call(start.elapsed().as_nanos(), iterations));
 
@@ -88,7 +88,7 @@ async fn main(input: String) -> Result<String> {
             black_box(matcher.mask());
             matcher
                 .accept_tokens(black_box(&[ACCEPTED_TOKEN_ID]))
-                .map_err(|error| format!("mask+accept: {error:?}"))?;
+                .context("mask+accept")?;
         }
         combined_samples.push(per_call(start.elapsed().as_nanos(), iterations));
     }

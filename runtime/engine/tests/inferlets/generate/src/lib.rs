@@ -59,7 +59,7 @@ async fn main(input: String) -> Result<String> {
         }
         Ok(())
     };
-    reserve_to_tokens(n.max(1)).map_err(|e| format!("ws.reserve prompt: {e}"))?;
+    reserve_to_tokens(n.max(1)).context("ws.reserve prompt")?;
 
     // ───────────────────────── 1. PREFILL FIRE (N-wide) ─────────────────────
     // Seeded prompt and every descriptor channel are explicit. The pages
@@ -110,14 +110,8 @@ async fn main(input: String) -> Result<String> {
 
     // ONE pipeline for the whole prefill→decode stream.
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p.submit(&pipe).context("prefill submit")?;
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     generated.push(g0 as u32);
@@ -175,14 +169,14 @@ async fn main(input: String) -> Result<String> {
 
         for step in 1..max_tokens {
             reserve_to_tokens(n + step as u32)
-                .map_err(|e| format!("reserve decode @{step}: {e}"))?;
+                .with_context(|| format!("reserve decode @{step}"))?;
             fwd.submit(&pipe)
-                .map_err(|e| format!("decode submit @{step}: {e}"))?;
+                .with_context(|| format!("decode submit @{step}"))?;
             let t = out
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("out.take @{step}: {e}"))?;
+                .with_context(|| format!("out.take @{step}"))?;
             let Some(&t0) = t.first() else {
                 return Err(format!("out.take @{step}: empty tensor"));
             };

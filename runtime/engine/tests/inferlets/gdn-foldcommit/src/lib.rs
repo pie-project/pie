@@ -55,8 +55,7 @@ impl Arm {
         let ws = WorkingSet::new();
         let rs = RsWorkingSet::new();
         let page_size = kv_page_size();
-        ws.reserve(max_pages)
-            .map_err(|e| format!("ws.reserve: {e}"))?;
+        ws.reserve(max_pages).context("ws.reserve")?;
         let mut arm = Arm {
             ws,
             rs,
@@ -280,17 +279,17 @@ impl Arm {
             // whereas the peak logit VALUE moves with the state continuously.
             peak_sink.put(&reduce_max(&logits));
         });
-        fwd.submit(pipe).map_err(|e| format!("{tag} submit: {e}"))?;
+        fwd.submit(pipe).with_context(|| format!("{tag} submit"))?;
         let token = out
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("{tag} take: {e}"))?[0];
+            .with_context(|| format!("{tag} take"))?[0];
         let peak_v = peak
             .take()
             .get::<f32>()
             .await
-            .map_err(|e| format!("{tag} peak take: {e}"))?[0];
+            .with_context(|| format!("{tag} peak take"))?[0];
         Ok((Some(token), peak_v))
     }
 }
@@ -350,8 +349,7 @@ impl Duo {
     fn new(span: u32) -> Result<Self> {
         let ws = WorkingSet::new();
         let page_size = kv_page_size();
-        ws.reserve(2 * span)
-            .map_err(|e| format!("duo reserve: {e}"))?;
+        ws.reserve(2 * span).context("duo reserve")?;
         let rs = [RsWorkingSet::new(), RsWorkingSet::new()];
         Ok(Duo {
             ws,
@@ -486,12 +484,12 @@ impl Duo {
         fwd.epilogue(move || {
             sink.put(&reduce_max(intrinsics::logits()));
         });
-        fwd.submit(pipe).map_err(|e| format!("{tag} submit: {e}"))?;
+        fwd.submit(pipe).with_context(|| format!("{tag} submit"))?;
         let v = peak
             .take()
             .get::<f32>()
             .await
-            .map_err(|e| format!("{tag} take: {e}"))?;
+            .with_context(|| format!("{tag} take"))?;
         Ok([v[0], v[1]])
     }
 }
@@ -553,7 +551,7 @@ async fn mixed_positions(prompt: &[u32]) -> Result<String> {
                 if shape.is_some() {
                     duo.rs[row]
                         .alloc_buffer(buf_pages(duo))
-                        .map_err(|e| format!("duo {i} row {row} alloc_buffer: {e}"))?;
+                        .with_context(|| format!("duo {i} row {row} alloc_buffer"))?;
                 }
             }
             duo.fire(&cont, shapes, &pipe, "middle").await?;
@@ -564,7 +562,7 @@ async fn mixed_positions(prompt: &[u32]) -> Result<String> {
                 if shape.is_some() {
                     duo.rs[row]
                         .free_buffer(&[0])
-                        .map_err(|e| format!("duo {i} row {row} free_buffer: {e}"))?;
+                        .with_context(|| format!("duo {i} row {row} free_buffer"))?;
                 }
             }
             peaks.push(duo.fire(&[cont[0]], [None, None], &pipe, "next").await?);
@@ -635,7 +633,7 @@ async fn fold_inside_new_tokens(prompt: &[u32]) -> Result<String> {
     // Arm A: buffer the first pair, then append the second pair AND fold all
     // four -- the write-and-fold through a non-empty buffer.
     a.rs.alloc_buffer((T as u32).div_ceil(a.rs_page))
-        .map_err(|e| format!("A alloc_buffer: {e}"))?;
+        .context("A alloc_buffer")?;
     a.fire(&cont[..HALF as usize], Some((0, 0)), &pipe, "A-buffer")
         .await?;
     a.pos += HALF;
@@ -738,7 +736,7 @@ async fn fold_behind_new_tokens(prompt: &[u32]) -> Result<String> {
     for (arm, tag) in [(&a, "A"), (&b, "B"), (&c, "C")] {
         arm.rs
             .alloc_buffer(slabs)
-            .map_err(|e| format!("{tag} alloc_buffer: {e}"))?;
+            .with_context(|| format!("{tag} alloc_buffer"))?;
     }
 
     // Every arm buffers the same window, folding nothing.
@@ -754,7 +752,7 @@ async fn fold_behind_new_tokens(prompt: &[u32]) -> Result<String> {
     // ── Arm B: the same two things, in two fires ──────────────────────────
     b.build_empty_fire(&Channel::from([BEHIND]), "B-commit")?
         .submit(&pipe)
-        .map_err(|e| format!("B-commit submit: {e}"))?;
+        .context("B-commit submit")?;
     let (_, b_ahead) = b.fire(&ahead, Some((0, 0)), &pipe, "B-append").await?;
     b.pos += T as u32;
 
@@ -771,7 +769,7 @@ async fn fold_behind_new_tokens(prompt: &[u32]) -> Result<String> {
         if live > 0 {
             arm.rs
                 .free_buffer(&(0..live).collect::<Vec<_>>())
-                .map_err(|e| format!("{tag} free_buffer: {e}"))?;
+                .with_context(|| format!("{tag} free_buffer"))?;
         }
         let (_, peak) = arm.fire(&next, None, &pipe, tag).await?;
         arm.pos += 1;
@@ -847,8 +845,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     let slabs = (T as u32 + 1).div_ceil(a.rs_page).max(1);
 
     // ── Arm A: ONE fire over four tokens, folding only the first two ──────
-    a.rs.alloc_buffer(slabs)
-        .map_err(|e| format!("A alloc_buffer: {e}"))?;
+    a.rs.alloc_buffer(slabs).context("A alloc_buffer")?;
     let (_, a_inside) = a
         .fire(&cont, Some((0, HALF)), &pipe, "A-fold-inside")
         .await?;
@@ -858,8 +855,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     // A different interior cut. `fold(n)` is a no-op for every legal n, so C
     // must converge on A: the boundary may land anywhere inside the fire's
     // own tokens without changing what the context means.
-    c.rs.alloc_buffer(slabs)
-        .map_err(|e| format!("C alloc_buffer: {e}"))?;
+    c.rs.alloc_buffer(slabs).context("C alloc_buffer")?;
     let (_, c_inside) = c.fire(&cont, Some((0, 1)), &pipe, "C-fold-one").await?;
     c.pos += T as u32;
 
@@ -867,8 +863,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     b.fire(&cont[..HALF as usize], None, &pipe, "B-fold")
         .await?;
     b.pos += HALF;
-    b.rs.alloc_buffer(slabs)
-        .map_err(|e| format!("B alloc_buffer: {e}"))?;
+    b.rs.alloc_buffer(slabs).context("B alloc_buffer")?;
     let (_, b_inside) = b
         .fire(&cont[HALF as usize..], Some((0, 0)), &pipe, "B-append")
         .await?;
@@ -880,8 +875,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     // but never uses the split. It separates "the split is wrong" from "a
     // buffer holding its already-folded prefix behaves differently from one
     // that never held it" -- which is what arm B would otherwise conflate.
-    d.rs.alloc_buffer(slabs)
-        .map_err(|e| format!("D alloc_buffer: {e}"))?;
+    d.rs.alloc_buffer(slabs).context("D alloc_buffer")?;
     d.fire(&cont, Some((0, 0)), &pipe, "D-append").await?;
     d.pos += T as u32;
     // An ordinary COMMIT moves the boundary two tokens into an ALREADY
@@ -890,7 +884,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
     // replays the buffer instead.
     d.build_empty_fire(&Channel::from([HALF]), "D-commit")?
         .submit(&pipe)
-        .map_err(|e| format!("D-commit submit: {e}"))?;
+        .context("D-commit submit")?;
 
     // Drain: fold whatever is still buffered, then free the slabs so the
     // probe below is a plain in-forward fold on both arms.
@@ -905,7 +899,7 @@ async fn fold_interior_boundary(prompt: &[u32]) -> Result<String> {
         if live > 0 {
             arm.rs
                 .free_buffer(&(0..live).collect::<Vec<_>>())
-                .map_err(|e| format!("{tag} free_buffer: {e}"))?;
+                .with_context(|| format!("{tag} free_buffer"))?;
         }
         let (_, peak) = arm.fire(&next, None, &pipe, tag).await?;
         arm.pos += 1;
@@ -974,9 +968,7 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
     let slabs = (T as u32 + 1).div_ceil(a.rs_page).max(1);
 
     for arm in [&a, &b, &c] {
-        arm.rs
-            .alloc_buffer(slabs)
-            .map_err(|e| format!("alloc_buffer: {e}"))?;
+        arm.rs.alloc_buffer(slabs).context("alloc_buffer")?;
     }
     a.fire(&cont, Some((0, 0)), &pipe, "A-append").await?;
     a.pos += T as u32;
@@ -988,7 +980,7 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
     // The whole point: a fire whose row carries no tokens at all.
     a.build_empty_fire(&Channel::from([HALF]), "A-commit")?
         .submit(&pipe)
-        .map_err(|e| format!("A-commit submit: {e}"))?;
+        .context("A-commit submit")?;
     // Arm C folds EVERYTHING through an empty row. `u32::MAX` is the
     // fire-invariant spelling of "fold everything", and the WIT promises it
     // is CLAMPED to the tail. Under the old rule a commit was selected by
@@ -997,7 +989,7 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
     // fold length says, so nothing but an explicit clamp keeps this legal.
     c.build_empty_fire(&Channel::from([u32::MAX]), "C-commit")?
         .submit(&pipe)
-        .map_err(|e| format!("C-commit submit: {e}"))?;
+        .context("C-commit submit")?;
     // Arm B does not fold. Folding is a no-op -- it trades optionality for
     // memory, never meaning -- so a context that folded half its buffer and
     // one that folded none of it must decode identically. If the empty row
@@ -1013,7 +1005,7 @@ async fn empty_commit(prompt: &[u32]) -> Result<String> {
         if live > 0 {
             arm.rs
                 .free_buffer(&(0..live).collect::<Vec<_>>())
-                .map_err(|e| format!("{tag} free_buffer: {e}"))?;
+                .with_context(|| format!("{tag} free_buffer"))?;
         }
         let (_, peak) = arm.fire(&next, None, &pipe, tag).await?;
         arm.pos += 1;
@@ -1088,7 +1080,7 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     for arm in [&a, &b, &c] {
         arm.rs
             .alloc_buffer(W.div_ceil(arm.rs_page).max(1))
-            .map_err(|e| format!("alloc_buffer: {e}"))?;
+            .context("alloc_buffer")?;
     }
 
     // ── 1. APPEND: fill the buffer, and compute the count ON DEVICE ────────
@@ -1122,24 +1114,14 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     a.pos += W;
     let a_commit = a.build_empty_fire(&n_dev, "A-commit")?;
     a.pos -= W;
-    a_append
-        .submit(&pipe)
-        .map_err(|e| format!("A-append submit: {e}"))?;
+    a_append.submit(&pipe).context("A-append submit")?;
 
     let b_append = b.build_fire(&window, Some(&Channel::from([0u32])), "B-append", || {})?;
-    b_append
-        .submit(&pipe)
-        .map_err(|e| format!("B-append submit: {e}"))?;
+    b_append.submit(&pipe).context("B-append submit")?;
     let c_append = c.build_fire(&window, Some(&Channel::from([0u32])), "C-append", || {})?;
-    c_append
-        .submit(&pipe)
-        .map_err(|e| format!("C-append submit: {e}"))?;
+    c_append.submit(&pipe).context("C-append submit")?;
 
-    let argmax = raw
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("raw take: {e}"))?[0];
+    let argmax = raw.take().get::<i32>().await.context("raw take")?[0];
     let expected = 1 + (argmax.rem_euclid(W as i32)) as u32;
     // As far from `expected` as the window allows: the control has to be a
     // clearly different context, not an adjacent one.
@@ -1153,15 +1135,13 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
     // A commit replays buffered activations and stops at the recurrence, so it
     // produces no logits and carries an empty epilogue. Arm A's `n_dev` has no
     // host-known seed, which is exactly what routes it down the device path.
-    a_commit
-        .submit(&pipe)
-        .map_err(|e| format!("A-commit submit: {e}"))?;
+    a_commit.submit(&pipe).context("A-commit submit")?;
     b.build_empty_fire(&Channel::from([expected]), "B-commit")?
         .submit(&pipe)
-        .map_err(|e| format!("B-commit submit: {e}"))?;
+        .context("B-commit submit")?;
     c.build_empty_fire(&Channel::from([other]), "C-commit")?
         .submit(&pipe)
-        .map_err(|e| format!("C-commit submit: {e}"))?;
+        .context("C-commit submit")?;
     for arm in [&mut a, &mut b, &mut c] {
         arm.pos += 1;
         // The commit settles the boundary the only way the host can: the guest
@@ -1169,7 +1149,7 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
         // bound, and a fire that needed the exact value would be refused.
         arm.rs
             .free_buffer(&(0..W.div_ceil(arm.rs_page).max(1)).collect::<Vec<_>>())
-            .map_err(|e| format!("free_buffer: {e}"))?;
+            .context("free_buffer")?;
     }
 
     // ── 3. PROBE: one token past the commit pins the folded STATE ──────────
@@ -1268,14 +1248,12 @@ async fn main(input: String) -> Result<String> {
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
     let max_pages = (n + chunks * SPEC_TOKENS + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // Buffered slots for the speculative chunk. Reserved logically here;
     // the buffering fire materializes them on first write.
     let slabs = (chunks * SPEC_TOKENS).div_ceil(buffer_page);
-    rs.alloc_buffer(slabs)
-        .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+    rs.alloc_buffer(slabs).context("rs.alloc_buffer")?;
 
     // ───────────────── 1. PREFILL — mode `fold` (default) ─────────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
@@ -1321,14 +1299,8 @@ async fn main(input: String) -> Result<String> {
     });
 
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p.submit(&pipe).context("prefill submit")?;
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
 
     // ────────────── 2. SPECULATE — `fold_len = 0`, nothing folds ──────────
     // One SPEC_TOKENS-wide fire. Its activations land in the buffered slots;
@@ -1391,14 +1363,12 @@ async fn main(input: String) -> Result<String> {
         let t = reduce_argmax(intrinsics::logits());
         spec_out.put(&t);
     });
-    fwd_s
-        .submit(&pipe)
-        .map_err(|e| format!("speculative submit: {e}"))?;
+    fwd_s.submit(&pipe).context("speculative submit")?;
     let drafted = spec_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("spec_out take: {e}"))?[0];
+        .context("spec_out take")?[0];
 
     // ─────────────── 3. COMMIT — `fold_len = accepted` ────────────────────
     // Replays only the accepted prefix into the folded state. No logits, and
@@ -1458,9 +1428,7 @@ async fn main(input: String) -> Result<String> {
         // fails with PIE_STATUS_INVALID_ARGUMENT. An empty epilogue is the
         // minimal well-formed program that produces no logits.
         fwd_c.epilogue(|| {});
-        fwd_c
-            .submit(&pipe)
-            .map_err(|e| format!("commit submit: {e}"))?;
+        fwd_c.submit(&pipe).context("commit submit")?;
         committed = accepted;
     }
 
@@ -1535,13 +1503,8 @@ async fn main(input: String) -> Result<String> {
             let t = reduce_argmax(intrinsics::logits());
             c2_out.put(&t);
         });
-        fwd2.submit(&pipe)
-            .map_err(|e| format!("chain submit: {e}"))?;
-        c2_out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("c2_out take: {e}"))?;
+        fwd2.submit(&pipe).context("chain submit")?;
+        c2_out.take().get::<i32>().await.context("c2_out take")?;
         chained = "ok";
     }
 
@@ -1551,7 +1514,7 @@ async fn main(input: String) -> Result<String> {
     let remaining = rs.buffer_size();
     if remaining > 0 {
         rs.free_buffer(&(0..remaining).collect::<Vec<_>>())
-            .map_err(|e| format!("free_buffer: {e}"))?;
+            .context("free_buffer")?;
     }
 
     pipe.close();

@@ -93,20 +93,13 @@ impl Stream {
     /// channel each fire (D2), exactly like the templates.
     fn submit(&self) -> Result<()> {
         self.pool_ids_ch.put(self.pool_ids.clone());
-        self.decode
-            .submit(&self.pipeline)
-            .map_err(|e| format!("decode submit: {e}"))
+        self.decode.submit(&self.pipeline).context("decode submit")
     }
 
     /// Harvest one fire's sampled token off the `out` channel (blocks by
     /// awaiting the in-flight fire; poison surfaces as `Err`).
     async fn take_token(&self) -> Result<u32> {
-        let v = self
-            .out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("out take: {e}"))?;
+        let v = self.out.take().get::<i32>().await.context("out take")?;
         Ok(v.first().copied().unwrap_or(0) as u32)
     }
 }
@@ -122,9 +115,7 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     let pool = pool_pages * PAGE_T;
 
     let ws = WorkingSet::new();
-    let grant = ws
-        .reserve(pool_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    let grant = ws.reserve(pool_pages).context("ws.reserve")?;
     let pool_ids = grant.ids().to_vec();
 
     // ── 1. PREFILL FIRE (N-wide): causal [N, POOL] mask, N-cell KV write,
@@ -172,14 +163,8 @@ async fn start_stream(prompt: &[u32], budget: usize) -> Result<(u32, Stream)> {
     // fire of this generation submit here (the Stream carries it). The g0
     // handoff still rides the host (awaited take), unchanged.
     let pipeline = Pipeline::new();
-    fwd_p
-        .submit(&pipeline)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?;
+    fwd_p.submit(&pipeline).context("prefill submit")?;
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?;
     let g0 = g0.first().copied().unwrap_or(0) as u32;
 
     // ── 2. DECODE PASS (1-wide, device loop-carried): the epilogue carries

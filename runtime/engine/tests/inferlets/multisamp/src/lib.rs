@@ -96,8 +96,7 @@ async fn main(_input: String) -> Result<String> {
     let prompt: Vec<u32> = if prompt.is_empty() { vec![0] } else { prompt };
     let n = prompt.len() as u32;
     let max_pages = (n + (samplers.len() * STEPS_PER_KIND) as u32 + 1).div_ceil(page_size);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // ── PREFILL FIRE (N-wide) — the first kind's first token. ──
     let (_, kind0) = samplers[0];
@@ -150,14 +149,8 @@ async fn main(_input: String) -> Result<String> {
     // ONE pipeline for the whole stream (R4-4): the prefill and every kind's
     // decode fires continue the SAME growing context, so they all submit here.
     let pipeline = Pipeline::new();
-    fwd_p
-        .submit(&pipeline)
-        .map_err(|e| format!("prefill submit: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p.submit(&pipeline).context("prefill submit")?;
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
 
     // `count` = total tokens generated so far (across every kind), INCLUDING
     // `last_tok`; the next fire embeds `last_tok` at absolute position
@@ -236,12 +229,12 @@ async fn main(_input: String) -> Result<String> {
 
             for step in 0..steps {
                 fwd.submit(&pipeline)
-                    .map_err(|e| format!("{name} submit @{step}: {e}"))?;
+                    .with_context(|| format!("{name} submit @{step}"))?;
                 let t = out
                     .take()
                     .get::<i32>()
                     .await
-                    .map_err(|e| format!("{name} out.take @{step}: {e}"))?;
+                    .with_context(|| format!("{name} out.take @{step}"))?;
                 let Some(&t0) = t.first() else {
                     return Err(format!("{name} out.take @{step}: empty tensor"));
                 };

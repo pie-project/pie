@@ -80,9 +80,7 @@ impl Decoder {
     fn new(capacity_tokens: u32) -> Result<Decoder> {
         let pool_pages = capacity_tokens.div_ceil(PAGE_T).max(1);
         let ws = WorkingSet::new();
-        let grant = ws
-            .reserve(pool_pages)
-            .map_err(|e| format!("ws.reserve: {e}"))?;
+        let grant = ws.reserve(pool_pages).context("ws.reserve")?;
         let pool_ids = grant.ids().to_vec();
         Ok(Decoder {
             ws,
@@ -149,14 +147,9 @@ impl Decoder {
             g_ch.put(&tok);
         });
 
-        fwd.submit(&pipeline)
-            .map_err(|e| format!("prefill submit: {e}"))?;
+        fwd.submit(&pipeline).context("prefill submit")?;
         self.seq += n;
-        let g0 = g_ch
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("g0 take: {e}"))?[0];
+        let g0 = g_ch.take().get::<i32>().await.context("g0 take")?[0];
         Ok(g0 as u32)
     }
 
@@ -260,21 +253,14 @@ impl DecodeLoop {
     /// the decoder cursor on SUBMIT, like the classic probe.
     fn submit(&self, d: &mut Decoder) -> Result<()> {
         d.pool_ids_ch_put(&self.pool_ids_ch);
-        self.fwd
-            .submit(&self.pipeline)
-            .map_err(|e| format!("decode submit: {e}"))?;
+        self.fwd.submit(&self.pipeline).context("decode submit")?;
         d.seq += 1;
         Ok(())
     }
 
     /// Drain the oldest in-flight fire's token (blocks until committed).
     async fn take(&self) -> Result<u32> {
-        let t = self
-            .out
-            .take()
-            .get::<i32>()
-            .await
-            .map_err(|e| format!("out.take: {e}"))?;
+        let t = self.out.take().get::<i32>().await.context("out.take")?;
         Ok(*t.first().unwrap_or(&0) as u32)
     }
 

@@ -42,9 +42,7 @@ const MAX_TOKENS: u32 = 16;
 const PAGE_T: u32 = 16;
 
 async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
-    t.get::<i32>()
-        .await
-        .map_err(|e| format!("tensor take: {e}"))
+    t.get::<i32>().await.context("tensor take")
 }
 
 /// Committed length of a sentinel `[k+1]` tail = the count before the first
@@ -201,8 +199,7 @@ async fn bootstrap(
         drafts_out.put(&drafts);
     });
 
-    fwd.submit(pipeline)
-        .map_err(|e| format!("bootstrap submit: {e}"))?;
+    fwd.submit(pipeline).context("bootstrap submit")?;
     let seed = get_i32(seed_out.take())
         .await?
         .first()
@@ -284,8 +281,7 @@ async fn verify_window(
         drafts_out.put(&next_drafts);
     });
 
-    fwd.submit(pipeline)
-        .map_err(|e| format!("verify submit: {e}"))?;
+    fwd.submit(pipeline).context("verify submit")?;
     let commit = get_i32(commit_out_h.take()).await?;
     let drafts = get_i32(drafts_out_h.take()).await?;
     Ok((commit, drafts))
@@ -311,8 +307,7 @@ async fn main(input: String) -> Result<String> {
         prompt.push(0);
     }
     let max_pages = (prompt.len() as u32 + MAX_TOKENS + k + 1).div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // ONE pipeline for the whole stream (R4-4): the bootstrap and every
     // verify window continue the same sequential decode, so all their fires
@@ -344,7 +339,7 @@ async fn main(input: String) -> Result<String> {
         let live = pending_fold + kp1 + rs_page;
         while rs.buffer_size() * rs_page < live {
             rs.alloc_buffer(window_slabs.max(1))
-                .map_err(|e| format!("rs.alloc_buffer: {e}"))?;
+                .context("rs.alloc_buffer")?;
         }
 
         let (commit, drafts) = verify_window(
@@ -370,8 +365,7 @@ async fn main(input: String) -> Result<String> {
         // tokens over the slots just released.
         let rejected = kp1 - clen as u32;
         if rejected > 0 {
-            rs.discard_buffered(rejected)
-                .map_err(|e| format!("discard_buffered: {e}"))?;
+            rs.discard_buffered(rejected).context("discard_buffered")?;
         }
         pending_fold = clen as u32;
 

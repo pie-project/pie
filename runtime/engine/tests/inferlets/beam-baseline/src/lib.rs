@@ -122,12 +122,12 @@ async fn forward_logits(
         logits_out.put(&intrinsics::logits());
     });
 
-    fwd.submit(on).map_err(|e| format!("submit {tag}: {e}"))?;
+    fwd.submit(on).with_context(|| format!("submit {tag}"))?;
     logits_out
         .take()
         .get::<f32>()
         .await
-        .map_err(|e| format!("logits take {tag}: {e}"))
+        .with_context(|| format!("logits take {tag}"))
 }
 
 #[inferlet::main]
@@ -156,8 +156,7 @@ async fn main(input: String) -> Result<String> {
     // every CoW child shares one address space sized for prompt + decode.
     let root = WorkingSet::new();
     let max_pages = (n + max_tokens as u32 + 1).div_ceil(kv_page_size());
-    root.reserve(max_pages)
-        .map_err(|e| format!("root reserve: {e}"))?;
+    root.reserve(max_pages).context("root reserve")?;
 
     // One run-ahead ordering domain for the whole search: forks and fires
     // linearize on it, so a survivor's fork is ordered after its parent's
@@ -169,7 +168,7 @@ async fn main(input: String) -> Result<String> {
     let mut beams: Vec<Beam> = Vec::with_capacity(beam_width);
     let mut pending: Vec<Vec<u32>> = Vec::with_capacity(beam_width);
     for _ in 0..beam_width {
-        let ws = root.fork(&pipe).map_err(|e| format!("seed fork: {e}"))?;
+        let ws = root.fork(&pipe).context("seed fork")?;
         beams.push(Beam {
             ws,
             seq_len: 0,
@@ -206,10 +205,7 @@ async fn main(input: String) -> Result<String> {
         let mut next: Vec<Beam> = Vec::with_capacity(beam_width);
         let mut next_pending: Vec<Vec<u32>> = Vec::with_capacity(beam_width);
         for (score, parent, tok) in &cand {
-            let ws = beams[*parent]
-                .ws
-                .fork(&pipe)
-                .map_err(|e| format!("survivor fork: {e}"))?;
+            let ws = beams[*parent].ws.fork(&pipe).context("survivor fork")?;
             let mut tokens = beams[*parent].tokens.clone();
             tokens.push(*tok);
             next.push(Beam {

@@ -22,7 +22,7 @@ async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i
     let max_pages = N.div_ceil(PAGE_T);
     let suffix_start = if cached { PAGE_T } else { 0 };
     ws.reserve(max_pages - ws.page_len())
-        .map_err(|e| format!("{tag} ws.reserve: {e}"))?;
+        .with_context(|| format!("{tag} ws.reserve"))?;
     let input = &tokens[suffix_start as usize..];
     let toks = Channel::from(input).named("toks");
     let input_len = input.len() as u32;
@@ -67,13 +67,12 @@ async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i
     });
 
     let pipe = Pipeline::new();
-    fwd.submit(&pipe)
-        .map_err(|e| format!("{tag} submit: {e}"))?;
+    fwd.submit(&pipe).with_context(|| format!("{tag} submit"))?;
     let g = out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("{tag} out.take: {e}"))?[0];
+        .with_context(|| format!("{tag} out.take"))?[0];
     if !cached {
         let prefix = ws.slice(&pipe, 0, 1)?;
         prefix.update_index(PREFIX_KEY)?;
@@ -90,7 +89,7 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
     let ws = WorkingSet::new();
     let max_pages = N.div_ceil(PAGE_T);
     ws.reserve(max_pages)
-        .map_err(|e| format!("{tag} ws.reserve: {e}"))?;
+        .with_context(|| format!("{tag} ws.reserve"))?;
     let k = PAGE_T as usize;
 
     let toks_a = Channel::from(&tokens[..k]).named("toks_a");
@@ -125,12 +124,12 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
     let pipe = Pipeline::new();
     fwd_a
         .submit(&pipe)
-        .map_err(|e| format!("{tag} chunk-a submit: {e}"))?;
+        .with_context(|| format!("{tag} chunk-a submit"))?;
     let _ = sink
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("{tag} sink.take: {e}"))?;
+        .with_context(|| format!("{tag} sink.take"))?;
 
     let toks_b = Channel::from(&tokens[k..]).named("toks_b");
     let suffix_len = N - PAGE_T;
@@ -174,12 +173,12 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
     });
     fwd_b
         .submit(&pipe)
-        .map_err(|e| format!("{tag} chunk-b submit: {e}"))?;
+        .with_context(|| format!("{tag} chunk-b submit"))?;
     let g = out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("{tag} out.take: {e}"))?[0];
+        .with_context(|| format!("{tag} out.take"))?[0];
     pipe.close();
     Ok(g)
 }

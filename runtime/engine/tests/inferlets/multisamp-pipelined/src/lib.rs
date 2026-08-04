@@ -78,7 +78,7 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
     let n = prompt.len() as u32;
     let max_pages = (n + STEPS_PER_KIND as u32 + 1).div_ceil(page_size);
     ws.reserve(max_pages)
-        .map_err(|e| format!("{name} ws.reserve: {e}"))?;
+        .with_context(|| format!("{name} ws.reserve"))?;
 
     // ── PREFILL FIRE (N-wide, awaited) — this kind's first token. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
@@ -123,12 +123,12 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
     let pipe = Pipeline::new();
     fwd_p
         .submit(&pipe)
-        .map_err(|e| format!("{name} prefill submit: {e}"))?;
+        .with_context(|| format!("{name} prefill submit"))?;
     let g0 = g0_ch
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("{name} g0 take: {e}"))?[0];
+        .with_context(|| format!("{name} g0 take"))?[0];
 
     let mut got: Vec<u32> = Vec::with_capacity(STEPS_PER_KIND);
     got.push(g0 as u32);
@@ -195,7 +195,7 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
         let mut inflight = 0usize;
         while inflight < DEPTH && submitted < budget {
             fwd.submit(&pipe)
-                .map_err(|e| format!("{name} decode submit @{submitted}: {e}"))?;
+                .with_context(|| format!("{name} decode submit @{submitted}"))?;
             submitted += 1;
             inflight += 1;
         }
@@ -204,7 +204,7 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("{name} out.take @{}: {e}", got.len()))?;
+                .with_context(|| format!("{name} out.take @{}", got.len()))?;
             inflight -= 1;
             let Some(&t0) = t.first() else {
                 return Err(format!("{name} out.take @{}: empty tensor", got.len()));
@@ -212,7 +212,7 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
             got.push(t0 as u32);
             if submitted < budget {
                 fwd.submit(&pipe)
-                    .map_err(|e| format!("{name} decode submit @{submitted}: {e}"))?;
+                    .with_context(|| format!("{name} decode submit @{submitted}"))?;
                 submitted += 1;
                 inflight += 1;
             }

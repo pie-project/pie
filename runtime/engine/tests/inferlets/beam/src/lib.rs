@@ -139,25 +139,25 @@ async fn main(_input: String) -> Result<String> {
         // Fresh headroom for this fire: B grant ids from the working set (D2).
         let grant = ws
             .reserve(B)
-            .map_err(|e| format!("ws.reserve @{step}: {e}"))?;
+            .with_context(|| format!("ws.reserve @{step}"))?;
         fresh.put(grant);
         fwd.submit(&pipeline)
-            .map_err(|e| format!("submit @{step}: {e}"))?;
+            .with_context(|| format!("submit @{step}"))?;
         let picked = out
             .take()
             .get::<i32>()
             .await
-            .map_err(|e| format!("out.take @{step}: {e}"))?;
+            .with_context(|| format!("out.take @{step}"))?;
         let _parents = out_par
             .take()
             .get::<u32>()
             .await
-            .map_err(|e| format!("out_par.take @{step}: {e}"))?;
+            .with_context(|| format!("out_par.take @{step}"))?;
         let _scr = out_scr
             .take()
             .get::<f32>()
             .await
-            .map_err(|e| format!("out_scr.take @{step}: {e}"))?;
+            .with_context(|| format!("out_scr.take @{step}"))?;
         if let Some(&t0) = picked.first() {
             hyp_tokens.push(t0 as u32);
         }

@@ -55,8 +55,7 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     let ws = WorkingSet::new();
     let n = prompt.len() as u32;
     let max_pages = (n + k + 1).div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("greedy ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("greedy ws.reserve")?;
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
 
     let toks_p = Channel::from(prompt_i32).named("g_toks_p");
@@ -92,14 +91,8 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     // ONE pipeline for the whole greedy stream (R4-4): prefill then decode
     // are one sequential stream. The g0 handoff still rides the host.
     let pipe = Pipeline::new();
-    fwd_p
-        .submit(&pipe)
-        .map_err(|e| format!("greedy prefill: {e}"))?;
-    let g0 = g0_ch
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("g0 take: {e}"))?[0];
+    fwd_p.submit(&pipe).context("greedy prefill")?;
+    let g0 = g0_ch.take().get::<i32>().await.context("g0 take")?[0];
 
     let mut g: Vec<u32> = vec![g0 as u32];
     if k > 1 {
@@ -145,12 +138,12 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
         });
         for step in 1..k {
             fwd.submit(&pipe)
-                .map_err(|e| format!("greedy decode @{step}: {e}"))?;
+                .with_context(|| format!("greedy decode @{step}"))?;
             let t = out
                 .take()
                 .get::<i32>()
                 .await
-                .map_err(|e| format!("greedy out @{step}: {e}"))?[0];
+                .with_context(|| format!("greedy out @{step}"))?[0];
             g.push(t as u32);
         }
     }
@@ -169,8 +162,7 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
 
     let ws = WorkingSet::new();
     let max_pages = n.div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("verify ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("verify ws.reserve")?;
     let toks = Channel::from(inp).named("v_toks");
     let embed_indptr = Channel::from([0u32, n]).named("v_embed_indptr");
     let positions = Channel::from_iter(0..n).named("v_positions");
@@ -222,13 +214,12 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
     });
 
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline)
-        .map_err(|e| format!("verify submit: {e}"))?;
+    fwd.submit(&pipeline).context("verify submit")?;
     let v = verify_out
         .take()
         .get::<i32>()
         .await
-        .map_err(|e| format!("verify take: {e}"))?;
+        .context("verify take")?;
     pipeline.close();
     Ok(v.iter().map(|&x| x as u32).collect())
 }

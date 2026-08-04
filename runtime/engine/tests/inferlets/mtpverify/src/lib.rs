@@ -88,8 +88,7 @@ async fn verify_window(
 
     let ws = WorkingSet::new();
     let max_pages = n.div_ceil(PAGE_T);
-    ws.reserve(max_pages)
-        .map_err(|e| format!("ws.reserve: {e}"))?;
+    ws.reserve(max_pages).context("ws.reserve")?;
 
     // Seeded inputs (single fire: the host geometry prefill reads seeds) + the
     // terminal [k]-Token reader output.
@@ -145,12 +144,8 @@ async fn verify_window(
     });
 
     let pipeline = Pipeline::new();
-    fwd.submit(&pipeline).map_err(|e| format!("submit: {e}"))?;
-    let raw = out
-        .take()
-        .get::<i32>()
-        .await
-        .map_err(|e| format!("out take: {e}"))?;
+    fwd.submit(&pipeline).context("submit")?;
+    let raw = out.take().get::<i32>().await.context("out take")?;
     pipeline.close();
     Ok(accepted_prefix(&raw))
 }
