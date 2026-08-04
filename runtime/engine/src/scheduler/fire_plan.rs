@@ -342,6 +342,36 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
     // sort_by_key is stable, so equal keys keep `arrival` order even
     // without the explicit third component; it is in the key anyway so the
     // contract survives callers passing members out of arrival order.
+    // GRAY SERIATION (the review's generalization #3, staged): the
+    // Gray-code rank over the axis bit-vector orders members so that
+    // ADJACENT combinations differ in one axis — each axis's window
+    // fragments into the fewest runs when members carry arbitrary axis
+    // subsets (lex: mask splits into 2 runs at k=2 axes; Gray: 1 run
+    // each — the PoC's radix-36 vs Gray-18 table). TODAY the admitted
+    // combination set nests (both-window-axes lanes are refused or
+    // k-uniform), so Gray and the standing lexicographic key produce
+    // THE SAME block structure — asserted below, so the moment a
+    // relaxation admits a combination where they diverge, this fires
+    // and the window consumers get generalized WITH the reorder
+    // rather than silently after it.
+    fn gray_rank(bits: u32) -> u32 {
+        // Inverse of n -> n ^ (n >> 1): prefix-XOR decode.
+        let mut rank = bits;
+        let mut shift = 1;
+        while shift < 32 {
+            rank ^= rank >> shift;
+            shift <<= 1;
+        }
+        rank
+    }
+    let axis_bits = |m: &MemberFacts| -> u32 {
+        // Bit order = the standing key's significance (mask > hook >
+        // truncated); multi_token and lora stay outside (not window
+        // axes).
+        (u32::from(m.custom_mask) << 2)
+            | (u32::from(m.hook_program) << 1)
+            | u32::from(m.truncated)
+    };
     member_order.sort_by_key(|&index| {
         let member = &members[index];
         (
@@ -359,6 +389,32 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
         )
     });
 
+    #[cfg(debug_assertions)]
+    {
+        let mut gray_order: Vec<usize> = (0..members.len()).collect();
+        gray_order.sort_by_key(|&i| {
+            (
+                members[i].device_resolved_geometry,
+                gray_rank(axis_bits(&members[i])),
+                !members[i].multi_token,
+                members[i].arrival,
+            )
+        });
+        if member_order != gray_order {
+            // NOT an assert: a hooked+truncated lane coexisting with a
+            // plain hooked one already ranks differently under Gray
+            // (011 before 010). The sentinel's job is DETECTION — the
+            // fire still runs on the lexicographic order the window
+            // consumers contract for; this line is the signal to bring
+            // the Gray reorder and the (start, len) consumer
+            // generalization in together.
+            eprintln!(
+                "[seriation] gray/lex divergence: lex={member_order:?} \
+                 gray={gray_order:?} — a combination outside the \
+                 nesting set is live"
+            );
+        }
+    }
     let hook_members = members.iter().filter(|m| m.hook_program).count();
     let qkv_postprocess = if hook_members == 0 {
         Site {
