@@ -27,10 +27,11 @@ use serde::{Deserialize, Serialize};
 
 // Qwen3-0.6B adapter geometry: trace-known shape (a different rank is a
 // different traced program); the CONTENTS are per-instance data.
-const NUM_LAYERS: u32 = 28;
 const RANK: u32 = 8;
-const D_IN: u32 = 1024; // hidden_size
-const D_OUT: u32 = 2048; // q width = 16 heads * head_dim 128
+// Model geometry DEFAULTS (Qwen3-0.6B); override per model via args.
+const DEF_LAYERS: u32 = 28;
+const DEF_D_IN: u32 = 1024;
+const DEF_D_OUT: u32 = 2048;
 const SITE_Q: u32 = 1 << 0;
 
 #[derive(Deserialize)]
@@ -56,6 +57,13 @@ struct Input {
     /// adapter surface only).
     #[serde(default = "default_sites")]
     sites: String,
+    /// Model geometry overrides (defaults = Qwen3-0.6B).
+    #[serde(default)]
+    layers: Option<u32>,
+    #[serde(default)]
+    d_in: Option<u32>,
+    #[serde(default)]
+    d_out: Option<u32>,
     /// Scale-vector deviation from ones (the scale/DoRA modes):
     /// l = 1 + scale_l * pattern. 0.0 = ones (the multiplicative
     /// identity).
@@ -135,6 +143,12 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let adapter_scale = input.adapter_scale;
+    #[allow(non_snake_case)]
+    let NUM_LAYERS: u32 = input.layers.unwrap_or(DEF_LAYERS);
+    #[allow(non_snake_case)]
+    let D_IN: u32 = input.d_in.unwrap_or(DEF_D_IN);
+    #[allow(non_snake_case)]
+    let D_OUT: u32 = input.d_out.unwrap_or(DEF_D_OUT);
     let ws = WorkingSet::new();
     let page_size = ws.page_size();
 

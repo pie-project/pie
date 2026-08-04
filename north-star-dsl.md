@@ -2186,3 +2186,21 @@ is mostly fixed cost at 128 tokens), so the 46x ceiling needs the
 LARGER MODEL (where base-weight reads dominate), not more lanes —
 the honest residual of that rock is now "bigger checkpoint", nothing
 else. Zero incidents at D=32.
+
+## THE WEIGHT CURVE AT 7B (2026-08-04) — the 46x thesis confirmed in shape
+
+Mistral-7B (local checkpoint, 17.5GB resident), 32 DISTINCT adapters,
+128 tok/lane, release:
+
+  0.6B . D=8 4.60x   D=16  6.40x   D=32  8.48x
+  7B   . D=8 6.37x   D=16 11.21x   D=32 17.87x
+
+Model size doubles the curve at every D — exactly the thesis: the
+merge's win is the base-weight read it deduplicates, and the bigger
+the weights, the closer to ideal (56% of ideal at 7B/D=32 vs 27% at
+0.6B). The README's 46x at its larger-model/longer-sequence shape is
+now an extrapolation the measured curve SUPPORTS rather than a
+number taken on faith. Zero incidents; mistral (a force_prefill
+deployment) serves 32-adapter fires cleanly. lora-probe geometry is
+now argument-driven (layers/d_in/d_out) — any llama-like checkpoint
+can run this battery.
