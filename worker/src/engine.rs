@@ -474,6 +474,16 @@ fn load_model_drivers(
     // that did not exit cleanly.
     crate::embedded_driver::sweep_stale_launch_state();
 
+    // Every driver-side disk cache derives from this. Resolved here because
+    // `$PIE_HOME` is the worker layer's to know; the driver has never been
+    // told it, which is the only reason those caches used to sit under XDG.
+    crate::embedded_driver::set_cache_dir(
+        crate::paths::pie_home()
+            .join("cache")
+            .to_string_lossy()
+            .into_owned(),
+    );
+
     // Resolve the weight-artifact directory here, before any driver startup
     // TOML is written. `$PIE_HOME` is this layer's to know: the driver has
     // never been told it, which is why the old env-var form fell back to XDG.

@@ -150,6 +150,42 @@ fn weight_cache_dir() -> String {
     WEIGHT_CACHE_DIR.get().cloned().unwrap_or_default()
 }
 
+/// The root every driver-side disk cache derives from: `$PIE_HOME/cache`.
+///
+/// Location is convention, not configuration -- there is no config field for
+/// it, and `$PIE_HOME` is the one lever that moves it. Before this the driver
+/// caches derived from `$XDG_CACHE_HOME`/`$HOME/.cache` instead, not as a
+/// choice but because the driver had never been told `$PIE_HOME`. That split
+/// pie's state across two roots: `pie serve` wrote programs, logs and
+/// optimized checkpoints under one and compiled PTIR, GEMM tuning and planner
+/// profiles under another.
+static CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the resolved cache root, before any driver is created. First writer
+/// wins, so a cache a live driver is already using cannot move.
+pub fn set_cache_dir(dir: String) {
+    let _ = CACHE_DIR.set(dir);
+}
+
+fn cache_dir() -> String {
+    CACHE_DIR.get().cloned().unwrap_or_default()
+}
+
+/// Emit `[cache] dir` into a driver's startup TOML.
+///
+/// Omitted when unset so a driver launched with a hand-written TOML (its own
+/// `dev.toml`, say) keeps the XDG derivation rather than losing its cache to
+/// an empty path.
+fn insert_cache_table(doc: &mut toml::Table) {
+    let dir = cache_dir();
+    if dir.is_empty() {
+        return;
+    }
+    let mut table = toml::Table::new();
+    insert_str(&mut table, "dir", dir);
+    insert_table(doc, "cache", table);
+}
+
 fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
     table.insert(key.into(), toml::Value::String(value.into()));
 }
@@ -358,6 +394,7 @@ pub fn write_metal_startup_toml(
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", options.verbose);
     insert_table(&mut doc, "runtime", runtime);
+    insert_cache_table(&mut doc);
 
     write_toml_table(out_path, doc)
 }
@@ -460,6 +497,7 @@ pub(crate) fn write_cuda_startup_toml(
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", opts.verbose);
     insert_table(&mut doc, "runtime", runtime);
+    insert_cache_table(&mut doc);
 
     if let Some(tp) = tp {
         let mut distributed = toml::Table::new();
@@ -1012,6 +1050,25 @@ mod tests {
             vec![0, 1, 2]
         );
         assert!(launches.iter().all(|launch| launch.size == 3));
+    }
+
+    #[test]
+    fn the_startup_toml_carries_the_cache_root() {
+        // The driver derives every disk cache from this. Without it the caches
+        // fall back to XDG, which is what split pie's state across two roots.
+        //
+        // NOTE: this installs a process-global OnceLock that outlives the test,
+        // so every later test in this binary sees `[cache]` emitted. Nothing
+        // asserts its absence today; a test that needs it unset cannot share a
+        // process with this one.
+        set_cache_dir("/pie-home/cache".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("driver.toml");
+        let snap = dir.path().join("snapshot");
+        write_cuda_startup_toml(&out, &CudaNativeDriverOptions::default(), &snap, 0, None)
+            .unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(val["cache"]["dir"].as_str().unwrap(), "/pie-home/cache");
     }
 
     #[test]

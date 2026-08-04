@@ -24,6 +24,8 @@
 
 #include <ptir_abi.h>
 
+#include "config.hpp"
+
 #include "pipeline/region_support.hpp"
 
 namespace pie_cuda_driver::pipeline::generated {
@@ -421,10 +423,14 @@ class ModuleCache {
 
   private:
     static std::filesystem::path default_cache_directory() {
-        // Location is convention, not configuration: XDG_CACHE_HOME is the
-        // standard way to move a cache, it is not a PIE_* flag, and the blobs
-        // are small enough that nobody needs to put them on a separate disk
-        // from the tuning cache.
+        // Location is convention, not configuration. The convention is
+        // `$PIE_HOME/cache`, which the engine sends in `[cache] dir` -- one
+        // root for everything pie writes. The XDG fallback below is for a
+        // driver run against a hand-written TOML that says nothing.
+        const std::string& root = pie_cuda_driver::cache_dir();
+        if (!root.empty()) {
+            return std::filesystem::path(root) / "ptir-cuda";
+        }
         if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
             if (*xdg != '\0') {
                 return std::filesystem::path(xdg) /

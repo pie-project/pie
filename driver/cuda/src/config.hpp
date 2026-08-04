@@ -83,6 +83,17 @@ struct Config {
     RuntimeConfig runtime;
 };
 
+/// The root every disk cache derives from, from `[cache] dir` -- normally
+/// `$PIE_HOME/cache`. Empty means the engine did not say, which happens when a
+/// driver is run against a hand-written TOML; the caches then fall back to
+/// their XDG derivation.
+inline std::string& mutable_cache_dir() {
+    static std::string dir;
+    return dir;
+}
+
+inline const std::string& cache_dir() { return mutable_cache_dir(); }
+
 /// This model's materialized-weight artifact directory, published by
 /// `load_config` because the artifact cache is built from a place that never
 /// sees a `Config`. Empty disables the cache.
@@ -219,6 +230,11 @@ inline Config load_config(const std::filesystem::path& path) {
     }
     if (auto r = tbl["runtime"].as_table()) {
         c.runtime.verbose = (*r)["verbose"].value_or(c.runtime.verbose);
+    }
+    if (auto cache = tbl["cache"].as_table()) {
+        // Published before returning: the module, tuning and planner-profile
+        // caches are each built from somewhere that never sees this Config.
+        mutable_cache_dir() = (*cache)["dir"].value_or(std::string{});
     }
 
     if (c.model.snapshot_dir.empty()) {

@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../config.hpp"
 #include "../model/config.hpp"
 #include "kv_cache_format.hpp"
 
@@ -131,10 +132,12 @@ nlohmann::json read_document(const std::filesystem::path& path,
 
 std::filesystem::path planner_profile_cache_path() {
     // Same derivation as the module and tuning caches
-    // (`pipeline/generated/module_cache.hpp`, `ops/tuning_cache.hpp`): XDG
-    // first, then $HOME/.cache. This file used to read $HOME directly and
-    // ignore XDG_CACHE_HOME, which put pie's state in THREE roots on any
-    // machine that sets it -- $PIE_HOME, $XDG_CACHE_HOME/pie, and this one.
+    // (`pipeline/generated/module_cache.hpp`, `ops/tuning_cache.hpp`):
+    // `[cache] dir` when the engine sent one, else XDG, else $HOME/.cache.
+    const std::string& root = cache_dir();
+    if (!root.empty()) {
+        return std::filesystem::path(root) / "cuda_memory_profiles.json";
+    }
     if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
         if (xdg[0] != '\0') {
             return std::filesystem::path(xdg) / "pie" /

@@ -23,6 +23,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "config.hpp"
+
 
 namespace pie_cuda_driver::ops {
 
@@ -79,6 +81,10 @@ class TuningCache {
    private:
     static std::string resolve_path(const char* name) {
         // Convention, not configuration -- see module_cache.hpp.
+        const std::string& root = pie_cuda_driver::cache_dir();
+        if (!root.empty()) {
+            return root + "/" + name;
+        }
         const char* xdg = std::getenv("XDG_CACHE_HOME");
         if (xdg != nullptr && xdg[0] != '\0') {
             return std::string(xdg) + "/pie/" + name;
