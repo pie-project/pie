@@ -478,8 +478,7 @@ fn load_model_drivers(
     // `$PIE_HOME` is the worker layer's to know; the driver has never been
     // told it, which is the only reason those caches used to sit under XDG.
     crate::embedded_driver::set_cache_dir(
-        crate::paths::pie_home()
-            .join("cache")
+        crate::state::driver_cache_dir()
             .to_string_lossy()
             .into_owned(),
     );

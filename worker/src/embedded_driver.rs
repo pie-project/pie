@@ -221,7 +221,10 @@ pub fn launch_state_dir() -> PathBuf {
     launch_state_root().join(std::process::id().to_string())
 }
 
-fn launch_state_root() -> PathBuf {
+/// Root of the per-launch state directories. Public so `state::entries` names
+/// the same path the sweep walks -- a listing that pointed elsewhere would
+/// report nothing and reclaim nothing.
+pub fn launch_state_root() -> PathBuf {
     crate::paths::pie_home().join("standalone")
 }
 

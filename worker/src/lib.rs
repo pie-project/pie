@@ -28,6 +28,7 @@ pub mod contract_author;
 pub mod driver_ffi;
 pub mod embedded_driver;
 pub mod paths;
+pub mod state;
 pub mod translate;
 pub mod weights;
 
