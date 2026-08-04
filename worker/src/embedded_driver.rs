@@ -521,6 +521,15 @@ pub(crate) fn write_cuda_startup_toml(
     if let Some(pages) = opts.max_total_pages {
         insert_int(&mut batching, "total_pages", pages);
     }
+    // Omitted when absent, like the other derived keys: the driver defaults
+    // them to "let the planner choose", so writing a sentinel would be a
+    // second spelling of an absent key.
+    if let Some(tokens) = opts.max_forward_tokens {
+        insert_int(&mut batching, "max_forward_tokens", tokens);
+    }
+    if let Some(requests) = opts.max_forward_requests {
+        insert_int(&mut batching, "max_forward_requests", requests);
+    }
     insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
     // Written only when asked for, like the derived keys above: the driver
     // defaults it to false too, so emitting `false` would be a second spelling

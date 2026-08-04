@@ -1228,6 +1228,29 @@ pub struct CudaNativeDriverOptions {
     /// normal case. One name for two meanings is a question a reader cannot
     /// answer from the file.
     pub max_total_pages: Option<u32>,
+    /// HARD pin on the prefill token budget the forward step is built for.
+    ///
+    /// **Omit to let the memory planner choose.** Setting it collapses that
+    /// axis of the planner's lattice to a single candidate, the same way
+    /// `kv_page_size` does — which is the point: a value measured on this
+    /// machine beats one scored by a model of it.
+    ///
+    /// `pie config optimize` and `calibrate_planner` are how you get a number
+    /// worth pinning. A guess here is worse than absence, because absence still
+    /// gets the planner's judgement.
+    ///
+    /// Named for the same quantity Metal calls `max_forward_tokens`, because
+    /// here they ARE the same quantity — unlike `total_pages`, where one name
+    /// covered two different things and this driver's field had to be renamed
+    /// `max_total_pages` to break the collision.
+    pub max_forward_tokens: Option<u32>,
+    /// HARD pin on the decode width — how many requests one forward step may
+    /// carry. **Omit to let the memory planner choose.**
+    ///
+    /// Pinning this moves `[server] max_concurrent_processes` underneath you
+    /// when that key is absent: admission derives from the driver's request
+    /// cap, so the two are one decision. Set both, or neither.
+    pub max_forward_requests: Option<u32>,
     /// Measure the forward step on this boot instead of scoring it.
     ///
     /// The memory planner picks `max_forward_tokens` by scoring a candidate
@@ -1340,6 +1363,8 @@ impl Default for CudaNativeDriverOptions {
             kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
             max_total_pages: None,
+            max_forward_tokens: None,
+            max_forward_requests: None,
             calibrate_planner: false,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),

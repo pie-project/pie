@@ -523,6 +523,21 @@ CudaMemoryPlan plan_cuda_memory(
     }
     uniq_clip_desc(Ns, calibrating ? 131072 : prefill_cap);
     uniq_clip_desc(Rs, 4096);
+
+    // A pinned axis is a single-candidate lattice. This is the point of
+    // `pie config optimize` writing what it measured: with the shape pinned,
+    // the analytic score and every per-(model, GPU) special case below stop
+    // running at all, because there is nothing left for them to choose between.
+    //
+    // Not honoured during a calibration boot -- that boot exists to search, and
+    // seeding a search from its own previous answer makes the value a one-way
+    // ratchet. Same argument as the profile cache at the bottom of this file.
+    if (!calibrating && cfg.batching.max_forward_tokens > 0) {
+        Ns.assign(1, static_cast<int>(cfg.batching.max_forward_tokens));
+    }
+    if (!calibrating && cfg.batching.max_forward_requests > 0) {
+        Rs.assign(1, static_cast<int>(cfg.batching.max_forward_requests));
+    }
     // Quest key envelopes are `[num_pages, kv_heads, head_dim]` bf16 x2 per
     // layer, i.e. per PAGE rather than per token, so they do not scale with
     // `kv_page_size`. They live in the same arena as the pages and must be
@@ -847,9 +862,20 @@ CudaMemoryPlan plan_cuda_memory(
     }
 
     if (candidates.empty()) {
-        throw std::runtime_error(
+        std::string why =
             "cuda memory planner: no viable forward/KV layout fits budget " +
-            std::to_string(budget / (1024 * 1024)) + " MiB");
+            std::to_string(budget / (1024 * 1024)) + " MiB";
+        // A pin is the likeliest reason a lattice that normally has hundreds of
+        // candidates has none -- and the operator can act on that, where they
+        // cannot act on "no layout fits".
+        if (cfg.batching.max_forward_tokens > 0 ||
+            cfg.batching.max_forward_requests > 0) {
+            why +=
+                ". [driver] max_forward_tokens/max_forward_requests pin the "
+                "shape to a single candidate; unset them to let the planner "
+                "choose, or re-run `pie config optimize` on this machine";
+        }
+        throw std::runtime_error(why);
     }
 
     // A measured shape beats a scored one. `calibrate_memory_planner` times the

@@ -73,6 +73,7 @@ pub fn doctor(global: &startup::GlobalArgs, json: bool) -> Result<bool> {
     // the file alone.
     let (path, origin) = startup::cli_config_path(global);
     sections.push(("config", check_config(&path, origin)));
+    sections.push(("tuning", check_tuning(&path)));
 
     for (_, checks) in &sections {
         for (_, _, status) in checks {
@@ -315,4 +316,94 @@ fn check_gpus() -> Vec<(String, String, Status)> {
             Status::Warn,
         )],
     }
+}
+
+/// Has this machine been measured, or is it running on defaults someone else
+/// measured?
+///
+/// The plan's §7 makes this mandatory rather than nice. `pie config optimize`
+/// and `[driver] calibrate_planner` write values that pin the forward shape and
+/// the batching policy; a machine where neither has run gets the analytic
+/// planner's judgement, which is a model of the machine rather than the machine.
+/// That is a perfectly serviceable state -- it is what every deployment has had
+/// until now -- but it is not one an operator should have to infer from the
+/// absence of keys in a file.
+///
+/// Warnings, never failures. An unmeasured machine serves.
+fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> {
+    let file: toml::Value = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|content| toml::from_str(&content).ok())
+        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+    let set = |key: &str| {
+        pie_worker::config_schema::lookup(&file, key).map(|v| v.to_string())
+    };
+
+    let mut checks = Vec::new();
+
+    match (set("driver.max_forward_tokens"), set("driver.max_forward_requests")) {
+        (Some(tokens), Some(requests)) => checks.push((
+            "forward shape".to_string(),
+            format!("pinned at {tokens} tokens x {requests} requests"),
+            Status::Pass,
+        )),
+        // One without the other is worth saying out loud: the axes share one
+        // memory budget, so pinning half of a lattice point leaves the planner
+        // choosing the other half around it.
+        (Some(tokens), None) => checks.push((
+            "forward shape".to_string(),
+            format!("max_forward_tokens pinned at {tokens}, decode width still derived"),
+            Status::Warn,
+        )),
+        (None, Some(requests)) => checks.push((
+            "forward shape".to_string(),
+            format!("max_forward_requests pinned at {requests}, token budget still derived"),
+            Status::Warn,
+        )),
+        (None, None) => checks.push((
+            "forward shape".to_string(),
+            "derived by the planner's analytic score (`pie config optimize --for ...`)".to_string(),
+            Status::Warn,
+        )),
+    }
+
+    let frame_knobs = ["runtime.frame_size", "runtime.frame_submit_depth", "runtime.frame_dispatch_depth"];
+    let pinned: Vec<&str> = frame_knobs.iter().copied().filter(|k| set(k).is_some()).collect();
+    checks.push(if pinned.is_empty() {
+        (
+            "batching".to_string(),
+            "defaults, measured on other hardware (`pie config optimize --for ...`)".to_string(),
+            Status::Warn,
+        )
+    } else {
+        (
+            "batching".to_string(),
+            format!("{} of 3 knobs set in this config", pinned.len()),
+            Status::Pass,
+        )
+    });
+
+    // The driver's own measurement, keyed by (device, model, tp, kv format) --
+    // so its mere presence is not proof it applies HERE. Saying "measured on
+    // some machine" would be worse than saying nothing, hence the wording.
+    let profile_cache = pie_worker::state::driver_cache_dir().join("cuda_memory_profiles.json");
+    checks.push(if profile_cache.is_file() {
+        (
+            "planner profile".to_string(),
+            format!(
+                "{} exists; the driver checks its key at boot",
+                crate::ui::short_path(&profile_cache)
+            ),
+            Status::Pass,
+        )
+    } else {
+        (
+            "planner profile".to_string(),
+            "none; the forward step has never been timed here (`[driver] calibrate_planner`)"
+                .to_string(),
+            Status::Warn,
+        )
+    });
+
+    checks
 }
