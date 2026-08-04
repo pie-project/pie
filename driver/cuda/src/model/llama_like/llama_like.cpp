@@ -1227,7 +1227,8 @@ void llama_like_forward_paged(
     std::uint32_t unmasked_prefix_rows,
     const std::uint32_t* mask_suffix_qo_indptr_d,
     const std::uint32_t* mask_suffix_kv_page_indptr_d,
-    std::uint32_t max_layers)
+    std::uint32_t max_layers,
+    std::uint32_t full_depth_rows)
 {
     // Tensor-parallel local dims. tp_size == 1 reverts to single-GPU
     // shapes; the local *_local fields just shadow the unsharded value.
@@ -1398,6 +1399,14 @@ void llama_like_forward_paged(
     bool rope_table_ready = false;
     const float* rope_table = nullptr;
 
+    // STRUCTURAL S-2: the two-range body is the next slice — until it
+    // lands, a planned depth split must not silently run every row at
+    // the suffix's bound.
+    if (full_depth_rows != 0xffffffffu) {
+        throw std::runtime_error(
+            "depth union: planned full-depth split reached a body "
+            "without the two-range loop (S-2 driver slice owed)");
+    }
     // STRUCTURAL v0 (S-1): a truncated fire runs layers [0, k) and the
     // unchanged tail takes the head at layer k (logit lens). k == L is
     // the identity by construction.

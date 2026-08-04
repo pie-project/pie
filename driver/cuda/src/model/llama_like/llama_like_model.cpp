@@ -168,7 +168,8 @@ void LlamaLikeModel::body(Workspace& ws,
         in.unmasked_prefix_rows,
         in.mask_suffix_qo_indptr_d,
         in.mask_suffix_kv_page_indptr_d,
-        in.max_layers);
+        in.max_layers,
+        in.full_depth_rows);
 }
 
 std::uint32_t LlamaLikeModel::graph_layout() {

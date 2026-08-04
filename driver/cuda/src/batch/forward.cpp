@@ -1313,6 +1313,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.stage_hooks                  = in.stage_hooks;
     fwd_in.lora                         = in.lora;
     fwd_in.max_layers                   = in.planned_max_layers;
+    fwd_in.full_depth_rows              = in.planned_full_depth_rows;
     if (use_spatial_mask || use_spatial_mask_mixed) {
         // The masked suffix's rebased device CSRs (pure decode: qo is the
         // identity, kv_page_indptr rebases by its page base; every other

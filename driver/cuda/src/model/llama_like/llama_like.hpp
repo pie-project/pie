@@ -292,7 +292,12 @@ void llama_like_forward_paged(
     // (UINT32_MAX = full model). The layerskip-draft / logit-lens class:
     // the tail (final norm + lm_head) is unchanged — it simply reads
     // layer k's hidden state.
-    std::uint32_t max_layers = 0xffffffffu);
+    std::uint32_t max_layers = 0xffffffffu,
+    // STRUCTURAL S-2: the depth union's request split (leading members
+    // at full depth; UINT32_MAX = uniform fire). The two-range body:
+    // layers [0, max_layers) run full-N, layers [max_layers, L) run the
+    // full-depth prefix only, ONE unchanged tail serves both.
+    std::uint32_t full_depth_rows = 0xffffffffu);
 
 // The fire-scoped lora staging (`LoraFireState` in llama_like.cpp — the
 // adapter cast + grouping built once per fire), behind an opaque handle so

@@ -243,6 +243,10 @@ struct ForwardFn {
         // refuse them); the hand-written body honours the bound, the
         // declared legs throw loudly until S-4 states the depth peel.
         std::uint32_t max_layers = 0xffffffffu;
+        // STRUCTURAL S-2: the depth union's request split — leading
+        // members run all L layers, the truncated suffix stops at
+        // `max_layers` (one tail serves both). UINT32_MAX = uniform.
+        std::uint32_t full_depth_rows = 0xffffffffu;
     };
 
     struct PrepareInputs {
@@ -652,6 +656,9 @@ struct ForwardDispatchInputs {
     // STRUCTURAL v0 (S-1): run only the first k layers and take the head
     // there (UINT32_MAX = full model; truncated steps are SOLO).
     std::uint32_t planned_max_layers = 0xffffffffu;
+    // STRUCTURAL S-2: the depth seriation's request split (leading
+    // members at FULL depth; UINT32_MAX = uniform fire).
+    std::uint32_t planned_full_depth_rows = 0xffffffffu;
     // Direct non-graph prefill/mixed launches may gather the requested hidden
     // rows before lm_head instead of materializing [N, vocab] logits.
     bool compact_logits = false;
