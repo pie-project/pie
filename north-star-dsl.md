@@ -1514,3 +1514,28 @@ polymorphism — the prefix region's plan-family choice under sm>=9
 is not yet stated; off on sm_89.
 
 Commit 797cdefc6.
+
+## THE PROMOTION, PRICED (2026-08-04) — release A/B of the spatial default
+
+The retired solo regime was only ever priced by a code comment
+("1.8-2.3x per token for the co-batched plain lanes", projected, never
+measured). Measured now, release build on the L40S (llama-3.2-1b,
+256 tokens/lane, warm rounds, masked lane joining mid-stream; ON =
+default, OFF = PIE_SPATIAL_MASK=0):
+
+  plain-only R=4/R=8 . ON == OFF (~1.22-1.24s)  — no regression
+  mixed R=4 . plains 1.29s vs 1.43s (ON 10% faster), masked 11% faster
+  mixed R=8 . plains 1.30s vs 1.57s (ON 17% faster), masked 15% faster
+
+The shape of the numbers is the thesis: the masked lane's tax on its
+co-batched plains is CONSTANT ~6% under the spatial merge (one marginal
+row in a shared fire) and GROWS with R under the solo regime (+15% at
+R=4, +27% at R=8 — the duplicate weight read plus the eager mask
+dispatch bill the whole co-batch). 285 R=4 split=3 fires confirmed
+composing during the bench; canonical masked output byte-stable
+throughout. The old comment's 1.8-2.3x was the lockstep worst case —
+the real solo regime pipelined some of the cost; the merge removes it
+structurally rather than hiding it. Gains scale with R and with model
+size (the fire is launch-bound at 1B/R<=8; the weight-read term the
+merge deletes is the one that grows). Bench + table:
+.wiki/tart/bench_spatial_results.md, scratchpad bench_spatial.py.
