@@ -960,6 +960,22 @@ int main(int argc, char** argv) {
     // fraction from the wrong family's geometry -- which read as zero -- once
     // claimed 824 GB/s on a bus that does 400.
     if (shape.n_experts > 0 && shape.experts_per_token > 0) {
+        // The routed bank is what the discount is TAKEN FROM, so a mixture
+        // whose heap counted no routed bytes has not been discounted at all --
+        // and the inactive-bytes check below cannot see it, because both of
+        // its sides come from the same match. That is exactly how gemma4's
+        // 26B came to claim 806 GB/s: its experts are staged as
+        // `layers.N.experts.` and the rule matched `mlp.experts.`, so
+        // `routed_resident` was zero, `inactive` was zero, and zero unread
+        // bytes was duly found to be at least zero. This asks the question the
+        // other way round -- the config says there IS a bank, so the heap has
+        // to have found one.
+        if (shape.experts_per_token < shape.n_experts && wb.routed_resident == 0) {
+            std::printf("  FAIL  the config declares %d experts top-%d, but no staged weight "
+                        "was counted as routed, so the %.1f GB/s above is the whole heap\n",
+                        shape.n_experts, shape.experts_per_token, wb.per_token * decode_tps / 1e9);
+            return 1;
+        }
         const double inactive =
             double(wb.routed_resident) *
             (1.0 - double(shape.experts_per_token) / double(shape.n_experts));
