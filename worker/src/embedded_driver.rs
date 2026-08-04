@@ -346,14 +346,15 @@ pub(crate) fn write_cuda_startup_toml(
         "stream_routed_experts",
         opts.stream_routed_experts,
     );
-    model.insert(
-        "expert_cache_gb".into(),
-        toml::Value::Float(opts.expert_cache_gb),
-    );
-    model.insert(
-        "expert_host_cache_gb".into(),
-        toml::Value::Float(opts.expert_host_cache_gb),
-    );
+    // Omitted when absent rather than written as a sentinel: the driver's
+    // own default IS the derivation, so an absent key and a "0 means derive"
+    // key would be two spellings of one thing.
+    if let Some(gb) = opts.expert_cache_gb {
+        model.insert("expert_cache_gb".into(), toml::Value::Float(gb));
+    }
+    if let Some(gb) = opts.expert_host_cache_gb {
+        model.insert("expert_host_cache_gb".into(), toml::Value::Float(gb));
+    }
     insert_bool(
         &mut model,
         "enable_system_speculation",
@@ -375,9 +376,13 @@ pub(crate) fn write_cuda_startup_toml(
             CudaMemoryProfile::Throughput => "throughput",
         },
     );
-    insert_int(&mut batching, "kv_page_size", opts.kv_page_size);
+    if let Some(size) = opts.kv_page_size {
+        insert_int(&mut batching, "kv_page_size", size);
+    }
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
-    insert_int(&mut batching, "total_pages", opts.total_pages);
+    if let Some(pages) = opts.total_pages {
+        insert_int(&mut batching, "total_pages", pages);
+    }
     insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
     insert_table(&mut doc, "batching", batching);
 
@@ -521,7 +526,7 @@ pub(crate) fn create_driver_backend_group(
                 "cuda group creation requires cuda-native rank options"
             ));
         };
-        if !opts.mtp_assistant_snapshot_dir.is_empty() {
+        if opts.mtp_assistant_snapshot_dir.is_some() {
             return Err(anyhow!(
                 "mtp_assistant_snapshot_dir is not supported by the single-model \
                  LoadPlan boot contract"
@@ -575,7 +580,7 @@ pub(crate) fn create_driver_backend(
     let (mut backend, runtime_quant, mxfp4_moe) = match options {
         #[cfg(feature = "driver-cuda")]
         DriverOptions::CudaNative(opts) => {
-            if !opts.mtp_assistant_snapshot_dir.is_empty() {
+            if opts.mtp_assistant_snapshot_dir.is_some() {
                 return Err(anyhow!(
                     "mtp_assistant_snapshot_dir is not supported by the single-model \
                      LoadPlan boot contract"
@@ -964,17 +969,18 @@ mod tests {
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
-        // 0 = derive: the driver's memory planner scores candidates unless
-        // the operator pins one.
-        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 0);
+        // Derived values are OMITTED, not written as a sentinel. The driver's
+        // own default is the derivation, so emitting `0 = derive` would be a
+        // second spelling of an absent key.
+        assert!(val["batching"].get("kv_page_size").is_none());
         assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
         assert_eq!(
             val["batching"]["gpu_mem_utilization"].as_float().unwrap(),
             0.90
         );
         assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
-        assert_eq!(val["batching"]["total_pages"].as_integer().unwrap(), 0);
-        assert_eq!(val["batching"].as_table().unwrap().len(), 6);
+        assert!(val["batching"].get("total_pages").is_none());
+        assert_eq!(val["batching"].as_table().unwrap().len(), 4);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         // Expert streaming is off unless an operator asks for it: for a model
         // that fits it is strictly slower, and it costs graph capture besides.
@@ -982,7 +988,8 @@ mod tests {
             val["model"]["stream_routed_experts"].as_bool().unwrap(),
             false
         );
-        assert_eq!(val["model"]["expert_cache_gb"].as_float().unwrap(), 0.0);
+        assert!(val["model"].get("expert_cache_gb").is_none());
+        assert!(val["model"].get("expert_host_cache_gb").is_none());
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
     }
 

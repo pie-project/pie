@@ -908,22 +908,23 @@ pub struct CudaNativeDriverOptions {
 
     pub gpu_mem_utilization: f64,
     pub memory_profile: CudaMemoryProfile,
-    /// KV page size in tokens. **0 = let the driver's memory planner derive
-    /// one** by scoring candidates against the memory profile, which is what
-    /// every deployment has been getting: this field reached the driver but
-    /// the planner never read it, so only the (now deleted)
-    /// `PIE_CUDA_KV_PAGE_SIZE` could pin it. A non-zero value now pins it, and
-    /// the planner searches a single-candidate lattice.
-    ///
-    /// Same 0-means-derive convention as `total_pages` below.
-    pub kv_page_size: u32,
+    /// KV page size in tokens. **Omit to let the driver's memory planner
+    /// derive one** by scoring candidates against the serving profile, which
+    /// is what every deployment has been getting: this field reached the
+    /// driver but the planner never read it, so only the (now deleted)
+    /// `PIE_CUDA_KV_PAGE_SIZE` could pin it. Setting it pins it, and the
+    /// planner searches a single-candidate lattice.
+    pub kv_page_size: Option<u32>,
     pub kv_cache_dtype: String,
     pub swap_pool_size: u32,
-    /// Optional HARD cap on the runtime KV page count (0 = derive from
-    /// `gpu_mem_utilization`). >0 forces a tiny deterministic pool for
-    /// contention/preempt tests + CI, independent of the forward-layout floor.
-    /// Mirrors the metal driver's `total_pages`.
-    pub total_pages: u32,
+    /// HARD cap on the runtime KV page count. **Omit to derive it from
+    /// `gpu_mem_utilization`.** Setting it forces a tiny deterministic pool
+    /// for contention/preempt tests + CI, independent of the forward-layout
+    /// floor.
+    ///
+    /// Note this is NOT the metal driver's `total_pages`, which it resembles:
+    /// there the value is used directly and 1024 is a real default.
+    pub total_pages: Option<u32>,
     pub weight_dtype: String,
     /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
     /// from `model.driver.device`; set on the C++ side via
@@ -942,11 +943,11 @@ pub struct CudaNativeDriverOptions {
     /// BF16-scratch fallback; `"bf16"`/`"dequant"` eagerly materialize BF16
     /// experts; `"native"` requires true MXFP4 GEMM kernels.
     pub mxfp4_moe: String,
-    /// Optional Gemma-4 native MTP assistant checkpoint used by
-    /// `.system_speculation()` on cuda_native. If omitted, the CUDA
-    /// driver auto-discovers the paired `-assistant` checkpoint from
-    /// the Hugging Face cache when available.
-    pub mtp_assistant_snapshot_dir: String,
+    /// Gemma-4 native MTP assistant checkpoint used by
+    /// `.system_speculation()` on cuda_native. **Omit to let the CUDA driver
+    /// auto-discover** the paired `-assistant` checkpoint from the Hugging
+    /// Face cache when available.
+    pub mtp_assistant_snapshot_dir: Option<String>,
     /// Maximum number of MTP draft tokens returned per system-spec step.
     pub mtp_num_drafts: u32,
     /// Page routed MoE experts through a bounded VRAM slab instead of keeping
@@ -955,11 +956,11 @@ pub struct CudaNativeDriverOptions {
     /// hold it. Off by default: for a model that fits, this is strictly
     /// slower, and it disables CUDA graph capture besides.
     pub stream_routed_experts: bool,
-    /// The expert slab, in GiB. 0 = derive one at startup from what is left
-    /// after the resident weights and the KV pool. Ignored unless
+    /// The expert slab, in GiB. **Omit to derive one** at startup from what
+    /// is left after the resident weights and the KV pool. Ignored unless
     /// `stream_routed_experts` is set.
-    pub expert_cache_gb: f64,
-    /// A pinned host DRAM tier behind the slab, in GiB. 0 = none.
+    pub expert_cache_gb: Option<f64>,
+    /// A pinned host DRAM tier behind the slab, in GiB. **Omit for none.**
     ///
     /// The slab bounds what the GPU holds; this bounds what host memory holds
     /// behind it, in the same slot-shaped form. A miss the tier can serve is
@@ -967,7 +968,7 @@ pub struct CudaNativeDriverOptions {
     /// instead of a checkpoint read, a plan and a transform -- so it is worth
     /// setting exactly when the experts do not fit in VRAM but do fit in RAM.
     /// Ignored unless `stream_routed_experts` is set.
-    pub expert_host_cache_gb: f64,
+    pub expert_host_cache_gb: Option<f64>,
     /// Operator opt-in for system speculation (MTP). Default false: the runtime
     /// drives the auto-drafter only when this is true. Speculation is a
     /// latency-regime win (helps at low batch, costs at compute saturation), so
@@ -1013,22 +1014,20 @@ impl Default for CudaNativeDriverOptions {
             binary_path: String::new(),
             gpu_mem_utilization: 0.90,
             memory_profile: CudaMemoryProfile::Auto,
-            // 0 = derive. This is the behaviour every deployment already had:
-            // the planner ignored the field, so 32 was never actually pinned.
-            kv_page_size: 0,
+            kv_page_size: None,
             kv_cache_dtype: "auto".to_string(),
             swap_pool_size: 0,
-            total_pages: 0,
+            total_pages: None,
             weight_dtype: "bfloat16".to_string(),
             device: String::new(),
             verbose: false,
             runtime_quant: String::new(),
             mxfp4_moe: "auto".to_string(),
-            mtp_assistant_snapshot_dir: String::new(),
+            mtp_assistant_snapshot_dir: None,
             mtp_num_drafts: 3,
             stream_routed_experts: false,
-            expert_cache_gb: 0.0,
-            expert_host_cache_gb: 0.0,
+            expert_cache_gb: None,
+            expert_host_cache_gb: None,
             enable_system_speculation: false,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
@@ -1062,16 +1061,37 @@ impl CudaNativeDriverOptions {
             self.mtp_num_drafts <= 32,
             "model.driver.options.mtp_num_drafts must be in 0..=32"
         );
-        ensure!(
-            self.expert_cache_gb.is_finite() && self.expert_cache_gb >= 0.0,
-            "model.driver.options.expert_cache_gb must be >= 0 (0 = derive one \
-             at startup)"
-        );
-        ensure!(
-            self.expert_host_cache_gb.is_finite() && self.expert_host_cache_gb >= 0.0,
-            "model.driver.options.expert_host_cache_gb must be >= 0 (0 = no \
-             host tier)"
-        );
+        // Present means the operator chose a size, so a present zero is a
+        // contradiction rather than a way to say "derive" -- that is what
+        // omitting the key is for.
+        if let Some(gb) = self.expert_cache_gb {
+            ensure!(
+                gb.is_finite() && gb > 0.0,
+                "model.driver.options.expert_cache_gb must be > 0; \
+                 omit it to derive one at startup"
+            );
+        }
+        if let Some(gb) = self.expert_host_cache_gb {
+            ensure!(
+                gb.is_finite() && gb > 0.0,
+                "model.driver.options.expert_host_cache_gb must be > 0; \
+                 omit it for no host tier"
+            );
+        }
+        if let Some(pages) = self.total_pages {
+            ensure!(
+                pages > 0,
+                "model.driver.options.total_pages must be > 0; \
+                 omit it to derive from gpu_mem_utilization"
+            );
+        }
+        if let Some(size) = self.kv_page_size {
+            ensure!(
+                size > 0,
+                "model.driver.options.kv_page_size must be > 0; \
+                 omit it to let the memory planner derive one"
+            );
+        }
         Ok(())
     }
 }
@@ -1383,11 +1403,11 @@ mtp_num_drafts = 6
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Throughput);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.mxfp4_moe, "routed_dequant");
-        assert_eq!(opts.mtp_assistant_snapshot_dir, "/models/gemma4-mtp");
+        assert_eq!(opts.mtp_assistant_snapshot_dir.as_deref(), Some("/models/gemma4-mtp"));
         assert_eq!(opts.mtp_num_drafts, 6);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
-        // 0 = derive: the planner scores candidates unless pinned.
-        assert_eq!(opts.kv_page_size, 0);
+        // Absent = derive: the planner scores candidates unless pinned.
+        assert_eq!(opts.kv_page_size, None);
         assert_eq!(opts.kv_cache_dtype, "auto"); // default
     }
 
@@ -1412,7 +1432,7 @@ kv_page_size = 16
         let cfg: Config = toml::from_str(toml).unwrap();
         cfg.validate().unwrap();
         let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
-        assert_eq!(opts.kv_page_size, 16);
+        assert_eq!(opts.kv_page_size, Some(16));
     }
 
     #[test]
@@ -1433,7 +1453,7 @@ device = ["cuda:0"]
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);
         assert_eq!(opts.mxfp4_moe, "auto");
-        assert!(opts.mtp_assistant_snapshot_dir.is_empty());
+        assert!(opts.mtp_assistant_snapshot_dir.is_none());
         assert_eq!(opts.mtp_num_drafts, 3);
         assert_eq!(opts.ready_timeout_s, 600.0);
         assert_eq!(opts.kv_cache_dtype, "auto");
