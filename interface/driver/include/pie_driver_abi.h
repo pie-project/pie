@@ -362,6 +362,15 @@
 #define PIE_REGION_SIG_TRUNCATED (1 << 3)
 
 /**
+ * [`PieStepDesc::region_sig`] bit: a span-grouped correction (lora)
+ * program. Window-free — never a seriation term — but the depth
+ * split's decline rules consult it (a lane carrying BOTH correction
+ * and truncation is the PQ-tree class, refused), so the table states
+ * it (③b: the words' decline rules become derivable).
+ */
+#define PIE_REGION_SIG_LORA (1 << 4)
+
+/**
  * [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
  * sentinel. Not zero: zero is a legitimate planned value ("no fast
  * prefix" — an all-hooked step).
