@@ -305,7 +305,10 @@ int main(int argc, char** argv) {
     GptOssPsos psos;
     DecodeStepPsos base;
     if (!build_gptoss_psos(*ctx, kernels_dir, g, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/false, &err)) {
+        // gpt-oss's shared table is affine b4/g64; its mxfp4 entrypoints are
+        // named directly in `gptoss/kernels.cpp`.
+        !load_decode_psos(*ctx, kernels_dir, base, pie::metal::AffineFormat{4, 64},
+                          /*with_argmax=*/false, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

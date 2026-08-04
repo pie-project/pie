@@ -383,8 +383,6 @@ instantiate_sdpa_tiled_impl("sdpa_paged_tiled", bfloat16, bfloat, 64, 64, false)
 #define instantiate_sdpa_paged_sink(name, itype, d, v)                     \
   instantiate_sdpa_paged_impl("sdpa_paged_decode_sink", name, itype, d, v, true)
 
-instantiate_sdpa_paged(float32, float, 256, 256)
-instantiate_sdpa_paged(float16, half, 256, 256)
 instantiate_sdpa_paged(bfloat16, bfloat, 256, 256)
 instantiate_sdpa_paged(bfloat16, bfloat, 512, 512)  // gemma4 full-attn (head_dim 512)
 instantiate_sdpa_paged(bfloat16, bfloat, 128, 128)  // llama / qwen (head_dim 128)

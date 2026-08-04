@@ -400,8 +400,8 @@ int main(int argc, char** argv) {
     DecodeStepPsos base;
     MultiBatchPsos mb;
     if (!build_gemma4_psos(*ctx, kernels_dir, g, psos, &err) ||
-        !load_decode_psos(*ctx, kernels_dir, base, /*with_argmax=*/false, &err) ||
-        !load_multibatch_psos(*ctx, kernels_dir, mb, /*with_d512=*/true, &err)) {
+        !load_decode_psos(*ctx, kernels_dir, base, g.quant, /*with_argmax=*/false, &err) ||
+        !load_multibatch_psos(*ctx, kernels_dir, mb, g.quant, /*with_d512=*/true, &err)) {
         std::printf("  FAIL  pipelines: %s\n", err.c_str());
         return 1;
     }

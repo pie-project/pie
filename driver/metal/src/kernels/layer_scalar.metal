@@ -33,6 +33,4 @@ template <typename T>
       const device itype*, const device itype*, device itype*,         \
       constant LayerScalarParams&, uint);
 
-instantiate_layer_scalar(float32, float)
-instantiate_layer_scalar(float16, half)
 instantiate_layer_scalar(bfloat16, bfloat)

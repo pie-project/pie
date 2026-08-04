@@ -31,6 +31,4 @@ template <typename T>
   [[kernel]] void logit_softcap<itype>(                                \
       const device itype*, device itype*, constant SoftcapParams&, uint);
 
-instantiate_softcap(float32, float)
-instantiate_softcap(float16, half)
 instantiate_softcap(bfloat16, bfloat)

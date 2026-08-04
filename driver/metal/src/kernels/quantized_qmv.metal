@@ -262,8 +262,6 @@ template <typename T, int group_size, int bits>
       const device itype*, device itype*, const constant int&,           \
       const constant int&, uint3, uint, uint);
 
-instantiate_qmv_fast(float32, float, 64, 4)
-instantiate_qmv_fast(float16, half, 64, 4)
 instantiate_qmv_fast(bfloat16, bfloat, 64, 4)
 instantiate_qmv_fast(bfloat16, bfloat, 32, 4)
 instantiate_qmv_fast(bfloat16, bfloat, 128, 4)
@@ -278,8 +276,6 @@ instantiate_qmv_fast(bfloat16, bfloat, 128, 8)
       const device itype*, device itype*, const constant int&,                  \
       const constant int&, const device itype*, uint3, uint, uint);
 
-instantiate_qmv_fast_residual(float32, float, 64, 4)
-instantiate_qmv_fast_residual(float16, half, 64, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 32, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 128, 4)
@@ -316,8 +312,6 @@ template <typename T, int group_size, int bits>
       const device itype*, device itype*, const constant int&,           \
       const constant int&, uint3, uint, uint);
 
-instantiate_qmv_narrow(float32, float, 64, 4)
-instantiate_qmv_narrow(float16, half, 64, 4)
 instantiate_qmv_narrow(bfloat16, bfloat, 64, 4)
 instantiate_qmv_narrow(bfloat16, bfloat, 32, 4)
 instantiate_qmv_narrow(bfloat16, bfloat, 128, 4)
