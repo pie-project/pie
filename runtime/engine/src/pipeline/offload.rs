@@ -1724,6 +1724,8 @@ mod tests {
 
     fn test_caps() -> DriverCapabilities {
         DriverCapabilities {
+            has_lora: false,
+            model_site_summary: Default::default(),
             abi_version: pie_driver_abi::PIE_DRIVER_ABI_VERSION,
             total_pages: 8,
             kv_page_size: 16,

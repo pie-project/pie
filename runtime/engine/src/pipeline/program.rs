@@ -545,6 +545,7 @@ mod tests {
     #[test]
     fn quest_tap_binds_only_against_a_backend_with_kv_envelopes() {
         let caps = |has: bool| pie_model::PtirCaps {
+            has_lora: false,
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,
@@ -641,6 +642,7 @@ mod tests {
     #[test]
     fn kv_envelope_capability_gates_the_envelope_dot_kernel() {
         let caps = |has: bool| pie_model::PtirCaps {
+            has_lora: false,
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,
