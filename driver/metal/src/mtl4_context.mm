@@ -1835,6 +1835,35 @@ static void apply_commit_feedback(const RawMetalContext& ctx,
     tm.gpu_error_text = fb.error;
 }
 
+/// One command buffer, encoded and closed.
+///
+/// Shared so the ordered and the unordered runner cannot drift on what encoding
+/// a segment means. Not in an anonymous namespace: `StepEncoder`'s constructor
+/// is private, and a name the header cannot see is a name it cannot befriend.
+void* encode_one_command_buffer(void* ctx_impl, int ab,
+                                const std::function<void(StepEncoder&)>& encode_fn) {
+    auto& I = *static_cast<RawMetalContext::Impl*>(ctx_impl);
+    id<MTL4CommandBuffer> cb = [I.dev newCommandBuffer];
+    [cb beginCommandBufferWithAllocator:I.alloc[ab]];
+    [cb useResidencySet:I.rs];
+    id<MTL4ComputeCommandEncoder> en = [cb computeCommandEncoder];
+
+    I.step.en  = en;
+    I.step.ctx = &I;
+    StepEncoder se(&I.step);
+    encode_fn(se);
+
+    [en endEncoding];
+    [cb endCommandBuffer];
+    I.step.en = nil;
+    // Hands the caller a reference rather than a borrowed pointer. A plain
+    // `__bridge` here compiles and then crashes in `objc_retain`: ARC releases
+    // `cb` when this function returns, so the caller bridges back a pointer to
+    // a command buffer that is already gone. The call sites balance this with
+    // `__bridge_transfer`.
+    return (__bridge_retained void*)cb;
+}
+
 StepTiming RawMetalContext::run_step(const std::function<void(StepEncoder&)>& encode_fn,
                                      int ab) {
     return run_steps({encode_fn}, ab);
@@ -1863,20 +1892,8 @@ StepTiming RawMetalContext::run_steps(
     std::vector<id<MTL4CommandBuffer>> cbs;
     cbs.reserve(encode_fns.size());
     for (const auto& encode_fn : encode_fns) {
-        id<MTL4CommandBuffer> cb = [I.dev newCommandBuffer];
-        [cb beginCommandBufferWithAllocator:I.alloc[ab]];
-        [cb useResidencySet:I.rs];
-        id<MTL4ComputeCommandEncoder> en = [cb computeCommandEncoder];
-
-        I.step.en  = en;
-        I.step.ctx = &I;
-        StepEncoder se(&I.step);
-        encode_fn(se);
-
-        [en endEncoding];
-        [cb endCommandBuffer];
-        I.step.en = nil;
-        cbs.push_back(cb);
+        cbs.push_back((__bridge_transfer id<MTL4CommandBuffer>)
+            encode_one_command_buffer(&I, ab, encode_fn));
     }
     double t1 = nowms();
 
@@ -1896,6 +1913,59 @@ StepTiming RawMetalContext::run_steps(
     tm.encode_ms   = t1 - t0;
     tm.gpu_exec_ms = t2 - t1;
     apply_commit_feedback(*this, signalled, tm);
+    return tm;
+}
+
+StepTiming RawMetalContext::run_segments(
+    const std::vector<std::function<void(StepEncoder&)>>& encode_fns,
+    const std::function<void(std::size_t)>& between,
+    int ab) {
+    auto& I = *impl_;
+    StepTiming tm;
+    ab &= 1;
+    if (I.wedged) {
+        tm.timed_out = true;
+        return tm;
+    }
+    if (encode_fns.empty()) {
+        tm.completed = true;
+        return tm;
+    }
+
+    std::uint64_t last_signal = 0;
+    for (std::size_t i = 0; i < encode_fns.size(); ++i) {
+        const double t0 = nowms();
+        // Legal every time round: `reset` needs every buffer drawn from this
+        // allocator to have completed, and the previous iteration waited for
+        // exactly that. Resetting per segment rather than once is what keeps a
+        // long model from growing the allocator by its layer count.
+        [I.alloc[ab] reset];
+        id<MTL4CommandBuffer> cb = (__bridge_transfer id<MTL4CommandBuffer>)
+            encode_one_command_buffer(&I, ab, encode_fns[i]);
+        const double t1 = nowms();
+
+        last_signal = I.commit_and_signal(&cb, 1, 0);
+        const auto wait_begin = M0TimingCounters::Clock::now();
+        const bool ok = I.await_event(last_signal);
+        m0_timing_counters().record_forward_wait(
+            M0TimingCounters::Clock::now() - wait_begin);
+        const double t2 = nowms();
+
+        tm.encode_ms += t1 - t0;
+        tm.gpu_exec_ms += t2 - t1;
+        if (!ok) {
+            // A segment that never finished leaves the host holding results
+            // that were never computed, so `between` is not called and the
+            // remaining segments are not encoded.
+            tm.timed_out = true;
+            tm.completed = false;
+            apply_commit_feedback(*this, last_signal, tm);
+            return tm;
+        }
+        if (between) between(i);
+    }
+    tm.completed = true;
+    apply_commit_feedback(*this, last_signal, tm);
     return tm;
 }
 

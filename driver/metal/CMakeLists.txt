@@ -543,6 +543,7 @@ if(APPLE)
   add_metal_linked_test(ptir_m0_device_test tests/ptir_m0_device_test.cpp)
   add_metal_linked_test(kv_append_paged_pso_test tests/kv_append_paged_pso_test.cpp)
   add_metal_linked_test(commit_batch_feedback_test tests/commit_batch_feedback_test.cpp)
+  add_metal_linked_test(run_segments_test tests/run_segments_test.cpp)
   add_metal_linked_test(argtable_capacity_test tests/argtable_capacity_test.cpp)
   # Reads a .metal source to exercise archive invalidation, so it needs the
   # source tree rather than the build directory.
