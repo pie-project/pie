@@ -232,7 +232,9 @@ struct LoraFireState {
         lanes.reserve(table.count);
         for (std::uint32_t i = 0; i < table.count; ++i) {
             const LoraLaneView& lane = table.lanes[i];
-            if (lane.a == nullptr || lane.b == nullptr) {
+            const bool scale_lane =
+                lane.form == LoraLaneView::Form::Scale;
+            if (lane.a == nullptr || (!scale_lane && lane.b == nullptr)) {
                 throw std::runtime_error(
                     "lora lane carries a null adapter address");
             }
@@ -259,7 +261,8 @@ struct LoraFireState {
                     std::to_string(lane.num_layers) + " layers, model has " +
                     std::to_string(cfg.num_hidden_layers));
             }
-            if (lane.d_in != static_cast<std::uint32_t>(H)) {
+            if (!scale_lane &&
+                lane.d_in != static_cast<std::uint32_t>(H)) {
                 throw std::runtime_error(
                     "lora adapter d_in " + std::to_string(lane.d_in) +
                     " != hidden size " + std::to_string(H));
@@ -276,6 +279,26 @@ struct LoraFireState {
             };
             require_width(kLoraSiteQ, Hq, "q");
             require_width(kLoraSiteV, Hk, "v");
+            if (scale_lane) {
+                // The SCALE form (IA3): stage the l vector's bf16 cast;
+                // no rank, no scratch, no grouping — apply() multiplies
+                // the span rows elementwise per consumed site.
+                if (lane.token_start > static_cast<std::uint32_t>(N) ||
+                    lane.token_count >
+                        static_cast<std::uint32_t>(N) - lane.token_start) {
+                    throw std::runtime_error(
+                        "lora scale lane token span exceeds the fire");
+                }
+                if (lane.token_count == 0) continue;
+                const std::size_t l_elems = static_cast<std::size_t>(
+                    lane.num_layers) * lane.d_out;
+                Lane out{&lane, nullptr, nullptr};
+                out.a_bf16 = arena.alloc(l_elems * 2);
+                lanes.push_back(out);
+                kernels::launch_cast_fp32_to_bf16(
+                    lane.a, out.a_bf16, l_elems, stream);
+                continue;
+            }
             if (lane.rank == 0 ||
                 lane.rank > static_cast<std::uint32_t>(I)) {
                 // The xA^T scratch below aliases ws.gate ([max_tokens, I]),
@@ -348,6 +371,10 @@ struct LoraFireState {
             lane_spans_disjoint()) {
             for (std::size_t i = 0; i < lanes.size(); ++i) {
                 const LoraLaneView& v = *lanes[i].view;
+                if (v.form == LoraLaneView::Form::Scale) {
+                    // Scale lanes are elementwise — nothing to group.
+                    continue;
+                }
                 Group* g = nullptr;
                 for (Group& cand : groups) {
                     if (cand.rank == static_cast<int>(v.rank) &&
@@ -590,6 +617,26 @@ struct LoraFireState {
             if (lane.grouped) continue;
             const LoraLaneView& v = *lane.view;
             const int t = static_cast<int>(v.token_count);
+            if (v.form == LoraLaneView::Form::Scale) {
+                // IA3: y = l ⊙ y over the lane's span at each consumed
+                // site; l's layer slice is bf16 [d_out].
+                const auto* l_l =
+                    static_cast<const std::uint16_t*>(lane.a_bf16) +
+                    static_cast<std::size_t>(layer) * v.d_out;
+                if ((v.sites_bits & kLoraSiteQ) != 0) {
+                    kernels::launch_scale_rows_bf16(
+                        bf16_row(q_out,
+                                 static_cast<int>(v.token_start), Hq),
+                        l_l, t, static_cast<int>(v.d_out), stream);
+                }
+                if ((v.sites_bits & kLoraSiteV) != 0) {
+                    kernels::launch_scale_rows_bf16(
+                        bf16_row(v_out,
+                                 static_cast<int>(v.token_start), Hk),
+                        l_l, t, static_cast<int>(v.d_out), stream);
+                }
+                continue;
+            }
             const int R = static_cast<int>(v.rank);
             const auto* a_l = static_cast<const std::uint16_t*>(lane.a_bf16) +
                 static_cast<std::size_t>(layer) * R * v.d_in;

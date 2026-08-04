@@ -215,9 +215,23 @@ async fn main(input: Input) -> Result<Output> {
         // states the SAME thing through the PEFT v0a classifier.
         if input.surface == "adapter" {
             use inferlet::ptir::adapter::{mm, Site};
-            fwd_p
-                .adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
-                .map_err(|e| e.to_string())?;
+            if input.sites != "scale_q" {
+                fwd_p
+                    .adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
+                    .map_err(|e| e.to_string())?;
+            }
+            if input.sites == "scale_q" {
+                use inferlet::ptir::adapter::scale;
+                let l = Channel::from_shaped(
+                    [NUM_LAYERS, D_OUT],
+                    (0..(NUM_LAYERS * D_OUT))
+                        .map(|i| 1.0f32
+                            + pattern(i, 0x0d0d_d0d0, 0.2) * adapter_scale)
+                        .collect::<Vec<f32>>())
+                    .named("lora_l_q");
+                fwd_p.adapter(Site::Q, |_x, y| scale(y, &l))
+                    .map_err(|e| e.to_string())?;
+            }
             if input.sites == "qv" {
                 let av = Channel::from_shaped(
                     [NUM_LAYERS, RANK, D_IN], a_host.clone())
@@ -302,8 +316,22 @@ async fn main(input: Input) -> Result<Output> {
         let fwd = ForwardPass::new();
         if input.surface == "adapter" {
             use inferlet::ptir::adapter::{mm, Site};
-            fwd.adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
-                .map_err(|e| e.to_string())?;
+            if input.sites != "scale_q" {
+                fwd.adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
+                    .map_err(|e| e.to_string())?;
+            }
+            if input.sites == "scale_q" {
+                use inferlet::ptir::adapter::scale;
+                let l = Channel::from_shaped(
+                    [NUM_LAYERS, D_OUT],
+                    (0..(NUM_LAYERS * D_OUT))
+                        .map(|i| 1.0f32
+                            + pattern(i, 0x0d0d_d0d0, 0.2) * adapter_scale)
+                        .collect::<Vec<f32>>())
+                    .named("lora_l_q");
+                fwd.adapter(Site::Q, |_x, y| scale(y, &l))
+                    .map_err(|e| e.to_string())?;
+            }
             if input.sites == "qv" {
                 let av = Channel::from_shaped(
                     [NUM_LAYERS, RANK, D_IN], a_host.clone())

@@ -4223,10 +4223,12 @@ model::LoraLaneView resolve_lane_lora_one(
         throw std::runtime_error(
             "lora resolution ran on a stage without the sink");
     }
-    if (sink->args.size() != 3) {
+    if (sink->args.size() != 3 && sink->args.size() != 2) {
         throw std::runtime_error(
-            "lora sink does not have the (A, B, SITES) argument shape");
+            "lora sink is neither the (A, B, SITES) low-rank shape nor "
+            "the (L, SITES) scale shape");
     }
+    const bool scale_form = sink->args.size() == 2;
 
     // A and B are channel CONTENTS (an adapter swap is a re-seed, never a
     // re-trace), so the harvested address is the channel's committed cell —
@@ -4277,7 +4279,8 @@ model::LoraLaneView resolve_lane_lora_one(
     // SITES is trace-known placement (a `Tensor::constant` bitmask over the
     // model's site vocabulary): structure, not contents, so it lives in the
     // plan as a literal rather than behind a channel.
-    const plan::PlanOp& sites = producer(sink->args[2]);
+    const plan::PlanOp& sites =
+        producer(sink->args[scale_form ? 1 : 2]);
     if (sites.tag != PTIR_OP_CONST) {
         throw std::runtime_error(
             "lora SITES argument is not a trace-known constant");
@@ -4323,6 +4326,40 @@ model::LoraLaneView resolve_lane_lora_one(
         }
         return type;
     };
+    if (scale_form) {
+        // The SCALE form (IA3): `l` is [num_layers, d_out] f32, applied
+        // as `y = l ⊙ y` at the declared sites. `a` carries the l
+        // address; rank/d_in rest at zero (no GEMM, no scratch).
+        if (sink->args[0] >= stage.value_types.size()) {
+            throw std::runtime_error(
+                "lora scale sink L argument has no declared value type");
+        }
+        const plan::ValueType& l_type = stage.value_types[sink->args[0]];
+        if (l_type.dtype != PTIR_DT_F32 || l_type.dims.size() != 2) {
+            throw std::runtime_error(
+                "lora scale sink L argument is not f32 rank-2 "
+                "([num_layers, d_out])");
+        }
+        for (const auto& dim : l_type.dims) {
+            if (dim.symbolic || dim.value == 0) {
+                throw std::runtime_error(
+                    "lora scale sink L argument has a symbolic or zero "
+                    "dimension");
+            }
+        }
+        return model::LoraLaneView{
+            .a = channel_address(sink->args[0], "L"),
+            .b = nullptr,
+            .sites_bits = sites.lit_bits,
+            .token_start = lane.token_start,
+            .token_count = lane.token_count,
+            .num_layers = l_type.dims[0].value,
+            .rank = 0,
+            .d_in = 0,
+            .d_out = l_type.dims[1].value,
+            .form = model::LoraLaneView::Form::Scale,
+        };
+    }
     const plan::ValueType& a_type = static_dims_3(sink->args[0], "A");
     const plan::ValueType& b_type = static_dims_3(sink->args[1], "B");
     const std::uint32_t num_layers = a_type.dims[0].value;
@@ -4349,6 +4386,7 @@ model::LoraLaneView resolve_lane_lora_one(
         .rank = rank,
         .d_in = d_in,
         .d_out = d_out,
+        .form = model::LoraLaneView::Form::LowRank,
     };
 }
 

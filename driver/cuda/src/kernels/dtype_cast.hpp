@@ -30,6 +30,15 @@ void launch_cast_fp32_to_bf16(
 /// compressed-tensors FP8 loader when scales ship as bf16 but the
 /// dispatcher (cuBLASLt scale-pointer / dequant fallback) requires
 /// fp32. Equivalent to `(int32(bf16_bits) << 16) reinterpreted as fp32`.
+/// `rows x width` bf16 buffer scaled in place by a bf16 vector:
+/// `buf[r, c] *= l[c]` — the adapter SCALE form's (IA3) per-site apply.
+void launch_scale_rows_bf16(
+    void*         buf_bf16,
+    const void*   l_bf16,
+    int           rows,
+    int           width,
+    cudaStream_t  stream);
+
 void launch_cast_bf16_to_fp32(
     const void*   src_bf16,
     void*         dst_fp32,

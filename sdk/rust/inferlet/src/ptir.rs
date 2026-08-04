@@ -83,6 +83,7 @@ pub mod adapter {
         Y,
         Mm(Channel, Box<Expr>),
         Add(Box<Expr>, Box<Expr>),
+        Scale(Channel, Box<Expr>),
     }
 
     impl Expr {
@@ -100,6 +101,15 @@ pub mod adapter {
     pub fn mm(w: &Channel, e: Expr) -> Expr {
         Expr {
             kind: ExprKind::Mm(w.clone(), Box::new(e)),
+        }
+    }
+
+    /// `scale(e, l)` — elementwise multiply by the channel-borne vector
+    /// `l: [num_layers, d_out]` (IA3's form; any static scale folds into
+    /// `l`'s contents).
+    pub fn scale(e: Expr, l: &Channel) -> Expr {
+        Expr {
+            kind: ExprKind::Scale(l.clone(), Box::new(e)),
         }
     }
 
@@ -1007,6 +1017,30 @@ impl ForwardPass {
     ) -> Result<(), String> {
         use adapter::ExprKind as K;
         let expr = f(adapter::Expr::x(), adapter::Expr::y());
+        // The SCALE form (IA3): scale(y, l) — lowered to the 2-argument
+        // adapter sink.
+        if let K::Scale(l, inner) = &expr.kind {
+            if matches!(inner.kind, K::Y) {
+                let l = l.clone();
+                {
+                    let mut inner_state = self.inner.borrow_mut();
+                    if inner_state.adapter_sites & site.bit() != 0 {
+                        return Err(format!(
+                            "adapter: site {site:?} already carries an \
+                             adapter on this pass"
+                        ));
+                    }
+                    inner_state.adapter_sites |= site.bit();
+                }
+                self.prologue(move || {
+                    intrinsics::kernel::adapter_scale(
+                        l.read(),
+                        Tensor::constant(site.bit()),
+                    );
+                });
+                return Ok(());
+            }
+        }
         let (lhs, rhs) = match expr.kind {
             K::Add(l, r) => (*l, *r),
             _ => {

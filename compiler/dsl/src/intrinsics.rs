@@ -259,4 +259,26 @@ pub mod kernel {
         );
         record_sink(String::from("lora"), span, SinkScope::PassWide);
     }
+
+    /// `adapter_scale(l, sites)` — the SCALE form of the adapter sink
+    /// (IA3): the whole forward applies `y = l ⊙ y` at the declared
+    /// sites. `l` is `[num_layers, d_out]` with any static scale folded
+    /// into its contents; `sites` is the trace-known placement constant.
+    /// Wire-encodes as the 2-argument `lora` sink (arity selects the
+    /// form — the driver's resolver branches on it).
+    #[track_caller]
+    pub fn adapter_scale(l: impl AsTensor, sites: impl AsTensor) {
+        let span = Span::here();
+        let (l, _) = l.to_arg().materialize();
+        let (sites, _) = sites.to_arg().materialize();
+        let name = intern_name("lora");
+        emit(
+            Op::SinkCall {
+                name,
+                args: vec![l, sites],
+            },
+            &[],
+        );
+        record_sink(String::from("lora"), span, SinkScope::PassWide);
+    }
 }
