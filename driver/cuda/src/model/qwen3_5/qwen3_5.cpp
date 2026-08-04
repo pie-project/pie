@@ -98,8 +98,6 @@ Qwen3_5Weights bind_qwen3_5(LoadedModel& engine) {
             // Whichever layout the contract published. The fused switch makes
             // the join a load-time `Concat`, so the separate tensors are simply
             // absent -- there is never a moment when both are resident.
-            Lw.la_in_proj_qkvz = maybe(engine, la + "in_proj_qkvz.weight");
-            Lw.la_in_proj_ba = maybe(engine, la + "in_proj_ba.weight");
             Lw.la_in_proj_qkv = maybe(engine, la + "in_proj_qkv.weight");
             Lw.la_in_proj_z = maybe(engine, la + "in_proj_z.weight");
             Lw.la_in_proj_b = maybe(engine, la + "in_proj_b.weight");

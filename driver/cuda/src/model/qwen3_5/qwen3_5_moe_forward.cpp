@@ -723,46 +723,23 @@ void linear_attn_body(
                 const auto* x =
                     static_cast<const std::uint16_t*>(ws.norm_x.data()) +
                     static_cast<std::size_t>(src0) * H;
-                if (Lw.la_in_proj_qkvz != nullptr) {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_qkvz->data(),
-                        la.mixed_qkvz.data(), rows, conv_dim + V_dim, H);
-                    kernels::launch_split_bf16_rows(
-                        la.mixed_qkvz.data(),
-                        la.mixed_qkv.data() +
-                            static_cast<std::size_t>(dst0) * conv_dim,
-                        la.z.data() + static_cast<std::size_t>(src0) * V_dim,
-                        rows, conv_dim, V_dim, stream);
-                } else {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_qkv->data(),
-                        la.mixed_qkv.data() +
-                            static_cast<std::size_t>(dst0) * conv_dim,
-                        rows, conv_dim, H);
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_z->data(),
-                        la.z.data() + static_cast<std::size_t>(src0) * V_dim,
-                        rows, V_dim, H);
-                }
-                if (Lw.la_in_proj_ba != nullptr) {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_ba->data(),
-                        la.ba.data(), rows, 2 * V_h, H);
-                    kernels::launch_split_qwen_gdn_ba_bf16(
-                        la.ba.data(),
-                        la.b.data() + static_cast<std::size_t>(dst0) * V_h,
-                        la.a.data() + static_cast<std::size_t>(dst0) * V_h,
-                        rows, V_h, stream);
-                } else {
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_a->data(),
-                        la.a.data() + static_cast<std::size_t>(dst0) * V_h,
-                        rows, V_h, H);
-                    ops::gemm_act_x_wt_bf16(cublas.handle(),
-                        x, Lw.la_in_proj_b->data(),
-                        la.b.data() + static_cast<std::size_t>(dst0) * V_h,
-                        rows, V_h, H);
-                }
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    x, Lw.la_in_proj_qkv->data(),
+                    la.mixed_qkv.data() +
+                        static_cast<std::size_t>(dst0) * conv_dim,
+                    rows, conv_dim, H);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    x, Lw.la_in_proj_z->data(),
+                    la.z.data() + static_cast<std::size_t>(src0) * V_dim,
+                    rows, V_dim, H);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    x, Lw.la_in_proj_a->data(),
+                    la.a.data() + static_cast<std::size_t>(dst0) * V_h,
+                    rows, V_h, H);
+                ops::gemm_act_x_wt_bf16(cublas.handle(),
+                    x, Lw.la_in_proj_b->data(),
+                    la.b.data() + static_cast<std::size_t>(dst0) * V_h,
+                    rows, V_h, H);
             };
             if (!has_buffer_read) {
                 in_proj_rows(0, 0, N);

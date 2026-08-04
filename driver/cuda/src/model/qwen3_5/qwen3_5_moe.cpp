@@ -96,13 +96,6 @@ const char* select_prefix(const LoadedModel& e) {
 
 }  // namespace
 
-bool qwen35_fused_gdn_projection_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_FUSED_GDN_PROJ");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
 
 bool qwen35_mtp_int8_lm_head_enabled() {
     static const bool enabled = [] {
@@ -190,8 +183,6 @@ Qwen3_5MoeWeights bind_qwen3_5_moe(const LoadedModel& engine) {
             // Qwen3.6-35B-A3B: the bind-time concatenation needed 1.4 GB of
             // duplicate weights, because the arena-backed sources reclaimed
             // nothing when erased. Joining b/a is still measured as a wash.
-            Lw.la_in_proj_qkvz = maybe(engine, la + "in_proj_qkvz.weight");
-            Lw.la_in_proj_ba = maybe(engine, la + "in_proj_ba.weight");
             Lw.la_in_proj_qkv = maybe(engine, la + "in_proj_qkv.weight");
             Lw.la_in_proj_z = maybe(engine, la + "in_proj_z.weight");
             Lw.la_in_proj_b = maybe(engine, la + "in_proj_b.weight");

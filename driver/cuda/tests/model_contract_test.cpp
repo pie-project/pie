@@ -1724,15 +1724,7 @@ void test_qwen3_5_gdn_splits_by_block() {
             shape_is(la + "norm.weight", {kValue});
             shape_is(la + "conv1d.weight", {local, kConvKernel});
             shape_is(la + "conv1d.bias", {local});
-            // Under `PIE_QWEN35_FUSED_GDN_PROJ` the shard is the first leg of
-            // the join rather than a tensor of its own, so assert whichever
-            // layout this process selected. Both must be this rank's share.
-            if (model::qwen35_fused_gdn_projection_enabled()) {
-                shape_is(la + "in_proj_qkvz.weight",
-                         {local + kValue / static_cast<std::int64_t>(tp), kHidden});
-            } else {
-                shape_is(la + "in_proj_qkv.weight", {local, kHidden});
-            }
+            shape_is(la + "in_proj_qkv.weight", {local, kHidden});
 
             // The same prefix decides whether the generic dense join fires, so
             // a wrong one is invisible here and expensive there: bind falls
