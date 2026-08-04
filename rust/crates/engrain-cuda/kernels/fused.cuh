@@ -35,6 +35,8 @@ extern "C" __global__ void en_advance_fused(
     int32_t* cand_depth,
     int32_t* cand_floor,
     int32_t* cand_window,
+    int32_t* cand_at,
+    int32_t* cand_used,
     int32_t* hist_slot,
     int32_t* hist_lexer,
     int32_t* hist_stack,
@@ -45,6 +47,7 @@ extern "C" __global__ void en_advance_fused(
     int32_t stack_stride,
     int32_t max_reductions,
     int32_t window,
+    int32_t arena_slots,
     int32_t paths,
     int32_t has_verdicts,
     int32_t rollback,
@@ -107,6 +110,8 @@ extern "C" __global__ void en_advance_fused(
     }
     if (lane == 0) {
         old_count[sequence] = count;
+        // The candidate arena is a bump per sequence, so the bump starts here.
+        cand_used[sequence] = 0;
     }
     __syncthreads();
 
@@ -198,12 +203,27 @@ extern "C" __global__ void en_advance_fused(
                 }
 
                 if (r.alive && path < r.radix) {
+                    // Packed, not placed. A bump per sequence costs one
+                    // atomic on a counter two or three threads touch, and
+                    // buys the difference between a budget and a product of
+                    // ceilings. A sequence that runs out drops the candidate
+                    // and says so, which is the narrowing signal the caller
+                    // already refills from the reference matcher.
+                    int32_t need = r.depth - r.floor;
+                    int32_t at = need > 0
+                        ? atomicAdd(&cand_used[sequence], need)
+                        : 0;
+                    if (at + need > arena_slots) {
+                        state->overflow[sequence] = 1;
+                        continue;
+                    }
+                    int32_t base_at = sequence * arena_slots + at;
                     cand_lexer[out_base + index] = next_state;
                     cand_depth[out_base + index] = r.depth;
                     cand_floor[out_base + index] = r.floor;
-                    int64_t at = (out_base + index) * (int64_t)window;
-                    for (int32_t k = 0; k < r.depth - r.floor; ++k) {
-                        cand_window[at + k] = mine[k];
+                    cand_at[out_base + index] = base_at;
+                    for (int32_t k = 0; k < need; ++k) {
+                        cand_window[base_at + k] = mine[k];
                     }
                     ++index;
                 }
@@ -260,7 +280,7 @@ extern "C" __global__ void en_advance_fused(
                     for (int32_t slot = lane; slot < depth; slot += blockDim.x) {
                         if (state->stack[(int64_t)out * stack_stride + slot]
                             != en::stack_entry(old_stack, cand_window, source_row,
-                                               candidate, stack_stride, window, floor,
+                                               cand_at[candidate], stack_stride, floor,
                                                slot)) {
                             differs = 1;
                         }
@@ -274,7 +294,7 @@ extern "C" __global__ void en_advance_fused(
                     for (int32_t slot = lane; slot < depth; slot += blockDim.x) {
                         state->stack[(int64_t)out * stack_stride + slot] =
                             en::stack_entry(old_stack, cand_window, source_row,
-                                            candidate, stack_stride, window, floor,
+                                            cand_at[candidate], stack_stride, floor,
                                             slot);
                     }
                     if (lane == 0) {

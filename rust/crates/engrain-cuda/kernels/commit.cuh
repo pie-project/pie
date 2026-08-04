@@ -32,10 +32,10 @@ extern "C" __global__ void en_commit(
     const int32_t* cand_depth,
     const int32_t* cand_floor,
     const int32_t* cand_window,
+    const int32_t* cand_at,
     int32_t configs,
     int32_t max_readings,
-    int32_t stack_stride,
-    int32_t window) {
+    int32_t stack_stride) {
     int32_t sequence = blockIdx.x;
     int32_t lane = threadIdx.x;
     int32_t count = old_count[sequence];
@@ -99,7 +99,7 @@ extern "C" __global__ void en_commit(
                     for (int32_t slot = lane; slot < depth; slot += blockDim.x) {
                         if (state->stack[(int64_t)out * stack_stride + slot]
                             != en::stack_entry(old_stack, cand_window, source_row,
-                                               candidate, stack_stride, window, floor,
+                                               cand_at[candidate], stack_stride, floor,
                                                slot)) {
                             differs = 1;
                         }
@@ -116,7 +116,7 @@ extern "C" __global__ void en_commit(
                     for (int32_t slot = lane; slot < depth; slot += blockDim.x) {
                         state->stack[(int64_t)out * stack_stride + slot] =
                             en::stack_entry(old_stack, cand_window, source_row,
-                                            candidate, stack_stride, window, floor,
+                                            cand_at[candidate], stack_stride, floor,
                                             slot);
                     }
                     if (lane == 0) {

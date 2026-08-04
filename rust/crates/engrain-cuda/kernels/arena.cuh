@@ -138,18 +138,21 @@ struct Shape {
 /// launched with them at all - "too many resources requested for launch" -
 /// while the parse that needed it was a JSON array with no maxItems, which is
 /// an ordinary schema rather than a pathological one.
+/// `at` is where this candidate's window was packed, not where it would sit in
+/// a grid of worst cases. The grid was `rows x readings x window`, a product of
+/// four independent ceilings that never co-occur: measured over one real step
+/// at batch 512, 8.00 GiB was reserved and 0.01 MiB written.
 __device__ inline int32_t stack_entry(
     const int32_t* old_stack,
     const int32_t* cand_window,
     int64_t source_row,
-    int64_t candidate,
+    int32_t at,
     int32_t stack_stride,
-    int32_t window,
     int32_t floor,
     int32_t slot) {
     return slot < floor
         ? old_stack[source_row * stack_stride + slot]
-        : cand_window[candidate * (int64_t)window + (slot - floor)];
+        : cand_window[at + (slot - floor)];
 }
 
 }  // namespace en

@@ -44,6 +44,13 @@ _GROUP_BLOCK = 64
 # repeated union rather than a wrong answer. Sixty-four is 16 MiB at batch 512
 # against 5.16 GiB for the bit-per-group shape it replaces.
 _GROUP_FILTER = 64
+
+# Window entries one sequence may pack into its candidate arena in a step.
+# Measured over a real step at batch 512 across forty-nine corpus schemas, the
+# most any sequence wanted was 8 configurations x 4 candidates x 7 entries, so
+# 224; this is that with room, and it is 2 MiB at batch 512 against the 8 GiB
+# the old grid of ceilings reserved.
+_CANDIDATE_ARENA = 1024
 # Threads per block for the CUDA kernels that give a warp to a configuration.
 # Four warps, which is what the Triton locate uses, so the two are comparable.
 _LOCATE_THREADS = 128
@@ -1414,6 +1421,8 @@ def _candidate_kernel(
     cand_depth_ptr,
     cand_floor_ptr,
     cand_window_ptr,
+    cand_at_ptr,
+    cand_used_ptr,
     overflow_ptr,
     ROWS: tl.constexpr,
     CONFIGS: tl.constexpr,
@@ -1421,6 +1430,7 @@ def _candidate_kernel(
     STACK_STRIDE: tl.constexpr,
     MAX_REDUCTIONS: tl.constexpr,
     WINDOW: tl.constexpr,
+    ARENA: tl.constexpr,
     NO_GROUP: tl.constexpr,
     PATHS: tl.constexpr,
 ):
@@ -1755,25 +1765,31 @@ def _candidate_kernel(
                         # there, so what is stored is the floor and the window.
                         # Whole stacks made this 151 MB at batch 512, four fifths of
                         # everything a batch allocated.
-                        tl.store(cand_lexer_ptr + out_base + index, next_state)
-                        tl.store(cand_depth_ptr + out_base + index, copy_depth)
-                        tl.store(cand_floor_ptr + out_base + index, floor)
-                        top_lane = tl.arange(0, WINDOW)
-                        # 64-bit deliberately: this is the one address in the
-                        # step that is a product of three ceilings, and at
-                        # batch 512 it passed 2^31 and read someone else's
-                        # memory rather than failing.
-                        window_base = (out_base + index).to(tl.int64) * WINDOW
-                        tl.store(
-                            cand_window_ptr + window_base + top_lane,
-                            tl.load(
-                                scratch_ptr + scratch + top_lane,
-                                mask=top_lane < copy_depth - floor,
-                                other=0,
-                            ),
-                            mask=top_lane < copy_depth - floor,
-                        )
-                        index = index + 1
+                        # Packed into the sequence's arena, not placed in a
+                        # grid of worst cases. The grid was `rows x readings x
+                        # window` and reserved 8.00 GiB at batch 512 to write
+                        # 0.01 MiB of it.
+                        need = copy_depth - floor
+                        bump = tl.atomic_add(cand_used_ptr + sequence, need)
+                        if bump + need > ARENA:
+                            tl.store(overflow_ptr + sequence, 1)
+                        else:
+                            tl.store(cand_lexer_ptr + out_base + index, next_state)
+                            tl.store(cand_depth_ptr + out_base + index, copy_depth)
+                            tl.store(cand_floor_ptr + out_base + index, floor)
+                            base_at = sequence * ARENA + bump
+                            tl.store(cand_at_ptr + out_base + index, base_at)
+                            top_lane = tl.arange(0, WINDOW)
+                            tl.store(
+                                cand_window_ptr + base_at + top_lane,
+                                tl.load(
+                                    scratch_ptr + scratch + top_lane,
+                                    mask=top_lane < need,
+                                    other=0,
+                                ),
+                                mask=top_lane < need,
+                            )
+                            index = index + 1
                     span = tl.maximum(span, radix)
                     path = path + 1
                 use = use + 1
@@ -1807,6 +1823,7 @@ def _commit_kernel(
     cand_depth_ptr,
     cand_floor_ptr,
     cand_window_ptr,
+    cand_at_ptr,
     terminated_ptr,
     overflow_ptr,
     widest_ptr,
@@ -1887,7 +1904,7 @@ def _commit_kernel(
                                             ),
                                             tl.load(
                                                 cand_window_ptr
-                                                + (base + index).to(tl.int64) * WINDOW
+                                                + tl.load(cand_at_ptr + base + index)
                                                 + tl.maximum(lane - floor, 0),
                                                 mask=(lane >= floor) & (lane < depth),
                                                 other=0,
@@ -3436,8 +3453,18 @@ class DeviceBatch:
         self.cand_lexer = torch.zeros(slots, dtype=torch.int32, device="cuda")
         self.cand_depth = torch.zeros(slots, dtype=torch.int32, device="cuda")
         self.cand_floor = torch.zeros(slots, dtype=torch.int32, device="cuda")
+        # A budget per sequence, not a product of ceilings. The old shape was
+        # `batch x configurations x readings x window` - four independent worst
+        # cases that never co-occur - and over one real step at batch 512 it
+        # reserved 8.00 GiB and wrote 0.01 MiB. Candidates are bumped into
+        # their sequence's slice instead, and a sequence that runs out drops
+        # the candidate and raises `overflow`, which is the narrowing signal a
+        # caller already refills from the reference matcher.
+        self.window_budget = max(grammar.window, _CANDIDATE_ARENA)
+        self.cand_at = torch.zeros(slots, dtype=torch.int32, device="cuda")
+        self.cand_used = torch.zeros(batch, dtype=torch.int32, device="cuda")
         self.cand_window = torch.zeros(
-            slots * grammar.window, dtype=torch.int32, device="cuda"
+            batch * self.window_budget, dtype=torch.int32, device="cuda"
         )
         self.old_lexer = torch.zeros(
             batch * self.configs, dtype=torch.int32, device="cuda"
@@ -4157,12 +4184,12 @@ class DeviceBatch:
                 self.cand_depth.data_ptr(),
                 self.cand_floor.data_ptr(),
                 self.cand_window.data_ptr(),
+                self.cand_at.data_ptr(),
             ],
             [
                 self.configs,
                 self.max_readings,
                 grammar.max_stack,
-                grammar.window,
             ],
         )
 
@@ -4193,6 +4220,8 @@ class DeviceBatch:
                 self.cand_depth.data_ptr(),
                 self.cand_floor.data_ptr(),
                 self.cand_window.data_ptr(),
+                self.cand_at.data_ptr(),
+                self.cand_used.data_ptr(),
             ],
             [
                 rows,
@@ -4201,6 +4230,7 @@ class DeviceBatch:
                 grammar.max_stack,
                 grammar.max_reductions,
                 grammar.window,
+                self.window_budget,
                 grammar.paths,
             ],
         )
@@ -4733,6 +4763,8 @@ class DeviceBatch:
                 self.cand_depth.data_ptr(),
                 self.cand_floor.data_ptr(),
                 self.cand_window.data_ptr(),
+                self.cand_at.data_ptr(),
+                self.cand_used.data_ptr(),
                 self.hist_slot.data_ptr(),
                 self.hist_lexer.data_ptr(),
                 self.hist_stack.data_ptr(),
@@ -4745,6 +4777,7 @@ class DeviceBatch:
                 grammar.max_stack,
                 grammar.max_reductions,
                 grammar.window,
+                self.window_budget,
                 grammar.paths,
                 grammar.has_verdicts,
                 self.rollback_depth,
@@ -4779,8 +4812,14 @@ class DeviceBatch:
         else:
             self._locate_triton(grammar, rows)
         if "candidate" in _PORTED:
+            # The candidates are bumped into each sequence's arena, so the
+            # bump starts at zero. The fused kernel does this itself, in the
+            # block that owns the sequence; the unfused path has no such
+            # moment, so it happens here.
+            self.cand_used.zero_()
             self._candidate_cuda(grammar, rows)
         else:
+            self.cand_used.zero_()
             self._candidate_triton(grammar, rows)
 
     def _advance_prepare_triton(self, grammar, rows) -> None:
@@ -4804,6 +4843,7 @@ class DeviceBatch:
         if self.rollback_depth > 0:
             self._history_triton(grammar, rows)
         self._locate_triton(grammar, rows)
+        self.cand_used.zero_()
         self._candidate_triton(grammar, rows)
 
         self._commit_triton(grammar)
@@ -4892,6 +4932,8 @@ class DeviceBatch:
             self.cand_depth,
             self.cand_floor,
             self.cand_window,
+            self.cand_at,
+            self.cand_used,
             self.overflow,
             ROWS=rows,
             CONFIGS=self.configs,
@@ -4899,6 +4941,7 @@ class DeviceBatch:
             STACK_STRIDE=grammar.max_stack,
             MAX_REDUCTIONS=grammar.max_reductions,
             WINDOW=grammar.window,
+            ARENA=self.window_budget,
             NO_GROUP=_NO_GROUP,
             PATHS=grammar.paths,
             num_warps=1,
@@ -4918,6 +4961,7 @@ class DeviceBatch:
             self.cand_depth,
             self.cand_floor,
             self.cand_window,
+            self.cand_at,
             self.terminated,
             self.overflow,
             self.widest,

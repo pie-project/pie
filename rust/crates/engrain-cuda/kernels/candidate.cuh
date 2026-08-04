@@ -288,12 +288,15 @@ extern "C" __global__ void en_candidate(
     int32_t* cand_depth,
     int32_t* cand_floor,
     int32_t* cand_window,
+    int32_t* cand_at,
+    int32_t* cand_used,
     int32_t rows,
     int32_t configs,
     int32_t max_readings,
     int32_t stack_stride,
     int32_t max_reductions,
     int32_t window,
+    int32_t arena_slots,
     int32_t paths) {
     int32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
     int32_t threads = gridDim.x * blockDim.x;
@@ -389,15 +392,27 @@ extern "C" __global__ void en_candidate(
                     // shares everything below its floor with the configuration
                     // it came from, so what is stored is the floor and the
                     // window. Whole stacks were 151 MB at batch 512.
+                    // Packed, not placed. A bump per sequence costs one
+                    // atomic on a counter two or three threads touch, and
+                    // buys the difference between a budget and a product of
+                    // ceilings. A sequence that runs out drops the candidate
+                    // and says so, which is the narrowing signal the caller
+                    // already refills from the reference matcher.
+                    int32_t need = r.depth - r.floor;
+                    int32_t at = need > 0
+                        ? atomicAdd(&cand_used[sequence], need)
+                        : 0;
+                    if (at + need > arena_slots) {
+                        state->overflow[sequence] = 1;
+                        continue;
+                    }
+                    int32_t base_at = sequence * arena_slots + at;
                     cand_lexer[out_base + index] = next_state;
                     cand_depth[out_base + index] = r.depth;
                     cand_floor[out_base + index] = r.floor;
-                    // 64-bit deliberately: this is the one address in the step
-                    // that is a product of three ceilings, and at batch 512 it
-                    // passed 2^31 and read someone else's memory.
-                    int64_t at = (out_base + index) * (int64_t)window;
-                    for (int32_t k = 0; k < r.depth - r.floor; ++k) {
-                        cand_window[at + k] = mine[k];
+                    cand_at[out_base + index] = base_at;
+                    for (int32_t k = 0; k < need; ++k) {
+                        cand_window[base_at + k] = mine[k];
                     }
                     ++index;
                 }
