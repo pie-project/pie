@@ -27,6 +27,19 @@ struct Input {
     /// Beam width. `1` degenerates to greedy decoding (the beam identity).
     #[serde(default = "default_beams")]
     beams: u32,
+    /// Bind the per-beam ancestry mask to the attention port. Default on.
+    ///
+    /// Setting this false leaves the whole program identical — the mask is
+    /// still evolved in the epilogue — and only stops attention from reading
+    /// it, so every beam attends the whole filled pool instead of its own
+    /// ancestry. That is a deliberately broken beam, and it exists as a
+    /// CONTROL: a driver that silently ignores `custom_mask_d` produces the
+    /// mask-off token stream while reporting success, so a benchmark can only
+    /// trust a model family whose mask-on and mask-off runs actually differ.
+    /// `ModelCapabilities` carries no `supports_custom_mask` flag to check
+    /// instead, which is why this has to be established by differencing.
+    #[serde(default = "default_mask")]
+    mask: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -35,6 +48,10 @@ fn default_max_tokens() -> usize {
 
 fn default_beams() -> u32 {
     2
+}
+
+fn default_mask() -> bool {
+    true
 }
 
 /// Per-step disagreements between the beam pick and the raw-logit argmax.
@@ -73,6 +90,7 @@ fn advance_hypotheses(
 async fn main(input: Input) -> Result<String> {
     let max_steps = input.max_tokens;
     let b = input.beams;
+    let use_mask = input.mask;
     if b == 0 {
         return Err("beams must be at least 1".into());
     }
@@ -185,6 +203,10 @@ async fn main(input: Input) -> Result<String> {
     // All descriptor ports channel-bound (device-geometry fire wire-form):
     // Pages ← pages, PageIndptr ← page_indptr, KvLen ← klen, WSlot/WOff ← the
     // explicit write descriptor. The pool is fixed so these carry constant values.
+    // The AttnMask port is the ONE thing `input.mask` changes: everything else
+    // about the fire, including the epilogue's mask evolution, is identical in
+    // both arms, so a mask-on/mask-off token-stream difference isolates whether
+    // attention honoured the mask and nothing else.
     fwd.attention(
         &ws,
         ..,
@@ -195,7 +217,7 @@ async fn main(input: Input) -> Result<String> {
         &w_slot,
         &w_off,
         &pos,
-        Some(&mask),
+        if use_mask { Some(&mask) } else { None },
     )?;
     fwd.epilogue(move || {
         // 1. top-B over the flattened [B,V] cand block.
@@ -375,8 +397,23 @@ async fn main(input: Input) -> Result<String> {
         final_scores[best_lane]
     );
     let text = wit_model::decode(&hypotheses[best_lane])?;
+    // Emit the returned beam's TOKEN IDS beside the text. A benchmark digests
+    // these directly; re-tokenizing `text` would not be equivalent, because
+    // detokenize→tokenize is not the identity, so a digest taken that way could
+    // agree across two genuinely different token streams.
+    let returned_tokens = hypotheses[best_lane]
+        .iter()
+        .map(|t| t.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Shared-pool occupancy after the run. `fill` starts at 1 (the BOS cell at
+    // pool position 0) and every step appends exactly one cell per lane, so it
+    // is monotonic and its peak is its final value. Reported by the inferlet
+    // rather than re-derived host-side so the number comes from the algorithm.
+    let kv_cells_occupied_peak = 1 + (B as usize) * max_steps;
     Ok(format!(
-        "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}",
+        "{text}\n[beam] width={B} steps={max_steps} best_score={:.4} greedy_mismatches={greedy_mismatches}\n\
+         [beam] mask={use_mask} kv_cells_occupied_peak={kv_cells_occupied_peak} returned_tokens={returned_tokens}",
         final_scores[best_lane]
     ))
 }

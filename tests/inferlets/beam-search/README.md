@@ -47,9 +47,43 @@ a scalar score preserve the logits argmax.
 | --- | --- | --- | --- |
 | `max_tokens` | int | `16` | Number of generated tokens |
 | `beams` | int | `2` | Beam width; `1` degenerates to greedy decoding |
+| `mask` | bool | `true` | Bind the ancestry mask to the attention port; `false` is the deliberately-broken control described below |
 
 There is deliberately no `prompt` parameter. This inferlet starts from the fixed
 Qwen BOS token.
+
+### `mask = false` is a control, not a mode
+
+The whole program is identical in both arms — the epilogue still evolves the
+mask — and only the attention port's binding changes. With the mask unbound
+every beam attends the entire filled pool instead of its own ancestry, so the
+search is wrong by construction.
+
+It exists because a driver that ignores the mask cannot be detected any other
+way. `ModelCapabilities` carries no `supports_custom_mask` flag, and a model
+family whose forward never reads `custom_mask_d` does not fail — it returns
+fluent, plausible, meaningless output at a perfectly ordinary speed. Differencing
+the two arms by the returned beam's token digest is what distinguishes "the mask
+worked" from "the mask was dropped on the floor".
+
+Note the difference is vacuous at `beams = 1`: a single beam's ancestry is the
+whole filled span, so masked and unmasked attention cover the same cells and the
+two arms agree. The control only carries signal at `beams >= 2`.
+
+## Output
+
+Three lines: the decoded best hypothesis, then
+
+```
+[beam] width=<B> steps=<N> best_score=<f> greedy_mismatches=<n>
+[beam] mask=<bool> kv_cells_occupied_peak=<n> returned_tokens=<id,id,…>
+```
+
+`returned_tokens` carries the best beam's raw token ids so a consumer can digest
+them directly; re-tokenizing the decoded text is not equivalent, because
+detokenize→tokenize is not the identity. `kv_cells_occupied_peak` is the shared
+pool's occupancy, `1 + width * steps` — `fill` starts at the BOS cell and grows
+by one cell per lane per step, so it is monotonic and peaks at its final value.
 
 ## Implementation notes
 
