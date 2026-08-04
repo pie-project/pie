@@ -154,6 +154,175 @@ pub enum OffloadTransfer {
 // [cluster]
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Units
+// -----------------------------------------------------------------------------
+//
+// A duration or a size is written with its unit -- `"50ms"`, `"4GiB"` -- rather
+// than carried in the field name. The old spelling put the unit in the name and
+// the number in the value, which meant the two could disagree only silently and
+// that the file could not be read without knowing the schema: `submit_deadline_us
+// = 50000` and `request_timeout_secs = 120` sat in the same table.
+//
+// It also drifted. Before this, one file held `request_timeout_secs` and
+// `silence_timeout_secs` next to `ready_timeout_s` and `shutdown_timeout_s` --
+// two spellings of "seconds" -- and `_us`, `_mb`, `_gb` besides.
+
+/// A duration written with its unit: `"50ms"`, `"120s"`, `"2m"`.
+///
+/// Accepted units: `ns`, `us`, `ms`, `s`, `m`, `h`. A bare number is refused
+/// rather than assumed to be seconds -- assuming is how `_us` and `_secs` came
+/// to live in one table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Duration(std::time::Duration);
+
+impl Duration {
+    pub const fn from_millis(ms: u64) -> Self {
+        Self(std::time::Duration::from_millis(ms))
+    }
+    pub const fn from_secs(s: u64) -> Self {
+        Self(std::time::Duration::from_secs(s))
+    }
+    pub fn as_micros(&self) -> u64 {
+        self.0.as_micros().min(u64::MAX as u128) as u64
+    }
+    pub fn as_secs(&self) -> u64 {
+        self.0.as_secs()
+    }
+    pub fn as_secs_f64(&self) -> f64 {
+        self.0.as_secs_f64()
+    }
+}
+
+fn parse_duration(text: &str) -> std::result::Result<Duration, String> {
+    let t = text.trim();
+    let split = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .ok_or_else(|| {
+            format!("duration {t:?} has no unit; write one of 120s, 50ms, 2m")
+        })?;
+    let (value, unit) = t.split_at(split);
+    let value: f64 = value
+        .parse()
+        .map_err(|_| format!("duration {t:?} has an unparseable number"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("duration {t:?} must be finite and non-negative"));
+    }
+    let nanos = match unit.trim() {
+        "ns" => value,
+        "us" | "\u{b5}s" => value * 1e3,
+        "ms" => value * 1e6,
+        "s" => value * 1e9,
+        "m" => value * 6e10,
+        "h" => value * 3.6e12,
+        other => {
+            return Err(format!(
+                "duration {t:?} has unknown unit {other:?}; use ns, us, ms, s, m, h"
+            ));
+        }
+    };
+    Ok(Duration(std::time::Duration::from_nanos(nanos as u64)))
+}
+
+impl<'de> Deserialize<'de> for Duration {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        parse_duration(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for Duration {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let us = self.as_micros();
+        if us % 1_000_000 == 0 {
+            s.serialize_str(&format!("{}s", us / 1_000_000))
+        } else if us % 1_000 == 0 {
+            s.serialize_str(&format!("{}ms", us / 1_000))
+        } else {
+            s.serialize_str(&format!("{us}us"))
+        }
+    }
+}
+
+/// A byte size written with its unit: `"256MiB"`, `"4GiB"`.
+///
+/// Binary units only (`B`, `KiB`, `MiB`, `GiB`, `TiB`), because that is what
+/// the `_mb`/`_gb` fields this replaces always meant -- each multiplied by
+/// 1024*1024, never 1000*1000.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ByteSize(u64);
+
+impl ByteSize {
+    pub const fn from_mib(mib: u64) -> Self {
+        Self(mib * 1024 * 1024)
+    }
+    pub const fn as_bytes(&self) -> u64 {
+        self.0
+    }
+    pub const fn as_mib(&self) -> u64 {
+        self.0 / (1024 * 1024)
+    }
+    pub fn as_gib_f64(&self) -> f64 {
+        self.0 as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+}
+
+fn parse_byte_size(text: &str) -> std::result::Result<ByteSize, String> {
+    let t = text.trim();
+    let split = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .ok_or_else(|| {
+            format!("size {t:?} has no unit; write one of 512B, 256MiB, 4GiB")
+        })?;
+    let (value, unit) = t.split_at(split);
+    let value: f64 = value
+        .parse()
+        .map_err(|_| format!("size {t:?} has an unparseable number"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("size {t:?} must be finite and non-negative"));
+    }
+    let scale: f64 = match unit.trim() {
+        "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => {
+            return Err(format!(
+                "size {t:?} has unknown unit {other:?}; use B, KiB, MiB, GiB, TiB \
+                 (binary units only)"
+            ));
+        }
+    };
+    Ok(ByteSize((value * scale) as u64))
+}
+
+impl<'de> Deserialize<'de> for ByteSize {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        parse_byte_size(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for ByteSize {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        const KIB: u64 = 1024;
+        let b = self.0;
+        let text = if b % GIB == 0 && b != 0 {
+            format!("{}GiB", b / GIB)
+        } else if b % MIB == 0 && b != 0 {
+            format!("{}MiB", b / MIB)
+        } else if b % KIB == 0 && b != 0 {
+            format!("{}KiB", b / KIB)
+        } else {
+            format!("{b}B")
+        };
+        s.serialize_str(&text)
+    }
+}
+
 /// Distributed-cluster topology. Absent, or `controller` unset ⇒ single-node
 /// (the worker terminates clients directly; no controller/gateway).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -305,10 +474,10 @@ pub struct RuntimeConfig {
     pub worker_threads: usize,
     #[serde(default = "default_wasm_max_instances")]
     pub wasm_max_instances: u32,
-    #[serde(default = "default_wasm_max_memory_mb")]
-    pub wasm_max_memory_mb: usize,
+    #[serde(default = "default_wasm_max_memory")]
+    pub wasm_max_memory: ByteSize,
     #[serde(default)]
-    pub wasm_warm_memory_mb: usize,
+    pub wasm_warm_memory: ByteSize,
     #[serde(default = "default_wasm_warm_slots")]
     pub wasm_warm_slots: u32,
     #[serde(default)]
@@ -319,8 +488,8 @@ pub struct RuntimeConfig {
     pub allow_network: bool,
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
-    #[serde(default = "default_max_upload_mb")]
-    pub max_upload_mb: usize,
+    #[serde(default = "default_max_upload")]
+    pub max_upload: ByteSize,
 }
 
 impl Default for RuntimeConfig {
@@ -328,14 +497,14 @@ impl Default for RuntimeConfig {
         Self {
             worker_threads: default_worker_threads(),
             wasm_max_instances: default_wasm_max_instances(),
-            wasm_max_memory_mb: default_wasm_max_memory_mb(),
-            wasm_warm_memory_mb: 0,
+            wasm_max_memory: default_wasm_max_memory(),
+            wasm_warm_memory: ByteSize::from_mib(0),
             wasm_warm_slots: default_wasm_warm_slots(),
             allow_fs: false,
             fs_scratch_dir: default_fs_scratch_dir(),
             allow_network: true,
             network_allowed_hosts: default_network_allowed_hosts(),
-            max_upload_mb: default_max_upload_mb(),
+            max_upload: default_max_upload(),
         }
     }
 }
@@ -351,10 +520,13 @@ impl RuntimeConfig {
             "runtime.wasm_max_instances must be > 0"
         );
         ensure!(
-            self.wasm_max_memory_mb > 0,
-            "runtime.wasm_max_memory_mb must be > 0"
+            self.wasm_max_memory.as_bytes() > 0,
+            "runtime.wasm_max_memory must be > 0"
         );
-        ensure!(self.max_upload_mb > 0, "runtime.max_upload_mb must be > 0");
+        ensure!(
+            self.max_upload.as_bytes() > 0,
+            "runtime.max_upload must be > 0"
+        );
         Ok(())
     }
 }
@@ -374,8 +546,8 @@ fn default_worker_threads() -> usize {
 fn default_wasm_max_instances() -> u32 {
     1000
 }
-fn default_wasm_max_memory_mb() -> usize {
-    4096
+fn default_wasm_max_memory() -> ByteSize {
+    ByteSize::from_mib(4096)
 }
 fn default_wasm_warm_slots() -> u32 {
     100
@@ -386,8 +558,8 @@ fn default_fs_scratch_dir() -> PathBuf {
 fn default_network_allowed_hosts() -> Vec<String> {
     vec!["*".to_string()]
 }
-fn default_max_upload_mb() -> usize {
-    256
+fn default_max_upload() -> ByteSize {
+    ByteSize::from_mib(256)
 }
 
 // -----------------------------------------------------------------------------
@@ -446,8 +618,8 @@ impl ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
-    #[serde(default = "default_request_timeout_secs")]
-    pub request_timeout_secs: u64,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: Duration,
     /// How long a pipeline that is HARD-BLOCKING a frame's seal may go
     /// without submitting before the engine stops waiting for it, in
     /// microseconds.
@@ -475,8 +647,8 @@ pub struct SchedulerConfig {
     /// for that was the wrong response, which is why this only leashes now.
     ///
     /// Exposed to guests verbatim as `model.submit-deadline-us()`.
-    #[serde(default = "default_submit_deadline_us")]
-    pub submit_deadline_us: u64,
+    #[serde(default = "default_submit_deadline")]
+    pub submit_deadline: Duration,
     /// How long a lane may stay silent in total — through the leash above and
     /// on past it — before the engine terminates its process, in seconds.
     ///
@@ -485,8 +657,8 @@ pub struct SchedulerConfig {
     /// killed however long it stays away; that is the contract this enforces.
     /// The leash already keeps a straggler from holding the fleet, so nothing
     /// but a genuinely abandoned process ever reaches this.
-    #[serde(default = "default_silence_timeout_secs")]
-    pub silence_timeout_secs: u64,
+    #[serde(default = "default_silence_timeout")]
+    pub silence_timeout: Duration,
     /// Waves per frame (*k*): how many token steps the wait-all quorum admits
     /// before it runs. A deployment constant, fixed at engine start exactly
     /// like the KV page size — never renegotiated per frame, never adapted
@@ -548,9 +720,9 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            request_timeout_secs: default_request_timeout_secs(),
-            submit_deadline_us: default_submit_deadline_us(),
-            silence_timeout_secs: default_silence_timeout_secs(),
+            request_timeout: default_request_timeout(),
+            submit_deadline: default_submit_deadline(),
+            silence_timeout: default_silence_timeout(),
             frame_size: default_frame_size(),
             frame_submit_depth: default_frame_submit_depth(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
@@ -578,20 +750,20 @@ const UPLOAD_STAGING_DEPTH: u32 = 13;
 impl SchedulerConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.request_timeout_secs > 0,
-            "scheduler.request_timeout_secs must be > 0"
+            self.request_timeout.as_micros() > 0,
+            "scheduler.request_timeout must be > 0"
         );
         ensure!(
-            self.submit_deadline_us > 0,
-            "scheduler.submit_deadline_us must be > 0"
+            self.submit_deadline.as_micros() > 0,
+            "scheduler.submit_deadline must be > 0"
         );
         ensure!(
-            self.silence_timeout_secs > 0,
-            "scheduler.silence_timeout_secs must be > 0"
+            self.silence_timeout.as_micros() > 0,
+            "scheduler.silence_timeout must be > 0"
         );
         ensure!(
-            self.silence_timeout_secs * 1_000_000 >= self.submit_deadline_us,
-            "scheduler.silence_timeout_secs must not be shorter than submit_deadline_us: \
+            self.silence_timeout >= self.submit_deadline,
+            "scheduler.silence_timeout must not be shorter than submit_deadline: \
              a kill that lands before the leash would fail guests the leash exists to spare"
         );
         ensure!(self.frame_size >= 1, "scheduler.frame_size must be >= 1");
@@ -624,16 +796,16 @@ impl SchedulerConfig {
     }
 }
 
-fn default_request_timeout_secs() -> u64 {
-    120
+fn default_request_timeout() -> Duration {
+    Duration::from_secs(120)
 }
 
-fn default_submit_deadline_us() -> u64 {
-    50_000
+fn default_submit_deadline() -> Duration {
+    Duration::from_millis(50)
 }
 
-fn default_silence_timeout_secs() -> u64 {
-    30
+fn default_silence_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn default_frame_size() -> u32 {
@@ -840,8 +1012,8 @@ pub struct MetalDriverOptions {
     pub device: String,
     #[serde(skip)]
     pub verbose: bool,
-    pub ready_timeout_s: f64,
-    pub shutdown_timeout_s: f64,
+    pub ready_timeout: Duration,
+    pub shutdown_timeout: Duration,
     /// Accepted for config compatibility; ignored (the metal driver is a
     /// statically-linked lib, no separate executable to discover).
     pub binary_path: String,
@@ -859,8 +1031,8 @@ impl Default for MetalDriverOptions {
             stream_routed_experts: false,
             device: "metal:0".to_string(),
             verbose: false,
-            ready_timeout_s: 120.0,
-            shutdown_timeout_s: 5.0,
+            ready_timeout: Duration::from_secs(120),
+            shutdown_timeout: Duration::from_secs(5),
             binary_path: String::new(),
         }
     }
@@ -887,12 +1059,12 @@ pub struct DummyDriverOptions {
     #[serde(default)]
     pub arch_name: Option<String>,
 
-    #[serde(default = "default_dummy_ready_timeout_s")]
-    pub ready_timeout_s: f64,
+    #[serde(default = "default_dummy_ready_timeout")]
+    pub ready_timeout: Duration,
 }
 
-fn default_dummy_ready_timeout_s() -> f64 {
-    5.0
+fn default_dummy_ready_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 
 /// `[model.driver.options]` for `type = "cuda_native"`.
@@ -959,7 +1131,7 @@ pub struct CudaNativeDriverOptions {
     /// The expert slab, in GiB. **Omit to derive one** at startup from what
     /// is left after the resident weights and the KV pool. Ignored unless
     /// `stream_routed_experts` is set.
-    pub expert_cache_gb: Option<f64>,
+    pub expert_cache: Option<ByteSize>,
     /// A pinned host DRAM tier behind the slab, in GiB. **Omit for none.**
     ///
     /// The slab bounds what the GPU holds; this bounds what host memory holds
@@ -968,15 +1140,15 @@ pub struct CudaNativeDriverOptions {
     /// instead of a checkpoint read, a plan and a transform -- so it is worth
     /// setting exactly when the experts do not fit in VRAM but do fit in RAM.
     /// Ignored unless `stream_routed_experts` is set.
-    pub expert_host_cache_gb: Option<f64>,
+    pub expert_host_cache: Option<ByteSize>,
     /// Operator opt-in for system speculation (MTP). Default false: the runtime
     /// drives the auto-drafter only when this is true. Speculation is a
     /// latency-regime win (helps at low batch, costs at compute saturation), so
     /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
     pub enable_system_speculation: bool,
 
-    pub ready_timeout_s: f64,
-    pub shutdown_timeout_s: f64,
+    pub ready_timeout: Duration,
+    pub shutdown_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -1026,11 +1198,11 @@ impl Default for CudaNativeDriverOptions {
             mtp_assistant_snapshot_dir: None,
             mtp_num_drafts: 3,
             stream_routed_experts: false,
-            expert_cache_gb: None,
-            expert_host_cache_gb: None,
+            expert_cache: None,
+            expert_host_cache: None,
             enable_system_speculation: false,
-            ready_timeout_s: 600.0,
-            shutdown_timeout_s: 5.0,
+            ready_timeout: Duration::from_secs(600),
+            shutdown_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -1064,17 +1236,17 @@ impl CudaNativeDriverOptions {
         // Present means the operator chose a size, so a present zero is a
         // contradiction rather than a way to say "derive" -- that is what
         // omitting the key is for.
-        if let Some(gb) = self.expert_cache_gb {
+        if let Some(size) = self.expert_cache {
             ensure!(
-                gb.is_finite() && gb > 0.0,
-                "model.driver.options.expert_cache_gb must be > 0; \
+                size.as_bytes() > 0,
+                "model.driver.options.expert_cache must be > 0; \
                  omit it to derive one at startup"
             );
         }
-        if let Some(gb) = self.expert_host_cache_gb {
+        if let Some(size) = self.expert_host_cache {
             ensure!(
-                gb.is_finite() && gb > 0.0,
-                "model.driver.options.expert_host_cache_gb must be > 0; \
+                size.as_bytes() > 0,
+                "model.driver.options.expert_host_cache must be > 0; \
                  omit it for no host tier"
             );
         }
@@ -1109,6 +1281,89 @@ hf_repo = "Qwen/Qwen3-0.6B"
 type = "metal"
 device = ["cpu"]
 "#;
+
+    #[test]
+    fn units_round_trip_through_their_string_form() {
+        assert_eq!(parse_duration("50ms").unwrap(), Duration::from_millis(50));
+        assert_eq!(parse_duration("120s").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_byte_size("4GiB").unwrap().as_bytes(), 4 << 30);
+        assert_eq!(parse_byte_size("256MiB").unwrap().as_mib(), 256);
+    }
+
+    #[test]
+    fn a_bare_number_is_refused_rather_than_assumed() {
+        // Assuming a unit is how `_us` and `_secs` came to live in one table.
+        let err = parse_duration("120").unwrap_err();
+        assert!(err.contains("has no unit"), "got: {err}");
+        let err = parse_byte_size("256").unwrap_err();
+        assert!(err.contains("has no unit"), "got: {err}");
+    }
+
+    #[test]
+    fn decimal_units_are_refused_for_sizes() {
+        // The `_mb`/`_gb` fields this replaces always meant MiB/GiB -- each
+        // multiplied by 1024*1024, never 1000*1000. Accepting "MB" would let a
+        // config mean 5% less than it says.
+        let err = parse_byte_size("256MB").unwrap_err();
+        assert!(err.contains("binary units only"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_the_legacy_unit_suffixed_names() {
+        // Renamed, not aliased: deny_unknown_fields turns an old config into a
+        // clear error naming the key, which is how this repo has handled every
+        // other config rename (see the rejects_legacy_* tests below).
+        for legacy in [
+            "wasm_max_memory_mb = 4096",
+            "max_upload_mb = 256",
+            "wasm_warm_memory_mb = 0",
+        ] {
+            let toml = format!("{MINIMAL_METAL}\n[runtime]\n{legacy}\n");
+            assert!(
+                toml::from_str::<Config>(&toml).is_err(),
+                "{legacy} should no longer parse"
+            );
+        }
+        for legacy in [
+            "request_timeout_secs = 120",
+            "submit_deadline_us = 50000",
+            "silence_timeout_secs = 30",
+        ] {
+            let toml = format!("{MINIMAL_METAL}\n[model.scheduler]\n{legacy}\n");
+            assert!(
+                toml::from_str::<Config>(&toml).is_err(),
+                "{legacy} should no longer parse"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_durations_parse_from_their_units() {
+        let toml = format!(
+            "{MINIMAL_METAL}\n[model.scheduler]\n\
+             request_timeout = \"90s\"\nsubmit_deadline = \"25ms\"\n\
+             silence_timeout = \"1m\"\n"
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.model.scheduler.request_timeout.as_secs(), 90);
+        assert_eq!(cfg.model.scheduler.submit_deadline.as_micros(), 25_000);
+        assert_eq!(cfg.model.scheduler.silence_timeout.as_secs(), 60);
+    }
+
+    #[test]
+    fn a_silence_timeout_under_the_submit_deadline_is_refused() {
+        // The comparison is now between two Durations rather than between a
+        // seconds count and a microseconds count.
+        let toml = format!(
+            "{MINIMAL_METAL}\n[model.scheduler]\n\
+             submit_deadline = \"5s\"\nsilence_timeout = \"1s\"\n"
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("must not be shorter than submit_deadline"), "got: {err}");
+    }
 
     #[test]
     fn parses_minimal_metal_config() {
@@ -1455,7 +1710,7 @@ device = ["cuda:0"]
         assert_eq!(opts.mxfp4_moe, "auto");
         assert!(opts.mtp_assistant_snapshot_dir.is_none());
         assert_eq!(opts.mtp_num_drafts, 3);
-        assert_eq!(opts.ready_timeout_s, 600.0);
+        assert_eq!(opts.ready_timeout, Duration::from_secs(600));
         assert_eq!(opts.kv_cache_dtype, "auto");
     }
 

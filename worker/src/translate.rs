@@ -27,6 +27,10 @@ pub struct ModelDrivers {
     pub groups: Vec<GroupDriver>,
 }
 
+/// The one place config units become the engine's plain numbers. `Duration`
+/// and `ByteSize` carry their unit through the config layer; `pie_engine`'s
+/// bootstrap structs still take `_secs`/`_us`/`_mb` scalars, so the conversion
+/// happens here and only here.
 pub fn build(
     user: &config::Config,
     drivers: ModelDrivers,
@@ -60,14 +64,14 @@ pub fn build(
         runtime: pie_engine::bootstrap::RuntimeConfig {
             worker_threads: user.runtime.worker_threads,
             wasm_max_instances: user.runtime.wasm_max_instances,
-            wasm_max_memory_mb: user.runtime.wasm_max_memory_mb,
-            wasm_warm_memory_mb: user.runtime.wasm_warm_memory_mb,
+            wasm_max_memory_mb: user.runtime.wasm_max_memory.as_mib() as usize,
+            wasm_warm_memory_mb: user.runtime.wasm_warm_memory.as_mib() as usize,
             wasm_warm_slots: user.runtime.wasm_warm_slots,
             allow_fs: user.runtime.allow_fs,
             fs_scratch_dir: user.runtime.fs_scratch_dir.clone(),
             allow_network: user.runtime.allow_network,
             network_allowed_hosts: user.runtime.network_allowed_hosts.clone(),
-            max_upload_mb: user.runtime.max_upload_mb,
+            max_upload_mb: user.runtime.max_upload.as_mib() as usize,
             py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
@@ -134,9 +138,9 @@ fn build_model(
         tokenizer_path,
         drivers,
         scheduler: pie_engine::bootstrap::SchedulerConfig {
-            request_timeout_secs: m.scheduler.request_timeout_secs,
-            submit_deadline_us: m.scheduler.submit_deadline_us,
-            silence_timeout_secs: m.scheduler.silence_timeout_secs,
+            request_timeout_secs: m.scheduler.request_timeout.as_secs(),
+            submit_deadline_us: m.scheduler.submit_deadline.as_micros(),
+            silence_timeout_secs: m.scheduler.silence_timeout.as_secs(),
             frame_size: m.scheduler.frame_size,
             frame_submit_depth: m.scheduler.frame_submit_depth,
             frame_dispatch_depth: m.scheduler.frame_dispatch_depth,

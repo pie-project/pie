@@ -349,11 +349,16 @@ pub(crate) fn write_cuda_startup_toml(
     // Omitted when absent rather than written as a sentinel: the driver's
     // own default IS the derivation, so an absent key and a "0 means derive"
     // key would be two spellings of one thing.
-    if let Some(gb) = opts.expert_cache_gb {
-        model.insert("expert_cache_gb".into(), toml::Value::Float(gb));
+    // The driver still speaks GiB floats; the unit lives in the config type,
+    // not on the wire.
+    if let Some(size) = opts.expert_cache {
+        model.insert("expert_cache_gb".into(), toml::Value::Float(size.as_gib_f64()));
     }
-    if let Some(gb) = opts.expert_host_cache_gb {
-        model.insert("expert_host_cache_gb".into(), toml::Value::Float(gb));
+    if let Some(size) = opts.expert_host_cache {
+        model.insert(
+            "expert_host_cache_gb".into(),
+            toml::Value::Float(size.as_gib_f64()),
+        );
     }
     insert_bool(
         &mut model,
@@ -687,7 +692,7 @@ mod tests {
                 opts: DummyDriverOptions {
                     vocab_size: None,
                     arch_name: None,
-                    ready_timeout_s: 5.0,
+                    ready_timeout: crate::config::Duration::from_secs(5),
                 },
                 random_seed: 7,
                 activation_dtype: "f32".to_string(),
