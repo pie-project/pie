@@ -40,6 +40,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -117,6 +118,24 @@ class CheckpointSource {
         std::uint64_t file_offset,
         std::uint64_t span_bytes) const {
         return checked_file(file_id, file_offset, span_bytes).data + file_offset;
+    }
+
+    /// The whole mapping for one plan file: its base and its length.
+    ///
+    /// Every other accessor here hands out a span the plan named, because that
+    /// is what a reader wants. A consumer that means to hand the mapping ITSELF
+    /// to a device needs the base and the length instead -- Metal's no-copy
+    /// buffer takes a page-aligned pointer and a length, and one buffer per
+    /// file is the difference between one allocation and one per tensor.
+    ///
+    /// Returns `{nullptr, 0}` for an unknown or empty file rather than
+    /// throwing: "this file cannot be mapped in place" is an answer a caller
+    /// acts on, not an error.
+    std::pair<const std::uint8_t*, std::size_t> mapped_file(
+        std::uint32_t file_id) const noexcept {
+        if (file_id >= files_.size()) return {nullptr, 0};
+        const File& file = files_[file_id];
+        return {file.data, file.mapped_size};
     }
 
     /// Ask the kernel to start faulting a span in.

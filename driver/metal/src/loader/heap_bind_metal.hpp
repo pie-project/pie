@@ -27,10 +27,12 @@ struct Dispatch;  // beta: decode_step.hpp
 struct BoundDecode {
     HeapPlan plan;
     SlotHandle weights_region;
-    /// Keeps any streamed weights' mapping alive. It MUST outlive every slot in
-    /// `weights`: they point into it, and unmapping it under them reads as
-    /// weights of exactly zero.
-    std::shared_ptr<void> stream_pack;
+    /// Keeps alive whatever the weight slots point into when they point
+    /// outside the heap -- the stream pack, or the checkpoint's own mapping.
+    /// It MUST outlive every slot in `weights`: unmapping it under them reads
+    /// as weights of exactly zero, which is a model that runs and answers
+    /// nothing rather than a model that fails.
+    std::shared_ptr<void> weight_mapping;
 
     // load-once weights, keyed by HF tensor name (tied lm_head appears once).
     std::unordered_map<std::string, SlotHandle> weights;
@@ -65,16 +67,18 @@ struct BoundDecode {
 struct StagedWeights {
     /// How many bytes were bound over a pack instead of copied into the heap.
     std::uint64_t streamed_bytes = 0;
-    /// Keeps that pack's mapping alive. It MUST outlive every slot in
-    /// `weights`: they point into it, and unmapping it under them reads as
-    /// weights of exactly zero -- a model that runs and answers nothing.
-    std::shared_ptr<void> stream_pack;
+    /// Keeps alive whatever the weight slots point into when they point
+    /// outside the heap. Two things can be on the other end and they are the
+    /// same obligation: the stream pack, or -- when the checkpoint already
+    /// places its tensors where a device pointer may point -- the
+    /// `CheckpointSource` whose mmap the slots slice directly.
+    std::shared_ptr<void> weight_mapping;
     SlotHandle weights_region{};
     std::unordered_map<std::string, SlotHandle> weights;
 };
 StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
-    const pie_loader::CheckpointSource& view,
+    std::shared_ptr<pie_loader::CheckpointSource> view,
     const pie_loader::LoadPlan& load,
     std::size_t weights_bytes);
 
@@ -137,14 +141,14 @@ WeightBytes weight_bytes(const std::unordered_map<std::string, SlotHandle>& weig
 
 StagedWeights stage_plan_weights(
     RawMetalContext& ctx,
-    const pie_loader::CheckpointSource& view,
+    std::shared_ptr<pie_loader::CheckpointSource> view,
     const pie_loader::LoadPlan& load,
     std::size_t weights_bytes,
     const std::function<bool(const std::string&)>& streams);
 
 BoundDecode stage_decode_storage(
     RawMetalContext& ctx,
-    const pie_loader::CheckpointSource& view,
+    std::shared_ptr<pie_loader::CheckpointSource> view,
     const pie_loader::LoadPlan& load_plan,
     const DecodeGeometry& g,
     const HeapPlan& heap_plan,

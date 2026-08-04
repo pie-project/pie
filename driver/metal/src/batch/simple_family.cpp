@@ -281,18 +281,19 @@ class Gemma4Engine final : public SimpleFamilyEngine {
 
         try {
             const auto storage = load_plan.view();
-            pie_loader::CheckpointSource view(storage);
+            auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
             StagedWeights staged = stage_plan_weights(
-                ctx, view, load_plan, storage.memory.persistent_bytes,
+                ctx, std::move(view), load_plan, storage.memory.persistent_bytes,
                 stream_predicate(cfg.stream_routed_experts));
             b_.weights = std::move(staged.weights);
-            // The pack must outlive the weights that point into it; see the
+            // Whatever the weights point into -- the pack, or the checkpoint's
+            // own mapping -- must outlive them; see the
             // gpt-oss engine below.
-            stream_pack_ = std::move(staged.stream_pack);
+            weight_mapping_ = std::move(staged.weight_mapping);
             if (staged.streamed_bytes > 0) {
                 std::fprintf(stderr,
-                             "[pie-metal] gemma4: %.2f GB of FFN weights streamed from a "
-                             "pack, and out of the heap\n",
+                             "[pie-metal] gemma4: %.2f GB of weights bound where they lie, and out of "
+                             "the heap\n",
                              double(staged.streamed_bytes) / 1e9);
             }
         } catch (const std::exception& e) {
@@ -491,7 +492,7 @@ class Gemma4Engine final : public SimpleFamilyEngine {
 
     gemma4::Gemma4Geometry g_{};
     /// Keeps the streamed weights' mapping alive; see `init`.
-    std::shared_ptr<void> stream_pack_{};
+    std::shared_ptr<void> weight_mapping_{};
     int max_ctx_ = 0;
     int max_rows_ = 1;
     int max_sampled_ = 1;
@@ -627,15 +628,15 @@ class GptOssEngine final : public SimpleFamilyEngine {
 
         try {
             const auto storage = load_plan.view();
-            pie_loader::CheckpointSource view(storage);
+            auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
             StagedWeights staged = stage_plan_weights(
-                ctx, view, load_plan, storage.memory.persistent_bytes,
+                ctx, std::move(view), load_plan, storage.memory.persistent_bytes,
                 stream_predicate(cfg.stream_routed_experts));
             b_.weights = std::move(staged.weights);
             // The pack must outlive the weights that point into it. Taking only
             // `staged.weights` and letting `staged` die unmaps it under them,
             // which reads as weights of exactly zero.
-            stream_pack_ = std::move(staged.stream_pack);
+            weight_mapping_ = std::move(staged.weight_mapping);
             if (staged.streamed_bytes > 0) {
                 std::fprintf(stderr,
                              "[pie-metal] gpt-oss: %.2f GB of experts streamed from a pack, "
@@ -862,7 +863,7 @@ class GptOssEngine final : public SimpleFamilyEngine {
     std::vector<SlotHandle> kpages_{};
     std::vector<SlotHandle> vpages_{};
     /// Keeps the streamed weights' mapping alive; see `init`.
-    std::shared_ptr<void> stream_pack_{};
+    std::shared_ptr<void> weight_mapping_{};
     int max_sampled_ = 1;
     int max_rows_ = 1;
     int bound_rows_ = 0;
@@ -1002,14 +1003,14 @@ class LlamaEngine final : public SimpleFamilyEngine {
 
         try {
             const auto storage = load_plan.view();
-            pie_loader::CheckpointSource view(storage);
+            auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
             StagedWeights staged = stage_plan_weights(
-                ctx, view, load_plan, storage.memory.persistent_bytes,
+                ctx, std::move(view), load_plan, storage.memory.persistent_bytes,
                 stream_predicate(cfg.stream_routed_experts));
             b_.weights = std::move(staged.weights);
             // The pack must outlive the weights that point into it; see the
             // gpt-oss engine above.
-            stream_pack_ = std::move(staged.stream_pack);
+            weight_mapping_ = std::move(staged.weight_mapping);
             if (staged.streamed_bytes > 0) {
                 std::fprintf(stderr,
                              "[pie-metal] llama: %.2f GB of FFN weights streamed from a pack, "
@@ -1225,7 +1226,7 @@ class LlamaEngine final : public SimpleFamilyEngine {
     MultiBatchPsos mb_{};
     std::vector<llama::KvPages> kv_{};
     /// Keeps the streamed weights' mapping alive; see the gpt-oss engine.
-    std::shared_ptr<void> stream_pack_{};
+    std::shared_ptr<void> weight_mapping_{};
     int max_rows_ = 1;
     int max_sampled_ = 1;
     int bound_rows_ = 0;

@@ -36,6 +36,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -263,10 +264,11 @@ bool a_padded_contract_stages_zeros_where_no_source_reaches() {
     auto ctx = RawMetalContext::create(16u << 20, 64u << 20);
     if (!expect(ctx != nullptr, "RawMetalContext::create succeeds")) return false;
 
-    pie_loader::CheckpointSource source(view);
+    auto source = std::make_shared<pie_loader::CheckpointSource>(view);
     pie::metal::BoundDecode bound;
     try {
-        bound = pie::metal::stage_decode_storage(*ctx, source, plan, geometry, heap_plan);
+        bound = pie::metal::stage_decode_storage(*ctx, std::move(source), plan, geometry,
+                                                 heap_plan);
     } catch (const std::exception& error) {
         expect(false, std::string("staging the padded plan: ") + error.what());
         return false;

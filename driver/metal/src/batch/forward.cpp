@@ -778,12 +778,42 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     // doubled rather than halved, and on a machine where the model only just
     // fits that is the difference between running and reading zeros.
     const auto streams = SimpleFamilyEngine::stream_predicate(cfg.stream_routed_experts);
-    const std::size_t streamed =
-        streams ? std::size_t(streamable_plan_bytes(load_plan, streams)) : 0;
-    const std::size_t heap_bytes = (weights > streamed ? weights - streamed : weights) +
+    // Not gated on `streams`: a checkpoint that places its tensors where a
+    // device pointer may point has EVERY weight bound over its own mapping,
+    // whether or not anything asked for expert streaming.
+    const std::size_t streamed = std::size_t(streamable_plan_bytes(load_plan, streams));
+    // Saturating, not `>` -- when EVERY weight is bound where it lies the two
+    // are equal, and a guard that fell back to the full `weights` on equality
+    // is the one case that matters most: it re-reserved the entire model
+    // alongside its own mapping and the first command buffer came back out of
+    // memory.
+    const std::size_t heap_bytes = (weights >= streamed ? weights - streamed : 0) +
                                    SimpleFamilyEngine::extra_heap_bytes(family, cfg, max_ctx_);
-    // `create` here takes no elastic budget, so the whole ask is the heap.
-    if (!fits_on_this_gpu(heap_bytes, 0, weights, err)) return false;
+    // `create` here takes no elastic budget, so the whole ask is the heap. The
+    // weight figure in the refusal is the heap's share, not the checkpoint's:
+    // bytes bound where they lie are not allocated here, and quoting the whole
+    // model against a heap that never holds it reads as a contradiction.
+    if (!fits_on_this_gpu(heap_bytes, 0, heap_bytes, err)) return false;
+    // Two marks, because between them lies the answer to "why is loading slow"
+    // and the two halves have completely different causes. Everything up to
+    // `staged` is the driver's own work -- copying, dequantizing, allocating --
+    // and `PIE_METAL_LOAD_TRACE`'s `load:` line breaks it down further. What
+    // follows is `make_resident`, which is the kernel paging the weights in,
+    // and no amount of driver work makes it cheaper.
+    //
+    // Binding a checkpoint where it lies moves the whole cost across that line:
+    // Qwen3-30B off safetensors is 31.3 s of copying and 2.2 s of residency,
+    // and off the same weights in a `.zt` it is 1 ms and 9.3 s. The second
+    // number rose because the pages are now faulted from the file instead of
+    // from a heap that the copy had already warmed -- and the total still fell
+    // from 33.8 s to 9.6 s, because the file is read once instead of twice.
+    const auto _t0 = std::chrono::steady_clock::now();
+    const auto _mark = [&](const char* what) {
+        if (std::getenv("PIE_METAL_LOAD_TRACE") == nullptr) return;
+        std::fprintf(stderr, "[pie-metal] setup: %s %.0f ms\n", what,
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - _t0).count());
+    };
     ctx_ = RawMetalContext::create(heap_bytes);
     if (!ctx_) {
         if (err) *err = "RawMetalContext::create failed";
@@ -791,6 +821,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     }
     simple_ = SimpleFamilyEngine::create(family, *ctx_, kernels_dir, cfg, load_plan, max_ctx_,
                                          err);
+    _mark("staged");
     if (!simple_) return false;
 
     // The sampler reads through the same staging path qwen3.5 uses, so the
@@ -837,6 +868,7 @@ bool MetalExecutor::Impl::setup_simple(model::ModelFamily family,
     kv_pool_.layers.clear();
 
     ctx_->make_resident();
+    _mark("resident");
     return true;
 }
 
@@ -851,7 +883,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // The mmap is transient: the LoadPlan copies each finalized tensor
     // once into the resident weights region.
     const auto storage = load_plan.view();
-    pie_loader::CheckpointSource view(storage);
+    auto view = std::make_shared<pie_loader::CheckpointSource>(storage);
     plan_ = plan_heap(
         g_,
         storage.memory.persistent_bytes,
@@ -892,10 +924,11 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     // footprint doubled rather than halved, which on a machine where the model
     // only just fits is the difference between running and reading zeros.
     const auto streams = SimpleFamilyEngine::stream_predicate(stream_routed_experts);
-    const size_t streamed =
-        streams ? size_t(streamable_plan_bytes(load_plan, streams)) : 0;
+    // Not gated on `streams`; see `setup_simple`.
+    const size_t streamed = size_t(streamable_plan_bytes(load_plan, streams));
+    // Saturating; see `setup_simple` on why equality is the case that matters.
     const size_t resident_weights =
-        plan_.weights_bytes > streamed ? plan_.weights_bytes - streamed : plan_.weights_bytes;
+        plan_.weights_bytes >= streamed ? plan_.weights_bytes - streamed : 0;
     const size_t heap_bytes =
         resident_weights + plan_.io_bytes + plan_.mb_io_bytes +
         consts_budget + (32u << 20);
@@ -912,7 +945,7 @@ bool MetalExecutor::Impl::setup(const std::string& kernels_dir,
     }
 
     // ── Stage weights/state/KV/IO; bind weight/state/KV/IO slots by ordinal. ──
-    b_ = stage_decode_storage(*ctx_, view, load_plan, g_, plan_, streams);
+    b_ = stage_decode_storage(*ctx_, std::move(view), load_plan, g_, plan_, streams);
     bind_decode_dag(*ctx_, b_, dag_, g_, gdn_prep_);
 
     // ── Scratch pool (colors_used slots) → beta's bind pass. ──
