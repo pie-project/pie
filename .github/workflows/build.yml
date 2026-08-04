@@ -277,7 +277,7 @@ jobs:
         # 17.14, MSVC 19.44) ships on the image and is within CUDA 12.9's
         # supported host-compiler range. Bump this when the CUDA toolkit is
         # bumped (or when the image drops 14.44).
-        uses: TheMrMilchmann/setup-msvc-dev@v4.0.0
+        uses: TheMrMilchmann/setup-msvc-dev@v4.1.0
         with:
           arch: x64
           toolset: "14.44"
