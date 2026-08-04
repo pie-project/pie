@@ -97,11 +97,27 @@ pub async fn run_standalone(
     let control = EmbeddedControl(handle.clone());
 
     // The in-proc gateway binds its worker-facing socket on an ephemeral
-    // loopback port so the embedded worker can dial in. The client edge binds
-    // what the config says -- there is no mode overriding it, because
-    // `server.host` already defaults to loopback and a second way to decide
-    // the bind address is a second thing that can disagree with the file.
+    // loopback port so the embedded worker can dial in.
     gateway.worker_listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+
+    // The client edge binds `[worker.server] host:port` -- the only address in
+    // the standalone file that looks like it decides this.
+    //
+    // It did not. `[gateway] listen` decided it, that section is empty in every
+    // generated config, and its default is 0.0.0.0:8080 -- so a file saying
+    // `host = "127.0.0.1"` was serving on every interface. `pie local` used to
+    // paper over it by forcing loopback; deleting `pie local` removed the paper
+    // rather than the hole.
+    //
+    // Overwritten rather than defaulted-from, because two spellings for one
+    // bind address is what produced this: whichever loses is a line in a config
+    // file that means nothing.
+    let host: std::net::IpAddr = worker
+        .server
+        .host
+        .parse()
+        .with_context(|| format!("[server] host {:?} is not an IP address", worker.server.host))?;
+    gateway.listen = SocketAddr::new(host, worker.server.port);
     let gw = pie_gateway::bind(gateway, control.clone())
         .await
         .context("bind in-proc gateway")?;
