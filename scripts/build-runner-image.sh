@@ -47,6 +47,9 @@ CUDA_ARCH="90"
 BUILD_JOBS=""
 PUSH=0
 VERIFY_ONLY=""
+# Only meaningful with --verify-only: which recipe the caller expects the tag to be
+# serving. A build does not take this, because a build stamps the recipe it used.
+TOOLING_REV=""
 
 usage() {
     cat >&2 <<EOF
@@ -58,6 +61,10 @@ usage: $(basename "$0") [options]
   --jobs <n>         cap parallel compile jobs; unset uses every core
   --push             publish, then verify the tag registry-side
   --verify-only <t>  skip building; just verify that <repo>:<t> is published
+  --tooling-rev <r>  with --verify-only, the recipe commit the tag must have been
+                     built from (or tree:<sha>); required, because the revision
+                     label alone cannot tell two recipes of the same pie commit
+                     apart
   -h, --help         this text
 EOF
 }
@@ -70,6 +77,7 @@ while [ "$#" -gt 0 ]; do
         --jobs)        BUILD_JOBS="$2"; shift 2 ;;
         --push)        PUSH=1; shift ;;
         --verify-only) VERIFY_ONLY="$2"; shift 2 ;;
+        --tooling-rev) TOOLING_REV="$2"; shift 2 ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -107,15 +115,30 @@ esac
 # that reports success while the registry has nothing is exactly how a topology
 # ends up pinned to an unpublished tag.
 # ---------------------------------------------------------------------------
+#
+# The revision label alone is not enough to identify an image. Every recipe commit
+# that builds the same PIE_REV lands on the same mutable tag, so two images with
+# identical revision labels can differ in ways that matter — 338fe76fe removed the
+# baked SSH host keys that cec35638e shipped, and both claim revision a922174bc139.
+# Comparing only the revision would certify either one, including a rebuild or
+# revert that put the vulnerable image back on the tag. So the expected recipe is
+# compared too, and both are printed.
+#
+# The expected tooling revision is an INPUT, deliberately not read from HEAD:
+# derived from HEAD, --verify-only would stop being able to check an already
+# published image the moment the recipe moved on, which is exactly when you want to
+# ask what is live.
 verify_published() {
-    local repo="$1" tag="$2" want_rev="$3"
+    local repo="$1" tag="$2" want_rev="$3" want_tooling_rev="$4"
     echo "==> verifying ${repo}:${tag} against the registry"
-    PIE_VERIFY_REPO="${repo}" PIE_VERIFY_TAG="${tag}" PIE_VERIFY_REV="${want_rev}" python3 - <<'PY'
+    PIE_VERIFY_REPO="${repo}" PIE_VERIFY_TAG="${tag}" PIE_VERIFY_REV="${want_rev}" \
+    PIE_VERIFY_TOOLING_REV="${want_tooling_rev}" python3 - <<'PY'
 import json, os, sys, urllib.error, urllib.request
 
 repo = os.environ["PIE_VERIFY_REPO"]
 tag = os.environ["PIE_VERIFY_TAG"]
 want_rev = os.environ["PIE_VERIFY_REV"]
+want_tooling_rev = os.environ["PIE_VERIFY_TOOLING_REV"]
 accept = ", ".join([
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -190,17 +213,36 @@ if published_rev != want_rev:
         f"{published_rev!r} and this build claims {want_rev!r}"
     )
 
+published_tooling_rev = labels.get("org.pie-project.image.tooling_revision")
+if published_tooling_rev != want_tooling_rev:
+    fail(
+        f"{repo}:{tag} is published and its revision label matches, but it was "
+        f"built from recipe {published_tooling_rev!r} and this expects "
+        f"{want_tooling_rev!r}. The revision label cannot tell these apart: "
+        "every recipe that builds this pie commit shares this tag, so the tag "
+        "may have been rebuilt or reverted to a different recipe. Nothing may be "
+        "pinned to it until the recipe is the expected one."
+    )
+
 print(f"    tag published: {repo}:{tag}")
 print(f"    revision label: {published_rev}")
+print(f"    tooling revision: {published_tooling_rev}")
 print(f"    cuda arches: {labels.get('org.pie-project.cuda.architectures')}")
 print(f"    immutable ref: {repo}@{digest}")
 PY
 }
 
 if [ -n "${VERIFY_ONLY}" ]; then
-    verify_published "${REPO}" "${VERIFY_ONLY}" "${REV}"
+    [ -n "${TOOLING_REV}" ] \
+        || die "--verify-only also needs --tooling-rev: the revision label alone cannot distinguish two recipes of the same pie commit, so verifying without it could certify an image you did not mean"
+    printf '%s' "${TOOLING_REV}" | grep -Eq '^(tree:)?[0-9a-f]{40}$' \
+        || die "--tooling-rev must be a full 40-character lowercase sha, optionally 'tree:'-prefixed (got '${TOOLING_REV}')"
+    verify_published "${REPO}" "${VERIFY_ONLY}" "${REV}" "${TOOLING_REV}"
     exit 0
 fi
+
+[ -z "${TOOLING_REV}" ] \
+    || die "--tooling-rev applies only to --verify-only; a build stamps the recipe it actually used rather than one supplied on the command line"
 
 # ---------------------------------------------------------------------------
 # The pin. What has to be true is that the pie source compiled into the image is
@@ -369,8 +411,45 @@ if [ -n "${tooling_untracked}" ]; then
     die "refusing to publish an image whose recipe is in no commit (it would be labelled ${tooling_rev}, a tree only this clone has); commit the tooling and rebuild, then push"
 fi
 
+# The same contract, broken the other way: the recipe is in a commit, but only in
+# this clone. Committing locally satisfies the check above, so nothing so far stops
+# publishing an image whose tooling_revision label no consumer can resolve — and if
+# this clone is lost, the artifact's recipe is gone for good.
+#
+# An existence check, not a sync: `git ls-remote` asks the declared source
+# repository what refs it has and fetches nothing. The commit passes if the remote
+# publishes it as a tip, or if it is an ancestor of a tip whose history this clone
+# can already evaluate (the ordinary case: the branch was pushed, then more commits
+# landed on top).
+#
+# This URL is the one the image advertises as org.opencontainers.image.source in
+# docker/runner-cuda-sm90.Dockerfile; it is where a consumer will go looking, so it
+# is what has to be checked, not whatever `origin` happens to point at here.
+source_repo_url="https://github.com/pie-project/pie.git"
+remote_tips="$(git ls-remote "${source_repo_url}" 'refs/heads/*' 'refs/tags/*' | awk '{print $1}')" \
+    || die "cannot reach ${source_repo_url} to confirm the recipe commit is published there"
+
+tooling_reachable=""
+if printf '%s\n' "${remote_tips}" | grep -qxF "${tooling_rev}"; then
+    tooling_reachable="published as a ref tip"
+else
+    for tip in ${remote_tips}; do
+        git cat-file -e "${tip}^{commit}" 2>/dev/null || continue
+        if git merge-base --is-ancestor "${tooling_rev}" "${tip}"; then
+            tooling_reachable="an ancestor of ${tip}"
+            break
+        fi
+    done
+fi
+
+if [ -z "${tooling_reachable}" ]; then
+    echo "build-runner-image: recipe commit ${tooling_rev} is not reachable from ${source_repo_url}" >&2
+    die "refusing to publish an image whose recipe is in a commit only this clone has; push the branch first, then publish, so that org.pie-project.image.tooling_revision resolves for whoever pulls the image"
+fi
+echo "==> recipe commit ${tooling_rev} is ${tooling_reachable} on ${source_repo_url}"
+
 docker push "${REF}"
-verify_published "${REPO}" "${TAG}" "${REV}"
+verify_published "${REPO}" "${TAG}" "${REV}" "${tooling_rev}"
 
 cat <<EOF
 
