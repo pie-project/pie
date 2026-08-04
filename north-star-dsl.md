@@ -2665,3 +2665,16 @@ plan hook), so banding it requires planning from composed geometry —
 scoped out as a future increment; the envelope degrades to the
 pre-Act-1 demotion, no regression. Diagnosis instruments are
 permanent (PIE_REGION_TRACE: [region] / [band-gate] / [band-prep]).
+
+## THE SECOND LEG WALKS BANDS (2026-08-04)
+
+The declared interpreter now serves banded fires: per-op live-row
+resolution from the band arrays, the PrefixPlanSwap dispatch pairing
+each band's plan with its own workspace; the generated static forms
+stand down; the model gate admits only fires whose decode-family band
+plans exist. Validated opt-in (PIE_DECLARED_FORWARD=1): 22 banded
+fires walk the trace, hand walker zero, full lane byte-equal, zero
+incidents. Record corrected: the declared leg (opt-in, never running)
+was NOT the 14B demoter — the envelope's prepare-skip was the whole
+story. Board: hand ✓ declared ✓ generated (stands down, port later);
+envelope banding and Act 2/3 remain.
