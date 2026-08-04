@@ -44,7 +44,7 @@ enum Command {
         cmd: ops::cache::CacheCmd,
     },
 
-    /// Manage configuration (list / show / set / unset / init).
+    /// Manage configuration (list / show / set / unset / edit / init).
     Config {
         #[command(subcommand)]
         cmd: ops::config::ConfigCmd,

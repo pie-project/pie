@@ -104,11 +104,19 @@ fn init(global: &startup::GlobalArgs, force: bool) -> Result<()> {
 /// different and usually more useful answer. A key you never set still has a
 /// value, and until now the only way to learn it was to read the Rust.
 fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Result<()> {
-    let (cfg_path, _) = startup::cli_config_path(global);
+    let (cfg_path, origin) = startup::cli_config_path(global);
     let file: toml::Value = match std::fs::read_to_string(&cfg_path) {
         Ok(content) => toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?,
-        // Absent is normal; then nothing is set and every row is a default.
-        Err(_) => toml::Value::Table(Default::default()),
+        // Absent is normal on the default path -- nothing is set and every row
+        // is a default. Named explicitly and absent is the operator pointing at
+        // a file that is not there, which `show` and `doctor` both refuse; this
+        // silently listed defaults instead.
+        Err(_) if origin == startup::Origin::Default => toml::Value::Table(Default::default()),
+        Err(e) => bail!(
+            "no config file at {} ({}): {e}",
+            crate::ui::short_path(&cfg_path),
+            origin.describe()
+        ),
     };
 
     // Which driver the config asks for decides which option keys exist at all.
@@ -187,8 +195,13 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
         sections.entry(parent).or_default().push(field);
     }
 
-    for section in &order {
-        println!("\n{bold}[{section}]{reset}");
+    for (index, section) in order.iter().enumerate() {
+        // No leading blank line: `pie config list | head -1` should be a
+        // heading, not nothing.
+        if index > 0 {
+            println!();
+        }
+        println!("{bold}[{section}]{reset}");
         let mut table = crate::ui::Table::new(
             [
                 crate::ui::Align::Left,
@@ -197,7 +210,7 @@ fn list(global: &startup::GlobalArgs, prefix: Option<String>, json: bool) -> Res
             ],
             2,
         );
-        for field in &sections[section] {
+        for field in &sections[section.as_str()] {
             // A marker rather than a colour: this is the column a person scans
             // for -- what have I actually changed? -- and it has to survive a
             // pipe.
@@ -234,6 +247,43 @@ fn effective(file: &toml::Value, field: &pie_worker::config_schema::Field) -> St
     }
 }
 
+/// The schema entry for a key, or an "unknown key" error naming near misses.
+///
+/// Every command that takes a KEY goes through here, so a typo reads as a typo
+/// rather than as whatever the schema happened to say next. `set nope.key 1`
+/// used to fail with "nope.key does not accept \"1\"", which describes a type
+/// mismatch on a key that does not exist.
+fn schema_field(file: &toml::Value, key: &str) -> Result<pie_worker::config_schema::Field> {
+    let fields = pie_worker::config_schema::fields(driver_kind(file));
+    if let Some(found) = fields.iter().find(|f| f.key == key) {
+        return Ok(found.clone());
+    }
+    let leaf = key.rsplit('.').next().unwrap_or(key);
+    let near: Vec<&str> = fields
+        .iter()
+        .filter(|f| f.key.ends_with(&format!(".{leaf}")) || f.key == leaf)
+        .map(|f| f.key.as_str())
+        .collect();
+    if near.is_empty() {
+        bail!("unknown key {key:?}; `pie config list` shows every key");
+    }
+    bail!("unknown key {key:?}; did you mean {}?", near.join(" or "))
+}
+
+/// Which driver the config asks for, since that decides which `[driver]` keys
+/// exist at all.
+fn driver_kind(file: &toml::Value) -> pie_worker::config::DriverKind {
+    pie_worker::config_schema::lookup(file, "driver.type")
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "cuda_native" | "cuda" => Some(pie_worker::config::DriverKind::CudaNative),
+            "metal" => Some(pie_worker::config::DriverKind::Metal),
+            "dummy" => Some(pie_worker::config::DriverKind::Dummy),
+            _ => None,
+        })
+        .unwrap_or(pie_worker::config::DriverKind::Dummy)
+}
+
 fn is_set(file: &toml::Value, key: &str) -> bool {
     pie_worker::config_schema::lookup(file, key).is_some()
 }
@@ -266,7 +316,7 @@ fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
         }
         bail!(
             "no config file at {} ({}); pie will not start without it",
-            cfg_path.display(),
+            crate::ui::short_path(&cfg_path),
             origin.describe()
         );
     }
@@ -276,12 +326,20 @@ fn show(global: &startup::GlobalArgs, key: Option<String>) -> Result<()> {
     if let Some(key) = key {
         let root: toml::Value =
             toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
-        let found = get_nested(&root, &key).ok_or_else(|| {
-            // Absent is a real answer here, not a failure of lookup: pie
-            // derives a value when a key is missing, so say which it is.
-            anyhow!("{key} is not set; pie derives it. `pie config list` shows every key and its value")
-        })?;
-        println!("{}", display_value(found));
+        if let Some(found) = get_nested(&root, &key) {
+            println!("{}", display_value(found));
+            return Ok(());
+        }
+        // Not in the file is not the same as having no value. `show` used to
+        // stop here and say "pie derives it" for every key the file omitted --
+        // which is most of them, and which disagreed with `pie config list`
+        // three lines down the terminal. It answers with what pie will USE.
+        let field = schema_field(&root, &key)?;
+        match (&field.default, field.required) {
+            (Some(default), _) => println!("{}", display_value(default)),
+            (None, true) => bail!("{key} has no value: the config must set it"),
+            (None, false) => bail!("{key} is not set; pie derives it at startup"),
+        }
         return Ok(());
     }
     let cwd = std::env::current_dir().ok();
@@ -436,6 +494,12 @@ fn typed_by_schema(
     key: &str,
     value: &str,
 ) -> Result<(String, toml::Value)> {
+    // Checked first so a typo reads as a typo. Without it the candidate loop
+    // runs to its last (string) reading and reports THAT failure, which for a
+    // key that does not exist describes a type mismatch instead.
+    let parsed: toml::Value =
+        toml::from_str(content).unwrap_or_else(|_| toml::Value::Table(Default::default()));
+    schema_field(&parsed, key)?;
     let mut last_error = None;
     for candidate in candidates(value) {
         let mut root: toml::Value =
@@ -552,6 +616,9 @@ fn unset(global: &startup::GlobalArgs, key: String) -> Result<()> {
     let mut root: toml::Value =
         toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
 
+    // An unknown key is a typo, not an already-unset key: reporting "already
+    // unset" for `serrver.port` tells the operator their edit took effect.
+    schema_field(&root, &key)?;
     if !remove_nested(&mut root, &key)? {
         println!("{key} is already unset");
         return Ok(());
@@ -641,6 +708,30 @@ fn step<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_key_reads_as_a_typo_not_as_a_type_error() {
+        let file: toml::Value = toml::from_str(fixture()).unwrap();
+        // The old failure mode: `set server.nonexistent 5` ran the candidate
+        // loop to its string reading and reported that, which describes a type
+        // mismatch on a key that does not exist.
+        let err = schema_field(&file, "server.nonexistent").unwrap_err().to_string();
+        assert!(err.contains("unknown key"), "got: {err}");
+        // A near miss names the real key rather than the whole list.
+        let err = schema_field(&file, "serrver.port").unwrap_err().to_string();
+        assert!(err.contains("server.port"), "got: {err}");
+    }
+
+    #[test]
+    fn show_and_list_agree_about_an_unset_key_with_a_default() {
+        // They did not. `show` said "pie derives it" for every key the file
+        // omitted -- which is most of them -- while `list` printed the default
+        // three lines further down the same terminal.
+        let file: toml::Value = toml::from_str("[model]\nname = \"a\"\n").unwrap();
+        let field = schema_field(&file, "server.port").unwrap();
+        assert_eq!(field.default, Some(toml::Value::Integer(8080)));
+        assert_eq!(effective(&file, &field), "8080");
+    }
 
     #[test]
     fn effective_distinguishes_set_from_default_from_derived_from_required() {

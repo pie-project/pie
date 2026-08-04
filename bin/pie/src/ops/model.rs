@@ -154,7 +154,17 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
 fn list(json: bool) -> Result<()> {
     let hub = hub_dir();
     if !hub.exists() {
-        println!("(no HuggingFace cache at {})", hub.display());
+        // `--json` promises one document per invocation, so the early return
+        // has to honour it too -- a consumer parsing stdout should never get
+        // nothing because a directory happened to be missing.
+        if json {
+            return crate::ui::emit_json(&serde_json::json!({
+                "hub": hub,
+                "models": [],
+            }));
+        }
+        println!("nothing downloaded yet");
+        println!("  no HuggingFace cache at {}", crate::ui::short_path(&hub));
         return Ok(());
     }
 
@@ -214,7 +224,7 @@ fn list(json: bool) -> Result<()> {
         ));
     }
     table.print(&palette);
-    println!("\n{dim}{}{reset}", hub.display());
+    println!("\n{dim}{}{reset}", crate::ui::short_path(&hub));
     Ok(())
 }
 
