@@ -2591,9 +2591,12 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         s.depth_band_k.clear();
         s.depth_band_rows.clear();
         {
+            // DEFAULT ON since the 7B pricing (the demotion was the
+            // bug — a co-fired lane's k is honored, layer-skip pays
+            // 1.26x on draft fleets); PIE_DEPTH_BANDS=0 disarms.
             static const bool bands_on = [] {
                 const char* v = std::getenv("PIE_DEPTH_BANDS");
-                return v != nullptr && v[0] == '1';
+                return v == nullptr || v[0] != '0';
             }();
             const auto& ind = s.dispatch_view.region_row_indptr;
             if (bands_on && s.is_pure_decode && !s.have_custom_mask &&
