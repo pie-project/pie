@@ -112,6 +112,12 @@ inline bool spatial_stream_enabled() {
 // dedicated workspace the mixed prepare planned into.
 AttentionWorkspace& spatial_suffix_attn_ws() { return spatial_suffix_ws(); }
 
+// ④ Act 1: the interpreter's banded tail dispatch pairs against the
+// same per-band workspaces the prepare planned into.
+AttentionWorkspace& depth_band_attn_ws_public(int i) {
+    return depth_band_ws(i);
+}
+
 namespace {
 
 inline SpatialSideStream& spatial_side_stream() {

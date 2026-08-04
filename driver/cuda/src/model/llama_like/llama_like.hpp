@@ -205,6 +205,11 @@ struct LlamaLikePlanState {
 // sites pair with it.
 AttentionWorkspace& spatial_suffix_attn_ws();
 
+// ④ Act 1 (banded depth): band slot `i`'s dedicated workspace — the
+// prepare plans each band's prefix plan into it, and both walkers'
+// banded tail dispatches pair against it.
+AttentionWorkspace& depth_band_attn_ws_public(int i);
+
 // Refresh the decode plan for the current fire. Caller invokes this
 // BEFORE either a direct forward call OR a graph replay, outside any
 // capture region. Pure decode plans the flashinfer decode/predecode path;

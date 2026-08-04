@@ -460,7 +460,10 @@ void llama_like_forward_declared(
     // complete): the emitter constructs the lora staging AND the hook
     // sidebands (page mask, score captures) and spells the sites,
     // brackets and corrections with constant layers.
-    if (generated_forward_enabled()) {
+    if (generated_forward_enabled() &&
+        // ④: the static forms have no banded walk — banded fires keep
+        // the interpreter.
+        plan_state.depth_band_count < 2) {
         const auto run = [&](auto decode_fn, auto prefill_fn) {
             (is_pure_decode ? decode_fn : prefill_fn)(
                 w, cfg, fwd_cfg, plan_state, ws, cache, attn_ws, cublas,
@@ -533,6 +536,31 @@ void llama_like_forward_declared(
             "prefix plan (gate drift)");
     }
     bool depth_tail_active = false;
+    // ④ Act 1 (banded depth): >= 2 distinct-k bands stamped by the
+    // prepare. Deepest-first arrays; at layer L the live rows are
+    // N_fire below the shallowest k, else the matched band's start row
+    // (0 = the op is skipped — nothing lives at that depth). Banded
+    // fires derive max_layers FULL, so the union/uniform logic above
+    // stays idle.
+    const int band_count = static_cast<int>(plan_state.depth_band_count);
+    const bool depth_banded = band_count >= 2 && depth_stated;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (plan_state.depth_band_rows[static_cast<std::size_t>(j)] >
+                    0 &&
+                !plan_state.depth_band_plans[static_cast<std::size_t>(j)]) {
+                throw std::runtime_error(
+                    "depth bands (declared): stamped band without a "
+                    "usable prefix plan (the model gate should have "
+                    "kept this fire hand-written)");
+            }
+        }
+        if (std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr) {
+            std::fprintf(stderr, "[depth-bands-declared] R=%d m=%d\n",
+                         R_fire, band_count);
+        }
+    }
+    int depth_band_index = -1;
     // The Peel split (A3): the hook-free prefix row count — the
     // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
     // the stated Peel op, not a choice: with no hooks every row is the
@@ -735,7 +763,31 @@ void llama_like_forward_declared(
         // tail-layer ops are SKIPPED (the unchanged epilogue, layer -1,
         // is the logit-lens head). Union fire: tail-layer ops run over
         // the full-depth prefix rows.
-        if (depth_k >= 0) {
+        if (depth_banded) {
+            depth_band_index = -1;
+            int live = N_fire;
+            if (op.depth_role != 0) {
+                // Deepest-first: the first band whose k the layer has
+                // reached is the deepest containing interval.
+                for (int j = 0; j < band_count; ++j) {
+                    if (op.layer >= static_cast<std::int32_t>(
+                                        plan_state.depth_band_k
+                                            [static_cast<std::size_t>(j)])) {
+                        live = static_cast<int>(
+                            plan_state.depth_band_rows
+                                [static_cast<std::size_t>(j)]);
+                        depth_band_index = j;
+                        break;
+                    }
+                }
+            }
+            if (live == 0) continue;
+            N = live;
+            R = live;
+            if (depth_band_index >= 0 && live == N_fire) {
+                depth_band_index = -1;  // degenerate: every row lives
+            }
+        } else if (depth_k >= 0) {
             // PROMOTED: membership comes from the op's STATED role
             // (depth_role != 0), not a re-derived layer-tag rule — the
             // one function all walkers share is now the trace itself.
@@ -1185,6 +1237,27 @@ void llama_like_forward_declared(
                 // STRUCTURAL S-4: tail-layer attention on a union fire
                 // pairs with the PREFIX plan and its dedicated
                 // workspace (the plan/workspace pairing rule).
+                // ④ Act 1: a banded tail dispatch pairs the band's
+                // prefix plan with the band's OWN workspace.
+                if (depth_band_index >= 0 && op.depth_role == 2) {
+                    const int layer_window_left_b =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    auto kv_view_b = cache.layer_view(L);
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan_state.depth_band_plans
+                             [static_cast<std::size_t>(depth_band_index)],
+                        attn_q, kv_view_b, attn_out_buf,
+                        kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        depth_band_attn_ws_public(depth_band_index),
+                        stream, layer_window_left_b,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    break;
+                }
                 if (depth_tail_active && op.depth_role == 2) {
                     const int layer_window_left_d =
                         (!fwd_cfg.per_layer_window_left.empty() &&

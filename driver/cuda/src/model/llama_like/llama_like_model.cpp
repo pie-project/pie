@@ -134,13 +134,22 @@ void LlamaLikeModel::body(Workspace& ws,
         // the packed buffer cannot honour it (same availability check the
         // hand-written `use_fused_qkv` makes).
         (!declared_.fused_qkv || !ws.qkv_fused.empty()) &&
-        // ④ Act 1 (banded depth): the declared walker has no banded
-        // form yet — a banded fire falls back to the hand-written body
-        // (the per-fire fallback this gate exists for). Without this
-        // term the declared leg silently demotes mixed-k fires to full
-        // depth (caught live at 14B: R=8 co-fires, no [depth-bands],
-        // no DECLINE).
-        plan_.depth_band_count < 2;
+        // ④ Act 1 (banded depth): the interpreter serves banded fires
+        // when the DECODE-family band plans exist (every live band has
+        // its prefix plan); prefill-family banded deployments keep the
+        // hand-written body. Without any term here the declared leg
+        // silently demoted mixed-k fires to full depth (caught live at
+        // 14B: R=8 co-fires, no [depth-bands], no DECLINE).
+        (plan_.depth_band_count < 2 ||
+         (in.is_pure_decode && [&] {
+             for (std::uint32_t j = 0; j < plan_.depth_band_count; ++j) {
+                 if (plan_.depth_band_rows[j] > 0 &&
+                     !plan_.depth_band_plans[j]) {
+                     return false;
+                 }
+             }
+             return true;
+         }()));
     if (declared_eligible) {
         llama_like_forward_declared(
             declared_, weights_, hf_config_, fwd_cfg_, plan_,
