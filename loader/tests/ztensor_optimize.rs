@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use pie_loader::checkpoint::write::WriteTensor;
 use pie_loader::checkpoint::write::write_zt;
 use pie_loader::checkpoint::zt::parse_checkpoint;
-use pie_loader::types::{DType, Encoding, QuantScheme, QuantSpec, TensorDecl, TensorId, Visibility};
+use pie_loader::types::{
+    DType, Encoding, QuantScheme, QuantSpec, TensorDecl, TensorId, Visibility,
+};
 
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zt_optimize_{tag}_{}", std::process::id()));
@@ -57,11 +59,19 @@ fn an_optimized_artifact_reads_back_byte_for_byte() {
     let dir = tmpdir("artifact");
     let path = dir.join("model.zt");
 
-    let embed: Vec<u8> = (0..4096u32).flat_map(|i| ((i % 97) as f32).to_le_bytes()).collect();
-    let norm: Vec<u8> = (0..256u32).flat_map(|i| ((i % 13) as f32).to_le_bytes()).collect();
+    let embed: Vec<u8> = (0..4096u32)
+        .flat_map(|i| ((i % 97) as f32).to_le_bytes())
+        .collect();
+    let norm: Vec<u8> = (0..256u32)
+        .flat_map(|i| ((i % 13) as f32).to_le_bytes())
+        .collect();
     let bias = vec![3u8; 64];
 
-    let d_embed = decl("model.embed.weight", vec![1024, 4], Encoding::Raw(DType::F32));
+    let d_embed = decl(
+        "model.embed.weight",
+        vec![1024, 4],
+        Encoding::Raw(DType::F32),
+    );
     let d_norm = decl("model.norm.weight", vec![256], Encoding::Raw(DType::F32));
     let d_bias = decl("model.bias", vec![64], Encoding::Raw(DType::U8));
 
@@ -73,9 +83,18 @@ fn an_optimized_artifact_reads_back_byte_for_byte() {
         &path,
         &provenance,
         &[
-            WriteTensor { decl: &d_embed, bytes: &embed },
-            WriteTensor { decl: &d_norm, bytes: &norm },
-            WriteTensor { decl: &d_bias, bytes: &bias },
+            WriteTensor {
+                decl: &d_embed,
+                bytes: &embed,
+            },
+            WriteTensor {
+                decl: &d_norm,
+                bytes: &norm,
+            },
+            WriteTensor {
+                decl: &d_bias,
+                bytes: &bias,
+            },
         ],
     )
     .unwrap();
@@ -116,7 +135,10 @@ fn a_corrupt_artifact_is_caught_by_its_digest() {
     write_zt(
         &path,
         &BTreeMap::new(),
-        &[WriteTensor { decl: &d, bytes: &bytes }],
+        &[WriteTensor {
+            decl: &d,
+            bytes: &bytes,
+        }],
     )
     .unwrap();
 
@@ -167,7 +189,10 @@ fn each_affine_group_scheme_round_trips_as_itself() {
         write_zt(
             &path,
             &BTreeMap::new(),
-            &[WriteTensor { decl: &d, bytes: &payload }],
+            &[WriteTensor {
+                decl: &d,
+                bytes: &payload,
+            }],
         )
         .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
 
@@ -209,7 +234,10 @@ fn the_artifact_names_parameters_not_schemes() {
     write_zt(
         &path,
         &BTreeMap::new(),
-        &[WriteTensor { decl: &d, bytes: &vec![0u8; 512] }],
+        &[WriteTensor {
+            decl: &d,
+            bytes: &vec![0u8; 512],
+        }],
     )
     .unwrap();
 

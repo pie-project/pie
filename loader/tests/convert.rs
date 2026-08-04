@@ -67,7 +67,11 @@ fn convert_writes_a_zt_checkpoint() {
     );
 
     let artifact = out.join("model.zt");
-    assert!(artifact.is_file(), "convert did not write {}", artifact.display());
+    assert!(
+        artifact.is_file(),
+        "convert did not write {}",
+        artifact.display()
+    );
 
     let parsed = parse_checkpoint_metadata(&artifact).unwrap();
     let w = parsed.tensor_by_name("w").expect("payload is in the file");
@@ -103,7 +107,10 @@ fn convert_writes_a_zt_checkpoint() {
     // Provenance landed in the file's own attributes rather than a sidecar.
     let attributes = format!(
         "{:?}",
-        reader.attributes().as_ref().expect("provenance is recorded")
+        reader
+            .attributes()
+            .as_ref()
+            .expect("provenance is recorded")
     );
     for key in [
         "pie_convert_compiler",
@@ -120,7 +127,10 @@ fn convert_writes_a_zt_checkpoint() {
         .arg(&out)
         .output()
         .unwrap();
-    assert!(!rerun.status.success(), "an existing destination was overwritten");
+    assert!(
+        !rerun.status.success(),
+        "an existing destination was overwritten"
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
