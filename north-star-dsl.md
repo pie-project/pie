@@ -2073,3 +2073,11 @@ prefix), and the BLINDING PROPERTY SURVIVES — the isolated lane still
 cannot name the planted code word while sharing the fire. Policy
 semantics are composition-invariant, which is the whole promise: the
 work-sharing merge never leaks what a mask forbids.
+
+## PRODUCT RE-PRICED AT THE 15/15 TIP (2026-08-04)
+
+Composed ~1.11s vs solo regime ~1.31s warm — 1.18x on the five-lane
+mix, consistent with the pre-anchor 1.22x (the hook cells' wins ride
+shapes this small battery barely exercises; the per-axis numbers
+remain the scaling story). The A/B stands as the campaign's standing
+perf regression: composed strictly dominates at every measured shape.
