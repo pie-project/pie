@@ -149,7 +149,7 @@ impl Decoder {
 
         fwd.submit(&pipeline).context("prefill submit")?;
         self.seq += n;
-        let g0 = g_ch.take().to_host::<i32>().await?;
+        let g0 = g_ch.take_host::<i32>().await?;
         Ok(g0 as u32)
     }
 
@@ -260,7 +260,7 @@ impl DecodeLoop {
 
     /// Drain the oldest in-flight fire's token (blocks until committed).
     async fn take(&self) -> Result<u32> {
-        let t = self.out.take().to_host::<Vec<i32>>().await?;
+        let t = self.out.take_host::<Vec<i32>>().await?;
         Ok(*t.first().unwrap_or(&0) as u32)
     }
 

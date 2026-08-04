@@ -99,12 +99,12 @@ async fn main(_input: Input) -> Result<String> {
     fwd.submit(&pipeline)
         .context("sampling-primitives submit")?;
 
-    let token = token_out.take().to_host::<i32>().await? as usize;
-    let logits = logits_out.take().to_host::<Vec<f32>>().await?;
-    let entropy = entropy_out.take().to_host::<f32>().await?;
-    let probabilities = probs_out.take().to_host::<Vec<f32>>().await?;
-    let log_probabilities = logprobs_out.take().to_host::<Vec<f32>>().await?;
-    let keep_mask = keep_out.take().to_host::<Vec<i32>>().await?;
+    let token = token_out.take_host::<i32>().await? as usize;
+    let logits = logits_out.take_host::<Vec<f32>>().await?;
+    let entropy = entropy_out.take_host::<f32>().await?;
+    let probabilities = probs_out.take_host::<Vec<f32>>().await?;
+    let log_probabilities = logprobs_out.take_host::<Vec<f32>>().await?;
+    let keep_mask = keep_out.take_host::<Vec<i32>>().await?;
     pipeline.close();
 
     if token != argmax(&logits) || token != argmax(&probabilities) {

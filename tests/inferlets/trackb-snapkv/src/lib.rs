@@ -300,8 +300,7 @@ async fn main(input: Input) -> Result<Output> {
             .submit(&pipe)
             .with_context(|| format!("prefill chunk submit @{base}"))?;
         tok_out_c
-            .take()
-            .to_host::<Vec<i32>>()
+            .take_host::<Vec<i32>>()
             .await
             .with_context(|| format!("prefill chunk take @{base}"))?;
     }
@@ -394,12 +393,12 @@ async fn main(input: Input) -> Result<Output> {
         .submit(&pipe)
         .with_context(|| format!("prefill submit @{base}"))?;
 
-    let g0 = tok_out_p.take().to_host::<i32>().await?;
+    let g0 = tok_out_p.take_host::<i32>().await?;
     generated.push(g0 as u32);
 
-    let prefill_scores = scores_out.take().to_host::<Vec<f32>>().await?;
-    let layers_observed = layers_out.take().to_host::<u32>().await?;
-    let device_page_mass = page_mass_out.take().to_host::<Vec<f32>>().await?;
+    let prefill_scores = scores_out.take_host::<Vec<f32>>().await?;
+    let layers_observed = layers_out.take_host::<u32>().await?;
+    let device_page_mass = page_mass_out.take_host::<Vec<f32>>().await?;
 
     // ── DECODE LOOP (1-wide, run-ahead), enforcing the fixed keep-set. ──
     if generated.len() < max_tokens {
@@ -488,8 +487,7 @@ async fn main(input: Input) -> Result<Output> {
         let budget_n = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
-                .take()
-                .to_host::<i32>()
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);

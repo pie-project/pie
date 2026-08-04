@@ -245,9 +245,9 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().to_host::<i32>().await?;
-    let k0 = kept_out_p.take().to_host::<f32>().await?;
-    let m0 = mass_out_p.take().to_host::<f32>().await?;
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let k0 = kept_out_p.take_host::<f32>().await?;
+    let m0 = mass_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
     kept_sizes.push(k0);
     kept_mass.push(m0);
@@ -316,18 +316,15 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
-                .take()
-                .to_host::<i32>()
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             let k = kept_out
-                .take()
-                .to_host::<f32>()
+                .take_host::<f32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             let m = mass_out
-                .take()
-                .to_host::<f32>()
+                .take_host::<f32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);

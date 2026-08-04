@@ -172,7 +172,7 @@ async fn main(input: Input) -> Result<String> {
     // streams must share a single scope.
     let pipeline = Pipeline::new();
     uncond_prefill.submit(&pipeline).context("uncond prefill")?;
-    let first_uncond_logits = u_pre_out.take().to_host::<Vec<f32>>().await?;
+    let first_uncond_logits = u_pre_out.take_host::<Vec<f32>>().await?;
 
     // ---- conditional stream ---------------------------------------------
     let cond_ws = WorkingSet::new();
@@ -222,9 +222,9 @@ async fn main(input: Input) -> Result<String> {
 
     c_pre_uncond.put(first_uncond_logits);
     cond_prefill.submit(&pipeline).context("cond prefill")?;
-    let first = first_out.take().to_host::<i32>().await? as u32;
-    let mut shifts = first_shift.take().to_host::<i32>().await? as u64;
-    let mut kl_total = first_kl.take().to_host::<f32>().await? as f64;
+    let first = first_out.take_host::<i32>().await? as u32;
+    let mut shifts = first_shift.take_host::<i32>().await? as u64;
+    let mut kl_total = first_kl.take_host::<f32>().await? as f64;
     let mut scored = 1u64;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
@@ -341,13 +341,13 @@ async fn main(input: Input) -> Result<String> {
     for _ in 0..budget {
         u_token.put(vec![previous as i32]);
         uncond_decode.submit(&pipeline).context("uncond decode")?;
-        let uncond_logits = u_logits_out.take().to_host::<Vec<f32>>().await?;
+        let uncond_logits = u_logits_out.take_host::<Vec<f32>>().await?;
 
         c_uncond.put(uncond_logits);
         cond_decode.submit(&pipeline).context("cond decode")?;
-        let token = c_token_out.take().to_host::<i32>().await? as u32;
-        shifts += c_shift_out.take().to_host::<i32>().await? as u64;
-        kl_total += c_kl_out.take().to_host::<f32>().await? as f64;
+        let token = c_token_out.take_host::<i32>().await? as u32;
+        shifts += c_shift_out.take_host::<i32>().await? as u64;
+        kl_total += c_kl_out.take_host::<f32>().await? as f64;
         scored += 1;
 
         if stop_tokens.contains(&token) {

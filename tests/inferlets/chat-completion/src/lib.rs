@@ -8,7 +8,6 @@
 //! handling; the sampled token itself remains device-carried into the next pass.
 
 use inferlet::chat;
-use inferlet::ptir::Taken;
 use inferlet::ptir::attention::prelude::*;
 use serde::Deserialize;
 
@@ -50,7 +49,7 @@ fn default_top_p() -> f32 {
 /// `r` is the taken `[2]` u32 rng state (`[key, ctr]`) driving the Gumbel noise.
 /// Returns the sampled token `[1]` i32. Zero temperature is exact greedy
 /// decoding; positive temperatures use nucleus sampling.
-fn sample_token(r: &Taken, temperature: f32, top_p: f32, vocab: u32) -> Tensor {
+fn sample_token(r: &Tensor, temperature: f32, top_p: f32, vocab: u32) -> Tensor {
     let logits = intrinsics::logits(); // [1, vocab] f32 (read-out row)
     if temperature == 0.0 {
         return cast(&reduce_argmax(&logits), dtype::i32);
@@ -155,7 +154,7 @@ async fn main(input: Input) -> Result<String> {
         fwd_p.submit(&pipe).context("prefill submit")?;
         // max_tokens == 1: the prefill spends the whole budget, so it was
         // the stream's last submit — finish() right after it (F7).
-        g0_ch.take().to_host::<i32>().await?
+        g0_ch.take_host::<i32>().await?
     };
 
     let chat_dec = chat::Decoder::new();
@@ -266,7 +265,7 @@ async fn main(input: Input) -> Result<String> {
         max_tokens.saturating_sub(1) // g0 already emitted
     };
     run_ahead(&pipe, &fwd, budget, async || {
-        let t = out.take().to_host::<Vec<i32>>().await?;
+        let t = out.take_host::<Vec<i32>>().await?;
         let token = *t.first().unwrap_or(&0) as u32;
         if stop.contains(&token) {
             return Ok(ControlFlow::Break(()));

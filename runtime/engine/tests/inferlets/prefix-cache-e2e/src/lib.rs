@@ -69,8 +69,7 @@ async fn round(tokens: &[i32], tag: &str, cached: bool) -> std::result::Result<i
     let pipe = Pipeline::new();
     fwd.submit(&pipe).with_context(|| format!("{tag} submit"))?;
     let g = out
-        .take()
-        .to_host::<i32>()
+        .take_host::<i32>()
         .await
         .with_context(|| format!("{tag} out.take"))?;
     if !cached {
@@ -126,8 +125,7 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
         .submit(&pipe)
         .with_context(|| format!("{tag} chunk-a submit"))?;
     let _ = sink
-        .take()
-        .to_host::<Vec<i32>>()
+        .take_host::<Vec<i32>>()
         .await
         .with_context(|| format!("{tag} sink.take"))?;
 
@@ -175,8 +173,7 @@ async fn round_chunked(tokens: &[i32], tag: &str) -> std::result::Result<i32, St
         .submit(&pipe)
         .with_context(|| format!("{tag} chunk-b submit"))?;
     let g = out
-        .take()
-        .to_host::<i32>()
+        .take_host::<i32>()
         .await
         .with_context(|| format!("{tag} out.take"))?;
     pipe.close();

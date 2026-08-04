@@ -161,7 +161,7 @@ async fn main(input: Input) -> Result<String> {
     amateur_prefill
         .submit(&pipeline)
         .context("amateur prefill")?;
-    let first_amateur_logits = amateur_prefill_out.take().to_host::<Vec<f32>>().await?;
+    let first_amateur_logits = amateur_prefill_out.take_host::<Vec<f32>>().await?;
 
     // The expert keeps the complete context and consumes the amateur logits in
     // its epilogue to perform the contrastive token selection on-device.
@@ -338,7 +338,7 @@ async fn main(input: Input) -> Result<String> {
     amateur_decode.submit(&pipeline).context("amateur decode")?;
 
     for step in 0..budget {
-        let amateur_logits = amateur_logits_out.take().to_host::<Vec<f32>>().await?;
+        let amateur_logits = amateur_logits_out.take_host::<Vec<f32>>().await?;
 
         expert_amateur.put(amateur_logits);
         expert_decode.submit(&pipeline).context("expert decode")?;
@@ -360,8 +360,7 @@ async fn main(input: Input) -> Result<String> {
 
 async fn read_expert_token(channel: &Channel) -> Result<u32> {
     channel
-        .take()
-        .to_host::<Vec<i32>>()
+        .take_host::<Vec<i32>>()
         .await?
         .first()
         .copied()

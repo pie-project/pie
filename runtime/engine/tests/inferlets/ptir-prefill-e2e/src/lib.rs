@@ -121,7 +121,7 @@ async fn main(_input: String) -> Result<String> {
     // finish() (F7) lands after the last decode submit, not here).
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take().to_host::<i32>().await?;
+    let g0 = g0_ch.take_host::<i32>().await?;
     println!("[prefill] N-wide fire committed; first generated token g0={g0}");
 
     // ───────────────────────── 2. DECODE LOOP (1-wide) ──────────────────────
@@ -203,8 +203,7 @@ async fn main(_input: String) -> Result<String> {
         fwd.submit(&pipe)
             .with_context(|| format!("decode submit @{step}"))?;
         let t = out
-            .take()
-            .to_host::<Vec<i32>>()
+            .take_host::<Vec<i32>>()
             .await
             .with_context(|| format!("@{step}"))?;
         if let Some(&t0) = t.first() {

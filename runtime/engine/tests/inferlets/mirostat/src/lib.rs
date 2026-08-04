@@ -163,7 +163,7 @@ async fn main(input: String) -> Result<String> {
         },
     )?;
     fwd_p.epilogue(move || {
-        let mu_v = mu_p.take().tensor();
+        let mu_v = mu_p.take();
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
         let logits = intrinsics::logits(); // [vocab] f32 (single read-out row)
         let (token, surprise) = mirostat_step(floor, logits, vocab, mu_v, &r);
@@ -180,8 +180,8 @@ async fn main(input: String) -> Result<String> {
     // zero decode fires follow.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = tok_out_p.take().to_host::<i32>().await?;
-    let s0 = s_out_p.take().to_host::<f32>().await?;
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let s0 = s_out_p.take_host::<f32>().await?;
 
     generated.push(g0 as u32);
     surprises.push(s0);
@@ -221,7 +221,7 @@ async fn main(input: String) -> Result<String> {
         fwd.epilogue(move || {
             // Takes + compute first, PUTS last (value-id discipline).
             let length = kv_len.take();
-            let mu_v = mu_ch.take().tensor(); // [1] f32, host-updated each step
+            let mu_v = mu_ch.take(); // [1] f32, host-updated each step
             let r = rng.take(); // [2] u32 rng state
             let logits = intrinsics::logits(); // [vocab] f32
             let (token, surprise) = mirostat_step(floor, logits, vocab, mu_v, &r);
@@ -247,13 +247,11 @@ async fn main(input: String) -> Result<String> {
             fwd.submit(&pipe)
                 .with_context(|| format!("decode submit @{step}"))?;
             let t = tok_out
-                .take()
-                .to_host::<i32>()
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{step}"))?;
             let s = s_out
-                .take()
-                .to_host::<f32>()
+                .take_host::<f32>()
                 .await
                 .with_context(|| format!("@{step}"))?;
             generated.push(t as u32);

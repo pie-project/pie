@@ -166,19 +166,16 @@ async fn main(input: Input) -> Result<Output> {
         // prompt. The intermediate takes cannot be skipped -- an epilogue put
         // has to be drained or the channel fills.
         g0 = tok_out_p
-            .take()
-            .to_host::<i32>()
+            .take_host::<i32>()
             .await
             .with_context(|| format!("@{base}"))?;
         if want_stats {
             s1_out_p
-                .take()
-                .to_host::<Vec<f32>>()
+                .take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("@{base}"))?;
             s2_out_p
-                .take()
-                .to_host::<Vec<f32>>()
+                .take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("@{base}"))?;
         }
@@ -251,19 +248,16 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget, async || {
             let t = tok_out
-                .take()
-                .to_host::<i32>()
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             if want_stats {
                 s1_out
-                    .take()
-                    .to_host::<Vec<f32>>()
+                    .take_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("@{}", generated.len()))?;
                 s2_out
-                    .take()
-                    .to_host::<Vec<f32>>()
+                    .take_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("@{}", generated.len()))?;
             }

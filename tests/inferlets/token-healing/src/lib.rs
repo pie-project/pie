@@ -191,7 +191,7 @@ async fn main(input: Input) -> Result<Output> {
     heal_mask.put(first_mask);
     let pipeline = Pipeline::new();
     prefill.submit(&pipeline).context("token-healing prefill")?;
-    let first = first_out.take().to_host::<i32>().await? as u32;
+    let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = vec![first];
 
@@ -242,7 +242,7 @@ async fn main(input: Input) -> Result<Output> {
 
         let budget = input.max_tokens - 1;
         run_ahead(&pipeline, &decode, budget as usize, async || {
-            let token = token_out.take().to_host::<i32>().await? as u32;
+            let token = token_out.take_host::<i32>().await? as u32;
             generated.push(token);
             Ok(ControlFlow::Continue(()))
         })

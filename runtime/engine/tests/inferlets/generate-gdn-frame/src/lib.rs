@@ -100,7 +100,7 @@ async fn main(input: String) -> Result<String> {
 
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take().to_host::<i32>().await?;
+    let g0 = g0_ch.take_host::<i32>().await?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     generated.push(g0 as u32);
@@ -170,8 +170,7 @@ async fn main(input: String) -> Result<String> {
                 .with_context(|| format!("rs frame submit (live={live}, k={k})"))?;
             for wave in 0..live {
                 let t = out
-                    .take()
-                    .to_host::<Vec<i32>>()
+                    .take_host::<Vec<i32>>()
                     .await
                     .with_context(|| format!("@wave {wave}"))?;
                 let Some(&t0) = t.first() else {

@@ -130,8 +130,8 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline).context("submit")?;
-    let tgt = target_out.take().to_host::<Vec<i32>>().await?;
-    let ver = verify_out.take().to_host::<Vec<i32>>().await?;
+    let tgt = target_out.take_host::<Vec<i32>>().await?;
+    let ver = verify_out.take_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok((tgt, ver))
 }

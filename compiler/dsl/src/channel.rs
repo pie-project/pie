@@ -343,24 +343,6 @@ impl AsTensor for &Taken {
     }
 }
 
-/// Feeding one channel from another (`positions.put(&length)`) is the shape of
-/// every decode loop, so a `Taken` puts directly rather than via `.tensor()`.
-impl IntoPut for &Taken {
-    #[track_caller]
-    fn into_put(self) -> PutValue {
-        match &self.inner {
-            TakenInner::InProgram(t) => PutValue::Tensor(t.clone()),
-            TakenInner::Host { chan, .. } => PutValue::Tensor(host_take_poison(chan)),
-        }
-    }
-}
-impl IntoPut for Taken {
-    #[track_caller]
-    fn into_put(self) -> PutValue {
-        (&self).into_put()
-    }
-}
-
 // Host-side await surface (wires real async over the driver channel).
 impl Taken {
     /// Await the host value. Consumes the cell for `take`, copies for `read`.

@@ -92,7 +92,7 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
     // are one sequential stream. The g0 handoff still rides the host.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("greedy prefill")?;
-    let g0 = g0_ch.take().to_host::<i32>().await?;
+    let g0 = g0_ch.take_host::<i32>().await?;
 
     let mut g: Vec<u32> = vec![g0 as u32];
     if k > 1 {
@@ -140,8 +140,7 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
             fwd.submit(&pipe)
                 .with_context(|| format!("greedy decode @{step}"))?;
             let t = out
-                .take()
-                .to_host::<i32>()
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("greedy out @{step}"))?;
             g.push(t as u32);
@@ -200,7 +199,7 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded input tokens (NOT a separate
         // submitted draft channel) and gather the k draft positions out of it.
-        let toks_val = toks.read().tensor(); // [n] i32
+        let toks_val = toks.read(); // [n] i32
         let draft = gather(&toks_val, Tensor::constant(draft_positions.clone())); // [k] i32
         let target = reduce_argmax(intrinsics::logits()); // [k] i32
         let hit = eq(&target, &draft); // [k] bool
@@ -215,7 +214,7 @@ async fn fire_verify(prompt: &[u32], k: u32, drafts: &[u32]) -> Result<Vec<u32>>
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline).context("verify submit")?;
-    let v = verify_out.take().to_host::<Vec<i32>>().await?;
+    let v = verify_out.take_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok(v.iter().map(|&x| x as u32).collect())
 }

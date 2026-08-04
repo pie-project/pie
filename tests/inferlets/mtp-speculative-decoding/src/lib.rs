@@ -118,10 +118,9 @@ async fn main(input: Input) -> Result<String> {
     });
     prefill.submit(&pipeline).context("prefill")?;
 
-    let seed = seed_out.take().to_host::<i32>().await? as u32;
+    let seed = seed_out.take_host::<i32>().await? as u32;
     let seed_drafts = drafts_out
-        .take()
-        .to_host::<Vec<i32>>()
+        .take_host::<Vec<i32>>()
         .await?
         .into_iter()
         .map(|token| token as u32)
@@ -256,7 +255,7 @@ async fn main(input: Input) -> Result<String> {
     // Every verify round commits at least one token, so `max_tokens` bounds
     // the number of rounds.
     run_ahead(&pipeline, &fwd, input.max_tokens, async || {
-        let round = committed_out.take().to_host::<Vec<i32>>().await?;
+        let round = committed_out.take_host::<Vec<i32>>().await?;
         let live = unpad_tokens(&round);
         if live.is_empty() {
             return Ok(ControlFlow::Continue(()));

@@ -278,9 +278,9 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         prefill.epilogue(move || {
-            let allowed = pre_mask.take().tensor();
-            let idx = pre_alpha_idx.take().tensor();
-            let val = pre_alpha_val.take().tensor();
+            let allowed = pre_mask.take();
+            let idx = pre_alpha_idx.take();
+            let val = pre_alpha_val.take();
             let r = pre_rng.take();
             let (token, mass, prob, wmass) =
                 asap_step(intrinsics::logits(), vocab, &allowed, &idx, &val, &r);
@@ -296,11 +296,11 @@ async fn main(input: Input) -> Result<Output> {
         pre_alpha_val.put(val0);
         prefill.submit(&pipeline).context("ASAp prefill")?;
 
-        let first = pre_token.take().to_host::<i32>().await?;
+        let first = pre_token.take_host::<i32>().await?;
         let mut path_nodes = vec![0usize];
-        let mut masses = vec![pre_mass.take().to_host::<f32>().await?];
-        let mut probs = vec![pre_prob.take().to_host::<f32>().await?];
-        let mut weighted_masses = vec![pre_wmass.take().to_host::<f32>().await?];
+        let mut masses = vec![pre_mass.take_host::<f32>().await?];
+        let mut probs = vec![pre_prob.take_host::<f32>().await?];
+        let mut weighted_masses = vec![pre_wmass.take_host::<f32>().await?];
         // The α the step actually used for the token it took.
         let mut used_alpha = vec![alpha_of(&trie, 0, first as u32)];
 
@@ -349,9 +349,9 @@ async fn main(input: Input) -> Result<Output> {
             )?;
             decode.epilogue(move || {
                 let length = kv_len.take();
-                let allowed = mask_ch.take().tensor();
-                let idx = alpha_idx.take().tensor();
-                let val = alpha_val.take().tensor();
+                let allowed = mask_ch.take();
+                let idx = alpha_idx.take();
+                let val = alpha_val.take();
                 let r = rng.take();
                 let (token, mass, prob, wmass) =
                     asap_step(intrinsics::logits(), vocab, &allowed, &idx, &val, &r);
@@ -381,10 +381,10 @@ async fn main(input: Input) -> Result<Output> {
                 alpha_val.put(val);
                 decode.submit(&pipeline).context("ASAp decode")?;
 
-                let token = token_out.take().to_host::<i32>().await? as u32;
-                masses.push(mass_out.take().to_host::<f32>().await?);
-                probs.push(prob_out.take().to_host::<f32>().await?);
-                weighted_masses.push(wmass_out.take().to_host::<f32>().await?);
+                let token = token_out.take_host::<i32>().await? as u32;
+                masses.push(mass_out.take_host::<f32>().await?);
+                probs.push(prob_out.take_host::<f32>().await?);
+                weighted_masses.push(wmass_out.take_host::<f32>().await?);
                 used_alpha.push(alpha_of(&trie, node, token));
                 generated.push(token);
                 constraint.accept_tokens(&[token]).map_err(|e| {

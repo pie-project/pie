@@ -93,15 +93,15 @@ async fn main(_input: String) -> Result<String> {
 
     let pipeline = Pipeline::new();
     mixed.submit(&pipeline).context("mixed submit")?;
-    let token_value = mixed_token.take().to_host::<u32>().await?;
-    let scalar_value = mixed_scalar.take().to_host::<f32>().await?;
-    let vector_value = vector.take().to_host::<Vec<u32>>().await?;
-    let empty_prefix = prefix_len.take().to_host::<u32>().await? as usize;
+    let token_value = mixed_token.take_host::<u32>().await?;
+    let scalar_value = mixed_scalar.take_host::<f32>().await?;
+    let vector_value = vector.take_host::<Vec<u32>>().await?;
+    let empty_prefix = prefix_len.take_host::<u32>().await? as usize;
     let samplers = [
-        sampler_a.take().to_host::<u32>().await?,
-        sampler_b.take().to_host::<u32>().await?,
-        sampler_c.take().to_host::<u32>().await?,
-        sampler_d.take().to_host::<u32>().await?,
+        sampler_a.take_host::<u32>().await?,
+        sampler_b.take_host::<u32>().await?,
+        sampler_c.take_host::<u32>().await?,
+        sampler_d.take_host::<u32>().await?,
     ];
     pipeline.close();
 
@@ -120,7 +120,7 @@ async fn main(_input: String) -> Result<String> {
     entropy_pass
         .submit(&entropy_pipeline)
         .context("entropy submit")?;
-    let entropy_value = entropy.take().to_host::<f32>().await?;
+    let entropy_value = entropy.take_host::<f32>().await?;
     entropy_pipeline.close();
 
     let mixed_ok = token_value == 7 && (scalar_value - 1.25).abs() < f32::EPSILON;

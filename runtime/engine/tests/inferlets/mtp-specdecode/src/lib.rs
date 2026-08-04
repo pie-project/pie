@@ -197,13 +197,12 @@ async fn bootstrap(
 
     fwd.submit(pipeline).context("bootstrap submit")?;
     let seed = seed_out
-        .take()
-        .to_host::<Vec<i32>>()
+        .take_host::<Vec<i32>>()
         .await?
         .first()
         .copied()
         .ok_or_else(|| "bootstrap: empty seed".to_string())?;
-    let drafts = drafts_out.take().to_host::<Vec<i32>>().await?;
+    let drafts = drafts_out.take_host::<Vec<i32>>().await?;
     Ok((seed, drafts))
 }
 
@@ -259,7 +258,7 @@ async fn verify_window(
     )
     .context("verify binding")?;
     fwd.epilogue(move || {
-        let win = toks.read().tensor(); // [k+1] i32 device-alias peek
+        let win = toks.read(); // [k+1] i32 device-alias peek
         let draft_v = gather(&win, Tensor::constant((1..=k).collect::<Vec<u32>>()));
         let picked = reduce_argmax(intrinsics::logits()); // [k+1]
         let head = gather(&picked, iota(k));
@@ -280,8 +279,8 @@ async fn verify_window(
     });
 
     fwd.submit(pipeline).context("verify submit")?;
-    let commit = commit_out_h.take().to_host::<Vec<i32>>().await?;
-    let drafts = drafts_out_h.take().to_host::<Vec<i32>>().await?;
+    let commit = commit_out_h.take_host::<Vec<i32>>().await?;
+    let drafts = drafts_out_h.take_host::<Vec<i32>>().await?;
     Ok((commit, drafts))
 }
 

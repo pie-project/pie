@@ -146,8 +146,7 @@ async fn verify(committed: &[u32], draft: &[u32], page_size: u32) -> Result<Vec<
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline).context("verify cached draft")?;
     let target = target_out
-        .take()
-        .to_host::<Vec<i32>>()
+        .take_host::<Vec<i32>>()
         .await?
         .into_iter()
         .map(|token| token as u32)

@@ -153,8 +153,7 @@ async fn main(input: String) -> Result<String> {
         fwd.submit(&pipeline)
             .with_context(|| format!("submit @{step}"))?;
         let token = tok_out
-            .take()
-            .to_host::<i32>()
+            .take_host::<i32>()
             .await
             .with_context(|| format!("@{step}"))? as u32;
 

@@ -125,8 +125,7 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
         .submit(&pipe)
         .with_context(|| format!("{name} prefill submit"))?;
     let g0 = g0_ch
-        .take()
-        .to_host::<i32>()
+        .take_host::<i32>()
         .await
         .with_context(|| format!("{name} g0 take"))?;
 
@@ -201,8 +200,7 @@ async fn run_kind(name: &str, idx: usize, kind: Kind, vocab: u32) -> Result<Vec<
         }
         while inflight > 0 {
             let t = out
-                .take()
-                .to_host::<Vec<i32>>()
+                .take_host::<Vec<i32>>()
                 .await
                 .with_context(|| format!("{name} out.take @{}", got.len()))?;
             inflight -= 1;

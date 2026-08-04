@@ -262,9 +262,9 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().to_host::<i32>().await?;
-    let a0 = s1_out_p.take().to_host::<f32>().await?;
-    let b0 = s2_out_p.take().to_host::<f32>().await?;
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let a0 = s1_out_p.take_host::<f32>().await?;
+    let b0 = s2_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
     s1.push(a0);
     s2.push(b0);
@@ -333,18 +333,15 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
-                .take()
-                .to_host::<i32>()
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             let a = s1_out
-                .take()
-                .to_host::<f32>()
+                .take_host::<f32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             let b = s2_out
-                .take()
-                .to_host::<f32>()
+                .take_host::<f32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);

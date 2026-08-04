@@ -124,8 +124,7 @@ async fn forward_logits(
 
     fwd.submit(on).with_context(|| format!("submit {tag}"))?;
     logits_out
-        .take()
-        .to_host::<Vec<f32>>()
+        .take_host::<Vec<f32>>()
         .await
         .with_context(|| format!("{tag}"))
 }

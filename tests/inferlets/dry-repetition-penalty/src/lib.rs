@@ -386,8 +386,8 @@ async fn main(input: Input) -> Result<Output> {
     )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let hist = hist_p.take().tensor();
-        let hlen = hlen_p.take().tensor();
+        let hist = hist_p.take();
+        let hlen = hlen_p.take();
         let logits = intrinsics::logits();
         let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
         let r_next = add(&r, iota(2));
@@ -402,9 +402,9 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
 
-    let g0 = tok_out_p.take().to_host::<i32>().await?;
-    let c0 = cnt_out_p.take().to_host::<f32>().await?;
-    let k0 = peak_out_p.take().to_host::<f32>().await?;
+    let g0 = tok_out_p.take_host::<i32>().await?;
+    let c0 = cnt_out_p.take_host::<f32>().await?;
+    let k0 = peak_out_p.take_host::<f32>().await?;
     generated.push(g0 as u32);
     counts.push(c0);
     peaks.push(k0);
@@ -456,8 +456,8 @@ async fn main(input: Input) -> Result<Output> {
             // Takes and compute first, puts last (value-id discipline).
             let length = kv_len.take();
             let r = rng.take();
-            let hist = hist_c.take().tensor();
-            let hlen = hlen_c.take().tensor();
+            let hist = hist_c.take();
+            let hlen = hlen_c.take();
             let logits = intrinsics::logits();
             let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
 
@@ -483,18 +483,15 @@ async fn main(input: Input) -> Result<Output> {
         let budget = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget as usize, async || {
             let t = tok_out
-                .take()
-                .to_host::<i32>()
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             let c = cnt_out
-                .take()
-                .to_host::<f32>()
+                .take_host::<f32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             let k = peak_out
-                .take()
-                .to_host::<f32>()
+                .take_host::<f32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             generated.push(t as u32);

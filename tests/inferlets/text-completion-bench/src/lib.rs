@@ -540,7 +540,7 @@ macro_rules! define_run_one {
 
             // ── HOST DRAIN (off the critical path — the decode burst is already in
             // the engine while this first take waits on the prefill).
-            let g0 = g0_ch.take().to_host::<i32>().await?;
+            let g0 = g0_ch.take_host::<i32>().await?;
 
             let ttft_us = input
                 .report_timing
@@ -568,7 +568,7 @@ macro_rules! define_run_one {
 
             let mut taken = 0usize;
             while taken < submitted {
-                let t = out.take().to_host::<Vec<i32>>().await?;
+                let t = out.take_host::<Vec<i32>>().await?;
                 taken += 1;
                 let Some(&t0) = t.first() else {
                     return Err("out.take: empty tensor".into());

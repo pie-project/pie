@@ -233,13 +233,12 @@ async fn bootstrap(
 
     fwd.submit(pipeline).context("bootstrap submit")?;
     let seed = seed_out
-        .take()
-        .to_host::<Vec<i32>>()
+        .take_host::<Vec<i32>>()
         .await?
         .first()
         .copied()
         .ok_or_else(|| "bootstrap: empty seed".to_string())?;
-    let drafts = drafts_out.take().to_host::<Vec<i32>>().await?;
+    let drafts = drafts_out.take_host::<Vec<i32>>().await?;
     Ok((seed, drafts))
 }
 
@@ -323,7 +322,7 @@ fn build_verify(
     fwd.epilogue(move || {
         // Device-alias read: peek the embedded window (NOT a resubmitted draft
         // channel) and gather rows 1..=k as the verify operand.
-        let win = toks.read().tensor(); // [k+1] i32
+        let win = toks.read(); // [k+1] i32
         let draft_v = gather(&win, Tensor::constant((1..=k).collect::<Vec<u32>>())); // [k]
         let picked = reduce_argmax(intrinsics::logits()); // [k+1] target (k verify + bonus)
         let head = gather(&picked, iota(k)); // [k] picked[0..k]
@@ -538,8 +537,8 @@ async fn main(input: String) -> Result<String> {
             c.submit(&pipeline).context("device commit submit")?;
         }
 
-        let commit = commit_out.take().to_host::<Vec<i32>>().await?;
-        let drafts = drafts_out.take().to_host::<Vec<i32>>().await?;
+        let commit = commit_out.take_host::<Vec<i32>>().await?;
+        let drafts = drafts_out.take_host::<Vec<i32>>().await?;
         let clen = committed_len(&commit); // n_acc accepted + 1 bonus (≥ 1)
 
         // The device path's whole claim is that the number the DRIVER folded is
@@ -555,7 +554,7 @@ async fn main(input: String) -> Result<String> {
         // noise forks the whole trajectory. Three identical host-mode launches
         // in one engine boot produce different token streams.
         if let Some(echo) = clen_echo {
-            let seen = echo.take().to_host::<Vec<u32>>().await?;
+            let seen = echo.take_host::<Vec<u32>>().await?;
             match seen.first().copied() {
                 Some(v) if v as usize == clen => clen_agreements += 1,
                 other => {

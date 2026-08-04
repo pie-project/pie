@@ -187,7 +187,7 @@ async fn main(input: Input) -> Result<String> {
         // finish() lands right after its submit (F7).
         let pipe = Pipeline::new();
         fwd_p.submit(&pipe).context("prefill submit")?;
-        let g0s: Vec<i32> = g0s_ch.take().to_host::<Vec<i32>>().await?;
+        let g0s: Vec<i32> = g0s_ch.take_host::<Vec<i32>>().await?;
         // All B candidates share the prefill's token; they diverge in the decode
         // loop, where each lane draws its own Gumbel noise.
         let g0s: Vec<i32> = vec![g0s[0]; num_candidates];
@@ -325,7 +325,7 @@ async fn main(input: Input) -> Result<String> {
             0
         };
         run_ahead(&pipe, &fwd, budget, async || {
-            let step: Vec<i32> = out.take().to_host::<Vec<i32>>().await?;
+            let step: Vec<i32> = out.take_host::<Vec<i32>>().await?;
             for (c, &t) in step.iter().enumerate().take(num_candidates) {
                 if done[c] {
                     continue; // lane keeps firing; its output is ignored

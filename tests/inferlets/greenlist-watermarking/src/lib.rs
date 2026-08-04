@@ -136,7 +136,7 @@ async fn main(input: Input) -> Result<String> {
     prefill.submit(&pipeline).context("watermark prefill")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    let first = first_out.take().to_host::<i32>().await? as u32;
+    let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -206,7 +206,7 @@ async fn main(input: Input) -> Result<String> {
             green.put(green_mask(vocab, previous, input.gamma));
             decode.submit(&pipeline).context("watermark decode")?;
             submitted += 1;
-            let token = token_out.take().to_host::<i32>().await? as u32;
+            let token = token_out.take_host::<i32>().await? as u32;
             previous = token;
             if stop_tokens.contains(&token) {
                 break;

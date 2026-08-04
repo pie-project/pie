@@ -117,7 +117,7 @@ async fn main(input: String) -> Result<String> {
     // zero decode fires follow.
     let pipe = Pipeline::new();
     fwd_p.submit(&pipe).context("prefill submit")?;
-    let g0 = g0_ch.take().to_host::<i32>().await?;
+    let g0 = g0_ch.take_host::<i32>().await?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
     generated.push(g0 as u32);
@@ -182,8 +182,7 @@ async fn main(input: String) -> Result<String> {
             fwd.submit(&pipe)
                 .with_context(|| format!("decode submit @{step}"))?;
             let t = out
-                .take()
-                .to_host::<Vec<i32>>()
+                .take_host::<Vec<i32>>()
                 .await
                 .with_context(|| format!("@{step}"))?;
             let Some(&t0) = t.first() else {

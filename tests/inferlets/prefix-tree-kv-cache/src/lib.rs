@@ -77,7 +77,7 @@ async fn append_tokens(
         next_token.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
     fwd.submit(pipeline).context("append shared prefix")?;
-    Ok(next_token.take().to_host::<i32>().await?)
+    Ok(next_token.take_host::<i32>().await?)
 }
 
 async fn generate(
@@ -156,7 +156,7 @@ async fn generate(
 
     let budget = max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &fwd, budget as usize, async || {
-        let token = token_out.take().to_host::<i32>().await? as u32;
+        let token = token_out.take_host::<i32>().await? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

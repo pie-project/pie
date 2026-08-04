@@ -268,8 +268,7 @@ async fn main(input: Input) -> Result<Output> {
         // continuation. The intermediate takes are not waste that can be
         // skipped -- the epilogue put has to be drained or the channel fills.
         g0 = tok_out_p
-            .take()
-            .to_host::<i32>()
+            .take_host::<i32>()
             .await
             .with_context(|| format!("@{base}"))?;
     }
@@ -411,29 +410,25 @@ async fn main(input: Input) -> Result<Output> {
         let budget_n = max_tokens - 1;
         run_ahead(&pipe, &fwd, budget_n as usize, async || {
             let t = tok_out
-                .take()
-                .to_host::<i32>()
+                .take_host::<i32>()
                 .await
                 .with_context(|| format!("@{}", generated.len()))?;
             if let Some(ch) = scores_out.as_ref() {
                 last_scores = ch
-                    .take()
-                    .to_host::<Vec<f32>>()
+                    .take_host::<Vec<f32>>()
                     .await
                     .with_context(|| format!("@{}", generated.len()))?;
             }
             layers_observed = match layers_out.as_ref() {
                 Some(ch) => ch
-                    .take()
-                    .to_host::<u32>()
+                    .take_host::<u32>()
                     .await
                     .with_context(|| format!("@{}", generated.len()))?,
                 None => layers_observed,
             };
             kv_len_last = match kvlen_out.as_ref() {
                 Some(ch) => ch
-                    .take()
-                    .to_host::<u32>()
+                    .take_host::<u32>()
                     .await
                     .with_context(|| format!("@{}", generated.len()))?,
                 None => kv_len_last,

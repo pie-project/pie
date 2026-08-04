@@ -111,7 +111,7 @@ async fn main(input: Input) -> Result<String> {
     prefill.submit(&pipeline).context("JSON-schema prefill")?;
     // max_tokens == 1: the prefill spends the whole budget, so it was the
     // stream's last submit — finish() right after it (F7).
-    let first = first_out.take().to_host::<i32>().await? as u32;
+    let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = vec![first];
     constraint
@@ -175,7 +175,7 @@ async fn main(input: Input) -> Result<String> {
             grammar_mask.put(unpack_mask(&constraint.mask(), vocab));
             decode.submit(&pipeline).context("JSON-schema decode")?;
             submitted += 1;
-            let token = token_out.take().to_host::<i32>().await? as u32;
+            let token = token_out.take_host::<i32>().await? as u32;
             generated.push(token);
             constraint
                 .accept_tokens(&[token])

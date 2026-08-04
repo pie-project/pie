@@ -28,10 +28,9 @@ use std::rc::Rc;
 
 use pie_dsl::builder::Builder;
 use pie_dsl::channel::PutValue;
-use pie_dsl::value::{Arg, ConstData};
+use pie_dsl::value::ConstData;
 use pie_dsl::{
-    AsTensor, Channel as DslChannel, DType, IntoConst, IntoPut, IntoShape, Port, Shape, Stage,
-    Tensor,
+    Channel as DslChannel, DType, IntoConst, IntoPut, IntoShape, Port, Shape, Stage, Tensor,
 };
 
 use crate::pie::inferlet::channel as wit_channel;
@@ -156,7 +155,7 @@ fn claim_port(port: Port, ch: &Channel) -> DslChannel {
 /// A GPU-resident bounded queue (overview §1). Owns the `pie-dsl` trace
 /// declaration and the WIT `channel` resource. In a stage closure `take`/`read`/
 /// `put` record IR ops; on the host `put` stages a value (seed / host-writer
-/// cell) and `Taken::get().await`/`Taken::bytes().await` materialize a committed value.
+/// cell) and `take_host`/`read_host` await a committed value.
 /// A registry-backed COPY TOKEN (F9): the channel's shared state (DSL trace
 /// state + WIT handle) lives in thread-local registries keyed by gid, and
 /// this token holds only the gid plus immutable metadata. Stage closures
@@ -320,29 +319,78 @@ impl Channel {
         self.shape
     }
 
-    /// `take()` — consume a cell. In a stage closure: records a `ChanTake` and
-    /// yields an in-program value ([`AsTensor`]). On the host:
-    /// [`Taken::to_host`] awaits the committed value (awaits until a fire
-    /// fills it; poison ⇒ `Err`).
-    pub fn take(&self) -> Taken {
-        Taken {
-            dsl: self.dsl().take(),
-            wit: self.wit(),
-            mode: TakenMode::Take,
-            dtype: self.dtype,
-            name: self.dsl().name(),
-        }
+    /// `take()` — consume a cell, inside a stage closure. Records a `ChanTake`
+    /// and yields the in-program value. The host counterpart is
+    /// [`take_host`](Self::take_host); asking a host channel for an in-program
+    /// value is an authoring error and is reported as one.
+    pub fn take(&self) -> Tensor {
+        self.dsl().take().tensor()
     }
 
-    /// `read()` — peek a cell (leaves it full). Same dual as [`take`](Self::take).
-    pub fn read(&self) -> Taken {
-        Taken {
-            dsl: self.dsl().read(),
-            wit: self.wit(),
-            mode: TakenMode::Read,
-            dtype: self.dtype,
-            name: self.dsl().name(),
+    /// `read()` — peek a cell (leaves it full), inside a stage closure. Device
+    /// counterpart of [`read_host`](Self::read_host).
+    pub fn read(&self) -> Tensor {
+        self.dsl().read().tensor()
+    }
+
+    /// Consume a cell on the host, decoded as `T` — a whole `Vec<f32>`, or a
+    /// bare `f32` for a channel that holds one value. Awaits in-flight fires;
+    /// a poisoned channel returns `Err`.
+    ///
+    /// `T`'s element type must be the channel's own dtype. The bytes are a raw
+    /// little-endian window, so decoding an `f32` channel as `i32` would
+    /// reinterpret the bit pattern and return plausible garbage.
+    ///
+    /// Errors already name the channel, so inferlets do not repeat it in a
+    /// [`context`](crate::Context) call.
+    ///
+    /// ```ignore
+    /// let logits = out.take_host::<Vec<f32>>().await?;
+    /// let count = n_ch.take_host::<i32>().await?;
+    /// ```
+    pub async fn take_host<T: FromChannel>(&self) -> Result<T, String> {
+        self.check_host::<T>("take")?;
+        let _endpoint = self.dsl().take();
+        let raw = self.wit().take().await;
+        self.decode_host::<T>(raw, "take")
+    }
+
+    /// Peek a cell on the host (leaves it full). Same as
+    /// [`take_host`](Self::take_host) otherwise.
+    pub async fn read_host<T: FromChannel>(&self) -> Result<T, String> {
+        self.check_host::<T>("read")?;
+        let _endpoint = self.dsl().read();
+        let raw = self.wit().read().await;
+        self.decode_host::<T>(raw, "read")
+    }
+
+    /// `"{channel} take"` / `"{channel} read"` — the prefix on every host
+    /// readback error, so the message names the channel without the inferlet
+    /// spelling it out again.
+    fn host_label(&self, verb: &str) -> String {
+        format!("{} {verb}", self.dsl().name())
+    }
+
+    fn check_host<T: FromChannel>(&self, verb: &str) -> Result<(), String> {
+        if T::DTYPE != self.dtype {
+            return Err(format!(
+                "{}: channel holds {:?}, decoded as {:?}",
+                self.host_label(verb),
+                self.dtype,
+                T::DTYPE
+            ));
         }
+        Ok(())
+    }
+
+    fn decode_host<T: FromChannel>(
+        &self,
+        raw: Result<Vec<u8>, String>,
+        verb: &str,
+    ) -> Result<T, String> {
+        let label = self.host_label(verb);
+        let raw = raw.map_err(|e| format!("{label}: {e}"))?;
+        T::from_bytes(&raw).map_err(|e| format!("{label}: {e}"))
     }
 
     /// `put(v)` — in a stage closure `v` is an in-program [`Tensor`] (device
@@ -350,7 +398,7 @@ impl Channel {
     /// channel as the next cell / a seed, and the host-writer endpoint is
     /// recorded on the trace side for host-role derivation). Fire-and-forget
     /// (D1: staged puts coalesce into the next submit); a fire that fails
-    /// surfaces downstream as poison at [`Taken::get`]/[`Taken::bytes`].
+    /// surfaces downstream as an `Err` from [`take_host`](Self::take_host).
     pub fn put(&self, v: impl IntoPut) {
         match v.into_put() {
             PutValue::Tensor(t) => {
@@ -395,111 +443,10 @@ channel_from_iter!(i32);
 channel_from_iter!(f32);
 channel_from_iter!(bool);
 
-/// The result of [`Channel::take`]/[`Channel::read`]. In a stage closure it is
-/// an in-program value ([`tensor`](Self::tensor), or [`AsTensor`]); on the host
-/// [`to_host`](Self::to_host) / [`bytes`](Self::bytes) await the committed
-/// value.
-pub struct Taken {
-    dsl: pie_dsl::Taken,
-    wit: Rc<wit_channel::Channel>,
-    mode: TakenMode,
-    dtype: DType,
-    name: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TakenMode {
-    Take,
-    Read,
-}
-
-impl Taken {
-    /// The in-program [`Tensor`] (panics on a host take — a frontend bug).
-    pub fn tensor(self) -> Tensor {
-        self.dsl.tensor()
-    }
-
-    /// Materialize the committed value to the host as raw little-endian bytes.
-    /// Awaits in-flight fires; a poisoned channel returns `Err`, labelled with
-    /// the channel's [`name`](Channel::named).
-    pub async fn bytes(self) -> Result<Vec<u8>, String> {
-        let label = self.label();
-        match self.mode {
-            TakenMode::Take => self.wit.take().await,
-            TakenMode::Read => self.wit.read().await,
-        }
-        .map_err(|e| format!("{label}: {e}"))
-    }
-
-    /// Materialize the committed value to the host as `T` — either a whole
-    /// `Vec<f32>` or, for a one-element channel, a bare `f32`.
-    ///
-    /// `T`'s element type must be the channel's own dtype. The bytes are a raw
-    /// little-endian window, so decoding an `f32` channel as `i32` would
-    /// reinterpret the bit pattern and return plausible garbage.
-    ///
-    /// Errors are already labelled `"{channel} take"`, so inferlets do not
-    /// repeat the channel's name in a [`context`](crate::Context) call.
-    ///
-    /// ```ignore
-    /// let logits = out.take().to_host::<Vec<f32>>().await?;
-    /// let count = n_ch.take().to_host::<i32>().await?;
-    /// ```
-    pub async fn to_host<T: FromChannel>(self) -> Result<T, String> {
-        if T::DTYPE != self.dtype {
-            return Err(format!(
-                "{}: channel holds {:?}, decoded as {:?}",
-                self.label(),
-                self.dtype,
-                T::DTYPE
-            ));
-        }
-        let label = self.label();
-        let raw = self.bytes().await?;
-        T::from_bytes(&raw).map_err(|e| format!("{label}: {e}"))
-    }
-
-    /// `"{channel} take"` / `"{channel} read"` — the prefix on every host
-    /// readback error, so the message names the channel without the inferlet
-    /// spelling it out again.
-    fn label(&self) -> String {
-        let verb = match self.mode {
-            TakenMode::Take => "take",
-            TakenMode::Read => "read",
-        };
-        format!("{} {verb}", self.name)
-    }
-}
-
-impl AsTensor for Taken {
-    fn to_arg(&self) -> Arg {
-        self.dsl.to_arg()
-    }
-}
-impl AsTensor for &Taken {
-    fn to_arg(&self) -> Arg {
-        (*self).to_arg()
-    }
-}
-
-/// `put`ting a `Taken` straight back into another channel is the common shape
-/// of a decode loop (`positions.put(&length)`), so it does not need to be
-/// spelled `.tensor()` first.
-impl IntoPut for &Taken {
-    fn into_put(self) -> PutValue {
-        (&self.dsl).into_put()
-    }
-}
-impl IntoPut for Taken {
-    fn into_put(self) -> PutValue {
-        self.dsl.into_put()
-    }
-}
-
 /// A host-readable element type (little-endian, 4 bytes/elem; `bool` is 1 byte).
 ///
 /// [`DTYPE`](Self::DTYPE) is what makes the raw byte window self-describing:
-/// [`Taken::to_host`] refuses a `T` the channel does not hold.
+/// [`Channel::take_host`] refuses a `T` the channel does not hold.
 pub trait HostElem: Copy {
     const DTYPE: DType;
     fn decode(raw: &[u8]) -> Vec<Self>;
@@ -535,7 +482,7 @@ impl HostElem for bool {
     }
 }
 
-/// A type [`Taken::to_host`] can materialize a channel into: a whole
+/// A type [`Channel::take_host`] can materialize a channel into: a whole
 /// `Vec<T>`, or a bare `T` for a channel that holds a single value.
 ///
 /// The impls are spelled out rather than blanket over [`HostElem`] because

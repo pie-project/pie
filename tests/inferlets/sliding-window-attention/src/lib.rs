@@ -109,7 +109,7 @@ async fn main(input: Input) -> Result<String> {
     if input.max_tokens == 1 {
         pipeline.close();
     }
-    let first = first_out.take().to_host::<i32>().await? as u32;
+    let first = first_out.take_host::<i32>().await? as u32;
 
     let mut generated = Vec::with_capacity(input.max_tokens);
     if !stop_tokens.contains(&first) {
@@ -192,7 +192,7 @@ async fn main(input: Input) -> Result<String> {
 
     let budget = input.max_tokens.saturating_sub(generated.len());
     run_ahead(&pipeline, &decode, budget as usize, async || {
-        let token = token_out.take().to_host::<i32>().await? as u32;
+        let token = token_out.take_host::<i32>().await? as u32;
         if stop_tokens.contains(&token) {
             return Ok(ControlFlow::Break(()));
         }

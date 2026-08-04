@@ -55,7 +55,7 @@ async fn main(_input: String) -> Result<String> {
     if late_put {
         increment.put(vec![1u32]);
     }
-    let value = out.take().to_host::<u32>().await?;
+    let value = out.take_host::<u32>().await?;
     pipeline.close();
 
     Ok(format!("value={value}"))

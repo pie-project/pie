@@ -145,7 +145,7 @@ async fn verify_window(
 
     let pipeline = Pipeline::new();
     fwd.submit(&pipeline).context("submit")?;
-    let raw = out.take().to_host::<Vec<i32>>().await?;
+    let raw = out.take_host::<Vec<i32>>().await?;
     pipeline.close();
     Ok(accepted_prefix(&raw))
 }

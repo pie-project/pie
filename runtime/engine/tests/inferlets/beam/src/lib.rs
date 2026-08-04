@@ -144,18 +144,15 @@ async fn main(_input: String) -> Result<String> {
         fwd.submit(&pipeline)
             .with_context(|| format!("submit @{step}"))?;
         let picked = out
-            .take()
-            .to_host::<Vec<i32>>()
+            .take_host::<Vec<i32>>()
             .await
             .with_context(|| format!("@{step}"))?;
         let _parents = out_par
-            .take()
-            .to_host::<Vec<u32>>()
+            .take_host::<Vec<u32>>()
             .await
             .with_context(|| format!("@{step}"))?;
         let _scr = out_scr
-            .take()
-            .to_host::<Vec<f32>>()
+            .take_host::<Vec<f32>>()
             .await
             .with_context(|| format!("@{step}"))?;
         if let Some(&t0) = picked.first() {
