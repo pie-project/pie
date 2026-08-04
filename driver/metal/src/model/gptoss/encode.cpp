@@ -83,11 +83,13 @@ Kernel shared_kind(Kind k) {
         case Kind::AttnResidual:  return Kernel::Residual;
         case Kind::RouterGemv:    return Kernel::GoRouter;
         case Kind::RouterTopK:    return Kernel::GoRouterTopK;
+        case Kind::ExpertSort:    return Kernel::LlMoeSort;
+        case Kind::ExpertGather:  return Kernel::LlMoeGather;
         case Kind::ExpertGate:    return Kernel::GoExpertGate;
         case Kind::ExpertUp:      return Kernel::GoExpertUp;
         case Kind::ExpertSwiGlu:  return Kernel::GoSwiGlu;
         case Kind::ExpertDown:    return Kernel::GoExpertDown;
-        case Kind::ExpertCombine: return Kernel::GoExpertCombine;
+        case Kind::ExpertCombine: return Kernel::LlMoeCombine;
         case Kind::FfnResidual:   return Kernel::LayerOut;
         case Kind::LmHead:        return Kernel::LmHeadUntied;
         case Kind::Argmax:        return Kernel::Argmax;
@@ -109,9 +111,11 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const GptOssPsos& go)
         case Kind::ExpertGate: case Kind::ExpertUp: case Kind::ExpertDown:
             return go.qmv_routed_bias;
         case Kind::RouterTopK:    return go.router_topk;
+        case Kind::ExpertSort:    return go.moe_sort;
+        case Kind::ExpertGather:  return go.moe_gather;
         case Kind::RowGather:     return go.row_gather;
         case Kind::ExpertSwiGlu:  return go.swiglu;
-        case Kind::ExpertCombine: return go.expert_combine;
+        case Kind::ExpertCombine: return go.moe_combine;
         case Kind::SdpaSink:      return go.sdpa_sink;
         case Kind::RopeQ: case Kind::RopeK: return go.rope_freqs;
         // The shared table only has entries for qwen3.5's kinds, so the norms
@@ -130,11 +134,10 @@ Pso pso_for(const Dispatch& d, const DecodeStepPsos& base, const GptOssPsos& go)
 
 void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Threadgroup& tg) {
     if (const KN kn = qmv_kn(d.kind, g); kn.N != 0) {
-        // A routed projection gets one grid plane per selected expert; a dense
-        // one gets a single plane. Same kernel, same shape otherwise.
         const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
                             d.kind == Kind::ExpertDown;
-        qmv_dispatch(kn.N, routed ? g.experts_per_token : 1, grid, tg);
+        qmv_dispatch(kn.N, 1, grid, tg,
+                     routed ? gptoss_moe_sorted_rows(g, 1) : 1);
         return;
     }
 
@@ -170,10 +173,20 @@ void launch_shape(const Dispatch& d, const GptOssGeometry& g, Grid& grid, Thread
         case Kind::RouterTopK:
             router_topk_dispatch(g.n_experts, grid, tg);
             return;
+        case Kind::ExpertSort:
+            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            return;
+        case Kind::ExpertGather:
+            shared_kernels::moe_route_rows_dispatch(
+                g.hidden, gptoss_moe_sorted_rows(g, 1), grid, tg);
+            return;
         case Kind::ExpertSwiGlu:
-            elementwise_dispatch(g.experts_per_token * g.intermediate, grid, tg);
+            elementwise_dispatch(
+                gptoss_moe_sorted_rows(g, 1) * g.intermediate, grid, tg);
             return;
         case Kind::ExpertCombine:
+            shared_kernels::expert_combine_dispatch(g.hidden, grid, tg);
+            return;
         case Kind::AttnResidual:
         case Kind::FfnResidual:
             elementwise_dispatch(g.hidden, grid, tg);
@@ -227,6 +240,32 @@ int gptoss_qmm_pool_rows(int max_rows) {
     return ((n + kQmmBMWide - 1) / kQmmBMWide) * kQmmBMWide;
 }
 
+int gptoss_moe_pairs(const GptOssGeometry& g, int rows) {
+    return (rows < 1 ? 1 : rows) * g.experts_per_token;
+}
+
+int gptoss_moe_tile_rows(const GptOssGeometry& g, int rows) {
+    return shared_kernels::moe_tile_rows(
+        gptoss_moe_pairs(g, rows), g.n_experts);
+}
+
+int gptoss_moe_sorted_rows(const GptOssGeometry& g, int rows) {
+    return shared_kernels::moe_sorted_rows(
+        gptoss_moe_pairs(g, rows), g.n_experts);
+}
+
+int gptoss_moe_qmm_bn(Kind k, const GptOssGeometry& g, int rows) {
+    const bool routed = k == Kind::ExpertGate || k == Kind::ExpertUp ||
+                        k == Kind::ExpertDown;
+    if (!routed || !g.mxfp4_experts || gptoss_moe_tile_rows(g, rows) <= 1)
+        return 0;
+    const KN kn = qmv_kn(k, g);
+    int bn = 0;
+    for (const int candidate : {16, 32, 64})
+        if (kn.N % candidate == 0) bn = candidate;
+    return bn;
+}
+
 /// The dense projections, which are the ones a batched GEMM can serve.
 ///
 /// NOT the routed three: each row picks its own experts, so their weight is
@@ -266,6 +305,10 @@ Pso pso_for_mb_rows(const Dispatch& d, const GptOssGeometry& g, int rows,
     const int N = rows < 1 ? 1 : rows;
     const int S = head_rows < 1 ? N : (head_rows < N ? head_rows : N);
     const int m = d.kind == Kind::LmHead ? S : N;
+    if (const int bn = gptoss_moe_qmm_bn(d.kind, g, N); bn > 0) {
+        const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
+        if (go.qmm_routed_bias[slot].valid()) return go.qmm_routed_bias[slot];
+    }
     if (const int bn = gptoss_qmm_bn(d.kind, g, m); bn > 0) {
         const int wide = qmm_bm_slot(qmm_bm(m));
         const int slot = bn == 64 ? 2 : (bn == 32 ? 1 : 0);
@@ -288,6 +331,11 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
         const bool routed = d.kind == Kind::ExpertGate || d.kind == Kind::ExpertUp ||
                             d.kind == Kind::ExpertDown;
         const int m = d.kind == Kind::LmHead ? S : N;
+        if (const int bn = gptoss_moe_qmm_bn(d.kind, g, N); bn > 0) {
+            qmm_t_dispatch(kn.N, gptoss_moe_sorted_rows(g, N), bn,
+                           shared_kernels::kMoeTileRows, grid, tg);
+            return;
+        }
         // A dense projection becomes a matmul once the batch fills a tile: the
         // matvec re-reads the whole weight PER ROW, which on this checkpoint is
         // 318 MB a layer.
@@ -298,7 +346,8 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
             qmm_t_dispatch(kn.N, gptoss_qmm_rows(m), bn, qmm_bm(m), grid, tg);
             return;
         }
-        qmv_dispatch(kn.N, routed ? g.experts_per_token : 1, grid, tg, m);
+        qmv_dispatch(kn.N, 1, grid, tg,
+                     routed ? gptoss_moe_sorted_rows(g, N) : m);
         return;
     }
 
@@ -335,14 +384,19 @@ void launch_shape_mb(const Dispatch& d, const GptOssGeometry& g, int rows, Grid&
         case Kind::RouterTopK:
             router_topk_dispatch(g.n_experts, grid, tg, N);
             return;
+        case Kind::ExpertSort:
+            shared_kernels::moe_route_sort_dispatch(g.n_experts, grid, tg);
+            return;
+        case Kind::ExpertGather:
+            shared_kernels::moe_route_rows_dispatch(
+                g.hidden, gptoss_moe_sorted_rows(g, N), grid, tg);
+            return;
         case Kind::ExpertSwiGlu:
-            elementwise_mb_dispatch(g.experts_per_token * g.intermediate, N, grid, tg);
+            elementwise_dispatch(
+                gptoss_moe_sorted_rows(g, N) * g.intermediate, grid, tg);
             return;
         case Kind::ExpertCombine:
-            // One thread per (channel, row): `y` is [rows, k, hidden], so the
-            // row is a real axis rather than a fold onto x.
-            grid = Grid{std::uint32_t(g.hidden), std::uint32_t(N), 1};
-            tg = Threadgroup{256, 1, 1};
+            shared_kernels::expert_combine_dispatch(g.hidden, grid, tg, N);
             return;
         case Kind::AttnResidual:
         case Kind::FfnResidual:

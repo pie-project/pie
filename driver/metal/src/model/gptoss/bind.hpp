@@ -84,8 +84,9 @@ inline std::size_t gptoss_kv_bytes_per_layer(const GptOssGeometry& g, int max_ct
 
 /// The widest activation any pool buffer must hold, in elements.
 ///
-/// NOT `hidden`: the MoE's operands are a k-wide stack, so the expert gate/up
-/// are `experts_per_token * intermediate` and the logits are the vocabulary.
+/// At M=1 the sorted MoE has one row per selected expert, so its floor remains
+/// `experts_per_token * intermediate`; M>1 padding is accounted by
+/// `go_pool_elems`, where the row count is known.
 inline int gptoss_widest_elems(const GptOssGeometry& g) {
     int widest = g.hidden;
     widest = widest < g.vocab ? g.vocab : widest;

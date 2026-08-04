@@ -209,9 +209,8 @@ constant constexpr uint kMaxExperts = 1024;
 /// them where the SORT left them.
 ///
 /// The same arithmetic as `expert_combine`, and deliberately a separate kernel
-/// rather than that one taught an optional index: gpt-oss does not sort, so
-/// giving it a buffer it must bind and never reads would be the bias slot
-/// problem again.
+/// rather than that one taught an optional index: every sorted family binds the
+/// inverse, while an unsorted caller should not carry a buffer it never reads.
 ///
 /// A slot whose pair never got a position contributes zero. That cannot happen
 /// for a routing the geometry accepted -- every id is in range and every pair
