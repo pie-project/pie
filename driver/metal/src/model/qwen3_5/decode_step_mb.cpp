@@ -222,7 +222,7 @@ Pso mb_pso(const Dispatch& d, const DecodeStepPsos& base, const MultiBatchPsos& 
             return base[d.kind];
         }
         default: {
-            const int wide_ = d.qmm_bm == kQmmBMWide ? 1 : 0;
+            const int wide_ = qmm_bm_slot(d.qmm_bm);
             if (d.qmm_split > 1 && mb.qmm_t_splitk[wide_].valid())
                 return mb.qmm_t_splitk[wide_];
             if (d.qmm_bn > 0) {
@@ -513,7 +513,7 @@ void encode_prefill_dags_mb(StepEncoder& se,
             d0.kind != Kernel::LmHeadUntied) {
             const int out = qmv_out_size(d0.kind, *geometry);
             if (out != 0 && out % 32 == 0) {
-                const bool wide = qmm_strided_bm(strided_rows) == kQmmBMWide &&
+                const bool wide = qmm_strided_bm(strided_rows) > kQmmBM &&
                                   mb_psos.qmm_t_strided_wide.valid();
                 const Pso& gemm =
                     wide ? (d0.fuse_residual ? mb_psos.qmm_t_strided_wide_residual

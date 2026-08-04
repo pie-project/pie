@@ -1669,6 +1669,32 @@ instantiate_qmm_t(64, 32, 32, 64, 8)
 instantiate_qmm_t(32, 32, 32, 64, 8)
 instantiate_qmm_t(128, 32, 32, 64, 8)
 
+// The third row block. A prompt is not a 32-row batch: 128 tokens at BM=32
+// unpack every weight four times, and the GEMM is memory-bound on exactly that
+// unpacking. BM=64 halves it again at no cost in accumulators -- 64x32/128
+// lanes is the same sixteen per lane that 32x64 already spends -- and buys 20%
+// on a llama-1B prefill. It is a strict addition: `qmm_bm_index` only reaches
+// this rung when the batch divides by 64, so nothing that used to run at 32
+// moves.
+instantiate_qmm_t(64, 64, 32, 16, 4)
+instantiate_qmm_t(32, 64, 32, 16, 4)
+instantiate_qmm_t(128, 64, 32, 16, 4)
+instantiate_qmm_t(64, 64, 32, 16, 8)
+instantiate_qmm_t(32, 64, 32, 16, 8)
+instantiate_qmm_t(128, 64, 32, 16, 8)
+instantiate_qmm_t(64, 64, 32, 32, 4)
+instantiate_qmm_t(32, 64, 32, 32, 4)
+instantiate_qmm_t(128, 64, 32, 32, 4)
+instantiate_qmm_t(64, 64, 32, 32, 8)
+instantiate_qmm_t(32, 64, 32, 32, 8)
+instantiate_qmm_t(128, 64, 32, 32, 8)
+instantiate_qmm_t(64, 64, 32, 64, 4)
+instantiate_qmm_t(32, 64, 32, 64, 4)
+instantiate_qmm_t(128, 64, 32, 64, 4)
+instantiate_qmm_t(64, 64, 32, 64, 8)
+instantiate_qmm_t(32, 64, 32, 64, 8)
+instantiate_qmm_t(128, 64, 32, 64, 8)
+
 // ── Strided form, for the prefill ────────────────────────────────────────────
 // Identical to the aligned kernel above except that the row pitch of `x`, `y`
 // and `residual` is given separately from `K`/`N`.
@@ -1983,6 +2009,13 @@ instantiate_qmm_t_splitk(128, 32, 32, 32, 4)
 instantiate_qmm_t_splitk(64, 32, 32, 32, 8)
 instantiate_qmm_t_splitk(32, 32, 32, 32, 8)
 instantiate_qmm_t_splitk(128, 32, 32, 32, 8)
+instantiate_qmm_t_splitk(64, 64, 32, 32, 4)
+instantiate_qmm_t_splitk(32, 64, 32, 32, 4)
+instantiate_qmm_t_splitk(128, 64, 32, 32, 4)
+instantiate_qmm_t_splitk(64, 64, 32, 32, 8)
+instantiate_qmm_t_splitk(32, 64, 32, 32, 8)
+instantiate_qmm_t_splitk(128, 64, 32, 32, 8)
+
 
 template [[host_name("qmm_splitk_reduce_bfloat16")]] [[kernel]] void
 qmm_splitk_reduce<bfloat, false>(device bfloat*, const constant int&,

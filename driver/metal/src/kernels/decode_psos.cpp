@@ -202,19 +202,22 @@ bool load_multibatch_psos(RawMetalContext& ctx,
     };
 
     const std::string qmm = "quantized_qmm_t.metal";
-    for (int w = 0; w < 2; ++w) {
+    // The table's first axis IS `kQmmBMs`. Spelling the extent as a literal in
+    // the header is unavoidable -- it cannot see the model layer -- so the two
+    // are tied here, where both are visible.
+    static_assert(pie::metal::kQmmBMCount ==
+                      int(sizeof(out.qmm_t) / sizeof(out.qmm_t[0])),
+                  "the PSO table's row-block axis must match kQmmBMs");
+    for (int w = 0; w < pie::metal::kQmmBMCount; ++w) {
+        const int bm = pie::metal::kQmmBMs[w];
         for (int i = 0; i < 3; ++i) {
             const int bn = 16 << i;
-            const int bm = w == 0 ? pie::metal::kQmmBM : pie::metal::kQmmBMWide;
             const std::string suffix = q + "_bm_" + std::to_string(bm) +
                                        "_bn_" + std::to_string(bn);
             want(qmm, "affine_qmm_t" + suffix, &out.qmm_t[w][i]);
             want(qmm, "affine_qmm_t_residual" + suffix, &out.qmm_t_residual[w][i]);
             want(qmm, "affine_qmm_t_bias" + suffix, &out.qmm_t_bias[w][i]);
         }
-    }
-    for (int w = 0; w < 2; ++w) {
-        const int bm = w == 0 ? pie::metal::kQmmBM : pie::metal::kQmmBMWide;
         want(qmm,
              "affine_qmm_t_splitk" + q + "_bm_" + std::to_string(bm) +
                  "_bn_" + std::to_string(pie::metal::kQmmSplitBN),
