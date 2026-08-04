@@ -64,6 +64,29 @@ pub fn llama_like_cuda(
     plan.depth_window = class == FireClass::Decode
         && !cuda.xqa_decode
         && !cuda.head_dim_padded;
+    if plan.depth_window {
+        // PROMOTED (the review's depth-IR gap): each op's role under
+        // the axis is stated as serialized vocabulary the goldens pin.
+        // Layer-tagged ops are Windowed; the flashinfer decode dispatch
+        // additionally swaps to the depth prefix plan on union tail
+        // layers.
+        for op in &mut plan.ops {
+            if op.layer.is_none() {
+                continue;
+            }
+            op.depth_role = Some(
+                match &op.kind {
+                    crate::trace::OpKind::Launch { kernel, .. }
+                        if kernel
+                            == "dispatch_attention_flashinfer_decode" =>
+                    {
+                        crate::trace::DepthRole::PrefixPlanSwap
+                    }
+                    _ => crate::trace::DepthRole::Windowed,
+                },
+            );
+        }
+    }
     plan
 }
 

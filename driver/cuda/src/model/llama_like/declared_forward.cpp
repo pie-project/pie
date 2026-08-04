@@ -736,7 +736,11 @@ void llama_like_forward_declared(
         // is the logit-lens head). Union fire: tail-layer ops run over
         // the full-depth prefix rows.
         if (depth_k >= 0) {
-            const bool tail_op = op.layer >= 0 && op.layer >= depth_k;
+            // PROMOTED: membership comes from the op's STATED role
+            // (depth_role != 0), not a re-derived layer-tag rule — the
+            // one function all walkers share is now the trace itself.
+            const bool tail_op = op.depth_role != 0 &&
+                op.layer >= depth_k;
             if (tail_op && !depth_union) continue;
             depth_tail_active = depth_union && tail_op;
             N = depth_tail_active ? depth_split : N_fire;
@@ -1181,7 +1185,7 @@ void llama_like_forward_declared(
                 // STRUCTURAL S-4: tail-layer attention on a union fire
                 // pairs with the PREFIX plan and its dedicated
                 // workspace (the plan/workspace pairing rule).
-                if (depth_tail_active) {
+                if (depth_tail_active && op.depth_role == 2) {
                     const int layer_window_left_d =
                         (!fwd_cfg.per_layer_window_left.empty() &&
                          L < static_cast<int>(

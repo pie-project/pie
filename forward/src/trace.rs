@@ -617,6 +617,29 @@ pub struct Op {
     pub outputs: Vec<ValueId>,
     /// The layer this op belongs to, or `None` for prologue/epilogue.
     pub layer: Option<u32>,
+    /// STRUCTURAL S-3, promoted (the review's depth-IR gap): this op's
+    /// role under the DEPTH axis, stated as VOCABULARY the goldens pin
+    /// rather than a membership rule three walkers re-derive from the
+    /// layer tag. `None` = outside the axis (prologue/epilogue — the
+    /// unchanged tail is the logit-lens head by construction).
+    /// The split point `k` remains a runtime input; the role says WHAT
+    /// this op does when its layer falls in the truncated range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_role: Option<DepthRole>,
+}
+
+/// An op's behavior under the depth axis ([`Op::depth_role`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepthRole {
+    /// Skipped on a uniform truncated fire when `layer >= k`; runs over
+    /// the full-depth prefix rows on a union fire.
+    Windowed,
+    /// `Windowed`, and additionally the attention dispatch pairs the
+    /// depth PREFIX plan with the dedicated workspace on union tail
+    /// layers (the plan/workspace pairing rule) instead of the fire's
+    /// decode plan.
+    PrefixPlanSwap,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -855,6 +878,7 @@ impl TraceBuilder {
             inputs,
             outputs: outputs.clone(),
             layer: self.layer,
+            depth_role: None,
         });
         outputs
     }

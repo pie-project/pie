@@ -503,7 +503,7 @@ fn emit_range_scoped(
             if cur_layer.is_some() {
                 close_scope(b);
             }
-            if let Some(l) = op.layer {
+            if let Some(l) = op.layer.filter(|_| op.depth_role.is_some()) {
                 b.stmt("{");
                 b.stmt(&format!(
                     "const bool depth_tail = depth_k <= {l};"
@@ -1560,11 +1560,13 @@ fn emit_launch(
             // Per-layer window resolution is RUNTIME cfg reads
             // (per_layer_window_left / sliding_window) — placement-
             // independent, so post-norm deployments emit it unchanged.
-            if depth_active {
-                // STRUCTURAL S-4: a depth-tail layer's attention pairs
-                // the PREFIX plan with its dedicated workspace (the
-                // plan/workspace pairing rule); `depth_tail` is the
-                // enclosing layer scope's static-L bool.
+            if depth_active
+                && op.depth_role
+                    == Some(crate::trace::DepthRole::PrefixPlanSwap)
+            {
+                // STRUCTURAL S-4 (role-stated): the trace SAYS this
+                // launch swaps to the prefix plan on union tail layers
+                // — the emitter spells what the vocabulary states.
                 b.stmt("const ops::DecodePlanCache* depth_dp = depth_tail");
                 b.stmt("    ? plan_state.depth_prefix_decode_plan.get()");
                 b.stmt("    : plan_state.decode_plan.get();");

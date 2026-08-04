@@ -522,6 +522,10 @@ pub struct PieForwardOp {
     /// the field's contract). Empty for every other kind.
     pub aux_names: PieForwardIdRange,
     /// Values consumed, in operand order.
+    /// The op's role under the DEPTH axis ([`crate::trace::DepthRole`]
+    /// as wire values: 0 = none, 1 = windowed, 2 = prefix-plan-swap).
+    /// Appended per the ABI discipline; pre-role consumers read 0.
+    pub depth_role: u32,
     pub inputs: PieForwardIdRange,
     /// Values produced (`SplitQkv` produces three, `KvAppend` none).
     pub outputs: PieForwardIdRange,

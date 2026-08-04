@@ -6628,7 +6628,8 @@
       "outputs": [
         2
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6650,7 +6651,8 @@
       "outputs": [
         3
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6665,7 +6667,8 @@
       "outputs": [
         4
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6682,7 +6685,8 @@
         6,
         7
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6711,7 +6715,8 @@
         7
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6731,7 +6736,8 @@
         8,
         9
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6764,7 +6770,8 @@
         7
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6781,7 +6788,8 @@
         7
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6794,7 +6802,8 @@
         8
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6806,7 +6815,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6822,7 +6832,8 @@
         8
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -6838,7 +6849,8 @@
         8
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6851,7 +6863,8 @@
         8
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6866,7 +6879,8 @@
       "outputs": [
         10
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6883,7 +6897,8 @@
         12,
         13
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6912,7 +6927,8 @@
         13
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6932,7 +6948,8 @@
         14,
         15
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6965,7 +6982,8 @@
         13
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6982,7 +7000,8 @@
         13
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -6995,7 +7014,8 @@
         14
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7027,7 +7047,8 @@
         14
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7043,7 +7064,8 @@
         14
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -7056,7 +7078,8 @@
         14
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7071,7 +7094,8 @@
       "outputs": [
         16
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7084,7 +7108,8 @@
       "outputs": [
         17
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7105,7 +7130,8 @@
         1
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7122,7 +7148,8 @@
         19,
         20
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7142,7 +7169,8 @@
         21,
         22
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7175,7 +7203,8 @@
         20
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7192,7 +7221,8 @@
         20
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7205,7 +7235,8 @@
         17
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7237,7 +7268,8 @@
         17
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7253,7 +7285,8 @@
         17
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -7266,7 +7299,8 @@
         17
       ],
       "outputs": [],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7282,7 +7316,8 @@
       "outputs": [
         23
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7297,7 +7332,8 @@
       "outputs": [
         24
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7312,7 +7348,8 @@
       "outputs": [
         25
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7326,7 +7363,8 @@
       "outputs": [
         26
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7342,7 +7380,8 @@
       "outputs": [
         27
       ],
-      "layer": 0
+      "layer": 0,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7357,7 +7396,8 @@
       "outputs": [
         28
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7379,7 +7419,8 @@
       "outputs": [
         29
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7394,7 +7435,8 @@
       "outputs": [
         30
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7411,7 +7453,8 @@
         32,
         33
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7440,7 +7483,8 @@
         33
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7460,7 +7504,8 @@
         34,
         35
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7493,7 +7538,8 @@
         33
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7510,7 +7556,8 @@
         33
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7523,7 +7570,8 @@
         34
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7535,7 +7583,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7551,7 +7600,8 @@
         34
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -7567,7 +7617,8 @@
         34
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7580,7 +7631,8 @@
         34
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7595,7 +7647,8 @@
       "outputs": [
         36
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7612,7 +7665,8 @@
         38,
         39
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7641,7 +7695,8 @@
         39
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7661,7 +7716,8 @@
         40,
         41
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7694,7 +7750,8 @@
         39
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7711,7 +7768,8 @@
         39
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7724,7 +7782,8 @@
         40
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7756,7 +7815,8 @@
         40
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7772,7 +7832,8 @@
         40
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -7785,7 +7846,8 @@
         40
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7800,7 +7862,8 @@
       "outputs": [
         42
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7813,7 +7876,8 @@
       "outputs": [
         43
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7834,7 +7898,8 @@
         1
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7851,7 +7916,8 @@
         45,
         46
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7871,7 +7937,8 @@
         47,
         48
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7904,7 +7971,8 @@
         46
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7921,7 +7989,8 @@
         46
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7934,7 +8003,8 @@
         43
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7966,7 +8036,8 @@
         43
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -7982,7 +8053,8 @@
         43
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -7995,7 +8067,8 @@
         43
       ],
       "outputs": [],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8011,7 +8084,8 @@
       "outputs": [
         49
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8026,7 +8100,8 @@
       "outputs": [
         50
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8041,7 +8116,8 @@
       "outputs": [
         51
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8055,7 +8131,8 @@
       "outputs": [
         52
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8071,7 +8148,8 @@
       "outputs": [
         53
       ],
-      "layer": 1
+      "layer": 1,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8086,7 +8164,8 @@
       "outputs": [
         54
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8108,7 +8187,8 @@
       "outputs": [
         55
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8123,7 +8203,8 @@
       "outputs": [
         56
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8140,7 +8221,8 @@
         58,
         59
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8169,7 +8251,8 @@
         59
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8189,7 +8272,8 @@
         60,
         61
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8222,7 +8306,8 @@
         59
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8239,7 +8324,8 @@
         59
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8252,7 +8338,8 @@
         60
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8264,7 +8351,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8280,7 +8368,8 @@
         60
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -8296,7 +8385,8 @@
         60
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8309,7 +8399,8 @@
         60
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8324,7 +8415,8 @@
       "outputs": [
         62
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8341,7 +8433,8 @@
         64,
         65
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8370,7 +8463,8 @@
         65
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8390,7 +8484,8 @@
         66,
         67
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8423,7 +8518,8 @@
         65
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8440,7 +8536,8 @@
         65
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8453,7 +8550,8 @@
         66
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8485,7 +8583,8 @@
         66
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8501,7 +8600,8 @@
         66
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -8514,7 +8614,8 @@
         66
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8529,7 +8630,8 @@
       "outputs": [
         68
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8542,7 +8644,8 @@
       "outputs": [
         69
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8563,7 +8666,8 @@
         1
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8580,7 +8684,8 @@
         71,
         72
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8600,7 +8705,8 @@
         73,
         74
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8633,7 +8739,8 @@
         72
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8650,7 +8757,8 @@
         72
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8663,7 +8771,8 @@
         69
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8695,7 +8804,8 @@
         69
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8711,7 +8821,8 @@
         69
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -8724,7 +8835,8 @@
         69
       ],
       "outputs": [],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8740,7 +8852,8 @@
       "outputs": [
         75
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8755,7 +8868,8 @@
       "outputs": [
         76
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8770,7 +8884,8 @@
       "outputs": [
         77
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8784,7 +8899,8 @@
       "outputs": [
         78
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8800,7 +8916,8 @@
       "outputs": [
         79
       ],
-      "layer": 2
+      "layer": 2,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8815,7 +8932,8 @@
       "outputs": [
         80
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8837,7 +8955,8 @@
       "outputs": [
         81
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8852,7 +8971,8 @@
       "outputs": [
         82
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8869,7 +8989,8 @@
         84,
         85
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8898,7 +9019,8 @@
         85
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8918,7 +9040,8 @@
         86,
         87
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8951,7 +9074,8 @@
         85
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8968,7 +9092,8 @@
         85
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8981,7 +9106,8 @@
         86
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -8993,7 +9119,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9009,7 +9136,8 @@
         86
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -9025,7 +9153,8 @@
         86
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9038,7 +9167,8 @@
         86
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9053,7 +9183,8 @@
       "outputs": [
         88
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9070,7 +9201,8 @@
         90,
         91
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9099,7 +9231,8 @@
         91
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9119,7 +9252,8 @@
         92,
         93
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9152,7 +9286,8 @@
         91
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9169,7 +9304,8 @@
         91
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9182,7 +9318,8 @@
         92
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9214,7 +9351,8 @@
         92
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9230,7 +9368,8 @@
         92
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -9243,7 +9382,8 @@
         92
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9258,7 +9398,8 @@
       "outputs": [
         94
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9271,7 +9412,8 @@
       "outputs": [
         95
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9292,7 +9434,8 @@
         1
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9309,7 +9452,8 @@
         97,
         98
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9329,7 +9473,8 @@
         99,
         100
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9362,7 +9507,8 @@
         98
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9379,7 +9525,8 @@
         98
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9392,7 +9539,8 @@
         95
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9424,7 +9572,8 @@
         95
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9440,7 +9589,8 @@
         95
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -9453,7 +9603,8 @@
         95
       ],
       "outputs": [],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9469,7 +9620,8 @@
       "outputs": [
         101
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9484,7 +9636,8 @@
       "outputs": [
         102
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9499,7 +9652,8 @@
       "outputs": [
         103
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9513,7 +9667,8 @@
       "outputs": [
         104
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9529,7 +9684,8 @@
       "outputs": [
         105
       ],
-      "layer": 3
+      "layer": 3,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9544,7 +9700,8 @@
       "outputs": [
         106
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9566,7 +9723,8 @@
       "outputs": [
         107
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9581,7 +9739,8 @@
       "outputs": [
         108
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9598,7 +9757,8 @@
         110,
         111
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9627,7 +9787,8 @@
         111
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9647,7 +9808,8 @@
         112,
         113
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9680,7 +9842,8 @@
         111
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9697,7 +9860,8 @@
         111
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9710,7 +9874,8 @@
         112
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9722,7 +9887,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9738,7 +9904,8 @@
         112
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -9754,7 +9921,8 @@
         112
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9767,7 +9935,8 @@
         112
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9782,7 +9951,8 @@
       "outputs": [
         114
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9799,7 +9969,8 @@
         116,
         117
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9828,7 +9999,8 @@
         117
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9848,7 +10020,8 @@
         118,
         119
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9881,7 +10054,8 @@
         117
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9898,7 +10072,8 @@
         117
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9911,7 +10086,8 @@
         118
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9943,7 +10119,8 @@
         118
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9959,7 +10136,8 @@
         118
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -9972,7 +10150,8 @@
         118
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -9987,7 +10166,8 @@
       "outputs": [
         120
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10000,7 +10180,8 @@
       "outputs": [
         121
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10021,7 +10202,8 @@
         1
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10038,7 +10220,8 @@
         123,
         124
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10058,7 +10241,8 @@
         125,
         126
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10091,7 +10275,8 @@
         124
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10108,7 +10293,8 @@
         124
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10121,7 +10307,8 @@
         121
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10153,7 +10340,8 @@
         121
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10169,7 +10357,8 @@
         121
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -10182,7 +10371,8 @@
         121
       ],
       "outputs": [],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10198,7 +10388,8 @@
       "outputs": [
         127
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10213,7 +10404,8 @@
       "outputs": [
         128
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10228,7 +10420,8 @@
       "outputs": [
         129
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10242,7 +10435,8 @@
       "outputs": [
         130
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10258,7 +10452,8 @@
       "outputs": [
         131
       ],
-      "layer": 4
+      "layer": 4,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10273,7 +10468,8 @@
       "outputs": [
         132
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10295,7 +10491,8 @@
       "outputs": [
         133
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10310,7 +10507,8 @@
       "outputs": [
         134
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10327,7 +10525,8 @@
         136,
         137
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10356,7 +10555,8 @@
         137
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10376,7 +10576,8 @@
         138,
         139
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10409,7 +10610,8 @@
         137
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10426,7 +10628,8 @@
         137
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10439,7 +10642,8 @@
         138
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10451,7 +10655,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10467,7 +10672,8 @@
         138
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -10483,7 +10689,8 @@
         138
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10496,7 +10703,8 @@
         138
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10511,7 +10719,8 @@
       "outputs": [
         140
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10528,7 +10737,8 @@
         142,
         143
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10557,7 +10767,8 @@
         143
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10577,7 +10788,8 @@
         144,
         145
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10610,7 +10822,8 @@
         143
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10627,7 +10840,8 @@
         143
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10640,7 +10854,8 @@
         144
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10672,7 +10887,8 @@
         144
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10688,7 +10904,8 @@
         144
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -10701,7 +10918,8 @@
         144
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10716,7 +10934,8 @@
       "outputs": [
         146
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10729,7 +10948,8 @@
       "outputs": [
         147
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10750,7 +10970,8 @@
         1
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10767,7 +10988,8 @@
         149,
         150
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10787,7 +11009,8 @@
         151,
         152
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10820,7 +11043,8 @@
         150
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10837,7 +11061,8 @@
         150
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10850,7 +11075,8 @@
         147
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10882,7 +11108,8 @@
         147
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10898,7 +11125,8 @@
         147
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -10911,7 +11139,8 @@
         147
       ],
       "outputs": [],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10927,7 +11156,8 @@
       "outputs": [
         153
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10942,7 +11172,8 @@
       "outputs": [
         154
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10957,7 +11188,8 @@
       "outputs": [
         155
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10971,7 +11203,8 @@
       "outputs": [
         156
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -10987,7 +11220,8 @@
       "outputs": [
         157
       ],
-      "layer": 5
+      "layer": 5,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11002,7 +11236,8 @@
       "outputs": [
         158
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11024,7 +11259,8 @@
       "outputs": [
         159
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11039,7 +11275,8 @@
       "outputs": [
         160
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11056,7 +11293,8 @@
         162,
         163
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11085,7 +11323,8 @@
         163
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11105,7 +11344,8 @@
         164,
         165
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11138,7 +11378,8 @@
         163
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11155,7 +11396,8 @@
         163
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11168,7 +11410,8 @@
         164
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11180,7 +11423,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11196,7 +11440,8 @@
         164
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -11212,7 +11457,8 @@
         164
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11225,7 +11471,8 @@
         164
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11240,7 +11487,8 @@
       "outputs": [
         166
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11257,7 +11505,8 @@
         168,
         169
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11286,7 +11535,8 @@
         169
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11306,7 +11556,8 @@
         170,
         171
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11339,7 +11590,8 @@
         169
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11356,7 +11608,8 @@
         169
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11369,7 +11622,8 @@
         170
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11401,7 +11655,8 @@
         170
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11417,7 +11672,8 @@
         170
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -11430,7 +11686,8 @@
         170
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11445,7 +11702,8 @@
       "outputs": [
         172
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11458,7 +11716,8 @@
       "outputs": [
         173
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11479,7 +11738,8 @@
         1
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11496,7 +11756,8 @@
         175,
         176
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11516,7 +11777,8 @@
         177,
         178
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11549,7 +11811,8 @@
         176
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11566,7 +11829,8 @@
         176
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11579,7 +11843,8 @@
         173
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11611,7 +11876,8 @@
         173
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11627,7 +11893,8 @@
         173
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -11640,7 +11907,8 @@
         173
       ],
       "outputs": [],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11656,7 +11924,8 @@
       "outputs": [
         179
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11671,7 +11940,8 @@
       "outputs": [
         180
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11686,7 +11956,8 @@
       "outputs": [
         181
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11700,7 +11971,8 @@
       "outputs": [
         182
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11716,7 +11988,8 @@
       "outputs": [
         183
       ],
-      "layer": 6
+      "layer": 6,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11731,7 +12004,8 @@
       "outputs": [
         184
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11753,7 +12027,8 @@
       "outputs": [
         185
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11768,7 +12043,8 @@
       "outputs": [
         186
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11785,7 +12061,8 @@
         188,
         189
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11814,7 +12091,8 @@
         189
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11834,7 +12112,8 @@
         190,
         191
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11867,7 +12146,8 @@
         189
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11884,7 +12164,8 @@
         189
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11897,7 +12178,8 @@
         190
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11909,7 +12191,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11925,7 +12208,8 @@
         190
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -11941,7 +12225,8 @@
         190
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11954,7 +12239,8 @@
         190
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11969,7 +12255,8 @@
       "outputs": [
         192
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -11986,7 +12273,8 @@
         194,
         195
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12015,7 +12303,8 @@
         195
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12035,7 +12324,8 @@
         196,
         197
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12068,7 +12358,8 @@
         195
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12085,7 +12376,8 @@
         195
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12098,7 +12390,8 @@
         196
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12130,7 +12423,8 @@
         196
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12146,7 +12440,8 @@
         196
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -12159,7 +12454,8 @@
         196
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12174,7 +12470,8 @@
       "outputs": [
         198
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12187,7 +12484,8 @@
       "outputs": [
         199
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12208,7 +12506,8 @@
         1
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12225,7 +12524,8 @@
         201,
         202
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12245,7 +12545,8 @@
         203,
         204
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12278,7 +12579,8 @@
         202
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12295,7 +12597,8 @@
         202
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12308,7 +12611,8 @@
         199
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12340,7 +12644,8 @@
         199
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12356,7 +12661,8 @@
         199
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -12369,7 +12675,8 @@
         199
       ],
       "outputs": [],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12385,7 +12692,8 @@
       "outputs": [
         205
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12400,7 +12708,8 @@
       "outputs": [
         206
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12415,7 +12724,8 @@
       "outputs": [
         207
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12429,7 +12739,8 @@
       "outputs": [
         208
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12445,7 +12756,8 @@
       "outputs": [
         209
       ],
-      "layer": 7
+      "layer": 7,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12460,7 +12772,8 @@
       "outputs": [
         210
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12482,7 +12795,8 @@
       "outputs": [
         211
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12497,7 +12811,8 @@
       "outputs": [
         212
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12514,7 +12829,8 @@
         214,
         215
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12543,7 +12859,8 @@
         215
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12563,7 +12880,8 @@
         216,
         217
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12596,7 +12914,8 @@
         215
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12613,7 +12932,8 @@
         215
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12626,7 +12946,8 @@
         216
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12638,7 +12959,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12654,7 +12976,8 @@
         216
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -12670,7 +12993,8 @@
         216
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12683,7 +13007,8 @@
         216
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12698,7 +13023,8 @@
       "outputs": [
         218
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12715,7 +13041,8 @@
         220,
         221
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12744,7 +13071,8 @@
         221
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12764,7 +13092,8 @@
         222,
         223
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12797,7 +13126,8 @@
         221
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12814,7 +13144,8 @@
         221
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12827,7 +13158,8 @@
         222
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12859,7 +13191,8 @@
         222
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12875,7 +13208,8 @@
         222
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -12888,7 +13222,8 @@
         222
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12903,7 +13238,8 @@
       "outputs": [
         224
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12916,7 +13252,8 @@
       "outputs": [
         225
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12937,7 +13274,8 @@
         1
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12954,7 +13292,8 @@
         227,
         228
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -12974,7 +13313,8 @@
         229,
         230
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13007,7 +13347,8 @@
         228
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13024,7 +13365,8 @@
         228
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13037,7 +13379,8 @@
         225
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13069,7 +13412,8 @@
         225
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13085,7 +13429,8 @@
         225
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -13098,7 +13443,8 @@
         225
       ],
       "outputs": [],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13114,7 +13460,8 @@
       "outputs": [
         231
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13129,7 +13476,8 @@
       "outputs": [
         232
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13144,7 +13492,8 @@
       "outputs": [
         233
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13158,7 +13507,8 @@
       "outputs": [
         234
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13174,7 +13524,8 @@
       "outputs": [
         235
       ],
-      "layer": 8
+      "layer": 8,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13189,7 +13540,8 @@
       "outputs": [
         236
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13211,7 +13563,8 @@
       "outputs": [
         237
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13226,7 +13579,8 @@
       "outputs": [
         238
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13243,7 +13597,8 @@
         240,
         241
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13272,7 +13627,8 @@
         241
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13292,7 +13648,8 @@
         242,
         243
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13325,7 +13682,8 @@
         241
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13342,7 +13700,8 @@
         241
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13355,7 +13714,8 @@
         242
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13367,7 +13727,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13383,7 +13744,8 @@
         242
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -13399,7 +13761,8 @@
         242
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13412,7 +13775,8 @@
         242
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13427,7 +13791,8 @@
       "outputs": [
         244
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13444,7 +13809,8 @@
         246,
         247
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13473,7 +13839,8 @@
         247
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13493,7 +13860,8 @@
         248,
         249
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13526,7 +13894,8 @@
         247
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13543,7 +13912,8 @@
         247
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13556,7 +13926,8 @@
         248
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13588,7 +13959,8 @@
         248
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13604,7 +13976,8 @@
         248
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -13617,7 +13990,8 @@
         248
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13632,7 +14006,8 @@
       "outputs": [
         250
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13645,7 +14020,8 @@
       "outputs": [
         251
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13666,7 +14042,8 @@
         1
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13683,7 +14060,8 @@
         253,
         254
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13703,7 +14081,8 @@
         255,
         256
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13736,7 +14115,8 @@
         254
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13753,7 +14133,8 @@
         254
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13766,7 +14147,8 @@
         251
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13798,7 +14180,8 @@
         251
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13814,7 +14197,8 @@
         251
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -13827,7 +14211,8 @@
         251
       ],
       "outputs": [],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13843,7 +14228,8 @@
       "outputs": [
         257
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13858,7 +14244,8 @@
       "outputs": [
         258
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13873,7 +14260,8 @@
       "outputs": [
         259
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13887,7 +14275,8 @@
       "outputs": [
         260
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13903,7 +14292,8 @@
       "outputs": [
         261
       ],
-      "layer": 9
+      "layer": 9,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13918,7 +14308,8 @@
       "outputs": [
         262
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13940,7 +14331,8 @@
       "outputs": [
         263
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13955,7 +14347,8 @@
       "outputs": [
         264
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -13972,7 +14365,8 @@
         266,
         267
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14001,7 +14395,8 @@
         267
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14021,7 +14416,8 @@
         268,
         269
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14054,7 +14450,8 @@
         267
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14071,7 +14468,8 @@
         267
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14084,7 +14482,8 @@
         268
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14096,7 +14495,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14112,7 +14512,8 @@
         268
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -14128,7 +14529,8 @@
         268
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14141,7 +14543,8 @@
         268
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14156,7 +14559,8 @@
       "outputs": [
         270
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14173,7 +14577,8 @@
         272,
         273
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14202,7 +14607,8 @@
         273
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14222,7 +14628,8 @@
         274,
         275
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14255,7 +14662,8 @@
         273
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14272,7 +14680,8 @@
         273
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14285,7 +14694,8 @@
         274
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14317,7 +14727,8 @@
         274
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14333,7 +14744,8 @@
         274
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -14346,7 +14758,8 @@
         274
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14361,7 +14774,8 @@
       "outputs": [
         276
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14374,7 +14788,8 @@
       "outputs": [
         277
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14395,7 +14810,8 @@
         1
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14412,7 +14828,8 @@
         279,
         280
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14432,7 +14849,8 @@
         281,
         282
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14465,7 +14883,8 @@
         280
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14482,7 +14901,8 @@
         280
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14495,7 +14915,8 @@
         277
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14527,7 +14948,8 @@
         277
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14543,7 +14965,8 @@
         277
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -14556,7 +14979,8 @@
         277
       ],
       "outputs": [],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14572,7 +14996,8 @@
       "outputs": [
         283
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14587,7 +15012,8 @@
       "outputs": [
         284
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14602,7 +15028,8 @@
       "outputs": [
         285
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14616,7 +15043,8 @@
       "outputs": [
         286
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14632,7 +15060,8 @@
       "outputs": [
         287
       ],
-      "layer": 10
+      "layer": 10,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14647,7 +15076,8 @@
       "outputs": [
         288
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14669,7 +15099,8 @@
       "outputs": [
         289
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14684,7 +15115,8 @@
       "outputs": [
         290
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14701,7 +15133,8 @@
         292,
         293
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14730,7 +15163,8 @@
         293
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14750,7 +15184,8 @@
         294,
         295
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14783,7 +15218,8 @@
         293
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14800,7 +15236,8 @@
         293
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14813,7 +15250,8 @@
         294
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14825,7 +15263,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14841,7 +15280,8 @@
         294
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -14857,7 +15297,8 @@
         294
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14870,7 +15311,8 @@
         294
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14885,7 +15327,8 @@
       "outputs": [
         296
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14902,7 +15345,8 @@
         298,
         299
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14931,7 +15375,8 @@
         299
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14951,7 +15396,8 @@
         300,
         301
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -14984,7 +15430,8 @@
         299
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15001,7 +15448,8 @@
         299
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15014,7 +15462,8 @@
         300
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15046,7 +15495,8 @@
         300
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15062,7 +15512,8 @@
         300
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -15075,7 +15526,8 @@
         300
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15090,7 +15542,8 @@
       "outputs": [
         302
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15103,7 +15556,8 @@
       "outputs": [
         303
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15124,7 +15578,8 @@
         1
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15141,7 +15596,8 @@
         305,
         306
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15161,7 +15617,8 @@
         307,
         308
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15194,7 +15651,8 @@
         306
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15211,7 +15669,8 @@
         306
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15224,7 +15683,8 @@
         303
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15256,7 +15716,8 @@
         303
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15272,7 +15733,8 @@
         303
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -15285,7 +15747,8 @@
         303
       ],
       "outputs": [],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15301,7 +15764,8 @@
       "outputs": [
         309
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15316,7 +15780,8 @@
       "outputs": [
         310
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15331,7 +15796,8 @@
       "outputs": [
         311
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15345,7 +15811,8 @@
       "outputs": [
         312
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15361,7 +15828,8 @@
       "outputs": [
         313
       ],
-      "layer": 11
+      "layer": 11,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15376,7 +15844,8 @@
       "outputs": [
         314
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15398,7 +15867,8 @@
       "outputs": [
         315
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15413,7 +15883,8 @@
       "outputs": [
         316
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15430,7 +15901,8 @@
         318,
         319
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15459,7 +15931,8 @@
         319
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15479,7 +15952,8 @@
         320,
         321
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15512,7 +15986,8 @@
         319
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15529,7 +16004,8 @@
         319
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15542,7 +16018,8 @@
         320
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15554,7 +16031,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15570,7 +16048,8 @@
         320
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -15586,7 +16065,8 @@
         320
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15599,7 +16079,8 @@
         320
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15614,7 +16095,8 @@
       "outputs": [
         322
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15631,7 +16113,8 @@
         324,
         325
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15660,7 +16143,8 @@
         325
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15680,7 +16164,8 @@
         326,
         327
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15713,7 +16198,8 @@
         325
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15730,7 +16216,8 @@
         325
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15743,7 +16230,8 @@
         326
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15775,7 +16263,8 @@
         326
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15791,7 +16280,8 @@
         326
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -15804,7 +16294,8 @@
         326
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15819,7 +16310,8 @@
       "outputs": [
         328
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15832,7 +16324,8 @@
       "outputs": [
         329
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15853,7 +16346,8 @@
         1
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15870,7 +16364,8 @@
         331,
         332
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15890,7 +16385,8 @@
         333,
         334
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15923,7 +16419,8 @@
         332
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15940,7 +16437,8 @@
         332
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15953,7 +16451,8 @@
         329
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -15985,7 +16484,8 @@
         329
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16001,7 +16501,8 @@
         329
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -16014,7 +16515,8 @@
         329
       ],
       "outputs": [],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16030,7 +16532,8 @@
       "outputs": [
         335
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16045,7 +16548,8 @@
       "outputs": [
         336
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16060,7 +16564,8 @@
       "outputs": [
         337
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16074,7 +16579,8 @@
       "outputs": [
         338
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16090,7 +16596,8 @@
       "outputs": [
         339
       ],
-      "layer": 12
+      "layer": 12,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16105,7 +16612,8 @@
       "outputs": [
         340
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16127,7 +16635,8 @@
       "outputs": [
         341
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16142,7 +16651,8 @@
       "outputs": [
         342
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16159,7 +16669,8 @@
         344,
         345
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16188,7 +16699,8 @@
         345
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16208,7 +16720,8 @@
         346,
         347
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16241,7 +16754,8 @@
         345
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16258,7 +16772,8 @@
         345
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16271,7 +16786,8 @@
         346
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16283,7 +16799,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16299,7 +16816,8 @@
         346
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -16315,7 +16833,8 @@
         346
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16328,7 +16847,8 @@
         346
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16343,7 +16863,8 @@
       "outputs": [
         348
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16360,7 +16881,8 @@
         350,
         351
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16389,7 +16911,8 @@
         351
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16409,7 +16932,8 @@
         352,
         353
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16442,7 +16966,8 @@
         351
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16459,7 +16984,8 @@
         351
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16472,7 +16998,8 @@
         352
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16504,7 +17031,8 @@
         352
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16520,7 +17048,8 @@
         352
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -16533,7 +17062,8 @@
         352
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16548,7 +17078,8 @@
       "outputs": [
         354
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16561,7 +17092,8 @@
       "outputs": [
         355
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16582,7 +17114,8 @@
         1
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16599,7 +17132,8 @@
         357,
         358
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16619,7 +17153,8 @@
         359,
         360
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16652,7 +17187,8 @@
         358
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16669,7 +17205,8 @@
         358
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16682,7 +17219,8 @@
         355
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16714,7 +17252,8 @@
         355
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16730,7 +17269,8 @@
         355
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -16743,7 +17283,8 @@
         355
       ],
       "outputs": [],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16759,7 +17300,8 @@
       "outputs": [
         361
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16774,7 +17316,8 @@
       "outputs": [
         362
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16789,7 +17332,8 @@
       "outputs": [
         363
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16803,7 +17347,8 @@
       "outputs": [
         364
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16819,7 +17364,8 @@
       "outputs": [
         365
       ],
-      "layer": 13
+      "layer": 13,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16834,7 +17380,8 @@
       "outputs": [
         366
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16856,7 +17403,8 @@
       "outputs": [
         367
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16871,7 +17419,8 @@
       "outputs": [
         368
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16888,7 +17437,8 @@
         370,
         371
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16917,7 +17467,8 @@
         371
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16937,7 +17488,8 @@
         372,
         373
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16970,7 +17522,8 @@
         371
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -16987,7 +17540,8 @@
         371
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17000,7 +17554,8 @@
         372
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17012,7 +17567,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17028,7 +17584,8 @@
         372
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -17044,7 +17601,8 @@
         372
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17057,7 +17615,8 @@
         372
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17072,7 +17631,8 @@
       "outputs": [
         374
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17089,7 +17649,8 @@
         376,
         377
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17118,7 +17679,8 @@
         377
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17138,7 +17700,8 @@
         378,
         379
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17171,7 +17734,8 @@
         377
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17188,7 +17752,8 @@
         377
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17201,7 +17766,8 @@
         378
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17233,7 +17799,8 @@
         378
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17249,7 +17816,8 @@
         378
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -17262,7 +17830,8 @@
         378
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17277,7 +17846,8 @@
       "outputs": [
         380
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17290,7 +17860,8 @@
       "outputs": [
         381
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17311,7 +17882,8 @@
         1
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17328,7 +17900,8 @@
         383,
         384
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17348,7 +17921,8 @@
         385,
         386
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17381,7 +17955,8 @@
         384
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17398,7 +17973,8 @@
         384
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17411,7 +17987,8 @@
         381
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17443,7 +18020,8 @@
         381
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17459,7 +18037,8 @@
         381
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -17472,7 +18051,8 @@
         381
       ],
       "outputs": [],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17488,7 +18068,8 @@
       "outputs": [
         387
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17503,7 +18084,8 @@
       "outputs": [
         388
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17518,7 +18100,8 @@
       "outputs": [
         389
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17532,7 +18115,8 @@
       "outputs": [
         390
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17548,7 +18132,8 @@
       "outputs": [
         391
       ],
-      "layer": 14
+      "layer": 14,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17563,7 +18148,8 @@
       "outputs": [
         392
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17585,7 +18171,8 @@
       "outputs": [
         393
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17600,7 +18187,8 @@
       "outputs": [
         394
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17617,7 +18205,8 @@
         396,
         397
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17646,7 +18235,8 @@
         397
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17666,7 +18256,8 @@
         398,
         399
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17699,7 +18290,8 @@
         397
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17716,7 +18308,8 @@
         397
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17729,7 +18322,8 @@
         398
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17741,7 +18335,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17757,7 +18352,8 @@
         398
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -17773,7 +18369,8 @@
         398
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17786,7 +18383,8 @@
         398
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17801,7 +18399,8 @@
       "outputs": [
         400
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17818,7 +18417,8 @@
         402,
         403
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17847,7 +18447,8 @@
         403
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17867,7 +18468,8 @@
         404,
         405
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17900,7 +18502,8 @@
         403
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17917,7 +18520,8 @@
         403
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17930,7 +18534,8 @@
         404
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17962,7 +18567,8 @@
         404
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -17978,7 +18584,8 @@
         404
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -17991,7 +18598,8 @@
         404
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18006,7 +18614,8 @@
       "outputs": [
         406
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18019,7 +18628,8 @@
       "outputs": [
         407
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18040,7 +18650,8 @@
         1
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18057,7 +18668,8 @@
         409,
         410
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18077,7 +18689,8 @@
         411,
         412
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18110,7 +18723,8 @@
         410
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18127,7 +18741,8 @@
         410
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18140,7 +18755,8 @@
         407
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18172,7 +18788,8 @@
         407
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18188,7 +18805,8 @@
         407
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -18201,7 +18819,8 @@
         407
       ],
       "outputs": [],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18217,7 +18836,8 @@
       "outputs": [
         413
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18232,7 +18852,8 @@
       "outputs": [
         414
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18247,7 +18868,8 @@
       "outputs": [
         415
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18261,7 +18883,8 @@
       "outputs": [
         416
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18277,7 +18900,8 @@
       "outputs": [
         417
       ],
-      "layer": 15
+      "layer": 15,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18292,7 +18916,8 @@
       "outputs": [
         418
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18314,7 +18939,8 @@
       "outputs": [
         419
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18329,7 +18955,8 @@
       "outputs": [
         420
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18346,7 +18973,8 @@
         422,
         423
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18375,7 +19003,8 @@
         423
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18395,7 +19024,8 @@
         424,
         425
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18428,7 +19058,8 @@
         423
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18445,7 +19076,8 @@
         423
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18458,7 +19090,8 @@
         424
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18470,7 +19103,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18486,7 +19120,8 @@
         424
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -18502,7 +19137,8 @@
         424
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18515,7 +19151,8 @@
         424
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18530,7 +19167,8 @@
       "outputs": [
         426
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18547,7 +19185,8 @@
         428,
         429
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18576,7 +19215,8 @@
         429
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18596,7 +19236,8 @@
         430,
         431
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18629,7 +19270,8 @@
         429
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18646,7 +19288,8 @@
         429
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18659,7 +19302,8 @@
         430
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18691,7 +19335,8 @@
         430
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18707,7 +19352,8 @@
         430
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -18720,7 +19366,8 @@
         430
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18735,7 +19382,8 @@
       "outputs": [
         432
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18748,7 +19396,8 @@
       "outputs": [
         433
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18769,7 +19418,8 @@
         1
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18786,7 +19436,8 @@
         435,
         436
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18806,7 +19457,8 @@
         437,
         438
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18839,7 +19491,8 @@
         436
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18856,7 +19509,8 @@
         436
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18869,7 +19523,8 @@
         433
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18901,7 +19556,8 @@
         433
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18917,7 +19573,8 @@
         433
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -18930,7 +19587,8 @@
         433
       ],
       "outputs": [],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18946,7 +19604,8 @@
       "outputs": [
         439
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18961,7 +19620,8 @@
       "outputs": [
         440
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18976,7 +19636,8 @@
       "outputs": [
         441
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -18990,7 +19651,8 @@
       "outputs": [
         442
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19006,7 +19668,8 @@
       "outputs": [
         443
       ],
-      "layer": 16
+      "layer": 16,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19021,7 +19684,8 @@
       "outputs": [
         444
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19043,7 +19707,8 @@
       "outputs": [
         445
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19058,7 +19723,8 @@
       "outputs": [
         446
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19075,7 +19741,8 @@
         448,
         449
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19104,7 +19771,8 @@
         449
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19124,7 +19792,8 @@
         450,
         451
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19157,7 +19826,8 @@
         449
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19174,7 +19844,8 @@
         449
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19187,7 +19858,8 @@
         450
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19199,7 +19871,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19215,7 +19888,8 @@
         450
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -19231,7 +19905,8 @@
         450
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19244,7 +19919,8 @@
         450
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19259,7 +19935,8 @@
       "outputs": [
         452
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19276,7 +19953,8 @@
         454,
         455
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19305,7 +19983,8 @@
         455
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19325,7 +20004,8 @@
         456,
         457
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19358,7 +20038,8 @@
         455
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19375,7 +20056,8 @@
         455
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19388,7 +20070,8 @@
         456
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19420,7 +20103,8 @@
         456
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19436,7 +20120,8 @@
         456
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -19449,7 +20134,8 @@
         456
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19464,7 +20150,8 @@
       "outputs": [
         458
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19477,7 +20164,8 @@
       "outputs": [
         459
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19498,7 +20186,8 @@
         1
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19515,7 +20204,8 @@
         461,
         462
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19535,7 +20225,8 @@
         463,
         464
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19568,7 +20259,8 @@
         462
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19585,7 +20277,8 @@
         462
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19598,7 +20291,8 @@
         459
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19630,7 +20324,8 @@
         459
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19646,7 +20341,8 @@
         459
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -19659,7 +20355,8 @@
         459
       ],
       "outputs": [],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19675,7 +20372,8 @@
       "outputs": [
         465
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19690,7 +20388,8 @@
       "outputs": [
         466
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19705,7 +20404,8 @@
       "outputs": [
         467
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19719,7 +20419,8 @@
       "outputs": [
         468
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19735,7 +20436,8 @@
       "outputs": [
         469
       ],
-      "layer": 17
+      "layer": 17,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19750,7 +20452,8 @@
       "outputs": [
         470
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19772,7 +20475,8 @@
       "outputs": [
         471
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19787,7 +20491,8 @@
       "outputs": [
         472
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19804,7 +20509,8 @@
         474,
         475
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19833,7 +20539,8 @@
         475
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19853,7 +20560,8 @@
         476,
         477
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19886,7 +20594,8 @@
         475
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19903,7 +20612,8 @@
         475
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19916,7 +20626,8 @@
         476
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19928,7 +20639,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19944,7 +20656,8 @@
         476
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -19960,7 +20673,8 @@
         476
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19973,7 +20687,8 @@
         476
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -19988,7 +20703,8 @@
       "outputs": [
         478
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20005,7 +20721,8 @@
         480,
         481
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20034,7 +20751,8 @@
         481
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20054,7 +20772,8 @@
         482,
         483
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20087,7 +20806,8 @@
         481
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20104,7 +20824,8 @@
         481
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20117,7 +20838,8 @@
         482
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20149,7 +20871,8 @@
         482
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20165,7 +20888,8 @@
         482
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -20178,7 +20902,8 @@
         482
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20193,7 +20918,8 @@
       "outputs": [
         484
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20206,7 +20932,8 @@
       "outputs": [
         485
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20227,7 +20954,8 @@
         1
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20244,7 +20972,8 @@
         487,
         488
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20264,7 +20993,8 @@
         489,
         490
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20297,7 +21027,8 @@
         488
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20314,7 +21045,8 @@
         488
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20327,7 +21059,8 @@
         485
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20359,7 +21092,8 @@
         485
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20375,7 +21109,8 @@
         485
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -20388,7 +21123,8 @@
         485
       ],
       "outputs": [],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20404,7 +21140,8 @@
       "outputs": [
         491
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20419,7 +21156,8 @@
       "outputs": [
         492
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20434,7 +21172,8 @@
       "outputs": [
         493
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20448,7 +21187,8 @@
       "outputs": [
         494
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20464,7 +21204,8 @@
       "outputs": [
         495
       ],
-      "layer": 18
+      "layer": 18,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20479,7 +21220,8 @@
       "outputs": [
         496
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20501,7 +21243,8 @@
       "outputs": [
         497
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20516,7 +21259,8 @@
       "outputs": [
         498
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20533,7 +21277,8 @@
         500,
         501
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20562,7 +21307,8 @@
         501
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20582,7 +21328,8 @@
         502,
         503
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20615,7 +21362,8 @@
         501
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20632,7 +21380,8 @@
         501
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20645,7 +21394,8 @@
         502
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20657,7 +21407,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20673,7 +21424,8 @@
         502
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -20689,7 +21441,8 @@
         502
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20702,7 +21455,8 @@
         502
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20717,7 +21471,8 @@
       "outputs": [
         504
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20734,7 +21489,8 @@
         506,
         507
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20763,7 +21519,8 @@
         507
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20783,7 +21540,8 @@
         508,
         509
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20816,7 +21574,8 @@
         507
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20833,7 +21592,8 @@
         507
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20846,7 +21606,8 @@
         508
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20878,7 +21639,8 @@
         508
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20894,7 +21656,8 @@
         508
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -20907,7 +21670,8 @@
         508
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20922,7 +21686,8 @@
       "outputs": [
         510
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20935,7 +21700,8 @@
       "outputs": [
         511
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20956,7 +21722,8 @@
         1
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20973,7 +21740,8 @@
         513,
         514
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -20993,7 +21761,8 @@
         515,
         516
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21026,7 +21795,8 @@
         514
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21043,7 +21813,8 @@
         514
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21056,7 +21827,8 @@
         511
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21088,7 +21860,8 @@
         511
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21104,7 +21877,8 @@
         511
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -21117,7 +21891,8 @@
         511
       ],
       "outputs": [],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21133,7 +21908,8 @@
       "outputs": [
         517
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21148,7 +21924,8 @@
       "outputs": [
         518
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21163,7 +21940,8 @@
       "outputs": [
         519
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21177,7 +21955,8 @@
       "outputs": [
         520
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21193,7 +21972,8 @@
       "outputs": [
         521
       ],
-      "layer": 19
+      "layer": 19,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21208,7 +21988,8 @@
       "outputs": [
         522
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21230,7 +22011,8 @@
       "outputs": [
         523
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21245,7 +22027,8 @@
       "outputs": [
         524
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21262,7 +22045,8 @@
         526,
         527
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21291,7 +22075,8 @@
         527
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21311,7 +22096,8 @@
         528,
         529
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21344,7 +22130,8 @@
         527
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21361,7 +22148,8 @@
         527
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21374,7 +22162,8 @@
         528
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21386,7 +22175,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21402,7 +22192,8 @@
         528
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -21418,7 +22209,8 @@
         528
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21431,7 +22223,8 @@
         528
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21446,7 +22239,8 @@
       "outputs": [
         530
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21463,7 +22257,8 @@
         532,
         533
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21492,7 +22287,8 @@
         533
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21512,7 +22308,8 @@
         534,
         535
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21545,7 +22342,8 @@
         533
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21562,7 +22360,8 @@
         533
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21575,7 +22374,8 @@
         534
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21607,7 +22407,8 @@
         534
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21623,7 +22424,8 @@
         534
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -21636,7 +22438,8 @@
         534
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21651,7 +22454,8 @@
       "outputs": [
         536
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21664,7 +22468,8 @@
       "outputs": [
         537
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21685,7 +22490,8 @@
         1
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21702,7 +22508,8 @@
         539,
         540
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21722,7 +22529,8 @@
         541,
         542
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21755,7 +22563,8 @@
         540
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21772,7 +22581,8 @@
         540
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21785,7 +22595,8 @@
         537
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21817,7 +22628,8 @@
         537
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21833,7 +22645,8 @@
         537
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -21846,7 +22659,8 @@
         537
       ],
       "outputs": [],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21862,7 +22676,8 @@
       "outputs": [
         543
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21877,7 +22692,8 @@
       "outputs": [
         544
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21892,7 +22708,8 @@
       "outputs": [
         545
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21906,7 +22723,8 @@
       "outputs": [
         546
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21922,7 +22740,8 @@
       "outputs": [
         547
       ],
-      "layer": 20
+      "layer": 20,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21937,7 +22756,8 @@
       "outputs": [
         548
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21959,7 +22779,8 @@
       "outputs": [
         549
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21974,7 +22795,8 @@
       "outputs": [
         550
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -21991,7 +22813,8 @@
         552,
         553
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22020,7 +22843,8 @@
         553
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22040,7 +22864,8 @@
         554,
         555
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22073,7 +22898,8 @@
         553
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22090,7 +22916,8 @@
         553
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22103,7 +22930,8 @@
         554
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22115,7 +22943,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22131,7 +22960,8 @@
         554
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -22147,7 +22977,8 @@
         554
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22160,7 +22991,8 @@
         554
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22175,7 +23007,8 @@
       "outputs": [
         556
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22192,7 +23025,8 @@
         558,
         559
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22221,7 +23055,8 @@
         559
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22241,7 +23076,8 @@
         560,
         561
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22274,7 +23110,8 @@
         559
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22291,7 +23128,8 @@
         559
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22304,7 +23142,8 @@
         560
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22336,7 +23175,8 @@
         560
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22352,7 +23192,8 @@
         560
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -22365,7 +23206,8 @@
         560
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22380,7 +23222,8 @@
       "outputs": [
         562
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22393,7 +23236,8 @@
       "outputs": [
         563
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22414,7 +23258,8 @@
         1
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22431,7 +23276,8 @@
         565,
         566
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22451,7 +23297,8 @@
         567,
         568
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22484,7 +23331,8 @@
         566
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22501,7 +23349,8 @@
         566
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22514,7 +23363,8 @@
         563
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22546,7 +23396,8 @@
         563
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22562,7 +23413,8 @@
         563
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -22575,7 +23427,8 @@
         563
       ],
       "outputs": [],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22591,7 +23444,8 @@
       "outputs": [
         569
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22606,7 +23460,8 @@
       "outputs": [
         570
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22621,7 +23476,8 @@
       "outputs": [
         571
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22635,7 +23491,8 @@
       "outputs": [
         572
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22651,7 +23508,8 @@
       "outputs": [
         573
       ],
-      "layer": 21
+      "layer": 21,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22666,7 +23524,8 @@
       "outputs": [
         574
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22688,7 +23547,8 @@
       "outputs": [
         575
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22703,7 +23563,8 @@
       "outputs": [
         576
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22720,7 +23581,8 @@
         578,
         579
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22749,7 +23611,8 @@
         579
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22769,7 +23632,8 @@
         580,
         581
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22802,7 +23666,8 @@
         579
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22819,7 +23684,8 @@
         579
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22832,7 +23698,8 @@
         580
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22844,7 +23711,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22860,7 +23728,8 @@
         580
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -22876,7 +23745,8 @@
         580
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22889,7 +23759,8 @@
         580
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22904,7 +23775,8 @@
       "outputs": [
         582
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22921,7 +23793,8 @@
         584,
         585
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22950,7 +23823,8 @@
         585
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -22970,7 +23844,8 @@
         586,
         587
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23003,7 +23878,8 @@
         585
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23020,7 +23896,8 @@
         585
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23033,7 +23910,8 @@
         586
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23065,7 +23943,8 @@
         586
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23081,7 +23960,8 @@
         586
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -23094,7 +23974,8 @@
         586
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23109,7 +23990,8 @@
       "outputs": [
         588
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23122,7 +24004,8 @@
       "outputs": [
         589
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23143,7 +24026,8 @@
         1
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23160,7 +24044,8 @@
         591,
         592
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23180,7 +24065,8 @@
         593,
         594
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23213,7 +24099,8 @@
         592
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23230,7 +24117,8 @@
         592
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23243,7 +24131,8 @@
         589
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23275,7 +24164,8 @@
         589
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23291,7 +24181,8 @@
         589
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -23304,7 +24195,8 @@
         589
       ],
       "outputs": [],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23320,7 +24212,8 @@
       "outputs": [
         595
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23335,7 +24228,8 @@
       "outputs": [
         596
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23350,7 +24244,8 @@
       "outputs": [
         597
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23364,7 +24259,8 @@
       "outputs": [
         598
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23380,7 +24276,8 @@
       "outputs": [
         599
       ],
-      "layer": 22
+      "layer": 22,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23395,7 +24292,8 @@
       "outputs": [
         600
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23417,7 +24315,8 @@
       "outputs": [
         601
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23432,7 +24331,8 @@
       "outputs": [
         602
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23449,7 +24349,8 @@
         604,
         605
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23478,7 +24379,8 @@
         605
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23498,7 +24400,8 @@
         606,
         607
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23531,7 +24434,8 @@
         605
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23548,7 +24452,8 @@
         605
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23561,7 +24466,8 @@
         606
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23573,7 +24479,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23589,7 +24496,8 @@
         606
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -23605,7 +24513,8 @@
         606
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23618,7 +24527,8 @@
         606
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23633,7 +24543,8 @@
       "outputs": [
         608
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23650,7 +24561,8 @@
         610,
         611
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23679,7 +24591,8 @@
         611
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23699,7 +24612,8 @@
         612,
         613
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23732,7 +24646,8 @@
         611
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23749,7 +24664,8 @@
         611
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23762,7 +24678,8 @@
         612
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23794,7 +24711,8 @@
         612
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23810,7 +24728,8 @@
         612
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -23823,7 +24742,8 @@
         612
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23838,7 +24758,8 @@
       "outputs": [
         614
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23851,7 +24772,8 @@
       "outputs": [
         615
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23872,7 +24794,8 @@
         1
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23889,7 +24812,8 @@
         617,
         618
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23909,7 +24833,8 @@
         619,
         620
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23942,7 +24867,8 @@
         618
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23959,7 +24885,8 @@
         618
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -23972,7 +24899,8 @@
         615
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24004,7 +24932,8 @@
         615
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24020,7 +24949,8 @@
         615
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -24033,7 +24963,8 @@
         615
       ],
       "outputs": [],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24049,7 +24980,8 @@
       "outputs": [
         621
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24064,7 +24996,8 @@
       "outputs": [
         622
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24079,7 +25012,8 @@
       "outputs": [
         623
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24093,7 +25027,8 @@
       "outputs": [
         624
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24109,7 +25044,8 @@
       "outputs": [
         625
       ],
-      "layer": 23
+      "layer": 23,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24124,7 +25060,8 @@
       "outputs": [
         626
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24146,7 +25083,8 @@
       "outputs": [
         627
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24161,7 +25099,8 @@
       "outputs": [
         628
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24178,7 +25117,8 @@
         630,
         631
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24207,7 +25147,8 @@
         631
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24227,7 +25168,8 @@
         632,
         633
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24260,7 +25202,8 @@
         631
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24277,7 +25220,8 @@
         631
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24290,7 +25234,8 @@
         632
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24302,7 +25247,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24318,7 +25264,8 @@
         632
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -24334,7 +25281,8 @@
         632
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24347,7 +25295,8 @@
         632
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24362,7 +25311,8 @@
       "outputs": [
         634
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24379,7 +25329,8 @@
         636,
         637
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24408,7 +25359,8 @@
         637
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24428,7 +25380,8 @@
         638,
         639
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24461,7 +25414,8 @@
         637
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24478,7 +25432,8 @@
         637
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24491,7 +25446,8 @@
         638
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24523,7 +25479,8 @@
         638
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24539,7 +25496,8 @@
         638
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -24552,7 +25510,8 @@
         638
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24567,7 +25526,8 @@
       "outputs": [
         640
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24580,7 +25540,8 @@
       "outputs": [
         641
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24601,7 +25562,8 @@
         1
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24618,7 +25580,8 @@
         643,
         644
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24638,7 +25601,8 @@
         645,
         646
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24671,7 +25635,8 @@
         644
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24688,7 +25653,8 @@
         644
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24701,7 +25667,8 @@
         641
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24733,7 +25700,8 @@
         641
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24749,7 +25717,8 @@
         641
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -24762,7 +25731,8 @@
         641
       ],
       "outputs": [],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24778,7 +25748,8 @@
       "outputs": [
         647
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24793,7 +25764,8 @@
       "outputs": [
         648
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24808,7 +25780,8 @@
       "outputs": [
         649
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24822,7 +25795,8 @@
       "outputs": [
         650
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24838,7 +25812,8 @@
       "outputs": [
         651
       ],
-      "layer": 24
+      "layer": 24,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24853,7 +25828,8 @@
       "outputs": [
         652
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24875,7 +25851,8 @@
       "outputs": [
         653
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24890,7 +25867,8 @@
       "outputs": [
         654
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24907,7 +25885,8 @@
         656,
         657
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24936,7 +25915,8 @@
         657
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24956,7 +25936,8 @@
         658,
         659
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -24989,7 +25970,8 @@
         657
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25006,7 +25988,8 @@
         657
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25019,7 +26002,8 @@
         658
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25031,7 +26015,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25047,7 +26032,8 @@
         658
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -25063,7 +26049,8 @@
         658
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25076,7 +26063,8 @@
         658
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25091,7 +26079,8 @@
       "outputs": [
         660
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25108,7 +26097,8 @@
         662,
         663
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25137,7 +26127,8 @@
         663
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25157,7 +26148,8 @@
         664,
         665
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25190,7 +26182,8 @@
         663
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25207,7 +26200,8 @@
         663
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25220,7 +26214,8 @@
         664
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25252,7 +26247,8 @@
         664
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25268,7 +26264,8 @@
         664
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -25281,7 +26278,8 @@
         664
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25296,7 +26294,8 @@
       "outputs": [
         666
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25309,7 +26308,8 @@
       "outputs": [
         667
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25330,7 +26330,8 @@
         1
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25347,7 +26348,8 @@
         669,
         670
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25367,7 +26369,8 @@
         671,
         672
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25400,7 +26403,8 @@
         670
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25417,7 +26421,8 @@
         670
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25430,7 +26435,8 @@
         667
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25462,7 +26468,8 @@
         667
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25478,7 +26485,8 @@
         667
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -25491,7 +26499,8 @@
         667
       ],
       "outputs": [],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25507,7 +26516,8 @@
       "outputs": [
         673
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25522,7 +26532,8 @@
       "outputs": [
         674
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25537,7 +26548,8 @@
       "outputs": [
         675
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25551,7 +26563,8 @@
       "outputs": [
         676
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25567,7 +26580,8 @@
       "outputs": [
         677
       ],
-      "layer": 25
+      "layer": 25,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25582,7 +26596,8 @@
       "outputs": [
         678
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25604,7 +26619,8 @@
       "outputs": [
         679
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25619,7 +26635,8 @@
       "outputs": [
         680
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25636,7 +26653,8 @@
         682,
         683
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25665,7 +26683,8 @@
         683
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25685,7 +26704,8 @@
         684,
         685
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25718,7 +26738,8 @@
         683
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25735,7 +26756,8 @@
         683
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25748,7 +26770,8 @@
         684
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25760,7 +26783,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25776,7 +26800,8 @@
         684
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -25792,7 +26817,8 @@
         684
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25805,7 +26831,8 @@
         684
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25820,7 +26847,8 @@
       "outputs": [
         686
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25837,7 +26865,8 @@
         688,
         689
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25866,7 +26895,8 @@
         689
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25886,7 +26916,8 @@
         690,
         691
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25919,7 +26950,8 @@
         689
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25936,7 +26968,8 @@
         689
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25949,7 +26982,8 @@
         690
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25981,7 +27015,8 @@
         690
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -25997,7 +27032,8 @@
         690
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -26010,7 +27046,8 @@
         690
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26025,7 +27062,8 @@
       "outputs": [
         692
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26038,7 +27076,8 @@
       "outputs": [
         693
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26059,7 +27098,8 @@
         1
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26076,7 +27116,8 @@
         695,
         696
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26096,7 +27137,8 @@
         697,
         698
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26129,7 +27171,8 @@
         696
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26146,7 +27189,8 @@
         696
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26159,7 +27203,8 @@
         693
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26191,7 +27236,8 @@
         693
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26207,7 +27253,8 @@
         693
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -26220,7 +27267,8 @@
         693
       ],
       "outputs": [],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26236,7 +27284,8 @@
       "outputs": [
         699
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26251,7 +27300,8 @@
       "outputs": [
         700
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26266,7 +27316,8 @@
       "outputs": [
         701
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26280,7 +27331,8 @@
       "outputs": [
         702
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26296,7 +27348,8 @@
       "outputs": [
         703
       ],
-      "layer": 26
+      "layer": 26,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26311,7 +27364,8 @@
       "outputs": [
         704
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26333,7 +27387,8 @@
       "outputs": [
         705
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26348,7 +27403,8 @@
       "outputs": [
         706
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26365,7 +27421,8 @@
         708,
         709
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26394,7 +27451,8 @@
         709
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26414,7 +27472,8 @@
         710,
         711
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26447,7 +27506,8 @@
         709
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26464,7 +27524,8 @@
         709
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26477,7 +27538,8 @@
         710
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26489,7 +27551,8 @@
       },
       "inputs": [],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26505,7 +27568,8 @@
         710
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -26521,7 +27585,8 @@
         710
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26534,7 +27599,8 @@
         710
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26549,7 +27615,8 @@
       "outputs": [
         712
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26566,7 +27633,8 @@
         714,
         715
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26595,7 +27663,8 @@
         715
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26615,7 +27684,8 @@
         716,
         717
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26648,7 +27718,8 @@
         715
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26665,7 +27736,8 @@
         715
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26678,7 +27750,8 @@
         716
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26710,7 +27783,8 @@
         716
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26726,7 +27800,8 @@
         716
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -26739,7 +27814,8 @@
         716
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26754,7 +27830,8 @@
       "outputs": [
         718
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26767,7 +27844,8 @@
       "outputs": [
         719
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26788,7 +27866,8 @@
         1
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26805,7 +27884,8 @@
         721,
         722
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26825,7 +27905,8 @@
         723,
         724
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26858,7 +27939,8 @@
         722
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26875,7 +27957,8 @@
         722
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26888,7 +27971,8 @@
         719
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26920,7 +28004,8 @@
         719
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26936,7 +28021,8 @@
         719
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "prefix_plan_swap"
     },
     {
       "kind": {
@@ -26949,7 +28035,8 @@
         719
       ],
       "outputs": [],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26965,7 +28052,8 @@
       "outputs": [
         725
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26980,7 +28068,8 @@
       "outputs": [
         726
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -26995,7 +28084,8 @@
       "outputs": [
         727
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -27009,7 +28099,8 @@
       "outputs": [
         728
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
@@ -27025,7 +28116,8 @@
       "outputs": [
         729
       ],
-      "layer": 27
+      "layer": 27,
+      "depth_role": "windowed"
     },
     {
       "kind": {
