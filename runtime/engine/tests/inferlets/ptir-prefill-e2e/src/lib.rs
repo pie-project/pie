@@ -172,13 +172,13 @@ async fn main(_input: String) -> Result<String> {
         let base_b = broadcast(reshape(&base, [1]), [pool_len]);
         let new_mask = reshape(le(&col, &base_b), [1, pool_len]);
 
-        let logical_slot = div(&base, page_t);
+        let logical_slot = &base / page_t;
         let w_slot_v = gather(&pids, &logical_slot);
-        let w_off_v = rem(&base, page_t);
-        let klen_v = add(&base, 1u32);
-        let next_free = add(&base, 1u32);
+        let w_off_v = &base % page_t;
+        let klen_v = &base + 1u32;
+        let next_free = &base + 1u32;
         let pages_v = reshape(&pids, [POOL_PAGES]);
-        let pidx_v = mul(&iota(2), POOL_PAGES);
+        let pidx_v = &iota(2) * POOL_PAGES;
 
         tok_in.put(&tok);
         out.put(&tok);

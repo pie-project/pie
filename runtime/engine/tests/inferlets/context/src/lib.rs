@@ -2,7 +2,7 @@
 //! APIs on the raw keep-core surface (off the `Context` facade).
 
 use inferlet::working_set::KvWorkingSet;
-use inferlet::{model, Result};
+use inferlet::{Result, model};
 
 #[inferlet::main]
 async fn main(_input: String) -> Result<String> {

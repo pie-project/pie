@@ -73,12 +73,12 @@ async fn main(_input: String) -> Result<String> {
         // mtp_verify_tail: head = picked[0..K]; accept-prefix = leading run of matches.
         let head = gather(&picked, iota(K)); // [K]
         let hit = eq(&head, &draft); // [K] bool
-        let ones = broadcast(Tensor::constant(1.0f32), [K]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [K]);
+        let ones = broadcast(1.0f32, [K]);
+        let zeros = broadcast(0.0f32, [K]);
         let run = cumprod(select(&hit, &ones, &zeros)); // [K]
         let nacc = cast(reduce_sum(&run), dtype::u32); // accepted-prefix length
         let keep = ge(broadcast(&nacc, [kp1]), iota(kp1)); // [K+1]
-        let neg1 = broadcast(Tensor::constant(-1i32), [kp1]);
+        let neg1 = broadcast(-1i32, [kp1]);
         let commit = select(&keep, &picked, &neg1); // accept-prefix + -1 sentinels
         out.put(&commit);
     });

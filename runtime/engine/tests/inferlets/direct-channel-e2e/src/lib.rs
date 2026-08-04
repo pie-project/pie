@@ -38,7 +38,7 @@ async fn main(_input: String) -> Result<String> {
     pass.epilogue(move || {
         let current = state.take();
         let late_increment = increment.take();
-        let next = add(&current, &late_increment);
+        let next = &current + &late_increment;
         state.put(&next);
         out.put(&next);
     });

@@ -280,19 +280,16 @@ macro_rules! define_beam_search {
             // single read-out row, so a width-1 beam has to be reshaped back to
             // `[B, v]` before it can meet the `[B, 1]`-broadcast score column.
             let logits = reshape(intrinsics::logits(), [B, v]);
-            let cand = add(
-                broadcast(reshape(scores.take(), [B, 1]), [B, v]),
-                log_softmax(&logits),
-            );
+            let cand = broadcast(reshape(scores.take(), [B, 1]), [B, v]) + log_softmax(&logits);
             let (s, i) = top_k(reshape(cand, [B * v]), B);
-            let parent = div(&i, v);
-            let tok_i = cast(rem(&i, v), dtype::i32);
+            let parent = &i / v;
+            let tok_i = cast(&i % v, dtype::i32);
 
             // 2. flat tail-append positions: wpos = fill + lane.
             let base = fill.take(); // [1]
             let lane = iota(B); // [B]
             let base_b = broadcast(reshape(&base, [1]), [B]); // [1] -> [B]
-            let wpos = add(&base_b, &lane); // [B]
+            let wpos = &base_b + &lane; // [B]
 
             // 3. mask evolution: inherit parent's ancestry, OR the new position.
             let inherited = gather(mask.take(), &parent); // bool [B,POOL]
@@ -304,9 +301,9 @@ macro_rules! define_beam_search {
 
             // 4. Explicit write descriptor for each surviving beam.
             let pids = pool_ids_ch.take();
-            let logical_slot = div(&wpos, PAGE_T); // [B] index into the pool
+            let logical_slot = &wpos / PAGE_T; // [B] index into the pool
             let w_slot_v = gather(&pids, &logical_slot);
-            let w_off_v = rem(&wpos, PAGE_T);
+            let w_off_v = &wpos % PAGE_T;
             // Device-resolved geometry is loop-carried: the host never drains
             // these rings, so the graph has to take before it puts or the
             // readiness check sees a full ring and refuses to commit the pass.
@@ -316,11 +313,11 @@ macro_rules! define_beam_search {
             w_off.put(&w_off_v);
 
             // KV span after this step's appends (the mask restricts attention).
-            let filled = add(&base, B); // [1]
+            let filled = &base + B; // [1]
             klen.take();
             klen.put(broadcast(reshape(&filled, [1]), [B]));
 
-            pos.put(add(pos.take(), 1u32));
+            pos.put(pos.take() + 1u32);
             fill.put(&filled);
             scores.put(&s);
             toks.take();
@@ -329,20 +326,17 @@ macro_rules! define_beam_search {
             // times (every beam references all POOL_PAGES pool pages; the mask does
             // the per-beam selection). Built in-graph from the host-fed pids.
             // Live page count for the NEXT fire, from that fire's klen.
-            let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
+            let page_count = (&filled + (PAGE_T - 1)) / PAGE_T;
             let pages_ig = gather(
                 &pids,
-                rem(
-                    iota(B * POOL_PAGES),
-                    broadcast(&page_count, [B * POOL_PAGES]),
-                ),
+                iota(B * POOL_PAGES) % broadcast(&page_count, [B * POOL_PAGES]),
             );
             pages.take();
             pages.put(&pages_ig);
             // Re-emit the constant page_indptr each fire (channel-bound; peeked ports
             // still want a fresh value each pass). [0, POOL_PAGES, 2*POOL_PAGES].
             page_indptr.take();
-            page_indptr.put(mul(iota(B + 1), broadcast(&page_count, [B + 1])));
+            page_indptr.put(iota(B + 1) * broadcast(&page_count, [B + 1]));
 
             out.put(&tok_i);
             out_par.put(&parent);

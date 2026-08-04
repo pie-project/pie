@@ -170,13 +170,13 @@ async fn main(input: Input) -> Result<String> {
             // that elided 4-byte slot, corrupting the sampler's scratch — the
             // failure is silent and yields plausible-looking junk tokens.
             let logits = intrinsics::logits(); // [1, vocab] (single read-out row)
-            let scaled = div(&reshape(&logits, [1, vocab]), temperature);
+            let scaled = &reshape(&logits, [1, vocab]) / temperature;
             let probs = softmax(&scaled);
             let keep = pivot_threshold(&probs, cummass_le(top_p));
             let masked = mask_apply(&scaled, &keep); // [1, vocab]
             let g = gumbel(&r, [1, vocab]);
-            let toks0 = reduce_argmax(add(&masked, &g)); // [1] i32
-            let r_next = add(&r, iota(2)); // advance ctr: [key, ctr+1]
+            let toks0 = reduce_argmax(&masked + &g); // [1] i32
+            let r_next = &r + iota(2); // advance ctr: [key, ctr+1]
             g0s_ch.put(&toks0);
             rng_p.put(&r_next);
         });
@@ -263,18 +263,18 @@ async fn main(input: Input) -> Result<String> {
             // Per-lane top-p + temperature sample over [B, vocab] logits
             // (row-wise nucleus, independent Gumbel noise per lane).
             let logits = intrinsics::logits(); // [B, vocab]
-            let scaled = div(&logits, temperature);
+            let scaled = &logits / temperature;
             let probs = softmax(&scaled);
             let keep = pivot_threshold(&probs, cummass_le(top_p));
             let masked = mask_apply(&scaled, &keep);
             let g = gumbel(&r, [b, vocab]);
-            let toks = reduce_argmax(add(&masked, &g)); // [B] i32
-            let r_next = add(&r, iota(2));
+            let toks = reduce_argmax(&masked + &g); // [B] i32
+            let r_next = &r + iota(2);
 
             // Flat append cells for the NEXT fire: wpos = base + lane.
             let lane = iota(b);
             let base_b = broadcast(reshape(&base, [1]), [b]);
-            let wpos = add(&base_b, &lane); // [B]
+            let wpos = &base_b + &lane; // [B]
 
             // Mask evolution: each lane keeps its own ancestry + its new cell.
             let col = broadcast(reshape(iota(pool), [1, pool]), [b, pool]);
@@ -282,20 +282,17 @@ async fn main(input: Input) -> Result<String> {
             let new_mask = or(mask.take(), eq(col, wpos_c)); // [B, POOL]
 
             // Explicit write descriptor via the host-fed pool ids.
-            let w_slot_n = gather(&pids, div(&wpos, PAGE_T)); // [B]
-            let w_off_n = rem(&wpos, PAGE_T); // [B]
-            let filled = add(&base, b); // [1] span after the next fire's appends
+            let w_slot_n = gather(&pids, &wpos / PAGE_T); // [B]
+            let w_off_n = &wpos % PAGE_T; // [B]
+            let filled = &base + b; // [1] span after the next fire's appends
             let klen_n = broadcast(reshape(&filled, [1]), [b]);
-            let pos_n = add(pos.take(), 1u32);
-            let page_count = div(add(&filled, PAGE_T - 1), PAGE_T);
+            let pos_n = pos.take() + 1u32;
+            let page_count = (&filled + (PAGE_T - 1)) / PAGE_T;
             let pages_n = gather(
                 &pids,
-                rem(
-                    iota(b * pool_pages),
-                    broadcast(&page_count, [b * pool_pages]),
-                ),
+                iota(b * pool_pages) % broadcast(&page_count, [b * pool_pages]),
             );
-            let pidx_n = mul(iota(b + 1), broadcast(&page_count, [b + 1]));
+            let pidx_n = iota(b + 1) * broadcast(&page_count, [b + 1]);
 
             // Device-resolved geometry is loop-carried: the host never drains
             // these rings, so the graph has to take before it puts or the

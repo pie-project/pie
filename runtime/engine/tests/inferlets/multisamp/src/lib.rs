@@ -55,7 +55,7 @@ fn keep_mask(kind: Kind, scaled: &Tensor) -> Tensor {
         }
         Kind::MinP { p } => {
             let probs = softmax(scaled);
-            let thr = mul(reduce_max(&probs), p); // scalar threshold (NOT broadcast to [vocab])
+            let thr = reduce_max(&probs) * p; // scalar threshold (NOT broadcast to [vocab])
             pivot_threshold(probs, prob_ge(thr))
         }
         Kind::TopKTopP { k, p } => {
@@ -69,12 +69,12 @@ fn keep_mask(kind: Kind, scaled: &Tensor) -> Tensor {
 
 /// Masked Gumbel-max sample: `argmax(select(keep, scaled, -inf) + gumbel(r))`.
 /// `r` is the taken `[2]` u32 rng state (`[key, ctr]`).
-fn sample(kind: Kind, scaled: Tensor, vocab: u32, r: impl AsTensor) -> Tensor {
+fn sample(kind: Kind, scaled: Tensor, vocab: u32, r: &Tensor) -> Tensor {
     let keep = keep_mask(kind, &scaled);
-    let neg_inf = broadcast(Tensor::constant(f32::NEG_INFINITY), [vocab]);
+    let neg_inf = broadcast(f32::NEG_INFINITY, [vocab]);
     let masked = select(&keep, &scaled, &neg_inf);
     let g = gumbel(r, [vocab]);
-    reduce_argmax(add(masked, g))
+    reduce_argmax(masked + g)
 }
 
 #[inferlet::main]
@@ -140,9 +140,9 @@ async fn main(_input: String) -> Result<String> {
     )?;
     fwd_p.epilogue(move || {
         let r = rng_p.take(); // [2] u32 rng state (key, ctr)
-        let scaled = div(intrinsics::logits(), TEMPERATURE);
+        let scaled = intrinsics::logits() / TEMPERATURE;
         let t = sample(kind0, scaled, vocab, &r);
-        let r_next = add(&r, iota(2));
+        let r_next = &r + iota(2);
         g0_ch.put(&t);
         rng_p.put(&r_next);
     });
@@ -209,20 +209,20 @@ async fn main(_input: String) -> Result<String> {
             fwd.epilogue(move || {
                 let length = kv_len.take();
                 let r = rng.take(); // [2] u32 rng state
-                let scaled = div(intrinsics::logits(), TEMPERATURE);
+                let scaled = intrinsics::logits() / TEMPERATURE;
                 let t = sample(kind, scaled, vocab, &r);
 
-                let r_next = add(&r, iota(2));
-                let next_length = add(&length, 1u32);
-                let page_count = div(add(&next_length, page_size - 1), page_size);
+                let r_next = &r + iota(2);
+                let next_length = &length + 1u32;
+                let page_count = (&next_length + (page_size - 1)) / page_size;
 
                 tok_in.put(&t);
                 kv_len.put(&next_length);
                 positions.put(&length);
-                w_slot.put(div(&length, page_size));
-                w_off.put(rem(&length, page_size));
+                w_slot.put(&length / page_size);
+                w_off.put(&length % page_size);
                 page_indptr.take();
-                page_indptr.put(mul(iota(2), broadcast(&page_count, [2])));
+                page_indptr.put(iota(2) * broadcast(&page_count, [2]));
                 out.put(&t);
                 rng.put(&r_next);
             });

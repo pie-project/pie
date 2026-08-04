@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ztensor::DType as ZDType;
-use ztensor::cbor::{self, Value};
+use ztensor::format::cbor::{self, Value};
 
 use crate::error::Error;
 use crate::types::{DType, Encoding, QuantScheme, TensorDecl};
@@ -245,13 +245,11 @@ struct Sharding {
 /// the root of a shard set, so the two cannot describe metadata differently.
 fn write_meta_object(writer: &mut ztensor::Writer, name: &str, bytes: &[u8]) -> Result<(), Error> {
     writer
-        .object(name)
-        .shape(vec![bytes.len() as u64])
-        .layout("dense")
-        .part("data")
-        .dtype(ZDType::U8)
-        .bytes(bytes)
-        .add()
+        .object(name, |o| {
+            o.shape(vec![bytes.len() as u64])
+                .layout("dense")
+                .part("data", |p| p.dtype(ZDType::U8).bytes(bytes))
+        })
         .map_err(Error::from)
 }
 
@@ -371,15 +369,23 @@ impl CheckpointWriter {
             })
             .collect::<Result<_, _>>()?;
         let (layout, attributes) = profile_of(&decl.encoding)?;
-        let mut object = self.writer().object(&decl.name).shape(shape).layout(layout);
-        if let Some(attributes) = attributes {
-            object = object.attributes(attributes);
-        }
-        object = object.part("data").dtype(dtype);
-        if let Some(ltype) = ltype {
-            object = object.logical(ltype);
-        }
-        self.open = Some(object.length(nbytes).stream().map_err(Error::from)?);
+        let sink = self
+            .writer()
+            .stream(&decl.name, |mut o| {
+                o = o.shape(shape).layout(layout);
+                if let Some(attributes) = attributes {
+                    o = o.attributes(attributes);
+                }
+                o.part("data", |mut p| {
+                    p = p.dtype(dtype);
+                    if let Some(ltype) = ltype {
+                        p = p.logical(ltype);
+                    }
+                    p.length(nbytes)
+                })
+            })
+            .map_err(Error::from)?;
+        self.open = Some(sink);
         if let Some(sharding) = &mut self.sharding {
             sharding.current_bytes = sharding.current_bytes.saturating_add(nbytes);
         }
@@ -518,7 +524,7 @@ impl CheckpointWriter {
                 .map_err(Error::from)?;
             root.add_shard(name.clone(), &identity)
                 .map_err(Error::from)?;
-            let manifest = ztensor::manifest_of(path)
+            let manifest = ztensor::read::manifest_of(path)
                 .map_err(Error::from)?
                 .ok_or_else(|| {
                     Error::Checkpoint(format!("shard {} carries no manifest", path.display()))
@@ -837,16 +843,16 @@ mod tests {
         let mut files = vec![root.clone()];
         files.extend((1..=3).map(|i| dir.join(format!("model-{i:05}.zt"))));
         for file in &files {
-            let manifest = ztensor::manifest_of(file).unwrap().expect("a manifest");
+            let manifest = ztensor::read::manifest_of(file).unwrap().expect("a manifest");
             for (name, object) in &manifest.objects {
                 for (part, blob) in &object.parts {
                     assert_eq!(
-                        blob.blob.offset % ztensor::ALIGN_CANONICAL,
+                        blob.blob.offset % ztensor::format::ALIGN_CANONICAL,
                         0,
                         "{}: {name}/{part} at {} is not on a {} boundary",
                         file.display(),
                         blob.blob.offset,
-                        ztensor::ALIGN_CANONICAL,
+                        ztensor::format::ALIGN_CANONICAL,
                     );
                     checked += 1;
                 }

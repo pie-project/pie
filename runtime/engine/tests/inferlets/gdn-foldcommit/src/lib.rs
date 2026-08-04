@@ -1102,7 +1102,7 @@ async fn device_fold_length(prompt: &[u32]) -> Result<String> {
                 let t = reduce_argmax(&intrinsics::logits());
                 raw_sink.put(&t);
                 // In [1, W]: a real function of the logits, bounded by the window.
-                sink.put(&cast(add(rem(t, W), 1u32), dtype::u32));
+                sink.put(&cast(t % W + 1u32, dtype::u32));
             },
         )?
     };

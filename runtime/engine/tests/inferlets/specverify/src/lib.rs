@@ -118,11 +118,11 @@ async fn verify_window(prompt: &[u32], k: u32, draft: &[i32]) -> Result<(Vec<i32
         let logits = intrinsics::logits(); // [k, vocab] f32 matrix intrinsic
         let tgt = reduce_argmax(logits); // [k] i32 per-row argmax
         let hit = eq(&tgt, &d); // [k] bool
-        let ones = broadcast(Tensor::constant(1.0f32), [k]);
-        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let ones = broadcast(1.0f32, [k]);
+        let zeros = broadcast(0.0f32, [k]);
         // Cross-row prefix-AND: reject at j zeroes the WHOLE suffix.
         let keep = gt(cumprod(select(&hit, &ones, &zeros)), 0.5f32);
-        let neg1 = broadcast(Tensor::constant(-1i32), [k]);
+        let neg1 = broadcast(-1i32, [k]);
         let ver = select(&keep, &d, &neg1); // accepted prefix, then -1
         target_out.put(&tgt);
         verify_out.put(&ver);
