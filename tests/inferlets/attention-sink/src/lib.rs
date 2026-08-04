@@ -72,11 +72,8 @@ async fn main(input: Input) -> Result<String> {
     let prompt_tokens = Channel::from_iter(prompt.iter().map(|&token| token as i32));
     let prefill_embed_indptr = Channel::from([0u32, n]).named("prefill_embed_indptr");
     let prefill_positions = Channel::from_iter(0..n).named("prefill_positions");
-    let prefill_slots = Channel::from(
-        (0..n)
-            .map(|position| pool_ids[(position / PAGE_T) as usize])
-            .collect::<Vec<_>>(),
-    );
+    let prefill_slots =
+        Channel::from_iter((0..n).map(|position| pool_ids[(position / PAGE_T) as usize]));
     let prefill_offsets = Channel::from_iter((0..n).map(|position| position % PAGE_T));
     let prefill_klen = Channel::from([n]);
     let prefill_pages = Channel::from(pool_ids.clone());
@@ -84,7 +81,7 @@ async fn main(input: Input) -> Result<String> {
     // `kv_len = (page_count-1)*PAGE_T + last_page_len`. A pool-wide constant page
     // count claims a kv length the pass does not have and silently corrupts
     // attention, so the count must track `kv_len` exactly.
-    let prefill_indptr = Channel::from_shaped([2], vec![0u32, n.div_ceil(PAGE_T)]);
+    let prefill_indptr = Channel::from([0u32, n.div_ceil(PAGE_T)]);
     let causal = Channel::from_shaped(
         [n, pool_len],
         (0..n)
@@ -144,7 +141,7 @@ async fn main(input: Input) -> Result<String> {
         host_sink_window_mask(pool_len, n, sink, window),
     );
     let pages = Channel::from(pool_ids.clone());
-    let page_indptr = Channel::from_shaped([2], vec![0u32, (n + 1).div_ceil(PAGE_T)]);
+    let page_indptr = Channel::from([0u32, (n + 1).div_ceil(PAGE_T)]);
     let pool_ids_input = Channel::from(pool_ids.clone()).named("pool_ids");
     let token_out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
@@ -189,8 +186,8 @@ async fn main(input: Input) -> Result<String> {
         write_offset.put(&base % PAGE_T);
         mask.put(&next_mask);
         pages.put(reshape(&ids, [pool_pages]));
-        let page_count = (&next + (PAGE_T - 1)) / PAGE_T;
-        page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+        let page_count = next.div_ceil(PAGE_T);
+        page_indptr.put(indptr(1, &page_count));
         pool_ids_input.put(&ids);
     });
 

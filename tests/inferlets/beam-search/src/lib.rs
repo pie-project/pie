@@ -197,7 +197,7 @@ macro_rules! define_beam_search {
         let scores = Channel::from(initial_scores).named("scores");
         let toks = Channel::from(vec![BOS; B as usize]).named("toks");
         let pos = Channel::from(vec![0u32; B as usize]).named("pos");
-        let fill = Channel::from(vec![1u32; 1]).named("fill"); // next free flat position
+        let fill = Channel::from([1u32]).named("fill"); // next free flat position
         let klen = Channel::from(vec![1u32; B as usize]).named("klen");
         let w_slot = Channel::from(vec![pool0; B as usize]).named("w_slot");
         let w_off = Channel::from(vec![0u32; B as usize]).named("w_off");
@@ -321,7 +321,7 @@ macro_rules! define_beam_search {
             // times (every beam references all POOL_PAGES pool pages; the mask does
             // the per-beam selection). Built in-graph from the host-fed pids.
             // Live page count for the NEXT fire, from that fire's klen.
-            let page_count = (&filled + (PAGE_T - 1)) / PAGE_T;
+            let page_count = filled.div_ceil(PAGE_T);
             let pages_ig = gather(
                 &pids,
                 iota(B * POOL_PAGES) % broadcast(&page_count, [B * POOL_PAGES]),

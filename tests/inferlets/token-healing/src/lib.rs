@@ -228,14 +228,14 @@ async fn main(input: Input) -> Result<Output> {
             let length = kv_len.take();
             let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
             let next_length = &length + 1u32;
-            let page_count = (&next_length + (page_size - 1)) / page_size;
+            let page_count = next_length.div_ceil(page_size);
 
             token_in.put(&token);
             kv_len.put(&next_length);
             positions.put(&length);
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
-            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+            page_indptr.put(indptr(1, &page_count));
             token_out.put(&token);
         });
 

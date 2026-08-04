@@ -58,6 +58,63 @@ impl Tensor {
     pub fn shape(&self) -> Shape {
         self.ty().shape
     }
+
+    /// Ceiling division, the same spelling std gives the host scalars
+    /// (`u32::div_ceil`): `n.div_ceil(page_size)` reads the same whether `n`
+    /// is a prompt length on the host or a device-resolved KV length.
+    ///
+    /// This is the page-count arithmetic every decode epilogue does, and
+    /// spelling it `(n + (page_size - 1)) / page_size` hid a rounding rule
+    /// behind an off-by-one that had to be re-read every time.
+    ///
+    /// A trace-known scalar divisor has its `- 1` folded here, so the emitted
+    /// ops are exactly the ones the hand-written form produced.
+    pub fn div_ceil(&self, rhs: impl AsTensor) -> Tensor {
+        let d = rhs.to_arg();
+        match const_scalar(&d) {
+            Some(v) => {
+                let one_less = Tensor::from_arg(scalar_arg(v - 1.0, d.ty().dtype));
+                (self + one_less) / Tensor::from_arg(d)
+            }
+            None => {
+                let d = Tensor::from_arg(d);
+                (self + &d - 1u32) / &d
+            }
+        }
+    }
+
+    fn from_arg(a: Arg) -> Tensor {
+        match a {
+            Arg::Node { id, ty } => Tensor::node(id, ty),
+            Arg::Const(c) => Tensor {
+                inner: TensorInner::Const(c),
+            },
+        }
+    }
+}
+
+/// The numeric value of a trace-known scalar operand, if it is one.
+fn const_scalar(a: &Arg) -> Option<f64> {
+    let Arg::Const(c) = a else { return None };
+    if !c.shape.is_scalar() {
+        return None;
+    }
+    let b = c.bytes.as_slice();
+    Some(match c.dtype {
+        DType::Bool => (b.first().copied().unwrap_or(0) != 0) as u8 as f64,
+        DType::F32 => f32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
+        DType::I32 => i32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
+        DType::U32 => u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as f64,
+    })
+}
+
+/// A scalar constant operand of the given dtype.
+fn scalar_arg(v: f64, dtype: DType) -> Arg {
+    Arg::Const(ConstData {
+        shape: Shape::SCALAR,
+        dtype,
+        bytes: scalar_bytes_of(v, dtype),
+    })
 }
 
 /// A trace-known constant value: a typed scalar/vector immediate.
@@ -753,8 +810,20 @@ pub fn iota(len: u32) -> Tensor {
     let ty = ValueType::new(Shape::vector(len), DType::U32);
     Tensor::node(emit(Op::Iota { len }, &[ty]), ty)
 }
-/// Axis-0 generalized gather: `gather(src[n, rest..], idx[S..]) -> [S.., rest..]`.
-#[track_caller]
+/// The CSR row-offset vector for `rows` runs of equal length `run_len`:
+/// `[0, run_len, 2*run_len, …, rows*run_len]`, one entry more than there are
+/// rows.
+///
+/// This is what a descriptor's `*_indptr` port wants, and the shape every
+/// decode epilogue rebuilds each fire as its page count grows. Spelled out it
+/// was `iota(2) * broadcast(&page_count, [2])` — arithmetic that happens to
+/// evaluate to `[0, page_count]` without ever saying so.
+pub fn indptr(rows: u32, run_len: impl AsTensor) -> Tensor {
+    let n = rows + 1;
+    iota(n) * broadcast(run_len, [n])
+}
+
+/// Axis-0 generalized gather: `gather(src[n, rest..], idx[S..]) -> [S.., rest..]`.#[track_caller]
 pub fn gather(src: impl AsTensor, idx: impl AsTensor) -> Tensor {
     let (is, tys) = src.to_arg().materialize();
     let (ii, tyi) = idx.to_arg().materialize();

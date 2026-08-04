@@ -507,3 +507,51 @@ fn put_drains_a_peeked_port_and_leaves_a_consuming_one_alone() {
         "the drain must precede its put"
     );
 }
+
+// ---------------------------------------------------------------------------
+// div_ceil / indptr lower to exactly what they replaced
+// ---------------------------------------------------------------------------
+
+/// Both helpers are pure spelling: they must emit the SAME ops as the
+/// arithmetic the guests wrote by hand, or migrating 81 call sites would move
+/// the container bytes.
+#[test]
+fn div_ceil_and_indptr_match_the_arithmetic_they_replace() {
+    const PAGE: u32 = 16;
+
+    fn ops_of(body: impl Fn() + 'static) -> Vec<Op> {
+        let tok: &'static Channel = leak(Channel::new([1], dtype::i32));
+        let indptr_ch: &'static Channel = leak(Channel::from([0u32, 1]));
+        tok.put([1i32]);
+        let mut b = Builder::new(VOCAB, PAGE);
+        b.bind_port(Port::EmbedTokens, tok);
+        b.bind_port(Port::EmbedIndptr, indptr_ch);
+        b.stage(Stage::Epilogue, move || {
+            body();
+            tok.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        });
+        b.build().expect("must build").container().stages[0]
+            .ops
+            .clone()
+    }
+
+    let by_hand = ops_of(|| {
+        let len = Tensor::constant([7u32]);
+        let _ = (&len + (PAGE - 1)) / PAGE;
+    });
+    let by_helper = ops_of(|| {
+        let len = Tensor::constant([7u32]);
+        let _ = len.div_ceil(PAGE);
+    });
+    assert_eq!(by_hand, by_helper, "div_ceil must not change the lowering");
+
+    let by_hand = ops_of(|| {
+        let count = Tensor::constant([3u32]);
+        let _ = iota(2) * broadcast(&count, [2]);
+    });
+    let by_helper = ops_of(|| {
+        let count = Tensor::constant([3u32]);
+        let _ = indptr(1, &count);
+    });
+    assert_eq!(by_hand, by_helper, "indptr must not change the lowering");
+}

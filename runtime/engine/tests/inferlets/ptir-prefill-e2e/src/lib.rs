@@ -82,9 +82,9 @@ async fn main(_input: String) -> Result<String> {
     let w_off_v: Vec<u32> = (0..n).map(|c| c % page_t).collect();
     let w_slot_p = Channel::from(w_slot_v).named("w_slot_p"); // [N]
     let w_off_p = Channel::from(w_off_v).named("w_off_p"); // [N]
-    let klen_p = Channel::from(vec![n; 1]).named("klen_p"); // [1] one seq, N kv len
+    let klen_p = Channel::from([n]).named("klen_p"); // [1] one seq, N kv len
     let pages_p = Channel::from(pool_ids.clone()).named("pages_p"); // [POOL_PAGES]
-    let page_indptr_p = Channel::from_shaped([2], vec![0u32, POOL_PAGES]).named("pidx_p");
+    let page_indptr_p = Channel::from([0u32, POOL_PAGES]).named("pidx_p");
 
     // Causal prefill mask [N, POOL]: query row i attends KV cols j with j <= i.
     let mask_pv: Vec<bool> = (0..n)
@@ -129,17 +129,17 @@ async fn main(_input: String) -> Result<String> {
     // attention reads the prefill's KV cells 0..N). Full causal mask (attend all
     // filled positions). Device loop-carried exactly like windowed-attention.
     let phys_n = pool_ids[(n / page_t) as usize];
-    let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-    let pos = Channel::from(vec![n; 1]).named("pos");
-    let fill = Channel::from(vec![n + 1; 1]).named("fill"); // next free after this fire writes cell N
-    let klen = Channel::from(vec![n + 1; 1]).named("klen"); // cells 0..=N present
-    let w_slot = Channel::from(vec![phys_n; 1]).named("w_slot");
-    let w_off = Channel::from(vec![n % page_t; 1]).named("w_off");
+    let tok_in = Channel::from([g0]).named("tok_in");
+    let pos = Channel::from([n]).named("pos");
+    let fill = Channel::from([n + 1]).named("fill"); // next free after this fire writes cell N
+    let klen = Channel::from([n + 1]).named("klen"); // cells 0..=N present
+    let w_slot = Channel::from([phys_n]).named("w_slot");
+    let w_off = Channel::from([n % page_t]).named("w_off");
     // Seed mask: the first decode query at position N attends 0..=N.
     let seed_mask: Vec<bool> = (0..pool_len).map(|j| j <= n).collect();
     let mask = Channel::from_shaped([1, pool_len], seed_mask).named("mask");
     let pages = Channel::from(pool_ids.clone()).named("pages");
-    let page_indptr = Channel::from_shaped([2], vec![0u32, POOL_PAGES]).named("page_indptr");
+    let page_indptr = Channel::from([0u32, POOL_PAGES]).named("page_indptr");
     let pool_ids_ch = Channel::new([POOL_PAGES], dtype::u32).named("pool_ids");
     let out = Channel::new([1], dtype::i32).named("out");
     let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");

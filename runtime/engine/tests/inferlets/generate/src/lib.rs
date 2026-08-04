@@ -70,19 +70,10 @@ async fn main(input: String) -> Result<String> {
     let positions_p = Channel::from_iter(0..n).named("positions_p");
     let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
     let page_indptr_p = Channel::from([0u32, n.div_ceil(page_size)]).named("page_indptr_p");
-    let w_slot_p = Channel::from(
-        (0..n)
-            .map(|position| position / page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot_p");
-    let w_off_p = Channel::from(
-        (0..n)
-            .map(|position| position % page_size)
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off_p");
-    let echo_p = Channel::from(vec![ECHO_TOKEN; 1]).named("echo_p"); // [1] i32 seed
+    let w_slot_p =
+        Channel::from_iter((0..n).map(|position| position / page_size)).named("w_slot_p");
+    let w_off_p = Channel::from_iter((0..n).map(|position| position % page_size)).named("w_off_p");
+    let echo_p = Channel::from([ECHO_TOKEN]).named("echo_p"); // [1] i32 seed
     let g0_ch = Channel::new([1], dtype::i32).named("g0"); // host-read first gen token
 
     let fwd_p = ForwardPass::new();
@@ -123,8 +114,8 @@ async fn main(input: String) -> Result<String> {
     // the runtime resolves EmbedTokens from the device channel value; a
     // host-fed embed leaves `token_ids` empty and KV-prepare rejects it.
     if generated.len() < max_tokens {
-        let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
-        let echo = Channel::from(vec![ECHO_TOKEN; 1]).named("echo");
+        let tok_in = Channel::from([g0]).named("tok_in");
+        let echo = Channel::from([ECHO_TOKEN]).named("echo");
         let out = Channel::new([1], dtype::i32).named("out");
         let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from([n]).named("positions");
@@ -154,8 +145,8 @@ async fn main(input: String) -> Result<String> {
             let length = kv_len.take();
             let t = echo.take(); // [1] i32 — the echo token
             let next_length = &length + 1u32;
-            let page_count = (&next_length + (page_size - 1)) / page_size;
-            let next_page_indptr = iota(2) * broadcast(&page_count, [2]);
+            let page_count = next_length.div_ceil(page_size);
+            let next_page_indptr = indptr(1, &page_count);
             tok_in.put(&t);
             echo.put(&t);
             kv_len.put(&next_length);

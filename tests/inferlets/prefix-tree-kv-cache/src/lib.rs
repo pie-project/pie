@@ -42,18 +42,8 @@ async fn append_tokens(
     let positions = Channel::from_iter(start..total).named("positions");
     let pages = Channel::from_iter(0..ws.page_len()).named("pages");
     let page_indptr = Channel::from([0u32, total.div_ceil(kv_page_size())]).named("page_indptr");
-    let w_slot = Channel::from(
-        (start..total)
-            .map(|p| p / kv_page_size())
-            .collect::<Vec<_>>(),
-    )
-    .named("w_slot");
-    let w_off = Channel::from(
-        (start..total)
-            .map(|p| p % kv_page_size())
-            .collect::<Vec<_>>(),
-    )
-    .named("w_off");
+    let w_slot = Channel::from_iter((start..total).map(|p| p / kv_page_size())).named("w_slot");
+    let w_off = Channel::from_iter((start..total).map(|p| p % kv_page_size())).named("w_off");
     let next_token = Channel::new([1], dtype::i32).named("next_token");
 
     let fwd = ForwardPass::new();
@@ -142,14 +132,14 @@ async fn generate(
         let length = kv_len.take();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
         let next_length = &length + 1u32;
-        let page_count = (&next_length + (page_size - 1)) / page_size;
+        let page_count = next_length.div_ceil(page_size);
 
         token_in.put(&token);
         kv_len.put(&next_length);
         positions.put(&length);
         w_slot.put(&length / page_size);
         w_off.put(&length % page_size);
-        page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+        page_indptr.put(indptr(1, &page_count));
         token_out.put(&token);
     });
 

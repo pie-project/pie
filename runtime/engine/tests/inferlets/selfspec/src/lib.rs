@@ -96,7 +96,7 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
 
     let mut g: Vec<u32> = vec![g0 as u32];
     if k > 1 {
-        let tok_in = Channel::from(vec![g0; 1]).named("g_tok_in");
+        let tok_in = Channel::from([g0]).named("g_tok_in");
         let out = Channel::new([1], dtype::i32).named("g_out");
         let lane1 = Channel::from([0u32, 1u32]).named("g_embed_indptr");
         let positions = Channel::from([n]).named("g_positions");
@@ -126,13 +126,13 @@ async fn greedy_reference(prompt: &[u32], k: u32) -> Result<Vec<u32>> {
             let length = kv_len.take();
             let t = reduce_argmax(intrinsics::logits());
             let next_length = &length + 1u32;
-            let page_count = (&next_length + (PAGE_T - 1)) / PAGE_T;
+            let page_count = next_length.div_ceil(PAGE_T);
             tok_in.put(&t);
             kv_len.put(&next_length);
             positions.put(&length);
             w_slot.put(&length / PAGE_T);
             w_off.put(&length % PAGE_T);
-            page_indptr.put(iota(2) * broadcast(&page_count, [2]));
+            page_indptr.put(indptr(1, &page_count));
             out.put(&t);
         });
         for step in 1..k {

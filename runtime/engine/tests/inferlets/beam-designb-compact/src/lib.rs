@@ -76,7 +76,7 @@ async fn main(input: String) -> Result<String> {
     let scores = Channel::from(vec![0.0f32; B as usize]).named("scores");
     let toks = Channel::from(vec![BOS; B as usize]).named("toks");
     let pos = Channel::from(vec![0u32; B as usize]).named("pos");
-    let fill = Channel::from(vec![INIT_FILL; 1]).named("fill");
+    let fill = Channel::from([INIT_FILL]).named("fill");
     let klen = Channel::from(vec![PAGE_T; B as usize]).named("klen");
     let w_slot = Channel::from(vec![phys0; B as usize]).named("w_slot");
     let w_off = Channel::from(vec![0u32; B as usize]).named("w_off");

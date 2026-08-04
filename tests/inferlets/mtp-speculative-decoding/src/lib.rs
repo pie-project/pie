@@ -222,7 +222,7 @@ async fn main(input: Input) -> Result<String> {
         let next_positions = broadcast(&next_base, [w]) + &next_rank;
 
         let next_kv_len = &next_positions + &next_live_u32;
-        let page_counts = (&next_kv_len + (PAGE_T - 1)) / PAGE_T;
+        let page_counts = next_kv_len.div_ceil(PAGE_T);
         let page_tail = cast(cumsum(cast(&page_counts, dtype::f32)), dtype::u32);
         let next_page_indptr = scatter_set(broadcast(0u32, [w + 1]), iota(w) + 1u32, &page_tail);
         len.put(&next_base);
