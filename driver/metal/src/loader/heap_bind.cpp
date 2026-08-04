@@ -672,12 +672,12 @@ std::unordered_map<std::uint32_t, MappedSource> resolve_mappable(
 }
 
 
-/// Can every weight be read where it already lies?
+/// Which weights can be read where they already lie.
 ///
-/// True when two things hold. Every allocated buffer is a plain span of a file
-/// -- no dequantize, no fill, no band copy -- so there is nothing to compute on
-/// the way in. And every one of those spans begins on `align`, so a device
-/// pointer may point at it.
+/// A buffer qualifies on two counts. It is a plain span of a file -- no
+/// dequantize, no fill, no band copy -- so there is nothing to compute on the
+/// way in. And that span begins on `align`, so a device pointer may point at
+/// it.
 ///
 /// The second is the one that actually decides, and it is about PLACEMENT
 /// rather than format. A stock safetensors checkpoint packs tensors end to end:
@@ -687,34 +687,28 @@ std::unordered_map<std::uint32_t, MappedSource> resolve_mappable(
 /// the file is called, and a safetensors checkpoint that happened to be padded
 /// would take the same path.
 ///
+/// Answered per BUFFER, not for the checkpoint as a whole. It began as
+/// all-or-nothing and that made the cost a cliff rather than a slope:
+/// Qwen3.5-0.8B ships eighteen norm tensors as F16, every kernel here reads
+/// BF16, and those eighteen casts -- 0.0 MB of a 629 MB checkpoint -- put the
+/// other 629 MB back through the copy. The same eighteen tensors would have
+/// cost Qwen3.5-35B a twenty-gigabyte copy. Now the heap holds exactly what
+/// had to be computed and the file supplies the rest.
+///
 /// Pure, because the answer is needed TWICE and the two callers must not
 /// disagree. The heap is sized before a context exists, and it has to leave
 /// these bytes out; the stager then has to leave exactly the same ones out. A
 /// heap sized for weights that are then also mapped is the footprint doubled,
 /// which on a model that only just fits is the difference between running and
 /// an out-of-memory command buffer.
-struct MapInPlace {
-    bool ok = false;
-    std::unordered_map<std::uint32_t, MappedSource> sources;
-    std::uint64_t bytes = 0;
-};
-
-MapInPlace plan_map_in_place(const pie_loader::PieLoaderPlan& plan,
-                             const pie_loader::LoadPlanIndex& index,
-                             std::uint64_t align) {
-    MapInPlace out;
-    out.sources = resolve_mappable(plan, index, [](const std::string&) { return true; });
-    if (out.sources.empty()) return out;
-    for (std::size_t step = 0; step < plan.schedule.len; ++step) {
-        const auto& instr = index.instruction(plan.schedule.ptr[step]);
-        if (instr.op.tag != pie_loader::PieLoaderStorageOp::Tag::Allocate) continue;
-        if (out.sources.count(instr.op.allocate.buffer_id) == 0) return out;
+std::unordered_map<std::uint32_t, MappedSource> plan_map_in_place(
+    const pie_loader::PieLoaderPlan& plan,
+    const pie_loader::LoadPlanIndex& index,
+    std::uint64_t align) {
+    auto out = resolve_mappable(plan, index, [](const std::string&) { return true; });
+    for (auto it = out.begin(); it != out.end();) {
+        it = it->second.file_offset % align == 0 ? std::next(it) : out.erase(it);
     }
-    for (const auto& [id, src] : out.sources) {
-        if (src.file_offset % align != 0) return out;
-        out.bytes += src.bytes;
-    }
-    out.ok = true;
     return out;
 }
 
@@ -730,7 +724,11 @@ std::uint64_t streamable_plan_bytes(const pie_loader::LoadPlan& load,
     // nothing was copied anywhere to begin with.
     const auto direct = plan_map_in_place(
         plan, index, std::max<std::uint64_t>(1, load.preferred_alignment()));
-    if (direct.ok) return direct.bytes;
+    if (!direct.empty()) {
+        std::uint64_t bytes = 0;
+        for (const auto& [id, src] : direct) bytes += src.bytes;
+        return bytes;
+    }
     if (!streams) return 0;
     std::uint64_t total = 0;
     for (const auto& [id, src] : resolve_mappable(plan, index, streams)) total += src.bytes;
@@ -862,8 +860,12 @@ StagedWeights stage_plan_weights(
     // these two ever disagreed the heap would be wrong in one direction or the
     // other, so they ask one function rather than each deciding.
     const auto direct = plan_map_in_place(load_plan, index, align);
-    std::unordered_map<std::uint32_t, MappedSource> all_sources = direct.sources;
-    bool compact_around_pack = !mapped.empty() && !all_sources.empty();
+    // The pack is the OTHER way to keep weights out of the heap, and it is for
+    // checkpoints this one cannot help: it re-places misaligned tensors by
+    // copying them once. When anything maps, nothing needs re-placing.
+    std::unordered_map<std::uint32_t, MappedSource> all_sources =
+        resolve_mappable(load_plan, index, [](const std::string&) { return true; });
+    bool compact_around_pack = direct.empty() && !mapped.empty() && !all_sources.empty();
     if (compact_around_pack) {
         for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
             const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
@@ -898,11 +900,11 @@ StagedWeights stage_plan_weights(
     // One buffer per FILE rather than per tensor: a device allocation carries
     // a residency-set commit, and 1351 of them cost more than the copy would.
     std::unordered_map<std::uint32_t, SlotHandle> file_slots;
-    bool map_in_place = direct.ok;
+    bool map_in_place = !direct.empty();
     const auto map_t0 = std::chrono::steady_clock::now();
     if (map_in_place) {
         std::vector<std::uint32_t> file_ids;
-        for (const auto& [id, src] : all_sources) {
+        for (const auto& [id, src] : direct) {
             if (std::find(file_ids.begin(), file_ids.end(), src.file_id) == file_ids.end()) {
                 file_ids.push_back(src.file_id);
             }
@@ -918,7 +920,7 @@ StagedWeights stage_plan_weights(
         // span past the end of its file would otherwise become a GPU read of
         // whatever follows the mapping, which is not a fault and not zero.
         if (map_in_place) {
-            for (const auto& [id, src] : all_sources) {
+            for (const auto& [id, src] : direct) {
                 const SlotHandle& f = file_slots.at(src.file_id);
                 if (src.file_offset <= f.size && src.bytes <= f.size - src.file_offset) continue;
                 map_in_place = false;
@@ -927,12 +929,12 @@ StagedWeights stage_plan_weights(
         }
         if (map_in_place) {
             b.weight_mapping = std::move(view_owned);
-            for (const auto& [id, src] : all_sources) b.streamed_bytes += src.bytes;
+            for (const auto& [id, src] : direct) b.streamed_bytes += src.bytes;
             if (std::getenv("PIE_METAL_LOAD_TRACE") != nullptr) {
                 std::fprintf(stderr, "[pie-metal] load: map %.0f ms (%zu files, %zu slices)\n",
                              std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - map_t0).count(),
-                             file_slots.size(), all_sources.size());
+                             file_slots.size(), direct.size());
             }
         } else {
             file_slots.clear();
@@ -987,35 +989,55 @@ StagedWeights stage_plan_weights(
         }
     }
 
+    // What the heap still has to hold.
+    //
+    // The plan lays every persistent buffer out in one arena at a fixed offset,
+    // and both paths that take bytes OUT of that arena -- the pack and the
+    // mapping -- leave holes in it. Allocating the arena's full size around
+    // those holes would put back exactly the bytes that were just removed, so
+    // the survivors are re-laid compactly and the arena is never built.
+    //
+    // Whatever is left is what genuinely had to be computed: a cast to BF16, a
+    // dequantized MXFP4 block, a fill. On a `.zt` this is usually a rounding
+    // error against the model -- 0.0 MB for Qwen3.5-0.8B, 201 MB of 1.7 GB for
+    // Llama-3.2-3B -- and on a checkpoint that needs no transform at all it is
+    // zero and no region is allocated.
+    const bool compact = map_in_place || compact_around_pack;
     std::unordered_map<std::uint32_t, std::uint64_t> compact_offset;
     std::uint64_t compact_bytes = 0;
-    if (compact_around_pack && !map_in_place) {
+    if (compact) {
         std::vector<std::uint32_t> ids;
-        for (const auto& [id, src] : all_sources) {
-            if (mapped.count(id) == 0) ids.push_back(id);
+        for (std::size_t step = 0; step < load_plan.schedule.len; ++step) {
+            const auto& instr = index.instruction(load_plan.schedule.ptr[step]);
+            if (instr.op.tag != pie_loader::PieLoaderStorageOp::Tag::Allocate) continue;
+            const auto& decl = index.buffer(instr.op.allocate.buffer_id);
+            if (!decl.has_persistent_offset || decl.temporary) continue;
+            if (direct.count(decl.id) != 0 || mapped.count(decl.id) != 0) continue;
+            ids.push_back(decl.id);
         }
         std::sort(ids.begin(), ids.end());
         for (const std::uint32_t id : ids) {
             compact_offset[id] = compact_bytes;
-            compact_bytes += ((all_sources.at(id).bytes + align - 1) / align) * align;
+            compact_bytes += ((index.buffer(id).bytes + align - 1) / align) * align;
         }
     }
-    // Mapped in place, nothing is copied, so there is no region to copy INTO --
-    // and allocating one anyway would put the model's whole size back in the
-    // heap beside a mapping that already holds it.
-    if (!map_in_place) {
-        b.weights_region = ctx.heap_alloc(
-            compact_around_pack ? std::size_t(compact_bytes) : weights_bytes,
-                                          std::size_t(align));
+    if (!compact || compact_bytes > 0) {
+        b.weights_region =
+            ctx.heap_alloc(compact ? std::size_t(compact_bytes) : weights_bytes,
+                           std::size_t(align));
         if (!b.weights_region.valid()) {
             throw std::runtime_error("heap_alloc failed for program-owned weights region");
         }
     }
-    if (compact_around_pack && !map_in_place) {
+    if (compact) {
         // Each buffer pulls its own bytes, so the bulk writes are skipped below:
-        // they address the arena the plan laid out, which no longer exists.
+        // they address the arena the plan laid out, which no longer exists. Only
+        // the survivors that ARE plain file spans are pulled here; the rest are
+        // written by the transform that was the reason they survived.
         for (const auto& [id, off] : compact_offset) {
-            const auto& src = all_sources.at(id);
+            const auto found = all_sources.find(id);
+            if (found == all_sources.end()) continue;
+            const auto& src = found->second;
             view.copy_storage_bytes(src.file_id, src.file_offset, src.bytes,
                                     static_cast<std::uint8_t*>(b.weights_region.contents()) + off,
                                     load.max_tile_bytes());
@@ -1099,18 +1121,19 @@ StagedWeights stage_plan_weights(
                 pending_scratch.emplace(decl.id, decl.bytes);
                 break;
             }
-            if (map_in_place) {
-                const auto& src = all_sources.at(decl.id);
-                buffers.emplace(decl.id, slice_slot(file_slots.at(src.file_id),
-                                                    src.file_offset, decl.bytes));
-                break;
-            }
-            if (compact_around_pack) {
-                buffers.emplace(decl.id,
-                                mapped.count(decl.id) != 0
-                                    ? slice_slot(pack_slot, pack_offset.at(decl.id), decl.bytes)
-                                    : slice_slot(b.weights_region, compact_offset.at(decl.id),
-                                                 decl.bytes));
+            if (compact) {
+                const auto in_file = direct.find(decl.id);
+                if (in_file != direct.end()) {
+                    buffers.emplace(decl.id,
+                                    slice_slot(file_slots.at(in_file->second.file_id),
+                                               in_file->second.file_offset, decl.bytes));
+                } else if (mapped.count(decl.id) != 0) {
+                    buffers.emplace(decl.id,
+                                    slice_slot(pack_slot, pack_offset.at(decl.id), decl.bytes));
+                } else {
+                    buffers.emplace(decl.id, slice_slot(b.weights_region,
+                                                        compact_offset.at(decl.id), decl.bytes));
+                }
                 break;
             }
             buffers.emplace(
@@ -1142,7 +1165,7 @@ StagedWeights stage_plan_weights(
             // Mapped in place: the bytes are already where they need to be.
             // Compacted: every buffer pulled its own. Either way the arena this
             // write addresses no longer exists.
-            if (map_in_place || compact_around_pack) break;
+            if (compact) break;
             const auto _span = trace.span(&trace.bulk_ms);
             const auto& op = instr.op.bulk_extent_write;
             const std::uint64_t offset = op.dest_offset;
