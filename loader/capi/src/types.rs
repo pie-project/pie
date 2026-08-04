@@ -14,8 +14,9 @@
 //!   `has_*: bool` companion, matching the C++ views this replaces, so the
 //!   layout is legible from C without knowing Rust's niche rules.
 
+use pie_loader::contract::Visibility;
 use pie_loader::types::{
-    BackendKind, DType, QuantGranularity, QuantScheme, RepackLayout, ScaleForm,
+    BackendKind, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,
 };
 
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
@@ -974,3 +975,94 @@ const _: () = {
     assert!(PIE_LOADER_TILE_MAP_SCALE == p::TILE_MAP_SCALE);
     assert!(PIE_LOADER_FUSION_FP8_TO_MXFP4 == p::FUSION_FP8_TO_MXFP4);
 };
+
+impl From<PieLoaderVisibility> for Visibility {
+    fn from(value: PieLoaderVisibility) -> Self {
+        match value {
+            PieLoaderVisibility::Public => Self::Public,
+            PieLoaderVisibility::Internal => Self::Internal,
+        }
+    }
+}
+
+/// `QuantSpec::channel_axis`, as a signed integer so that `-1` is "unset".
+///
+/// A sentinel rather than a second `bool` field keeps the struct a plain list
+/// of numbers, which is what a designated initializer is good at.
+pub const PIE_LOADER_NO_AXIS: i32 = -1;
+
+/// [`pie_loader::types::QuantSpec`], flattened.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieLoaderQuantSpecView {
+    /// A `PieLoaderQuantScheme` value, as `uint32_t`.
+    pub scheme: u32,
+    /// A `PieLoaderDType` value, as `uint32_t`.
+    pub logical_dtype: u32,
+    /// `0` asks for the scheme's default, exactly as the Rust side does.
+    pub bits_per_element: u8,
+    /// `0` asks for the scheme's default.
+    pub group_size: u32,
+    pub channel_axis: i32,
+}
+
+impl Default for PieLoaderQuantSpecView {
+    fn default() -> Self {
+        Self {
+            scheme: PieLoaderQuantScheme::None as u32,
+            logical_dtype: PieLoaderDType::BF16 as u32,
+            bits_per_element: 0,
+            group_size: 0,
+            channel_axis: PIE_LOADER_NO_AXIS,
+        }
+    }
+}
+
+/// [`pie_loader::types::Encoding`], flattened. `kind` selects which half is read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PieLoaderEncodingSpec {
+    /// A `PieLoaderEncodingKind` value, as `uint32_t`.
+    pub kind: u32,
+    /// A `PieLoaderDType` value, as `uint32_t`. Read when `kind == Raw`.
+    pub dtype: u32,
+    /// Read when `kind == Quant`.
+    pub quant: PieLoaderQuantSpecView,
+}
+
+impl Default for PieLoaderEncodingSpec {
+    fn default() -> Self {
+        Self {
+            kind: PieLoaderEncodingKind::Raw as u32,
+            dtype: PieLoaderDType::BF16 as u32,
+            quant: PieLoaderQuantSpecView::default(),
+        }
+    }
+}
+
+pub(crate) fn write_quant(spec: &QuantSpec) -> PieLoaderQuantSpecView {
+    PieLoaderQuantSpecView {
+        scheme: PieLoaderQuantScheme::from(spec.scheme) as u32,
+        logical_dtype: PieLoaderDType::from(spec.logical_dtype) as u32,
+        bits_per_element: spec.bits_per_element,
+        group_size: spec.group_size,
+        channel_axis: spec
+            .channel_axis
+            .map_or(PIE_LOADER_NO_AXIS, |axis| i32::from(axis.0)),
+    }
+}
+
+pub(crate) fn write_encoding(encoding: &Encoding) -> PieLoaderEncodingSpec {
+    let mut spec = PieLoaderEncodingSpec::default();
+    match encoding {
+        Encoding::Raw(dtype) => {
+            spec.kind = PieLoaderEncodingKind::Raw as u32;
+            spec.dtype = PieLoaderDType::from(*dtype) as u32;
+        }
+        Encoding::Quant(quant) => {
+            spec.kind = PieLoaderEncodingKind::Quant as u32;
+            spec.quant = write_quant(quant);
+        }
+    }
+    spec
+}

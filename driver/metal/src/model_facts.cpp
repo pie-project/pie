@@ -10,7 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 
 namespace pie::metal {
 
@@ -163,7 +163,8 @@ ModelFacts read_model_facts(const std::string& hf_path) {
         // only when `model_type` names one of them, on the same principle as
         // the two above: a config that never mentions this family cannot
         // accidentally select it.
-        if (pie::metal::model::llama::is_supported_model_type(facts.model_type)) {
+        if (pie::metal::model::model_family_of(facts.model_type) ==
+            pie::metal::model::ModelFamily::Llama) {
             const auto gi = [](const nlohmann::json& obj, const char* key, int& out) {
                 if (obj.contains(key) && obj[key].is_number_integer()) {
                     out = obj[key].get<int>();
@@ -226,7 +227,8 @@ ModelFacts read_model_facts(const std::string& hf_path) {
 
         // ── Qwen3.5 / Qwen3-Next: the GDN hybrid ──
         // Read only when `model_type` names it, like every block around it.
-        if (pie::metal::model::qwen3_5::is_supported_model_type(facts.model_type)) {
+        if (pie::metal::model::model_family_of(facts.model_type) ==
+            pie::metal::model::ModelFamily::Qwen35) {
             const auto gi = [](const nlohmann::json& obj, const char* key, int& out) {
                 if (obj.contains(key) && obj[key].is_number_integer()) {
                     out = obj[key].get<int>();

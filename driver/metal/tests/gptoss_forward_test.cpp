@@ -24,7 +24,7 @@
 #include "loader/heap_bind_metal.hpp"
 #include "loader/load_plan.hpp"
 #include "pie_loader/checkpoint_source.hpp"
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/gptoss/bind.hpp"
 #include "model/gptoss/decode_consts.hpp"
 #include "model/gptoss/decode_step.hpp"

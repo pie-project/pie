@@ -122,33 +122,14 @@ class LoadPlan {
         }
     }
 
-    /// Compile a contract the caller authored.
-    ///
-    /// The only way in, and the argument list is the architecture: what is in
-    /// the files, what the caller wants out, and what the device can do. Nothing
-    /// here is a model's name, so a family this build has never heard of loads
-    /// exactly as well as one it has. This is also the call that replaced the
-    /// old `deserialize`, where the worker compiled a plan and the driver parsed
-    /// it back.
-    static LoadPlan compile(const PieLoaderContractRequest& request) {
-        PieLoaderPlan* raw = nullptr;
-        LoadPlanDiagnostics diags;
-        const PieLoaderStatus status =
-            pie_loader_compile_contract(&request, &raw, diags.slot());
-        if (status != PieLoaderStatus::Ok) {
-            throw std::runtime_error(
-                "load plan: compile failed (" + status_name(status) + "): " +
-                diags.text());
-        }
-        if (raw == nullptr) {
-            throw std::runtime_error("load plan: compile returned no plan");
-        }
-        return LoadPlan(raw);
-    }
-
     /// Author this model's contract on the Rust side and compile it, in one
-    /// call — the §6 request boundary of `plan/model-in-rust.md`. The facts
-    /// and policy cross as a handful of scalars; no contract crosses at all.
+    /// call — the §6 request boundary of `plan/model-in-rust.md`, and the only
+    /// way to obtain a plan. The facts and policy cross as a handful of
+    /// scalars; no contract crosses at all, and nothing here lets a driver
+    /// hand one over: what gets built is decided by the author registry on
+    /// the far side. Nothing in the *loader* dispatches on the model_type the
+    /// facts carry — a family the registry has never heard of is a
+    /// diagnostic asking for an author, not a silent guess.
     ///
     /// `out_mxfp4_moe` receives the author's resolved policy as its wire
     /// value: the bind path branches on the author's answer, and a family may
@@ -183,21 +164,6 @@ class LoadPlan {
         if (status != PieLoaderStatus::Ok) {
             throw std::runtime_error(
                 "load plan: model verification failed (" + status_name(status) +
-                "): " + diags.text());
-        }
-    }
-
-    /// Re-check the plan against the contract it was compiled from.
-    ///
-    /// Not a tautology across a process or a cache: the plan may have come from
-    /// an artifact another rank, or another build, wrote (§6.2).
-    void verify(const PieLoaderContractRequest& request) const {
-        LoadPlanDiagnostics diags;
-        const PieLoaderStatus status =
-            pie_loader_verify_contract(plan_, &request, diags.slot());
-        if (status != PieLoaderStatus::Ok) {
-            throw std::runtime_error(
-                "load plan: verification failed (" + status_name(status) +
                 "): " + diags.text());
         }
     }

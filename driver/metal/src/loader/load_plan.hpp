@@ -5,7 +5,8 @@
 #include <string>
 #include <string_view>
 
-#include "model/contract.hpp"
+#include "model/facts.hpp"
+#include "pie_loader.h"
 #include "pie_loader/plan.hpp"
 #include "pie_loader/request.hpp"
 #include "pie_loader/source_checkpoint.hpp"
@@ -44,13 +45,20 @@ inline pie_loader::DeviceTarget metal_device_target() {
     };
 }
 
-/// Compile a contract this driver authored, for this device.
+/// Compile the plan through the Rust author: facts and policy in, plan out.
 ///
-/// Three inputs and no fourth: what the files contain, what this driver will
-/// bind, and what the GPU can do. The loader is not told which model this is,
-/// so a family it has never heard of loads exactly as well as one it has
-/// (`loader/architecture.md` §12 row 12). `model_type` selects the schema on
-/// *this* side of the call and never crosses it.
+/// `plan/model-in-rust.md` §6 — the driver sends what only it can know (the
+/// config facts it parsed, and that this device wants MLX names with in-place
+/// projections) and authoring happens on the loader's side, in the same
+/// `pie_model::contract` registry the CUDA boot goes through. `model_type`
+/// crosses as a fact: it is the key the author registry dispatches on, and an
+/// unknown one comes back as a diagnostic naming it rather than a plan.
+///
+/// What the request does NOT carry mirrors what the Metal authors never read:
+/// no runtime quantization, no MXFP4 MoE lowering choice, no component split,
+/// no expert streaming, and none of the CUDA per-family environment knobs —
+/// zeros and defaults, stated here rather than defaulted there, so equal
+/// requests author equal contracts.
 inline LoadPlan compile_load_plan(
     std::string_view snapshot_dir,
     const pie_loader::DeviceTarget& target,
@@ -63,15 +71,41 @@ inline LoadPlan compile_load_plan(
         throw std::runtime_error("load plan: " + open_error);
     }
 
-    pie_loader::ModelContract contract;
-    model::author_model_contract(checkpoint, model_type, target, contract, facts);
+    const pie_loader::PieLoaderModelRequest request{
+        .checkpoint = checkpoint.get(),
+        .target = pie_loader::target_spec(target),
+        .facts =
+            pie_loader::PieLoaderModelFactsView{
+                .model_type = pie_loader::borrow(model_type),
+                .quant_method = pie_loader::borrow(std::string_view{}),
+                .num_hidden_layers = static_cast<std::uint32_t>(
+                    facts.num_hidden_layers > 0 ? facts.num_hidden_layers : 0),
+                .num_experts = 0,
+                .head_dim = 0,
+                .mamba_groups = 0,
+                .tied_embeddings = facts.tied_embeddings,
+                .mlx_quant_bits = static_cast<std::uint32_t>(
+                    facts.quant_bits > 0 ? facts.quant_bits : 0),
+                .mlx_quant_group_size = static_cast<std::uint32_t>(
+                    facts.quant_group_size > 0 ? facts.quant_group_size : 0),
+                .num_kv_shared_layers = static_cast<std::uint32_t>(
+                    facts.num_kv_shared_layers > 0 ? facts.num_kv_shared_layers : 0),
+            },
+        .projections = 1,  // InPlace: the MLX lowering.
+        .naming = 1,       // MLX names, which is what this bind path reads.
+        .runtime_quant = 0,
+        .moe_request = 0,
+        .component = 0,
+        .stream_routed_experts = false,
+        .knobs = pie_loader::PieLoaderFamilyKnobs{},
+    };
 
-    const auto request =
-        pie_loader::build_contract_request(checkpoint, target, contract.view());
-    LoadPlan plan = LoadPlan::compile(request);
-    // A second opinion, not a restatement: `verify` shares no code with the
-    // compiler, and since §6 it also stats each file the plan declares.
-    plan.verify(request);
+    LoadPlan plan = LoadPlan::compile_model(request, nullptr);
+    // A second opinion, not a restatement: the verifier re-authors from this
+    // request on the far side and holds the plan to it — marshalling and
+    // author determinism both in scope — and since §6 it also stats each
+    // file the plan declares.
+    plan.verify_model(request);
     return plan;
 }
 

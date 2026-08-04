@@ -913,26 +913,6 @@ add_custom_target(pie_driver_cuda_test_fixtures SOURCES
   tests/load_parity/run.py
   tests/load_parity/spec.py)
 
-# The contract this driver authors (§12 row 12).
-# Set PIE_TEST_SNAPSHOT to also author it against a real checkpoint.
-if(PIE_LOADER_STATICLIB)
-  # Links the driver lib: authoring is now the arch table's `author_contract`
-  # hook, so reaching a family's contract means reaching its registry row.
-  pie_add_cuda_target(test_model_contract
-    SOURCES tests/model_contract_test.cpp
-    INCLUDE_DIRS
-     
-      ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-      ${CMAKE_CURRENT_SOURCE_DIR}/../../compiler/codegen/include
-      ${PIE_DRIVER_ABI_INCLUDE_DIR}
-      ${PIE_LOADER_INCLUDE_DIR}
-    LIBS pie_driver_cuda_lib nlohmann_json::nlohmann_json ${PIE_LOADER_STATICLIB} dl pthread)
-else()
-  message(STATUS
-    "test_model_contract: skipped (no libpie_loader.a; build one with "
-    "`cargo rustc -p pie-loader --lib --crate-type staticlib`)")
-endif()
-
 # Mixed prefill/decode batch: a continuing T=1 request must reuse its conv window.
 pie_add_cuda_target(test_causal_conv1d
   SOURCES tests/test_causal_conv1d.cu src/kernels/causal_conv1d.cu

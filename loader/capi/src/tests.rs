@@ -330,23 +330,20 @@ fn the_plan_declares_the_files_its_offsets_are_relative_to() {
 /// The contract names one tensor the plan does deliver: a plan may deliver more
 /// than a contract names, so the narrowest legal contract leaves only the plan's
 /// *internal* consistency under test — which is what every caller of this helper
-/// is mutating.
+/// is mutating. Verification runs over the *marshalled* plan
+/// (`view::verify_marshalled` rebuilds the view from the C arena), so the POD
+/// round-trip stays in scope exactly as it was when a C entry point did this.
 fn verify_diagnostics(plan: &LoadPlan) -> String {
-    let pod = arena::build(plan, arena::UNKEYED);
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&minimal_contract());
-    let mut req = contract_request(handle, owned.view());
-    req.target.tp_rank = 1;
-    req.target.tp_size = 4;
-    req.target.native_mxfp4_moe = true;
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let _ = unsafe { super::entry::pie_loader_verify_contract(pod, &req, &mut diags) };
-    let text = all_messages(diags);
-    unsafe { super::entry::pie_loader_release_diagnostics(diags) };
-    unsafe { super::entry::pie_loader_release(pod) };
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-    text
+    let contract = minimal_contract();
+    let contract_view = pie_loader::verify::ContractView::of(&contract);
+    match crate::view::verify_marshalled(plan, Some(&contract_view)) {
+        Ok(_) => String::new(),
+        Err(violations) => violations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
 }
 
 #[test]
@@ -772,81 +769,6 @@ fn target_spec() -> PieLoaderTargetSpec {
     }
 }
 
-/// Compile the fixture contract against a target the caller has broken, and
-/// report what came back.
-///
-/// A real checkpoint is opened even though every case here is expected to be
-/// refused before the checkpoint is read: a request that carried a null handle
-/// would be rejected for *that* reason instead, and the test would pass without
-/// exercising the field it names.
-fn compile_with_target(mutate: impl FnOnce(&mut PieLoaderTargetSpec)) -> (PieLoaderStatus, String) {
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
-    let mut req = contract_request(handle, owned.view());
-    mutate(&mut req.target);
-
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    let message = drain(diags);
-    if !plan.is_null() {
-        unsafe { super::entry::pie_loader_release(plan) };
-    }
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-    (status, message)
-}
-
-#[test]
-fn out_of_range_backend_is_rejected_not_transmuted() {
-    let (status, message) = compile_with_target(|t| t.backend = 7);
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-    assert!(
-        message.contains("backend") && message.contains('7'),
-        "unexpected diagnostic: {message}"
-    );
-}
-
-#[test]
-fn a_target_claiming_an_unknown_tile_map_transform_is_rejected() {
-    // The driver is the authority on what its kernels implement
-    // (`architecture.md` §9), so it may claim fewer transforms than the loader
-    // knows how to lower. It may not claim one the loader has never heard of:
-    // nothing downstream would notice until a kernel dispatch failed at load
-    // time.
-    let (status, message) =
-        compile_with_target(|t| t.tile_map_mask = CUDA_TILE_MAP_MASK | (1 << 30));
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-    assert!(
-        message.contains("does not define") && message.contains("cuda"),
-        "got: {message}"
-    );
-}
-
-#[test]
-fn a_target_claiming_fewer_transforms_than_the_loader_knows_is_accepted() {
-    // The converse: a driver that implements a subset is well-formed. Only the
-    // plan's *use* of a transform is checked against the claim, and that check
-    // already lives in `validate_target_support`.
-    let (status, message) =
-        compile_with_target(|t| t.tile_map_mask = CUDA_TILE_MAP_MASK & !TILE_MAP_REPACK);
-    assert_eq!(
-        status,
-        PieLoaderStatus::Ok,
-        "a narrower mask is not a malformed request: {message}"
-    );
-}
-
-#[test]
-fn a_target_that_states_no_tile_budget_is_rejected_rather_than_guessed_for() {
-    // `architecture.md` §9: a device constant the loader cannot measure has no
-    // safe default. The number decides how much scratch every Encode allocates,
-    // so guessing it would be a performance contract nobody signed.
-    let (status, message) = compile_with_target(|t| t.max_tile_bytes = 0);
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-    assert!(message.contains("max_tile_bytes"), "got: {message}");
-}
-
 #[test]
 fn every_declared_enum_value_is_accepted_by_its_checked_conversion() {
     for (v, want) in [
@@ -859,154 +781,41 @@ fn every_declared_enum_value_is_accepted_by_its_checked_conversion() {
     assert!(PieLoaderBackendKind::try_from(2).is_err());
 }
 
-#[test]
-fn a_bad_tp_shape_is_rejected() {
-    assert_eq!(
-        compile_with_target(|t| t.tp_size = 0).0,
-        PieLoaderStatus::InvalidRequest
-    );
-    assert_eq!(
-        compile_with_target(|t| {
-            t.tp_rank = 4;
-            t.tp_size = 4;
-        })
-        .0,
-        PieLoaderStatus::InvalidRequest
-    );
-}
-
-#[test]
-fn null_arguments_never_dereference() {
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-
-    let status = unsafe {
-        super::entry::pie_loader_compile_contract(std::ptr::null(), &mut plan, &mut diags)
-    };
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-    assert!(plan.is_null());
-    assert!(!diags.is_null(), "a null request should still be explained");
-    unsafe { super::entry::pie_loader_release_diagnostics(diags) };
-
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
-    let req = contract_request(handle, owned.view());
-
-    let status = unsafe {
-        super::entry::pie_loader_compile_contract(&req, std::ptr::null_mut(), std::ptr::null_mut())
-    };
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-
-    let status = unsafe {
-        super::entry::pie_loader_verify_contract(std::ptr::null(), &req, std::ptr::null_mut())
-    };
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe {
-        super::entry::pie_loader_open_checkpoint(
-            bytes("/nonexistent"),
-            std::ptr::null_mut(),
-            &mut diags,
-        )
-    };
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-    unsafe { super::entry::pie_loader_release_diagnostics(diags) };
-
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-}
-
-#[test]
-fn verify_rejects_a_plan_compiled_with_a_different_fusion_setting() {
-    // The two settings name different kernel sequences for the same weights.
-    // Accepting a fused plan on a driver that has fusion disabled would run
-    // something the plan does not describe — and, because the driver caches the
-    // materialized artifact, would do so from a cache entry the other setting
-    // wrote (`architecture.md` §8.1).
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
-    let req = contract_request(handle, owned.view());
-
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    assert_eq!(
-        status,
-        PieLoaderStatus::Ok,
-        "compile failed: {}",
-        drain(diags)
-    );
-
-    let mut diverged = req;
-    diverged.target.fusion_mask = 0;
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_verify_contract(plan, &diverged, &mut diags) };
-    assert_eq!(status, PieLoaderStatus::ContractViolation);
-    assert!(drain(diags).contains("fusion_mask"));
-
-    unsafe { super::entry::pie_loader_release(plan) };
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-}
-
-/// Join every diagnostic in the array. Verification reports *all* violations,
-/// not the first, so a test that read only one could pass on the wrong reason.
-fn all_messages(diags: *mut PieLoaderDiagnostics) -> String {
-    if diags.is_null() {
-        return String::new();
-    }
-    let items = unsafe { std::slice::from_raw_parts((*diags).items, (*diags).len) };
-    items
-        .iter()
-        .map(|d| {
-            let raw = unsafe { std::slice::from_raw_parts(d.message.ptr, d.message.len) };
-            String::from_utf8_lossy(raw).into_owned()
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
 /// Verify a plan against a contract *other* than the one it was compiled from.
 ///
 /// This is the only way a contract and a plan can disagree now: compiling from
 /// a contract makes them agree by construction, so the failure mode left is the
 /// `architecture.md` §6.2 one — two ranks, or a cache hit and a fresh compile,
-/// holding different programs and each believing the other's plan.
+/// holding different programs and each believing the other's plan. The plan
+/// crosses the C arena on the way (`view::verify_marshalled`), so the
+/// marshalling is in scope even though no C entry point remains to drive.
 fn verify_against(
-    plan: *const PieLoaderPlan,
+    plan: &LoadPlan,
     contract: &pie_loader::contract::ModelContract,
-) -> (PieLoaderStatus, String) {
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(contract);
-    let req = contract_request(handle, owned.view());
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_verify_contract(plan, &req, &mut diags) };
-    let message = all_messages(diags);
-    unsafe { super::entry::pie_loader_release_diagnostics(diags) };
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-    (status, message)
+) -> (bool, String) {
+    let contract_view = pie_loader::verify::ContractView::of(contract);
+    match crate::view::verify_marshalled(plan, Some(&contract_view)) {
+        Ok(_) => (true, String::new()),
+        Err(violations) => (
+            false,
+            violations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+    }
 }
 
-/// Compile the fixture contract and hand the plan to `body`.
-fn with_fixture_plan(body: impl FnOnce(*mut PieLoaderPlan)) {
+/// Compile the fixture contract — in Rust, since the contract entry died with
+/// the last C++ author — and hand the plan to `body`.
+fn with_fixture_plan(body: impl FnOnce(&LoadPlan)) {
     let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
-    let req = contract_request(handle, owned.view());
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    assert_eq!(
-        status,
-        PieLoaderStatus::Ok,
-        "compile failed: {}",
-        drain(diags)
-    );
-    body(plan);
-    unsafe { super::entry::pie_loader_release(plan) };
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
+    let metadata = pie_loader::checkpoint::read::parse_checkpoint_metadata(&dir)
+        .expect("the fixture checkpoint parses");
+    let plan = pie_loader::plan::compile(&metadata, &fused_contract(), target())
+        .expect("the fixture contract compiles");
+    body(&plan);
 }
 
 /// The point of the whole exercise: a contract the loader did not author,
@@ -1014,8 +823,8 @@ fn with_fixture_plan(body: impl FnOnce(*mut PieLoaderPlan)) {
 #[test]
 fn the_contract_a_plan_was_compiled_from_verifies_against_it() {
     with_fixture_plan(|plan| {
-        let (status, message) = verify_against(plan, &fused_contract());
-        assert_eq!(status, PieLoaderStatus::Ok, "diagnostics: {message}");
+        let (ok, message) = verify_against(plan, &fused_contract());
+        assert!(ok, "diagnostics: {message}");
     });
 }
 
@@ -1030,25 +839,17 @@ fn a_contract_naming_a_tensor_the_plan_does_not_deliver_is_a_violation() {
             vec![2, 4],
             Encoding::Raw(DType::BF16),
         ));
-        let (status, message) = verify_against(plan, &other);
-        assert_eq!(status, PieLoaderStatus::ContractViolation);
+        let (ok, message) = verify_against(plan, &other);
+        assert!(!ok);
         assert!(
             message.contains("c.weight") && message.contains("does not declare it"),
             "unexpected diagnostic: {message}"
         );
-
-        // A contract may not be empty: one that declared nothing would compile
-        // to a plan that loads nothing, which is never what a caller meant.
-        let (status, message) = verify_against(
-            plan,
-            &ModelContract {
-                alignment: 256,
-                tensors: Vec::new(),
-                groups: Vec::new(),
-            },
-        );
-        assert_eq!(status, PieLoaderStatus::ContractViolation);
-        assert!(message.contains("is empty"), "unexpected: {message}");
+        // ("a contract may not be empty" is no longer asserted here: that was
+        // a rule of the retired contract *request* — its reader refused an
+        // empty graph at the boundary — and requests no longer carry
+        // contracts. An author that declares nothing fails in its builder,
+        // before any plan exists to verify.)
     });
 }
 
@@ -1059,8 +860,8 @@ fn a_declared_shape_that_disagrees_with_the_plan_is_a_violation() {
     with_fixture_plan(|plan| {
         let mut other = fused_contract();
         other.tensors[0].shape = Some(vec![8, 4]);
-        let (status, message) = verify_against(plan, &other);
-        assert_eq!(status, PieLoaderStatus::ContractViolation);
+        let (ok, message) = verify_against(plan, &other);
+        assert!(!ok);
         assert!(
             message.contains("ab.weight") && message.contains('8'),
             "unexpected diagnostic: {message}"
@@ -1070,8 +871,8 @@ fn a_declared_shape_that_disagrees_with_the_plan_is_a_violation() {
         // demanded, the shape simply is not compared.
         let mut unstated = fused_contract();
         unstated.tensors[0].shape = None;
-        let (status, message) = verify_against(plan, &unstated);
-        assert_eq!(status, PieLoaderStatus::Ok, "diagnostics: {message}");
+        let (ok, message) = verify_against(plan, &unstated);
+        assert!(ok, "diagnostics: {message}");
     });
 }
 
@@ -1080,8 +881,8 @@ fn a_declared_encoding_that_disagrees_with_the_plan_is_a_violation() {
     with_fixture_plan(|plan| {
         let mut other = fused_contract();
         other.tensors[0].encoding = Encoding::Raw(DType::F32);
-        let (status, message) = verify_against(plan, &other);
-        assert_eq!(status, PieLoaderStatus::ContractViolation);
+        let (ok, message) = verify_against(plan, &other);
+        assert!(!ok);
         assert!(message.contains("ab.weight"), "unexpected: {message}");
     });
 }
@@ -1139,14 +940,14 @@ fn quant_scheme_survives_the_c_boundary() {
 }
 
 // ---------------------------------------------------------------------------
-// The contract entry point, end to end.
+// The checkpoint entry point, against a real file on disk.
 //
-// `pie_loader_compile` is checked above against a request that names a model
-// and lets the loader guess; these drive the path that has no model in it at
-// all. What is being tested is the whole chain — open a real checkpoint, state
-// a program over the tensors it reports, get a plan — because each half is
-// already covered on its own and the failure mode that is left is the two
-// halves disagreeing about what a name refers to.
+// The contract entry that used to be driven end-to-end here is gone
+// (`plan/model-in-rust.md` §8-5): a driver states facts and policy through
+// `pie_loader_compile_model`, and `capi/tests/model_entry.rs` drives that
+// boundary with a real snapshot. What remains in-crate is the half with no
+// author in it — opening a checkpoint and reading its tensor table back
+// through the POD views.
 // ---------------------------------------------------------------------------
 
 /// Write a two-tensor safetensors file and return its directory.
@@ -1199,17 +1000,6 @@ fn drain(diags: *mut PieLoaderDiagnostics) -> String {
     first
 }
 
-fn contract_request(
-    checkpoint: *const super::checkpoint::PieLoaderCheckpoint,
-    contract: super::contract::PieLoaderModelContractView,
-) -> super::entry::PieLoaderContractRequest {
-    super::entry::PieLoaderContractRequest {
-        checkpoint,
-        target: target_spec(),
-        contract,
-    }
-}
-
 /// The narrowest contract `plan_with_every_instr` satisfies.
 ///
 /// A contract may not be empty — one that declared nothing would compile to a
@@ -1249,38 +1039,6 @@ fn fused_contract() -> pie_loader::contract::ModelContract {
     }
 }
 
-/// A contract that publishes a weight and declares a second tensor as its
-/// scales, so the `scales` half of the contract ABI has something to carry.
-fn scaled_contract() -> pie_loader::contract::ModelContract {
-    use pie_loader::contract::{Expr, ModelContract, Scales, TensorContract};
-    use pie_loader::types::{QuantGranularity, ScaleForm};
-    ModelContract {
-        alignment: 256,
-        tensors: vec![
-            TensorContract::new(
-                "a.weight",
-                Expr::Src("a.weight".to_string()),
-                vec![2, 4],
-                Encoding::Raw(DType::BF16),
-            ),
-            TensorContract::new(
-                "a.scale",
-                Expr::Src("b.weight".to_string()),
-                vec![2, 4],
-                Encoding::Raw(DType::BF16),
-            )
-            .scaling(Scales {
-                of: "a.weight".to_string(),
-                granularity: QuantGranularity::PerChannel,
-                group_size: 0,
-                channel_axis: 0,
-                form: ScaleForm::F32Factors,
-            }),
-        ],
-        groups: Vec::new(),
-    }
-}
-
 #[test]
 fn an_opened_checkpoint_reports_the_tensors_a_contract_can_name() {
     let dir = contract_fixture();
@@ -1301,147 +1059,6 @@ fn an_opened_checkpoint_reports_the_tensors_a_contract_can_name() {
     assert_eq!(tensors[0].span_bytes, 16);
     assert_eq!(tensors[1].file_offset - tensors[0].file_offset, 16);
     unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-}
-
-#[test]
-fn a_contract_compiles_and_verifies_without_naming_a_model() {
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let owned = crate::contract_writer::write_contract(&fused_contract());
-    let req = contract_request(handle, owned.view());
-
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    assert_eq!(
-        status,
-        PieLoaderStatus::Ok,
-        "compile failed: {}",
-        drain(diags)
-    );
-    assert!(!plan.is_null());
-
-    let declared = unsafe { std::slice::from_raw_parts((*plan).tensors.ptr, (*plan).tensors.len) };
-    assert_eq!(declared.len(), 1);
-    let name = unsafe { std::slice::from_raw_parts(declared[0].name.ptr, declared[0].name.len) };
-    assert_eq!(std::str::from_utf8(name).unwrap(), "ab.weight");
-
-    let mut vdiags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let verified = unsafe { super::entry::pie_loader_verify_contract(plan, &req, &mut vdiags) };
-    assert_eq!(
-        verified,
-        PieLoaderStatus::Ok,
-        "verify failed: {}",
-        drain(vdiags)
-    );
-
-    unsafe { super::pie_loader_release(plan) };
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-}
-
-#[test]
-fn a_contract_naming_a_tensor_the_checkpoint_lacks_is_a_message_not_a_crash() {
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let mut model = fused_contract();
-    model.tensors[0].expr = pie_loader::contract::Expr::Src("missing.weight".to_string());
-    let owned = crate::contract_writer::write_contract(&model);
-    let req = contract_request(handle, owned.view());
-
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    assert_ne!(status, PieLoaderStatus::Ok);
-    assert!(plan.is_null());
-    assert!(
-        drain(diags).contains("missing.weight"),
-        "the message should name the tensor that is not there"
-    );
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-}
-
-#[test]
-fn a_contract_whose_declared_shape_is_wrong_fails_to_compile() {
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let mut model = fused_contract();
-    model.tensors[0].shape = Some(vec![8, 4]);
-    let owned = crate::contract_writer::write_contract(&model);
-    let req = contract_request(handle, owned.view());
-
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    assert_ne!(status, PieLoaderStatus::Ok);
-    let message = drain(diags);
-    assert!(
-        message.contains("[8, 4]") && message.contains("[4, 4]"),
-        "the message should show both the claim and the truth: {message}"
-    );
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-}
-
-/// A driver-written enum field is read as an integer and validated, never
-/// transmuted.
-///
-/// `PieLoaderScalesView` sits inside `PieLoaderModelContractView`, which the
-/// *driver* fills in. A Rust enum holding a value outside its variants is
-/// undefined behaviour the moment `read_contract` borrows the tensor slice —
-/// before any `match` could reject it — which is why every input-side enum on
-/// this boundary is spelled `u32`. This is the check that it still is.
-#[test]
-fn an_out_of_range_scale_granularity_is_rejected_not_transmuted() {
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let mut owned = crate::contract_writer::write_contract(&scaled_contract());
-    let scaled = owned.first_scaled().expect("the fixture declares scales");
-    owned.set_raw_scale_codes(scaled, 9, 1);
-    let req = contract_request(handle, owned.view());
-
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-    assert!(plan.is_null());
-    let message = drain(diags);
-    assert!(
-        message.contains("granularity") && message.contains('9'),
-        "the message should name the field and the value: {message}"
-    );
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-}
-
-#[test]
-fn an_out_of_range_scale_form_is_rejected_not_transmuted() {
-    let dir = contract_fixture();
-    let handle = open_checkpoint(&dir);
-    let mut owned = crate::contract_writer::write_contract(&scaled_contract());
-    let scaled = owned.first_scaled().expect("the fixture declares scales");
-    owned.set_raw_scale_codes(scaled, 0, 4);
-    let req = contract_request(handle, owned.view());
-
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-    assert!(plan.is_null());
-    let message = drain(diags);
-    assert!(
-        message.contains("form") && message.contains('4'),
-        "the message should name the field and the value: {message}"
-    );
-    unsafe { super::entry::pie_loader_close_checkpoint(handle) };
-}
-
-#[test]
-fn a_contract_request_with_no_checkpoint_is_rejected() {
-    let owned = crate::contract_writer::write_contract(&fused_contract());
-    let req = contract_request(std::ptr::null(), owned.view());
-    let mut plan: *mut PieLoaderPlan = std::ptr::null_mut();
-    let mut diags: *mut PieLoaderDiagnostics = std::ptr::null_mut();
-    let status = unsafe { super::entry::pie_loader_compile_contract(&req, &mut plan, &mut diags) };
-    assert_eq!(status, PieLoaderStatus::InvalidRequest);
-    assert!(drain(diags).contains("checkpoint is null"));
 }
 
 #[test]
@@ -1619,101 +1236,4 @@ fn storage_op_tags_are_the_wire_values() {
         6
     );
     assert_eq!(tag(Op::Fill { buffer_id: 0 }), 8);
-}
-
-/// A `Gather`'s indices are the first variable-length payload on an expression
-/// node that is neither a shape nor a child list, so they are the one field
-/// whose round trip nothing else would exercise.
-#[test]
-fn a_gather_carries_its_indices_across_the_ffi() {
-    use pie_loader::contract::{Expr, ModelContract, TensorContract};
-    let contract = ModelContract {
-        alignment: 256,
-        tensors: vec![TensorContract::inferred(
-            "permuted",
-            Expr::src("a.weight").gather(0, vec![3, 0, 7, 0]),
-            Encoding::Raw(DType::BF16),
-        )],
-        groups: Vec::new(),
-    };
-    let owned = crate::contract_writer::write_contract(&contract);
-    let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
-    assert_eq!(read, contract);
-}
-
-/// A group is the one thing on the contract ABI that is not a flat list: the
-/// C++ side keeps its declarations in storage of its own, and the flattened
-/// form has to say which of the shared tensor entries belong to which group.
-/// Both index nodes ride along, `Select`'s stride in the `start` field, so a
-/// whole-contract equality is the check that pins that encoding down.
-#[test]
-fn a_group_survives_the_contract_ffi() {
-    use pie_loader::contract::{Expr, GroupContract, ModelContract, TensorContract};
-    let contract = ModelContract {
-        alignment: 256,
-        tensors: vec![TensorContract::inferred(
-            "norm",
-            Expr::src("model.norm.weight"),
-            Encoding::Raw(DType::BF16),
-        )],
-        groups: vec![
-            GroupContract {
-                name: "experts".to_string(),
-                arity: 128,
-                tensors: vec![
-                    TensorContract::inferred(
-                        "gate_up",
-                        Expr::select(Expr::src("experts.gate_up_blocks"), 0, 1, 1),
-                        Encoding::Raw(DType::BF16),
-                    ),
-                    TensorContract::inferred(
-                        "down",
-                        Expr::src_indexed("model.layers.0.experts.{}.down.weight"),
-                        Encoding::Raw(DType::BF16),
-                    ),
-                ],
-            },
-            GroupContract {
-                name: "layers".to_string(),
-                arity: 4,
-                tensors: vec![TensorContract::inferred(
-                    "attn",
-                    Expr::src_indexed("model.layers.{}.attn.weight"),
-                    Encoding::Raw(DType::BF16),
-                )],
-            },
-        ],
-    };
-    let owned = crate::contract_writer::write_contract(&contract);
-    let read = unsafe { super::contract::read_contract(&owned.view()) }.expect("reads back");
-    assert_eq!(read, contract);
-}
-
-/// The rule `RepackLayout` used to state as a variant, now stated where it can
-/// still be violated.
-///
-/// Zero is what an all-zero node carries, and a `Repack` that names no kernel
-/// would otherwise reach the device as a transform that does nothing to bytes
-/// a GEMM is about to read as swizzled.
-#[test]
-fn a_repack_that_names_no_kernel_is_refused_at_the_boundary() {
-    use pie_loader::contract::{Expr, ModelContract, TensorContract, TensorType};
-    use pie_loader::types::RepackLayout;
-    let contract = ModelContract {
-        alignment: 256,
-        tensors: vec![TensorContract::inferred(
-            "packed",
-            Expr::src("blocks").repack(
-                RepackLayout::MarlinMxfp4Weight,
-                TensorType::raw(vec![2, 32, 64], DType::BF16),
-            ),
-            Encoding::Raw(DType::BF16),
-        )],
-        groups: Vec::new(),
-    };
-    let mut owned = crate::contract_writer::write_contract(&contract);
-    let node = owned.first_repack().expect("the contract has a Repack");
-    owned.set_raw_repack_layout(node, PieLoaderRepackLayout::None as u32);
-    let err = unsafe { super::contract::read_contract(&owned.view()) }.unwrap_err();
-    assert!(err.contains("names a kernel"), "{err}");
 }

@@ -1,6 +1,6 @@
 //! The request entry: facts and policy in, plan out.
 //!
-//! [`pie_loader_compile_model`] is the boundary the migration is heading for
+//! [`pie_loader_compile_model`] is the boundary the migration arrived at
 //! (`plan/model-in-rust.md` §6): the caller sends the facts it parsed and
 //! the policy it decided — a handful of scalars — and authoring happens on
 //! this side, in `pie_model::contract`. The contract never crosses the ABI
@@ -8,10 +8,10 @@
 //! resolved [`StorageTarget`] feeds both the author and the compiler, so the
 //! two cannot be told different worlds.
 //!
-//! [`pie_loader_compile_contract`](super::entry::pie_loader_compile_contract)
-//! stays beside this while any C++ author remains: a family this side does
-//! not know answers with a diagnostic naming the fallback rather than a
-//! guess.
+//! This is the only way to obtain a plan. The contract entry that used to
+//! stand beside it as the C++ authors' door was retired with the last of
+//! them (§8-5): a family this side does not know is a diagnostic asking for
+//! an author, not a fallback.
 //!
 //! Every enum-valued field crosses as a `u32`, for the reason
 //! `request.hpp` gives: these are *inputs*, and a Rust enum holding a value
@@ -234,8 +234,9 @@ unsafe fn author_from_request(
             .map_err(|err| (compile_error_status(&err), err.to_string()))?
             .ok_or_else(|| {
                 bad(format!(
-                    "no author for model_type '{}'; author a contract and call \
-                     pie_loader_compile_contract instead",
+                    "no author for model_type '{}'; every family loads through \
+                     this entry now, so an unknown one needs an author in \
+                     pie_model::contract (plan/model-in-rust.md §7)",
                     facts.model_type
                 ))
             })?;
@@ -323,10 +324,9 @@ pub unsafe extern "C" fn pie_loader_compile_model(
 
 /// Check a plan against the contract this request authors.
 ///
-/// The model-request counterpart of
-/// [`pie_loader_verify_contract`](super::entry::pie_loader_verify_contract):
-/// the caller has no contract to hand over, so the verifier re-authors one
-/// from the same request and holds the plan to it. Re-authoring is the
+/// The caller has no contract to hand over — a contract is loader-internal
+/// IR now — so the verifier re-authors one from the same request and holds
+/// the plan to it. Re-authoring is the
 /// point, not a cost — the check covers the author's determinism along with
 /// everything the contract verifier checks.
 ///

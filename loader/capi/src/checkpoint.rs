@@ -23,10 +23,9 @@
 
 use std::path::PathBuf;
 
-use crate::contract::{PieLoaderEncodingSpec, write_encoding};
 use crate::types::{
     PieLoaderBytes, PieLoaderCheckpointFileSlice, PieLoaderCheckpointFileView,
-    PieLoaderCheckpointFormat, PieLoaderI64Slice,
+    PieLoaderCheckpointFormat, PieLoaderEncodingSpec, PieLoaderI64Slice, write_encoding,
 };
 use pie_loader::checkpoint::CheckpointMetadata;
 

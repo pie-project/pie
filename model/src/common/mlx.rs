@@ -441,3 +441,47 @@ pub fn author_mlx_file(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::routed_expert_member;
+
+    /// The refusal that used to be pinned from Metal's C++ side
+    /// (`llama_decode_step_test.cpp`), ported here when the C++ author died:
+    /// a shared-expert block this driver does not compute, or an unstacked
+    /// per-expert bank, is an error naming the tensor — never a silent skip,
+    /// because skipping is what runs the routed mixture alone and produces
+    /// fluent text that is not the checkpoint's.
+    #[test]
+    fn routed_banks_map_and_unservable_experts_are_refused() {
+        let call = |member: &str, has_shared: bool| {
+            routed_expert_member(
+                &format!("model.layers.3.{member}"),
+                member,
+                "llama",
+                has_shared,
+            )
+        };
+        // The stacked routed bank, in both spellings, still maps.
+        assert!(matches!(
+            call("mlp.experts.gate_proj.weight", false),
+            Ok(None)
+        ));
+        assert_eq!(
+            call("mlp.switch_mlp.gate_proj.weight", false).unwrap(),
+            Some("mlp.experts.gate_proj.weight".to_string()),
+            "mlx_lm's spelling of the same bank maps"
+        );
+        // Per-expert tensors are refused, not skipped.
+        let err = call("mlp.experts.0.gate_proj.weight", false).unwrap_err();
+        assert!(err.to_string().contains("per-expert"), "{err}");
+        // A shared-expert block for a family that computes none is refused...
+        let err = call("mlp.shared_experts.gate_up_proj.weight", false).unwrap_err();
+        assert!(err.to_string().contains("shared expert"), "{err}");
+        // ...and accepted verbatim for one that does.
+        assert_eq!(
+            call("mlp.shared_expert.gate_proj.weight", true).unwrap(),
+            Some("mlp.shared_expert.gate_proj.weight".to_string())
+        );
+    }
+}

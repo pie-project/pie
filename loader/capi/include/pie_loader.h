@@ -12,15 +12,6 @@ struct PieLoaderPlan;
 
 namespace pie_loader {
 
-/// `PieLoaderExprNode::src` when the node has no single operand.
-constexpr static const uint32_t PIE_LOADER_NO_NODE = UINT32_MAX;
-
-/// `QuantSpec::channel_axis`, as a signed integer so that `-1` is "unset".
-///
-/// A sentinel rather than a second `bool` field keeps the struct a plain list
-/// of numbers, which is what a designated initializer is good at.
-constexpr static const int32_t PIE_LOADER_NO_AXIS = -1;
-
 /// Sentinel for "no buffer", mirroring the C++ `numeric_limits<uint32_t>::max()`
 /// default on `PieLoaderStorageInstrView::buffer_id`.
 constexpr static const uint32_t PIE_LOADER_NO_BUFFER = UINT32_MAX;
@@ -43,6 +34,12 @@ constexpr static const uint32_t PIE_LOADER_TILE_MAP_REPACK = (1 << 6);
 constexpr static const uint32_t PIE_LOADER_TILE_MAP_SCALE = (1 << 7);
 
 constexpr static const uint32_t PIE_LOADER_FUSION_FP8_TO_MXFP4 = (1 << 0);
+
+/// `QuantSpec::channel_axis`, as a signed integer so that `-1` is "unset".
+///
+/// A sentinel rather than a second `bool` field keeps the struct a plain list
+/// of numbers, which is what a designated initializer is good at.
+constexpr static const int32_t PIE_LOADER_NO_AXIS = -1;
 
 enum class PieLoaderStatus : uint32_t {
   Ok = 0,
@@ -77,14 +74,6 @@ enum class PieLoaderSeverity : uint32_t {
   /// choice without failing.
   Warning = 0,
   Error = 1,
-};
-
-/// Whether a declared tensor is bound by the driver. Mirrors [`Visibility`](pie_loader::types::Visibility).
-enum class PieLoaderVisibility : uint32_t {
-  /// A runtime weight, bound by name.
-  Public = 0,
-  /// A name the contract needed for itself: not bound, not persistent.
-  Internal = 1,
 };
 
 enum class PieLoaderDType : uint32_t {
@@ -132,6 +121,14 @@ enum class PieLoaderQuantScheme : uint32_t {
   GgufQ5K = 12,
   GgufQ8_0 = 13,
   Int4B8 = 14,
+};
+
+/// Whether a declared tensor is bound by the driver. Mirrors [`Visibility`](pie_loader::types::Visibility).
+enum class PieLoaderVisibility : uint32_t {
+  /// A runtime weight, bound by name.
+  Public = 0,
+  /// A name the contract needed for itself: not bound, not persistent.
+  Internal = 1,
 };
 
 /// `None` is the resting value for instructions that carry no tile map, so it
@@ -204,32 +201,6 @@ enum class PieLoaderScaleForm : uint32_t {
   /// BF16 multipliers paired with the zero points named by
   /// `zero_point_tensor_id`: an element is `code * scale + zero`.
   Bf16AffineFactors = 2,
-};
-
-/// Which constructor a node is. Mirrors [`pie_loader::contract::Expr`] exactly; a
-/// variant added there without a variant here is a compile error in
-/// `read_expr`.
-enum class PieLoaderExprKind : uint32_t {
-  Src = 0,
-  Out = 1,
-  Fill = 2,
-  Slice = 3,
-  Stride = 4,
-  Gather = 5,
-  Concat = 6,
-  Transmute = 7,
-  Shard = 8,
-  Repack = 9,
-  Cast = 10,
-  Scale = 11,
-  /// The two group nodes. Both stand for an index the contract does not
-  /// name, so both are an error outside a
-  /// [`GroupContract`](pie_loader::contract::GroupContract) -- which the C ABI
-  /// cannot declare yet, so a C++ author has no use for these today. They are
-  /// numbered here because the numbering is the ABI, and appending later
-  /// would be a second decision to get right.
-  SrcIndexed = 12,
-  Select = 13,
 };
 
 /// A borrowed UTF-8 string. Not NUL-terminated: plan strings come from Rust
@@ -340,252 +311,6 @@ struct PieLoaderDiagnostics {
   void *owner;
 };
 
-/// The device-measured half of a request.
-///
-/// Every field is a fact only the driver can state: what the device is, how
-/// wide the TP group is, and which transforms this backend's kernels implement.
-/// The loader never guesses any of it, which is what makes a plan reproducible
-/// from a recorded spec on a machine with no GPU (`architecture.md` §2 P2).
-///
-/// `backend` and `encode_scratch_dtype` are plain `uint32_t` rather than their
-/// enum types, and the same goes for every enum-valued *input* field. C++ lets a
-/// caller store any integer in an enum-typed field, and reading such a field as
-/// a Rust enum is undefined behaviour that happens *before* any check could
-/// reject it. Assign `static_cast<uint32_t>(PieLoaderBackendKind::Cuda)`; the
-/// loader validates the value and answers `PieLoaderStatus::InvalidRequest` if
-/// it is not one of them.
-struct PieLoaderTargetSpec {
-  uint32_t backend;
-  uint32_t tp_rank;
-  uint32_t tp_size;
-  uint64_t max_tile_bytes;
-  uint32_t preferred_alignment;
-  uint32_t tile_map_mask;
-  bool native_mxfp4_moe;
-  /// Which fused transform chains this build has kernels for
-  /// (`PIE_LOADER_FUSION_*`).
-  ///
-  /// The opt-out that used to be `PIE_CUDA_DISABLE_FUSED_TRANSCODE`, read
-  /// inside the executor. As a request field it changes the *plan*, so two
-  /// settings produce two artifacts instead of one plan that runs two ways
-  /// (`architecture.md` §8.1). Backends with no fused kernels pass `0`.
-  uint32_t fusion_mask;
-  /// The dtype this target's encode kernels dequantize through. Decides how
-  /// many rows of scratch fit in `max_tile_bytes`.
-  ///
-  /// A `u32` for the reason [`PieLoaderTargetSpec::backend`] is: this is an
-  /// *input*, so the value is whatever C++ wrote, and a Rust enum with a
-  /// value outside its variants is undefined behaviour before any check can
-  /// run. The output side, `PieLoaderTargetView`, keeps the enum — the loader
-  /// wrote that one.
-  uint32_t encode_scratch_dtype;
-  /// Row granularity of this target's block scales, or `0` for none. A
-  /// block-scaled source is not tiled, because a tile boundary would cut a
-  /// scale block.
-  uint32_t block_scale_rows;
-};
-
-using PieLoaderU32Slice = PieLoaderSlice<uint32_t>;
-
-/// One node of the expression graph.
-///
-/// Every field is read by exactly the kinds that need it and ignored by the
-/// rest; see `read_expr` for the mapping, which is the only place it is
-/// written down.
-struct PieLoaderExprNode {
-  /// A `PieLoaderExprKind` value, as `uint32_t`. Not the enum type, so that a
-  /// value the loader does not recognize is a diagnosable request rather than
-  /// undefined behaviour on the Rust side.
-  uint32_t kind;
-  /// `Src` / `Out`: the name. Borrowed for the call.
-  PieLoaderBytes name;
-  /// The single operand, for every kind that has one. Must be strictly less
-  /// than this node's own index. [`PIE_LOADER_NO_NODE`] for `Src`, `Out` and
-  /// `Concat`.
-  uint32_t src;
-  /// `Concat`: the operands, in order. Same index rule.
-  PieLoaderU32Slice parts;
-  /// `Slice`, `Stride`, `Concat`, `Shard`, and a per-group `Scale`.
-  uint8_t axis;
-  /// `Slice` and `Stride`.
-  int64_t start;
-  int64_t len;
-  /// `Stride`. A contiguous run is a `Slice`, so this must be at least 2.
-  int64_t step;
-  /// `Gather`: the indices to read along `axis`, in output order.
-  ///
-  /// Constants rather than a nested node, which is what keeps a contract
-  /// comparable and hashable. Borrowed for the call, like every other slice
-  /// in this struct.
-  PieLoaderI64Slice indices;
-  /// `Fill`: the constant, as the bit pattern of an IEEE-754 binary32, for
-  /// the reason `scale_factor_bits` gives.
-  ///
-  /// An unset field reads as `+0.0`, which is the one value a fill may
-  /// carry -- so unlike `Scale`, a `Fill` is not told apart from a forgotten
-  /// field by this. Its shape is: the loader rejects a rank-0 fill, and a
-  /// zeroed node has no shape at all.
-  uint32_t fill_bits;
-  /// `Transmute`: the type to read the same bytes under. `Repack`: the declared
-  /// output type, which the checker takes on trust because it cannot see
-  /// through the swizzle. `Fill`: the type of the constant tensor. At most
-  /// one extent may be `-1`, and never for a `Fill`.
-  PieLoaderI64Slice out_shape;
-  PieLoaderEncodingSpec out_encoding;
-  /// `Repack`: a `PieLoaderRepackLayout` value, as `uint32_t`. The whole of
-  /// what a repack says -- every count a kernel needs is the operand's type
-  /// or `out_shape`'s, so the loader derives it.
-  uint32_t repack_layout;
-  /// `Scale`: the multiplier, as the bit pattern of an IEEE-754 binary32.
-  ///
-  /// A `float` field would make this struct's layout depend on the C++
-  /// compiler agreeing about float ABI. `pie_loader::ModelContract::scale`
-  /// does the conversion, so no author writes a bit pattern.
-  ///
-  /// Leaving it unset means zero, which reads as `+0.0`; the loader rejects
-  /// that rather than scaling a tensor to nothing.
-  uint32_t scale_factor_bits;
-  /// `Scale`: the operand holding the factors, one per block. Same index
-  /// rule as `src`.
-  ///
-  /// [`PIE_LOADER_NO_NODE`] for a uniform factor, and that sentinel is what
-  /// tells the two forms apart. There used to be a separate `scale_group`
-  /// discriminant, on the grounds that a struct zeroed by hand would then
-  /// always read as the uniform case; but `src` has always carried the same
-  /// exposure — node zero is a legal index — so the sentinel is the rule
-  /// everywhere rather than in all places but one, and
-  /// [`PieLoaderExprNode::default`] sets it.
-  ///
-  /// The blocking itself is not stated here. It is the ratio of this
-  /// operand's shape to `src`'s, which is the only place it can be stated
-  /// once.
-  uint32_t scale_by;
-};
-
-using PieLoaderExprNodeSlice = PieLoaderSlice<PieLoaderExprNode>;
-
-/// What a scale tensor scales, said by the entry that declares the scales.
-///
-/// The loader used to work this pairing out by matching name suffixes —
-/// `{name}_scale_inv`, then `{base}.scale`, with the group size hardcoded to 128
-/// beside them. The driver had already found it properly and thrown it away:
-/// `dsv4_block_scales_to_fp32` takes a `.scale` tensor, looks up `<base>.weight`
-/// and publishes only if that companion is really FP8-E4M3. This is where that
-/// finding is kept.
-///
-/// Only for scales the *checkpoint* shipped. Scales the loader creates while
-/// quantizing are paired at creation, with no name involved.
-struct PieLoaderScalesView {
-  /// Name of the tensor these scales belong to. Empty means this entry is
-  /// not a scale tensor and the rest of this struct is ignored.
-  ///
-  /// Unlike `Expr::Out` this may name a *later* declaration: it pairs two
-  /// published tensors rather than feeding one into the other.
-  PieLoaderBytes of;
-  /// A [`PieLoaderQuantGranularity`], as a `u32`.
-  ///
-  /// Spelled as the underlying integer for the reason
-  /// [`PieLoaderTargetSpec::encode_scratch_dtype`] is: this struct is an
-  /// *input*, so the value is whatever C++ wrote, and a Rust enum holding a
-  /// value outside its variants is undefined behaviour the moment the
-  /// containing slice is borrowed — before `read_scales` could reject it.
-  /// `read_scales` converts it.
-  ///
-  /// [`PieLoaderTargetSpec::encode_scratch_dtype`]: crate::entry::PieLoaderTargetSpec::encode_scratch_dtype
-  uint32_t granularity;
-  /// Elements of `of` per scale entry, for `PerGroup`.
-  uint32_t group_size;
-  uint32_t channel_axis;
-  /// A [`PieLoaderScaleForm`], as a `u32`. See [`Self::granularity`].
-  uint32_t form;
-};
-
-/// One declared tensor: a name, the expression that produces it, and what the
-/// driver believes the result is.
-struct PieLoaderTensorContractView {
-  PieLoaderBytes name;
-  /// Index of the root node in [`PieLoaderModelContractView::nodes`].
-  uint32_t root;
-  /// The shape *this rank* expects, or empty for "do not check".
-  ///
-  /// Empty is not a weaker contract by accident; it is the honest declaration
-  /// for a packed quantized weight, whose on-disk extents are a property of
-  /// the quantizer that produced the checkpoint and not of the model. The
-  /// alternative — the driver guessing, and the loader checking the guess —
-  /// is what a `LogicalShape`-style helper exists to work around, and the
-  /// reason there is no such helper here.
-  PieLoaderI64Slice shape;
-  /// What the driver wants the tensor to *be*. Unlike the shape this is never
-  /// optional, because it is not a prediction: the loader inserts whatever
-  /// cast, decode or encode is needed to reach it.
-  PieLoaderEncodingSpec encoding;
-  /// Set when this entry holds the scales for another entry.
-  PieLoaderScalesView scales;
-  /// Whether the driver binds this tensor, or the contract just needed a
-  /// name for it. Zero -- the default -- is `Public`, so an author who does
-  /// not set it gets the tensor bound, which is what every existing
-  /// declaration means.
-  PieLoaderVisibility visibility;
-};
-
-using PieLoaderTensorContractSlice = PieLoaderSlice<PieLoaderTensorContractView>;
-
-/// A set of interchangeable declarations: the same tensors, `arity` times.
-///
-/// The expressions live in the same node pool as everything else and may use
-/// the two index-parametric nodes, [`PieLoaderExprKind::SrcIndexed`] and
-/// [`PieLoaderExprKind::Select`], which stand for the instance and are an error
-/// anywhere but here.
-struct PieLoaderGroupContractView {
-  PieLoaderBytes name;
-  /// How many instances. The loader compiles every one of them and requires
-  /// them to agree, so this is a claim being checked and not a hint.
-  uint32_t arity;
-  /// The declarations one instance publishes. `Expr::Out` inside a group
-  /// names an earlier declaration *of the same group*: an instance is a
-  /// self-contained load, so it cannot read the resident contract's outputs.
-  PieLoaderTensorContractSlice tensors;
-};
-
-using PieLoaderGroupContractSlice = PieLoaderSlice<PieLoaderGroupContractView>;
-
-/// Everything one driver rank declares.
-struct PieLoaderModelContractView {
-  /// Byte alignment every materialized buffer must satisfy.
-  uint32_t alignment;
-  /// The node pool, shared by every tensor. Topologically sorted: a node may
-  /// only reference nodes before it.
-  PieLoaderExprNodeSlice nodes;
-  /// The declarations, in order. `Expr::Out` may only name an earlier one.
-  PieLoaderTensorContractSlice tensors;
-  /// Interchangeable declaration sets. Empty for a contract that has none,
-  /// which is every contract that predates them.
-  PieLoaderGroupContractSlice groups;
-};
-
-/// A compile request that carries its own contract.
-///
-/// Exactly the north-star signature: the facts read off the checkpoint, the
-/// program stated over them, and the device to build for. None of the three is
-/// a model's name.
-///
-/// There is no `model`, because the loader infers nothing from `model_type`; no
-/// `runtime_quant`, because every tensor states the encoding it wants; no
-/// `mxfp4_moe`, because a contract either declares an MXFP4 expert weight or it
-/// does not; no `component`, because a contract that should not load the vision
-/// tower simply does not declare it; and no `demands`, because the contract
-/// already names every tensor it will produce and may declare the shape of
-/// each.
-struct PieLoaderContractRequest {
-  /// The checkpoint, already open. Not a directory: the driver had to read
-  /// the tensor table to write the contract, and compiling against the same
-  /// handle is what makes the contract and the plan provably about one parse.
-  const PieLoaderCheckpoint *checkpoint;
-  PieLoaderTargetSpec target;
-  /// What to build. Borrowed for the call; the loader copies what it keeps.
-  PieLoaderModelContractView contract;
-};
-
 struct PieLoaderSourceTensorView {
   uint32_t id;
   PieLoaderBytes name;
@@ -663,6 +388,8 @@ struct PieLoaderDestExtentView {
   uint64_t offset;
   PieLoaderStridedExtentView stride;
 };
+
+using PieLoaderU32Slice = PieLoaderSlice<uint32_t>;
 
 /// What an instruction does, as a tagged union carrying only that operation's
 /// operands.
@@ -937,6 +664,51 @@ struct PieLoaderPlan {
   void *owner;
 };
 
+/// The device-measured half of a request.
+///
+/// Every field is a fact only the driver can state: what the device is, how
+/// wide the TP group is, and which transforms this backend's kernels implement.
+/// The loader never guesses any of it, which is what makes a plan reproducible
+/// from a recorded spec on a machine with no GPU (`architecture.md` §2 P2).
+///
+/// `backend` and `encode_scratch_dtype` are plain `uint32_t` rather than their
+/// enum types, and the same goes for every enum-valued *input* field. C++ lets a
+/// caller store any integer in an enum-typed field, and reading such a field as
+/// a Rust enum is undefined behaviour that happens *before* any check could
+/// reject it. Assign `static_cast<uint32_t>(PieLoaderBackendKind::Cuda)`; the
+/// loader validates the value and answers `PieLoaderStatus::InvalidRequest` if
+/// it is not one of them.
+struct PieLoaderTargetSpec {
+  uint32_t backend;
+  uint32_t tp_rank;
+  uint32_t tp_size;
+  uint64_t max_tile_bytes;
+  uint32_t preferred_alignment;
+  uint32_t tile_map_mask;
+  bool native_mxfp4_moe;
+  /// Which fused transform chains this build has kernels for
+  /// (`PIE_LOADER_FUSION_*`).
+  ///
+  /// The opt-out that used to be `PIE_CUDA_DISABLE_FUSED_TRANSCODE`, read
+  /// inside the executor. As a request field it changes the *plan*, so two
+  /// settings produce two artifacts instead of one plan that runs two ways
+  /// (`architecture.md` §8.1). Backends with no fused kernels pass `0`.
+  uint32_t fusion_mask;
+  /// The dtype this target's encode kernels dequantize through. Decides how
+  /// many rows of scratch fit in `max_tile_bytes`.
+  ///
+  /// A `u32` for the reason [`PieLoaderTargetSpec::backend`] is: this is an
+  /// *input*, so the value is whatever C++ wrote, and a Rust enum with a
+  /// value outside its variants is undefined behaviour before any check can
+  /// run. The output side, `PieLoaderTargetView`, keeps the enum — the loader
+  /// wrote that one.
+  uint32_t encode_scratch_dtype;
+  /// Row granularity of this target's block scales, or `0` for none. A
+  /// block-scaled source is not tiled, because a tile boundary would cut a
+  /// scale block.
+  uint32_t block_scale_rows;
+};
+
 /// The config facts a family needs beyond the checkpoint itself. Mirrors
 /// [`ModelFacts`]; strings are borrowed for the call.
 struct PieLoaderModelFactsView {
@@ -1099,47 +871,13 @@ PieLoaderStatus pie_loader_open_checkpoint(PieLoaderBytes snapshot_dir,
 /// has not already been closed.
 void pie_loader_close_checkpoint(PieLoaderCheckpoint *checkpoint);
 
-/// Compile a driver-authored contract into a plan.
-///
-/// This is the only way to obtain a plan: what gets built is decided by the
-/// contract the driver authors, never by a model name the loader recognizes.
-/// The plan is owned by the caller and freed with [`pie_loader_release`];
-/// diagnostics are a separate allocation freed with
-/// [`pie_loader_release_diagnostics`].
+/// Free a plan returned by [`pie_loader_compile_model`](crate::model::pie_loader_compile_model).
 ///
 /// # Safety
 ///
-/// `req` must point at a valid [`PieLoaderContractRequest`] whose borrowed
-/// memory is live for the call. `out_plan` must be a writable slot. `out_diags`
-/// is either null or a writable slot.
-PieLoaderStatus pie_loader_compile_contract(const PieLoaderContractRequest *req,
-                                            PieLoaderPlan **out_plan,
-                                            PieLoaderDiagnostics **out_diags);
-
-/// Check a plan against the contract it was compiled from.
-///
-/// The contract is read a second time here rather than carried over from the
-/// compile, and the plan is read back out of the C arena rather than out of the
-/// Rust value it was built from. Both are deliberate: it makes this a check of
-/// two independently-derived answers, with the marshalling in scope, instead of
-/// a comparison of the compiler with itself.
-///
-/// # Safety
-///
-/// `plan` must point at a plan from [`pie_loader_compile_contract`] that has
-/// not been released. `req` must point at a valid [`PieLoaderContractRequest`]
-/// whose borrowed memory is live for the call. `out_diags` is either null or a
-/// writable slot.
-PieLoaderStatus pie_loader_verify_contract(const PieLoaderPlan *plan,
-                                           const PieLoaderContractRequest *req,
-                                           PieLoaderDiagnostics **out_diags);
-
-/// Free a plan returned by [`pie_loader_compile_contract`].
-///
-/// # Safety
-///
-/// `plan` is null or a pointer from [`pie_loader_compile_contract`] that has not already
-/// been released.
+/// `plan` is null or a pointer from
+/// [`pie_loader_compile_model`](crate::model::pie_loader_compile_model) that
+/// has not already been released.
 void pie_loader_release(PieLoaderPlan *plan);
 
 /// Free diagnostics returned through an out-param.
@@ -1169,10 +907,9 @@ PieLoaderStatus pie_loader_compile_model(const PieLoaderModelRequest *req,
 
 /// Check a plan against the contract this request authors.
 ///
-/// The model-request counterpart of
-/// [`pie_loader_verify_contract`](super::entry::pie_loader_verify_contract):
-/// the caller has no contract to hand over, so the verifier re-authors one
-/// from the same request and holds the plan to it. Re-authoring is the
+/// The caller has no contract to hand over — a contract is loader-internal
+/// IR now — so the verifier re-authors one from the same request and holds
+/// the plan to it. Re-authoring is the
 /// point, not a cost — the check covers the author's determinism along with
 /// everything the contract verifier checks.
 ///

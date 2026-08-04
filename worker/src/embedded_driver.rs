@@ -23,7 +23,7 @@ use crate::driver_ffi::Flavor;
 /// Anchors the loader ABI's C entry points into the final binary.
 ///
 /// `pie-loader-capi` is an rlib and the only callers of
-/// `pie_loader_compile_contract` and friends are the C++ drivers, which link
+/// `pie_loader_compile_model` and friends are the C++ drivers, which link
 /// *after* Rust. A linker never pulls an rlib member in on behalf of a C++
 /// reference, so without a reference from reachable Rust the entry points are
 /// simply absent and the failure surfaces as an undefined symbol at final
@@ -32,15 +32,16 @@ use crate::driver_ffi::Flavor;
 /// this static is what pulls it in.
 ///
 /// **This is load-bearing.** No Rust in this process calls the loader any more —
-/// §12 step 2 moved plan compilation behind the FFI and row 12 moved contract
-/// authorship to C++ — so this reference is the only thing keeping the object
-/// file in the link.
+/// §12 step 2 moved plan compilation behind the FFI, and the boot's request
+/// entry is `pie_loader_compile_model` (`plan/model-in-rust.md` §6) — so this
+/// reference is the only thing keeping the object file in the link.
 #[used]
 static PIE_LOADER_ENTRY_ANCHOR: unsafe extern "C" fn(
-    *const pie_loader_capi::entry::PieLoaderContractRequest,
+    *const pie_loader_capi::model::PieLoaderModelRequest,
     *mut *mut pie_loader_capi::PieLoaderPlan,
+    *mut u32,
     *mut *mut pie_loader_capi::PieLoaderDiagnostics,
-) -> pie_loader_capi::PieLoaderStatus = pie_loader_capi::entry::pie_loader_compile_contract;
+) -> pie_loader_capi::PieLoaderStatus = pie_loader_capi::model::pie_loader_compile_model;
 
 #[cfg(feature = "driver-cuda")]
 #[repr(C)]

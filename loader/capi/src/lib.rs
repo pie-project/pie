@@ -8,17 +8,19 @@
 //!
 //! `types` is the published `#[repr(C)]` vocabulary, `arena` turns a compiled
 //! [`LoadPlan`](pie_loader::plan::LoadPlan) into it, and `entry` holds the
-//! `extern "C"` functions the driver calls. `contract` and `checkpoint` read the
-//! two inputs back the other way — what the driver asks for, and which
-//! checkpoint to ask it of. `weight_store` is a surface of its own: the
-//! materialized-weight artifact, which is about finished device memory rather
-//! than about compiling anything, and carries its own entry points for that
-//! reason. The generated header (`loader/capi/include/pie_loader.h`) is the C
-//! view of exactly those six files; `view` is Rust-side borrowing helpers over
-//! them and publishes nothing. `contract_writer` publishes nothing either: it
-//! is the test-side stand-in for a C++ author, building the same POD graph a
-//! driver would, and it lives here because the graph it writes is this
-//! crate's.
+//! `extern "C"` functions the driver calls. `model` reads the one input back
+//! the other way — the facts-and-policy request a driver states — and
+//! `checkpoint` says which checkpoint to ask it of. `weight_store` is a
+//! surface of its own: the materialized-weight artifact, which is about
+//! finished device memory rather than about compiling anything, and carries
+//! its own entry points for that reason. The generated header
+//! (`loader/capi/include/pie_loader.h`) is the C view of exactly those five
+//! files; `view` is Rust-side borrowing helpers over them and publishes
+//! nothing. (A driver used to be able to hand over a fully-authored contract
+//! graph instead — `contract`, `contract_writer` and the C++ builder in
+//! `model_contract.hpp` were that path. It died with the last C++ author,
+//! `plan/model-in-rust.md` §8-5: authoring happens on this side now, and a
+//! contract is loader-internal IR that never crosses the ABI.)
 //!
 //! This is the only boundary the design has (`architecture.md` §10). There is
 //! no serialized form: a plan is compiled and executed in one process, so a
@@ -27,8 +29,6 @@
 
 pub mod arena;
 pub mod checkpoint;
-pub mod contract;
-pub mod contract_writer;
 pub mod entry;
 pub mod model;
 pub mod types;

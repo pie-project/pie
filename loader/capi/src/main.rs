@@ -13,8 +13,10 @@
 //! ```
 //!
 //! `CONTRACT` is a JSON [`ModelContract`] — what the tool holds instead of a
-//! model's name, because the loader does not have families any more. A driver
-//! authors one in C++ (`driver/*/src/model/<family>/<family>_contract.hpp`);
+//! model's name, because the compiler proper does not have families. In
+//! production the contract is authored from a model request on the Rust side
+//! (`pie_model::contract`, `plan/model-in-rust.md` §2) and never serialized;
+//! this JSON form exists for exactly this tool and the golden tests, and
 //! `loader/tests/golden/contracts/` holds the ones the tests use.
 //!
 //! `convert` is the one command that writes a checkpoint rather than reading

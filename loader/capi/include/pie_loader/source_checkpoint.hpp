@@ -147,19 +147,4 @@ private:
     PieLoaderCheckpoint* handle_ = nullptr;
 };
 
-/// Assemble a contract request.
-///
-/// Three arguments, and none of them is a model's name. Everything the request
-/// borrows — the checkpoint and the contract builder — must outlive the
-/// `pie_loader_compile_contract` call.
-inline PieLoaderContractRequest build_contract_request(const Checkpoint& checkpoint,
-                                                       const DeviceTarget& target,
-                                                       PieLoaderModelContractView contract) {
-    return PieLoaderContractRequest{
-        .checkpoint = checkpoint.get(),
-        .target = target_spec(target),
-        .contract = contract,
-    };
-}
-
 }  // namespace pie_loader

@@ -20,15 +20,11 @@
 
 use std::path::PathBuf;
 
-use pie_loader::cache_key::{ArtifactInputs, artifact_cache_key};
 use pie_loader::checkpoint::read::parse_checkpoint_metadata;
 use pie_loader::error::Error;
-use pie_loader::plan::LoadPlan;
-use pie_loader::plan::compile as compile_load_plan;
 
 use super::arena;
 use super::checkpoint::PieLoaderCheckpoint;
-use super::contract::PieLoaderModelContractView;
 use super::types::*;
 
 #[repr(u32)]
@@ -261,104 +257,6 @@ pub(super) fn compile_error_status(err: &Error) -> PieLoaderStatus {
     }
 }
 
-/// A compile request that carries its own contract.
-///
-/// Exactly the north-star signature: the facts read off the checkpoint, the
-/// program stated over them, and the device to build for. None of the three is
-/// a model's name.
-///
-/// There is no `model`, because the loader infers nothing from `model_type`; no
-/// `runtime_quant`, because every tensor states the encoding it wants; no
-/// `mxfp4_moe`, because a contract either declares an MXFP4 expert weight or it
-/// does not; no `component`, because a contract that should not load the vision
-/// tower simply does not declare it; and no `demands`, because the contract
-/// already names every tensor it will produce and may declare the shape of
-/// each.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PieLoaderContractRequest {
-    /// The checkpoint, already open. Not a directory: the driver had to read
-    /// the tensor table to write the contract, and compiling against the same
-    /// handle is what makes the contract and the plan provably about one parse.
-    pub checkpoint: *const PieLoaderCheckpoint,
-    pub target: PieLoaderTargetSpec,
-    /// What to build. Borrowed for the call; the loader copies what it keeps.
-    pub contract: PieLoaderModelContractView,
-}
-
-/// Compile a contract into a plan.
-///
-/// # Safety
-///
-/// `req` and everything its pointers reach must be live for the call.
-unsafe fn compile_contract_request(
-    req: &PieLoaderContractRequest,
-) -> Result<(LoadPlan, String), (PieLoaderStatus, String)> {
-    let checked = unsafe { read_contract_request(req) }?;
-    let source = unsafe { super::checkpoint::arena_of(req.checkpoint) };
-
-    compile_load_plan(&source.metadata, &checked.model, checked.target)
-        .map_err(|err| (compile_error_status(&err), err.to_string()))
-        .map(|plan| {
-            // `runtime_quant` and `component` are empty because neither exists
-            // on this path, and neither is missing information: the contract
-            // decides both, and the contract is entirely observable in the plan
-            // that is hashed alongside them.
-            let cache_key = artifact_cache_key(
-                &plan,
-                &ArtifactInputs {
-                    snapshot_dir: &source.snapshot_dir,
-                    runtime_quant: "",
-                    component: 0,
-                },
-            );
-            (plan, cache_key)
-        })
-}
-
-/// A contract request with its target resolved and its contract materialized.
-struct CheckedContractRequest {
-    model: pie_loader::contract::ModelContract,
-    target: pie_loader::plan::StorageTarget,
-}
-
-/// Validate a contract request without touching the filesystem.
-///
-/// Split out so that compiling and verifying resolve the target the same way;
-/// a second copy of these rules is a second thing to keep in step.
-///
-/// # Safety
-///
-/// `req` and everything its pointers reach must be live for the call.
-unsafe fn read_contract_request(
-    req: &PieLoaderContractRequest,
-) -> Result<CheckedContractRequest, (PieLoaderStatus, String)> {
-    let bad = |err: String| (PieLoaderStatus::InvalidRequest, err);
-    if req.checkpoint.is_null() {
-        return Err(bad(
-            "request.checkpoint is null; open one with pie_loader_open_checkpoint".to_string(),
-        ));
-    }
-    let backend = PieLoaderBackendKind::try_from(req.target.backend).map_err(|v| {
-        bad(format!(
-            "request.target.backend: {v} is not a PieLoaderBackendKind"
-        ))
-    })?;
-    if req.target.tp_size == 0 || req.target.tp_rank >= req.target.tp_size {
-        return Err(bad(format!(
-            "request.target: tp_rank {} is not a rank of a {}-way group",
-            req.target.tp_rank, req.target.tp_size
-        )));
-    }
-    // The MoE lowering is a property of the contract now, so the target is
-    // resolved with the request that asks for nothing: an expert weight is
-    // MXFP4 because a node says so, not because a flag on the side said the
-    // model was one of the ones that should be.
-    let target = super::storage_target(&req.target, backend).map_err(bad)?;
-    let model = unsafe { super::contract::read_contract(&req.contract) }.map_err(bad)?;
-    Ok(CheckedContractRequest { model, target })
-}
-
 /// Open a checkpoint and read its tensor table.
 ///
 /// The only entry point that touches the filesystem before a plan executes.
@@ -423,115 +321,13 @@ pub unsafe extern "C" fn pie_loader_close_checkpoint(checkpoint: *mut PieLoaderC
     unsafe { super::checkpoint::release(checkpoint) }
 }
 
-/// Compile a driver-authored contract into a plan.
-///
-/// This is the only way to obtain a plan: what gets built is decided by the
-/// contract the driver authors, never by a model name the loader recognizes.
-/// The plan is owned by the caller and freed with [`pie_loader_release`];
-/// diagnostics are a separate allocation freed with
-/// [`pie_loader_release_diagnostics`].
+/// Free a plan returned by [`pie_loader_compile_model`](crate::model::pie_loader_compile_model).
 ///
 /// # Safety
 ///
-/// `req` must point at a valid [`PieLoaderContractRequest`] whose borrowed
-/// memory is live for the call. `out_plan` must be a writable slot. `out_diags`
-/// is either null or a writable slot.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pie_loader_compile_contract(
-    req: *const PieLoaderContractRequest,
-    out_plan: *mut *mut PieLoaderPlan,
-    out_diags: *mut *mut PieLoaderDiagnostics,
-) -> PieLoaderStatus {
-    if !out_diags.is_null() {
-        unsafe { *out_diags = std::ptr::null_mut() };
-    }
-    if out_plan.is_null() {
-        return PieLoaderStatus::InvalidRequest;
-    }
-    unsafe { *out_plan = std::ptr::null_mut() };
-
-    let mut sink = DiagnosticSink::default();
-    if req.is_null() {
-        sink.error("pie_loader_compile_contract: request is null");
-        unsafe { emit(out_diags, sink.publish()) };
-        return PieLoaderStatus::InvalidRequest;
-    }
-
-    let status = match unsafe { compile_contract_request(&*req) } {
-        Ok((plan, cache_key)) => {
-            unsafe { *out_plan = arena::build(&plan, &cache_key) };
-            PieLoaderStatus::Ok
-        }
-        Err((status, message)) => {
-            sink.error(message);
-            status
-        }
-    };
-    unsafe { emit(out_diags, sink.publish()) };
-    status
-}
-
-/// Check a plan against the contract it was compiled from.
-///
-/// The contract is read a second time here rather than carried over from the
-/// compile, and the plan is read back out of the C arena rather than out of the
-/// Rust value it was built from. Both are deliberate: it makes this a check of
-/// two independently-derived answers, with the marshalling in scope, instead of
-/// a comparison of the compiler with itself.
-///
-/// # Safety
-///
-/// `plan` must point at a plan from [`pie_loader_compile_contract`] that has
-/// not been released. `req` must point at a valid [`PieLoaderContractRequest`]
-/// whose borrowed memory is live for the call. `out_diags` is either null or a
-/// writable slot.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pie_loader_verify_contract(
-    plan: *const PieLoaderPlan,
-    req: *const PieLoaderContractRequest,
-    out_diags: *mut *mut PieLoaderDiagnostics,
-) -> PieLoaderStatus {
-    if !out_diags.is_null() {
-        unsafe { *out_diags = std::ptr::null_mut() };
-    }
-    let mut sink = DiagnosticSink::default();
-    if plan.is_null() || req.is_null() {
-        sink.error("pie_loader_verify_contract: plan or request is null");
-        unsafe { emit(out_diags, sink.publish()) };
-        return PieLoaderStatus::InvalidRequest;
-    }
-
-    let plan = unsafe { &*plan };
-    let req = unsafe { &*req };
-    match unsafe { read_contract_request(req) } {
-        Ok(checked) => {
-            verify_plan_contract(
-                plan,
-                &pie_loader::verify::ContractView::of(&checked.model),
-                &mut sink,
-            );
-        }
-        Err((_, message)) => sink.error(message),
-    }
-    // A contract request states no MoE policy, so `Auto` is what the compile
-    // resolved and `Auto` is what verification must resolve.
-    verify_target_compat(plan, &req.target, &mut sink);
-
-    let status = if sink.is_empty() {
-        PieLoaderStatus::Ok
-    } else {
-        PieLoaderStatus::ContractViolation
-    };
-    unsafe { emit(out_diags, sink.publish()) };
-    status
-}
-
-/// Free a plan returned by [`pie_loader_compile_contract`].
-///
-/// # Safety
-///
-/// `plan` is null or a pointer from [`pie_loader_compile_contract`] that has not already
-/// been released.
+/// `plan` is null or a pointer from
+/// [`pie_loader_compile_model`](crate::model::pie_loader_compile_model) that
+/// has not already been released.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pie_loader_release(plan: *mut PieLoaderPlan) {
     unsafe { arena::release(plan) }
@@ -659,13 +455,11 @@ unsafe impl Sync for EntryAddr {}
 /// final link rather than anywhere near this file (`architecture.md` §3.4).
 /// `#[used]` keeps the table, and the table keeps the functions.
 #[used]
-static KEEP_ALIVE: [EntryAddr; 8] = [
+static KEEP_ALIVE: [EntryAddr; 6] = [
     EntryAddr(pie_loader_open_checkpoint as *const ()),
     EntryAddr(pie_loader_close_checkpoint as *const ()),
-    EntryAddr(pie_loader_compile_contract as *const ()),
     EntryAddr(crate::model::pie_loader_compile_model as *const ()),
     EntryAddr(crate::model::pie_loader_verify_model as *const ()),
-    EntryAddr(pie_loader_verify_contract as *const ()),
     EntryAddr(pie_loader_release as *const ()),
     EntryAddr(pie_loader_release_diagnostics as *const ()),
 ];
