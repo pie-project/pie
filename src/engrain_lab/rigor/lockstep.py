@@ -50,6 +50,15 @@ def main() -> int:
         "engine.",
     )
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--distinct",
+        type=int,
+        nargs="+",
+        default=None,
+        help="how many distinct schemas the batch draws from, cycled to fill "
+        "it. One is the case our fill deduplicates and theirs cannot; all of "
+        "them is the case that should hurt us. Default: as many as there are.",
+    )
     arguments = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(arguments.model)
@@ -104,9 +113,14 @@ def main() -> int:
     )
 
     report = []
-    print(f"\n{'batch':>6} {'engrain':>12} {'xgrammar':>12} {'ratio':>7}")
-    for batch in arguments.batches:
-        chosen = [pairs[index % len(pairs)] for index in range(batch)]
+    spreads = arguments.distinct or [len(pairs)]
+    print(
+        f"\n{'batch':>6} {'distinct':>9} {'engrain':>12} {'xgrammar':>12} "
+        f"{'ratio':>7}"
+    )
+    for batch, distinct in ((b, d) for b in arguments.batches for d in spreads):
+        spread = max(1, min(distinct, len(pairs), batch))
+        chosen = [pairs[index % spread] for index in range(batch)]
         pool = DeviceGrammar()
         try:
             assignment = []
@@ -152,9 +166,17 @@ def main() -> int:
                 continue
             us = statistics.median(ourtimes)
             them = statistics.median(theirtimes)
-            print(f"{batch:>6} {us:>11.1f}u {them:>11.1f}u {us / them:>7.2f}")
+            print(
+                f"{batch:>6} {spread:>9} {us:>11.1f}u {them:>11.1f}u "
+                f"{us / them:>7.2f}"
+            )
             report.append(
-                {"batch": batch, "engrain_us": us, "xgrammar_us": them}
+                {
+                    "batch": batch,
+                    "distinct": spread,
+                    "engrain_us": us,
+                    "xgrammar_us": them,
+                }
             )
         finally:
             del pool
