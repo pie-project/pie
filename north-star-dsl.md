@@ -2063,3 +2063,13 @@ at release. What remains beyond this campaign is recorded on the
 scoreboard: R=32-scale WEIGHT, the PQ-tree class, the spec-verify
 STRUCTURAL producer, a real mask-policy inferlet, the step-logit
 oracle.
+
+## DOC-ISOLATION UNDER COMPOSITION (2026-08-04)
+
+The real policy holds inside the spatial split: a doc-isolation lane
+co-batched with a plain lane forms 23 R=2 split fires (msplit=1, the
+policy lane on the custom kernel, the plain lane on the decode
+prefix), and the BLINDING PROPERTY SURVIVES — the isolated lane still
+cannot name the planted code word while sharing the fire. Policy
+semantics are composition-invariant, which is the whole promise: the
+work-sharing merge never leaks what a mask forbids.
