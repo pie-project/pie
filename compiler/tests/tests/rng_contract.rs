@@ -220,12 +220,23 @@ fn rng_magic_is_owned_by_the_contract() {
     ];
     let stride = ["9e37", "79b9", "7f4a", "7c15"].concat();
     let ambient_mask = ["a5a5", "a5a5"].concat();
+    // Every needle here is a CONSTANT the contract chose. The right-shift width
+    // used to sit in this list and is deliberately absent: it is not a constant
+    // but the shift implied by taking the top 24 bits of a 64-bit hash, which
+    // is what every hash-to-float writes. It also had no detection power to
+    // lose — in `ptir_rng_hash_uniform` that shift sits three lines from the
+    // scale divisor and the golden-ratio stride, so a real transcription trips
+    // those needles anyway. A needle that catches nothing the others miss while
+    // inventing false positives is not a guard rail.
+    //
+    // Needles are assembled from fragments because this file is itself walked:
+    // spelling one out in source — even in a comment — makes the test report
+    // itself. Keep it that way.
     let magic = [
         ["3c79", "ac49", "2ba7", "b653"].concat(),
         ["1c69", "b3f7", "4ac4", "ae35"].concat(),
         stride.clone(),
         ambient_mask.clone(),
-        [">>", "40"].concat(),
         ["16777216", ".0"].concat(),
     ];
 
